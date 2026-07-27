@@ -1078,7 +1078,7 @@ func TestAgentLoopOpenAIComputerRejectsMismatchedFunctionCallAliasBeforeExecutio
 	}
 }
 
-func TestAgentLoopOpenAIComputerUnknownCommitContinuesFromFinalScreenshot(t *testing.T) {
+func TestAgentLoopOpenAIComputerUnknownCommitStopsBeforeProviderContinuation(t *testing.T) {
 	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
 	llm := &openAIComputerLoopLLM{responses: []*client.CompletionResponse{
 		openAIComputerLoopResponse(
@@ -1087,17 +1087,12 @@ func TestAgentLoopOpenAIComputerUnknownCommitContinuesFromFinalScreenshot(t *tes
 			openAIContinuationTokenPrimary,
 			normalizedOpenAIComputerCallForTrajectory,
 		),
-		{
-			Model:        profile.Model(),
-			Provider:     profile.Provider(),
-			FinishReason: "stop",
-			OutputText:   "done",
-		},
 	}}
 	executor := &openAIComputerLoopBatchExecutor{
 		executions: []OpenAIComputerBatchExecution{{
 			CallID:              "call_001",
-			ContinuationAllowed: true,
+			ContinuationAllowed: false,
+			ActionEffect:        ComputerUseCommitUnknown,
 			Result: ToolResult{
 				Content: "commit status is unknown; do not retry automatically",
 				IsError: true,
@@ -1125,36 +1120,18 @@ func TestAgentLoopOpenAIComputerUnknownCommitContinuesFromFinalScreenshot(t *tes
 	loop.SetExecutionProfile(profile)
 	loop.SetOpenAIComputerBatchExecutor(executor)
 
-	reply, _, err := loop.Run(context.Background(), "click once", nil, nil)
-	if err != nil || reply != "done" {
-		t.Fatalf("unknown commit recovery = %q / %v", reply, err)
+	_, _, err := loop.Run(context.Background(), "click once", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "no verified state for continuation") {
+		t.Fatalf("unknown commit recovery error = %v", err)
 	}
 	requests := llm.capturedRequests()
-	if got := len(requests); got != 2 {
-		t.Fatalf("unknown commit issued %d completion requests, want 2", got)
+	if got := len(requests); got != 1 {
+		t.Fatalf("unknown commit issued %d completion requests, want 1", got)
 	}
 	if got := len(executor.capturedCalls()); got != 1 {
 		t.Fatalf("unknown commit executed %d batches, want 1", got)
 	}
 
-	continuation := requests[1]
-	if continuation.PreviousResponseID != openAIContinuationTokenPrimary {
-		t.Fatalf("continuation response id = %q", continuation.PreviousResponseID)
-	}
-	if len(continuation.Messages) < 2 {
-		t.Fatalf("continuation messages = %#v", continuation.Messages)
-	}
-	output := continuation.Messages[len(continuation.Messages)-1]
-	blocks := output.Content.Blocks()
-	if output.Role != "user" || len(blocks) != 1 ||
-		blocks[0].ToolUseID != "call_001" || !blocks[0].IsError {
-		t.Fatalf("recovery computer_call_output = %#v", output)
-	}
-	nested, ok := blocks[0].ToolContent.([]client.ContentBlock)
-	if !ok || len(nested) != 1 || nested[0].Source == nil ||
-		nested[0].Source.Data != "ZmluYWw=" {
-		t.Fatalf("recovery final screenshot = %#v", blocks[0].ToolContent)
-	}
 }
 
 func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {

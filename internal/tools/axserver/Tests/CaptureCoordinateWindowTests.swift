@@ -103,7 +103,40 @@ final class CaptureCoordinateWindowTests: XCTestCase {
                 dependencies: state.dependencies())
             XCTAssertEqual(result.status, "failed", name)
             XCTAssertEqual(result.failureCode, code, name)
+            if code == "image_dimensions_mismatch" {
+                XCTAssertTrue(result.retrySafe, name)
+                let diagnostics = try XCTUnwrap(result.failureDiagnostics, name)
+                XCTAssertEqual(diagnostics.stage, "decoded_dimensions", name)
+                XCTAssertEqual(diagnostics.pid, 4242, name)
+                XCTAssertEqual(diagnostics.bundleID, "com.example.fixture", name)
+                XCTAssertEqual(diagnostics.windowID, 7001, name)
+                XCTAssertEqual(diagnostics.preWindowQuartzBounds, diagnostics.postWindowQuartzBounds, name)
+                XCTAssertEqual(diagnostics.displayID, 2, name)
+                XCTAssertEqual(diagnostics.backingScaleFactor, 1, name)
+                XCTAssertEqual(diagnostics.expectedWidthPX, 1, name)
+                XCTAssertEqual(diagnostics.expectedHeightPX, 1, name)
+                XCTAssertEqual(diagnostics.metadataWidthPX, 2, name)
+                XCTAssertEqual(diagnostics.metadataHeightPX, 1, name)
+                XCTAssertEqual(diagnostics.decodedWidthPX, 2, name)
+                XCTAssertEqual(diagnostics.decodedHeightPX, 1, name)
+            }
         }
+    }
+
+    func testNonIntegralExpectedDimensionsCarryIdentityWithoutInventingActualPixels() throws {
+        var state = CaptureFixtureState()
+        state.preWindowBounds = .init(x: -100, y: 200, width: 1.5, height: 1)
+        state.postWindowBounds = state.preWindowBounds
+        let result = captureCoordinateWindow(
+            request: Self.request(width: 1.5),
+            dependencies: state.dependencies())
+
+        XCTAssertEqual(result.failureCode, "image_dimensions_mismatch")
+        let diagnostics = try XCTUnwrap(result.failureDiagnostics)
+        XCTAssertEqual(diagnostics.stage, "non_integral_expected_dimensions")
+        XCTAssertEqual(diagnostics.expectedWidthPX, 1.5)
+        XCTAssertNil(diagnostics.metadataWidthPX)
+        XCTAssertNil(diagnostics.decodedWidthPX)
     }
 
     func testInjectedCaptureRejectsCrossDisplayMirrorFollowerAndRotation() throws {
@@ -213,6 +246,16 @@ final class CaptureCoordinateWindowTests: XCTestCase {
             }
             XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(urlAfterScope).path))
         }
+    }
+
+    func testExactWindowCaptureArgumentsExcludeAttachedSurfaces() {
+        let outputURL = URL(fileURLWithPath: "/tmp/exact-window.png")
+
+        XCTAssertEqual(
+            coordinateWindowScreencaptureArguments(
+                windowID: 7001,
+                outputURL: outputURL),
+            ["-x", "-o", "-a", "-l7001", "/tmp/exact-window.png"])
     }
 
     func testBoundedCaptureFileReadAcceptsExactCapAndRejectsOneByteOver() throws {
@@ -357,7 +400,7 @@ final class CaptureCoordinateWindowTests: XCTestCase {
         Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAC0lEQVR4nGNggAIAAAkAAftSuKkAAAAASUVORK5CYII=")!
     }
 
-    private static func request() -> CaptureCoordinateWindowRequestV1 {
+    private static func request(width: Double = 1) -> CaptureCoordinateWindowRequestV1 {
         CaptureCoordinateWindowRequestV1(
             schemaVersion: 1,
             topologyRef: CaptureCoordinateWindowTopologyRefV1(
@@ -365,7 +408,11 @@ final class CaptureCoordinateWindowTests: XCTestCase {
             pid: 4242,
             bundleID: "com.example.fixture",
             windowID: 7001,
-            expectedQuartzBounds: DisplayTopologyRectV1(x: -100, y: 200, width: 1, height: 1))
+            expectedQuartzBounds: DisplayTopologyRectV1(
+                x: -100,
+                y: 200,
+                width: width,
+                height: 1))
     }
 
     private static func window() -> CaptureCoordinateWindowWindowSnapshot {

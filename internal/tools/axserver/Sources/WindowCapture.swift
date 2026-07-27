@@ -175,11 +175,26 @@ func captureWindow(
     let tmpPath = (NSTemporaryDirectory() as NSString)
         .appendingPathComponent("kocoro-capwin-\(UUID().uuidString).png")
     defer { try? FileManager.default.removeItem(atPath: tmpPath) }
-    // -x: silent · -o: omit window shadow · -l<id>: capture that window's content
+    // Exact annotation captures must exclude attached surfaces because their
+    // union no longer shares the selected window's coordinate frame. Legacy
+    // best-window captures retain their historical, presentation-oriented
+    // behavior.
+    let captureArguments: [String]
+    if windowID != nil {
+        guard let exactWindowID = UInt32(exactly: chosen.id) else {
+            return .failure("window_not_found")
+        }
+        captureArguments = coordinateWindowScreencaptureArguments(
+            windowID: exactWindowID,
+            outputURL: URL(fileURLWithPath: tmpPath))
+    } else {
+        // -x: silent · -o: omit window shadow · -l<id>: capture that window's content
+        captureArguments = ["-x", "-o", "-l\(chosen.id)", tmpPath]
+    }
     do {
         try runCoordinateWindowCaptureProcess(
             executableURL: URL(fileURLWithPath: "/usr/sbin/screencapture"),
-            arguments: ["-x", "-o", "-l\(chosen.id)", tmpPath],
+            arguments: captureArguments,
             timeout: 8)
     } catch {
         return .failure("window_not_found")

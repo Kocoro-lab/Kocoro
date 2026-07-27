@@ -274,6 +274,7 @@ func TestOpenAIComputerActionRuntimeBindsPostKeypressObservationForOneType(
 	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
 	harness.tree.Elements = nil
 	harness.tree.RefPaths = map[string]computerUseRefPath{}
+	harness.tree.FocusedRef = nil
 	harness.observe(t)
 
 	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
@@ -323,14 +324,20 @@ func TestOpenAIComputerActionRuntimeBindsPostKeypressObservationForOneType(
 		t.Fatalf("post-keypress type result=%+v err=%v", typed, err)
 	}
 
-	if _, err := runtime.PlanOpenAIComputerActionV1(
+	if harness.tool.coordinateFocus != nil {
+		t.Fatal("post-keypress one-shot coordinate target was reusable")
+	}
+	secondPlan, err := runtime.PlanOpenAIComputerActionV1(
 		context.Background(),
 		OpenAIComputerActionV1{
 			Type: OpenAIComputerActionTypeTextV1,
 			Text: "must not reuse",
 		},
-	); err == nil {
-		t.Fatal("post-keypress keyboard target was reusable")
+	)
+	if err == nil || secondPlan.Args != "" ||
+		!strings.Contains(err.Error(), "type target is unavailable") {
+		t.Fatalf("one-shot window focus was reusable: plan=%+v err=%v",
+			secondPlan, err)
 	}
 }
 

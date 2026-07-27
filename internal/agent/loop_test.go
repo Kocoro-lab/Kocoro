@@ -1714,6 +1714,75 @@ func TestAgentLoop_TerminalComputerUseFailureBlocksBrowserFallbackInTurn(
 	}
 }
 
+func TestAgentLoop_OneGoalComputerUseCallOwnsDesktopForTurn(t *testing.T) {
+	computerUse := &mockCountingTool{
+		name:    "computer_use",
+		content: "computer_use_result: unverified\naction_effect: committed",
+	}
+
+	var thirdRequest client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"complete the desktop goal"}`), 10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"retry the desktop goal"}`), 10, 5))
+		case 3:
+			thirdRequest = req
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The desktop result remains unverified, so I stopped.",
+				"end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+
+	result, _, err := loop.Run(
+		context.Background(),
+		"Complete one desktop task",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("result = %q", result)
+	}
+	if computerUse.runs != 1 {
+		t.Fatalf("computer_use executed %d times, want once", computerUse.runs)
+	}
+	encoded, err := json.Marshal(thirdRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript := string(encoded); !strings.Contains(
+		transcript,
+		"alternate_desktop_control_blocked",
+	) {
+		t.Fatalf("second goal-level call was not blocked: %s", transcript)
+	}
+}
+
 // mockErrorTool always returns an error.
 type mockErrorTool struct {
 	name string

@@ -2731,7 +2731,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		openAIContinuationRequest    *client.CompletionRequest
 		openAIContinuationScreenshot *client.ContentBlock
 		openAIComputerErrorBatches   int // total failed-but-continuable batches this Run; see maxOpenAIComputerErrorBatches
-		computerUseTerminalFailure   bool
+		computerUseOwnsTurn          bool
 		afterCheckpoint              bool
 		checkpointDone               bool
 		nudges                       = newNudgeWindow(maxNudges, nudgeWindowIters)
@@ -4689,12 +4689,12 @@ iterationLoop:
 			}
 			seenCalls[dedupKey] = true
 
-			blockedByPriorComputerUseFailure := computerUseTerminalFailure &&
+			blockedByPriorComputerUse := computerUseOwnsTurn &&
 				isAlternateDesktopControlCall(fc.Name, argsStr)
 			blockedBesideComputerUse := computerUseOwnsGUIResponse &&
 				fc.Name != "computer_use" &&
 				isAlternateDesktopControlCall(fc.Name, argsStr)
-			if blockedByPriorComputerUseFailure || blockedBesideComputerUse {
+			if blockedByPriorComputerUse || blockedBesideComputerUse {
 				blocked := alternateDesktopControlBlockedResult()
 				a.logAudit(fc.Name, argsStr, blocked.Content, "deny", false, 0, nil)
 				callMeta[idx].resolved = true
@@ -4703,6 +4703,12 @@ iterationLoop:
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, blocked, 0)
 				}
 				continue
+			}
+			if fc.Name == "computer_use" {
+				// One goal-level call owns desktop control for the complete
+				// parent turn. Recovery, re-observation, and verification belong
+				// inside its private executor, not in a second outer task.
+				computerUseOwnsTurn = true
 			}
 
 			// Denied-call blocking: auto-reject if this exact call was denied earlier
@@ -5049,10 +5055,6 @@ iterationLoop:
 			er := execResults[idx]
 			result := er.result
 			elapsed := er.elapsed
-			if isTerminalGoalComputerUseFailure(fc.Name, result) {
-				computerUseTerminalFailure = true
-			}
-
 			if callMeta[idx].resolved {
 				// Already resolved in Phase 1 (denied/unknown/hook-denied).
 				// Just record in context — audit and handler events were already fired.

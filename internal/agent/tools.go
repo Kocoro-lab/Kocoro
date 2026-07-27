@@ -76,7 +76,14 @@ type ToolResult struct {
 	// GUIOutcome is a daemon-internal, redacted execution acknowledgement. It
 	// is consumed by the computer-use control wrapper and is never serialized
 	// into provider-visible tool results.
-	GUIOutcome *GUIActionOutcome
+	GUIOutcome *GUIActionOutcome `json:"-"`
+	// ComputerUseOutcome is the goal-level counterpart to GUIOutcome. It keeps
+	// completed/not-completed/unverified and the accumulated action effect
+	// available to local orchestration without serializing it to providers.
+	ComputerUseOutcome *ComputerUseTaskOutcome `json:"-"`
+	// GUICaptureDiagnostics carries redacted exact-window capture geometry only
+	// inside the daemon. It is never serialized into provider-visible results.
+	GUICaptureDiagnostics *GUICaptureDiagnostics `json:"-"`
 	// Usage optionally reports per-call cost for this tool. Gateway tools
 	// whose server returns billing info (x_search → xAI tokens, web_search
 	// → SerpAPI query count) populate this so the audit logger can write a

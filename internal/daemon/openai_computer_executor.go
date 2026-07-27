@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -38,9 +39,10 @@ type daemonOpenAIComputerPrivateRuntimeV1 struct {
 // while daemonGUIWorkflow retains the single turn lease across Responses
 // continuations.
 type daemonOpenAIComputerBatchRunnerV1 struct {
-	workflow *daemonGUIWorkflow
-	runtime  openAIComputerActionRuntimeV1
-	trace    *openAIComputerTraceV1
+	workflow         *daemonGUIWorkflow
+	runtime          openAIComputerActionRuntimeV1
+	trace            *openAIComputerTraceV1
+	observationRetry func(context.Context, int) error
 
 	statsMu       sync.Mutex
 	stats         openAIComputerBatchStatsV1
@@ -52,8 +54,14 @@ type daemonOpenAIComputerBatchRunnerV1 struct {
 // private model can make that judgment from the latest screenshot, and it
 // reports the judgment through openAIComputerTaskOutcomeV1.
 type openAIComputerBatchStatsV1 struct {
-	Batches           int
-	LastFailureDetail string
+	Batches                         int
+	LastFailureDetail               string
+	LastFailureCode                 string
+	LastGUIResult                   agent.GUIActionResult
+	LastFinalObservationUnavailable bool
+	TaskEffect                      agent.ComputerUseCommitEffect
+	LastBatchEffect                 agent.ComputerUseCommitEffect
+	LastBatchHadFreshObservation    bool
 }
 
 func (r *daemonOpenAIComputerBatchRunnerV1) recordBatchV1(
@@ -63,6 +71,30 @@ func (r *daemonOpenAIComputerBatchRunnerV1) recordBatchV1(
 	r.statsMu.Lock()
 	defer r.statsMu.Unlock()
 	r.stats.Batches++
+	r.stats.LastFailureCode =
+		openAIComputerTraceFailureCodeV1(execution.Result, err)
+	r.stats.LastGUIResult = ""
+	if execution.Result.GUIOutcome != nil {
+		r.stats.LastGUIResult = execution.Result.GUIOutcome.Result
+	}
+	r.stats.LastFinalObservationUnavailable = false
+	batchEffect := execution.ActionEffect
+	if batchEffect == "" {
+		batchEffect = agent.ComputerUseCommitNone
+	}
+	r.stats.LastBatchEffect = batchEffect
+	r.stats.TaskEffect = agent.MergeComputerUseCommitEffect(
+		r.stats.TaskEffect,
+		batchEffect,
+	)
+	r.stats.LastBatchHadFreshObservation =
+		execution.ContinuationAllowed &&
+			len(execution.Result.Images) == 1
+	if execution.Result.GUIOutcome != nil &&
+		execution.Result.GUIOutcome.FailureCode ==
+			"final_observation_unavailable" {
+		r.stats.LastFinalObservationUnavailable = true
+	}
 	if err == nil && !execution.Result.IsError {
 		return
 	}
@@ -245,14 +277,18 @@ func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 	}
 	executor.trace = r.trace
 	executor.batchIndex = batchIndex
+	executor.observationRetry = r.observationRetry
 	defer executor.EndBatchV1()
 
 	result, executeErr := tools.NewOpenAIComputerAdapterV1(executor).
 		ExecuteBatchV1(ctx, payload)
 	return agent.OpenAIComputerBatchExecution{
-		CallID:              result.CallID,
-		ContinuationAllowed: executeErr == nil && len(result.ToolResult.Images) == 1,
-		Result:              result.ToolResult,
+		CallID: result.CallID,
+		ContinuationAllowed: executeErr == nil &&
+			len(result.ToolResult.Images) == 1 &&
+			result.ActionEffect != agent.ComputerUseCommitUnknown,
+		ActionEffect: result.ActionEffect,
+		Result:       result.ToolResult,
 	}, executeErr
 }
 
@@ -267,11 +303,12 @@ type daemonOpenAIComputerExecutorV1 struct {
 	operationMu sync.Mutex
 	mu          sync.Mutex
 
-	workflow   *daemonGUIWorkflow
-	runtime    openAIComputerActionRuntimeV1
-	provenance tools.OpenAIComputerExecutionProvenanceV1
-	trace      *openAIComputerTraceV1
-	batchIndex int
+	workflow         *daemonGUIWorkflow
+	runtime          openAIComputerActionRuntimeV1
+	provenance       tools.OpenAIComputerExecutionProvenanceV1
+	trace            *openAIComputerTraceV1
+	batchIndex       int
+	observationRetry func(context.Context, int) error
 
 	authority       tools.OpenAIComputerBatchAuthorityV1
 	call            *tools.OpenAIComputerCallV1
@@ -399,7 +436,7 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 		batchIndex = e.batchIndex
 	}
 	defer func() {
-		trace.record(openAIComputerTraceEventV1{
+		trace.record(openAIComputerTraceWithCaptureDiagnosticsV1(openAIComputerTraceEventV1{
 			Phase:       "action",
 			Status:      openAIComputerTraceStatusV1(execution.Result, err),
 			BatchIndex:  batchIndex,
@@ -412,7 +449,7 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 				err,
 			),
 			DurationMS: time.Since(started).Milliseconds(),
-		})
+		}, execution.Result))
 	}()
 	if e == nil {
 		return tools.OpenAIComputerActionExecutionV1{
@@ -550,26 +587,26 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 	started := time.Now()
 	var trace *openAIComputerTraceV1
 	batchIndex := 0
+	attemptRecorded := false
 	if e != nil {
 		trace = e.trace
 		batchIndex = e.batchIndex
 	}
 	defer func() {
-		status := openAIComputerTraceStatusV1(result, err)
-		failureCode := openAIComputerTraceFailureCodeV1(result, err)
-		if err == nil && !result.IsError && len(result.Images) != 1 {
-			status = "failed"
-			if failureCode == "" {
-				failureCode = "final_image_unavailable"
-			}
+		if attemptRecorded {
+			return
 		}
-		trace.record(openAIComputerTraceEventV1{
+		failureCode := openAIComputerTraceFailureCodeV1(result, err)
+		if failureCode == "" && err != nil {
+			failureCode = "executor_error"
+		}
+		trace.record(openAIComputerTraceWithCaptureDiagnosticsV1(openAIComputerTraceEventV1{
 			Phase:       "final_observation",
-			Status:      status,
+			Status:      openAIComputerTraceStatusV1(result, err),
 			BatchIndex:  batchIndex,
 			FailureCode: failureCode,
 			DurationMS:  time.Since(started).Milliseconds(),
-		})
+		}, result))
 	}()
 	if e == nil {
 		return agent.ToolResult{},
@@ -580,30 +617,109 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 	if err := e.validateFinalBoundary(authority, call); err != nil {
 		return agent.ToolResult{}, err
 	}
-	if err := ctx.Err(); err != nil {
-		return agent.ToolResult{}, fmt.Errorf("OpenAI computer final observation cancelled")
-	}
-	plan, err := e.runtime.PlanOpenAIComputerObservationV1(
-		"Capture final OpenAI native computer screenshot",
-		true,
+
+	result, err = runOpenAIComputerObservationV1(
+		ctx,
+		maxOpenAIComputerFinalObservationsV1,
+		e.observationRetry,
+		func(
+			attemptCtx context.Context,
+			attempt int,
+		) (agent.ToolResult, error) {
+			plan, planErr := e.runtime.PlanOpenAIComputerObservationV1(
+				"Capture final OpenAI native computer screenshot",
+				true,
+			)
+			if planErr != nil {
+				return agent.ToolResult{},
+					fmt.Errorf(
+						"OpenAI computer final observation could not be safely projected",
+					)
+			}
+			nativeActionCtx :=
+				tools.ContextWithOpenAINativeComputerActionV1(attemptCtx)
+			return e.runPlanV1(
+				nativeActionCtx,
+				plan,
+				fmt.Sprintf(
+					"%s/final-observation/%d",
+					call.CallID,
+					attempt,
+				),
+			)
+		},
+		func(
+			attempt int,
+			attemptResult agent.ToolResult,
+			attemptErr error,
+			duration time.Duration,
+		) {
+			attemptRecorded = true
+			status := openAIComputerTraceStatusV1(attemptResult, attemptErr)
+			failureCode := openAIComputerTraceFailureCodeV1(
+				attemptResult,
+				attemptErr,
+			)
+			if attemptErr == nil && !attemptResult.IsError &&
+				len(attemptResult.Images) != 1 {
+				status = "failed"
+				if failureCode == "" {
+					failureCode = "final_image_unavailable"
+				}
+			}
+			trace.record(openAIComputerTraceWithCaptureDiagnosticsV1(openAIComputerTraceEventV1{
+				Phase:       "final_observation",
+				Status:      status,
+				Attempt:     attempt,
+				BatchIndex:  batchIndex,
+				FailureCode: failureCode,
+				DurationMS:  duration.Milliseconds(),
+			}, attemptResult))
+		},
 	)
+	if err == nil && !result.IsError && len(result.Images) == 1 {
+		result.GUIOutcome = nil
+		return result, nil
+	}
+
+	detail := ""
 	if err != nil {
-		return agent.ToolResult{},
-			fmt.Errorf("OpenAI computer final observation could not be safely projected")
+		detail = boundOpenAIComputerObservationDetailV1(err.Error())
+	} else {
+		detail = openAIComputerObservationResultDetailV1(result)
 	}
-	nativeActionCtx := tools.ContextWithOpenAINativeComputerActionV1(ctx)
-	var runErr error
-	result, runErr = e.runPlanV1(
-		nativeActionCtx,
-		plan,
-		call.CallID+"/final-observation",
+	if detail == "" {
+		detail = "the desktop observation completed without a verified image"
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		ctx.Err() != nil {
+		failure := agent.BusinessError(
+			"computer_use_error: cancelled\n" +
+				"message: the final desktop observation was cancelled\n" +
+				"detail: " + detail,
+		)
+		failure.GUIOutcome = &agent.GUIActionOutcome{
+			Result:      agent.GUIActionResultCancelled,
+			Phase:       agent.GUIActionPhaseObserving,
+			FailureCode: "cancelled",
+		}
+		return failure, err
+	}
+	failure := agent.BusinessError(
+		"computer_use_error: final_observation_unavailable\n" +
+			"message: the action batch ended, but no fresh final screenshot could be captured\n" +
+			"detail: " + detail,
 	)
-	if runErr != nil || result.IsError || len(result.Images) != 1 {
-		return agent.ToolResult{},
-			fmt.Errorf("OpenAI computer final exact screenshot is unavailable")
+	failure.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseObserving,
+		FailureCode: "final_observation_unavailable",
 	}
-	result.GUIOutcome = nil
-	return result, nil
+	return failure, fmt.Errorf(
+		"OpenAI computer final exact screenshot is unavailable: %s",
+		detail,
+	)
 }
 
 func (e *daemonOpenAIComputerExecutorV1) runPlanV1(
@@ -696,6 +812,13 @@ func openAIComputerCommitStateV1(
 	case agent.GUIActionResultVerified:
 		return tools.OpenAIComputerCommitVerifiedV1
 	case agent.GUIActionResultCompletedUnverified:
+		switch result.GUIOutcome.FailureCode {
+		case "commit_unknown",
+			"commit_status_unknown",
+			"action_commit_unknown",
+			"invalid_helper_result":
+			return tools.OpenAIComputerCommitUnknownV1
+		}
 		return tools.OpenAIComputerCommitUnverifiedV1
 	case agent.GUIActionResultUserInterference, agent.GUIActionResultCancelled:
 		return tools.OpenAIComputerCommitUnknownV1

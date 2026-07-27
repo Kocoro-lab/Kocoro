@@ -162,18 +162,15 @@ func (t *ComputerUseTool) PreflightConsequentialRiskV1(
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return ConsequentialRiskPreflightResultV1{}, err
 	}
-	if args.Action == "hotkey" && computerUseHotkeyRequiresDestinationAuthorityV1(args.Keys) {
-		// A raw chord has no trusted element/destination authority. There is
-		// therefore no safe confirmation draft to show: block the path outright.
+	if computerUseKeyboardNeedsExactIntentV1(args) {
+		if t.allowsLocationNavigationCommitV1(args) {
+			return ConsequentialRiskPreflightResultV1{
+				Status: ConsequentialRiskPreflightNoneV1,
+			}, nil
+		}
 		return ConsequentialRiskPreflightResultV1{
-			Status: ConsequentialRiskPreflightBlockedV1, FailureCode: ConsequentialRiskCodeUnsupportedPathV1,
-		}, nil
-	}
-	if args.Action == "keypress" &&
-		computerUseKeypressRequiresDestinationAuthorityV1(args.Modifiers, args.KeySequence) &&
-		!t.allowsLocationNavigationCommitV1(args) {
-		return ConsequentialRiskPreflightResultV1{
-			Status: ConsequentialRiskPreflightBlockedV1, FailureCode: ConsequentialRiskCodeUnsupportedPathV1,
+			Status:      ConsequentialRiskPreflightBlockedV1,
+			FailureCode: ConsequentialRiskCodeUnsupportedPathV1,
 		}, nil
 	}
 	if args.Ref == "" {

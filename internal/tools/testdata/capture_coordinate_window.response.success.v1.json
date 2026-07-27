@@ -3,6 +3,7 @@
   "status": "captured",
   "failure_code": null,
   "retry_safe": false,
+  "failure_diagnostics": null,
   "topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
   "helper_boot_id": "helper_boot_demo",
   "pid": 4242,

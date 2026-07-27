@@ -705,6 +705,7 @@ type OpenAIComputerBatchResultV1 struct {
 	Provider     string
 	APISurface   string
 	ToolContract string
+	ActionEffect agent.ComputerUseCommitEffect
 	ToolResult   agent.ToolResult
 }
 
@@ -790,6 +791,7 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 	result := OpenAIComputerBatchResultV1{
 		CallID: call.CallID, Provider: call.Provider, APISurface: call.APISurface,
 		ToolContract: call.ToolContract,
+		ActionEffect: agent.ComputerUseCommitNone,
 	}
 	if a == nil || a.executor == nil {
 		result.ToolResult = agent.BusinessError(
@@ -808,10 +810,11 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 		return result, nil
 	}
 
-	committed := false
 	for index, action := range call.Actions {
 		if err := ctx.Err(); err != nil {
-			result.ToolResult = openAIComputerCancellationResultV1(committed)
+			result.ToolResult = openAIComputerCancellationResultV1(
+				result.ActionEffect != agent.ComputerUseCommitNone,
+			)
 			return result, nil
 		}
 		scope := OpenAIComputerActionScopeV1{
@@ -826,9 +829,10 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 			scope,
 			action,
 		)
-		if execution.CommitState != OpenAIComputerNotCommittedV1 {
-			committed = true
-		}
+		result.ActionEffect = agent.MergeComputerUseCommitEffect(
+			result.ActionEffect,
+			openAIComputerActionEffectV1(execution.CommitState),
+		)
 		if invalid := validateOpenAIComputerActionExecutionV1(action, execution, executeErr); invalid != "" {
 			failure := agent.BusinessError(
 				fmt.Sprintf(
@@ -843,7 +847,7 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 				authority,
 				call,
 				failure,
-				committed,
+				result.ActionEffect != agent.ComputerUseCommitNone,
 			)
 			return result, nil
 		}
@@ -864,12 +868,14 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 				authority,
 				call,
 				result.ToolResult,
-				committed,
+				result.ActionEffect != agent.ComputerUseCommitNone,
 			)
 			return result, nil
 		}
 		if err := ctx.Err(); err != nil {
-			result.ToolResult = openAIComputerCancellationResultV1(committed)
+			result.ToolResult = openAIComputerCancellationResultV1(
+				result.ActionEffect != agent.ComputerUseCommitNone,
+			)
 			return result, nil
 		}
 	}
@@ -881,10 +887,31 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 	)
 	if invalid := validateOpenAIComputerFinalObservationV1(final, finalErr); invalid != "" {
 		message := "OpenAI computer batch finished, but its required final exact screenshot is unavailable"
-		if committed {
-			message += "; actions may have completed; do not retry automatically"
+		if result.ActionEffect != agent.ComputerUseCommitNone {
+			message += "; one or more actions committed; do not retry automatically"
 		}
-		result.ToolResult = agent.BusinessError(message)
+		failure := agent.BusinessError(message)
+		if detail := strings.TrimSpace(final.Content); detail != "" {
+			failure.Content += "\nfinal observation: " + detail
+		}
+		if final.GUIOutcome != nil &&
+			final.GUIOutcome.FailureCode == "final_observation_unavailable" {
+			outcomeResult := agent.GUIActionResultFailed
+			if result.ActionEffect != agent.ComputerUseCommitNone {
+				outcomeResult = agent.GUIActionResultCompletedUnverified
+			}
+			failure.GUIOutcome = &agent.GUIActionOutcome{
+				Result:      outcomeResult,
+				Phase:       agent.GUIActionPhaseVerifying,
+				FailureCode: "final_observation_unavailable",
+			}
+		} else if final.GUIOutcome != nil &&
+			(final.GUIOutcome.Result == agent.GUIActionResultCancelled ||
+				final.GUIOutcome.Result == agent.GUIActionResultUserInterference) {
+			outcome := *final.GUIOutcome
+			failure.GUIOutcome = &outcome
+		}
+		result.ToolResult = failure
 		return result, nil
 	}
 	final.Content = fmt.Sprintf(
@@ -894,6 +921,19 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 	final.GUIOutcome = nil
 	result.ToolResult = final
 	return result, nil
+}
+
+func openAIComputerActionEffectV1(
+	state OpenAIComputerCommitStateV1,
+) agent.ComputerUseCommitEffect {
+	switch state {
+	case OpenAIComputerCommitVerifiedV1, OpenAIComputerCommitUnverifiedV1:
+		return agent.ComputerUseCommitKnown
+	case OpenAIComputerCommitUnknownV1:
+		return agent.ComputerUseCommitUnknown
+	default:
+		return agent.ComputerUseCommitNone
+	}
 }
 
 func openAIComputerActionCanContinueV1(
@@ -1000,7 +1040,12 @@ func openAIComputerActionFailureV1(
 	} else if execution.Result.Content != "" {
 		message += ": " + execution.Result.Content
 	}
-	return agent.BusinessError(message)
+	failure := agent.BusinessError(message)
+	if execution.Result.GUIOutcome != nil {
+		outcome := *execution.Result.GUIOutcome
+		failure.GUIOutcome = &outcome
+	}
+	return failure
 }
 
 func openAIComputerCancellationResultV1(committed bool) agent.ToolResult {
@@ -1029,6 +1074,9 @@ func (a *OpenAIComputerAdapterV1) attachOpenAIComputerFinalObservationV1(
 	if validateOpenAIComputerFinalObservationV1(final, err) == "" {
 		failure.Images = append([]agent.ImageBlock(nil), final.Images...)
 		return failure
+	}
+	if detail := strings.TrimSpace(final.Content); detail != "" {
+		failure.Content += "; final observation: " + detail
 	}
 	if committed && !strings.Contains(failure.Content, "do not retry automatically") {
 		failure.Content += "; actions may have completed and no final screenshot is available; do not retry automatically"

@@ -8,10 +8,9 @@ import (
 	"unicode/utf8"
 )
 
-// parseComputerUseHotkeyV1 is the single raw chord parser used by both the
-// local execution path and the consequential-risk preflight. It deliberately
-// preserves the existing lower-case key/modifier spelling passed to the helper;
-// aliases are canonicalized only for policy classification below.
+// parseComputerUseHotkeyV1 is the single raw chord parser used by the local
+// target-bound execution path. It deliberately preserves lower-case
+// key/modifier spelling until aliases are canonicalized for the helper wire.
 func parseComputerUseHotkeyV1(raw string) (key string, modifiers []string, ok bool) {
 	parts := strings.Split(strings.ToLower(raw), "+")
 	key = strings.TrimSpace(parts[len(parts)-1])
@@ -46,28 +45,26 @@ func canonicalComputerUseHotkeyTokenV1(token string) string {
 	}
 }
 
-// computerUseHotkeyRequiresDestinationAuthorityV1 classifies raw global
-// keyboard chords whose effect cannot be made safe by window authority alone.
-// The decision is pure and structural: model-authored description/prose and AX
-// labels are never inputs. These chords require a trusted element/destination
-// authority that the raw hotkey path cannot currently provide, so callers must
-// fail closed rather than asking the user to confirm an unbound destination.
-func computerUseHotkeyRequiresDestinationAuthorityV1(raw string) bool {
-	key, modifiers, ok := parseComputerUseHotkeyV1(raw)
-	if !ok {
+// computerUseKeyboardNeedsExactIntentV1 covers only destination-free keyboard
+// actions that can activate or destructively mutate the focused UI. Ordinary
+// editing/navigation shortcuts remain window-bound; high-risk activation must
+// instead carry executor-authored intent.
+func computerUseKeyboardNeedsExactIntentV1(args computerUseArgs) bool {
+	var keySequence []string
+	modifiers := args.Modifiers
+	switch args.Action {
+	case "hotkey":
+		key, parsedModifiers, ok := parseComputerUseHotkeyV1(args.Keys)
+		if !ok {
+			return false
+		}
+		keySequence = []string{key}
+		modifiers = parsedModifiers
+	case "keypress":
+		keySequence = args.KeySequence
+	default:
 		return false
 	}
-	return computerUseKeypressRequiresDestinationAuthorityV1(modifiers, []string{key})
-}
-
-// computerUseKeypressRequiresDestinationAuthorityV1 applies the same
-// fail-closed policy as raw hotkeys to OpenAI's ordered key sequence. Modifier
-// keys are held for the complete sequence, so every non-modifier key must be
-// classified against the same chord authority.
-func computerUseKeypressRequiresDestinationAuthorityV1(
-	modifiers []string,
-	keySequence []string,
-) bool {
 	modifierSet := make(map[string]struct{}, len(modifiers))
 	for _, modifier := range modifiers {
 		modifierSet[canonicalComputerUseHotkeyTokenV1(modifier)] = struct{}{}
@@ -76,27 +73,25 @@ func computerUseKeypressRequiresDestinationAuthorityV1(
 		_, exists := modifierSet[modifier]
 		return exists
 	}
-
 	for _, rawKey := range keySequence {
-		key := canonicalComputerUseHotkeyTokenV1(rawKey)
-		switch key {
-		case "return", "enter", "space":
-			return true
-		}
-		if has("command") {
-			switch key {
-			case "s", "p", "w", "q", "delete", "backspace":
+		switch canonicalComputerUseHotkeyTokenV1(rawKey) {
+		case "return", "enter":
+			// Plain Return activates the current control in many apps, while
+			// Command/Control-Return is also a common send/publish shortcut.
+			// Shift/Option-Return remains an ordinary editing chord.
+			if len(modifierSet) == 0 || has("command") || has("control") {
 				return true
 			}
-		}
-		if has("shift") && (key == "delete" || key == "backspace") {
-			return true
-		}
-		if has("command") && has("option") && key == "escape" {
-			return true
-		}
-		if has("command") && has("control") && key == "q" {
-			return true
+		case "space":
+			// Only plain Space is an activation key. Command-Space and other
+			// modified variants are ordinary system/app navigation chords.
+			if len(modifierSet) == 0 {
+				return true
+			}
+		case "delete", "backspace":
+			if has("shift") || has("command") {
+				return true
+			}
 		}
 	}
 	return false
@@ -118,20 +113,62 @@ func computerUseLocationNavigationTextV1(text string) bool {
 		return false
 	}
 	host := parsed.Hostname()
-	if host == "" {
-		return false
-	}
 	return host == "localhost" ||
 		net.ParseIP(host) != nil ||
 		strings.Contains(host, ".")
 }
 
 func computerUsePlainReturnKeypressV1(args computerUseArgs) bool {
-	if len(args.Modifiers) != 0 || len(args.KeySequence) != 1 {
+	if args.Action != "keypress" ||
+		len(args.Modifiers) != 0 ||
+		len(args.KeySequence) != 1 {
 		return false
 	}
 	key := canonicalComputerUseHotkeyTokenV1(args.KeySequence[0])
 	return key == "return" || key == "enter"
+}
+
+func openAIComputerLocationFocusShortcutV1(
+	action OpenAIComputerActionV1,
+) bool {
+	if action.Type != OpenAIComputerActionKeypressV1 {
+		return false
+	}
+	modifiers, keys, err := openAIComputerKeySequenceV1(action.Keys)
+	if err != nil || len(modifiers) != 1 || len(keys) != 1 {
+		return false
+	}
+	return canonicalComputerUseHotkeyTokenV1(modifiers[0]) == "command" &&
+		canonicalComputerUseHotkeyTokenV1(keys[0]) == "l"
+}
+
+func computerUseLocationFieldEvidenceV1(
+	element computerUseElement,
+) bool {
+	switch element.Role {
+	case "AXTextField", "AXComboBox":
+	default:
+		return false
+	}
+	for _, value := range []*string{
+		element.Title,
+		element.Description,
+		element.Desc,
+		element.Identifier,
+	} {
+		if value == nil {
+			continue
+		}
+		label := strings.ToLower(strings.TrimSpace(*value))
+		for _, marker := range []string{
+			"address", "location", "url", "website", "web address",
+		} {
+			if strings.Contains(label, marker) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (t *ComputerUseTool) allowsLocationNavigationCommitV1(
@@ -146,12 +183,4 @@ func (t *ComputerUseTool) allowsLocationNavigationCommitV1(
 		t.snapshot.windowID != nil &&
 		*t.snapshot.windowID > 0 &&
 		uint64(*t.snapshot.windowID) == uint64(commit.windowID)
-}
-
-func (t *ComputerUseTool) consumeLocationNavigationCommitV1(
-	args computerUseArgs,
-) bool {
-	allowed := t.allowsLocationNavigationCommitV1(args)
-	t.navigationCommit = nil
-	return allowed
 }

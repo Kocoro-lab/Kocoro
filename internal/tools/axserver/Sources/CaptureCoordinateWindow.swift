@@ -84,6 +84,39 @@ struct CaptureCoordinateWindowWindowSnapshot: Equatable {
     let bounds: DisplayTopologyRectV1
 }
 
+struct CaptureCoordinateWindowFailureDiagnosticsV1: Encodable, Equatable {
+    let stage: String
+    let pid: Int
+    let bundleID: String
+    let windowID: UInt32
+    let preWindowQuartzBounds: DisplayTopologyRectV1
+    let postWindowQuartzBounds: DisplayTopologyRectV1
+    let displayID: UInt32
+    let backingScaleFactor: Double
+    let expectedWidthPX: Double
+    let expectedHeightPX: Double
+    let metadataWidthPX: Int?
+    let metadataHeightPX: Int?
+    let decodedWidthPX: Int?
+    let decodedHeightPX: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case stage, pid
+        case bundleID = "bundle_id"
+        case windowID = "window_id"
+        case preWindowQuartzBounds = "pre_window_quartz_bounds"
+        case postWindowQuartzBounds = "post_window_quartz_bounds"
+        case displayID = "display_id"
+        case backingScaleFactor = "backing_scale_factor"
+        case expectedWidthPX = "expected_width_px"
+        case expectedHeightPX = "expected_height_px"
+        case metadataWidthPX = "metadata_width_px"
+        case metadataHeightPX = "metadata_height_px"
+        case decodedWidthPX = "decoded_width_px"
+        case decodedHeightPX = "decoded_height_px"
+    }
+}
+
 enum CaptureCoordinateWindowLiveError: Error, Equatable {
     case invalidRequest
     case timeout
@@ -106,6 +139,7 @@ struct CaptureCoordinateWindowResultV1: Encodable {
     let status: String
     let failureCode: String?
     let retrySafe: Bool
+    let failureDiagnostics: CaptureCoordinateWindowFailureDiagnosticsV1?
     let topologyRef: CaptureCoordinateWindowTopologyRefV1?
     let helperBootID: String?
     let pid: Int?
@@ -127,6 +161,7 @@ struct CaptureCoordinateWindowResultV1: Encodable {
         case schemaVersion = "schema_version"
         case failureCode = "failure_code"
         case retrySafe = "retry_safe"
+        case failureDiagnostics = "failure_diagnostics"
         case topologyRef = "topology_ref"
         case helperBootID = "helper_boot_id"
         case bundleID = "bundle_id"
@@ -162,6 +197,7 @@ struct CaptureCoordinateWindowResultV1: Encodable {
             status: "captured",
             failureCode: nil,
             retrySafe: false,
+            failureDiagnostics: nil,
             topologyRef: topologyRef,
             helperBootID: helperBootID,
             pid: pid,
@@ -179,12 +215,17 @@ struct CaptureCoordinateWindowResultV1: Encodable {
             capturedAt: capturedAt)
     }
 
-    static func failed(code: String, retrySafe: Bool) -> Self {
+    static func failed(
+        code: String,
+        retrySafe: Bool,
+        diagnostics: CaptureCoordinateWindowFailureDiagnosticsV1? = nil
+    ) -> Self {
         Self(
             schemaVersion: 1,
             status: "failed",
             failureCode: code,
             retrySafe: retrySafe,
+            failureDiagnostics: diagnostics,
             topologyRef: nil,
             helperBootID: nil,
             pid: nil,
@@ -208,6 +249,7 @@ struct CaptureCoordinateWindowResultV1: Encodable {
         try container.encode(status, forKey: .status)
         try encodeNullable(failureCode, into: &container, key: .failureCode)
         try container.encode(retrySafe, forKey: .retrySafe)
+        try encodeNullable(failureDiagnostics, into: &container, key: .failureDiagnostics)
         try encodeNullable(topologyRef, into: &container, key: .topologyRef)
         try encodeNullable(helperBootID, into: &container, key: .helperBootID)
         try encodeNullable(pid, into: &container, key: .pid)
@@ -362,7 +404,24 @@ func captureCoordinateWindow(
     guard expectedWidth.isFinite, expectedHeight.isFinite,
           abs(expectedWidth.rounded() - expectedWidth) <= 0.000_001,
           abs(expectedHeight.rounded() - expectedHeight) <= 0.000_001 else {
-        return .failed(code: "image_dimensions_mismatch", retrySafe: false)
+        return .failed(
+            code: "image_dimensions_mismatch",
+            retrySafe: true,
+            diagnostics: CaptureCoordinateWindowFailureDiagnosticsV1(
+                stage: "non_integral_expected_dimensions",
+                pid: request.pid,
+                bundleID: request.bundleID,
+                windowID: request.windowID,
+                preWindowQuartzBounds: preWindow.bounds,
+                postWindowQuartzBounds: postWindow.bounds,
+                displayID: display.displayID,
+                backingScaleFactor: display.backingScaleFactor,
+                expectedWidthPX: expectedWidth,
+                expectedHeightPX: expectedHeight,
+                metadataWidthPX: nil,
+                metadataHeightPX: nil,
+                decodedWidthPX: nil,
+                decodedHeightPX: nil))
     }
     let dimensions: (width: Int, height: Int)
     switch decodeCoordinateWindowPNG(
@@ -371,8 +430,25 @@ func captureCoordinateWindow(
         expectedHeight: Int(expectedHeight.rounded())) {
     case let .valid(width, height):
         dimensions = (width, height)
-    case .dimensionMismatch:
-        return .failed(code: "image_dimensions_mismatch", retrySafe: false)
+    case let .dimensionMismatch(metadataWidth, metadataHeight, decodedWidth, decodedHeight):
+        return .failed(
+            code: "image_dimensions_mismatch",
+            retrySafe: true,
+            diagnostics: CaptureCoordinateWindowFailureDiagnosticsV1(
+                stage: "decoded_dimensions",
+                pid: request.pid,
+                bundleID: request.bundleID,
+                windowID: request.windowID,
+                preWindowQuartzBounds: preWindow.bounds,
+                postWindowQuartzBounds: postWindow.bounds,
+                displayID: display.displayID,
+                backingScaleFactor: display.backingScaleFactor,
+                expectedWidthPX: expectedWidth,
+                expectedHeightPX: expectedHeight,
+                metadataWidthPX: metadataWidth,
+                metadataHeightPX: metadataHeight,
+                decodedWidthPX: decodedWidth,
+                decodedHeightPX: decodedHeight))
     case .invalid:
         return .failed(code: "invalid_png", retrySafe: false)
     }
@@ -429,7 +505,12 @@ private func coordinateWindowRect(
 
 enum CoordinateWindowPNGDecodeResult {
     case valid(width: Int, height: Int)
-    case dimensionMismatch
+    case dimensionMismatch(
+        metadataWidth: Int,
+        metadataHeight: Int,
+        decodedWidth: Int,
+        decodedHeight: Int
+    )
     case invalid
 }
 
@@ -453,7 +534,11 @@ func decodeCoordinateWindowPNG(
           height.intValue == expectedHeight,
           image.width == expectedWidth,
           image.height == expectedHeight else {
-        return .dimensionMismatch
+        return .dimensionMismatch(
+            metadataWidth: width.intValue,
+            metadataHeight: height.intValue,
+            decodedWidth: image.width,
+            decodedHeight: image.height)
     }
     var decodedPixel = [UInt8](repeating: 0, count: 4)
     guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
@@ -565,10 +650,25 @@ func runCoordinateWindowScreencapture(
     try withCoordinateWindowTemporaryFile { outputURL in
         try runCoordinateWindowCaptureProcess(
             executableURL: URL(fileURLWithPath: "/usr/sbin/screencapture"),
-            arguments: ["-x", "-o", "-l\(windowID)", outputURL.path],
+            arguments: coordinateWindowScreencaptureArguments(
+                windowID: windowID,
+                outputURL: outputURL),
             timeout: timeout)
         return try readCoordinateWindowCaptureFile(outputURL, rawByteCap: rawByteCap)
     }
+}
+
+/// The strict coordinate frame is the selected CGWindow's own bounds. Without
+/// `-a`, screencapture expands the PNG to the union of that window and any
+/// attached sheet/popover, while CGWindowList still reports only the selected
+/// window's bounds. That produces a real, persistent dimensions mismatch and
+/// would make image coordinates ambiguous. An attached sheet that is itself
+/// the frontmost actionable layer-0 window is selected by its own window ID.
+func coordinateWindowScreencaptureArguments(
+    windowID: UInt32,
+    outputURL: URL
+) -> [String] {
+    ["-x", "-o", "-a", "-l\(windowID)", outputURL.path]
 }
 
 func withCoordinateWindowTemporaryFile<T>(

@@ -24,11 +24,93 @@ import (
 
 const openAIComputerDaemonContinuationToken = "shct_pOIBMOn2gmZdU7TJZm93xdhEM1SNRTRle-n9A0mz76g"
 
+func TestOpenAIComputerTaskOutcomeSeparatesNotCompletedFromUnverified(
+	t *testing.T,
+) {
+	for _, status := range []string{"completed", "not_completed", "unverified"} {
+		outcome, err := parseOpenAIComputerTaskOutcomeV1(
+			`{"status":"` + status + `","summary":"fixture"}`,
+		)
+		if err != nil || outcome.Status != status {
+			t.Fatalf("status %q outcome=%+v err=%v", status, outcome, err)
+		}
+	}
+	if _, err := parseOpenAIComputerTaskOutcomeV1(
+		`{"status":"failed","summary":"ambiguous legacy result"}`,
+	); err == nil {
+		t.Fatal("legacy failed status still conflates a verified negative with unverified")
+	}
+}
+
+func TestOpenAIComputerCommitStatePreservesUnknownAcknowledgements(t *testing.T) {
+	for _, code := range []string{
+		"commit_unknown",
+		"commit_status_unknown",
+		"action_commit_unknown",
+		"invalid_helper_result",
+	} {
+		t.Run(code, func(t *testing.T) {
+			result := agent.ToolResult{
+				IsError: true,
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseInputCommitted,
+					FailureCode: code,
+				},
+			}
+			if got := openAIComputerCommitStateV1(result, nil); got != tools.OpenAIComputerCommitUnknownV1 {
+				t.Fatalf("commit state = %q", got)
+			}
+		})
+	}
+}
+
+func TestOpenAIComputerBatchStatsAccumulateTaskEffectMonotonically(t *testing.T) {
+	runner := &daemonOpenAIComputerBatchRunnerV1{}
+	runner.recordBatchV1(agent.OpenAIComputerBatchExecution{
+		ActionEffect: agent.ComputerUseCommitKnown,
+	}, nil)
+	runner.recordBatchV1(agent.OpenAIComputerBatchExecution{
+		ActionEffect: agent.ComputerUseCommitNone,
+	}, nil)
+	stats := runner.BatchStatsV1()
+	if stats.TaskEffect != agent.ComputerUseCommitKnown ||
+		stats.LastBatchEffect != agent.ComputerUseCommitNone {
+		t.Fatalf("known then observation stats = %+v", stats)
+	}
+	runner.recordBatchV1(agent.OpenAIComputerBatchExecution{
+		ActionEffect: agent.ComputerUseCommitUnknown,
+	}, nil)
+	runner.recordBatchV1(agent.OpenAIComputerBatchExecution{
+		ActionEffect: agent.ComputerUseCommitKnown,
+	}, nil)
+	stats = runner.BatchStatsV1()
+	if stats.TaskEffect != agent.ComputerUseCommitUnknown {
+		t.Fatalf("unknown effect was downgraded: %+v", stats)
+	}
+}
+
+func TestOpenAIComputerTaskUnknownCommitIsStructuredUnverified(t *testing.T) {
+	result := openAIComputerTaskUnverifiedResultV1(
+		"commit_unknown",
+		"helper acknowledgement was lost",
+		agent.ComputerUseCommitUnknown,
+	)
+	if result.IsError ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskUnverified ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitUnknown ||
+		!strings.Contains(result.Content, "action_effect: unknown") {
+		t.Fatalf("unknown task outcome = %+v", result)
+	}
+}
+
 type openAIComputerDaemonProbeTool struct {
 	mu                  sync.Mutex
 	runs                []string
 	preflights          []string
 	results             map[string]agent.ToolResult
+	resultQueues        map[string][]agent.ToolResult
 	riskResults         map[string]tools.ConsequentialRiskPreflightResultV1
 	afterRun            func(string)
 	targetBundleID      string
@@ -122,6 +204,10 @@ func (t *openAIComputerDaemonProbeTool) Run(
 	}
 	t.runs = append(t.runs, name)
 	result := t.results[name]
+	if queue := t.resultQueues[name]; len(queue) > 0 {
+		result = queue[0]
+		t.resultQueues[name] = queue[1:]
+	}
 	afterRun := t.afterRun
 	t.mu.Unlock()
 	if afterRun != nil {
@@ -544,6 +630,96 @@ func TestDaemonOpenAIComputerExecutorRunsOrderedActionsThroughFreshAuthority(t *
 	if active := coordinator.Snapshot().Active; active == nil ||
 		active.LeaseID != executor.authority.LeaseID {
 		t.Fatalf("batch lease was not retained: %+v", active)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorRetriesFinalObservationWithoutReplayingActions(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	probe.resultQueues = map[string][]agent.ToolResult{
+		"final_screenshot": {
+			{
+				Content: "state_id: must-not-escape\nref=e17\nscreenshot_warning: " +
+					"[transient error] computer_use_error: capture_timeout\n" +
+					"message: the exact window capture timed out",
+			},
+			{
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "fresh-final-image",
+				}},
+			},
+		},
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"click","button":"left","x":10,"y":20}`,
+		),
+	)
+	if err != nil || result.ToolResult.IsError ||
+		len(result.ToolResult.Images) != 1 {
+		t.Fatalf("transient final observation result=%+v err=%v", result, err)
+	}
+	if result.ActionEffect != agent.ComputerUseCommitKnown {
+		t.Fatalf("committed click effect = %q", result.ActionEffect)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"click,final_screenshot,final_screenshot" {
+		t.Fatalf("observation retry replayed or reordered actions: %q", got)
+	}
+	if executor.finalCaptures != 1 {
+		t.Fatalf("logical final captures = %d, want 1", executor.finalCaptures)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorReportsCommittedBatchAsUnverifiedWhenFinalObservationExhausts(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	probe.results["final_screenshot"] = agent.ToolResult{
+		Content: "state_id: must-not-escape\nref=e17\nscreenshot_warning: " +
+			"[transient error] computer_use_error: capture_timeout\n" +
+			"message: the exact window capture timed out",
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"click","button":"left","x":10,"y":20}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if !result.ToolResult.IsError ||
+		!strings.Contains(result.ToolResult.Content, "final_observation_unavailable") ||
+		!strings.Contains(result.ToolResult.Content, "capture_timeout") {
+		t.Fatalf("exhausted final observation result=%+v", result.ToolResult)
+	}
+	if result.ActionEffect != agent.ComputerUseCommitKnown {
+		t.Fatalf("unverified batch effect = %q", result.ActionEffect)
+	}
+	if strings.Contains(result.ToolResult.Content, "state_id") ||
+		strings.Contains(result.ToolResult.Content, "ref=e17") {
+		t.Fatalf("final observation leaked stale authority: %q", result.ToolResult.Content)
+	}
+	if result.ToolResult.GUIOutcome == nil ||
+		result.ToolResult.GUIOutcome.Result != agent.GUIActionResultCompletedUnverified ||
+		result.ToolResult.GUIOutcome.Phase != agent.GUIActionPhaseVerifying ||
+		result.ToolResult.GUIOutcome.FailureCode != "final_observation_unavailable" {
+		t.Fatalf("missing completed-unverified batch outcome: %+v",
+			result.ToolResult.GUIOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"click,final_screenshot,final_screenshot,final_screenshot,"+
+			"final_screenshot,final_screenshot" {
+		t.Fatalf("final observation exhaustion replayed an action: %q", got)
 	}
 }
 
@@ -1151,7 +1327,7 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 		childTools: agent.NewToolRegistry(),
 		workflow:   workflow,
 		runtime:    &openAIComputerDaemonRuntimeProbe{tool: probe},
-		initialObservationRetry: func(context.Context, int) error {
+		observationRetry: func(context.Context, int) error {
 			return nil
 		},
 	}
@@ -1266,7 +1442,7 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 		maxIter:     4,
 		resultTrunc: 2000,
 		argsTrunc:   200,
-		initialObservationRetry: func(_ context.Context, attempt int) error {
+		observationRetry: func(_ context.Context, attempt int) error {
 			waits = append(waits, attempt)
 			return nil
 		},
@@ -1293,7 +1469,229 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 	}
 }
 
-func TestOpenAIComputerTaskToolExecutorFailureForbidsAutomaticRetryAndGuessing(
+func TestOpenAIComputerTaskToolAcceptsVisualSuccessAfterDynamicWindowCaptureSettles(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-final-retry",
+		"turn-openai-final-retry",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	initial := agent.ToolResult{
+		Content: "observed",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "aW5pdGlhbC1pbWFnZQ==",
+		}},
+	}
+	transient := agent.ToolResult{
+		Content: "state_id: must-not-escape\nscreenshot_warning: " +
+			"[transient error] computer_use_error: image_dimensions_mismatch\n" +
+			"message: the exact target window capture was rejected",
+		IsError: true,
+	}
+	final := agent.ToolResult{
+		Content: "observed",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "ZnJlc2gtZmluYWwtaW1hZ2U=",
+		}},
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "clicked",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+		},
+		resultQueues: map[string][]agent.ToolResult{
+			"final_screenshot": {
+				initial,
+				transient,
+				transient,
+				transient,
+				transient,
+				final,
+			},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(openAIComputerDaemonCall(
+				`{"type":"click","button":"left","x":10,"y":20}`,
+			)),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_final_retry_completed",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Calculator visibly shows the requested result.\"}"}`,
+			`{"status":"completed","summary":"Calculator visibly shows the requested result."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+		observationRetry: func(context.Context, int) error {
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 3-10 in Calculator","apps":["Calculator"],`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil || result.IsError ||
+		result.Content != "Calculator visibly shows the requested result." {
+		t.Fatalf("task result=%+v err=%v", result, err)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitKnown {
+		t.Fatalf("completed task lost structured outcome: %+v",
+			result.ComputerUseOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot,final_screenshot,"+
+			"final_screenshot,final_screenshot,final_screenshot" {
+		t.Fatalf("transient final observation replayed or reordered actions: %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolReturnsUnverifiedInsteadOfFailureWhenFinalObservationExhausts(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-final-unverified",
+		"turn-openai-final-unverified",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	initial := agent.ToolResult{
+		Content: "observed",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "aW5pdGlhbC1pbWFnZQ==",
+		}},
+	}
+	transient := agent.ToolResult{
+		Content: "state_id: must-not-escape\nref=e17\nscreenshot_warning: " +
+			"[transient error] computer_use_error: capture_timeout\n" +
+			"message: the exact window capture timed out",
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "clicked",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"final_screenshot": transient,
+		},
+		resultQueues: map[string][]agent.ToolResult{
+			"final_screenshot": {initial},
+		},
+	}
+	runtime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(openAIComputerDaemonCall(
+				`{"type":"click","button":"left","x":10,"y":20}`,
+			)),
+			"",
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+		observationRetry: func(context.Context, int) error {
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 3-10 in Calculator","apps":["Calculator"],`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil || result.IsError ||
+		!strings.Contains(result.Content, "computer_use_result: unverified") ||
+		!strings.Contains(result.Content, "final_observation_unavailable") ||
+		!strings.Contains(result.Content, "action_effect: committed") ||
+		!strings.Contains(result.Content, "capture_timeout") {
+		t.Fatalf("task result=%+v err=%v", result, err)
+	}
+	if strings.Contains(result.Content, "state_id") ||
+		strings.Contains(result.Content, "ref=e17") {
+		t.Fatalf("task result leaked stale observation authority: %q", result.Content)
+	}
+	if result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultCompletedUnverified ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseVerifying ||
+		result.GUIOutcome.FailureCode != "final_observation_unavailable" {
+		t.Fatalf("task result lost unverified outcome: %+v", result.GUIOutcome)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskUnverified ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitKnown {
+		t.Fatalf("task result lost structured outcome: %+v",
+			result.ComputerUseOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot,final_screenshot,"+
+			"final_screenshot,final_screenshot,final_screenshot" {
+		t.Fatalf("final observation exhaustion replayed an action: %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolExecutorFailureBeforeActionDoesNotClaimUnknownSideEffect(
 	t *testing.T,
 ) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
@@ -1336,9 +1734,9 @@ func TestOpenAIComputerTaskToolExecutorFailureForbidsAutomaticRetryAndGuessing(
 		t.Fatalf("task Run: %v", err)
 	}
 	if !result.IsError ||
-		!strings.Contains(result.Content, "executor_failed") ||
-		!strings.Contains(result.Content, "do not retry computer_use or attempt alternate desktop-control tools in this turn") ||
-		!strings.Contains(result.Content, "without guessing that the target app is missing or blocked") ||
+		!strings.Contains(result.Content, "executor_failed_before_action") ||
+		!strings.Contains(result.Content, "no desktop action was attempted") ||
+		strings.Contains(result.Content, "alternate desktop-control tools") ||
 		!strings.Contains(result.Content, "malformed provider response") {
 		t.Fatalf("task result = %+v", result)
 	}
@@ -1395,12 +1793,10 @@ func TestOpenAIComputerTaskToolBoundsPrivateExecutorDuration(t *testing.T) {
 		t.Fatalf("private executor deadline took %s", elapsed)
 	}
 	if !result.IsError ||
-		!strings.Contains(result.Content, "executor_timeout") ||
+		!strings.Contains(result.Content, "executor_timeout_before_action") ||
 		!strings.Contains(result.Content, "exceeded 20ms") ||
-		!strings.Contains(
-			result.Content,
-			"do not retry computer_use or attempt alternate desktop-control tools",
-		) {
+		!strings.Contains(result.Content, "no desktop action was attempted") ||
+		strings.Contains(result.Content, "alternate desktop-control tools") {
 		t.Fatalf("task result = %+v", result)
 	}
 	if got := strings.Join(runtime.initialObservationApps, ","); got !=
@@ -1619,8 +2015,8 @@ func TestOpenAIComputerTaskToolReportsFailedOutcomeAfterSuccessfulBatch(
 			t,
 			profile,
 			"resp_daemon_failed_outcome_final",
-			`{"type":"text","text":"{\"status\":\"failed\",\"summary\":\"Calculator still shows 7.56; the requested result is not visible.\"}"}`,
-			`{"status":"failed","summary":"Calculator still shows 7.56; the requested result is not visible."}`,
+			`{"type":"text","text":"{\"status\":\"not_completed\",\"summary\":\"Calculator still shows 7.56; the requested result is not visible.\"}"}`,
+			`{"status":"not_completed","summary":"Calculator still shows 7.56; the requested result is not visible."}`,
 		),
 	}}
 	childTools := agent.NewToolRegistry()
@@ -1646,13 +2042,19 @@ func TestOpenAIComputerTaskToolReportsFailedOutcomeAfterSuccessfulBatch(
 		t.Fatalf("task Run: %v", err)
 	}
 	if !result.IsError ||
-		!strings.Contains(result.Content, "task_failed") ||
+		!strings.Contains(result.Content, "task_not_completed") ||
 		!strings.Contains(
 			result.Content,
 			"Calculator still shows 7.56; the requested result is not visible.",
 		) ||
 		!strings.Contains(result.Content, "do not retry computer_use again in this turn") {
 		t.Fatalf("task result = %+v", result)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskNotCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitKnown {
+		t.Fatalf("not-completed task lost structured outcome: %+v",
+			result.ComputerUseOutcome)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=
 		"final_screenshot,click,final_screenshot" {
@@ -2056,6 +2458,14 @@ func TestDaemonOpenAIComputerExecutorUncertainCommitNeverContinuesOrRetries(t *t
 	if !result.ToolResult.IsError ||
 		!strings.Contains(result.ToolResult.Content, "do not retry automatically") {
 		t.Fatalf("uncertain result = %+v", result.ToolResult)
+	}
+	if result.ActionEffect != agent.ComputerUseCommitUnknown {
+		t.Fatalf("unknown action effect = %q", result.ActionEffect)
+	}
+	if result.ToolResult.GUIOutcome == nil ||
+		result.ToolResult.GUIOutcome.FailureCode != "commit_unknown" {
+		t.Fatalf("unknown action lost typed outcome: %+v",
+			result.ToolResult.GUIOutcome)
 	}
 	if got := probe.runNames(); strings.Join(got, ",") != "click,final_screenshot" {
 		t.Fatalf("uncertain action continued or retried: %v", got)

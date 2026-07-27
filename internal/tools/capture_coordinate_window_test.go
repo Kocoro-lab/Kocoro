@@ -173,7 +173,7 @@ func TestCaptureCoordinateWindowV1FailurePolicyMatrix(t *testing.T) {
 		"window_identity_mismatch":  false,
 		"image_too_large":           false,
 		"invalid_png":               false,
-		"image_dimensions_mismatch": false,
+		"image_dimensions_mismatch": true,
 		"response_too_large":        false,
 	}
 	fixture := captureWindowJSONMap(t, loadCoordinateFixture(t, "capture_coordinate_window.response.failure.v1.json"))
@@ -182,6 +182,9 @@ func TestCaptureCoordinateWindowV1FailurePolicyMatrix(t *testing.T) {
 			candidate := cloneCaptureWindowJSONMap(t, fixture)
 			candidate["failure_code"] = code
 			candidate["retry_safe"] = retrySafe
+			if code == "image_dimensions_mismatch" {
+				candidate["failure_diagnostics"] = canonicalCaptureWindowFailureDiagnosticsJSON()
+			}
 			if _, err := DecodeCaptureCoordinateWindowResultV1(marshalCaptureWindowJSON(t, candidate)); err != nil {
 				t.Fatalf("known policy rejected: %v", err)
 			}
@@ -190,6 +193,29 @@ func TestCaptureCoordinateWindowV1FailurePolicyMatrix(t *testing.T) {
 				t.Fatal("inverse retry_safe policy passed")
 			}
 		})
+	}
+}
+
+func canonicalCaptureWindowFailureDiagnosticsJSON() map[string]any {
+	return map[string]any{
+		"stage":     "decoded_dimensions",
+		"pid":       float64(4242),
+		"bundle_id": "com.example.fixture",
+		"window_id": float64(7001),
+		"pre_window_quartz_bounds": map[string]any{
+			"x": -100.0, "y": 200.0, "width": 1.0, "height": 1.0,
+		},
+		"post_window_quartz_bounds": map[string]any{
+			"x": -100.0, "y": 200.0, "width": 1.0, "height": 1.0,
+		},
+		"display_id":           float64(2),
+		"backing_scale_factor": 1.0,
+		"expected_width_px":    1.0,
+		"expected_height_px":   1.0,
+		"metadata_width_px":    float64(2),
+		"metadata_height_px":   float64(1),
+		"decoded_width_px":     float64(2),
+		"decoded_height_px":    float64(1),
 	}
 }
 

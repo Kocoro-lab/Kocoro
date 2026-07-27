@@ -62,6 +62,34 @@ type GUIActionPointer struct {
 	Y                  float64
 }
 
+type GUICaptureRect struct {
+	X      float64
+	Y      float64
+	Width  float64
+	Height float64
+}
+
+// GUICaptureDiagnostics is a local-only projection of a rejected exact-window
+// capture. It is intentionally attached to ToolResult outside provider-visible
+// content so local traces can explain geometry failures without exposing AX
+// state, window titles, screenshots, or typed content.
+type GUICaptureDiagnostics struct {
+	Stage              string
+	PID                int
+	BundleID           string
+	WindowID           uint32
+	PreWindowBounds    GUICaptureRect
+	PostWindowBounds   GUICaptureRect
+	DisplayID          uint32
+	BackingScaleFactor float64
+	ExpectedWidthPX    float64
+	ExpectedHeightPX   float64
+	MetadataWidthPX    int
+	MetadataHeightPX   int
+	DecodedWidthPX     int
+	DecodedHeightPX    int
+}
+
 type GUIActionOutcome struct {
 	Result      GUIActionResult
 	Phase       GUIActionPhase

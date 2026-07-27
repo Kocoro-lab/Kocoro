@@ -212,19 +212,11 @@ func (r *OpenAIComputerActionRuntimeV1) AuthorizeOpenAIComputerTypeAfterKeypress
 		expectedWindowAXBounds: *snapshot.expectedWindowAXBounds,
 		filter:                 snapshot.filter,
 		budget:                 snapshot.budget,
+		locationNavigation:     openAIComputerLocationFocusShortcutV1(action),
 		// The target comes from the post-keypress refresh itself. Any later
-		// tree change invalidates it before type commits.
-		observationBound:   true,
-		locationNavigation: openAIComputerLocationFocusKeypressV1(action),
+		// input is still bound to the same verified app, window, and frame.
 	}
 	return nil
-}
-
-func openAIComputerLocationFocusKeypressV1(action OpenAIComputerActionV1) bool {
-	modifiers, keys, err := openAIComputerKeySequenceV1(action.Keys)
-	return err == nil &&
-		len(modifiers) == 1 && modifiers[0] == "command" &&
-		len(keys) == 1 && keys[0] == "l"
 }
 
 // PlanOpenAIComputerTaskInitialObservationV1 binds the first screenshot to the

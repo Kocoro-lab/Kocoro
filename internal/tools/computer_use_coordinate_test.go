@@ -51,7 +51,30 @@ func TestComputerUseCoordinateObservationPublishesOnlyStableFramedWindow(t *test
 	}
 }
 
-func TestComputerUseCoordinateObservationRejectsEveryTreeStabilityAxis(t *testing.T) {
+func TestComputerUseCoordinateObservationAllowsDynamicAXContentInStableWindow(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	before := cloneComputerUseTree(t, harness.tree)
+	after := cloneComputerUseTree(t, harness.tree)
+	title := "Changed while the window was captured"
+	after.Elements[0].Title = &title
+	harness.queueObservation(before, after)
+
+	result, err := harness.tool.Run(context.Background(), `{
+		"action":"get_app_state","include_screenshot":true,
+		"description":"Inspect a dynamically updating window"
+	}`)
+	if err != nil || result.IsError {
+		t.Fatalf("observation result=%+v err=%v", result, err)
+	}
+	if len(result.Images) != 1 || harness.tool.coordinateArtifact == nil {
+		t.Fatalf("dynamic AX content invalidated stable window screenshot: %+v", result)
+	}
+}
+
+func TestComputerUseCoordinateObservationRejectsWindowIdentityChanges(t *testing.T) {
 	requireComputerUseDarwin(t)
 	baseHarness := newComputerUseCoordinateHarness(t)
 	base := baseHarness.tree
@@ -59,10 +82,6 @@ func TestComputerUseCoordinateObservationRejectsEveryTreeStabilityAxis(t *testin
 		name   string
 		mutate func(*computerUseTree)
 	}{
-		{name: "tree state", mutate: func(tree *computerUseTree) {
-			title := "Changed"
-			tree.Elements[0].Title = &title
-		}},
 		{name: "pid", mutate: func(tree *computerUseTree) { tree.PID++ }},
 		{name: "bundle", mutate: func(tree *computerUseTree) { tree.BundleID += ".changed" }},
 		{name: "window id", mutate: func(tree *computerUseTree) { value := *tree.WindowID + 1; tree.WindowID = &value }},
@@ -229,7 +248,10 @@ func TestComputerUseCoordinateClickMapsCurrentArtifactAndConsumesIt(t *testing.T
 	harness := newComputerUseCoordinateHarness(t)
 	harness.observe(t)
 	stateID := harness.tool.snapshot.id
-	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	current := cloneComputerUseTree(t, harness.tree)
+	title := "Changed after the screenshot"
+	current.Elements[0].Title = &title
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, current))
 	harness.fake.queue("display_topology", marshalDisplayTopology(t, harness.topology))
 
 	var executed *CoordinateMouseEventRequestV1
@@ -346,7 +368,7 @@ func TestOpenAINativeComputerBatchReusesStableWindowFrameAcrossCoordinateActions
 	}
 }
 
-func TestComputerUseVerifiedCoordinateClickAllowsOneWindowBoundTypeWithoutAXRef(t *testing.T) {
+func TestComputerUseVerifiedCoordinateClickBindsLiveFocusedRefForType(t *testing.T) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
 	harness.observe(t)
@@ -375,7 +397,8 @@ func TestComputerUseVerifiedCoordinateClickAllowsOneWindowBoundTypeWithoutAXRef(
 		t.Fatalf("coordinate click result=%+v err=%v", clicked, err)
 	}
 
-	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	focusedTree := computerUseCoordinateFocusedTextTreeV1(harness.tree)
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, focusedTree))
 	var executed *TargetBoundInputRequestV1
 	harness.tool.targetBoundInputExecutor = func(
 		_ context.Context, request TargetBoundInputRequestV1,
@@ -396,8 +419,13 @@ func TestComputerUseVerifiedCoordinateClickAllowsOneWindowBoundTypeWithoutAXRef(
 		t.Fatalf("coordinate-focused type result=%+v err=%v", typed, err)
 	}
 	if executed == nil || executed.Action != "type" || executed.Text == nil ||
-		*executed.Text != "hello" || executed.Ref != nil || executed.Path != nil ||
-		executed.ExpectedRole != nil || executed.ExpectedFingerprint != nil {
+		*executed.Text != "hello" || executed.Ref == nil || *executed.Ref != "e1" ||
+		executed.Path == nil ||
+		*executed.Path != "window[0]/AXTextField[0]" ||
+		executed.ExpectedRole == nil ||
+		*executed.ExpectedRole != "AXTextField" ||
+		executed.ExpectedFingerprint == nil ||
+		*executed.ExpectedFingerprint != "axf_coordinate" {
 		t.Fatalf("coordinate-focused type lost exact authority: %+v", executed)
 	}
 
@@ -409,6 +437,53 @@ func TestComputerUseVerifiedCoordinateClickAllowsOneWindowBoundTypeWithoutAXRef(
 		!strings.Contains(again.Content, "keyboard_target_unavailable") ||
 		!strings.Contains(again.Content, "do not retry automatically") {
 		t.Fatalf("reused coordinate focus result=%+v err=%v", again, err)
+	}
+}
+
+func TestComputerUseCoordinateTypeFallsBackToOneShotSameWindowWitness(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.observe(t)
+	frame := harness.tool.snapshot.expectedWindowAXBounds
+	harness.tool.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID:                harness.tool.snapshot.id,
+		pid:                    harness.tree.PID,
+		bundleID:               harness.tree.BundleID,
+		windowID:               uint32(*harness.tree.WindowID),
+		expectedWindowAXBounds: *frame,
+		filter:                 harness.tool.snapshot.filter,
+		budget:                 harness.tool.snapshot.budget,
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	var executed *TargetBoundInputRequestV1
+	harness.tool.targetBoundInputExecutor = func(
+		_ context.Context,
+		request TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = &request
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: "type",
+			InputCommitted: true, ClipboardTouched: true, ClipboardRestored: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		fmt.Sprintf(`{
+			"action":"type","state_id":%q,"text":"window fallback",
+			"description":"Use the verified focus handoff"
+		}`, harness.tool.snapshot.id),
+	)
+	if err != nil || result.IsError || executed == nil ||
+		executed.Ref != nil || executed.Path != nil ||
+		executed.ExpectedRole != nil || executed.ExpectedFingerprint != nil ||
+		executed.PID != harness.tree.PID ||
+		executed.WindowID != uint32(*harness.tree.WindowID) {
+		t.Fatalf("same-window focus fallback result=%+v err=%v executed=%+v",
+			result, err, executed)
 	}
 }
 
@@ -492,7 +567,7 @@ func TestComputerUseCoordinateFocusSurvivesOneSameWindowReobservation(t *testing
 		t.Fatalf("coordinate click result=%+v err=%v", result, err)
 	}
 
-	focused := cloneComputerUseTree(t, harness.tree)
+	focused := computerUseCoordinateFocusedTextTreeV1(harness.tree)
 	title := "Editor focused"
 	focused.Elements[0].Title = &title
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, focused))
@@ -528,6 +603,23 @@ func TestComputerUseCoordinateFocusSurvivesOneSameWindowReobservation(t *testing
 		t.Fatalf("same-window coordinate-focused type result=%+v err=%v called=%v",
 			typed, err, called)
 	}
+}
+
+func computerUseCoordinateFocusedTextTreeV1(
+	tree computerUseTree,
+) computerUseTree {
+	focused := tree.Elements[0].Ref
+	tree.FocusedRef = &focused
+	tree.Elements[0].Focused = true
+	tree.Elements[0].Role = "AXTextField"
+	tree.Elements[0].Path = "window[0]/AXTextField[0]"
+	tree.Elements[0].Actions = nil
+	tree.RefPaths[focused] = computerUseRefPath{
+		Path:        tree.Elements[0].Path,
+		Role:        tree.Elements[0].Role,
+		Fingerprint: tree.Elements[0].Fingerprint,
+	}
+	return tree
 }
 
 func TestComputerUseCoordinateClickPreservesOfficialOpenAIButtons(t *testing.T) {

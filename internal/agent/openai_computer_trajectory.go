@@ -14,12 +14,14 @@ import (
 )
 
 // OpenAIComputerBatchExecution is the narrow result returned to AgentLoop.
-// Result must contain exactly one final screenshot. ContinuationAllowed means
-// the provider may inspect that fresh state before choosing the next step,
-// including recovery after a partial or uncertain batch.
+// A continuable result contains exactly one final screenshot. A non-continuable
+// result may instead carry a redacted observation failure and typed action
+// effect so the goal-level owner can report unverified completion without
+// replaying input.
 type OpenAIComputerBatchExecution struct {
 	CallID              string
 	ContinuationAllowed bool
+	ActionEffect        ComputerUseCommitEffect
 	Result              ToolResult
 }
 

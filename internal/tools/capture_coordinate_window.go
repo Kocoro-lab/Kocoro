@@ -73,32 +73,68 @@ func (request CaptureCoordinateWindowRequestV1) Validate() error {
 }
 
 type CaptureCoordinateWindowResultV1 struct {
-	SchemaVersion      int                      `json:"schema_version"`
-	Status             string                   `json:"status"`
-	FailureCode        *string                  `json:"failure_code"`
-	RetrySafe          bool                     `json:"retry_safe"`
-	TopologyRef        *CoordinateTopologyRefV1 `json:"topology_ref"`
-	HelperBootID       *string                  `json:"helper_boot_id"`
-	PID                *int                     `json:"pid"`
-	BundleID           *string                  `json:"bundle_id"`
-	WindowID           *uint32                  `json:"window_id"`
-	WindowQuartzBounds *CoordinateQuartzRectV1  `json:"window_quartz_bounds"`
-	DisplayID          *uint32                  `json:"display_id"`
-	BackingScaleFactor *float64                 `json:"backing_scale_factor"`
-	MediaType          *string                  `json:"media_type"`
-	WidthPX            *int                     `json:"width_px"`
-	HeightPX           *int                     `json:"height_px"`
-	ByteLength         *int                     `json:"byte_length"`
-	SHA256             *string                  `json:"sha256"`
-	ImageBase64        *string                  `json:"image_base64"`
-	CapturedAt         *string                  `json:"captured_at"`
+	SchemaVersion      int                                          `json:"schema_version"`
+	Status             string                                       `json:"status"`
+	FailureCode        *string                                      `json:"failure_code"`
+	RetrySafe          bool                                         `json:"retry_safe"`
+	FailureDiagnostics *CaptureCoordinateWindowFailureDiagnosticsV1 `json:"failure_diagnostics"`
+	TopologyRef        *CoordinateTopologyRefV1                     `json:"topology_ref"`
+	HelperBootID       *string                                      `json:"helper_boot_id"`
+	PID                *int                                         `json:"pid"`
+	BundleID           *string                                      `json:"bundle_id"`
+	WindowID           *uint32                                      `json:"window_id"`
+	WindowQuartzBounds *CoordinateQuartzRectV1                      `json:"window_quartz_bounds"`
+	DisplayID          *uint32                                      `json:"display_id"`
+	BackingScaleFactor *float64                                     `json:"backing_scale_factor"`
+	MediaType          *string                                      `json:"media_type"`
+	WidthPX            *int                                         `json:"width_px"`
+	HeightPX           *int                                         `json:"height_px"`
+	ByteLength         *int                                         `json:"byte_length"`
+	SHA256             *string                                      `json:"sha256"`
+	ImageBase64        *string                                      `json:"image_base64"`
+	CapturedAt         *string                                      `json:"captured_at"`
 }
+
+type CaptureCoordinateWindowFailureDiagnosticsV1 struct {
+	Stage                  string                 `json:"stage"`
+	PID                    int                    `json:"pid"`
+	BundleID               string                 `json:"bundle_id"`
+	WindowID               uint32                 `json:"window_id"`
+	PreWindowQuartzBounds  CoordinateQuartzRectV1 `json:"pre_window_quartz_bounds"`
+	PostWindowQuartzBounds CoordinateQuartzRectV1 `json:"post_window_quartz_bounds"`
+	DisplayID              uint32                 `json:"display_id"`
+	BackingScaleFactor     float64                `json:"backing_scale_factor"`
+	ExpectedWidthPX        float64                `json:"expected_width_px"`
+	ExpectedHeightPX       float64                `json:"expected_height_px"`
+	MetadataWidthPX        *int                   `json:"metadata_width_px"`
+	MetadataHeightPX       *int                   `json:"metadata_height_px"`
+	DecodedWidthPX         *int                   `json:"decoded_width_px"`
+	DecodedHeightPX        *int                   `json:"decoded_height_px"`
+}
+
+var captureCoordinateWindowFailureDiagnosticsWireShapeV1 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
+	"stage":                     coordinateScalarWireShape(false),
+	"pid":                       coordinateScalarWireShape(false),
+	"bundle_id":                 coordinateScalarWireShape(false),
+	"window_id":                 coordinateScalarWireShape(false),
+	"pre_window_quartz_bounds":  coordinateQuartzRectWireShapeV1,
+	"post_window_quartz_bounds": coordinateQuartzRectWireShapeV1,
+	"display_id":                coordinateScalarWireShape(false),
+	"backing_scale_factor":      coordinateScalarWireShape(false),
+	"expected_width_px":         coordinateScalarWireShape(false),
+	"expected_height_px":        coordinateScalarWireShape(false),
+	"metadata_width_px":         coordinateScalarWireShape(true),
+	"metadata_height_px":        coordinateScalarWireShape(true),
+	"decoded_width_px":          coordinateScalarWireShape(true),
+	"decoded_height_px":         coordinateScalarWireShape(true),
+})
 
 var captureCoordinateWindowResultWireShapeV1 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
 	"schema_version":       coordinateScalarWireShape(false),
 	"status":               coordinateScalarWireShape(false),
 	"failure_code":         coordinateScalarWireShape(true),
 	"retry_safe":           coordinateScalarWireShape(false),
+	"failure_diagnostics":  coordinateNullableWireShape(captureCoordinateWindowFailureDiagnosticsWireShapeV1),
 	"topology_ref":         coordinateNullableWireShape(coordinateTopologyRefWireShapeV1),
 	"helper_boot_id":       coordinateScalarWireShape(true),
 	"pid":                  coordinateScalarWireShape(true),
@@ -150,7 +186,7 @@ func (result CaptureCoordinateWindowResultV1) ValidateTaggedUnion() error {
 	}
 	switch result.Status {
 	case "captured":
-		if result.FailureCode != nil || result.RetrySafe {
+		if result.FailureCode != nil || result.RetrySafe || result.FailureDiagnostics != nil {
 			return fmt.Errorf("captured result cannot carry failure metadata")
 		}
 		for _, present := range successFields {
@@ -185,8 +221,66 @@ func (result CaptureCoordinateWindowResultV1) ValidateTaggedUnion() error {
 				return fmt.Errorf("failed result cannot carry success fields")
 			}
 		}
+		if *result.FailureCode == "image_dimensions_mismatch" {
+			if result.FailureDiagnostics == nil {
+				return fmt.Errorf("image_dimensions_mismatch requires failure_diagnostics")
+			}
+			if err := result.FailureDiagnostics.Validate(); err != nil {
+				return err
+			}
+		} else if result.FailureDiagnostics != nil {
+			return fmt.Errorf("failure_diagnostics are only valid for image_dimensions_mismatch")
+		}
 	default:
 		return fmt.Errorf("invalid capture_coordinate_window status %q", result.Status)
+	}
+	return nil
+}
+
+func (diagnostics CaptureCoordinateWindowFailureDiagnosticsV1) Validate() error {
+	if diagnostics.Stage != "non_integral_expected_dimensions" &&
+		diagnostics.Stage != "decoded_dimensions" {
+		return fmt.Errorf("invalid capture failure diagnostic stage %q", diagnostics.Stage)
+	}
+	if diagnostics.PID <= 0 || diagnostics.BundleID == "" ||
+		diagnostics.WindowID == 0 || diagnostics.DisplayID == 0 ||
+		!finiteCoordinate(diagnostics.BackingScaleFactor) ||
+		diagnostics.BackingScaleFactor <= 0 ||
+		!finiteCoordinate(diagnostics.ExpectedWidthPX) ||
+		!finiteCoordinate(diagnostics.ExpectedHeightPX) ||
+		diagnostics.ExpectedWidthPX <= 0 || diagnostics.ExpectedHeightPX <= 0 {
+		return fmt.Errorf("capture failure diagnostics contain invalid identity or dimensions")
+	}
+	if err := validateCoordinateQuartzRect(
+		"failure_diagnostics.pre_window_quartz_bounds",
+		diagnostics.PreWindowQuartzBounds,
+	); err != nil {
+		return err
+	}
+	if err := validateCoordinateQuartzRect(
+		"failure_diagnostics.post_window_quartz_bounds",
+		diagnostics.PostWindowQuartzBounds,
+	); err != nil {
+		return err
+	}
+	actual := []*int{
+		diagnostics.MetadataWidthPX,
+		diagnostics.MetadataHeightPX,
+		diagnostics.DecodedWidthPX,
+		diagnostics.DecodedHeightPX,
+	}
+	if diagnostics.Stage == "decoded_dimensions" {
+		for _, value := range actual {
+			if value == nil || *value <= 0 {
+				return fmt.Errorf("decoded dimension diagnostics require positive actual dimensions")
+			}
+		}
+	} else {
+		for _, value := range actual {
+			if value != nil {
+				return fmt.Errorf("non-integral expected dimensions cannot carry decoded dimensions")
+			}
+		}
 	}
 	return nil
 }
@@ -195,10 +289,11 @@ func captureCoordinateWindowFailurePolicy(code string) (retrySafe bool, valid bo
 	switch code {
 	case "topology_unavailable", "stale_topology", "window_not_found",
 		"window_not_actionable", "window_bounds_mismatch", "display_not_actionable",
-		"capture_timeout", "capture_failed", "topology_changed", "window_changed":
+		"capture_timeout", "capture_failed", "topology_changed", "window_changed",
+		"image_dimensions_mismatch":
 		return true, true
 	case "invalid_request", "process_identity_mismatch", "window_identity_mismatch",
-		"image_too_large", "invalid_png", "image_dimensions_mismatch", "response_too_large":
+		"image_too_large", "invalid_png", "response_too_large":
 		return false, true
 	default:
 		return false, false

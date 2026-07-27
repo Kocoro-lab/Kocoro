@@ -29,6 +29,30 @@ type openAIComputerTraceEventV1 struct {
 	CommitState   string `json:"commit_state,omitempty"`
 	FailureCode   string `json:"failure_code,omitempty"`
 	DurationMS    int64  `json:"duration_ms"`
+
+	// Capture diagnostics are written as a separate structured audit event.
+	// Keeping them out of this JSON prevents the audit logger's intentionally
+	// small summary limit from truncating either object into invalid JSON.
+	captureDiagnostics *agent.GUICaptureDiagnostics
+}
+
+type openAIComputerCaptureDiagnosticEventV1 struct {
+	SchemaVersion      int        `json:"schema_version"`
+	Phase              string     `json:"phase"`
+	Attempt            int        `json:"attempt,omitempty"`
+	BatchIndex         int        `json:"batch_index,omitempty"`
+	ActionIndex        int        `json:"action_index,omitempty"`
+	AppBundleID        string     `json:"app_bundle_id,omitempty"`
+	CaptureStage       string     `json:"capture_stage"`
+	TargetPID          int        `json:"target_pid"`
+	TargetWindowID     uint32     `json:"target_window_id"`
+	DisplayID          uint32     `json:"display_id"`
+	BackingScaleFactor float64    `json:"backing_scale_factor"`
+	ExpectedSizePX     [2]float64 `json:"expected_size_px"`
+	MetadataSizePX     [2]int     `json:"metadata_size_px"`
+	DecodedSizePX      [2]int     `json:"decoded_size_px"`
+	PreWindowSize      [2]float64 `json:"pre_window_size"`
+	PostWindowSize     [2]float64 `json:"post_window_size"`
 }
 
 type openAIComputerTraceV1 struct {
@@ -53,6 +77,8 @@ func (t *openAIComputerTraceV1) record(event openAIComputerTraceEventV1) {
 	if t == nil || t.auditor == nil {
 		return
 	}
+	diagnostics := event.captureDiagnostics
+	event.captureDiagnostics = nil
 	event.SchemaVersion = 1
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -63,6 +89,55 @@ func (t *openAIComputerTraceV1) record(event openAIComputerTraceEventV1) {
 		SessionID:    t.sessionID,
 		Event:        openAIComputerTraceEventNameV1,
 		InputSummary: string(payload),
+	})
+	if diagnostics == nil {
+		return
+	}
+	diagnosticEvent := openAIComputerCaptureDiagnosticEventV1{
+		SchemaVersion:      1,
+		Phase:              event.Phase,
+		Attempt:            event.Attempt,
+		BatchIndex:         event.BatchIndex,
+		ActionIndex:        event.ActionIndex,
+		AppBundleID:        event.AppBundleID,
+		CaptureStage:       diagnostics.Stage,
+		TargetPID:          diagnostics.PID,
+		TargetWindowID:     diagnostics.WindowID,
+		DisplayID:          diagnostics.DisplayID,
+		BackingScaleFactor: diagnostics.BackingScaleFactor,
+		ExpectedSizePX: [2]float64{
+			diagnostics.ExpectedWidthPX,
+			diagnostics.ExpectedHeightPX,
+		},
+		MetadataSizePX: [2]int{
+			diagnostics.MetadataWidthPX,
+			diagnostics.MetadataHeightPX,
+		},
+		DecodedSizePX: [2]int{
+			diagnostics.DecodedWidthPX,
+			diagnostics.DecodedHeightPX,
+		},
+		PreWindowSize: [2]float64{
+			diagnostics.PreWindowBounds.Width,
+			diagnostics.PreWindowBounds.Height,
+		},
+		PostWindowSize: [2]float64{
+			diagnostics.PostWindowBounds.Width,
+			diagnostics.PostWindowBounds.Height,
+		},
+	}
+	if diagnosticEvent.AppBundleID == "" {
+		diagnosticEvent.AppBundleID = diagnostics.BundleID
+	}
+	diagnosticPayload, err := json.Marshal(diagnosticEvent)
+	if err != nil {
+		return
+	}
+	t.auditor.Log(audit.AuditEntry{
+		Timestamp:    time.Now(),
+		SessionID:    t.sessionID,
+		Event:        "computer_use_capture_diagnostic_v1",
+		InputSummary: string(diagnosticPayload),
 	})
 }
 
@@ -101,4 +176,19 @@ func openAIComputerTraceFailureCodeV1(
 	default:
 		return ""
 	}
+}
+
+func openAIComputerTraceWithCaptureDiagnosticsV1(
+	event openAIComputerTraceEventV1,
+	result agent.ToolResult,
+) openAIComputerTraceEventV1 {
+	diagnostics := result.GUICaptureDiagnostics
+	if diagnostics == nil {
+		return event
+	}
+	if event.AppBundleID == "" {
+		event.AppBundleID = diagnostics.BundleID
+	}
+	event.captureDiagnostics = diagnostics
+	return event
 }

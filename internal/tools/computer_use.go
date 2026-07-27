@@ -200,14 +200,17 @@ type computerUseCoordinateFocusV1 struct {
 	expectedWindowAXBounds CoordinateQuartzRectV1
 	filter                 string
 	budget                 int
-	observationBound       bool
 	locationNavigation     bool
 }
 
 type computerUseNavigationCommitV1 struct {
-	pid      int
-	bundleID string
-	windowID uint32
+	pid         int
+	bundleID    string
+	windowID    uint32
+	ref         string
+	path        string
+	role        string
+	fingerprint string
 }
 
 func (focus *computerUseCoordinateFocusV1) matchesTree(
@@ -458,7 +461,10 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 		args.Action != "get_app_state" && args.Action != "screenshot" {
 		t.coordinateFocus = nil
 	}
-	if t.navigationCommit != nil && args.Action != "keypress" {
+	if t.navigationCommit != nil &&
+		args.Action != "get_app_state" &&
+		args.Action != "screenshot" &&
+		!computerUsePlainReturnKeypressV1(args) {
 		t.navigationCommit = nil
 	}
 
@@ -681,7 +687,6 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 		pendingFocus.stateID = stateID
 		pendingFocus.filter = filter
 		pendingFocus.budget = budget
-		pendingFocus.observationBound = true
 		t.coordinateFocus = pendingFocus
 	}
 	if !args.IncludeScreenshot {
@@ -700,6 +705,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 			return failure, nil
 		}
 		result.Content += "\nscreenshot_warning: " + failure.Content
+		result.GUICaptureDiagnostics = failure.GUICaptureDiagnostics
 		return result, nil
 	}
 	t.coordinateArtifact = &artifact
@@ -823,7 +829,7 @@ func (t *ComputerUseTool) captureCoordinateObservationV1(
 	}
 	if !computerUseCoordinateTreesStableV1(treeA, treeB) {
 		return CoordinateWindowArtifactV1{}, agent.BusinessError(
-			"accessibility state changed during screenshot capture; coordinate image was discarded"), false
+			"window identity changed during screenshot capture; coordinate image was discarded"), false
 	}
 	frame := artifact.Frame()
 	createdAt, createdErr := time.Parse(time.RFC3339Nano, frame.CreatedAt)
@@ -831,7 +837,7 @@ func (t *ComputerUseTool) captureCoordinateObservationV1(
 	publishedAt := t.computerUseCoordinateNowV1()
 	if createdErr != nil || expiresErr != nil || publishedAt.Before(createdAt) || !publishedAt.Before(expiresAt) {
 		return CoordinateWindowArtifactV1{}, agent.BusinessError(
-			"coordinate screenshot authority was not current after AX stability verification"), false
+			"coordinate screenshot authority was not current after window identity verification"), false
 	}
 	return artifact, agent.ToolResult{}, true
 }
@@ -915,15 +921,52 @@ func computerUseCaptureFailureV1(
 		message,
 		recovery,
 	)
-	if result.RetrySafe {
-		return agent.TransientError(content), true
+	var diagnostics *agent.GUICaptureDiagnostics
+	if result.FailureDiagnostics != nil {
+		value := result.FailureDiagnostics
+		diagnostics = &agent.GUICaptureDiagnostics{
+			Stage:              value.Stage,
+			PID:                value.PID,
+			BundleID:           value.BundleID,
+			WindowID:           value.WindowID,
+			PreWindowBounds:    guiCaptureRectV1(value.PreWindowQuartzBounds),
+			PostWindowBounds:   guiCaptureRectV1(value.PostWindowQuartzBounds),
+			DisplayID:          value.DisplayID,
+			BackingScaleFactor: value.BackingScaleFactor,
+			ExpectedWidthPX:    value.ExpectedWidthPX,
+			ExpectedHeightPX:   value.ExpectedHeightPX,
+		}
+		if value.MetadataWidthPX != nil {
+			diagnostics.MetadataWidthPX = *value.MetadataWidthPX
+		}
+		if value.MetadataHeightPX != nil {
+			diagnostics.MetadataHeightPX = *value.MetadataHeightPX
+		}
+		if value.DecodedWidthPX != nil {
+			diagnostics.DecodedWidthPX = *value.DecodedWidthPX
+		}
+		if value.DecodedHeightPX != nil {
+			diagnostics.DecodedHeightPX = *value.DecodedHeightPX
+		}
 	}
-	return agent.BusinessError(content), true
+	if result.RetrySafe {
+		failure := agent.TransientError(content)
+		failure.GUICaptureDiagnostics = diagnostics
+		return failure, true
+	}
+	failure := agent.BusinessError(content)
+	failure.GUICaptureDiagnostics = diagnostics
+	return failure, true
+}
+
+func guiCaptureRectV1(rect CoordinateQuartzRectV1) agent.GUICaptureRect {
+	return agent.GUICaptureRect{
+		X: rect.X, Y: rect.Y, Width: rect.Width, Height: rect.Height,
+	}
 }
 
 func computerUseCoordinateTreesStableV1(before, after computerUseTree) bool {
-	if computerUseStateID(before) != computerUseStateID(after) ||
-		before.PID != after.PID || before.BundleID != after.BundleID ||
+	if before.PID != after.PID || before.BundleID != after.BundleID ||
 		before.WindowFrame == nil || after.WindowFrame == nil ||
 		*before.WindowFrame != *after.WindowFrame ||
 		before.WindowID == nil || after.WindowID == nil || *before.WindowID != *after.WindowID {
@@ -1523,10 +1566,11 @@ func (t *ComputerUseTool) coordinateFocusedType(
 	if !ok {
 		return failure, nil
 	}
-	if !focus.matchesTree(current) ||
-		focus.observationBound && computerUseStateID(current) != args.StateID {
+	if !focus.matchesTree(current) {
 		return computerUseKeyboardTargetUnavailableV1(), nil
 	}
+	ref, entry, element, hasFocusedElement :=
+		computerUseFocusedElementAuthorityV1(current)
 	deadline := t.computerUseCoordinateNowV1().Add(
 		computerUseMutationDeadlineV1,
 	)
@@ -1543,22 +1587,94 @@ func (t *ComputerUseTool) coordinateFocusedType(
 		Text:             &text,
 		CommitDeadlineAt: deadline.UTC().Format(time.RFC3339Nano),
 	}
-	result, err := t.executeTargetBoundInput(ctx, args.Action, request)
-	if err == nil && !result.IsError && focus.locationNavigation &&
-		computerUseLocationNavigationTextV1(text) {
-		t.navigationCommit = &computerUseNavigationCommitV1{
-			pid: current.PID, bundleID: current.BundleID,
-			windowID: uint32(*current.WindowID),
-		}
+	if hasFocusedElement {
+		request.Ref = &ref
+		path, role, fingerprint := entry.Path, entry.Role, entry.Fingerprint
+		request.Path = &path
+		request.ExpectedRole = &role
+		request.ExpectedFingerprint = &fingerprint
 	}
+	result, err := t.executeTargetBoundInput(ctx, args.Action, request)
+	locationTarget := focus.locationNavigation
+	if hasFocusedElement {
+		locationTarget = locationTarget ||
+			computerUseLocationFieldEvidenceV1(element)
+	}
+	t.recordLocationNavigationCommitV1(
+		result,
+		err,
+		text,
+		current,
+		ref,
+		entry,
+		locationTarget,
+	)
 	return result, err
+}
+
+func computerUseFocusedElementAuthorityV1(
+	tree computerUseTree,
+) (string, computerUseRefPath, computerUseElement, bool) {
+	if tree.FocusedRef == nil || !validComputerUseRef(*tree.FocusedRef) {
+		return "", computerUseRefPath{}, computerUseElement{}, false
+	}
+	ref := *tree.FocusedRef
+	entry, exists := tree.RefPaths[ref]
+	if !exists || entry.Path == "" || entry.Role == "" ||
+		entry.Fingerprint == "" {
+		return "", computerUseRefPath{}, computerUseElement{}, false
+	}
+	element, err := resolveComputerUseFingerprint(
+		tree.Elements,
+		entry.Fingerprint,
+	)
+	if err != nil || element.Ref != ref ||
+		element.Path != entry.Path ||
+		element.Role != entry.Role ||
+		element.Fingerprint != entry.Fingerprint {
+		return "", computerUseRefPath{}, computerUseElement{}, false
+	}
+	return ref, entry, element, true
+}
+
+func (t *ComputerUseTool) recordLocationNavigationCommitV1(
+	result agent.ToolResult,
+	err error,
+	text string,
+	tree computerUseTree,
+	ref string,
+	entry computerUseRefPath,
+	locationTarget bool,
+) {
+	knownCommit := result.GUIOutcome != nil &&
+		(result.GUIOutcome.Result == agent.GUIActionResultVerified ||
+			result.GUIOutcome.Result == agent.GUIActionResultCompletedUnverified) &&
+		result.GUIOutcome.FailureCode != "commit_unknown" &&
+		result.GUIOutcome.FailureCode != "commit_status_unknown" &&
+		result.GUIOutcome.FailureCode != "action_commit_unknown" &&
+		result.GUIOutcome.FailureCode != "invalid_helper_result"
+	if err != nil || result.IsError || !knownCommit || !locationTarget ||
+		!computerUseLocationNavigationTextV1(text) ||
+		tree.WindowID == nil || *tree.WindowID <= 0 ||
+		uint64(*tree.WindowID) > uint64(^uint32(0)) {
+		return
+	}
+	t.navigationCommit = &computerUseNavigationCommitV1{
+		pid:         tree.PID,
+		bundleID:    tree.BundleID,
+		windowID:    uint32(*tree.WindowID),
+		ref:         ref,
+		path:        entry.Path,
+		role:        entry.Role,
+		fingerprint: entry.Fingerprint,
+	}
 }
 
 func computerUseKeyboardTargetUnavailableV1() agent.ToolResult {
 	result := agent.BusinessError(
 		"computer_use_error: keyboard_target_unavailable\n" +
-			"message: no current text target is available from an AX focused ref, a verified coordinate click, or a refreshed post-keypress window target\n" +
-			"recovery: re-observe the intended window and establish one exact text target before typing; do not retry automatically",
+			"message: no current exact AX focus or one-shot verified same-window focus handoff is available for this keyboard action\n" +
+			"recovery: re-observe the intended window and establish one focused text target before typing; do not retry automatically",
 	)
 	// No target-bound input request was constructed, so this is a known
 	// pre-commit rejection rather than an ambiguous keyboard mutation.
@@ -1582,15 +1698,14 @@ func (t *ComputerUseTool) hotkey(ctx context.Context, args computerUseArgs) (age
 	for index := range modifiers {
 		modifiers[index] = canonicalComputerUseHotkeyTokenV1(modifiers[index])
 	}
-	if computerUseHotkeyRequiresDestinationAuthorityV1(args.Keys) {
-		// Raw hotkeys have window authority but no trusted element/destination.
-		// Consume the observation even though no helper call occurred so the model
-		// must re-observe before selecting a different mutation path.
-		t.invalidateState()
-		return consequentialRiskToolFailureV1(ConsequentialRiskCodeUnsupportedPathV1), nil
-	}
 	if args.Ref != "" {
 		return agent.ValidationError("hotkey is window-bound and does not accept 'ref'"), nil
+	}
+	if computerUseKeyboardNeedsExactIntentV1(args) {
+		t.invalidateState()
+		return consequentialRiskToolFailureV1(
+			ConsequentialRiskCodeUnsupportedPathV1,
+		), nil
 	}
 	return t.targetBoundInput(ctx, args, "", key, modifiers)
 }
@@ -1610,10 +1725,12 @@ func (t *ComputerUseTool) keypress(
 		return agent.ValidationError(
 			"keypress exceeds the admitted key/modifier sequence"), nil
 	}
-	if computerUseKeypressRequiresDestinationAuthorityV1(args.Modifiers, args.KeySequence) &&
-		!t.consumeLocationNavigationCommitV1(args) {
+	if computerUseKeyboardNeedsExactIntentV1(args) &&
+		!t.allowsLocationNavigationCommitV1(args) {
 		t.invalidateState()
-		return consequentialRiskToolFailureV1(ConsequentialRiskCodeUnsupportedPathV1), nil
+		return consequentialRiskToolFailureV1(
+			ConsequentialRiskCodeUnsupportedPathV1,
+		), nil
 	}
 	return t.targetBoundInput(ctx, args, "", "", args.Modifiers)
 }
@@ -1639,6 +1756,7 @@ func (t *ComputerUseTool) targetBoundInput(
 		return agent.BusinessError("target-bound input requires typed bundle and unique window authority; call get_app_state again"), nil
 	}
 	var typeEntry refEntry
+	var navigationCommit *computerUseNavigationCommitV1
 	if args.Action == "type" {
 		var exists bool
 		typeEntry, exists = t.refs[args.Ref]
@@ -1648,6 +1766,14 @@ func (t *ComputerUseTool) targetBoundInput(
 		if typeEntry.path == "" || typeEntry.role == "" || typeEntry.fingerprint == "" {
 			return agent.BusinessError("target-bound type requires typed element authority; call get_app_state again"), nil
 		}
+	} else if computerUseKeyboardNeedsExactIntentV1(args) {
+		if !t.allowsLocationNavigationCommitV1(args) {
+			return consequentialRiskToolFailureV1(
+				ConsequentialRiskCodeUnsupportedPathV1,
+			), nil
+		}
+		navigationCommit = t.navigationCommit
+		t.navigationCommit = nil
 	}
 
 	current, failure, ok := t.readTree(
@@ -1655,7 +1781,7 @@ func (t *ComputerUseTool) targetBoundInput(
 	if !ok {
 		return failure, nil
 	}
-	if !hasOpenAINativeComputerActionV1(ctx) &&
+	if args.Action == "type" && !hasOpenAINativeComputerActionV1(ctx) &&
 		computerUseStateID(current) != args.StateID {
 		return agent.BusinessError("stale state detected before target-bound input; call get_app_state again"), nil
 	}
@@ -1669,6 +1795,15 @@ func (t *ComputerUseTool) targetBoundInput(
 	if args.Action == "type" {
 		if current.FocusedRef == nil || *current.FocusedRef != args.Ref {
 			return agent.BusinessError("target-bound type ref is no longer focused; call get_app_state again"), nil
+		}
+	} else if navigationCommit != nil && navigationCommit.ref != "" {
+		ref, entry, _, focused := computerUseFocusedElementAuthorityV1(current)
+		if !focused ||
+			ref != navigationCommit.ref ||
+			entry.Path != navigationCommit.path ||
+			entry.Role != navigationCommit.role ||
+			entry.Fingerprint != navigationCommit.fingerprint {
+			return computerUseKeyboardTargetUnavailableV1(), nil
 		}
 	}
 
@@ -1707,7 +1842,22 @@ func (t *ComputerUseTool) targetBoundInput(
 		request.Keys = &keys
 		request.Modifiers = &explicitModifiers
 	}
-	return t.executeTargetBoundInput(ctx, args.Action, request)
+	result, err := t.executeTargetBoundInput(ctx, args.Action, request)
+	if args.Action == "type" {
+		ref, entry, element, focused := computerUseFocusedElementAuthorityV1(current)
+		if focused && ref == args.Ref {
+			t.recordLocationNavigationCommitV1(
+				result,
+				err,
+				text,
+				current,
+				ref,
+				entry,
+				computerUseLocationFieldEvidenceV1(element),
+			)
+		}
+	}
+	return result, err
 }
 
 func (t *ComputerUseTool) executeTargetBoundInput(
@@ -1861,11 +2011,6 @@ func (t *ComputerUseTool) pixelScroll(
 		ctx, t.snapshot.pid, t.snapshot.filter, t.snapshot.budget)
 	if !ok {
 		return failure, nil
-	}
-	if !hasOpenAINativeComputerActionV1(ctx) &&
-		computerUseStateID(currentTree) != args.StateID {
-		return agent.BusinessError(
-			"stale state detected before pixel scroll; call get_app_state again"), nil
 	}
 	currentTarget, failure, ok := computerUseCoordinateCaptureRequestV1(currentTree)
 	if !ok {
@@ -2112,10 +2257,6 @@ func (t *ComputerUseTool) drag(ctx context.Context, args computerUseArgs) (agent
 	currentTree, failure, ok := t.readTree(ctx, t.snapshot.pid, t.snapshot.filter, t.snapshot.budget)
 	if !ok {
 		return failure, nil
-	}
-	if !hasOpenAINativeComputerActionV1(ctx) &&
-		computerUseStateID(currentTree) != args.StateID {
-		return agent.BusinessError("stale state detected before drag; call get_app_state again"), nil
 	}
 	currentTarget, failure, ok := computerUseCoordinateCaptureRequestV1(currentTree)
 	if !ok {
@@ -2498,10 +2639,6 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 	)
 	if !ok {
 		return failure, nil
-	}
-	if !hasOpenAINativeComputerActionV1(ctx) &&
-		computerUseStateID(currentTree) != args.StateID {
-		return agent.BusinessError("stale state detected before coordinate action; call get_app_state again"), nil
 	}
 	currentTarget, failure, ok := computerUseCoordinateCaptureRequestV1(currentTree)
 	if !ok {
