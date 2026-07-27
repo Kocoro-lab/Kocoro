@@ -303,6 +303,15 @@ func withOpenAIComputerTaskFailureOutcomeV1(
 	return result
 }
 
+func openAIComputerPreActionRecoveryV1(
+	appPreparationMayHaveOccurred bool,
+) string {
+	if appPreparationMayHaveOccurred {
+		return "no native input action committed; requested app launch or focus may already have occurred; another appropriate non-computer_use control path may be used only if the user did not require Computer Use specifically"
+	}
+	return "no desktop action was attempted; another appropriate non-computer_use control path may be used only if the user did not require Computer Use specifically"
+}
+
 type openAIComputerTaskRuntimeV1 interface {
 	openAIComputerActionRuntimeV1
 	ResolveTaskAppV1(
@@ -615,7 +624,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			agent.BusinessError(
 				"computer_use_error: native_executor_unavailable\n"+
 					"message: OpenAI native Computer Use is temporarily unavailable\n"+
-					"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+					"recovery: "+openAIComputerPreActionRecoveryV1(false)+"\n"+
 					"detail: the local native executor is unavailable",
 			),
 			agent.ComputerUseTaskNotCompleted,
@@ -647,7 +656,7 @@ func (t *openAIComputerTaskToolV1) Run(
 				agent.BusinessError(
 					"computer_use_error: backend_contract_unavailable\n"+
 						"message: OpenAI native Computer Use is unavailable because its execution profile could not be resolved\n"+
-						"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+						"recovery: "+openAIComputerPreActionRecoveryV1(false)+"\n"+
 						"detail: "+t.profileErr.Error(),
 				),
 				agent.ComputerUseTaskNotCompleted,
@@ -677,7 +686,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			agent.BusinessError(
 				"computer_use_error: backend_contract_unsupported\n"+
 					"message: OpenAI native Computer Use is temporarily unavailable\n"+
-					"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+					"recovery: "+openAIComputerPreActionRecoveryV1(false)+"\n"+
 					"detail: the resolved execution profile does not support the native computer contract",
 			),
 			agent.ComputerUseTaskNotCompleted,
@@ -709,7 +718,12 @@ func (t *openAIComputerTaskToolV1) Run(
 				DurationMS:  time.Since(resolutionStarted).Milliseconds(),
 			})
 			return withOpenAIComputerTaskFailureOutcomeV1(
-				agent.BusinessError(err.Error()),
+				agent.BusinessError(
+					"computer_use_error: app_resolution_failed\n"+
+						"message: Computer Use could not resolve the requested app target\n"+
+						"recovery: "+openAIComputerPreActionRecoveryV1(false)+"\n"+
+						"detail: "+err.Error(),
+				),
 				agent.ComputerUseTaskNotCompleted,
 				agent.ComputerUseCommitNone,
 				"app_resolution_failed",
@@ -785,7 +799,12 @@ func (t *openAIComputerTaskToolV1) Run(
 		}
 		trace.record(event)
 		return withOpenAIComputerTaskFailureOutcomeV1(
-			agent.BusinessError(err.Error()),
+			agent.BusinessError(
+				"computer_use_error: app_launch_focus_failed\n"+
+					"message: Computer Use could not finish preparing the requested app target\n"+
+					"recovery: "+openAIComputerPreActionRecoveryV1(len(apps) > 0)+"\n"+
+					"detail: "+err.Error(),
+			),
 			agent.ComputerUseTaskNotCompleted,
 			agent.ComputerUseCommitNone,
 			"app_launch_focus_failed",
@@ -933,8 +952,7 @@ func (t *openAIComputerTaskToolV1) Run(
 		if failureCode == "initial_image_unavailable" ||
 			retryableOpenAIComputerObservationFailureCodeV1(failureCode) {
 			recovery = agent.ComputerUseRecoveryAlternateControl
-			recoveryText =
-				"no desktop action was attempted; another appropriate control path may be used in this turn"
+			recoveryText = openAIComputerPreActionRecoveryV1(len(apps) > 0)
 		} else if failureCode == "app_policy_blocked" {
 			recoveryText =
 				"do not retry or bypass the protected-app boundary with another desktop-control path"
@@ -959,7 +977,12 @@ func (t *openAIComputerTaskToolV1) Run(
 	)
 	if err != nil {
 		return withOpenAIComputerTaskFailureOutcomeV1(
-			agent.BusinessError(err.Error()),
+			agent.BusinessError(
+				"computer_use_error: native_executor_unavailable\n"+
+					"message: the private OpenAI Computer Use executor could not be initialized\n"+
+					"recovery: "+openAIComputerPreActionRecoveryV1(len(apps) > 0)+"\n"+
+					"detail: "+err.Error(),
+			),
 			agent.ComputerUseTaskNotCompleted,
 			agent.ComputerUseCommitNone,
 			"native_executor_unavailable",
@@ -1108,7 +1131,7 @@ func (t *openAIComputerTaskToolV1) Run(
 				agent.BusinessError(
 					"computer_use_error: executor_timeout_before_action\n"+
 						"message: the private OpenAI Computer Use executor did not return an initial action plan within its bounded response window\n"+
-						"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+						"recovery: "+openAIComputerPreActionRecoveryV1(len(apps) > 0)+"\n"+
 						"detail: "+initialUnavailable.Error(),
 				),
 				agent.ComputerUseTaskNotCompleted,
@@ -1159,7 +1182,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			outcomeRecovery := agent.ComputerUseRecoveryNone
 			if stats.Batches == 0 {
 				failureCode = "executor_timeout_before_action"
-				recovery = "no desktop action was attempted; another appropriate control path may be used in this turn"
+				recovery = openAIComputerPreActionRecoveryV1(len(apps) > 0)
 				outcomeRecovery = agent.ComputerUseRecoveryAlternateControl
 			}
 			trace.record(openAIComputerTraceEventV1{
@@ -1233,7 +1256,7 @@ func (t *openAIComputerTaskToolV1) Run(
 		recovery := "do not retry computer_use or attempt alternate desktop-control tools in this turn; report the executor failure without guessing that the target app is missing or blocked"
 		if stats.Batches == 0 {
 			failureCode = "executor_failed_before_action"
-			recovery = "no desktop action was attempted; another appropriate control path may be used in this turn"
+			recovery = openAIComputerPreActionRecoveryV1(len(apps) > 0)
 		} else if stats.TaskEffect == agent.ComputerUseCommitNone {
 			failureCode = "executor_failed_without_mutation"
 			recovery = "do not start another desktop-control path in this turn; report the executor failure and its last failure code"
@@ -1277,7 +1300,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			agent.BusinessError(
 				"computer_use_error: no_desktop_action\n"+
 					"message: the private OpenAI Computer Use executor finished without issuing any native computer batch, so the task was not done\n"+
-					"recovery: no desktop action was attempted; another appropriate control path may be used in this turn\n"+
+					"recovery: "+openAIComputerPreActionRecoveryV1(len(apps) > 0)+"\n"+
 					"detail: "+detail,
 			),
 			agent.ComputerUseTaskNotCompleted,

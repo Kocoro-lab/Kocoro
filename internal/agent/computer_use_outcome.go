@@ -2,8 +2,11 @@ package agent
 
 import "fmt"
 
-// ComputerUseCommitEffect is the task-level, monotonic summary of desktop
-// mutations. It is daemon-internal and must never be inferred from model text.
+// ComputerUseCommitEffect is the task-level, monotonic summary of
+// replay-sensitive native input mutations. App launch/focus preparation is
+// reported separately in the task result because repeating it is not the same
+// duplicate-side-effect risk as repeating click, key, type, scroll, or drag.
+// This value is daemon-internal and must never be inferred from model text.
 type ComputerUseCommitEffect string
 
 const (

@@ -250,6 +250,8 @@ type openAIComputerDaemonRuntimeProbe struct {
 	targetRefreshPlanErr   error
 	keyboardTargets        int
 	keyboardTargetErr      error
+	resolveErr             error
+	launchErr              error
 	initialObservationApps []string
 	resolvedApps           []string
 	launchedApps           []tools.OpenAIComputerTaskAppV1
@@ -260,6 +262,9 @@ func (r *openAIComputerDaemonRuntimeProbe) ResolveTaskAppV1(
 	app string,
 ) (tools.OpenAIComputerTaskAppV1, error) {
 	r.resolvedApps = append(r.resolvedApps, app)
+	if r.resolveErr != nil {
+		return tools.OpenAIComputerTaskAppV1{}, r.resolveErr
+	}
 	return tools.OpenAIComputerTaskAppV1{
 		App:      app,
 		BundleID: "com.example." + strings.ToLower(app),
@@ -271,7 +276,7 @@ func (r *openAIComputerDaemonRuntimeProbe) LaunchAndFocusTaskAppsV1(
 	apps []tools.OpenAIComputerTaskAppV1,
 ) error {
 	r.launchedApps = append(r.launchedApps, apps...)
-	return nil
+	return r.launchErr
 }
 
 func (r *openAIComputerDaemonRuntimeProbe) PlanOpenAIComputerActionV1(
@@ -1551,7 +1556,7 @@ func TestOpenAIComputerTaskToolResolverFailureDoesNotTouchDesktop(t *testing.T) 
 			t.Fatalf("task Run %d: %v", attempt, err)
 		}
 		if !result.IsError ||
-			!strings.Contains(result.Content, "another appropriate control path") ||
+			!strings.Contains(result.Content, "another appropriate non-computer_use control path") ||
 			!strings.Contains(result.Content, "no desktop action was attempted") ||
 			result.ComputerUseOutcome == nil ||
 			result.ComputerUseOutcome.Recovery !=
@@ -1616,7 +1621,9 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "initial_observation_unavailable") ||
-		!strings.Contains(result.Content, "another appropriate control path") ||
+		!strings.Contains(result.Content, "another appropriate non-computer_use control path") ||
+		!strings.Contains(result.Content, "app launch or focus may already have occurred") ||
+		strings.Contains(result.Content, "no desktop action was attempted") ||
 		!strings.Contains(result.Content, "window_changed") ||
 		result.ComputerUseOutcome == nil ||
 		result.ComputerUseOutcome.Recovery !=
@@ -1630,6 +1637,103 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	if got := strings.Join(probe.runNames(), ","); got !=
 		"final_screenshot,final_screenshot,final_screenshot,final_screenshot,final_screenshot" {
 		t.Fatalf("initial observation attempts = %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolAppResolutionFailureHasExecutableRecovery(
+	t *testing.T,
+) {
+	runtime := &openAIComputerDaemonRuntimeProbe{
+		tool:       &openAIComputerDaemonProbeTool{},
+		resolveErr: errors.New("requested app is not installed"),
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:    &openAIComputerDaemonLoopLLM{},
+		profile:    trustedOpenAIComputerProfileForDaemon(t),
+		childTools: agent.NewToolRegistry(),
+		workflow: testGUIWorkflow(
+			guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{}),
+			"session-openai-app-resolution-failure",
+			"turn-openai-app-resolution-failure",
+		),
+		runtime: runtime,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Open Missing App","apps":["Missing App"],`+
+			`"description":"Open the app"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "app_resolution_failed") ||
+		!strings.Contains(result.Content, "no desktop action was attempted") ||
+		!strings.Contains(
+			result.Content,
+			"only if the user did not require Computer Use specifically",
+		) ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Recovery !=
+			agent.ComputerUseRecoveryAlternateControl {
+		t.Fatalf("task result = %+v", result)
+	}
+	if len(runtime.resolvedApps) != 1 ||
+		len(runtime.launchedApps) != 0 {
+		t.Fatalf(
+			"resolution failure touched launch: resolved=%v launched=%v",
+			runtime.resolvedApps,
+			runtime.launchedApps,
+		)
+	}
+}
+
+func TestOpenAIComputerTaskToolLaunchFailureReportsPossiblePreparation(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-launch-failure",
+		"turn-openai-launch-failure",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	runtime := &openAIComputerDaemonRuntimeProbe{
+		tool:      &openAIComputerDaemonProbeTool{},
+		launchErr: errors.New("frontmost target did not stabilize"),
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:    &openAIComputerDaemonLoopLLM{},
+		profile:    trustedOpenAIComputerProfileForDaemon(t),
+		childTools: agent.NewToolRegistry(),
+		workflow:   workflow,
+		runtime:    runtime,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Open Calculator","apps":["Calculator"],`+
+			`"description":"Open the app"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "app_launch_focus_failed") ||
+		!strings.Contains(result.Content, "app launch or focus may already have occurred") ||
+		strings.Contains(result.Content, "no desktop action was attempted") ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Recovery !=
+			agent.ComputerUseRecoveryAlternateControl {
+		t.Fatalf("task result = %+v", result)
+	}
+	if len(runtime.launchedApps) != 1 ||
+		runtime.launchedApps[0].App != "Calculator" {
+		t.Fatalf("launch attempts = %+v", runtime.launchedApps)
 	}
 }
 
@@ -2082,7 +2186,8 @@ func TestOpenAIComputerTaskToolExecutorFailureBeforeActionDoesNotClaimUnknownSid
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "executor_failed_before_action") ||
-		!strings.Contains(result.Content, "no desktop action was attempted") ||
+		!strings.Contains(result.Content, "app launch or focus may already have occurred") ||
+		strings.Contains(result.Content, "no desktop action was attempted") ||
 		strings.Contains(result.Content, "alternate desktop-control tools") ||
 		!strings.Contains(result.Content, "malformed provider response") {
 		t.Fatalf("task result = %+v", result)
@@ -2236,7 +2341,8 @@ func TestOpenAIComputerTaskToolBoundsPrivateExecutorDuration(t *testing.T) {
 	if !result.IsError ||
 		!strings.Contains(result.Content, "executor_timeout_before_action") ||
 		!strings.Contains(result.Content, "exceeded 20ms") ||
-		!strings.Contains(result.Content, "no desktop action was attempted") ||
+		!strings.Contains(result.Content, "app launch or focus may already have occurred") ||
+		strings.Contains(result.Content, "no desktop action was attempted") ||
 		strings.Contains(result.Content, "alternate desktop-control tools") {
 		t.Fatalf("task result = %+v", result)
 	}
@@ -2350,7 +2456,8 @@ func TestOpenAIComputerTaskToolBoundsAndReportsInitialProviderStall(
 	if !result.IsError ||
 		!strings.Contains(result.Content, "executor_timeout_before_action") ||
 		!strings.Contains(result.Content, "after 2 bounded attempts of 10ms") ||
-		!strings.Contains(result.Content, "no desktop action was attempted") ||
+		!strings.Contains(result.Content, "app launch or focus may already have occurred") ||
+		strings.Contains(result.Content, "no desktop action was attempted") ||
 		strings.Contains(result.Content, "alternate desktop-control tools") {
 		t.Fatalf("task result = %+v", result)
 	}
@@ -2423,7 +2530,9 @@ func TestOpenAIComputerTaskToolRejectsCompletionClaimWithoutAnyDesktopAction(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "no_desktop_action") ||
-		!strings.Contains(result.Content, "another appropriate control path") ||
+		!strings.Contains(result.Content, "another appropriate non-computer_use control path") ||
+		!strings.Contains(result.Content, "app launch or focus may already have occurred") ||
+		strings.Contains(result.Content, "no desktop action was attempted") ||
 		!strings.Contains(result.Content, "I finished 250*0.01 in Calculator.") ||
 		result.ComputerUseOutcome == nil ||
 		result.ComputerUseOutcome.Recovery !=
