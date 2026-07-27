@@ -1962,15 +1962,18 @@ type approvedToolCall struct {
 }
 
 // assembleUserMessage combines stable per-session context with the user query.
-// The gateway's Anthropic provider splits on <!-- cache_break -->, caching the prefix.
-// Layout: [stableContext]\n<!-- cache_break -->\n[userMessage]
+// Cloud's Anthropic provider splits this message on <!-- cache_break --> into
+// two text blocks and attaches breakpoint 3 to the first one.
+// Layout: [stableContext]\n<!-- cache_break -->\n[volatileContext]\n\n[userMessage]
 //
-// Note: VolatileContext (memory, date/time, CWD, MCP) is stitched into the
-// System prompt by prompt.BuildSystemPrompt (after a `<!-- volatile -->`
-// marker so Shannon excludes it from the cached prefix). It is NOT consumed
-// here — this keeps user message bytes stable across turns so cross-turn
-// cache hits don't drift every minute due to embedded timestamps.
-// The defensive concat below handles callers that manually populate the field.
+// VolatileContext (memory, date/time, CWD, MCP context) is consumed HERE, in
+// the post-break half. Moving it into the System prompt behind a
+// `<!-- volatile -->` marker was tried and reverted — those bytes sit BEFORE
+// the tools cache_control, so the embedded timestamp broke the tools cache
+// every minute (see prompt.BuildSystemPrompt). Landing it after cache_break
+// confines per-turn drift to the uncached tail, leaving system + tools +
+// the stable prefix intact; the next turn's rolling marker absorbs the tail
+// into the cached prefix anyway.
 func assembleUserMessage(parts prompt.PromptParts, userMessage string) string {
 	var sb strings.Builder
 

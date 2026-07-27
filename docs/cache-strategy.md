@@ -15,12 +15,25 @@ touching the LLM request path.
 
 ## Breakpoint allocation (Anthropic cap = 4)
 
-| # | Position | Contents | Cache policy |
+Kocoro never writes `cache_control` on the wire. It positions content and emits
+a plain-text `<!-- cache_break -->` marker; Cloud's
+`anthropic_provider._build_api_request` translates that layout into the four
+breakpoints below.
+
+| # | Position on the wire | Contents | Cache policy |
 |---|---|---|---|
-| 1 | `system_stable` | gateway-cached persona + tools list + skills (excl. `<!-- volatile -->` tail) | Cloud request policy |
+| 1 | `system[0]` | persona + core operational rules + **local** tool names + IM/output/memory guidance. No skills and no MCP/gateway tool names — both are per-user and would break the BP #1 byte invariant | Cloud request policy |
 | 2 | `tools[-1]` | last tool definition — caches all tool schemas | Cloud request policy |
-| 3 | `user_1.cache_break` | per-session stable instructions + sticky context (before `<!-- cache_break -->`) | Cloud request policy |
-| 4 | `rolling marker on claude_messages[-2]` | per-turn rolling cache point | Cloud request policy |
+| 3 | `claude_messages[-1].content[0]` | the CURRENT turn's scaffolded user message, prefix half: shared instructions + sticky context + per-user tool catalog (everything before `<!-- cache_break -->`) | Cloud request policy |
+| 4 | `claude_messages[-2]`, last cache-eligible block | per-turn rolling cache point | Cloud request policy |
+
+**Numbering is historical, not positional.** On the wire BP #4 precedes BP #3:
+the rolling marker lands on the second-to-last message, while BP #3 lands on
+the last one (the current turn's user message). BP #3 is also NOT "the first
+user message" — persisted history strips the scaffold (`captureRunMessages`
+restores the raw user text), so exactly one `<!-- cache_break -->` exists per
+request no matter how long the session runs. That is what keeps the total at
+exactly 4 and inside Anthropic's cap.
 
 **BP #1 byte invariant (issue #107):** `system_stable` MUST be byte-identical
 for any two users running the same agent on the same OS. Per-user values
@@ -33,7 +46,9 @@ field on `cache_summary` audit entries (`internal/audit/audit.go`).
 
 All 4 breakpoints on a single request use the **same** `cache_control` dict.
 
-Volatile content (date, CWD, agent memory, MCP context) lives in the `user_1` block **after** the `<!-- cache_break -->` marker, or in a `<!-- volatile -->` tail inside the system prompt. Both positions leave breakpoints 1-4 byte-stable.
+Volatile content (date, CWD, agent memory, MCP context) lives in the current turn's user message **after** the `<!-- cache_break -->` marker, together with the raw user text, the skill listing, and the Language directive. None of it is covered by a breakpoint on the turn it is created — it is uncached input that turn, and the next turn's rolling marker absorbs it into the cached prefix.
+
+Cloud's `_split_system_message` also supports a `<!-- volatile -->` tail inside the system prompt, but **Kocoro does not emit that marker** — the ShanClaw path always sends a single system block. Routing volatile content there was tried and reverted: those bytes sit BEFORE the tools `cache_control`, so an embedded timestamp broke the tools cache every minute. See the note on `prompt.BuildSystemPrompt`.
 
 ## Cache source and current TTL policy
 
@@ -83,7 +98,7 @@ Regression tests: `internal/client/gateway_test.go::TestNormalizeToolInput_Canon
 
 A single rolling cache_control marker is placed on `claude_messages[-2]` by `_convert_messages_to_claude_format`. That's the entire story — there is NO cross-turn prev-marker preservation (`_apply_rolling_cache_marker` is defined but not called).
 
-Why not preserve prev marker: a direct bench (2026-04-15) showed it regresses 30-turn CHR from 93.6% → 61% and CER from 18.1x → 4.0x. Root cause: the preservation path calls `_strip_message_cache_control` on `user_1` to free a breakpoint slot for the prev marker, but stripping mutates the block's wire-bytes. Even though non-cache_control content is byte-identical, Anthropic's prefix matcher treats the resulting block as different, so the "free cached prefix up to prev_marker" fails to match, and the whole history falls through to uncached input. The single-rolling-marker layout is optimal under the public API's 4-breakpoint cap.
+Why not preserve prev marker: a direct bench (2026-04-15) showed it regresses 30-turn CHR from 93.6% → 61% and CER from 18.1x → 4.0x. Root cause: the preservation path calls `_strip_message_cache_control` on the current turn's user message to free a breakpoint slot for the prev marker, but stripping mutates the block's wire-bytes. Even though non-cache_control content is byte-identical, Anthropic's prefix matcher treats the resulting block as different, so the "free cached prefix up to prev_marker" fails to match, and the whole history falls through to uncached input. The single-rolling-marker layout is optimal under the public API's 4-breakpoint cap.
 
 **Evidence**: bench session `2026-04-15-longbench-1776236xxx` — 30 user turns, 40 model calls (1.3 calls/turn), msgs 2→80, CHR 93.6%, CER 18.07x. Parallel-workload bench (3 sub-tasks per prompt, 15 turns) — 21 reqs, CHR 93.8%, CER 20.14x.
 
