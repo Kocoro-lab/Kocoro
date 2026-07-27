@@ -350,7 +350,10 @@ func (result CoordinatePixelScrollResultV1) ValidateTaggedUnion() error {
 				return fmt.Errorf("normal pixel scroll acknowledgement is invalid")
 			}
 		case "cancelled_before_scroll", "request_expired_before_scroll",
-			"scroll_not_committed":
+			"scroll_not_committed", "scroll_event_creation_failed",
+			"scroll_event_type_mismatch", "scroll_event_location_mismatch",
+			"scroll_event_continuity_mismatch", "scroll_event_delta_mismatch",
+			"scroll_commit_gate_rejected":
 			if !beforeScroll {
 				return fmt.Errorf("invalid pre-scroll terminal acknowledgement")
 			}

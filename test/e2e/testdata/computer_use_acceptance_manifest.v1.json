@@ -6,7 +6,10 @@
     "paid_model_calls": true,
     "one_pointer_operator": true,
     "secondary_display_paused": true,
-    "default_timeout_seconds": 120
+    "default_timeout_seconds": 120,
+    "max_fix_cycles_per_checkpoint": 1,
+    "non_safety_reproduction_required": 2,
+    "out_of_scope_behavior": "record_only"
   },
   "scenarios": [
     {
@@ -53,6 +56,24 @@
       ],
       "risk": "ordinary_mutation",
       "tags": ["cold_launch", "keyboard_focus", "url_navigation", "content_readback"]
+    },
+    {
+      "id": "chrome_multi_window_url_navigation",
+      "enabled_by_default": true,
+      "prompt": "Use Computer Use to open Chrome, enter waylandz.com, open the blog page, and summarize its content.",
+      "preconditions": [
+        "Chrome is already running with at least two normal windows.",
+        "The currently focused Chrome window is not already on waylandz.com.",
+        "Network access to waylandz.com is available."
+      ],
+      "expected_state": [
+        "Computer Use keeps observation and keyboard input bound to the same focused Chrome window.",
+        "The final visible page is the waylandz.com blog page.",
+        "The tool result itself contains a grounded content summary rather than only claiming that content was recorded.",
+        "The parent does not make a second computer_use call in the same turn."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["warm_window", "multiple_windows", "keyboard_focus", "url_navigation", "content_readback"]
     },
     {
       "id": "textedit_calculator_cross_app",

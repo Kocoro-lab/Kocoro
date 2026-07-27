@@ -12,11 +12,14 @@ type computerUseAcceptanceManifestV1 struct {
 	SchemaVersion int    `json:"schema_version"`
 	Suite         string `json:"suite"`
 	RunPolicy     struct {
-		ManualOnly            bool `json:"manual_only"`
-		PaidModelCalls        bool `json:"paid_model_calls"`
-		OnePointerOperator    bool `json:"one_pointer_operator"`
-		SecondaryDisplayPause bool `json:"secondary_display_paused"`
-		DefaultTimeoutSeconds int  `json:"default_timeout_seconds"`
+		ManualOnly            bool   `json:"manual_only"`
+		PaidModelCalls        bool   `json:"paid_model_calls"`
+		OnePointerOperator    bool   `json:"one_pointer_operator"`
+		SecondaryDisplayPause bool   `json:"secondary_display_paused"`
+		DefaultTimeoutSeconds int    `json:"default_timeout_seconds"`
+		MaxFixCycles          int    `json:"max_fix_cycles_per_checkpoint"`
+		ReproductionRequired  int    `json:"non_safety_reproduction_required"`
+		OutOfScopeBehavior    string `json:"out_of_scope_behavior"`
 	} `json:"run_policy"`
 	Scenarios []struct {
 		ID               string   `json:"id"`
@@ -53,7 +56,10 @@ func TestOffline_ComputerUseAcceptanceManifestIsFrozenAndSafe(t *testing.T) {
 		!manifest.RunPolicy.PaidModelCalls ||
 		!manifest.RunPolicy.OnePointerOperator ||
 		!manifest.RunPolicy.SecondaryDisplayPause ||
-		manifest.RunPolicy.DefaultTimeoutSeconds != 120 {
+		manifest.RunPolicy.DefaultTimeoutSeconds != 120 ||
+		manifest.RunPolicy.MaxFixCycles != 1 ||
+		manifest.RunPolicy.ReproductionRequired != 2 ||
+		manifest.RunPolicy.OutOfScopeBehavior != "record_only" {
 		t.Fatalf("unsafe or drifting run policy: %+v", manifest.RunPolicy)
 	}
 	if len(manifest.Scenarios) < 7 {
@@ -80,6 +86,7 @@ func TestOffline_ComputerUseAcceptanceManifestIsFrozenAndSafe(t *testing.T) {
 		"calculator_cold_launch",
 		"calculator_warm_window",
 		"chrome_cold_url_navigation",
+		"chrome_multi_window_url_navigation",
 		"textedit_calculator_cross_app",
 		"slack_draft_without_send",
 		"slack_send_with_confirmation",

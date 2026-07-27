@@ -448,7 +448,10 @@ private func validateCoordinatePixelScrollResultV1(
         case "scroll_postcondition_not_declared":
             return afterScroll && endpoint.verified
         case "cancelled_before_scroll", "request_expired_before_scroll",
-             "scroll_not_committed":
+             "scroll_not_committed", "scroll_event_creation_failed",
+             "scroll_event_type_mismatch", "scroll_event_location_mismatch",
+             "scroll_event_continuity_mismatch", "scroll_event_delta_mismatch",
+             "scroll_commit_gate_rejected":
             return beforeScroll
         case "pointer_endpoint_not_verified":
             return beforeScroll && !endpoint.verified
@@ -514,7 +517,7 @@ struct CoordinatePixelScrollPreparedEventsV1 {
     let scrollEventPointDeltaAxis1: Int64
     let scrollEventPointDeltaAxis2: Int64
     let postPointerMove: () -> CoordinatePixelScrollCommitStateV1
-    let postScroll: () -> CoordinatePixelScrollCommitStateV1
+    let postScroll: () -> CoordinatePixelScrollPostResultV1
 
     init(
         point: CoordinateMouseEventPointV1,
@@ -533,7 +536,7 @@ struct CoordinatePixelScrollPreparedEventsV1 {
         scrollEventPointDeltaAxis1: Int64? = nil,
         scrollEventPointDeltaAxis2: Int64? = nil,
         postPointerMove: @escaping () -> CoordinatePixelScrollCommitStateV1,
-        postScroll: @escaping () -> CoordinatePixelScrollCommitStateV1
+        postScroll: @escaping () -> CoordinatePixelScrollPostResultV1
     ) {
         self.point = point
         self.providerDeltaX = providerDeltaX
@@ -554,6 +557,23 @@ struct CoordinatePixelScrollPreparedEventsV1 {
             scrollEventPointDeltaAxis2 ?? Int64(cgDeltas.axis2)
         self.postPointerMove = postPointerMove
         self.postScroll = postScroll
+    }
+}
+
+struct CoordinatePixelScrollPostResultV1 {
+    let state: CoordinatePixelScrollCommitStateV1
+    let failureCode: String?
+
+    static func committed() -> Self {
+        .init(state: .committed, failureCode: nil)
+    }
+
+    static func unknown() -> Self {
+        .init(state: .unknown, failureCode: nil)
+    }
+
+    static func notCommitted(_ failureCode: String) -> Self {
+        .init(state: .notCommitted, failureCode: failureCode)
     }
 }
 
@@ -584,6 +604,31 @@ private func pixelScrollPointMatches(
     guard let observed else { return false }
     return abs(expected.x - observed.x) <= coordinatePixelScrollPointerToleranceV1 &&
         abs(expected.y - observed.y) <= coordinatePixelScrollPointerToleranceV1
+}
+
+func coordinatePixelScrollEventFailureCodeV1(
+    expectedPoint: CoordinateMouseEventPointV1,
+    eventType: CGEventType,
+    eventLocation: CoordinateMouseEventPointV1,
+    continuous: Int64,
+    axis1: Int64,
+    axis2: Int64,
+    expectedAxis1: Int64,
+    expectedAxis2: Int64
+) -> String? {
+    guard eventType == .scrollWheel else {
+        return "scroll_event_type_mismatch"
+    }
+    guard pixelScrollPointMatches(expectedPoint, eventLocation) else {
+        return "scroll_event_location_mismatch"
+    }
+    guard continuous != 0 else {
+        return "scroll_event_continuity_mismatch"
+    }
+    guard axis1 == expectedAxis1, axis2 == expectedAxis2 else {
+        return "scroll_event_delta_mismatch"
+    }
+    return nil
 }
 
 private func pixelScrollEndpoint(
@@ -665,11 +710,15 @@ func runCoordinatePixelScrollV1(
           prepared.pointerMoveEventType == .mouseMoved,
           prepared.pointerMoveEventLocation == request.quartzPoint,
           prepared.pointerMoveExpectedEventCount <= 1,
-          prepared.scrollEventType == .scrollWheel,
-          prepared.scrollEventLocation == request.quartzPoint,
-          prepared.scrollEventContinuous != 0,
-          prepared.scrollEventPointDeltaAxis1 == Int64(prepared.cgDeltas.axis1),
-          prepared.scrollEventPointDeltaAxis2 == Int64(prepared.cgDeltas.axis2) else {
+          coordinatePixelScrollEventFailureCodeV1(
+            expectedPoint: request.quartzPoint,
+            eventType: prepared.scrollEventType,
+            eventLocation: prepared.scrollEventLocation,
+            continuous: prepared.scrollEventContinuous,
+            axis1: prepared.scrollEventPointDeltaAxis1,
+            axis2: prepared.scrollEventPointDeltaAxis2,
+            expectedAxis1: Int64(prepared.cgDeltas.axis1),
+            expectedAxis2: Int64(prepared.cgDeltas.axis2)) == nil else {
         return pixelScrollFailure(
             request: request, "event_preparation_failed", phase: "preparation")
     }
@@ -814,13 +863,14 @@ func runCoordinatePixelScrollV1(
             phase: "between_commits", code: "request_expired_before_scroll",
             observed: observed)
     }
-    let scrollState = prepared.postScroll()
-    switch scrollState {
+    let scrollResult = prepared.postScroll()
+    switch scrollResult.state {
     case .notCommitted:
         return pixelScrollResult(
             request: request, status: "committed_unverified",
             move: .committed, scroll: .notCommitted,
-            phase: "between_commits", code: "scroll_not_committed",
+            phase: "between_commits",
+            code: scrollResult.failureCode ?? "scroll_not_committed",
             observed: observed)
     case .unknown:
         return pixelScrollResult(
@@ -925,9 +975,15 @@ func productionCoordinatePixelScrollPreparedEventsV1(
     let axis2 = scroll.getIntegerValueField(.scrollWheelEventPointDeltaAxis2)
     let moveRequired = currentPointer != point
     let verified = move.type == .mouseMoved && moveLocation == point &&
-        scroll.type == .scrollWheel && scrollLocation == point &&
-        continuous != 0 && axis1 == Int64(deltas.axis1) &&
-        axis2 == Int64(deltas.axis2)
+        coordinatePixelScrollEventFailureCodeV1(
+            expectedPoint: point,
+            eventType: scroll.type,
+            eventLocation: scrollLocation,
+            continuous: continuous,
+            axis1: axis1,
+            axis2: axis2,
+            expectedAxis1: Int64(deltas.axis1),
+            expectedAxis2: Int64(deltas.axis2)) == nil
     guard verified else { return nil }
     return .init(
         point: point, providerDeltaX: providerDeltaX,
@@ -964,27 +1020,32 @@ func productionCoordinatePixelScrollPreparedEventsV1(
                 scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
                 wheel1: deltas.axis1, wheel2: deltas.axis2, wheel3: 0)
             else {
-                return .notCommitted
+                return .notCommitted("scroll_event_creation_failed")
             }
             let liveLocation = CoordinateMouseEventPointV1(
                 x: liveScroll.location.x, y: liveScroll.location.y)
-            guard liveScroll.type == .scrollWheel,
-                  liveLocation == point,
-                  liveScroll.getIntegerValueField(
-                    .scrollWheelEventIsContinuous) != 0,
-                  liveScroll.getIntegerValueField(
-                    .scrollWheelEventPointDeltaAxis1) == Int64(deltas.axis1),
-                  liveScroll.getIntegerValueField(
-                    .scrollWheelEventPointDeltaAxis2) == Int64(deltas.axis2)
-            else {
-                return .notCommitted
+            if let failureCode = coordinatePixelScrollEventFailureCodeV1(
+                expectedPoint: point,
+                eventType: liveScroll.type,
+                eventLocation: liveLocation,
+                continuous: liveScroll.getIntegerValueField(
+                    .scrollWheelEventIsContinuous),
+                axis1: liveScroll.getIntegerValueField(
+                    .scrollWheelEventPointDeltaAxis1),
+                axis2: liveScroll.getIntegerValueField(
+                    .scrollWheelEventPointDeltaAxis2),
+                expectedAxis1: Int64(deltas.axis1),
+                expectedAxis2: Int64(deltas.axis2)
+            ) {
+                return .notCommitted(failureCode)
             }
-            return processInputCommitGateV1.commitSample {
+            let committed = processInputCommitGateV1.commitSample {
                 liveScroll.post(tap: .cghidEventTap)
                 return true
             }
-                ? CoordinatePixelScrollCommitStateV1.committed
-                : CoordinatePixelScrollCommitStateV1.notCommitted
+            return committed
+                ? .committed()
+                : .notCommitted("scroll_commit_gate_rejected")
         })
 }
 

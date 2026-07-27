@@ -94,6 +94,8 @@ func TestCoordinateConsequentialRiskSupportsOnlyTrustedSufficientSendDeletePurch
 		{name: "delete destination unknown", title: "Delete", wantStatus: ConsequentialRiskPreflightBlockedV1, wantCode: ConsequentialRiskCodeDestinationUnknownV1},
 		{name: "purchase amount unknown", title: "Pay", description: stringPointer("Desk lamp"), wantStatus: ConsequentialRiskPreflightBlockedV1, wantCode: ConsequentialRiskCodeDestinationUnknownV1},
 		{name: "non risk", title: "Archive", wantStatus: ConsequentialRiskPreflightNoneV1},
+		{name: "read blog post", title: "Read post", wantStatus: ConsequentialRiskPreflightNoneV1},
+		{name: "post comment", title: "Post comment", wantStatus: ConsequentialRiskPreflightRequiredV1, wantKind: "send"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requireComputerUseDarwin(t)
@@ -198,6 +200,9 @@ func TestConsequentialRiskPreflightAllowsOnlyExactSemanticSend(t *testing.T) {
 		{name: "send phrase", label: "Send feedback", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightRequiredV1},
 		{name: "compound identifier style", label: "sendButton", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightRequiredV1},
 		{name: "post reply", label: "Post reply", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightRequiredV1},
+		{name: "post comment", label: "Post comment", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightRequiredV1},
+		{name: "read blog post", label: "Read post", window: "Wayland Zhang - Blog", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
+		{name: "blog post noun", label: "Blog post", window: "Wayland Zhang - Blog", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
 		{name: "near miss", label: "Sender settings", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
 	} {
 		t.Run(test.name, func(t *testing.T) {

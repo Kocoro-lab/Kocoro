@@ -4327,6 +4327,7 @@ iterationLoop:
 				*openAIComputerBaseRequest,
 				screenshot,
 				execution.Result.IsError,
+				openAIComputerContinuationFeedbackTextV1(execution),
 				safetyAcknowledgement,
 			)
 			if nextErr != nil {

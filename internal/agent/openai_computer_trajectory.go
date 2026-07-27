@@ -157,13 +157,20 @@ func (trajectory *openAIComputerTrajectory) BuildNextRequest(
 	screenshot client.ContentBlock,
 	acknowledgement *OpenAIComputerSafetyAcknowledgement,
 ) (client.CompletionRequest, error) {
-	return trajectory.buildNextRequest(base, screenshot, false, acknowledgement)
+	return trajectory.buildNextRequest(
+		base,
+		screenshot,
+		false,
+		"",
+		acknowledgement,
+	)
 }
 
 func (trajectory *openAIComputerTrajectory) buildNextRequest(
 	base client.CompletionRequest,
 	screenshot client.ContentBlock,
 	isError bool,
+	feedback string,
 	acknowledgement *OpenAIComputerSafetyAcknowledgement,
 ) (client.CompletionRequest, error) {
 	if trajectory == nil || trajectory.profile == nil {
@@ -213,14 +220,26 @@ func (trajectory *openAIComputerTrajectory) buildNextRequest(
 	screenshotCopy := screenshot
 	sourceCopy := *screenshot.Source
 	screenshotCopy.Source = &sourceCopy
+	if !isError && feedback != "" {
+		return client.CompletionRequest{}, fmt.Errorf(
+			"OpenAI computer success continuation cannot carry failure feedback",
+		)
+	}
 
 	next := base
 	next.Messages = make([]client.Message, 0, len(base.Messages)+2)
 	next.Messages = append(next.Messages, base.Messages...)
 	next.Messages = append(next.Messages, assistant)
+	resultContent := []client.ContentBlock{screenshotCopy}
+	if feedback != "" {
+		resultContent = append(resultContent, client.ContentBlock{
+			Type: "text",
+			Text: feedback,
+		})
+	}
 	resultBlock := client.NewToolResultBlockWithBlocks(
 		trajectory.call.CallID,
-		[]client.ContentBlock{screenshotCopy},
+		resultContent,
 		isError,
 	)
 	if len(acknowledgedChecks) > 0 {
@@ -240,6 +259,54 @@ func (trajectory *openAIComputerTrajectory) buildNextRequest(
 	next.ToolChoice = nil
 	next.PreviousResponseID = trajectory.responseID
 	return next, nil
+}
+
+const openAIComputerContinuationFeedbackPrefixV1 = "kocoro.computer_action_outcome.v1:"
+
+type openAIComputerContinuationGUIOutcomeV1 struct {
+	Result      GUIActionResult `json:"result"`
+	Phase       GUIActionPhase  `json:"phase"`
+	FailureCode string          `json:"failure_code"`
+}
+
+type openAIComputerContinuationFeedbackV1 struct {
+	SchemaVersion int                                     `json:"schema_version"`
+	Effect        ComputerUseCommitEffect                 `json:"effect"`
+	GUIOutcome    *openAIComputerContinuationGUIOutcomeV1 `json:"gui_outcome,omitempty"`
+}
+
+// openAIComputerContinuationFeedbackV1 exposes only local redacted enums to
+// the trusted Cloud adapter. Arbitrary executor prose, typed content,
+// coordinates, screenshots, app names, and AX state never enter this block.
+func openAIComputerContinuationFeedbackTextV1(
+	execution OpenAIComputerBatchExecution,
+) string {
+	if !execution.Result.IsError {
+		return ""
+	}
+	effect := execution.ActionEffect
+	switch effect {
+	case ComputerUseCommitNone, ComputerUseCommitKnown, ComputerUseCommitUnknown:
+	default:
+		effect = ComputerUseCommitNone
+	}
+	feedback := openAIComputerContinuationFeedbackV1{
+		SchemaVersion: 1,
+		Effect:        effect,
+	}
+	if outcome := execution.Result.GUIOutcome; outcome != nil &&
+		outcome.Validate() == nil {
+		feedback.GUIOutcome = &openAIComputerContinuationGUIOutcomeV1{
+			Result:      outcome.Result,
+			Phase:       outcome.Phase,
+			FailureCode: outcome.FailureCode,
+		}
+	}
+	payload, err := json.Marshal(feedback)
+	if err != nil {
+		return ""
+	}
+	return openAIComputerContinuationFeedbackPrefixV1 + string(payload)
 }
 
 func responseHasOpenAIComputerCall(response *client.CompletionResponse) bool {
@@ -445,9 +512,8 @@ func validateOpenAIComputerExecution(
 }
 
 // openAIComputerExecutionDetail preserves the executor's own failure text in
-// terminal errors. The continuation wire cannot carry it (computer_call_output
-// is screenshot-only), so this suffix is the only place the original reason
-// survives to the parent tool card and logs.
+// terminal errors. Continuations carry only separately generated redacted
+// enums; this bounded prose remains local to the parent tool card and logs.
 func openAIComputerExecutionDetail(execution OpenAIComputerBatchExecution) string {
 	detail := strings.TrimSpace(execution.Result.Content)
 	if detail == "" {

@@ -182,6 +182,30 @@ func TestCoordinatePixelScrollV1RejectsImpossibleTaggedUnionTuples(t *testing.T)
 	}
 }
 
+func TestCoordinatePixelScrollV1AcceptsRedactedScrollEventFailureCodes(t *testing.T) {
+	base, err := DecodeCoordinatePixelScrollResultV1(loadCoordinateFixture(
+		t, "coordinate_pixel_scroll.response.committed_unverified.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.ScrollCommitState = "not_committed"
+	base.Phase = "between_commits"
+	for _, failureCode := range []string{
+		"scroll_event_creation_failed",
+		"scroll_event_type_mismatch",
+		"scroll_event_location_mismatch",
+		"scroll_event_continuity_mismatch",
+		"scroll_event_delta_mismatch",
+		"scroll_commit_gate_rejected",
+	} {
+		result := base
+		result.FailureCode = &failureCode
+		if err := result.ValidateTaggedUnion(); err != nil {
+			t.Fatalf("%s rejected: %v", failureCode, err)
+		}
+	}
+}
+
 func TestCoordinatePixelScrollCancellationMarkerMatchesCrossLanguageFixture(t *testing.T) {
 	var fixture struct {
 		SchemaVersion int    `json:"schema_version"`

@@ -59,7 +59,7 @@ var consequentialRiskExactLabelsV1 = map[string]consequentialRiskSemanticKindV1{
 
 var consequentialRiskTokenLabelsV1 = map[string]consequentialRiskSemanticKindV1{
 	"send": consequentialRiskSemanticSendV1, "sending": consequentialRiskSemanticSendV1,
-	"sent": consequentialRiskSemanticSendV1, "post": consequentialRiskSemanticSendV1,
+	"sent":    consequentialRiskSemanticSendV1,
 	"publish": consequentialRiskSemanticSendV1, "submit": consequentialRiskSemanticSendV1,
 	"resend": consequentialRiskSemanticSendV1, "reply": consequentialRiskSemanticSendV1,
 	"delete": consequentialRiskSemanticDeleteV1, "remove": consequentialRiskSemanticDeleteV1,
@@ -104,9 +104,23 @@ func consequentialRiskTokenKindsV1(value string) []consequentialRiskSemanticKind
 		previous = current
 	}
 	var kinds []consequentialRiskSemanticKindV1
-	for _, token := range strings.Fields(normalized.String()) {
+	tokens := strings.Fields(normalized.String())
+	for _, token := range tokens {
 		if kind, found := consequentialRiskTokenLabelsV1[token]; found {
 			kinds = append(kinds, kind)
+		}
+	}
+	// "Post" alone is an action label, but in multi-word browser controls it
+	// is commonly a noun ("Read post", "Blog post"). Keep exact "Post" in
+	// consequentialRiskExactLabelsV1 and admit only communication-shaped
+	// multi-word phrases here.
+	for index := 0; index+1 < len(tokens); index++ {
+		if tokens[index] != "post" {
+			continue
+		}
+		switch tokens[index+1] {
+		case "comment", "message", "reply":
+			kinds = append(kinds, consequentialRiskSemanticSendV1)
 		}
 	}
 	compact := strings.ReplaceAll(normalizeConsequentialRiskLabelV1(value), " ", "")

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -204,6 +205,30 @@ func TestOpenAIComputerTrajectoryBuildsBatchAndNextScreenshotResult(t *testing.T
 
 	if base.PreviousResponseID != "" || len(base.Messages) != 1 {
 		t.Fatalf("base request mutated: %#v", base)
+	}
+}
+
+func TestOpenAIComputerTrajectorySerializesOnlyRedactedFailureFeedback(t *testing.T) {
+	execution := OpenAIComputerBatchExecution{
+		ActionEffect: ComputerUseCommitKnown,
+		Result: ToolResult{
+			IsError: true,
+			Content: "must not cross the wire: user text and coordinates",
+			GUIOutcome: &GUIActionOutcome{
+				Result:      GUIActionResultCompletedUnverified,
+				Phase:       GUIActionPhaseInputCommitted,
+				FailureCode: "scroll_event_location_mismatch",
+			},
+		},
+	}
+	feedback := openAIComputerContinuationFeedbackTextV1(execution)
+	const expected = `kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"committed","gui_outcome":{"result":"completed_unverified","phase":"input_committed","failure_code":"scroll_event_location_mismatch"}}`
+	if feedback != expected {
+		t.Fatalf("feedback = %q, want %q", feedback, expected)
+	}
+	if strings.Contains(feedback, "user text") ||
+		strings.Contains(feedback, "coordinates") {
+		t.Fatalf("executor prose leaked into feedback: %q", feedback)
 	}
 }
 

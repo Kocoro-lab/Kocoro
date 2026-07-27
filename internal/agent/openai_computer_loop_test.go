@@ -1160,6 +1160,7 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 		return OpenAIComputerBatchExecution{
 			CallID:              "call_001",
 			ContinuationAllowed: true,
+			ActionEffect:        ComputerUseCommitKnown,
 			Result: ToolResult{
 				Content: detail,
 				IsError: true,
@@ -1167,6 +1168,11 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 					MediaType: "image/png",
 					Data:      "ZmluYWw=",
 				}},
+				GUIOutcome: &GUIActionOutcome{
+					Result:      GUIActionResultCompletedUnverified,
+					Phase:       GUIActionPhaseInputCommitted,
+					FailureCode: "scroll_not_committed",
+				},
 			},
 		}
 	}
@@ -1231,8 +1237,10 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 			)
 		}
 		nested, ok := blocks[0].ToolContent.([]client.ContentBlock)
-		if !ok || len(nested) != 1 ||
-			nested[0].Type != "image" {
+		if !ok || len(nested) != 2 ||
+			nested[0].Type != "image" ||
+			nested[1].Type != "text" ||
+			nested[1].Text != `kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"committed","gui_outcome":{"result":"completed_unverified","phase":"input_committed","failure_code":"scroll_not_committed"}}` {
 			t.Fatalf(
 				"continuation request %d tool content = %#v",
 				index+2,

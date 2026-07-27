@@ -579,6 +579,8 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 			"Give the complete task once; the computer executor launches/focuses apps, " +
 			"observes the current UI, performs the needed actions, and verifies the result internally. " +
 			"Do not split clicks, typing, screenshots, or app switches into separate calls. " +
+			"For reading or summarization, this call returns the requested content itself; " +
+			"treat that result as final rather than calling computer_use again to retrieve hidden observations. " +
 			"Do not omit a later step or app from the user's request. " +
 			"List app names in apps when known; the executor may switch apps itself.",
 		Parameters: map[string]any{
@@ -1040,7 +1042,10 @@ func (t *openAIComputerTaskToolV1) Run(
 			"never use Return, Enter, Space, or another keyboard shortcut to submit or bypass that exact consequential-action confirmation because those activation paths are rejected locally. " +
 			"Do not ask the parent to perform clicks, typing, screenshots, or state management. " +
 			"Your final response is a machine-readable result: return exactly one compact JSON object " +
-			`{"status":"completed","summary":"brief visible result"} only when the latest screenshot visibly proves the requested end state. ` +
+			`{"status":"completed","summary":"self-contained result for the parent"} only when the latest screenshot visibly proves the requested end state. ` +
+			"For read, inspect, extract, or summarize goals, the summary must contain the requested facts, extracted text, or synthesis itself, using all fresh screenshots observed during this task. " +
+			"Never return only a completion claim such as content was viewed, recorded, or summarized; the parent cannot inspect your hidden observations or call this goal-level tool again in the same turn. " +
+			"For action-only goals, keep the summary brief and state the visible result. " +
 			`Return exactly {"status":"not_completed","summary":"brief visible result"} when the latest screenshot proves the requested end state was not reached. ` +
 			`Return exactly {"status":"unverified","summary":"brief reason"} when the available observation cannot prove either outcome. ` +
 			"Do not use Markdown, add fields, or put any text outside that JSON object. " +

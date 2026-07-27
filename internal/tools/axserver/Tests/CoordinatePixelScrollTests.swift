@@ -41,6 +41,69 @@ final class CoordinatePixelScrollTests: XCTestCase {
             scaleX: .infinity, scaleY: 1))
     }
 
+    func testLiveScrollEventUsesTheSamePointerToleranceAsTheVerifiedEndpoint() {
+        let point = CoordinateMouseEventPointV1(x: 123.5, y: 456.5)
+
+        XCTAssertNil(coordinatePixelScrollEventFailureCodeV1(
+            expectedPoint: point,
+            eventType: .scrollWheel,
+            eventLocation: .init(x: 125.5, y: 454.5),
+            continuous: 1,
+            axis1: 618,
+            axis2: -37,
+            expectedAxis1: 618,
+            expectedAxis2: -37))
+        XCTAssertEqual(
+            coordinatePixelScrollEventFailureCodeV1(
+                expectedPoint: point,
+                eventType: .scrollWheel,
+                eventLocation: .init(x: 125.51, y: 456.5),
+                continuous: 1,
+                axis1: 618,
+                axis2: -37,
+                expectedAxis1: 618,
+                expectedAxis2: -37),
+            "scroll_event_location_mismatch")
+    }
+
+    func testLiveScrollEventReportsTheExactRejectedContractMember() {
+        let point = CoordinateMouseEventPointV1(x: 123.5, y: 456.5)
+
+        XCTAssertEqual(
+            coordinatePixelScrollEventFailureCodeV1(
+                expectedPoint: point,
+                eventType: .mouseMoved,
+                eventLocation: point,
+                continuous: 1,
+                axis1: 618,
+                axis2: -37,
+                expectedAxis1: 618,
+                expectedAxis2: -37),
+            "scroll_event_type_mismatch")
+        XCTAssertEqual(
+            coordinatePixelScrollEventFailureCodeV1(
+                expectedPoint: point,
+                eventType: .scrollWheel,
+                eventLocation: point,
+                continuous: 0,
+                axis1: 618,
+                axis2: -37,
+                expectedAxis1: 618,
+                expectedAxis2: -37),
+            "scroll_event_continuity_mismatch")
+        XCTAssertEqual(
+            coordinatePixelScrollEventFailureCodeV1(
+                expectedPoint: point,
+                eventType: .scrollWheel,
+                eventLocation: point,
+                continuous: 1,
+                axis1: 617,
+                axis2: -37,
+                expectedAxis1: 618,
+                expectedAxis2: -37),
+            "scroll_event_delta_mismatch")
+    }
+
     func testProductionPreparationProvesExactMovePixelUnitAndFullDeltaFields() {
         let point = CoordinateMouseEventPointV1(x: 123.5, y: 456.5)
         let prepared = productionCoordinatePixelScrollPreparedEventsV1(
@@ -120,6 +183,22 @@ final class CoordinatePixelScrollTests: XCTestCase {
         XCTAssertEqual(result.requested?.cgPointDeltaAxis1, 618)
         XCTAssertEqual(result.requested?.cgPointDeltaAxis2, -37)
         XCTAssertFalse(result.retrySafe)
+    }
+
+    func testScrollPreparationFailureCodeSurvivesTheTypedResult() throws {
+        let harness = PixelScrollHarness()
+        harness.scrollCommitState = .notCommitted
+        harness.scrollFailureCode = "scroll_event_location_mismatch"
+
+        let result = runCoordinatePixelScrollV1(
+            request: try pixelScrollRequest(),
+            dependencies: harness.dependencies())
+
+        XCTAssertEqual(harness.posts, ["move", "scroll"])
+        XCTAssertEqual(result.status, "committed_unverified")
+        XCTAssertEqual(result.pointerMoveCommitState, "committed")
+        XCTAssertEqual(result.scrollCommitState, "not_committed")
+        XCTAssertEqual(result.failureCode, "scroll_event_location_mismatch")
     }
 
     func testCancellationAfterMoveReportsMoveCommitAndNeverPostsScroll() throws {
@@ -296,6 +375,7 @@ private final class PixelScrollHarness {
     var physicalAssessmentValues: [PhysicalInputInterferenceAssessmentV1] = []
     var pointerMoveCommitState: CoordinatePixelScrollCommitStateV1 = .committed
     var scrollCommitState: CoordinatePixelScrollCommitStateV1 = .committed
+    var scrollFailureCode = "scroll_not_committed"
     var observedPointer = CoordinateMouseEventPointV1(x: 350.5, y: 450.5)
     var observedPointerValues: [CoordinateMouseEventPointV1?] = []
     var nowValues: [Date] = []
@@ -326,7 +406,14 @@ private final class PixelScrollHarness {
                     },
                     postScroll: {
                         self.posts.append("scroll")
-                        return self.scrollCommitState
+                        switch self.scrollCommitState {
+                        case .committed:
+                            return .committed()
+                        case .unknown:
+                            return .unknown()
+                        case .notCommitted:
+                            return .notCommitted(self.scrollFailureCode)
+                        }
                     })
             },
             observePointer: {

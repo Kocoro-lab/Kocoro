@@ -5,6 +5,28 @@ import XCTest
 @testable import ax_server
 
 final class TargetBoundInputTests: XCTestCase {
+    func testFocusedAXWindowOutranksSameProcessCGOverlayOrSiblingWindow() {
+        XCTAssertTrue(targetBoundInputWindowAuthorityMatches(
+            requestedWindowID: 7001,
+            focusedAXWindowID: 7001,
+            frontmostCGWindowID: 7002))
+        XCTAssertFalse(targetBoundInputWindowAuthorityMatches(
+            requestedWindowID: 7001,
+            focusedAXWindowID: 7002,
+            frontmostCGWindowID: 7001))
+    }
+
+    func testCGFrontmostWindowRemainsFallbackWithoutAXWindowIdentity() {
+        XCTAssertTrue(targetBoundInputWindowAuthorityMatches(
+            requestedWindowID: 7001,
+            focusedAXWindowID: nil,
+            frontmostCGWindowID: 7001))
+        XCTAssertFalse(targetBoundInputWindowAuthorityMatches(
+            requestedWindowID: 7001,
+            focusedAXWindowID: nil,
+            frontmostCGWindowID: 7002))
+    }
+
     func testStrictWireAdmitsEveryFunctionKeySupportedByInputDriver() {
         for number in 1...12 {
             let key = "f\(number)"

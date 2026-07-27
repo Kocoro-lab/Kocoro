@@ -1408,6 +1408,7 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		hasFreshObservationInstructions := false
 		hasStopBeforeExtraActionInstructions := false
 		hasSafeNavigationRecoveryInstructions := false
+		hasSelfContainedInspectionResultInstructions := false
 		for _, message := range request.Messages {
 			if strings.Contains(
 				message.Content.Text(),
@@ -1417,9 +1418,18 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			}
 			if strings.Contains(
 				message.Content.Text(),
-				`{"status":"completed","summary":"brief visible result"}`,
+				`{"status":"completed","summary":"self-contained result for the parent"}`,
 			) {
 				hasOutcomeContract = true
+			}
+			if strings.Contains(
+				message.Content.Text(),
+				"the summary must contain the requested facts, extracted text, or synthesis itself",
+			) && strings.Contains(
+				message.Content.Text(),
+				"Never return only a completion claim such as content was viewed, recorded, or summarized",
+			) {
+				hasSelfContainedInspectionResultInstructions = true
 			}
 			if strings.Contains(
 				message.Content.Text(),
@@ -1475,6 +1485,9 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		}
 		if !hasOutcomeContract {
 			t.Fatalf("child request %d lacks terminal outcome contract", index)
+		}
+		if !hasSelfContainedInspectionResultInstructions {
+			t.Fatalf("child request %d lacks self-contained inspection result instructions", index)
 		}
 		if !hasConsequentialPathInstructions {
 			t.Fatalf("child request %d lacks consequential action path instructions", index)

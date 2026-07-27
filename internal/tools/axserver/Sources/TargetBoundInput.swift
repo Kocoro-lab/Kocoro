@@ -937,7 +937,25 @@ private func targetBoundInputFrontmostNormalWindowID(pid: Int) -> UInt32? {
     return nil
 }
 
-private func targetBoundInputFocusedAXWindow(pid: Int, windowID: UInt32) -> AXUIElement? {
+func targetBoundInputWindowAuthorityMatches(
+    requestedWindowID: UInt32,
+    focusedAXWindowID: UInt32?,
+    frontmostCGWindowID: UInt32?
+) -> Bool {
+    if let focusedAXWindowID {
+        return focusedAXWindowID == requestedWindowID
+    }
+    return frontmostCGWindowID == requestedWindowID
+}
+
+private struct TargetBoundInputFocusedAXWindowIdentityV1 {
+    let window: AXUIElement
+    let windowID: UInt32
+}
+
+private func targetBoundInputFocusedAXWindowIdentity(
+    pid: Int
+) -> TargetBoundInputFocusedAXWindowIdentityV1? {
     guard let processID = pid_t(exactly: pid) else { return nil }
     let app = AXUIElementCreateApplication(processID)
     guard let rawWindow = axValue(app, "AXFocusedWindow"),
@@ -949,8 +967,19 @@ private func targetBoundInputFocusedAXWindow(pid: Int, windowID: UInt32) -> AXUI
         x: rawFrame.x, y: rawFrame.y,
         width: rawFrame.width, height: rawFrame.height)
     guard let exact = uniqueWindowID(pid: pid, title: title, frame: frame),
-          UInt32(exactly: exact) == windowID else { return nil }
-    return window
+          let windowID = UInt32(exactly: exact) else { return nil }
+    return TargetBoundInputFocusedAXWindowIdentityV1(
+        window: window,
+        windowID: windowID)
+}
+
+private func targetBoundInputFocusedAXWindow(
+    pid: Int,
+    windowID: UInt32
+) -> AXUIElement? {
+    guard let identity = targetBoundInputFocusedAXWindowIdentity(pid: pid),
+          identity.windowID == windowID else { return nil }
+    return identity.window
 }
 
 private func targetBoundInputFingerprint(_ element: AXUIElement) -> String? {
@@ -1013,16 +1042,21 @@ private func productionTargetBoundInputAuthorityFailure(
         request.expectedWindowAXBounds, window.bounds) else {
         return "window_bounds_mismatch"
     }
-    guard targetBoundInputFrontmostNormalWindowID(pid: request.pid) == request.windowID else {
+    let focusedAXWindow = targetBoundInputFocusedAXWindowIdentity(pid: request.pid)
+    guard targetBoundInputWindowAuthorityMatches(
+        requestedWindowID: request.windowID,
+        focusedAXWindowID: focusedAXWindow?.windowID,
+        frontmostCGWindowID: targetBoundInputFrontmostNormalWindowID(pid: request.pid)
+    ) else {
         return "frontmost_window_mismatch"
     }
     if request.action == "type", request.ref != nil {
-        guard let focusedWindow = targetBoundInputFocusedAXWindow(
-            pid: request.pid, windowID: request.windowID) else {
+        guard let focusedWindow = focusedAXWindow,
+              focusedWindow.windowID == request.windowID else {
             return "focused_window_mismatch"
         }
         guard let path = request.path,
-              let target = resolveElement(in: focusedWindow, path: path) else {
+              let target = resolveElement(in: focusedWindow.window, path: path) else {
             return "path_not_found"
         }
         guard axString(target, "AXRole") == request.expectedRole else {
