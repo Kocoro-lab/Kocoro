@@ -310,8 +310,8 @@ func IsSkillExempt(t Tool) bool {
 // Explicit opt-in list (see internal/tools/cancelable_optin.go):
 // file_read, glob, grep, directory_list, think, system_info,
 // memory_recall, session_search, list_my_published_files, tool_search,
-// use_skill, schedule_list, plus pdf/docx/xlsx/pptx text extractors
-// (subprocess-based, respond cleanly to ctx cancel).
+// use_skill, schedule_list, ask_user_question, plus pdf/docx/xlsx/pptx text
+// extractors (subprocess-based, respond cleanly to ctx cancel).
 //
 // retract_published_file and http are deliberately NOT cancelable: HTTP
 // methods may be non-idempotent (POST/DELETE) and aborting mid-flight
@@ -367,6 +367,7 @@ var builtinCancelableMidTurn = map[string]struct{}{
 	"tool_search":             {},
 	"use_skill":               {},
 	"schedule_list":           {},
+	"ask_user_question":       {},
 	"archive_inspect":         {},
 	"pdf_to_text":             {},
 	"docx_to_text":            {},

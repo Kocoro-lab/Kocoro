@@ -2332,20 +2332,21 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// (BP #3, per-session). Issue #107.
 	localNames, mcpNames, gatewayNames := partitionLiveToolNamesBySource(effTools, toolNames)
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
-		BasePrompt:       basePrompt,
-		Memory:           mem,
-		Instructions:     instrText,
-		LocalToolNames:   localNames,
-		MCPToolNames:     mcpNames,
-		GatewayToolNames: gatewayNames,
-		DeferredTools:    deferredSummaries,
-		MCPContext:       a.mcpContext,
-		CWD:              cwd,
-		Skills:           a.agentSkills,
-		MemoryDir:        a.memoryDir,
-		StickyContext:    a.stickyContext,
-		ModelID:          modelID,
-		OutputFormat:     a.outputFormat,
+		BasePrompt:          basePrompt,
+		Memory:              mem,
+		Instructions:        instrText,
+		LocalToolNames:      localNames,
+		MCPToolNames:        mcpNames,
+		GatewayToolNames:    gatewayNames,
+		DeferredTools:       deferredSummaries,
+		MCPContext:          a.mcpContext,
+		CWD:                 cwd,
+		Skills:              a.agentSkills,
+		MemoryDir:           a.memoryDir,
+		StickyContext:       a.stickyContext,
+		ModelID:             modelID,
+		OutputFormat:        a.outputFormat,
+		QuestionUIAvailable: QuestionAskerFrom(ctx) != nil,
 	})
 
 	// Append cloud delegation guidance and cloud-specific contrast example

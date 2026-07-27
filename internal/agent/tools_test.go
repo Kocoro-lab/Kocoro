@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
@@ -60,6 +61,30 @@ func (m *mockTool) Run(ctx context.Context, args string) (ToolResult, error) {
 }
 
 func (m *mockTool) RequiresApproval() bool { return false }
+
+func TestAskUserQuestionIsCancelableMidTurn(t *testing.T) {
+	tool := &mockTool{name: "ask_user_question"}
+	if !IsCancelableMidTurn(tool) {
+		t.Fatal("ask_user_question must allow an interrupt to dismiss its side-effect-free pending UI")
+	}
+
+	parent, cancelParent := context.WithCancelCause(context.Background())
+	toolCtx, cleanup := dispatchCtx(parent, tool)
+	if cleanup != nil {
+		t.Fatal("cancelable question tool should receive the parent context directly")
+	}
+
+	cancelParent(agenttypes.NewCancelError(agenttypes.ReasonInterrupt))
+	select {
+	case <-toolCtx.Done():
+		reason, ok := agenttypes.ExtractReason(context.Cause(toolCtx))
+		if !ok || reason != agenttypes.ReasonInterrupt {
+			t.Fatalf("tool context cause = %v, want interrupt", context.Cause(toolCtx))
+		}
+	default:
+		t.Fatal("question tool context did not receive the interrupt")
+	}
+}
 
 // TestDisallowsAutoApproval pins the current policy: the deny-list mechanism
 // EXISTS (so a future genuinely-irreversible tool can be added) but is empty

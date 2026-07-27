@@ -190,7 +190,7 @@ func TestRemoteEventForwarderSendsEventBusEvents(t *testing.T) {
 	}
 }
 
-func TestRemoteEventForwarderSkipsLocalApprovalEvents(t *testing.T) {
+func TestRemoteEventForwarderSkipsLocalInteractionEvents(t *testing.T) {
 	client := NewClient("ws://localhost:1/x", "", nil, nil)
 	got := make(chan DaemonMessage, 2)
 	client.envelopeSender = func(dm DaemonMessage) error {
@@ -214,6 +214,8 @@ func TestRemoteEventForwarderSkipsLocalApprovalEvents(t *testing.T) {
 	srv.EventBus().Emit(Event{Type: EventApprovalRequest, Payload: json.RawMessage(`{"request_id":"req-1"}`)})
 	srv.EventBus().Emit(Event{Type: EventApprovalResolved, Payload: json.RawMessage(`{"request_id":"req-1"}`)})
 	srv.EventBus().Emit(Event{Type: EventApprovalNotice, Payload: json.RawMessage(`{"message":"notice"}`)})
+	srv.EventBus().Emit(Event{Type: EventQuestionRequest, Payload: json.RawMessage(`{"request_id":"question-1"}`)})
+	srv.EventBus().Emit(Event{Type: EventQuestionResolved, Payload: json.RawMessage(`{"request_id":"question-1"}`)})
 	srv.EventBus().Emit(Event{Type: EventAgentReply, Payload: json.RawMessage(`{"text":"done"}`)})
 
 	select {
