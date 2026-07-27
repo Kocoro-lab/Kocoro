@@ -1,21 +1,39 @@
 # Prompt Cache Strategy
 
-How Kocoro + Shannon allocate Anthropic's 4 `cache_control` breakpoints and route TTL by call-site origin. Canonical reference for anyone touching the LLM request path.
+How Kocoro + Shannon allocate Anthropic's 4 `cache_control` breakpoints and
+attribute cache traffic by call-site origin. Canonical reference for anyone
+touching the LLM request path.
 
 ## Design goals
 
-1. **Maximize cache_read / cache_creation (CER)** on long-running conversations — Slack/LINE/TUI where the user comes back over minutes or hours.
-2. **Minimize paid cache_creation** on one-shot invocations — cron, webhook, MCP, CLI `shan -y ...`, and every internal subagent (`decompose`, `tool_select`, `lead_decide`, `interpretation`, `stub_cleanup`, `verify`, …) where the cache will never be re-read.
+1. **Maximize cache_read / cache_creation (CER)** without changing prompt bytes
+   unnecessarily between calls.
+2. **Keep TTL policy Cloud-owned.** As of 2026-07-23, shannon-cloud applies the
+   short cache TTL to every source. Kocoro sends `cache_source` for attribution;
+   it does not choose a long or short bucket.
 3. **Stay inside the public Anthropic API** — no `cache_edits` protocol, no `DANGEROUS_uncachedSystemPromptSection` marker, no non-public `<system-reminder>` cache-key-invisible semantics. Kocoro *does* emit `<system-reminder>` tags as plain XML text (Claude is trained to read the tag as framework-internal trusted content — used for skill listings, post-tool nudges, and the instructions block in `prompt/builder.go`), but the wrapped content participates in the cache key like any other byte. The ~5-10 pp CHR gap versus first-party clients on non-public APIs is accepted as a structural ceiling.
 
 ## Breakpoint allocation (Anthropic cap = 4)
 
-| # | Position | Contents | TTL source |
+Kocoro never writes `cache_control` on the wire. It positions content and emits
+a plain-text `<!-- cache_break -->` marker; Cloud's
+`anthropic_provider._build_api_request` translates that layout into the four
+breakpoints below.
+
+| # | Position on the wire | Contents | Cache policy |
 |---|---|---|---|
-| 1 | `system_stable` | gateway-cached persona + tools list + skills (excl. `<!-- volatile -->` tail) | shared request ttl |
-| 2 | `tools[-1]` | last tool definition — caches all tool schemas | shared request ttl |
-| 3 | `user_1.cache_break` | per-session stable instructions + sticky context (before `<!-- cache_break -->`) | shared request ttl |
-| 4 | `rolling marker on claude_messages[-2]` | per-turn rolling cache point; preserved across turns when prev marker is still reachable | shared request ttl |
+| 1 | `system[0]` | persona + core operational rules + **local** tool names + IM/output/memory guidance. No skills and no MCP/gateway tool names — both are per-user and would break the BP #1 byte invariant | Cloud request policy |
+| 2 | `tools[-1]` | last tool definition — caches all tool schemas | Cloud request policy |
+| 3 | `claude_messages[-1].content[0]` | the CURRENT turn's scaffolded user message, prefix half: shared instructions + sticky context + per-user tool catalog (everything before `<!-- cache_break -->`) | Cloud request policy |
+| 4 | `claude_messages[-2]`, last cache-eligible block | per-turn rolling cache point | Cloud request policy |
+
+**Numbering is historical, not positional.** On the wire BP #4 precedes BP #3:
+the rolling marker lands on the second-to-last message, while BP #3 lands on
+the last one (the current turn's user message). BP #3 is also NOT "the first
+user message" — persisted history strips the scaffold (`captureRunMessages`
+restores the raw user text), so exactly one `<!-- cache_break -->` exists per
+request no matter how long the session runs. That is what keeps the total at
+exactly 4 and inside Anthropic's cap.
 
 **BP #1 byte invariant (issue #107):** `system_stable` MUST be byte-identical
 for any two users running the same agent on the same OS. Per-user values
@@ -26,38 +44,28 @@ or to the volatile segment. Test guard: see
 `internal/prompt/builder_test.go`. Production telemetry: `system_stable_hash`
 field on `cache_summary` audit entries (`internal/audit/audit.go`).
 
-All 4 breakpoints on a single request use the **same** `cache_control` dict. This trivially satisfies Anthropic's "monotonic non-increasing TTL across breakpoints" rule — you can't be out-of-order with a single TTL.
+All 4 breakpoints on a single request use the **same** `cache_control` dict.
 
-Volatile content (date, CWD, agent memory, MCP context) lives in the `user_1` block **after** the `<!-- cache_break -->` marker, or in a `<!-- volatile -->` tail inside the system prompt. Both positions leave breakpoints 1-4 byte-stable.
+Volatile content (date, CWD, agent memory, MCP context) lives in the current turn's user message **after** the `<!-- cache_break -->` marker, together with the raw user text, the skill listing, and the Language directive. None of it is covered by a breakpoint on the turn it is created — it is uncached input that turn, and the next turn's rolling marker absorbs it into the cached prefix.
 
-## Source → TTL routing
+Cloud's `_split_system_message` also supports a `<!-- volatile -->` tail inside the system prompt, but **Kocoro does not emit that marker** — the ShanClaw path always sends a single system block. Routing volatile content there was tried and reverted: those bytes sit BEFORE the tools `cache_control`, so an embedded timestamp broke the tools cache every minute. See the note on `prompt.BuildSystemPrompt`.
 
-TTL is resolved by `_ttl_block(request)` in `anthropic_provider.py`. Precedence:
+## Cache source and current TTL policy
 
-1. `SHANNON_FORCE_TTL` env (operator override — see below)
-2. `request.cache_source` → lookup in `_LONG_CACHE_SOURCES` → 1h
-3. Fallback → 5m (**fail cheap**: unknown sources pay the lower 1.25x write premium, not 2.0x)
+`cache_source` is an attribution label. It lets operators compare cost,
+cache-read rate, latency, and model-call count across Desktop, TUI, channels,
+schedules, helpers, and one-shot runs.
 
-| Source | TTL | Rationale |
-|---|---|---|
-| `slack` / `line` / `feishu` / `lark` / `telegram` | **1h** | Human-conversation channels; idle gaps > 5 min are common; re-read likely |
-| `tui` | **1h** | Iterative developer use; re-read within session |
-| `oneshot_interactive` | **1h** | Local `shan` TUI / interactive CLI without explicit source; similar reuse pattern |
-| `cache_bench` | **1h** | Synthetic bench traffic reflects a channel-message configuration |
-| `webhook` | 5m | One-shot trigger, rarely reused |
-| `cron` / `schedule` | 5m | Fire-and-forget scheduled task |
-| `mcp` | 5m | External MCP tool call with independent prompts |
-| `oneshot_cli` | 5m | `shan -y '...'` — single invocation, no session continuity |
-| `swarm_subagent` / `decompose` / `tool_select` / `lead_decide` / `interpretation` / `stub_cleanup` | 5m | Internal prompts that vary every call — no resume |
-| `memory_extract` / `verify_*` / `complexity_*` / `evaluate` / `context_summary` / `research_plan` / `web_fetch_*` | 5m | Short internal helper calls |
-| `agent_loop` / `agent_execute` / `agent_execute_stream` | 5m | Shannon's internal agent loops; multi-turn continuity not reliable |
-| `completions_proxy` / `completions_proxy_stream` | 5m | Raw passthrough endpoints |
-| Unknown / unset | 5m | Fail cheap |
+It is **not** a Kocoro-side TTL selector. The current shannon-cloud policy is:
 
-When adding a new call-site, either:
+| Request source | TTL |
+|---|---|
+| Every explicit `cache_source` | short |
+| Unknown / unset | short |
 
-- Pick a long bucket name → add to `_LONG_CACHE_SOURCES` in `anthropic_provider.py` **and** `cacheSourceFromDaemonSource` in `internal/daemon/runner.go` if the source originates on the Kocoro side
-- Pick a short bucket name → just set `cache_source=<name>` on the call; no list update needed
+If Cloud changes this policy, update shannon-cloud and this document together.
+Do not encode a future long/short assumption in Kocoro comments or branch agent
+behavior on `cache_source`.
 
 ## Env-var escape hatches
 
@@ -68,7 +76,7 @@ Operator-facing. Set on the `llm-service` container; applies to every request th
 | `SHANNON_FORCE_TTL=off` | Suppress `cache_control` entirely (no prompt-cache writes, no reads) | Bench baselines; isolating cache effects |
 | `SHANNON_FORCE_TTL=5m` | Force every request to 5m | A/B vs 1h in production |
 | `SHANNON_FORCE_TTL=1h` | Force every request to 1h | Legacy-compat / reproducing pre-Phase-1 behavior |
-| *(unset)* | Use source-routed policy above | Normal operation |
+| *(unset)* | Use the Cloud deployment policy (currently short for all sources) | Normal operation |
 | `SHANNON_CACHE_DEBUG=1` | Kocoro writes per-request hashes to `~/.shannon/logs/cache-debug.log` | Measurement / bench |
 | `SHANNON_CACHE_DRIFT_DEBUG=1` | Extra `DRIFT[...]` log lines from `_apply_rolling_cache_marker` | Diagnosing byte drift |
 
@@ -90,7 +98,7 @@ Regression tests: `internal/client/gateway_test.go::TestNormalizeToolInput_Canon
 
 A single rolling cache_control marker is placed on `claude_messages[-2]` by `_convert_messages_to_claude_format`. That's the entire story — there is NO cross-turn prev-marker preservation (`_apply_rolling_cache_marker` is defined but not called).
 
-Why not preserve prev marker: a direct bench (2026-04-15) showed it regresses 30-turn CHR from 93.6% → 61% and CER from 18.1x → 4.0x. Root cause: the preservation path calls `_strip_message_cache_control` on `user_1` to free a breakpoint slot for the prev marker, but stripping mutates the block's wire-bytes. Even though non-cache_control content is byte-identical, Anthropic's prefix matcher treats the resulting block as different, so the "free cached prefix up to prev_marker" fails to match, and the whole history falls through to uncached input. The single-rolling-marker layout is optimal under the public API's 4-breakpoint cap.
+Why not preserve prev marker: a direct bench (2026-04-15) showed it regresses 30-turn CHR from 93.6% → 61% and CER from 18.1x → 4.0x. Root cause: the preservation path calls `_strip_message_cache_control` on the current turn's user message to free a breakpoint slot for the prev marker, but stripping mutates the block's wire-bytes. Even though non-cache_control content is byte-identical, Anthropic's prefix matcher treats the resulting block as different, so the "free cached prefix up to prev_marker" fails to match, and the whole history falls through to uncached input. The single-rolling-marker layout is optimal under the public API's 4-breakpoint cap.
 
 **Evidence**: bench session `2026-04-15-longbench-1776236xxx` — 30 user turns, 40 model calls (1.3 calls/turn), msgs 2→80, CHR 93.6%, CER 18.07x. Parallel-workload bench (3 sub-tasks per prompt, 15 turns) — 21 reqs, CHR 93.8%, CER 20.14x.
 
@@ -98,13 +106,13 @@ If Anthropic ever treats `cache_control` fields as cache-key-insensitive (i.e. s
 
 ## Session-ID propagation
 
-`CompletionRequest.SessionID` must reach Shannon for prev-marker preservation to work. The chain:
+`CompletionRequest.SessionID` reaches Shannon for request correlation and
+future cache evolution. The chain is:
 
 - Kocoro `internal/agent/loop.go` sets `req.SessionID = a.sessionID` on every `Complete` call
 - Kocoro `internal/client/gateway.go` marshals `session_id` on the wire (json tag, not `-`)
-- Shannon `llm_provider/anthropic_provider.py::_apply_rolling_cache_marker(claude_messages, request.session_id, ttl_block)` keys the prev-marker memo on it
-
-Without this chain, the memo is keyed on `None` and cross-turn continuity collapses to single-rolling-marker-per-request.
+- Shannon receives the field even though the current single-rolling-marker
+  implementation does not preserve a prior marker across turns.
 
 ## Bench & KPI
 
@@ -138,8 +146,8 @@ distinct hashes per user_id within a TTL window indicate residual drift.
 
 | # | KPI | Target | Measurement |
 |---|---|---|---|
-| K9 | distinct `system_stable_hash` count among same-OS users on default agent within 1h | 1 | `jq -r '.system_stable_hash' audit.log \| sort -u \| wc -l` |
-| K10 | cross-user cache_read tokens / total input tokens (default agent, 1h window) | ≥ 30% | gateway DB or `cache-debug.log` |
+| K9 | distinct `system_stable_hash` count among same-OS users on default agent within one active short-TTL window | 1 | `jq -r '.system_stable_hash' audit.log \| sort -u \| wc -l` |
+| K10 | cross-user cache_read tokens / total input tokens within one active short-TTL window | Observe, do not assume a historical 1h target | gateway DB or `cache-debug.log` |
 
 If K9 > 1, the BP #1 still has a per-user drift source — re-audit
 `buildStaticSystem` and any code that contributes to `parts.System` (notably
@@ -170,17 +178,20 @@ content is per-user by construction. See `prompt.BuildToolListing`.
 ## Maintenance playbook
 
 **Adding a new call-site that hits the LLM:**
-1. Pick a `cache_source` name that matches the call's lifecycle (long-reuse or one-shot)
+1. Pick a stable `cache_source` name that identifies the call's lifecycle
 2. Pass `cache_source=<name>` into `providers.generate_completion` (or `manager.complete`)
-3. If long-reuse: add the name to `_LONG_CACHE_SOURCES` in `anthropic_provider.py`
-4. If originating on Kocoro side: add a case in `cacheSourceFromDaemonSource` in `runner.go`
-5. After traffic hits production, confirm no new `"unknown"` `cache_source` entries in `~/.shannon/logs/audit.log` (`jq -r '.cache_source' audit.log | sort -u`)
+3. If originating on Kocoro side, add a case in
+   `cacheSourceFromDaemonSource` in `runner.go`
+4. Do not add source-specific TTL behavior in Kocoro
+5. After traffic hits production, confirm no new `"unknown"` attribution rows
+   in `~/.shannon/logs/audit.log`
 
 **Diagnosing a CHR regression:**
 1. Enable `SHANNON_CACHE_DEBUG=1`, reproduce, and inspect `~/.shannon/logs/cache-debug.log` for `BYTE_DRIFT` (same `system_len`, different `system_h` across calls) — see `docs/cache-debug.md` for log schema
 2. If drift: enable `SHANNON_CACHE_DRIFT_DEBUG=1` and compare `payload_h` of drifting requests → find the non-deterministic marshaler
 3. If no drift: check `msgs` growth per turn; if > 20 and prompt doesn't encourage parallel tool use, Phase 2 nudge may be stripped by an agent override
-4. If neither: check whether `cache_source` was accidentally set to a short-bucket where a long bucket was intended — `jq -r '.cache_source' ~/.shannon/logs/audit.log | sort | uniq -c` gives a per-source breakdown
+4. If neither: compare per-source traffic volume and cache counters. A
+   `cache_source` label does not imply a different TTL under the current policy.
 
 **Bumping Anthropic SDK:**
 SDK changes can silently alter message serialization. After any `anthropic` version bump, run `pytest tests/test_byte_stability.py` and a 30-turn bench to verify CHR hasn't regressed.

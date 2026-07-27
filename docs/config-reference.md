@@ -89,6 +89,9 @@ agent:
   idle_soft_timeout_secs: 90       # emit "still working" status after this long waiting on the LLM (0 = disabled)
   idle_hard_timeout_secs: 540      # cancel run as soft/partial failure after this long idle. Default 540 leaves 60s headroom under the 600s gateway transport ceiling so cancellation can propagate before transport bails. Set to 0 to opt out (daemon logs a startup WARN).
   stream_idle_timeout_secs: 90     # abort the SSE streaming body if no chunk arrives for this long. Closes the failure mode idle_hard_timeout_secs cannot catch: silent TCP-level stream drop where the kernel never returns from read(). 0 = disabled (legacy scanner path).
+  interrupted_resume_max_attempts: 3 # cap automatic daemon-start continuations for one durable checkpoint. The attempt is persisted before the LLM call; 0/unset uses the default 3, and operators may raise it for a known recoverable provider outage.
+  interrupted_resume_max_age_hours: 4 # staleness window for auto-resume: checkpoints interrupted longer ago than this are abandoned (marker cleared, interrupted_turn_abandoned emitted) instead of resumed — a months-old interrupted turn carries a user intent whose context is gone and must not execute unattended on upgrade. 0/unset uses the default 4; raise for long planned outages.
+  interrupted_resume_enabled: true # gate daemon-start auto-continuation entirely. false leaves interrupted checkpoints in place without any automatic execution.
 
   # Skill matching
   skill_discovery: true            # per-turn small-model skill matching prefetch (default: true)

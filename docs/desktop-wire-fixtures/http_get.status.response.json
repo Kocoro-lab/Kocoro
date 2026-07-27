@@ -33,6 +33,7 @@
     "integration_tools_v1",
     "message_idempotency_v1",
     "message_idempotency_receipt_v2",
+    "question_v1",
     "project_entity_v1"
   ],
   "memory": {

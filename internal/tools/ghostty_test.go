@@ -89,7 +89,7 @@ func TestGhosttyTool_RequiresApproval(t *testing.T) {
 
 func TestGhosttyTool_InvalidAction(t *testing.T) {
 	tool := &GhosttyTool{tabs: newTabRegistry()}
-	result, err := tool.Run(context.Background(), `{"action":"bogus"}`)
+	result, err := tool.Run(context.Background(), `{"action":"bogus","description":"test invalid action"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestGhosttyTool_InvalidJSON(t *testing.T) {
 
 func TestGhosttyTool_ListTabs_Empty(t *testing.T) {
 	tool := &GhosttyTool{tabs: newTabRegistry()}
-	result, err := tool.Run(context.Background(), `{"action":"list_tabs"}`)
+	result, err := tool.Run(context.Background(), `{"action":"list_tabs","description":"test empty tab list"}`)
 	if err != nil {
 		t.Fatal(err)
 	}

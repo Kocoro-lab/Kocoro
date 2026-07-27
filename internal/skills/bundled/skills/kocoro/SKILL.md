@@ -5,21 +5,16 @@ description: >
   permissions, config, rules. 中:列出/查看/查询/创建/修改/删除/配置/安装 agent/skill/MCP/计划/权限/规则。
   日:一覧/表示/確認/検索/作成/更新/削除/設定/インストール エージェント/スキル/MCPサーバー/スケジュール/権限/ルール。
 
-  MUST use for ANY read: list/show/view/display/query/get/inspect/audit/check
-  the configured agents / skills / MCP servers / schedules / permissions / rules / config.
-
-  MUST use for ANY write: create/delete/update/configure/install/connect/rename/enable/disable
-  agent / skill / MCP server / schedule / permission / rule.
-
-  Covers anything under ~/.shannon/. Do NOT use bash/file_read/file_edit to probe or modify
-  these — kocoro routes every op through the daemon HTTP API at localhost:7533 which handles
-  validation, atomic writes and audit logging.
-# allowed-tools is intentionally absent (2026-07-20). The use_skill filter is
-# run-scoped: once this skill activates, every later tool call in the run is
-# hard-denied unless allowlisted — and this skill's trigger surface is
-# deliberately broad ("MUST use for ANY read/write"), so an allowlist bricked
-# mixed turns (platform op + bash / integration tools). Routing discipline is
-# enforced by the body text below instead. Policy guard:
+  Use for operations on Kocoro-managed platform state under ~/.shannon/, including
+  configured agents, skills, MCP servers, schedules, permissions, rules, and config.
+  Route only that platform-state portion through the daemon API; mixed requests may
+  and should continue with file, shell, web, and integration tools as appropriate.
+# allowed-tools is intentionally absent. The use_skill filter is run-scoped:
+# once a skill with an allowlist activates, every later tool call in the run is
+# denied unless listed. Kocoro platform work is frequently one part of a mixed
+# request, so a skill-level allowlist would incorrectly block unrelated file,
+# shell, web, and integration work. Routing discipline is enforced by the body
+# text below instead. Policy guard:
 # loader_test.go TestBundledPlatformSkills_ToolAllowlistIntentionallyAbsent.
 hidden: true
 ---
@@ -28,8 +23,10 @@ hidden: true
 
 You help users set up and manage their Kocoro platform.
 
-ALL platform operations go through the daemon HTTP API at `http://localhost:7533`.
-Use the `http` tool for every operation — with ONE exception: **schedules** use the native `schedule_*` tools (see "Create schedule" below). Never use bash/file_write/file_edit to manipulate ~/.shannon/ files directly — the API handles validation, atomic writes, and audit logging that direct file access would bypass.
+Kocoro-managed platform operations go through the daemon HTTP API at `http://localhost:7533`.
+Use the `http` tool for those operations — with ONE exception: **schedules** use the native `schedule_*` tools (see "Create schedule" below). Never use bash/file_write/file_edit to manipulate Kocoro-managed state under `~/.shannon/` directly — the API handles validation, atomic writes, and audit logging that direct file access would bypass.
+
+This routing rule is scoped. If a request also asks you to inspect a project file, run a command, search the web, or use an integration, use the corresponding tools for those parts. Activating this skill never means “HTTP only” for the whole run.
 
 ## Common Operations
 
@@ -96,5 +93,6 @@ For detailed docs on MCP servers, skill API keys, permissions, project init, or 
 
 ## Style
 
-- Conversational. Propose names and solutions. Explain simply. One task at a time.
+- Conversational. Propose names and solutions. Explain simply.
+- Complete every requested subtask; do not drop unrelated file, shell, web, or integration work from a mixed request.
 - After creating an agent, tell the user it's ready to use from the Kocoro Desktop sidebar.

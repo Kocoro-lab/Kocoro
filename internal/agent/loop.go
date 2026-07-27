@@ -884,7 +884,7 @@ type AgentLoop struct {
 	runMsgTimestamps   []time.Time      // parallel to runMessages: when each message was created
 	lastRunStatus      RunStatus
 	toolRefSupported   bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource        string // tag sent to gateway on every Complete call for prompt-cache TTL routing
+	cacheSource        string // attribution tag sent to gateway on every Complete call
 	skillDiscovery     bool   // call small-tier model on first turn to identify relevant skills (default true)
 	memoryPreflight    MemoryPreflightFunc
 	sentSkillNames     map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
@@ -1123,10 +1123,9 @@ func (a *AgentLoop) SetMCPContext(ctx string) {
 	a.mcpContext = ctx
 }
 
-// SetCacheSource tags every subsequent gateway Complete call with the given
-// cache_source string. Shannon uses it to route prompt-cache TTL (1h for
-// human-conversation channels; 5m for webhook/cron/mcp/one-shot/subagent paths).
-// Empty string is treated as "unknown" (5m fallback) by Shannon.
+// SetCacheSource tags every subsequent gateway Complete call with its logical
+// origin. Cloud currently uses the short prompt-cache TTL for every source, so
+// this value is attribution rather than a Kocoro-side policy switch.
 func (a *AgentLoop) SetCacheSource(src string) {
 	a.cacheSource = src
 }
@@ -1973,15 +1972,18 @@ type approvedToolCall struct {
 }
 
 // assembleUserMessage combines stable per-session context with the user query.
-// The gateway's Anthropic provider splits on <!-- cache_break -->, caching the prefix.
-// Layout: [stableContext]\n<!-- cache_break -->\n[userMessage]
+// Cloud's Anthropic provider splits this message on <!-- cache_break --> into
+// two text blocks and attaches breakpoint 3 to the first one.
+// Layout: [stableContext]\n<!-- cache_break -->\n[volatileContext]\n\n[userMessage]
 //
-// Note: VolatileContext (memory, date/time, CWD, MCP) is stitched into the
-// System prompt by prompt.BuildSystemPrompt (after a `<!-- volatile -->`
-// marker so Shannon excludes it from the cached prefix). It is NOT consumed
-// here — this keeps user message bytes stable across turns so cross-turn
-// cache hits don't drift every minute due to embedded timestamps.
-// The defensive concat below handles callers that manually populate the field.
+// VolatileContext (memory, date/time, CWD, MCP context) is consumed HERE, in
+// the post-break half. Moving it into the System prompt behind a
+// `<!-- volatile -->` marker was tried and reverted — those bytes sit BEFORE
+// the tools cache_control, so the embedded timestamp broke the tools cache
+// every minute (see prompt.BuildSystemPrompt). Landing it after cache_break
+// confines per-turn drift to the uncached tail, leaving system + tools +
+// the stable prefix intact; the next turn's rolling marker absorbs the tail
+// into the cached prefix anyway.
 func assembleUserMessage(parts prompt.PromptParts, userMessage string) string {
 	var sb strings.Builder
 
@@ -2085,6 +2087,18 @@ func reactiveSummaryInput(messages []client.Message, priorSummary string) []clie
 }
 
 func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []client.ContentBlock, history []client.Message) (string, *TurnUsage, error) {
+	return a.run(ctx, userMessage, userContent, history, false)
+}
+
+// ResumeInterrupted continues a checkpointed turn with a system-injected
+// continuation marker. The saved history already contains every completed
+// tool_use/tool_result pair, so the loop asks the model to continue instead of
+// replaying those tools or treating the marker as a fresh user request.
+func (a *AgentLoop) ResumeInterrupted(ctx context.Context, continuation string, history []client.Message) (string, *TurnUsage, error) {
+	return a.run(ctx, continuation, nil, history, true)
+}
+
+func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []client.ContentBlock, history []client.Message, initialUserInjected bool) (string, *TurnUsage, error) {
 	a.runMessages = nil      // reset for this run
 	a.runMsgInjected = nil   // reset for this run
 	a.runMsgTimestamps = nil // reset for this run
@@ -2328,20 +2342,21 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	// (BP #3, per-session). Issue #107.
 	localNames, mcpNames, gatewayNames := partitionLiveToolNamesBySource(effTools, toolNames)
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
-		BasePrompt:       basePrompt,
-		Memory:           mem,
-		Instructions:     instrText,
-		LocalToolNames:   localNames,
-		MCPToolNames:     mcpNames,
-		GatewayToolNames: gatewayNames,
-		DeferredTools:    deferredSummaries,
-		MCPContext:       a.mcpContext,
-		CWD:              cwd,
-		Skills:           a.agentSkills,
-		MemoryDir:        a.memoryDir,
-		StickyContext:    a.stickyContext,
-		ModelID:          modelID,
-		OutputFormat:     a.outputFormat,
+		BasePrompt:          basePrompt,
+		Memory:              mem,
+		Instructions:        instrText,
+		LocalToolNames:      localNames,
+		MCPToolNames:        mcpNames,
+		GatewayToolNames:    gatewayNames,
+		DeferredTools:       deferredSummaries,
+		MCPContext:          a.mcpContext,
+		CWD:                 cwd,
+		Skills:              a.agentSkills,
+		MemoryDir:           a.memoryDir,
+		StickyContext:       a.stickyContext,
+		ModelID:             modelID,
+		OutputFormat:        a.outputFormat,
+		QuestionUIAvailable: QuestionAskerFrom(ctx) != nil,
 	})
 
 	// Append cloud delegation guidance and cloud-specific contrast example
@@ -2400,8 +2415,11 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 	deltaIndices := make(map[int]bool)       // message indices that are delta injections (excluded from persistence)
 	msgTimestamps := make(map[int]time.Time) // message index → creation time
 	msgTimestamps[newMsgOffset] = time.Now() // timestamp the user message
+	if initialUserInjected {
+		injectedIndices[newMsgOffset] = true
+	}
 
-	if a.memoryPreflight != nil {
+	if a.memoryPreflight != nil && !initialUserInjected {
 		trace := MemoryPreflightTrace{Attempted: true, ForceHelper: isFirstConversationUserMessage(history)}
 		opts := MemoryPreflightOptions{ForceHelper: trace.ForceHelper, Trace: &trace}
 		if preflight := a.memoryPreflight(ctx, userMessage, opts); preflight != nil {
@@ -3267,9 +3285,8 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		// Enabled AND the gap since the last assistant response exceeds
 		// GapThresholdMinutes. The default config is Enabled=false, so
 		// per-iter compaction is OFF for typical sessions — short sessions
-		// never compact, and only sessions that idle past the 1h Anthropic
-		// prompt-cache TTL ceiling trigger a one-shot clearing pass when
-		// the next turn arrives.
+		// never compact, and only sessions that idle past the configured
+		// history-retention threshold trigger a one-shot clearing pass.
 		//
 		// Reactive context-pressure paths still call compressOldToolResults
 		// directly (loop.go ~1961/1980); those run only on
@@ -3622,6 +3639,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		}
 
 		const maxLLMRetries = 3
+		var committedStreamTools *streamToolStarter
 		// Inconsistent-finish retry wrapper: a successful HTTP response can
 		// still carry the upstream anomaly where finish_reason="tool_use" but
 		// neither a tool_use block (now detected via ContentBlocks in
@@ -3654,6 +3672,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				// On retries, skip streaming to avoid duplicate partial deltas.
 				if attempt == 0 && a.enableStreaming && a.handler != nil {
 					streamingText.Reset()
+					streamTools := newStreamToolStarter(ctx, a, effTools, a.handler)
 					resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
 						// A delta means the model received the request (incl. the
 						// drained system-event scaffold) and is responding — so the
@@ -3664,6 +3683,9 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						sawSystemEventScaffold = true
 						a.handler.OnStreamDelta(delta.Text)
 						streamingText.WriteString(delta.Text)
+						if delta.ToolCall != nil {
+							streamTools.Start(*delta.ToolCall, activeSkillFilter)
+						}
 					})
 					// Silent stream drop: the per-chunk watchdog inside CompleteStream
 					// fired because no chunk arrived for stream_idle_timeout_secs.
@@ -3671,6 +3693,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					// upstream and burn another 600s on the HTTP transport ceiling,
 					// so treat as a partial-success exit (matches ErrHardIdleTimeout).
 					if errors.Is(err, client.ErrStreamIdleTimeout) {
+						streamTools.CancelAll()
 						partial := streamingText.String()
 						if partial != "" {
 							messages = append(messages, client.Message{
@@ -3699,6 +3722,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 					}
 					// Fall back to non-streaming if gateway doesn't support it
 					if err != nil {
+						streamTools.CancelAll()
 						// Telemetry (NOT a fix): a streaming call that drops here
 						// re-issues as a non-stream request. If the gateway opened a
 						// fresh upstream for the retry, the new call comes back
@@ -3711,6 +3735,12 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 						fmt.Fprintf(os.Stderr, "[agent] stream->nonstream fallback iter=%d continuation=%d session_id=%q cache_source=%q skip_cache_write=%t stream_err_type=%T stream_err=%q\n",
 							i, continuationCount, req.SessionID, req.CacheSource, req.SkipCacheWrite, err, err.Error())
 						resp, err = a.client.Complete(ctx, req)
+					} else if resp != nil {
+						committedStreamTools = streamTools
+						committedStreamTools.CancelUnmatched(resp.AllToolCalls())
+					} else {
+						streamTools.CancelAll()
+						err = errors.New("streaming completion returned no response")
 					}
 				} else {
 					resp, err = a.client.Complete(ctx, req)
@@ -4297,6 +4327,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 		callMeta := make([]perCallMeta, len(toolCalls))
 		execResults := make([]toolExecResult, len(toolCalls))
 		var approved []approvedToolCall
+		var claimedStreamTool bool
 
 		// Deduplicate identical tool calls (same name + same arguments).
 		// The first occurrence executes; duplicates get a synthetic error result.
@@ -4362,6 +4393,29 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "unknown tool: " + fc.Name, IsError: true},
+					name:   fc.Name,
+				}
+				if a.handler != nil {
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
+				}
+				continue
+			}
+
+			// Skill admission happens before validation, permission prompts, and
+			// hooks. A tool excluded by the active skill must be observationally
+			// equivalent to an unavailable capability: it must not ask the user
+			// for approval or trigger pre-execution automation before being
+			// denied.
+			if activeSkillFilter != nil && !IsSkillExempt(tool) && !activeSkillFilter[fc.Name] {
+				denyMsg := fmt.Sprintf("[skill restriction] tool %q is not allowed by the active skill. Allowed: %s", fc.Name, activeSkillFilterStr)
+				if stickySkillName != "" && stickySkillSnippet != "" {
+					denyMsg += " — see sticky reminder above for guidance"
+					stickyInjectPending = true
+				}
+				a.logAudit(fc.Name, argsStr, denyMsg, "deny", false, 0, nil)
+				callMeta[idx].resolved = true
+				execResults[idx] = toolExecResult{
+					result: ToolResult{Content: denyMsg, IsError: true, ErrorCategory: ErrCategoryPermission},
 					name:   fc.Name,
 				}
 				if a.handler != nil {
@@ -4456,6 +4510,21 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				continue
 			}
 
+			// Framework-level validation is deliberately before state-cache lookup,
+			// permission prompts, and hooks. Tool.Run repeats typed validation as
+			// defense in depth, but malformed or incomplete calls should never
+			// create empty side effects (for example bash({}) or notify({})) or
+			// waste a remote MCP/gateway round-trip.
+			if validationResult, valid := ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
+				a.logAudit(fc.Name, argsStr, validationResult.Content, "validation", false, 0, nil)
+				callMeta[idx].resolved = true
+				execResults[idx] = toolExecResult{result: validationResult, name: fc.Name}
+				if a.handler != nil {
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, validationResult, 0)
+				}
+				continue
+			}
+
 			stateTraits := resolveCallStateTraits(fc.Name, argsStr)
 			if !stateTraits.Cacheable && len(stateTraits.Reads) == 0 && len(stateTraits.Writes) == 0 && !stateTraits.UnknownWrite {
 				stateTraits = resolveFallbackReadStateTraits(tool, argsStr)
@@ -4515,7 +4584,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 
 			// Pre-tool-use hook
 			if a.hookRunner != nil {
-				hookDecision, hookReason, hookErr := a.hookRunner.RunPreToolUse(ctx, fc.Name, argsStr, "")
+				hookDecision, hookReason, hookErr := a.hookRunner.RunPreToolUse(ctx, fc.Name, argsStr, a.sessionID)
 				if hookErr != nil {
 					fmt.Fprintf(os.Stderr, "[hooks] pre-tool-use error: %v\n", hookErr)
 				}
@@ -4533,57 +4602,40 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 			}
 
+			if committedStreamTools != nil {
+				if earlyResult, claimed := committedStreamTools.Claim(ctx, fc); claimed {
+					callMeta[idx].decision = "allow"
+					callMeta[idx].wasApproved = true
+					// NOT marked resolved: Claim only emitted OnToolCall. The
+					// post-execution serial pass below must still treat this
+					// call as executed so the claimed result gets err-mapping,
+					// sanitizeResult, the audit row, and the terminal
+					// OnToolResult event.
+					execResults[idx] = earlyResult
+					claimedStreamTool = true
+					// Preserve read-before-edit state before later calls in this
+					// response reach execution. The normal executor performs the
+					// same update between batches.
+					if readTracker != nil && fc.Name == "file_read" &&
+						!earlyResult.result.IsError && earlyResult.err == nil {
+						if path := extractPathArg(argsStr); path != "" {
+							readTracker.MarkRead(path)
+						}
+					}
+					continue
+				}
+			}
+
 			approved = append(approved, approvedToolCall{index: idx, fc: fc, tool: tool, argsStr: callMeta[idx].argsStr})
 		}
 
 		// ---- Phase 2 (batched): partition by read-only, execute with concurrency limits ----
 		if len(approved) > 0 {
-			// Execution-time denial: if a skill declared allowed-tools, block
-			// calls to tools outside the allowlist. Replaces schema-filtering
-			// (which caused cache miss) with a runtime check.
-			if activeSkillFilter != nil {
-				var kept []approvedToolCall
-				for _, ac := range approved {
-					// Framework-level exemption: pure-infrastructure tools
-					// (think, tool_search, use_skill) opt out via the
-					// SkillExempt interface so a skill's allowed-tools never
-					// locks the model out of reasoning or skill switching.
-					// Tools with I/O side effects MUST NOT implement this.
-					if IsSkillExempt(ac.tool) {
-						kept = append(kept, ac)
-						continue
-					}
-					if !activeSkillFilter[ac.fc.Name] {
-						denyMsg := fmt.Sprintf("[skill restriction] tool %q is not allowed by the active skill. Allowed: %s", ac.fc.Name, activeSkillFilterStr)
-						// Drift re-arm: when the active skill is sticky,
-						// append a soft nudge to this denial and re-arm the
-						// reminder for the NEXT iteration. One nudge per
-						// drift event — no per-turn spam.
-						if stickySkillName != "" && stickySkillSnippet != "" {
-							denyMsg += " — see sticky reminder above for guidance"
-							stickyInjectPending = true
-						}
-						execResults[ac.index] = toolExecResult{
-							result: ToolResult{
-								Content: denyMsg,
-								IsError: true,
-							},
-							name: ac.fc.Name,
-						}
-						if a.handler != nil {
-							a.handler.OnToolResult(ac.fc.Name, ac.argsStr, ac.fc.ID, execResults[ac.index].result, 0)
-						}
-						a.logAudit(ac.fc.Name, ac.argsStr, "denied by skill tool filter", "deny", false, 0, nil)
-					} else {
-						kept = append(kept, ac)
-					}
-				}
-				approved = kept
-			}
-
 			batches := partitionToolCalls(approved)
 			a.tracker.Enter(PhaseExecutingTools)
 			executeBatches(ctx, batches, execResults, readTracker, a.handler)
+		}
+		if len(approved) > 0 || claimedStreamTool {
 			// Per-turn aggregate cap: even when each result is below the 50K
 			// per-result spillThreshold, parallel of N tools returning
 			// 30K each can put hundreds of KB into one user message. Spill
@@ -4655,7 +4707,7 @@ func (a *AgentLoop) Run(ctx context.Context, userMessage string, userContent []c
 				}
 
 				if a.hookRunner != nil {
-					_ = a.hookRunner.RunPostToolUse(ctx, fc.Name, argsStr, result.Content, "")
+					_ = a.hookRunner.RunPostToolUse(ctx, fc.Name, argsStr, result.Content, a.sessionID)
 				}
 
 				a.logAudit(fc.Name, argsStr, result.Content, decision, wasApproved, elapsed.Milliseconds(), result.Usage)

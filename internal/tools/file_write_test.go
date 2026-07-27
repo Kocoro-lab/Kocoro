@@ -294,7 +294,7 @@ func TestFileWrite_MixedValidAndInvalid(t *testing.T) {
 	tool := &FileWriteTool{}
 	bad := fmt.Sprintf(`{"path":%q}`, path)
 	good := func(version string) string {
-		return fmt.Sprintf(`{"path":%q,"content":%q}`, path, version)
+		return fmt.Sprintf(`{"path":%q,"content":%q,"description":"test valid write"}`, path, version)
 	}
 
 	// Sequence: bad, good v1, bad, bad, good v2, bad, good v3, bad
@@ -415,11 +415,10 @@ func FuzzFileWrite_RawJSON(f *testing.F) {
 	})
 }
 
-// TestFileWrite_AllowsSingleSpaceContent verifies the documented "truncate"
-// workaround in the error message: the model can pass content=" " (single
-// space) to deliberately produce a near-empty file. Distinguishes "I forgot
-// content" (rejected) from "I want a near-empty file" (allowed).
-func TestFileWrite_AllowsSingleSpaceContent(t *testing.T) {
+// Whitespace-only content is a legitimate write (a lone newline, an
+// indentation-only line). Only the empty string "" is rejected — see
+// TestFileWrite_MissingContent / TestFileWrite_EmptyContent.
+func TestFileWrite_AcceptsWhitespaceOnlyContent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "near_empty.txt")
 
@@ -427,22 +426,18 @@ func TestFileWrite_AllowsSingleSpaceContent(t *testing.T) {
 	ctx := context.WithValue(context.Background(), agent.ReadTrackerKey(), tracker)
 
 	tool := &FileWriteTool{}
-	rawArgs := fmt.Sprintf(`{"path":%q,"content":" "}`, path)
+	rawArgs := fmt.Sprintf(`{"path":%q,"content":" ","description":"test whitespace write"}`, path)
 
 	result, err := tool.Run(ctx, rawArgs)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result.IsError {
-		t.Fatalf("expected success for single-space content, got: %s", result.Content)
+		t.Fatalf("whitespace-only content should write, got error: %s", result.Content)
 	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("readback: %v", err)
-	}
+	data, _ := os.ReadFile(path)
 	if string(data) != " " {
-		t.Errorf("expected single space, got: %q", data)
+		t.Fatalf("expected single space written, got %q", string(data))
 	}
 }
 
@@ -456,8 +451,9 @@ func TestFileWrite_RejectsUnreadExistingFile(t *testing.T) {
 
 	tool := &FileWriteTool{}
 	args, _ := json.Marshal(fileWriteArgs{
-		Path:    path,
-		Content: "overwritten",
+		Path:        path,
+		Content:     "overwritten",
+		Description: "test unread write",
 	})
 
 	result, err := tool.Run(ctx, string(args))
@@ -487,8 +483,9 @@ func TestFileWrite_AllowsNewFile(t *testing.T) {
 
 	tool := &FileWriteTool{}
 	args, _ := json.Marshal(fileWriteArgs{
-		Path:    path,
-		Content: "new content",
+		Path:        path,
+		Content:     "new content",
+		Description: "test new write",
 	})
 
 	result, err := tool.Run(ctx, string(args))
@@ -516,8 +513,9 @@ func TestFileWrite_AllowsReadExistingFile(t *testing.T) {
 
 	tool := &FileWriteTool{}
 	args, _ := json.Marshal(fileWriteArgs{
-		Path:    path,
-		Content: "overwritten",
+		Path:        path,
+		Content:     "overwritten",
+		Description: "test read write",
 	})
 
 	result, err := tool.Run(ctx, string(args))

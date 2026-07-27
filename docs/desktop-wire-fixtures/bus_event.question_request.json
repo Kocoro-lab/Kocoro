@@ -1,0 +1,29 @@
+{
+  "request_id": "qst_9f2c4b8a01d3e6f7",
+  "session_id": "f3b2a1c0-9d8e-4f5a-b6c7-d8e9f0a1b2c3",
+  "agent": "agent-3f2a91",
+  "source": "kocoro",
+  "channel": "",
+  "questions": [
+    {
+      "id": "q0",
+      "header": "Auth method",
+      "question": "Which authentication method should I wire up?",
+      "multi_select": false,
+      "allow_other": true,
+      "options": [
+        {
+          "label": "OAuth 2.0",
+          "description": "Delegated login via the provider's consent screen.",
+          "recommended": true
+        },
+        {
+          "label": "API key",
+          "description": "A static secret stored in config."
+        }
+      ]
+    }
+  ],
+  "auto_resolution_ms": 120000,
+  "ts": "2026-06-12T09:00:00Z"
+}

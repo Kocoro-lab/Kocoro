@@ -73,8 +73,15 @@ type Server struct {
 	// pendingBrokers maps requestID → per-request ApprovalBroker.
 	// SSE handlers register here so POST /approval can find the right broker.
 	pendingBrokers sync.Map // map[string]*ApprovalBroker
-	remoteRuns     sync.Map // map[string]*remoteRunState
-	remoteRunSlots chan struct{}
+	// questionBroker is the server-level QuestionBroker (ask_user_question).
+	// Like approvalBroker its sendFn is a no-op; SSE per-request brokers inherit
+	// its bus hooks so question.request / question.resolved stay consistent.
+	questionBroker *QuestionBroker
+	// pendingQuestionBrokers maps requestID → per-request QuestionBroker so
+	// POST /question can find the right broker (parallels pendingBrokers).
+	pendingQuestionBrokers sync.Map // map[string]*QuestionBroker
+	remoteRuns             sync.Map // map[string]*remoteRunState
+	remoteRunSlots         chan struct{}
 	// Remote run events are sequenced and kept briefly so a Cloud WS reconnect can
 	// replay events that were emitted while the socket was down.
 	remoteRunOutboxMu sync.Mutex
@@ -300,6 +307,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		deps:                   deps,
 		version:                version,
 		approvalBroker:         NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
+		questionBroker:         NewQuestionBroker(func(req QuestionRequest) error { return nil }),
 		eventBus:               NewEventBus(),
 		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
 		remoteRunSlots:         make(chan struct{}, MaxConcurrentAgents),
@@ -325,6 +333,11 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	WireApprovalBusHooks(s.approvalBroker, s.eventBus, func(p ApprovalResolvedPayload) error {
 		return s.notifyApprovalResolved(p)
 	})
+	// Question interaction: same bus-hook wiring so SSE per-request question
+	// brokers publish question.request / question.resolved through one path.
+	// notify is nil — no Cloud question transport exists yet (the interaction
+	// is Desktop-local today).
+	WireQuestionBusHooks(s.questionBroker, s.eventBus, nil)
 	if deps != nil {
 		deps.Suggestions = s.suggestions
 		if deps.ApprovalTracker == nil {
@@ -682,6 +695,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
+	mux.HandleFunc("POST /question", s.handleQuestion)
 	mux.HandleFunc("POST /remote/pairing-code", s.handleRemotePairingCode)
 	mux.HandleFunc("GET /remote/pairings", s.handleRemotePairings)
 	mux.HandleFunc("POST /remote/revoke", s.handleRemoteRevoke)
@@ -853,6 +867,11 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Continue durable mid-turn checkpoints after the process is fully
+	// configured. The worker is sequential to avoid a restart burst competing
+	// with foreground traffic for model and tool capacity.
+	go s.resumeInterruptedTurns(ctx)
+
 	go func() {
 		<-ctx.Done()
 		// Stop the memory sidecar before HTTP shutdown so SIGTERM reaches the
@@ -927,7 +946,11 @@ func (s *Server) forwardRemoteEvents(ctx context.Context) {
 
 func remoteEventAllowed(evt Event) bool {
 	switch evt.Type {
-	case EventApprovalRequest, EventApprovalResolved, EventApprovalNotice:
+	// Interactive requests stay local until the remote-control protocol can
+	// resolve them. Forwarding only one side would expose their payloads while
+	// leaving remote clients with no allowed POST endpoint to answer them.
+	case EventApprovalRequest, EventApprovalResolved, EventApprovalNotice,
+		EventQuestionRequest, EventQuestionResolved:
 		return false
 	default:
 		return true
@@ -1364,6 +1387,52 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
+// handleQuestion resolves a pending ask_user_question interaction. Mirrors
+// handleApproval: it claims the request under the broker mutex and emits the
+// terminal question.resolved (resolved_by=kocoro) as Resolve's beforeDeliver so
+// the event is sequenced before any post-answer agent event. Desktop-only
+// transport (the agent never calls it), so it stays out of the kocoro skill
+// references but is pinned by the wire fixtures.
+func (s *Server) handleQuestion(w http.ResponseWriter, r *http.Request) {
+	var req QuestionResponse
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.RequestID == "" {
+		http.Error(w, `{"error":"request_id required"}`, http.StatusBadRequest)
+		return
+	}
+	switch req.Action {
+	case QuestionActionAnswer, QuestionActionDecline:
+	default:
+		http.Error(w, `{"error":"action must be answer or decline"}`, http.StatusBadRequest)
+		return
+	}
+	emitResolved := func() {
+		emitBusJSON(s.eventBus, EventQuestionResolved, map[string]any{
+			"request_id":  req.RequestID,
+			"action":      req.Action,
+			"resolved_by": "kocoro",
+			"ts":          nowISO(),
+		})
+	}
+	// The per-request SSE broker owns the pending question; the server broker is
+	// the no-op-sendFn fallback that shares its bus hooks. No Cloud/WS question
+	// transport exists yet, so there is no third fallback (unlike approvals).
+	var err error
+	if b, ok := s.pendingQuestionBrokers.Load(req.RequestID); ok {
+		_, err = b.(*QuestionBroker).ResolveResponse(req, emitResolved)
+	} else {
+		_, err = s.questionBroker.ResolveResponse(req, emitResolved)
+	}
+	if err != nil {
+		http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true}`))
 }
@@ -2846,6 +2915,16 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	// Cancel only this request's pending approvals when the SSE stream ends.
 	defer reqBroker.CancelAll()
 
+	// Per-request question broker (ask_user_question), parallel to reqBroker:
+	// its own pending map + SSE `question` sendFn, inheriting the server broker's
+	// bus hooks so question.request / question.resolved stay consistent.
+	qBroker := NewQuestionBroker(newSSEQuestionSendFn(w, flusher))
+	qBroker.onRequest = s.questionBroker.onRequest
+	qBroker.onCleanup = s.questionBroker.onCleanup
+	qBroker.onRegister = func(requestID string) { s.pendingQuestionBrokers.Store(requestID, qBroker) }
+	qBroker.onDeregister = func(requestID string) { s.pendingQuestionBrokers.Delete(requestID) }
+	defer qBroker.CancelAll()
+
 	// Resolve auto_approve: per-agent overrides global
 	cfg, _, _ := s.deps.Snapshot()
 	autoApprove := cfg.Daemon.AutoApprove
@@ -2856,7 +2935,28 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	}
 
 	handler := &sseEventHandler{w: w, flusher: flusher, broker: reqBroker, ctx: r.Context(), autoApprove: autoApprove, deps: s.deps, agent: req.Agent, source: req.Source}
-	result, err := RunAgent(r.Context(), s.deps, req, handler)
+	// Inject the QuestionAsker so ask_user_question can reach qBroker. metaFn is
+	// read lazily at ask time so the session id RunAgent resolves mid-run is
+	// captured, mirroring how OnApprovalNeeded reads handler.sessionID.
+	//
+	// Gate on the run's SOURCE, not auto_approve. auto_approve only governs
+	// whether tool EXECUTIONS are auto-approved; it says nothing about whether a
+	// human can answer a multiple-choice question. An attended Desktop/web run
+	// with auto_approve on must still be able to ask. Only unattended sources
+	// (schedule/cron, heartbeat/watcher/mcp, non-interactive channels) get no
+	// asker, so a background run can never block on an interactive question; the
+	// QuestionBroker's auto-resolution timeout backstops an attended run whose
+	// user walks away.
+	askCtx := r.Context()
+	if !isUnattendedSource(req.Source) {
+		askCtx = agent.WithQuestionAsker(askCtx, &brokerQuestionAsker{
+			broker: qBroker,
+			metaFn: func() ApprovalRequestMeta {
+				return ApprovalRequestMeta{SessionID: handler.sessionID, Source: req.Source, Agent: req.Agent}
+			},
+		})
+	}
+	result, err := RunAgent(askCtx, s.deps, req, handler)
 	if err != nil {
 		payload := map[string]string{"error": err.Error()}
 		switch {

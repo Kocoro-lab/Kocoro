@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -379,13 +380,31 @@ func TestPDFToText_MissingExtractor(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{"path": path})
 	res, _ := (&PDFToTextTool{}).Run(context.Background(), string(args))
 	if !res.IsError {
-		t.Fatalf("expected error when pdftotext missing, got %q", res.Content)
+		t.Fatalf("expected error when all extractors are missing, got %q", res.Content)
 	}
 	if !strings.Contains(res.Content, "brew install poppler") {
 		t.Errorf("expected poppler install hint; got %q", res.Content)
 	}
 	if !strings.Contains(res.Content, "Anthropic document block") {
 		t.Errorf("expected hint about cloud document block; got %q", res.Content)
+	}
+}
+
+func TestPDFToText_PDFKitFallback(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("PDFKit is macOS-only")
+	}
+	if _, err := exec.LookPath("swift"); err != nil {
+		t.Skip("swift not installed")
+	}
+	path := filepath.Join(t.TempDir(), "sample.pdf")
+	writePDF(t, path, "Hello PDFKit")
+	out, ok := pdfTextWithPDFKit(context.Background(), path, nil)
+	if !ok {
+		t.Fatal("PDFKit fallback failed")
+	}
+	if !strings.Contains(out, "Hello PDFKit") {
+		t.Fatalf("fallback output missing text: %q", out)
 	}
 }
 

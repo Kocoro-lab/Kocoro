@@ -5,8 +5,8 @@ package koe
 import "sync"
 
 // NativeFloorEnabled keeps ASR out of playback-overlap admission. With VPIO
-// barge-in active, Realtime hears the raw audio and receives only two narrow
-// choices: resume the paused assistant or accept a genuine user turn.
+// barge-in active, Realtime hears the raw audio and receives only narrow
+// turn-control choices for the paused assistant response.
 func NativeFloorEnabled() bool { return koeEnvBool("KOE_NATIVE_FLOOR", true) }
 
 func nativeFloorControlEnabled(fullDuplexAEC bool) bool {
@@ -16,7 +16,7 @@ func nativeFloorControlEnabled(fullDuplexAEC bool) bool {
 		!koeEnvBool("KOE_INTERRUPT_RESPONSE", false)
 }
 
-const nativeFloorInstructions = "Decide turn-taking from the user's most recent RAW SPOKEN AUDIO, not from a transcript. Call exactly one function and say nothing. Classify the conversational function, not merely whether speech was detected. Call resume_playback for a brief backchannel, filler, laugh, acknowledgement, or non-directed sound that does not ask Kocoro to stop, change, answer, or act. Clear resume examples include mm-hmm, mhm, uh-huh, hmm, 嗯, 嗯嗯, 对, 好的, うん, はい, laughter, and sighs when they contain no request or correction. Call accept_turn only for semantic content that still needs Kocoro to respond or act after the current speech stops: a question, request, correction, topic change, or explicit stop. If a very short or non-lexical vocalization is ambiguous, prefer resume_playback; if intelligible words may contain a request or correction, prefer accept_turn."
+const nativeFloorInstructions = "Decide turn-taking from the user's most recent RAW SPOKEN AUDIO, not from a transcript. Call exactly one function and say nothing. Classify the conversational function, not merely whether speech was detected. Call resume_playback for a brief backchannel, filler, laugh, acknowledgement, or non-directed sound that does not ask Kocoro to stop, change, answer, or act. Clear resume examples include mm-hmm, mhm, uh-huh, hmm, 嗯, 嗯嗯, 对, 好的, うん, はい, laughter, and sighs when they contain no request or correction. Call stop_speaking when the user only wants the current speech to stop while keeping the voice call active: 停, 停一下, 别说了, 闭嘴, stop, stop talking, or shut up. Call end_call only when the user explicitly dismisses Kocoro or ends the entire voice conversation: 退出, 退出吧, 结束通话, 再见, 拜拜, exit, quit, bye, goodbye, or that's all. Call accept_turn for other semantic content that still needs Kocoro to respond or act after the current speech stops: a question, request, correction, or topic change. An explicit whole-conversation dismissal must choose end_call, never accept_turn or resume_playback. If a very short or non-lexical vocalization is ambiguous, prefer resume_playback; if intelligible words may contain a request or correction, prefer accept_turn."
 
 func nativeFloorToolDefs() []ToolDef {
 	return []ToolDef{
@@ -28,8 +28,20 @@ func nativeFloorToolDefs() []ToolDef {
 		},
 		{
 			Type:        "function",
+			Name:        "stop_speaking",
+			Description: "The user wants only the current speech to stop. Discard the paused response, say nothing, and keep the voice call active.",
+			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`),
+		},
+		{
+			Type:        "function",
 			Name:        "accept_turn",
-			Description: "The overlapping audio is a genuine user turn that expects Kocoro to stop, change, answer, or act. Discard the paused response and handle this turn.",
+			Description: "The overlapping audio is a genuine question, request, correction, or topic change that needs a response or action. Discard the paused response and handle this turn.",
+			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`),
+		},
+		{
+			Type:        "function",
+			Name:        "end_call",
+			Description: "The user explicitly dismisses Kocoro or ends the entire voice conversation. Discard the paused response and terminate the call immediately without speaking.",
 			Parameters:  obj(`{"type":"object","properties":{},"required":[]}`),
 		},
 	}
@@ -40,7 +52,9 @@ type floorDecision uint8
 const (
 	floorDecisionNone floorDecision = iota
 	floorDecisionResume
+	floorDecisionStop
 	floorDecisionAccept
+	floorDecisionEnd
 )
 
 type floorStage uint8
@@ -51,7 +65,9 @@ const (
 	floorWaitingForJudge
 	floorJudging
 	floorResuming
+	floorStopping
 	floorAccepting
+	floorEnding
 )
 
 type floorToolClaim struct {
@@ -139,7 +155,9 @@ func (f *nativeFloorController) claim(responseID, callID, tool string) floorTool
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if responseID != f.judgeResponseID || (f.stage != floorJudging && f.stage != floorResuming && f.stage != floorAccepting) {
+	if responseID != f.judgeResponseID ||
+		(f.stage != floorJudging && f.stage != floorResuming && f.stage != floorStopping &&
+			f.stage != floorAccepting && f.stage != floorEnding) {
 		return floorToolClaim{}
 	}
 	claim := floorToolClaim{handled: true, turnID: f.turnID}
@@ -161,9 +179,15 @@ func (f *nativeFloorController) claim(responseID, callID, tool string) floorTool
 	case "resume_playback":
 		f.stage = floorResuming
 		claim.decision = floorDecisionResume
+	case "stop_speaking":
+		f.stage = floorStopping
+		claim.decision = floorDecisionStop
 	case "accept_turn":
 		f.stage = floorAccepting
 		claim.decision = floorDecisionAccept
+	case "end_call":
+		f.stage = floorEnding
+		claim.decision = floorDecisionEnd
 	default:
 		claim.reason = "invalid_floor_tool"
 	}

@@ -21,7 +21,7 @@ func TestGlob_BasicPattern(t *testing.T) {
 	}
 
 	tool := &GlobTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"*.go","path":%q}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"*.go","path":%q,"description":"test glob"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestGlob_RecursivePattern(t *testing.T) {
 	}
 
 	tool := &GlobTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"**/*.go","path":%q}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"**/*.go","path":%q,"description":"test recursive glob"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestGlob_RecursivePattern(t *testing.T) {
 func TestGlob_NoMatches(t *testing.T) {
 	tmp := t.TempDir()
 	tool := &GlobTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"*.xyz","path":%q}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"*.xyz","path":%q,"description":"test empty glob"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestGlob_MaxResults(t *testing.T) {
 	}
 
 	tool := &GlobTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"*.txt","path":%q,"max_results":3}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"*.txt","path":%q,"max_results":3,"description":"test glob limit"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestGlob_ContextCancellation(t *testing.T) {
 
 	tool := &GlobTool{}
 	// Must not hang; either returns error result or an error
-	_, _ = tool.Run(ctx, fmt.Sprintf(`{"pattern":"**/*.go","path":%q}`, tmp))
+	_, _ = tool.Run(ctx, fmt.Sprintf(`{"pattern":"**/*.go","path":%q,"description":"test cancelled glob"}`, tmp))
 }
 
 // TestGlob_RelativePatternRefusedWithoutSessionCWD documents the guard:
@@ -132,7 +132,7 @@ func TestGlob_ContextCancellation(t *testing.T) {
 // started from.
 func TestGlob_RelativePatternRefusedWithoutSessionCWD(t *testing.T) {
 	tool := &GlobTool{}
-	result, err := tool.Run(context.Background(), `{"pattern":"*.go"}`)
+	result, err := tool.Run(context.Background(), `{"pattern":"*.go","description":"test relative guard"}`)
 	if err != nil {
 		t.Fatalf("Run should not return a transport error, got %v", err)
 	}
@@ -155,7 +155,7 @@ func TestGlob_RelativePatternWorksWithSessionCWD(t *testing.T) {
 
 	ctx := cwdctx.WithSessionCWD(context.Background(), tmp)
 	tool := &GlobTool{}
-	result, err := tool.Run(ctx, `{"pattern":"*.go"}`)
+	result, err := tool.Run(ctx, `{"pattern":"*.go","description":"test relative glob"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestGlob_GitignoreRespected(t *testing.T) {
 	}
 
 	tool := &GlobTool{}
-	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"**/*.go","path":%q}`, tmp))
+	result, err := tool.Run(context.Background(), fmt.Sprintf(`{"pattern":"**/*.go","path":%q,"description":"test gitignore"}`, tmp))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestGlob_AbsPatternUnderSessionCWDStillAllowed(t *testing.T) {
 
 	ctx := cwdctx.WithSessionCWD(context.Background(), sessionCWD)
 	tool := &GlobTool{}
-	argsJSON := fmt.Sprintf(`{"pattern":"%s/*.go"}`, sub)
+	argsJSON := fmt.Sprintf(`{"pattern":"%s/*.go","description":"test absolute pattern"}`, sub)
 
 	if !tool.IsSafeArgsWithContext(ctx, argsJSON) {
 		t.Fatalf("absolute pattern under session CWD should be auto-approved (sessionCWD=%s, target=%s)", sessionCWD, sub)

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
@@ -207,7 +208,7 @@ func (s *Server) handleSessionShare(w http.ResponseWriter, r *http.Request) {
 		Filename:    filename,
 		ContentType: "text/html",
 		Kind:        uploads.KindSessionShare,
-		Metadata:    buildShareUploadMetadata(sess.ID, agentName),
+		Metadata:    buildShareUploadMetadata(sess.ID, agentName, sess.Title),
 	})
 	if err != nil {
 		writeUploadsError(w, err)
@@ -459,26 +460,50 @@ func buildShareFilename(haikuSlug, title, sessionID string, now time.Time) strin
 	return fmt.Sprintf("session-%s-%s.html", slug, now.Format("20060102-150405"))
 }
 
+// shareTitleMetadataMaxRunes caps the session title stored in upload metadata.
+// Rune-based (not byte-based) so a CJK title is never cut mid-codepoint. 256
+// runes is ≤ 1 KiB of UTF-8, comfortably inside Cloud's 8 KiB metadata cap
+// alongside session_id + agent.
+const shareTitleMetadataMaxRunes = 256
+
 // buildShareUploadMetadata returns the JSON payload attached to every session-
 // share upload. Cloud stores it on the row so the Desktop UI can cross-reference
 // uploads back to their originating session/agent without round-tripping the
 // daemon. agentName empty (default agent) omits the key so the JSON stays
 // minimal — Cloud's 8 KiB metadata cap is generous but we keep this lean.
 //
+// title is the session title verbatim (trimmed, clamped) — unlike the filename
+// it is NOT slugified to ASCII, because metadata is a JSON field and never
+// becomes an S3 key, so the NFC/NFD normalization hazards documented on
+// slugifyTitleForFilename don't apply. This is the Desktop list's only lossless
+// source for CJK titles. Blank titles omit the key.
+//
 // json.Marshal failure on a string→string map is unreachable; on the off chance
 // the encoder ever fails we fall back to nil, which Upload treats as "omit the
 // metadata field entirely" — the share still goes through, just without the
 // cross-reference. Better than aborting the share.
-func buildShareUploadMetadata(sessionID, agentName string) json.RawMessage {
+func buildShareUploadMetadata(sessionID, agentName, title string) json.RawMessage {
 	md := map[string]string{"session_id": sessionID}
 	if agentName != "" {
 		md["agent"] = agentName
+	}
+	if t := clampRunes(strings.TrimSpace(title), shareTitleMetadataMaxRunes); t != "" {
+		md["title"] = t
 	}
 	raw, err := json.Marshal(md)
 	if err != nil {
 		return nil
 	}
 	return raw
+}
+
+// clampRunes truncates s to at most max runes, cutting at a rune boundary.
+func clampRunes(s string, max int) string {
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:max])
 }
 
 // slugifyTitleForFilename trims a session title down to a single token safe

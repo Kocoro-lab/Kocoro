@@ -46,12 +46,12 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 		}
 	}
 
-	// Total: 35 local + 2 server = 37. doc-extract pdf/docx/xlsx/pptx are
-	// pre-existing local extractors; schedule_show and present_deliverable are
-	// the recent additions pinned by this assertion.
+	// Total: 36 local + 2 server = 38. doc-extract pdf/docx/xlsx/pptx are
+	// pre-existing local extractors; schedule_show, present_deliverable, and
+	// ask_user_question are the additions pinned by this assertion.
 	schemas := reg.Schemas()
-	if len(schemas) != 37 {
-		t.Errorf("expected 37 tools, got %d", len(schemas))
+	if len(schemas) != 38 {
+		t.Errorf("expected 38 tools, got %d", len(schemas))
 	}
 }
 
@@ -75,8 +75,8 @@ func TestRegisterAll_ServerUnavailable(t *testing.T) {
 	}
 
 	schemas := reg.Schemas()
-	if len(schemas) != 35 {
-		t.Errorf("expected 35 local tools, got %d", len(schemas))
+	if len(schemas) != 36 {
+		t.Errorf("expected 36 local tools, got %d", len(schemas))
 	}
 }
 
@@ -118,12 +118,12 @@ func TestRegisterAll_LocalPriority(t *testing.T) {
 		t.Error("web_search should be a server tool")
 	}
 
-	// 35 local + 1 server (bash skipped) = 36. doc-extract pdf/docx/xlsx/pptx
-	// are pre-existing local extractors; schedule_show and present_deliverable
-	// are the recent additions pinned by this assertion.
+	// 36 local + 1 server (bash skipped) = 37. doc-extract pdf/docx/xlsx/pptx
+	// are pre-existing local extractors; schedule_show, present_deliverable, and
+	// ask_user_question are the additions pinned by this assertion.
 	schemas := reg.Schemas()
-	if len(schemas) != 36 {
-		t.Errorf("expected 36 tools, got %d", len(schemas))
+	if len(schemas) != 37 {
+		t.Errorf("expected 37 tools, got %d", len(schemas))
 	}
 }
 
@@ -210,6 +210,9 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	baseline.Register(&ThinkTool{})
 	baseline.Register(&BrowserTool{})
 	baseline.Register(&AccessibilityTool{})
+	baseline.Register(&AppleScriptTool{})
+	baseline.Register(&ScreenshotTool{})
+	baseline.Register(&WaitTool{})
 
 	healthStates := map[string]mcp.ServerHealth{
 		"playwright": {State: mcp.StateHealthy},
@@ -231,6 +234,11 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	// cannot, so it must survive Playwright (regression: it was wrongly removed).
 	if _, ok := reg.Get("accessibility"); !ok {
 		t.Error("accessibility must NOT be removed when Playwright is present")
+	}
+	for _, name := range []string{"applescript", "screenshot", "wait_for"} {
+		if _, ok := reg.Get(name); !ok {
+			t.Errorf("%s must NOT be removed when Playwright is present", name)
+		}
 	}
 }
 

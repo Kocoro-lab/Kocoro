@@ -30,7 +30,7 @@ func TestProcess_InvalidArgs(t *testing.T) {
 
 func TestProcess_UnknownAction(t *testing.T) {
 	tool := &ProcessTool{}
-	result, err := tool.Run(context.Background(), `{"action": "restart"}`)
+	result, err := tool.Run(context.Background(), `{"action": "restart","description":"test invalid action"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestProcess_UnknownAction(t *testing.T) {
 
 func TestProcess_KillNoPID(t *testing.T) {
 	tool := &ProcessTool{}
-	result, err := tool.Run(context.Background(), `{"action": "kill"}`)
+	result, err := tool.Run(context.Background(), `{"action": "kill","description":"test missing pid"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestProcess_List(t *testing.T) {
 		t.Skip("process list test not supported on Windows")
 	}
 	tool := &ProcessTool{}
-	result, err := tool.Run(context.Background(), `{"action": "list"}`)
+	result, err := tool.Run(context.Background(), `{"action": "list","description":"test process list"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

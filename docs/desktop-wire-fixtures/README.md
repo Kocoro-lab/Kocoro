@@ -52,6 +52,24 @@ Three transport surfaces, named by file prefix:
 | `bus_event.approval_notice.json` | `alwaysallow.go emitAlwaysAllowNotice` | post-decision feedback; `code` is the stable i18n key, `message` is English fallback |
 | `sse_event.approval.json` | `server.go handleMessageSSE` per-request broker sendFn | full `ApprovalRequest` struct; `channel`/`thread_id`/`agent` are present-but-empty for foreground runs (no omitempty) |
 
+### Ask-user question lifecycle
+
+Second request/resolve interaction (`ask_user_question` tool). Same `pendingCore` lifecycle + at-most-one-terminal-event contract as approvals; distinct wire face. Capability token `question_v1`.
+
+| File | Producer | Notes |
+|---|---|---|
+| `bus_event.question_request.json` | `internal/daemon/question_broker.go makeQuestionRequestEmitter` | `questions` is a bounded replay copy of the model-authored 1-4 array (`id` = `q0`..); non-identity display text is secret-redacted, while bounded option labels stay exact because they are response identities. `auto_resolution_ms` is optional (omitted when 0) |
+| `bus_event.question_resolved.json` | `server.go handleQuestion` (`POST /question` ingress) | `action: "answer"`, `resolved_by: "kocoro"` = a UI answered it |
+| `bus_event.question_resolved.daemon_cleanup.json` | `question_broker.go makeQuestionCleanupEmitter` | timeout / ctx-cancel / disconnect; always `action: "cancel"`, `resolved_by: "daemon"`. Exactly one terminal event per request_id across both files |
+| `sse_event.question.json` | `server.go handleMessageSSE` per-request broker sendFn | full `QuestionRequest` struct on the per-request stream under the shorter frame name `question`; `channel`/`thread_id`/`agent` present-but-empty for foreground runs |
+
+An `answer` response is all-or-nothing: it must contain exactly one entry for
+every rendered question ID. Single-select questions carry exactly one value;
+multi-select questions carry at least one. Values are full option labels (or
+one custom value when `allow_other` is true), never option indexes or tokens.
+Invalid responses leave the request pending so the UI can restore the card and
+retry. `decline` carries no answers.
+
 ### Agent run events
 
 | File | Producer | Notes |

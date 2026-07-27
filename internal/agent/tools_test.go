@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
@@ -61,6 +62,30 @@ func (m *mockTool) Run(ctx context.Context, args string) (ToolResult, error) {
 
 func (m *mockTool) RequiresApproval() bool { return false }
 
+func TestAskUserQuestionIsCancelableMidTurn(t *testing.T) {
+	tool := &mockTool{name: "ask_user_question"}
+	if !IsCancelableMidTurn(tool) {
+		t.Fatal("ask_user_question must allow an interrupt to dismiss its side-effect-free pending UI")
+	}
+
+	parent, cancelParent := context.WithCancelCause(context.Background())
+	toolCtx, cleanup := dispatchCtx(parent, tool)
+	if cleanup != nil {
+		t.Fatal("cancelable question tool should receive the parent context directly")
+	}
+
+	cancelParent(agenttypes.NewCancelError(agenttypes.ReasonInterrupt))
+	select {
+	case <-toolCtx.Done():
+		reason, ok := agenttypes.ExtractReason(context.Cause(toolCtx))
+		if !ok || reason != agenttypes.ReasonInterrupt {
+			t.Fatalf("tool context cause = %v, want interrupt", context.Cause(toolCtx))
+		}
+	default:
+		t.Fatal("question tool context did not receive the interrupt")
+	}
+}
+
 // TestDisallowsAutoApproval pins the current policy: the deny-list mechanism
 // EXISTS (so a future genuinely-irreversible tool can be added) but is empty
 // for now. publish_to_web / generate_image / edit_image were previously on
@@ -86,9 +111,9 @@ func TestDisallowsAutoApproval(t *testing.T) {
 	}
 }
 
-// TestDisallowsUnattendedAutoApproval pins the unattended gate. As of
-// 2026-07-22 the list contains exactly computer_use — an unattended
-// schedule/heartbeat/watcher run must never invoke computer_use on the
+// TestDisallowsUnattendedAutoApproval pins the unattended gate. The list
+// contains computer_use and standalone screenshot — an unattended
+// schedule/heartbeat/watcher run must never invoke either on the
 // strength of an attended always-allow click or a blanket auto_approve. See
 // unattendedAutoApprovalDenyList for the full rationale,
 // including why the legacy GUI tools are deliberately NOT listed.
@@ -98,11 +123,14 @@ func TestDisallowsAutoApproval(t *testing.T) {
 // scheduled runs of ordinary agents) gets caught.
 func TestDisallowsUnattendedAutoApproval(t *testing.T) {
 	got := UnattendedAutoApprovalDenyList()
-	if len(got) != 1 || got[0] != "computer_use" {
-		t.Fatalf("unattendedAutoApprovalDenyList expected [computer_use], got %v", got)
+	if len(got) != 2 || got[0] != "computer_use" || got[1] != "screenshot" {
+		t.Fatalf("unattendedAutoApprovalDenyList expected [computer_use screenshot], got %v", got)
 	}
 	if !DisallowsUnattendedAutoApproval("computer_use") {
 		t.Fatal("computer_use must be refused unattended auto-approval")
+	}
+	if !DisallowsUnattendedAutoApproval("screenshot") {
+		t.Fatal("screenshot must be refused unattended auto-approval")
 	}
 	// Ordinary tools and the three formerly-deny-listed tools should ALL
 	// return false. The formerly-deny-listed trio is enumerated explicitly

@@ -269,7 +269,7 @@ func (s *Server) runShareTask(
 		Filename:    filename,
 		ContentType: "text/html",
 		Kind:        uploads.KindSessionShare,
-		Metadata:    buildShareUploadMetadata(sess.ID, agentName),
+		Metadata:    buildShareUploadMetadata(sess.ID, agentName, sess.Title),
 	})
 	if err != nil {
 		s.failShareTask(task, fmt.Errorf("upload: %w", err))

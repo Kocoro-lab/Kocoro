@@ -67,6 +67,28 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	}
 }
 
+func TestProcessSSEData_EmitsOnlyCompleteToolCalls(t *testing.T) {
+	var deltas []StreamDelta
+	onDelta := func(delta StreamDelta) {
+		deltas = append(deltas, delta)
+	}
+
+	processSSEData(`data: {"type":"tool_call","id":"tool-1","name":"file_read","arguments":{"path":"README.md"}}`, onDelta)
+	processSSEData(`data: {"type":"tool_call","id":"tool-2","name":"file_read","arguments":"{\"path\":"}`, onDelta)
+	processSSEData(`data: {"type":"tool_use","tool_call":{"id":"tool-3","name":"grep","arguments":{"pattern":"TODO"}}}`, onDelta)
+
+	if len(deltas) != 2 {
+		t.Fatalf("complete tool deltas = %d, want 2: %#v", len(deltas), deltas)
+	}
+	if deltas[0].ToolCall == nil || deltas[0].ToolCall.ID != "tool-1" ||
+		deltas[0].ToolCall.ArgumentsString() != `{"path":"README.md"}` {
+		t.Fatalf("first tool delta = %#v", deltas[0])
+	}
+	if deltas[1].ToolCall == nil || deltas[1].ToolCall.ID != "tool-3" {
+		t.Fatalf("nested tool delta = %#v", deltas[1])
+	}
+}
+
 func TestListTools(t *testing.T) {
 	tools := []ServerToolSchema{
 		{Name: "web_search", Description: "Search the web", Parameters: map[string]any{"type": "object"}},
@@ -218,8 +240,8 @@ func TestCompletionRequest_MarshalsCacheSourceField(t *testing.T) {
 }
 
 func TestCompletionRequest_OmitsCacheSourceWhenEmpty(t *testing.T) {
-	// Unset CacheSource must not emit the field — Shannon interprets absence
-	// as "unknown" and falls back to 5m TTL.
+	// Unset CacheSource must not emit the field. Cloud currently applies the
+	// short TTL either way; explicit values remain useful for attribution.
 	req := CompletionRequest{
 		Messages: []Message{{Role: "user", Content: NewTextContent("hi")}},
 	}

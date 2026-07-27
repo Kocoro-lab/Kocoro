@@ -159,7 +159,7 @@ shan "show all tables in the database"     # sqlite MCP
 
 | Format | Built-in fallback | Better with |
 |---|---|---|
-| PDF | n/a — suggests upload so cloud renders it as a native Anthropic document block | `pdftotext` (`brew install poppler`) |
+| PDF | macOS PDFKit through the installed Swift runtime; other hosts return an install/upload hint | `pdftotext` (`brew install poppler`) |
 | DOCX | unzip + XML strip (raw text) | `pandoc` (`brew install pandoc`) |
 | XLSX | unzip + raw XML | `xlsx2csv` (`pip install xlsx2csv`) |
 | PPTX | unzip + XML strip | `pandoc` (`brew install pandoc`) |
@@ -199,9 +199,9 @@ Flags: `-y/--yes` auto-approve; `--agent` named agent; `--dangerously-skip-permi
 
 ### Voice Front Brain (macOS)
 
-`shan koe` runs Kocoro's OpenAI Realtime speech-to-speech front brain and delegates computer work to the local daemon. A spoken turn can start distinct tasks in parallel, cancel or refine an existing task by its call-scoped identity, and keep conversing while results run; completed results are queued and spoken as they arrive. Asking to stop everything cancels all running tasks in one call and reports any task that could not be cancelled.
+`shan koe` is Kocoro's realtime voice interface. It speaks as one consistent assistant, handles computer tasks while you keep talking, and shares results as they arrive. Each request stays as one task by default and splits into parallel work only when you explicitly ask.
 
-With the VPIO audio backend, `shan koe --barge-in` uses reversible native-S2S turn taking: playback pauses locally while the speech model decides whether the sound was a backchannel to ignore or a real interruption to accept. ASR is not on this admission path. An accepted interruption trims the cut-off reply from the conversation history, so Kocoro never refers back to words it did not actually get to say.
+With `shan koe --barge-in` on the VPIO audio backend, Kocoro can pause and resume around a backchannel, stop speaking without hanging up, accept a new request, or end the call. Stopping speech, cancelling work, and ending the call are separate actions; work already in progress survives a hang-up. Double-tap Option to talk again.
 
 ## Commands
 
@@ -294,6 +294,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | `schedule_list` / `_show` | No | List with sync status; show a schedule's last run. |
 | `session_search` | No | FTS5 keyword search across past session messages. |
 | `memory_append` | No | Append entries to agent MEMORY.md (flock-protected). |
+| `ask_user_question` | No | Ask the user to pick among a few explicit options (1-4 questions, 2-4 options each) when genuinely blocked or when they must choose between equivalent alternatives. You get the full chosen labels back. Rendered as a selection card in Kocoro Desktop; on channels/surfaces that can't prompt, it returns cleanly so the agent proceeds on its own judgment. |
 | `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill discovery auto-suggests relevant skills each turn via `model_tier: small` prefetch. |
 
 ### Calendar (registered only when daemon is a Kocoro Desktop subprocess)
@@ -395,9 +396,15 @@ Expose local tools to MCP clients via JSON-RPC 2.0 over stdio:
 shan mcp serve
 ```
 
-Same permission engine, hooks, and audit logging as the CLI. Tools requiring approval are denied in MCP mode (no interactive TTY).
+Same permission engine, hooks, and audit logging as the CLI. Tools requiring
+approval fail closed unless the connected client negotiated form elicitation;
+capable clients receive a structured one-call confirmation request.
 
-Supported methods: `initialize`, `tools/list`, `tools/call`.
+Supported request methods: `initialize`, `tools/list`, `tools/call`, and
+server-initiated `elicitation/create`. Long-running calls accept
+`notifications/cancelled`, calls carrying `_meta.progressToken` receive
+`notifications/progress`, and initialized clients receive
+`notifications/tools/list_changed` when the registry changes.
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | shan mcp serve

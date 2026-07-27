@@ -29,6 +29,16 @@ const (
 	// a channel-driven bash/http call executes with just a local log line. Payload:
 	// {session_id, agent, tool, source, channel, reason, ts}.
 	EventApprovalAuto = "approval_auto"
+	// EventQuestionRequest / EventQuestionResolved carry the structured
+	// ask-user interaction (see internal/daemon/question.go): the agent asks the
+	// user to pick from enumerated options and the choice returns as a
+	// structured selection, not free text. Dotted domain family per the "New
+	// event families" rule — payload nests under a common envelope; the
+	// per-request SSE stream uses the shorter name "question". Terminal-event
+	// discipline mirrors approvals: exactly one EventQuestionResolved per
+	// request_id.
+	EventQuestionRequest  = "question.request"
+	EventQuestionResolved = "question.resolved"
 	EventAgentError        = "agent_error"
 	EventHeartbeatAlert    = "heartbeat_alert"
 	EventToolStatus        = "tool_status"

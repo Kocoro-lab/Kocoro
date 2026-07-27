@@ -135,6 +135,18 @@ func TestToolSearchTool_SelectExact(t *testing.T) {
 	}
 }
 
+func TestToolSearchTool_BareExactName(t *testing.T) {
+	ts := newTestToolSearchAgent()
+	result, err := ts.Run(context.Background(), `{"query":" mock_mcp_a "}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:mock_mcp_a" {
+		t.Fatalf("bare exact name should load only that tool, got header: %s", header)
+	}
+}
+
 func TestToolSearchTool_KeywordSearch(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	// mockMCPTool has description "mock mcp tool"
@@ -480,6 +492,7 @@ func TestDeferredToolNames_IncludesLocalCategoricals(t *testing.T) {
 	reg.Register(&mockTool{name: "bash"})
 	reg.Register(&mockTool{name: "file_read"})
 	reg.Register(&mockTool{name: "file_write"})
+	reg.Register(&mockTool{name: "ask_user_question"})
 	// Categorical local tools that MUST be deferred:
 	reg.Register(&mockTool{name: "computer"})
 	reg.Register(&mockTool{name: "computer_use"})
@@ -494,7 +507,7 @@ func TestDeferredToolNames_IncludesLocalCategoricals(t *testing.T) {
 			t.Errorf("expected %q to be in deferred set, got %v", n, mapKeys(deferred))
 		}
 	}
-	mustNotDefer := []string{"bash", "file_read", "file_write"}
+	mustNotDefer := []string{"bash", "file_read", "file_write", "ask_user_question"}
 	for _, n := range mustNotDefer {
 		if deferred[n] {
 			t.Errorf("expected %q NOT to be in deferred set", n)
@@ -559,6 +572,7 @@ func TestHasCategoricalDeferred(t *testing.T) {
 		{"contains browser_*", map[string]bool{"browser_click": true}, true},
 		{"contains schedule_*", map[string]bool{"schedule_remove": true}, true},
 		{"contains process", map[string]bool{"process": true}, true},
+		{"ask user question stays direct", map[string]bool{"ask_user_question": true}, false},
 		{"memory_recall no longer always-deferred", map[string]bool{"memory_recall": true}, false},
 	}
 	for _, tc := range cases {
@@ -587,6 +601,7 @@ func TestBuildFullSchemasWithDefer_WebToolsNeverDeferred(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockTool{name: "bash"})
 	reg.Register(&mockTool{name: "computer"})
+	reg.Register(&mockTool{name: "ask_user_question"})
 	reg.Register(&mockSourcedTool{name: "web_search", source: SourceGateway})
 	reg.Register(&mockSourcedTool{name: "web_fetch", source: SourceGateway})
 	reg.Register(&mockSourcedTool{name: "alpaca_news", source: SourceGateway})
@@ -602,7 +617,7 @@ func TestBuildFullSchemasWithDefer_WebToolsNeverDeferred(t *testing.T) {
 		deferByName[schemaToolName(s)] = s.DeferLoading
 	}
 
-	for _, n := range []string{"web_search", "web_fetch"} {
+	for _, n := range []string{"ask_user_question", "web_search", "web_fetch"} {
 		if deferByName[n] {
 			t.Errorf("expected %q to ship with DeferLoading=false, got true", n)
 		}
@@ -624,6 +639,7 @@ func TestBuildLocalActiveSchemas_FiltersCold(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockTool{name: "bash"})
 	reg.Register(&mockTool{name: "file_read"})
+	reg.Register(&mockTool{name: "ask_user_question"})
 	reg.Register(&mockTool{name: "computer"})
 	reg.Register(&mockTool{name: "schedule_create"})
 	reg.Register(&mockTool{name: "browser_navigate"})
@@ -633,7 +649,7 @@ func TestBuildLocalActiveSchemas_FiltersCold(t *testing.T) {
 	schemas := buildLocalActiveSchemas(reg, cold)
 	names := liveToolNames(schemas)
 
-	want := []string{"bash", "file_read"}
+	want := []string{"ask_user_question", "bash", "file_read"}
 	if len(names) != len(want) {
 		t.Fatalf("expected %d active tools, got %d: %v", len(want), len(names), names)
 	}
