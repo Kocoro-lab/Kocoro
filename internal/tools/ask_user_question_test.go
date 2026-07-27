@@ -38,7 +38,9 @@ func TestAskUserQuestion_InfoSeparatesNeedFromQuestionPresentation(t *testing.T)
 	for _, guidance := range []string{
 		"Use only after determining that an answer is necessary",
 		"prefer a reasonable assumption for low-impact ambiguity",
-		"When a necessary question has 2-4 concrete options",
+		"`Structured question UI: available`",
+		"otherwise ask the necessary question in prose",
+		"a necessary question has 2-4 concrete options",
 		"call this tool in the same response",
 		"merely say you are waiting in prose",
 	} {
@@ -83,7 +85,7 @@ func TestAskUserQuestion_SingleSelect(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("unexpected error result: %q", res.Content)
 	}
-	if !strings.Contains(res.Content, `"Deploy target?"="Staging"`) {
+	if !strings.Contains(res.Content, `"Deploy target?"=["Staging"]`) {
 		t.Fatalf("content missing single-select answer: %q", res.Content)
 	}
 	// allow_other defaults to true when omitted.
@@ -92,15 +94,15 @@ func TestAskUserQuestion_SingleSelect(t *testing.T) {
 	}
 }
 
-func TestAskUserQuestion_MultiSelectCommaJoin(t *testing.T) {
+func TestAskUserQuestion_MultiSelectUsesUnambiguousJSONArray(t *testing.T) {
 	asker := &stubAsker{result: agent.UIQuestionResult{
 		Action:  agent.QuestionActionAnswer,
-		Answers: []agent.UIQuestionAnswer{{Question: "Which languages?", Values: []string{"Go", "Rust", "Python"}}},
+		Answers: []agent.UIQuestionAnswer{{Question: "Which languages?", Values: []string{"Go, templates", `Rust "stable"`}}},
 	}}
 	args := `{"questions":[{"question":"Which languages?","multi_select":true,"options":[{"label":"Go"},{"label":"Rust"},{"label":"Python"}]}]}`
 	res := runAsk(t, asker, args)
-	if !strings.Contains(res.Content, `"Which languages?"="Go,Rust,Python"`) {
-		t.Fatalf("multi-select values must be comma-joined: %q", res.Content)
+	if !strings.Contains(res.Content, `"Which languages?"=["Go, templates","Rust \"stable\""]`) {
+		t.Fatalf("multi-select values must be an unambiguous JSON array: %q", res.Content)
 	}
 }
 
@@ -141,8 +143,8 @@ func TestAskUserQuestion_MultipleQuestionsPreserveMetadataAndGroundedAnswers(t *
 		t.Fatalf("unexpected error result: %q", res.Content)
 	}
 	for _, want := range []string{
-		`"Deployment target?"="Staging (recommended)"`,
-		`"Required checks?"="Unit tests,Race detector"`,
+		`"Deployment target?"=["Staging (recommended)"]`,
+		`"Required checks?"=["Unit tests","Race detector"]`,
 	} {
 		if !strings.Contains(res.Content, want) {
 			t.Errorf("grounded result missing %q: %q", want, res.Content)
@@ -165,6 +167,22 @@ func TestAskUserQuestion_MultipleQuestionsPreserveMetadataAndGroundedAnswers(t *
 	second := asker.got.Questions[1]
 	if !second.MultiSelect || !second.AllowOther {
 		t.Errorf("second question defaults/flags not preserved: %+v", second)
+	}
+}
+
+func TestAskUserQuestion_RejectsOversizedCardContent(t *testing.T) {
+	validPrefix := `{"questions":[{"question":"Pick","options":[{"label":"A","preview":"`
+	validSuffix := `"},{"label":"B"}]}]}`
+	tooLongPreview := validPrefix + strings.Repeat("界", askUserQuestionMaxPreviewRunes+1) + validSuffix
+	res := runAsk(t, &stubAsker{}, tooLongPreview)
+	if !res.IsError || !strings.Contains(res.Content, "`preview` exceeds") {
+		t.Fatalf("oversized preview must be rejected, got %+v", res)
+	}
+
+	oversizedPayload := strings.Repeat(" ", askUserQuestionMaxPayloadBytes+1)
+	res = runAsk(t, &stubAsker{}, oversizedPayload)
+	if !res.IsError || !strings.Contains(res.Content, "arguments exceed") {
+		t.Fatalf("oversized payload must be rejected before decode, got %+v", res)
 	}
 }
 

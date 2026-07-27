@@ -6,20 +6,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
-// ask_user_question count bounds. These match the wire-side schema the daemon
-// enforces; they are small on purpose — a card with more than 4 questions or 4
-// options per question is a survey, not a quick disambiguation, and the model
-// should narrow the ask instead. To lift them, raise here AND in
-// internal/daemon/question.go's per-question option handling.
+// ask_user_question bounds keep a model-authored card small enough for the
+// Desktop UI and the daemon's replay ring. The current workload is at most four
+// compact questions with four short choices each; accepting unbounded previews
+// caused one call to retain arbitrarily large payloads in both the pending
+// broker and event bus. If richer cards become a product requirement, raise
+// these constants and their JSON-schema maxLength values together, then update
+// the Desktop render/round-trip fixtures.
 const (
-	askUserQuestionMinQuestions = 1
-	askUserQuestionMaxQuestions = 4
-	askUserQuestionMinOptions   = 2
-	askUserQuestionMaxOptions   = 4
+	askUserQuestionMinQuestions        = 1
+	askUserQuestionMaxQuestions        = 4
+	askUserQuestionMinOptions          = 2
+	askUserQuestionMaxOptions          = 4
+	askUserQuestionMaxPayloadBytes     = 32 * 1024
+	askUserQuestionMaxHeaderRunes      = 80
+	askUserQuestionMaxQuestionRunes    = 1000
+	askUserQuestionMaxLabelRunes       = 256
+	askUserQuestionMaxDescriptionRunes = 1000
+	askUserQuestionMaxPreviewRunes     = 4096
 )
 
 // AskUserQuestionTool presents the user a small set of closed-choice questions
@@ -102,7 +111,8 @@ func (t *AskUserQuestionTool) Info() agent.ToolInfo {
 		Description: "Ask the user multiple-choice questions to gather preferences, clarify consequential ambiguity, or make decisions that require their input. " +
 			"Presents 1-4 closed-choice questions (2-4 options each) as a selection UI; you receive the full chosen labels back. " +
 			"Use only after determining that an answer is necessary. Investigate discoverable facts first and prefer a reasonable assumption for low-impact ambiguity. " +
-			"When a necessary question has 2-4 concrete options, call this tool in the same response; do not restate the choices or merely say you are waiting in prose.",
+			"Call this tool only when the current Context contains the exact line `Structured question UI: available`; otherwise ask the necessary question in prose. " +
+			"When the UI is available and a necessary question has 2-4 concrete options, call this tool in the same response; do not restate the choices or merely say you are waiting in prose.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -116,10 +126,12 @@ func (t *AskUserQuestionTool) Info() agent.ToolInfo {
 						"properties": map[string]any{
 							"header": map[string]any{
 								"type":        "string",
+								"maxLength":   askUserQuestionMaxHeaderRunes,
 								"description": "Short chip label shown above the question (≤12 chars recommended), e.g. \"Auth method\".",
 							},
 							"question": map[string]any{
 								"type":        "string",
+								"maxLength":   askUserQuestionMaxQuestionRunes,
 								"description": "The question text shown to the user.",
 							},
 							"multi_select": map[string]any{
@@ -140,14 +152,17 @@ func (t *AskUserQuestionTool) Info() agent.ToolInfo {
 									"properties": map[string]any{
 										"label": map[string]any{
 											"type":        "string",
+											"maxLength":   askUserQuestionMaxLabelRunes,
 											"description": "The choice text the user sees and you receive back.",
 										},
 										"description": map[string]any{
 											"type":        "string",
+											"maxLength":   askUserQuestionMaxDescriptionRunes,
 											"description": "Short explanation of what picking this option means.",
 										},
 										"preview": map[string]any{
 											"type":        "string",
+											"maxLength":   askUserQuestionMaxPreviewRunes,
 											"description": "Optional supplementary content (mockup/snippet) shown when focused. Single-select only.",
 										},
 										"recommended": map[string]any{
@@ -182,6 +197,12 @@ func (t *AskUserQuestionTool) RequiresApproval() bool { return false }
 func (t *AskUserQuestionTool) IsReadOnlyCall(string) bool { return false }
 
 func (t *AskUserQuestionTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	if len(argsJSON) > askUserQuestionMaxPayloadBytes {
+		return agent.ValidationError(fmt.Sprintf(
+			"ask_user_question: arguments exceed the %d-byte card limit.",
+			askUserQuestionMaxPayloadBytes,
+		)), nil
+	}
 	var args askUserQuestionArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("ask_user_question: invalid arguments: %v", err)), nil
@@ -197,8 +218,14 @@ func (t *AskUserQuestionTool) Run(ctx context.Context, argsJSON string) (agent.T
 		return agent.ValidationError(fmt.Sprintf("ask_user_question: at most %d questions per call, got %d.", askUserQuestionMaxQuestions, len(args.Questions))), nil
 	}
 	for i, q := range args.Questions {
+		if utf8.RuneCountInString(q.Header) > askUserQuestionMaxHeaderRunes {
+			return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d `header` exceeds %d characters.", i, askUserQuestionMaxHeaderRunes)), nil
+		}
 		if strings.TrimSpace(q.Question) == "" {
 			return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d is missing the required `question` text.", i)), nil
+		}
+		if utf8.RuneCountInString(q.Question) > askUserQuestionMaxQuestionRunes {
+			return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d `question` exceeds %d characters.", i, askUserQuestionMaxQuestionRunes)), nil
 		}
 		if len(q.Options) < askUserQuestionMinOptions {
 			return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d needs at least %d options, got %d.", i, askUserQuestionMinOptions, len(q.Options))), nil
@@ -210,6 +237,15 @@ func (t *AskUserQuestionTool) Run(ctx context.Context, argsJSON string) (agent.T
 		for j, o := range q.Options {
 			if strings.TrimSpace(o.Label) == "" {
 				return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d option %d is missing the required `label`.", i, j)), nil
+			}
+			if utf8.RuneCountInString(o.Label) > askUserQuestionMaxLabelRunes {
+				return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d option %d `label` exceeds %d characters.", i, j, askUserQuestionMaxLabelRunes)), nil
+			}
+			if utf8.RuneCountInString(o.Description) > askUserQuestionMaxDescriptionRunes {
+				return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d option %d `description` exceeds %d characters.", i, j, askUserQuestionMaxDescriptionRunes)), nil
+			}
+			if utf8.RuneCountInString(o.Preview) > askUserQuestionMaxPreviewRunes {
+				return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d option %d `preview` exceeds %d characters.", i, j, askUserQuestionMaxPreviewRunes)), nil
 			}
 			label := strings.TrimSpace(o.Label)
 			if seenLabels[label] {
@@ -267,7 +303,8 @@ func (t *AskUserQuestionTool) Run(ctx context.Context, argsJSON string) (agent.T
 }
 
 // formatQuestionAnswers renders the user's selections as
-// "<question>"="<v1>,<v2>"; ... so the model reads full labels bound to their
+// <JSON question>=<JSON value array>; ... so commas and quotes inside labels
+// remain unambiguous while the model still reads full labels bound to their
 // question, never a bare index or token.
 func formatQuestionAnswers(answers []agent.UIQuestionAnswer) string {
 	if len(answers) == 0 {
@@ -275,7 +312,9 @@ func formatQuestionAnswers(answers []agent.UIQuestionAnswer) string {
 	}
 	parts := make([]string, 0, len(answers))
 	for _, a := range answers {
-		parts = append(parts, fmt.Sprintf("%q=%q", a.Question, strings.Join(a.Values, ",")))
+		questionJSON, _ := json.Marshal(a.Question)
+		valuesJSON, _ := json.Marshal(a.Values)
+		parts = append(parts, string(questionJSON)+"="+string(valuesJSON))
 	}
 	return "The user answered: " + strings.Join(parts, "; ") + ". Continue with these choices."
 }

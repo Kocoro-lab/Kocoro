@@ -48,10 +48,11 @@ func TestBuildSystemPrompt_SeparatesNeedFromQuestionPresentation(t *testing.T) {
 
 	for _, guidance := range []string{
 		"For low-impact ambiguity, make a reasonable assumption and continue",
-		"Once you have determined that user input is necessary",
-		"if the question can be expressed as 2–4 concrete choices",
-		"you MUST call `ask_user_question` in that same response",
-		"merely say you are waiting for the choice in prose",
+		"`Structured question UI: available`",
+		"necessary input can be expressed as 2–4 concrete choices",
+		"you MUST call `ask_user_question`",
+		"When the line is absent, do not call the tool",
+		"ask the necessary question concisely in prose instead",
 		"This presentation rule does not lower the threshold for asking",
 		"If the user may supply a custom value, set `allow_other`",
 		"keep `options` limited to concrete choices",
@@ -75,10 +76,11 @@ func TestBuildSystemPrompt_SystemIsStatic(t *testing.T) {
 		CWD:            "/home/user/project",
 	}
 	opts2 := PromptOptions{
-		BasePrompt:     "You are Shannon.",
-		LocalToolNames: []string{"bash", "file_read"},
-		Memory:         "User prefers Rust now.",
-		CWD:            "/tmp/other",
+		BasePrompt:          "You are Shannon.",
+		LocalToolNames:      []string{"bash", "file_read"},
+		Memory:              "User prefers Rust now.",
+		CWD:                 "/tmp/other",
+		QuestionUIAvailable: true,
 	}
 
 	parts1 := BuildSystemPrompt(opts1)
@@ -86,6 +88,29 @@ func TestBuildSystemPrompt_SystemIsStatic(t *testing.T) {
 
 	if parts1.System != parts2.System {
 		t.Errorf("System field changed between calls with different volatile content.\nFirst:\n%s\nSecond:\n%s", parts1.System, parts2.System)
+	}
+}
+
+func TestBuildSystemPrompt_QuestionUICapabilityIsVolatile(t *testing.T) {
+	available := BuildSystemPrompt(PromptOptions{
+		BasePrompt:          "Base.",
+		LocalToolNames:      []string{"ask_user_question"},
+		QuestionUIAvailable: true,
+	})
+	unavailable := BuildSystemPrompt(PromptOptions{
+		BasePrompt:     "Base.",
+		LocalToolNames: []string{"ask_user_question"},
+	})
+
+	const marker = "Structured question UI: available"
+	if !strings.Contains(available.VolatileContext, marker) {
+		t.Fatalf("available question UI must emit volatile capability marker:\n%s", available.VolatileContext)
+	}
+	if strings.Contains(unavailable.VolatileContext, marker) {
+		t.Fatalf("unavailable question UI must omit volatile capability marker:\n%s", unavailable.VolatileContext)
+	}
+	if available.System != unavailable.System {
+		t.Error("question UI availability must not perturb the cacheable system prompt")
 	}
 }
 

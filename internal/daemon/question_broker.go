@@ -219,6 +219,41 @@ func WireQuestionBusHooks(b *QuestionBroker, bus *EventBus, notify func(Question
 	b.SetOnCleanup(makeQuestionCleanupEmitter(bus, notify))
 }
 
+// Bus copies live in the in-memory replay ring, so model-authored display text
+// must be both secret-redacted and bounded. These byte caps cover the compact
+// 1-4 question cards produced by ask_user_question while keeping a single
+// malformed direct broker caller from retaining an unbounded event. If the UI
+// grows richer previews, change these caps together with the tool-side limits
+// and Desktop wire fixtures.
+const (
+	questionBusHeaderCap      = 200
+	questionBusQuestionCap    = 1000
+	questionBusLabelCap       = 1024
+	questionBusDescriptionCap = 1000
+	questionBusPreviewCap     = 4096
+)
+
+// questionsForBus returns a deep, display-only copy. Labels are capped but not
+// redacted because they are the response identity: Desktop posts the selected
+// full label and ResolveResponse validates it against the original snapshot.
+// All non-identity text is redacted before entering the replay ring.
+func questionsForBus(questions []Question) []Question {
+	out := make([]Question, len(questions))
+	for i, question := range questions {
+		out[i] = question
+		out[i].Header = redactAndTruncate(question.Header, questionBusHeaderCap)
+		out[i].Question = redactAndTruncate(question.Question, questionBusQuestionCap)
+		out[i].Options = make([]QuestionOption, len(question.Options))
+		for j, option := range question.Options {
+			out[i].Options[j] = option
+			out[i].Options[j].Label = truncate(option.Label, questionBusLabelCap)
+			out[i].Options[j].Description = redactAndTruncate(option.Description, questionBusDescriptionCap)
+			out[i].Options[j].Preview = redactAndTruncate(option.Preview, questionBusPreviewCap)
+		}
+	}
+	return out
+}
+
 // makeQuestionRequestEmitter publishes EventQuestionRequest with the payload
 // Desktop needs to render the question card. Mirrors makeApprovalRequestEmitter;
 // auto_resolution_ms is omitted when zero (matching the wire omitempty) so a
@@ -231,7 +266,7 @@ func makeQuestionRequestEmitter(bus *EventBus) func(req QuestionRequest) {
 			"agent":      req.Agent,
 			"source":     req.Source,
 			"channel":    req.Channel,
-			"questions":  req.Questions,
+			"questions":  questionsForBus(req.Questions),
 			"ts":         nowISO(),
 		}
 		if req.AutoResolutionMs > 0 {

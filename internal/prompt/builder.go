@@ -83,6 +83,10 @@ type PromptOptions struct {
 	// channel rendering — not all cloud channels, e.g. Feishu/Lark stay
 	// markdown; see outputFormatForSource). Empty defaults to "markdown".
 	OutputFormat string
+	// QuestionUIAvailable reports whether this run has a live QuestionAsker.
+	// It is rendered only in VolatileContext so attended/unattended source
+	// differences never perturb the cacheable system prompt.
+	QuestionUIAvailable bool
 }
 
 // PromptParts separates the system prompt into cacheable and volatile sections.
@@ -219,14 +223,16 @@ func buildStaticSystem(opts PromptOptions) string {
 		sb.WriteString("\n\n## Asking the user\n")
 		sb.WriteString("Only escalate to `ask_user_question` when you are genuinely blocked after investigating, " +
 			"or when the user must make a preference/decision among equivalent options that you cannot settle " +
-			"yourself. For low-impact ambiguity, make a reasonable assumption and continue. Once you have " +
-			"determined that user input is necessary, if the question can be expressed as 2–4 concrete choices, " +
-			"you MUST call `ask_user_question` in that same response. Do not ask the question, restate its choices, " +
-			"or merely say you are waiting for the choice in prose. This presentation rule does not lower the " +
-			"threshold for asking: do NOT reach for the tool at the first sign of friction; exhaust your tools and " +
-			"read the code first. A good question is a real fork — not a request for permission to start, and not " +
-			"a substitute for doing the work. If the user may supply a custom value, set `allow_other` and keep " +
-			"`options` limited to concrete choices; never add a Custom, Other, 自定义, or equivalent placeholder option.")
+			"yourself. For low-impact ambiguity, make a reasonable assumption and continue. The structured UI is " +
+			"available only when the current Context contains the exact line `Structured question UI: available`. " +
+			"When that line is present and necessary input can be expressed as 2–4 concrete choices, you MUST call " +
+			"`ask_user_question` in that same response; do not ask the question, restate its choices, or merely say " +
+			"you are waiting in prose. When the line is absent, do not call the tool; ask the necessary question " +
+			"concisely in prose instead. This presentation rule does not lower the threshold for asking: do NOT " +
+			"reach for the tool at the first sign of friction; exhaust your tools and read the code first. A good " +
+			"question is a real fork — not a request for permission to start, and not a substitute for doing the " +
+			"work. If the user may supply a custom value, set `allow_other` and keep `options` limited to concrete " +
+			"choices; never add a Custom, Other, 自定义, or equivalent placeholder option.")
 	}
 
 	sb.WriteString("\n\n## Memory & Retrieval\n")
@@ -472,6 +478,9 @@ func buildVolatileContext(opts PromptOptions) string {
 	}
 	if opts.SessionInfo != "" {
 		sb.WriteString("\n" + opts.SessionInfo)
+	}
+	if opts.QuestionUIAvailable {
+		sb.WriteString("\nStructured question UI: available")
 	}
 
 	// Output formatting guidance

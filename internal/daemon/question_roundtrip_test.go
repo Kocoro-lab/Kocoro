@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	agentpkg "github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
 // TestQuestionRoundTripViaHandler exercises the full daemon-side ask-user path
@@ -339,6 +342,183 @@ func TestClampQuestionAutoResolutionMs(t *testing.T) {
 				t.Fatalf("clampQuestionAutoResolutionMs(%d) = %d, want %d", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBrokerQuestionAskerMapsWireIDsAndGroundedLabels(t *testing.T) {
+	sentCh := make(chan QuestionRequest, 1)
+	broker := NewQuestionBroker(func(req QuestionRequest) error {
+		sentCh <- req
+		return nil
+	})
+	asker := &brokerQuestionAsker{
+		broker: broker,
+		metaFn: func() ApprovalRequestMeta {
+			return ApprovalRequestMeta{SessionID: "sess-adapter", Source: "desktop", Agent: "shan"}
+		},
+	}
+	resultCh := make(chan agentpkg.UIQuestionResult, 1)
+	go func() {
+		resultCh <- asker.AskUserQuestion(context.Background(), agentpkg.UIQuestionRequest{
+			AutoResolutionMs: 1,
+			Questions: []agentpkg.UIQuestion{{
+				Question: "Which target?",
+				Options: []agentpkg.UIQuestionOption{
+					{Label: "Blue"},
+					{Label: "Red"},
+				},
+			}},
+		})
+	}()
+
+	sent := <-sentCh
+	if sent.SessionID != "sess-adapter" || sent.Agent != "shan" ||
+		sent.AutoResolutionMs != questionAutoResolutionMinMs {
+		t.Fatalf("adapter metadata/clamp = %+v", sent)
+	}
+	if len(sent.Questions) != 1 || sent.Questions[0].ID != "q0" {
+		t.Fatalf("adapter did not mint q0 wire id: %+v", sent.Questions)
+	}
+	claimed, err := broker.ResolveResponse(QuestionResponse{
+		RequestID: sent.RequestID,
+		Action:    QuestionActionAnswer,
+		Answers:   []QuestionAnswer{{ID: "q0", Values: []string{"Blue"}}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("ResolveResponse error: %v", err)
+	}
+	if !claimed {
+		t.Fatal("ResolveResponse did not claim pending request")
+	}
+
+	result := <-resultCh
+	if result.Action != QuestionActionAnswer || len(result.Answers) != 1 ||
+		result.Answers[0].Question != "Which target?" ||
+		len(result.Answers[0].Values) != 1 || result.Answers[0].Values[0] != "Blue" {
+		t.Fatalf("adapter lost question grounding: %+v", result)
+	}
+}
+
+func TestQuestionPerRequestRegistrationRoutesHTTPResponse(t *testing.T) {
+	srv := NewServer(0, nil, nil, "test")
+	sentCh := make(chan QuestionRequest, 1)
+	broker := NewQuestionBroker(func(req QuestionRequest) error {
+		sentCh <- req
+		return nil
+	})
+	broker.onRegister = func(requestID string) { srv.pendingQuestionBrokers.Store(requestID, broker) }
+	broker.onDeregister = func(requestID string) { srv.pendingQuestionBrokers.Delete(requestID) }
+
+	resultCh := make(chan questionResolution, 1)
+	go func() {
+		resultCh <- broker.Request(context.Background(), ApprovalRequestMeta{Source: "desktop"}, &QuestionRequest{
+			Questions: []Question{{
+				ID:       "q0",
+				Question: "Pick",
+				Options:  []QuestionOption{{Label: "A"}, {Label: "B"}},
+			}},
+		})
+	}()
+	sent := <-sentCh
+	if _, ok := srv.pendingQuestionBrokers.Load(sent.RequestID); !ok {
+		t.Fatal("per-request broker was not registered before transport send")
+	}
+
+	body := strings.NewReader(`{"request_id":` + strconv.Quote(sent.RequestID) + `,"action":"answer","answers":[{"id":"q0","values":["B"]}]}`)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/question", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /question = %d, body %s", rec.Code, rec.Body.String())
+	}
+	result := <-resultCh
+	if result.Action != QuestionActionAnswer || len(result.Answers) != 1 || result.Answers[0].Values[0] != "B" {
+		t.Fatalf("registered broker did not receive HTTP answer: %+v", result)
+	}
+	if _, ok := srv.pendingQuestionBrokers.Load(sent.RequestID); ok {
+		t.Fatal("per-request broker was not deregistered after resolution")
+	}
+}
+
+func TestQuestionTimeoutEmitsSingleCleanup(t *testing.T) {
+	bus := NewEventBus()
+	broker := NewQuestionBroker(func(QuestionRequest) error { return nil })
+	WireQuestionBusHooks(broker, bus, nil)
+
+	result := broker.Request(context.Background(), ApprovalRequestMeta{Source: "desktop"}, &QuestionRequest{
+		AutoResolutionMs: 1,
+		Questions: []Question{{
+			ID:       "q0",
+			Question: "Pick",
+			Options:  []QuestionOption{{Label: "A"}, {Label: "B"}},
+		}},
+	})
+	if result.Action != QuestionActionCancel {
+		t.Fatalf("timeout action = %q, want cancel", result.Action)
+	}
+
+	var requests, resolved int
+	for _, evt := range bus.EventsSince(0) {
+		switch evt.Type {
+		case EventQuestionRequest:
+			requests++
+		case EventQuestionResolved:
+			resolved++
+			var payload QuestionResolvedPayload
+			if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+				t.Fatalf("decode cleanup event: %v", err)
+			}
+			if payload.Action != QuestionActionCancel || payload.ResolvedBy != "daemon" {
+				t.Fatalf("timeout cleanup payload = %+v", payload)
+			}
+		}
+	}
+	if requests != 1 || resolved != 1 {
+		t.Fatalf("timeout lifecycle events = request:%d resolved:%d, want 1:1", requests, resolved)
+	}
+}
+
+func TestQuestionRequestBusCopyRedactsAndBoundsDisplayText(t *testing.T) {
+	bus := NewEventBus()
+	emitter := makeQuestionRequestEmitter(bus)
+	secret := "AKIAIOSFODNN7EXAMPLE"
+	longPreview := secret + strings.Repeat("界", questionBusPreviewCap)
+	original := QuestionRequest{
+		RequestID: "qst-redact",
+		Questions: []Question{{
+			ID:       "q0",
+			Header:   secret,
+			Question: "Use " + secret + "?",
+			Options: []QuestionOption{{
+				Label:       "Keep exact label",
+				Description: "Description " + secret,
+				Preview:     longPreview,
+			}},
+		}},
+	}
+	emitter(original)
+
+	events := bus.EventsSince(0)
+	if len(events) != 1 || events[0].Type != EventQuestionRequest {
+		t.Fatalf("bus events = %+v, want one question.request", events)
+	}
+	var payload struct {
+		Questions []Question `json:"questions"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatalf("decode question.request: %v", err)
+	}
+	got := payload.Questions[0]
+	if strings.Contains(got.Header+got.Question+got.Options[0].Description+got.Options[0].Preview, secret) {
+		t.Fatalf("bus display copy leaked secret: %+v", got)
+	}
+	if len(got.Options[0].Preview) > questionBusPreviewCap {
+		t.Fatalf("preview bytes = %d, want <= %d", len(got.Options[0].Preview), questionBusPreviewCap)
+	}
+	if got.Options[0].Label != "Keep exact label" {
+		t.Fatalf("response identity label changed: %q", got.Options[0].Label)
+	}
+	if original.Questions[0].Header != secret || original.Questions[0].Options[0].Preview != longPreview {
+		t.Fatal("bus sanitization mutated the broker's original validation snapshot")
 	}
 }
 
