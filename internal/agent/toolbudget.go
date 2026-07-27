@@ -11,14 +11,29 @@ import (
 )
 
 const (
-	// schemaTokenBudget is a diagnostic guard for the directly exposed schema
-	// set. It must not reclassify tools: effective exposure is resolved from
-	// explicit tool policy and source defaults.
-	schemaTokenBudget = 8000
+	// directSchemaTokenBudget guards the default Direct-schema workload. The
+	// July 2026 built-in registry plus Cloud's web openers measured about 15K
+	// estimated tokens; crossing 16K indicates exposure drift that would make
+	// every model request materially larger. The override path is to defer an
+	// uncommon tool, or deliberately update this baseline with fresh production
+	// measurements and the maintained registry test. This remains diagnostic:
+	// it never reclassifies tools at runtime.
+	directSchemaTokenBudget = 16000
 
 	// charsPerTokenSchema mirrors the context estimator's conservative ratio.
 	charsPerTokenSchema = 3.5
 )
+
+func estimateToolSchemaTokens(tool Tool) int {
+	if tool == nil {
+		return 0
+	}
+	data, err := json.Marshal(buildToolSchema(tool))
+	if err != nil {
+		return 0
+	}
+	return int(math.Ceil(float64(len(data)) / charsPerTokenSchema))
+}
 
 // estimateSchemaTokens returns a heuristic token count for the named tool
 // schemas using compact JSON serialization.
@@ -33,13 +48,21 @@ func estimateSchemaTokens(reg *ToolRegistry, names []string) int {
 		if !ok {
 			continue
 		}
-		data, err := json.Marshal(buildToolSchema(t))
-		if err != nil {
-			continue
-		}
-		total += int(math.Ceil(float64(len(data)) / charsPerTokenSchema))
+		total += estimateToolSchemaTokens(t)
 	}
 	return total
+}
+
+// DirectSchemaTokenBudget exposes the maintained Direct-schema regression
+// threshold to the real built-in registry test without duplicating it.
+func DirectSchemaTokenBudget() int {
+	return directSchemaTokenBudget
+}
+
+// EstimateDirectSchemaTokens returns the diagnostic token estimate for every
+// effective Direct tool in the registry.
+func EstimateDirectSchemaTokens(reg *ToolRegistry) int {
+	return directSchemaBudgetReport(reg, directSchemaTokenBudget).Total
 }
 
 type schemaBudgetContributor struct {
@@ -69,7 +92,7 @@ func directSchemaBudgetReport(reg *ToolRegistry, budget int) schemaBudgetReport 
 		if !ok || EffectiveToolExposure(tool) != ToolExposureDirect {
 			continue
 		}
-		tokens := estimateSchemaTokens(reg, []string{name})
+		tokens := estimateToolSchemaTokens(tool)
 		report.Total += tokens
 		report.Contributors = append(report.Contributors, schemaBudgetContributor{
 			Name:   name,

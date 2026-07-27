@@ -2,9 +2,12 @@ package tools
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/daemon/desktop_rpc"
 	mcpproto "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -107,6 +110,36 @@ func TestConditionalLocalToolExposureMatrix(t *testing.T) {
 	}
 	for _, tc := range tests {
 		assertExposure(t, tc.tool, tc.want)
+	}
+}
+
+func TestDefaultDirectToolSchemaBudget(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cfg := &config.Config{}
+	cfg.Agent.Thinking = true
+	reg, _, cleanup := RegisterLocalTools(cfg, nil)
+	t.Cleanup(cleanup)
+
+	RegisterMemoryTool(reg, nil, nil)
+	RegisterCalendarTools(reg, desktop_rpc.NewDesktopRPCBroker())
+	reg.Register(&SessionSearchTool{})
+	reg.Register(NewCloudDelegateTool(nil, "", time.Hour, 0, nil, "", ""))
+
+	// Cloud owns the exact web_search/web_fetch schemas. Recent production
+	// schemas consume about 2.4K estimated tokens together, so keep a rounded
+	// 2.5K reserve while the runtime diagnostic measures their live definitions.
+	// Update the reserve from fresh production schemas if Cloud changes them.
+	const dynamicDirectSchemaReserveTokens = 2500
+	total := agent.EstimateDirectSchemaTokens(reg) + dynamicDirectSchemaReserveTokens
+	budget := agent.DirectSchemaTokenBudget()
+	t.Logf("default Direct schema estimate=%d budget=%d reserve=%d", total, budget, dynamicDirectSchemaReserveTokens)
+	if total > budget {
+		t.Fatalf(
+			"default Direct schemas exceed regression budget: total=%d budget=%d reserve=%d",
+			total,
+			budget,
+			dynamicDirectSchemaReserveTokens,
+		)
 	}
 }
 

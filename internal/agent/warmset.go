@@ -131,30 +131,35 @@ func (ws *WorkingSet) Invalidate() {
 	ws.searchIndex = nil
 }
 
-// toolSearchIndex reuses the tokenized BM25 index while the effective
-// Deferred set and its searchable metadata are byte-identical.
+// toolSearchIndex reuses the tokenized BM25 index while the effective toolset
+// fingerprint and Deferred name set are unchanged. AgentLoop synchronizes the
+// full metadata fingerprint before discovery; cache hits therefore hash only
+// the small Deferred name set instead of rebuilding every search document.
 func (ws *WorkingSet) toolSearchIndex(reg *ToolRegistry, deferred map[string]bool) *toolSearchIndex {
-	corpus := collectToolSearchCorpus(reg, deferred)
 	if ws == nil {
-		return buildToolSearchIndex(corpus)
+		return newToolSearchIndex(reg, deferred)
 	}
+	if ws.Fingerprint() == "" {
+		ws.SyncToolset(reg)
+	}
+	searchKey := ws.Fingerprint() + "\x00" + deferredToolSearchKey(deferred)
 
 	ws.mu.RLock()
-	if ws.searchIndex != nil && ws.searchKey == corpus.fingerprint {
+	if ws.searchIndex != nil && ws.searchKey == searchKey {
 		index := ws.searchIndex
 		ws.mu.RUnlock()
 		return index
 	}
 	ws.mu.RUnlock()
 
-	index := buildToolSearchIndex(corpus)
+	index := newToolSearchIndex(reg, deferred)
 	ws.mu.Lock()
-	if ws.searchIndex != nil && ws.searchKey == corpus.fingerprint {
+	if ws.searchIndex != nil && ws.searchKey == searchKey {
 		cached := ws.searchIndex
 		ws.mu.Unlock()
 		return cached
 	}
-	ws.searchKey = corpus.fingerprint
+	ws.searchKey = searchKey
 	ws.searchIndex = index
 	ws.mu.Unlock()
 	return index

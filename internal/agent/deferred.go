@@ -70,13 +70,31 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 	}
 
 	var matched []string
+	var alreadyDirect []string
+	recordDirect := func(name string) {
+		tool, ok := t.registry.Get(name)
+		if !ok || EffectiveToolExposure(tool) != ToolExposureDirect {
+			return
+		}
+		for _, existing := range alreadyDirect {
+			if existing == name {
+				return
+			}
+		}
+		alreadyDirect = append(alreadyDirect, name)
+	}
 
 	if strings.HasPrefix(args.Query, "select:") {
 		names := strings.Split(strings.TrimPrefix(args.Query, "select:"), ",")
 		for _, name := range names {
 			name = strings.TrimSpace(name)
-			if name != "" && t.deferred[name] {
+			if name == "" {
+				continue
+			}
+			if t.deferred[name] {
 				matched = append(matched, name)
+			} else {
+				recordDirect(name)
 			}
 		}
 	} else if t.deferred[args.Query] {
@@ -86,7 +104,10 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 		// that into a multi-call recovery loop.
 		matched = append(matched, args.Query)
 	} else {
-		matched = t.matchKeyword(args.Query)
+		recordDirect(args.Query)
+		if len(alreadyDirect) == 0 {
+			matched = t.matchKeyword(args.Query)
+		}
 	}
 	matched = expandDeferredFamilyCore(t.registry, t.deferred, matched)
 
@@ -108,9 +129,16 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 	sb.WriteString("LOADED:")
 	sb.WriteString(strings.Join(matched, ","))
 
-	if len(matched) == 0 {
+	if len(matched) == 0 && len(alreadyDirect) == 0 {
 		sb.WriteString("\nNo matching deferred tools found.")
-	} else {
+	}
+	for _, name := range alreadyDirect {
+		sb.WriteString(fmt.Sprintf(
+			"\nTool %q is already directly available; call it directly without tool_search.",
+			name,
+		))
+	}
+	if len(matched) > 0 {
 		sb.WriteString("\nSchemas loaded. Call these tools now to continue the user's task — do not stop or describe what was loaded.")
 		schemas := t.registry.FullSchemas(matched)
 		for i, s := range schemas {

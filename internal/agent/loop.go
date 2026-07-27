@@ -37,11 +37,6 @@ import (
 // inaccuracy. Below this, ShouldCompact's 0.90 trigger handles it.
 const preflightCompactThreshold = 0.95
 
-// warnedDirectSchemaBudgets prevents a stable over-budget registry from
-// logging on every turn. Dynamic toolset fingerprints still get one
-// deterministic contributor report when they first exceed the guard.
-var warnedDirectSchemaBudgets sync.Map
-
 // shouldPreflightCompact returns true when the messages-about-to-be-sent
 // estimate exceeds preflightCompactThreshold * contextWindow.
 //
@@ -2148,7 +2143,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	if a.workingSet == nil {
 		a.workingSet = NewWorkingSet()
 	}
-	a.workingSet.SyncToolset(a.tools)
+	toolsetChanged := a.workingSet.SyncToolset(a.tools)
 
 	// Resolve exposure independently for every tool, then pre-seed schemas that
 	// this session already loaded. Any remaining Deferred tool activates
@@ -2157,9 +2152,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	loadedDeferred := preseedDeferredSchemas(a.workingSet, deferred)
 	coldDeferred := remainingDeferredNames(deferred, loadedDeferred)
 	deferredMode := len(coldDeferred) > 0
-	if report := directSchemaBudgetReport(a.tools, schemaTokenBudget); report.Exceeded() {
-		fingerprint := a.workingSet.Fingerprint()
-		if _, alreadyWarned := warnedDirectSchemaBudgets.LoadOrStore(fingerprint, struct{}{}); !alreadyWarned {
+	if toolsetChanged {
+		if report := directSchemaBudgetReport(a.tools, directSchemaTokenBudget); report.Exceeded() {
 			log.Printf("[tool-search] Direct schema budget exceeded: total=%d budget=%d contributors=%s",
 				report.Total, report.Budget, formatSchemaBudgetContributors(report, 12))
 		}

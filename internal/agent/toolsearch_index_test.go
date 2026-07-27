@@ -248,6 +248,55 @@ func TestToolSearchBM25_CJKMetadataDoesNotScoreZero(t *testing.T) {
 	}
 }
 
+func TestTokenizeToolSearch_CJKPreservesFrequencyWithoutInflatingLength(t *testing.T) {
+	tokens, length := tokenizeToolSearchDocument("邮件邮件")
+	frequency := make(map[string]int)
+	for _, token := range tokens {
+		frequency[token]++
+	}
+	if frequency["邮件"] != 2 {
+		t.Fatalf("邮件 frequency = %d, want 2; tokens=%q", frequency["邮件"], tokens)
+	}
+	if length != 4 {
+		t.Fatalf("normalized CJK length = %d, want 4; tokens=%q", length, tokens)
+	}
+	for _, token := range tokens {
+		if token == "邮件邮件" {
+			t.Fatalf("whole-run CJK token should not inflate document length: %q", tokens)
+		}
+	}
+}
+
+func TestBuildToolSearchDocument_BoundsSchemaTraversalDepth(t *testing.T) {
+	var nested map[string]any
+	for depth := 0; depth < toolSearchSchemaMaxDepth+2; depth++ {
+		description := "within-depth"
+		if depth == 0 {
+			description = "beyond-depth"
+		}
+		nested = map[string]any{
+			"description": description,
+			"properties": map[string]any{
+				"child": nested,
+			},
+		}
+	}
+	tool := &searchMetadataTool{
+		name:   "deep_schema",
+		desc:   "Depth-bounded schema.",
+		source: SourceMCP,
+		params: nested,
+	}
+
+	document := buildToolSearchDocument(tool)
+	if strings.Contains(document, "beyond-depth") {
+		t.Fatalf("search document included metadata beyond depth cap: %s", document)
+	}
+	if !strings.Contains(document, "within-depth") {
+		t.Fatalf("search document should retain metadata within depth cap: %s", document)
+	}
+}
+
 func TestWorkingSet_ToolSearchIndexCacheReusesAndRebuildsByFingerprint(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&searchMetadataTool{
@@ -259,6 +308,7 @@ func TestWorkingSet_ToolSearchIndexCacheReusesAndRebuildsByFingerprint(t *testin
 	})
 	deferred := deferredToolNames(reg)
 	ws := NewWorkingSet()
+	ws.SyncToolset(reg)
 
 	first := ws.toolSearchIndex(reg, deferred)
 	second := ws.toolSearchIndex(reg, deferred)
@@ -273,9 +323,15 @@ func TestWorkingSet_ToolSearchIndexCacheReusesAndRebuildsByFingerprint(t *testin
 		namespace: "workspace_calendar",
 		params:    map[string]any{"type": "object"},
 	})
+	ws.SyncToolset(reg)
 	changed := ws.toolSearchIndex(reg, deferredToolNames(reg))
 	if changed == first {
 		t.Fatal("namespace metadata change must rebuild the cached search index")
+	}
+
+	reduced := ws.toolSearchIndex(reg, map[string]bool{})
+	if reduced == changed {
+		t.Fatal("Deferred-name set change must rebuild the cached search index")
 	}
 }
 

@@ -237,6 +237,25 @@ func TestToolSearchTool_KeywordSearchShortToken(t *testing.T) {
 	}
 }
 
+func TestToolSearchTool_KeywordSearchFallsBackToTokenPrefix(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockDescTool{name: "schedule_create", desc: "Create a timed job."})
+	reg.Register(&mockDescTool{name: "calendar_list", desc: "List calendar events."})
+	ts := newToolSearchTool(reg, map[string]bool{
+		"schedule_create": true,
+		"calendar_list":   true,
+	})
+
+	result, err := ts.Run(context.Background(), `{"query":"sched"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:schedule_create" {
+		t.Fatalf("prefix fallback header = %q, want LOADED:schedule_create", header)
+	}
+}
+
 func TestToolSearchTool_NoMatches(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	result, err := ts.Run(context.Background(), `{"query":"nonexistent_xyz"}`)
@@ -258,6 +277,27 @@ func TestToolSearchTool_OnlySearchesDeferred(t *testing.T) {
 	header := strings.SplitN(result.Content, "\n", 2)[0]
 	if strings.Contains(header, "bash") {
 		t.Error("tool_search should not find local tool 'bash'")
+	}
+	if !strings.Contains(result.Content, `Tool "bash" is already directly available`) {
+		t.Fatalf("Direct selection should explain that bash is already available, got %q", result.Content)
+	}
+}
+
+func TestToolSearchTool_SelectMixedDirectAndDeferred(t *testing.T) {
+	ts := newTestToolSearchAgent()
+	result, err := ts.Run(context.Background(), `{"query":"select:bash,mock_mcp_a"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:mock_mcp_a" {
+		t.Fatalf("mixed selection header = %q, want LOADED:mock_mcp_a", header)
+	}
+	if !strings.Contains(result.Content, `Tool "bash" is already directly available`) {
+		t.Fatalf("mixed selection should guide the Direct call, got %q", result.Content)
+	}
+	if len(result.ContentBlocks) != 1 || result.ContentBlocks[0].ToolName != "mock_mcp_a" {
+		t.Fatalf("mixed selection blocks = %+v, want one deferred reference", result.ContentBlocks)
 	}
 }
 

@@ -4,6 +4,10 @@ import "github.com/Kocoro-lab/ShanClaw/internal/agent"
 
 // Explicit local exposure is tool-owned so it survives registry clones,
 // filtering, MCP health rebuilds, and dynamic overlay extraction.
+//
+// Small, common local utilities such as clipboard and notify intentionally
+// inherit the Direct local default. Process and GUI automation are occasional,
+// schema-heavy capabilities, so they stay discoverable but Deferred.
 
 func (*AskUserQuestionTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDirect
@@ -89,6 +93,9 @@ func (*CalendarDeleteEventTool) ToolExposure() agent.ToolExposure {
 }
 
 func (t *ServerTool) ToolExposure() agent.ToolExposure {
+	// Only Cloud's canonical research openers are trusted as always-present
+	// Direct tools. Same-named MCP or integration tools retain their source
+	// default so a third-party catalog cannot expand the base schema surface.
 	if t.source == agent.SourceGateway {
 		switch t.schema.Name {
 		case "web_search", "web_fetch":

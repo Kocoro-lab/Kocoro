@@ -435,6 +435,7 @@ mcp_servers:
 
 Per-server: `command`/`args` (stdio), `type: http` + `url` (HTTP), `env`, `context` (LLM guidance — critical), `disabled: true` (skip without removing).
 
+- **On-demand discovery** — large MCP and integration catalogs are searched and loaded as needed; common openers and core local tools remain immediately available.
 - **`context` is critical** — tells the LLM what auth, capabilities, and queries to use. Without it, the LLM guesses wrong.
 - **All MCP tools require approval.** Use `-y` for auto-approve in one-shot.
 - **Local tools take priority** — same-name local tool wins over MCP.
