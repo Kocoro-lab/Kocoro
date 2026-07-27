@@ -72,6 +72,7 @@ var daemonStartCmd = &cobra.Command{
 
 		shanDir := config.ShannonDir()
 		agentsDir := filepath.Join(shanDir, "agents")
+		projectsDir := filepath.Join(shanDir, "projects")
 		pidPath := filepath.Join(shanDir, "daemon.pid")
 
 		if err := agents.EnsureBuiltins(agentsDir, Version); err != nil {
@@ -291,6 +292,7 @@ var daemonStartCmd = &cobra.Command{
 			Cleanup:          cleanup,
 			ShannonDir:       shanDir,
 			AgentsDir:        agentsDir,
+			ProjectsDir:      projectsDir,
 			Auditor:          auditor,
 			HookRunner:       hookRunner,
 			SessionCache:     sessionCache,

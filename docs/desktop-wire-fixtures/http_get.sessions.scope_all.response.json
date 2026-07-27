@@ -1,33 +1,35 @@
 {
-  "sessions": [
-    {
-      "id": "2026-07-05-aaaaaaaaaaaa",
-      "title": "agent chat",
-      "cwd": "",
-      "created_at": "2026-07-05T10:00:01Z",
-      "updated_at": "2026-07-05T10:00:01Z",
-      "msg_count": 1,
-      "kind": "interactive",
-      "agent": "agent-abc123"
-    },
-    {
-      "id": "2026-07-05-bbbbbbbbbbbb",
-      "title": "default chat",
-      "cwd": "",
-      "created_at": "2026-07-05T10:00:00Z",
-      "updated_at": "2026-07-05T10:00:00Z",
-      "msg_count": 1,
-      "kind": "interactive",
-      "agent": ""
-    }
-  ],
+  "has_more": false,
   "projects": [
     {
       "cwd": "",
-      "updated_at": "2026-07-05T10:00:01Z",
-      "session_count": 2
+      "session_count": 2,
+      "updated_at": "2026-07-05T10:00:01Z"
     }
   ],
-  "total": 2,
-  "has_more": false
+  "sessions": [
+    {
+      "agent": "agent-abc123",
+      "created_at": "2026-07-05T10:00:01Z",
+      "cwd": "",
+      "id": "2026-07-05-aaaaaaaaaaaa",
+      "kind": "interactive",
+      "msg_count": 1,
+      "project_id": "",
+      "title": "agent chat",
+      "updated_at": "2026-07-05T10:00:01Z"
+    },
+    {
+      "agent": "",
+      "created_at": "2026-07-05T10:00:00Z",
+      "cwd": "",
+      "id": "2026-07-05-bbbbbbbbbbbb",
+      "kind": "interactive",
+      "msg_count": 1,
+      "project_id": "",
+      "title": "default chat",
+      "updated_at": "2026-07-05T10:00:00Z"
+    }
+  ],
+  "total": 2
 }

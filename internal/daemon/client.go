@@ -239,6 +239,16 @@ const (
 	// daemon omits it and never emits the events, so the ask-user tool stays a
 	// no-op there rather than surfacing an undecodable event family.
 	CapQuestionV1 = "question_v1"
+	// CapProjectEntityV1 — daemon supports the persisted Project ENTITY (distinct
+	// from CapSessionProjectsV1, which is the CWD/folder-derived grouping): the
+	// /projects CRUD surface (incl. per-project instructions/memory + theme
+	// color), an always-emitted `project_id` on every session row, the
+	// `project_id` filter on GET /sessions, PATCH /sessions/{id} project_id
+	// re-filing, and project-scoped instructions/memory injection. Desktop gates
+	// the Projects module on this token so an older daemon (which 404s /projects
+	// and never emits project_id) falls back to hiding the feature instead of
+	// probing routes / sniffing the response shape.
+	CapProjectEntityV1 = "project_entity_v1"
 )
 
 var Capabilities = []string{
@@ -272,6 +282,7 @@ var Capabilities = []string{
 	CapMessageIdempotencyV1,
 	CapMessageIdempotencyReceiptV2,
 	CapQuestionV1,
+	CapProjectEntityV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a
