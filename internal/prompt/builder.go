@@ -219,9 +219,14 @@ func buildStaticSystem(opts PromptOptions) string {
 		sb.WriteString("\n\n## Asking the user\n")
 		sb.WriteString("Only escalate to `ask_user_question` when you are genuinely blocked after investigating, " +
 			"or when the user must make a preference/decision among equivalent options that you cannot settle " +
-			"yourself. Do NOT reach for it at the first sign of friction: exhaust your tools, read the code, and " +
-			"make a reasonable assumption first. A good question is a real fork with a small set of concrete " +
-			"choices — not a request for permission to start, and not a substitute for doing the work.")
+			"yourself. For low-impact ambiguity, make a reasonable assumption and continue. Once you have " +
+			"determined that user input is necessary, if the question can be expressed as 2–4 concrete choices, " +
+			"you MUST call `ask_user_question` in that same response. Do not ask the question, restate its choices, " +
+			"or merely say you are waiting for the choice in prose. This presentation rule does not lower the " +
+			"threshold for asking: do NOT reach for the tool at the first sign of friction; exhaust your tools and " +
+			"read the code first. A good question is a real fork — not a request for permission to start, and not " +
+			"a substitute for doing the work. If the user may supply a custom value, set `allow_other` and keep " +
+			"`options` limited to concrete choices; never add a Custom, Other, 自定义, or equivalent placeholder option.")
 	}
 
 	sb.WriteString("\n\n## Memory & Retrieval\n")

@@ -99,9 +99,10 @@ func unmarshalMaybeStringified(data []byte, v any) error {
 func (t *AskUserQuestionTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "ask_user_question",
-		Description: "Ask the user to choose among a few explicit options when you are genuinely blocked or need a preference decision. " +
+		Description: "Ask the user multiple-choice questions to gather preferences, clarify consequential ambiguity, or make decisions that require their input. " +
 			"Presents 1-4 closed-choice questions (2-4 options each) as a selection UI; you receive the full chosen labels back. " +
-			"Use this to resolve a real fork you cannot settle yourself — NOT for every ambiguity. Investigate first; only escalate when you are truly stuck or the choice is a user preference among equivalent options.",
+			"Use only after determining that an answer is necessary. Investigate discoverable facts first and prefer a reasonable assumption for low-impact ambiguity. " +
+			"When a necessary question has 2-4 concrete options, call this tool in the same response; do not restate the choices or merely say you are waiting in prose.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -127,13 +128,13 @@ func (t *AskUserQuestionTool) Info() agent.ToolInfo {
 							},
 							"allow_other": map[string]any{
 								"type":        "boolean",
-								"description": "Let the user type a free-text \"Other\" answer. Default true. Do NOT author an Other option yourself.",
+								"description": "Let the user type one free-text answer; the client adds the control. Default true. Never add an option named Other, Custom, 自定义, or any equivalent free-form placeholder.",
 							},
 							"options": map[string]any{
 								"type":        "array",
 								"minItems":    askUserQuestionMinOptions,
 								"maxItems":    askUserQuestionMaxOptions,
-								"description": "2-4 options. Order the recommended one first.",
+								"description": "2-4 concrete choices. Order the recommended one first. Do not include a Custom/Other/free-form placeholder; use allow_other instead.",
 								"items": map[string]any{
 									"type": "object",
 									"properties": map[string]any{
@@ -205,10 +206,16 @@ func (t *AskUserQuestionTool) Run(ctx context.Context, argsJSON string) (agent.T
 		if len(q.Options) > askUserQuestionMaxOptions {
 			return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d allows at most %d options, got %d.", i, askUserQuestionMaxOptions, len(q.Options))), nil
 		}
+		seenLabels := make(map[string]bool, len(q.Options))
 		for j, o := range q.Options {
 			if strings.TrimSpace(o.Label) == "" {
 				return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d option %d is missing the required `label`.", i, j)), nil
 			}
+			label := strings.TrimSpace(o.Label)
+			if seenLabels[label] {
+				return agent.ValidationError(fmt.Sprintf("ask_user_question: question %d contains duplicate option label %q.", i, label)), nil
+			}
+			seenLabels[label] = true
 		}
 	}
 

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	agentpkg "github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -28,8 +29,9 @@ type questionResolution struct {
 // channels decline rather than auto-approve).
 type QuestionBroker struct {
 	*pendingCore[questionResolution]
-	sendFn    func(req QuestionRequest) error
-	onRequest func(req QuestionRequest)
+	sendFn       func(req QuestionRequest) error
+	onRequest    func(req QuestionRequest)
+	requestsByID map[string][]Question
 }
 
 // NewQuestionBroker creates a broker. sendFn publishes a QuestionRequest to the
@@ -37,8 +39,9 @@ type QuestionBroker struct {
 // per-request SSE brokers inherit the bus hooks). It must be reconnect-safe.
 func NewQuestionBroker(sendFn func(req QuestionRequest) error) *QuestionBroker {
 	return &QuestionBroker{
-		pendingCore: newPendingCore[questionResolution](),
-		sendFn:      sendFn,
+		pendingCore:  newPendingCore[questionResolution](),
+		sendFn:       sendFn,
+		requestsByID: make(map[string][]Question),
 	}
 }
 
@@ -85,6 +88,19 @@ func (b *QuestionBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 	}
 
 	sent := *req
+	// Keep the original closed-choice contract alongside the pending entry so
+	// POST /question can reject stale UI tokens, unknown question IDs, and
+	// incomplete multi-question submissions before they reach the model. The
+	// map shares pendingCore.mu so request snapshots and resolution claims are
+	// sequenced against timeout/cancel/duplicate-response races.
+	b.mu.Lock()
+	b.requestsByID[reqID] = sent.Questions
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		delete(b.requestsByID, reqID)
+		b.mu.Unlock()
+	}()
 	return b.run(ctx, reqID, timeout, cancel,
 		func() error { return b.sendFn(sent) },
 		func() {
@@ -93,6 +109,95 @@ func (b *QuestionBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 			}
 		},
 	)
+}
+
+// ResolveResponse validates a Desktop response against the exact question
+// snapshot that was rendered, then resolves the pending request. Unknown or
+// already-terminal request IDs remain idempotent (claimed=false, err=nil).
+// A validation error leaves the request pending so the UI can retry.
+func (b *QuestionBroker) ResolveResponse(resp QuestionResponse, beforeDeliver func()) (bool, error) {
+	b.mu.Lock()
+	questions, exists := b.requestsByID[resp.RequestID]
+	b.mu.Unlock()
+	if !exists {
+		return false, nil
+	}
+	if err := validateQuestionResponse(questions, resp); err != nil {
+		return false, err
+	}
+	return b.Resolve(resp.RequestID, questionResolution{Action: resp.Action, Answers: resp.Answers}, beforeDeliver), nil
+}
+
+func validateQuestionResponse(questions []Question, resp QuestionResponse) error {
+	if resp.Action == QuestionActionDecline {
+		if len(resp.Answers) != 0 {
+			return fmt.Errorf("decline must not include answers")
+		}
+		return nil
+	}
+	if resp.Action != QuestionActionAnswer {
+		return fmt.Errorf("action must be answer or decline")
+	}
+	if len(resp.Answers) != len(questions) {
+		return fmt.Errorf("answer must include exactly %d question responses, got %d", len(questions), len(resp.Answers))
+	}
+
+	byID := make(map[string]Question, len(questions))
+	for _, question := range questions {
+		byID[question.ID] = question
+	}
+	seenAnswers := make(map[string]bool, len(resp.Answers))
+	for _, answer := range resp.Answers {
+		question, ok := byID[answer.ID]
+		if !ok {
+			return fmt.Errorf("unknown question id %q", answer.ID)
+		}
+		if seenAnswers[answer.ID] {
+			return fmt.Errorf("duplicate answer for question id %q", answer.ID)
+		}
+		seenAnswers[answer.ID] = true
+
+		if question.MultiSelect {
+			if len(answer.Values) == 0 {
+				return fmt.Errorf("question %q requires at least one value", answer.ID)
+			}
+			maxValues := len(question.Options)
+			if question.AllowOther {
+				maxValues++
+			}
+			if len(answer.Values) > maxValues {
+				return fmt.Errorf("question %q has too many values", answer.ID)
+			}
+		} else if len(answer.Values) != 1 {
+			return fmt.Errorf("question %q requires exactly one value", answer.ID)
+		}
+
+		optionLabels := make(map[string]bool, len(question.Options))
+		for _, option := range question.Options {
+			optionLabels[option.Label] = true
+		}
+		seenValues := make(map[string]bool, len(answer.Values))
+		customValues := 0
+		for _, value := range answer.Values {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("question %q contains an empty value", answer.ID)
+			}
+			if seenValues[value] {
+				return fmt.Errorf("question %q contains duplicate value %q", answer.ID, value)
+			}
+			seenValues[value] = true
+			if !optionLabels[value] {
+				customValues++
+				if !question.AllowOther {
+					return fmt.Errorf("question %q value %q is not an offered option", answer.ID, value)
+				}
+				if customValues > 1 {
+					return fmt.Errorf("question %q contains more than one custom value", answer.ID)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // CancelAll cancels all pending questions (daemon-originated), firing

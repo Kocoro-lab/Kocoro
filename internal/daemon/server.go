@@ -79,8 +79,8 @@ type Server struct {
 	// pendingQuestionBrokers maps requestID → per-request QuestionBroker so
 	// POST /question can find the right broker (parallels pendingBrokers).
 	pendingQuestionBrokers sync.Map // map[string]*QuestionBroker
-	remoteRuns     sync.Map // map[string]*remoteRunState
-	remoteRunSlots chan struct{}
+	remoteRuns             sync.Map // map[string]*remoteRunState
+	remoteRunSlots         chan struct{}
 	// Remote run events are sequenced and kept briefly so a Cloud WS reconnect can
 	// replay events that were emitted while the socket was down.
 	remoteRunOutboxMu sync.Mutex
@@ -1402,7 +1402,6 @@ func (s *Server) handleQuestion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"action must be answer or decline"}`, http.StatusBadRequest)
 		return
 	}
-	resolution := questionResolution{Action: req.Action, Answers: req.Answers}
 	emitResolved := func() {
 		emitBusJSON(s.eventBus, EventQuestionResolved, map[string]any{
 			"request_id":  req.RequestID,
@@ -1414,10 +1413,15 @@ func (s *Server) handleQuestion(w http.ResponseWriter, r *http.Request) {
 	// The per-request SSE broker owns the pending question; the server broker is
 	// the no-op-sendFn fallback that shares its bus hooks. No Cloud/WS question
 	// transport exists yet, so there is no third fallback (unlike approvals).
+	var err error
 	if b, ok := s.pendingQuestionBrokers.Load(req.RequestID); ok {
-		b.(*QuestionBroker).Resolve(req.RequestID, resolution, emitResolved)
+		_, err = b.(*QuestionBroker).ResolveResponse(req, emitResolved)
 	} else {
-		s.questionBroker.Resolve(req.RequestID, resolution, emitResolved)
+		_, err = s.questionBroker.ResolveResponse(req, emitResolved)
+	}
+	if err != nil {
+		http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true}`))

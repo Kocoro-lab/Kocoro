@@ -40,6 +40,32 @@ func TestBuildSystemPrompt_ParallelNudgeOnlyWhenToolsPresent(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_SeparatesNeedFromQuestionPresentation(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:     "Base.",
+		LocalToolNames: []string{"ask_user_question"},
+	})
+
+	for _, guidance := range []string{
+		"For low-impact ambiguity, make a reasonable assumption and continue",
+		"Once you have determined that user input is necessary",
+		"if the question can be expressed as 2–4 concrete choices",
+		"you MUST call `ask_user_question` in that same response",
+		"merely say you are waiting for the choice in prose",
+		"This presentation rule does not lower the threshold for asking",
+		"If the user may supply a custom value, set `allow_other`",
+		"keep `options` limited to concrete choices",
+		"never add a Custom, Other, 自定义, or equivalent placeholder option",
+	} {
+		if !strings.Contains(parts.System, guidance) {
+			t.Errorf("system prompt missing question-gating guidance %q", guidance)
+		}
+	}
+	if strings.Contains(parts.System, "no prior investigation is needed") {
+		t.Error("system prompt must not bypass the investigation gate for named choices")
+	}
+}
+
 func TestBuildSystemPrompt_SystemIsStatic(t *testing.T) {
 	// Two calls with different volatile content must produce identical System fields
 	opts1 := PromptOptions{

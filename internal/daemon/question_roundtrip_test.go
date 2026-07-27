@@ -87,6 +87,23 @@ func TestQuestionRoundTripViaHandler(t *testing.T) {
 	if rp.RequestID != requestID || rp.Action != QuestionActionAnswer || rp.ResolvedBy != "kocoro" {
 		t.Fatalf("question.resolved = %+v, want request_id=%s action=answer resolved_by=kocoro", rp, requestID)
 	}
+
+	// Retrying the same POST after a lost HTTP response is idempotent: return
+	// success, but never deliver a second answer or emit a second terminal
+	// event for the already-resolved request.
+	duplicateBody := strings.NewReader(`{"request_id":"` + requestID + `","action":"answer","answers":[{"id":"q0","values":["Clean first"]}]}`)
+	duplicateRec := httptest.NewRecorder()
+	srv.handleQuestion(duplicateRec, httptest.NewRequest(http.MethodPost, "/question", duplicateBody))
+	if duplicateRec.Code != http.StatusOK {
+		t.Fatalf("duplicate POST /question status = %d, want 200", duplicateRec.Code)
+	}
+	select {
+	case evt := <-bus:
+		if evt.Type == EventQuestionResolved {
+			t.Fatalf("duplicate POST emitted a second terminal event: %s", evt.Payload)
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
 }
 
 // TestQuestionNonInteractiveDeclines confirms a source with no selection UI
@@ -104,6 +121,244 @@ func TestQuestionNonInteractiveDeclines(t *testing.T) {
 	}
 }
 
+func TestQuestionRoundTripMultipleQuestionsPreservesIDsAndFullLabels(t *testing.T) {
+	srv := NewServer(0, nil, nil, "test")
+	bus := srv.eventBus.Subscribe()
+	defer srv.eventBus.Unsubscribe(bus)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resCh := make(chan questionResolution, 1)
+	go func() {
+		resCh <- srv.questionBroker.Request(ctx, ApprovalRequestMeta{
+			SessionID: "sess-multi",
+			Source:    "desktop",
+		}, &QuestionRequest{Questions: []Question{
+			{
+				ID:       "q0",
+				Question: "Deployment target?",
+				Options: []QuestionOption{
+					{Label: "Staging (recommended)"},
+					{Label: "Production"},
+				},
+			},
+			{
+				ID:          "q1",
+				Question:    "Required checks?",
+				MultiSelect: true,
+				Options: []QuestionOption{
+					{Label: "Unit tests"},
+					{Label: "Race detector"},
+					{Label: "Manual QA"},
+				},
+			},
+		}})
+	}()
+
+	request := waitForEvent(t, bus, EventQuestionRequest)
+	var payload struct {
+		RequestID string     `json:"request_id"`
+		Questions []Question `json:"questions"`
+	}
+	if err := json.Unmarshal(request.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal question.request: %v", err)
+	}
+	if len(payload.Questions) != 2 || payload.Questions[0].ID != "q0" || payload.Questions[1].ID != "q1" {
+		t.Fatalf("question IDs changed on the wire: %+v", payload.Questions)
+	}
+
+	body := strings.NewReader(`{"request_id":"` + payload.RequestID + `","action":"answer","answers":[` +
+		`{"id":"q0","values":["Staging (recommended)"]},` +
+		`{"id":"q1","values":["Unit tests","Race detector"]}]}`)
+	rec := httptest.NewRecorder()
+	srv.handleQuestion(rec, httptest.NewRequest(http.MethodPost, "/question", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /question status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	res := <-resCh
+	if len(res.Answers) != 2 ||
+		res.Answers[0].ID != "q0" || strings.Join(res.Answers[0].Values, "|") != "Staging (recommended)" ||
+		res.Answers[1].ID != "q1" || strings.Join(res.Answers[1].Values, "|") != "Unit tests|Race detector" {
+		t.Fatalf("answers lost IDs or full labels: %+v", res.Answers)
+	}
+}
+
+func TestQuestionContextCancelEmitsSingleDaemonCleanup(t *testing.T) {
+	srv := NewServer(0, nil, nil, "test")
+	bus := srv.eventBus.Subscribe()
+	defer srv.eventBus.Unsubscribe(bus)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resCh := make(chan questionResolution, 1)
+	go func() {
+		resCh <- srv.questionBroker.Request(ctx, ApprovalRequestMeta{Source: "desktop"}, &QuestionRequest{
+			Questions: []Question{{ID: "q0", Question: "Pick", Options: []QuestionOption{{Label: "A"}, {Label: "B"}}}},
+		})
+	}()
+	requestID := waitForQuestionRequest(t, bus)
+	cancel()
+
+	if res := <-resCh; res.Action != QuestionActionCancel {
+		t.Fatalf("context cancel action = %q, want cancel", res.Action)
+	}
+	resolved := waitForEvent(t, bus, EventQuestionResolved)
+	var payload QuestionResolvedPayload
+	if err := json.Unmarshal(resolved.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal question.resolved: %v", err)
+	}
+	if payload.RequestID != requestID || payload.Action != QuestionActionCancel || payload.ResolvedBy != "daemon" {
+		t.Fatalf("cleanup payload = %+v", payload)
+	}
+	if srv.questionBroker.Resolve(requestID, questionResolution{Action: QuestionActionAnswer}, nil) {
+		t.Fatal("a cancelled question must not accept a late answer")
+	}
+}
+
+func TestQuestionRejectsUngroundedAnswerAndRemainsPending(t *testing.T) {
+	srv := NewServer(0, nil, nil, "test")
+	bus := srv.eventBus.Subscribe()
+	defer srv.eventBus.Unsubscribe(bus)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resCh := make(chan questionResolution, 1)
+	go func() {
+		resCh <- srv.questionBroker.Request(ctx, ApprovalRequestMeta{Source: "desktop"}, &QuestionRequest{
+			Questions: []Question{{
+				ID:         "q0",
+				Question:   "Pick a color",
+				AllowOther: false,
+				Options:    []QuestionOption{{Label: "Red"}, {Label: "Blue"}},
+			}},
+		})
+	}()
+	requestID := waitForQuestionRequest(t, bus)
+
+	invalid := httptest.NewRecorder()
+	srv.handleQuestion(invalid, httptest.NewRequest(
+		http.MethodPost,
+		"/question",
+		strings.NewReader(`{"request_id":"`+requestID+`","action":"answer","answers":[{"id":"q0","values":["opt_b"]}]}`),
+	))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("ungrounded answer status = %d, want 400; body=%q", invalid.Code, invalid.Body.String())
+	}
+	select {
+	case res := <-resCh:
+		t.Fatalf("invalid answer unexpectedly resolved the question: %+v", res)
+	default:
+	}
+
+	valid := httptest.NewRecorder()
+	srv.handleQuestion(valid, httptest.NewRequest(
+		http.MethodPost,
+		"/question",
+		strings.NewReader(`{"request_id":"`+requestID+`","action":"answer","answers":[{"id":"q0","values":["Blue"]}]}`),
+	))
+	if valid.Code != http.StatusOK {
+		t.Fatalf("grounded answer status = %d, want 200; body=%q", valid.Code, valid.Body.String())
+	}
+	res := <-resCh
+	if len(res.Answers) != 1 || len(res.Answers[0].Values) != 1 || res.Answers[0].Values[0] != "Blue" {
+		t.Fatalf("valid full label not preserved: %+v", res.Answers)
+	}
+}
+
+func TestQuestionRejectsIncompleteMultiQuestionAnswer(t *testing.T) {
+	srv := NewServer(0, nil, nil, "test")
+	bus := srv.eventBus.Subscribe()
+	defer srv.eventBus.Unsubscribe(bus)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resCh := make(chan questionResolution, 1)
+	go func() {
+		resCh <- srv.questionBroker.Request(ctx, ApprovalRequestMeta{Source: "desktop"}, &QuestionRequest{
+			Questions: []Question{
+				{ID: "q0", Question: "Target?", Options: []QuestionOption{{Label: "Staging"}, {Label: "Production"}}},
+				{ID: "q1", Question: "Checks?", MultiSelect: true, Options: []QuestionOption{{Label: "Unit"}, {Label: "Race"}}},
+			},
+		})
+	}()
+	requestID := waitForQuestionRequest(t, bus)
+
+	rec := httptest.NewRecorder()
+	srv.handleQuestion(rec, httptest.NewRequest(
+		http.MethodPost,
+		"/question",
+		strings.NewReader(`{"request_id":"`+requestID+`","action":"answer","answers":[{"id":"q0","values":["Staging"]}]}`),
+	))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("incomplete answer status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+	}
+	select {
+	case res := <-resCh:
+		t.Fatalf("incomplete answer unexpectedly resolved the question: %+v", res)
+	default:
+	}
+	cancel()
+	if res := <-resCh; res.Action != QuestionActionCancel {
+		t.Fatalf("cleanup action = %q, want cancel", res.Action)
+	}
+}
+
+func TestHandleQuestionRejectsMalformedIngress(t *testing.T) {
+	srv := NewServer(0, nil, nil, "test")
+	tests := map[string]string{
+		"missing request id": `{"action":"answer","answers":[]}`,
+		"invalid action":     `{"request_id":"qst_missing","action":"cancel"}`,
+		"malformed json":     `{`,
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			srv.handleQuestion(rec, httptest.NewRequest(http.MethodPost, "/question", strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestClampQuestionAutoResolutionMs(t *testing.T) {
+	tests := map[string]struct {
+		input int
+		want  int
+	}{
+		"omitted":       {input: 0, want: 0},
+		"negative":      {input: -1, want: 0},
+		"below minimum": {input: 1, want: questionAutoResolutionMinMs},
+		"minimum":       {input: questionAutoResolutionMinMs, want: questionAutoResolutionMinMs},
+		"inside range":  {input: 90000, want: 90000},
+		"maximum":       {input: questionAutoResolutionMaxMs, want: questionAutoResolutionMaxMs},
+		"above maximum": {input: 999999, want: questionAutoResolutionMaxMs},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := clampQuestionAutoResolutionMs(tt.input); got != tt.want {
+				t.Fatalf("clampQuestionAutoResolutionMs(%d) = %d, want %d", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuestionIndexFromID(t *testing.T) {
+	tests := map[string]int{
+		"q0":  0,
+		"q3":  3,
+		"":    -1,
+		"q":   -1,
+		"x1":  -1,
+		"q-1": -1,
+		"qA":  -1,
+	}
+	for id, want := range tests {
+		if got := questionIndexFromID(id); got != want {
+			t.Errorf("questionIndexFromID(%q) = %d, want %d", id, got, want)
+		}
+	}
+}
+
 func waitForQuestionRequest(t *testing.T, bus <-chan Event) string {
 	t.Helper()
 	evt := waitForEvent(t, bus, EventQuestionRequest)
@@ -114,7 +369,7 @@ func waitForQuestionRequest(t *testing.T, bus <-chan Event) string {
 	if err := json.Unmarshal(evt.Payload, &p); err != nil {
 		t.Fatalf("unmarshal question.request: %v", err)
 	}
-	if p.RequestID == "" || len(p.Questions) != 1 || p.Questions[0].Question == "" {
+	if p.RequestID == "" || len(p.Questions) == 0 || p.Questions[0].Question == "" {
 		t.Fatalf("question.request payload malformed: %s", string(evt.Payload))
 	}
 	return p.RequestID

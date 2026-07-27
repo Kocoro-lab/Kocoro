@@ -33,6 +33,46 @@ func runAsk(t *testing.T, asker agent.QuestionAsker, argsJSON string) agent.Tool
 	return res
 }
 
+func TestAskUserQuestion_InfoSeparatesNeedFromQuestionPresentation(t *testing.T) {
+	info := (&AskUserQuestionTool{}).Info()
+	for _, guidance := range []string{
+		"Use only after determining that an answer is necessary",
+		"prefer a reasonable assumption for low-impact ambiguity",
+		"When a necessary question has 2-4 concrete options",
+		"call this tool in the same response",
+		"merely say you are waiting in prose",
+	} {
+		if !strings.Contains(info.Description, guidance) {
+			t.Errorf("tool description missing question-gating guidance %q", guidance)
+		}
+	}
+	if strings.Contains(info.Description, "explicitly asks") {
+		t.Error("tool description must not make any named-option request an automatic trigger")
+	}
+}
+
+func TestAskUserQuestion_InfoPreventsDuplicateCustomOption(t *testing.T) {
+	info := (&AskUserQuestionTool{}).Info()
+	properties := info.Parameters["properties"].(map[string]any)
+	questions := properties["questions"].(map[string]any)
+	questionItems := questions["items"].(map[string]any)
+	questionProperties := questionItems["properties"].(map[string]any)
+	allowOther := questionProperties["allow_other"].(map[string]any)
+	options := questionProperties["options"].(map[string]any)
+
+	allowOtherDescription := allowOther["description"].(string)
+	for _, marker := range []string{"Other", "Custom", "自定义", "Never add"} {
+		if !strings.Contains(allowOtherDescription, marker) {
+			t.Errorf("allow_other description missing %q: %q", marker, allowOtherDescription)
+		}
+	}
+	optionsDescription := options["description"].(string)
+	if !strings.Contains(optionsDescription, "concrete choices") ||
+		!strings.Contains(optionsDescription, "use allow_other instead") {
+		t.Errorf("options description does not exclude custom placeholders: %q", optionsDescription)
+	}
+}
+
 func TestAskUserQuestion_SingleSelect(t *testing.T) {
 	asker := &stubAsker{result: agent.UIQuestionResult{
 		Action:  agent.QuestionActionAnswer,
@@ -64,6 +104,70 @@ func TestAskUserQuestion_MultiSelectCommaJoin(t *testing.T) {
 	}
 }
 
+func TestAskUserQuestion_MultipleQuestionsPreserveMetadataAndGroundedAnswers(t *testing.T) {
+	asker := &stubAsker{result: agent.UIQuestionResult{
+		Action: agent.QuestionActionAnswer,
+		Answers: []agent.UIQuestionAnswer{
+			{Question: "Deployment target?", Values: []string{"Staging (recommended)"}},
+			{Question: "Required checks?", Values: []string{"Unit tests", "Race detector"}},
+		},
+	}}
+	args := `{
+		"auto_resolution_ms": 90000,
+		"questions": [
+			{
+				"header": "Target",
+				"question": "Deployment target?",
+				"allow_other": false,
+				"options": [
+					{"label": "Staging (recommended)", "description": "Safe preview", "preview": "https://staging.example", "recommended": true},
+					{"label": "Production", "description": "Public release"}
+				]
+			},
+			{
+				"header": "Checks",
+				"question": "Required checks?",
+				"multi_select": true,
+				"options": [
+					{"label": "Unit tests"},
+					{"label": "Race detector"},
+					{"label": "Manual QA"}
+				]
+			}
+		]
+	}`
+	res := runAsk(t, asker, args)
+	if res.IsError {
+		t.Fatalf("unexpected error result: %q", res.Content)
+	}
+	for _, want := range []string{
+		`"Deployment target?"="Staging (recommended)"`,
+		`"Required checks?"="Unit tests,Race detector"`,
+	} {
+		if !strings.Contains(res.Content, want) {
+			t.Errorf("grounded result missing %q: %q", want, res.Content)
+		}
+	}
+
+	if asker.got.AutoResolutionMs != 90000 || len(asker.got.Questions) != 2 {
+		t.Fatalf("request metadata not preserved: %+v", asker.got)
+	}
+	first := asker.got.Questions[0]
+	if first.Header != "Target" || first.AllowOther || first.MultiSelect {
+		t.Errorf("first question flags not preserved: %+v", first)
+	}
+	if len(first.Options) != 2 || first.Options[0].Label != "Staging (recommended)" ||
+		first.Options[0].Description != "Safe preview" ||
+		first.Options[0].Preview != "https://staging.example" ||
+		!first.Options[0].Recommended {
+		t.Errorf("first option metadata not preserved: %+v", first.Options)
+	}
+	second := asker.got.Questions[1]
+	if !second.MultiSelect || !second.AllowOther {
+		t.Errorf("second question defaults/flags not preserved: %+v", second)
+	}
+}
+
 func TestAskUserQuestion_Decline(t *testing.T) {
 	asker := &stubAsker{result: agent.UIQuestionResult{Action: agent.QuestionActionDecline}}
 	args := `{"questions":[{"question":"Pick one","options":[{"label":"A"},{"label":"B"}]}]}`
@@ -73,6 +177,24 @@ func TestAskUserQuestion_Decline(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "declined") {
 		t.Fatalf("decline content missing: %q", res.Content)
+	}
+}
+
+func TestAskUserQuestion_CancelIsCleanFallback(t *testing.T) {
+	asker := &stubAsker{result: agent.UIQuestionResult{Action: agent.QuestionActionCancel}}
+	args := `{"questions":[{"question":"Pick one","options":[{"label":"A"},{"label":"B"}]}]}`
+	res := runAsk(t, asker, args)
+	if res.IsError || !strings.Contains(res.Content, "Proceed using your best judgment") {
+		t.Fatalf("cancel should be a clean best-judgment fallback: %+v", res)
+	}
+}
+
+func TestAskUserQuestion_AnswerWithoutValuesDoesNotInventGrounding(t *testing.T) {
+	asker := &stubAsker{result: agent.UIQuestionResult{Action: agent.QuestionActionAnswer}}
+	args := `{"questions":[{"question":"Pick one","options":[{"label":"A"},{"label":"B"}]}]}`
+	res := runAsk(t, asker, args)
+	if res.IsError || !strings.Contains(res.Content, "no selection") {
+		t.Fatalf("empty answer should not invent an option label: %+v", res)
 	}
 }
 
@@ -91,6 +213,32 @@ func TestAskUserQuestion_TooFewOptionsValidationError(t *testing.T) {
 	res := runAsk(t, &stubAsker{}, args)
 	if !res.IsError || !strings.HasPrefix(res.Content, "[validation error]") {
 		t.Fatalf("fewer than 2 options must be a ValidationError, got: %q", res.Content)
+	}
+}
+
+func TestAskUserQuestion_ValidationBoundaries(t *testing.T) {
+	tests := map[string]string{
+		"too many questions": `{"questions":[
+			{"question":"1","options":[{"label":"A"},{"label":"B"}]},
+			{"question":"2","options":[{"label":"A"},{"label":"B"}]},
+			{"question":"3","options":[{"label":"A"},{"label":"B"}]},
+			{"question":"4","options":[{"label":"A"},{"label":"B"}]},
+			{"question":"5","options":[{"label":"A"},{"label":"B"}]}
+		]}`,
+		"missing question text": `{"questions":[{"question":"  ","options":[{"label":"A"},{"label":"B"}]}]}`,
+		"too many options": `{"questions":[{"question":"Pick","options":[
+			{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"},{"label":"E"}
+		]}]}`,
+		"missing option label":   `{"questions":[{"question":"Pick","options":[{"label":"A"},{"label":"  "}]}]}`,
+		"duplicate option label": `{"questions":[{"question":"Pick","options":[{"label":"A"},{"label":" A "}]}]}`,
+	}
+	for name, args := range tests {
+		t.Run(name, func(t *testing.T) {
+			res := runAsk(t, &stubAsker{}, args)
+			if !res.IsError || !strings.HasPrefix(res.Content, "[validation error]") {
+				t.Fatalf("expected validation error, got %+v", res)
+			}
+		})
 	}
 }
 
