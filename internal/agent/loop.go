@@ -776,6 +776,7 @@ type AgentLoop struct {
 	contextWindow         int
 	contextWindowExplicit bool
 	memoryDir             string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	projectEntityDir      string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
 	stickyContext         string             // session-scoped facts injected verbatim into system prompt; never truncated
 	outputFormat          string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
 	userFilePaths         []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
@@ -1870,6 +1871,15 @@ func (a *AgentLoop) SetSessionCWD(cwd string) {
 	a.sessionCWD = cwd
 }
 
+// SetProjectEntityDir sets the owning project's directory (~/.shannon/projects/
+// <id>) so LoadInstructions layers the project-scoped instructions tier. Pass ""
+// for an unfiled session. Project memory is handled separately by pointing the
+// loop's memoryDir at the same directory (see runner), so project memory reads
+// and auto-accumulation reuse the existing MEMORY.md plumbing.
+func (a *AgentLoop) SetProjectEntityDir(dir string) {
+	a.projectEntityDir = dir
+}
+
 // UserAttachedPath represents a single path the user attached via a file_ref
 // block. IsDir distinguishes folder attachments from file attachments so the
 // auto-approve matcher can do prefix-match for directories (entries inside an
@@ -1962,15 +1972,18 @@ type approvedToolCall struct {
 }
 
 // assembleUserMessage combines stable per-session context with the user query.
-// The gateway's Anthropic provider splits on <!-- cache_break -->, caching the prefix.
-// Layout: [stableContext]\n<!-- cache_break -->\n[userMessage]
+// Cloud's Anthropic provider splits this message on <!-- cache_break --> into
+// two text blocks and attaches breakpoint 3 to the first one.
+// Layout: [stableContext]\n<!-- cache_break -->\n[volatileContext]\n\n[userMessage]
 //
-// Note: VolatileContext (memory, date/time, CWD, MCP) is stitched into the
-// System prompt by prompt.BuildSystemPrompt (after a `<!-- volatile -->`
-// marker so Shannon excludes it from the cached prefix). It is NOT consumed
-// here — this keeps user message bytes stable across turns so cross-turn
-// cache hits don't drift every minute due to embedded timestamps.
-// The defensive concat below handles callers that manually populate the field.
+// VolatileContext (memory, date/time, CWD, MCP context) is consumed HERE, in
+// the post-break half. Moving it into the System prompt behind a
+// `<!-- volatile -->` marker was tried and reverted — those bytes sit BEFORE
+// the tools cache_control, so the embedded timestamp broke the tools cache
+// every minute (see prompt.BuildSystemPrompt). Landing it after cache_break
+// confines per-turn drift to the uncached tail, leaving system + tools +
+// the stable prefix intact; the next turn's rolling marker absorbs the tail
+// into the cached prefix anyway.
 func assembleUserMessage(parts prompt.PromptParts, userMessage string) string {
 	var sb strings.Builder
 
@@ -2167,7 +2180,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	if cwd != "" {
 		projectDir = filepath.Join(cwd, ".shannon")
 	}
-	instrText, _ := instructions.LoadInstructions(a.shannonDir, projectDir, 4000)
+	instrText, _ := instructions.LoadInstructions(a.shannonDir, a.projectEntityDir, projectDir, 4000)
 	if cwd != "" {
 		ctx = cwdctx.WithSessionCWD(ctx, cwd)
 	}
@@ -2329,20 +2342,21 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// (BP #3, per-session). Issue #107.
 	localNames, mcpNames, gatewayNames := partitionLiveToolNamesBySource(effTools, toolNames)
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
-		BasePrompt:       basePrompt,
-		Memory:           mem,
-		Instructions:     instrText,
-		LocalToolNames:   localNames,
-		MCPToolNames:     mcpNames,
-		GatewayToolNames: gatewayNames,
-		DeferredTools:    deferredSummaries,
-		MCPContext:       a.mcpContext,
-		CWD:              cwd,
-		Skills:           a.agentSkills,
-		MemoryDir:        a.memoryDir,
-		StickyContext:    a.stickyContext,
-		ModelID:          modelID,
-		OutputFormat:     a.outputFormat,
+		BasePrompt:          basePrompt,
+		Memory:              mem,
+		Instructions:        instrText,
+		LocalToolNames:      localNames,
+		MCPToolNames:        mcpNames,
+		GatewayToolNames:    gatewayNames,
+		DeferredTools:       deferredSummaries,
+		MCPContext:          a.mcpContext,
+		CWD:                 cwd,
+		Skills:              a.agentSkills,
+		MemoryDir:           a.memoryDir,
+		StickyContext:       a.stickyContext,
+		ModelID:             modelID,
+		OutputFormat:        a.outputFormat,
+		QuestionUIAvailable: QuestionAskerFrom(ctx) != nil,
 	})
 
 	// Append cloud delegation guidance and cloud-specific contrast example

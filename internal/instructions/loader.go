@@ -22,7 +22,15 @@ const maxCommandFileChars = 8000
 // projectDir is the project-level directory (e.g. .shannon relative to CWD).
 // maxTokens is an approximate budget (1 token ~ 4 chars).
 // Returns the combined instruction text, truncated if over budget.
-func LoadInstructions(shannonDir string, projectDir string, maxTokens int) (string, error) {
+// LoadInstructions merges instruction files in priority order (higher priority
+// wins on line-level dedup). Tiers, lowest → highest:
+//  1. Global instructions + rules (shannonDir)
+//  2. Project-entity instructions (projectEntityDir = ~/.shannon/projects/<id>),
+//     applied when the session belongs to a project. Orthogonal to the cwd tier.
+//  3. CWD project instructions/rules/local (projectDir = <cwd>/.shannon)
+//
+// Any of shannonDir / projectEntityDir / projectDir may be "" to skip that tier.
+func LoadInstructions(shannonDir string, projectEntityDir string, projectDir string, maxTokens int) (string, error) {
 	type source struct {
 		path     string
 		priority int // higher = higher priority
@@ -42,6 +50,14 @@ func LoadInstructions(shannonDir string, projectDir string, maxTokens int) (stri
 			sources = append(sources, source{rf, priority})
 			priority++
 		}
+	}
+
+	// 2.5. Project-entity instructions (the "Project" box a session belongs to).
+	// Ranked above global so a project can override global guidance, and below
+	// the cwd project tier so a repo-local .shannon still has the last word.
+	if projectEntityDir != "" {
+		sources = append(sources, source{filepath.Join(projectEntityDir, "instructions.md"), priority})
+		priority++
 	}
 
 	// 3. Project instructions

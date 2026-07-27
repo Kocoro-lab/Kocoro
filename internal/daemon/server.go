@@ -36,6 +36,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
 	"github.com/Kocoro-lab/ShanClaw/internal/migrate/claudecode"
+	"github.com/Kocoro-lab/ShanClaw/internal/projects"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
@@ -72,8 +73,15 @@ type Server struct {
 	// pendingBrokers maps requestID → per-request ApprovalBroker.
 	// SSE handlers register here so POST /approval can find the right broker.
 	pendingBrokers sync.Map // map[string]*ApprovalBroker
-	remoteRuns     sync.Map // map[string]*remoteRunState
-	remoteRunSlots chan struct{}
+	// questionBroker is the server-level QuestionBroker (ask_user_question).
+	// Like approvalBroker its sendFn is a no-op; SSE per-request brokers inherit
+	// its bus hooks so question.request / question.resolved stay consistent.
+	questionBroker *QuestionBroker
+	// pendingQuestionBrokers maps requestID → per-request QuestionBroker so
+	// POST /question can find the right broker (parallels pendingBrokers).
+	pendingQuestionBrokers sync.Map // map[string]*QuestionBroker
+	remoteRuns             sync.Map // map[string]*remoteRunState
+	remoteRunSlots         chan struct{}
 	// Remote run events are sequenced and kept briefly so a Cloud WS reconnect can
 	// replay events that were emitted while the socket was down.
 	remoteRunOutboxMu sync.Mutex
@@ -299,6 +307,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		deps:                   deps,
 		version:                version,
 		approvalBroker:         NewApprovalBroker(func(req ApprovalRequest) error { return nil }),
+		questionBroker:         NewQuestionBroker(func(req QuestionRequest) error { return nil }),
 		eventBus:               NewEventBus(),
 		notifyApprovalResolved: func(p ApprovalResolvedPayload) error { return nil },
 		remoteRunSlots:         make(chan struct{}, MaxConcurrentAgents),
@@ -324,6 +333,11 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	WireApprovalBusHooks(s.approvalBroker, s.eventBus, func(p ApprovalResolvedPayload) error {
 		return s.notifyApprovalResolved(p)
 	})
+	// Question interaction: same bus-hook wiring so SSE per-request question
+	// brokers publish question.request / question.resolved through one path.
+	// notify is nil — no Cloud question transport exists yet (the interaction
+	// is Desktop-local today).
+	WireQuestionBusHooks(s.questionBroker, s.eventBus, nil)
 	if deps != nil {
 		deps.Suggestions = s.suggestions
 		if deps.ApprovalTracker == nil {
@@ -565,6 +579,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /agents/{name}/permissions/always-allow", s.handleRemoveAgentAlwaysAllow)
 	mux.HandleFunc("POST /permissions/always-allow", s.handleAddGlobalAlwaysAllow)
 	mux.HandleFunc("DELETE /permissions/always-allow", s.handleRemoveGlobalAlwaysAllow)
+	mux.HandleFunc("GET /projects", s.handleProjects)
+	mux.HandleFunc("POST /projects", s.handleCreateProject)
+	mux.HandleFunc("GET /projects/{id}", s.handleGetProject)
+	mux.HandleFunc("PUT /projects/{id}", s.handleUpdateProject)
+	mux.HandleFunc("DELETE /projects/{id}", s.handleDeleteProject)
 	mux.HandleFunc("PUT /agents/{name}/commands/{cmd}", s.handlePutCommand)
 	mux.HandleFunc("DELETE /agents/{name}/commands/{cmd}", s.handleDeleteCommand)
 	mux.HandleFunc("PUT /agents/{name}/skills/{skill}", s.handlePutSkill)
@@ -676,6 +695,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /permissions/request", s.handlePermissionsRequest)
 	mux.HandleFunc("POST /approval", s.handleApproval)
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
+	mux.HandleFunc("POST /question", s.handleQuestion)
 	mux.HandleFunc("POST /remote/pairing-code", s.handleRemotePairingCode)
 	mux.HandleFunc("GET /remote/pairings", s.handleRemotePairings)
 	mux.HandleFunc("POST /remote/revoke", s.handleRemoteRevoke)
@@ -926,7 +946,11 @@ func (s *Server) forwardRemoteEvents(ctx context.Context) {
 
 func remoteEventAllowed(evt Event) bool {
 	switch evt.Type {
-	case EventApprovalRequest, EventApprovalResolved, EventApprovalNotice:
+	// Interactive requests stay local until the remote-control protocol can
+	// resolve them. Forwarding only one side would expose their payloads while
+	// leaving remote clients with no allowed POST endpoint to answer them.
+	case EventApprovalRequest, EventApprovalResolved, EventApprovalNotice,
+		EventQuestionRequest, EventQuestionResolved:
 		return false
 	default:
 		return true
@@ -1367,6 +1391,52 @@ func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
 
+// handleQuestion resolves a pending ask_user_question interaction. Mirrors
+// handleApproval: it claims the request under the broker mutex and emits the
+// terminal question.resolved (resolved_by=kocoro) as Resolve's beforeDeliver so
+// the event is sequenced before any post-answer agent event. Desktop-only
+// transport (the agent never calls it), so it stays out of the kocoro skill
+// references but is pinned by the wire fixtures.
+func (s *Server) handleQuestion(w http.ResponseWriter, r *http.Request) {
+	var req QuestionResponse
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.RequestID == "" {
+		http.Error(w, `{"error":"request_id required"}`, http.StatusBadRequest)
+		return
+	}
+	switch req.Action {
+	case QuestionActionAnswer, QuestionActionDecline:
+	default:
+		http.Error(w, `{"error":"action must be answer or decline"}`, http.StatusBadRequest)
+		return
+	}
+	emitResolved := func() {
+		emitBusJSON(s.eventBus, EventQuestionResolved, map[string]any{
+			"request_id":  req.RequestID,
+			"action":      req.Action,
+			"resolved_by": "kocoro",
+			"ts":          nowISO(),
+		})
+	}
+	// The per-request SSE broker owns the pending question; the server broker is
+	// the no-op-sendFn fallback that shares its bus hooks. No Cloud/WS question
+	// transport exists yet, so there is no third fallback (unlike approvals).
+	var err error
+	if b, ok := s.pendingQuestionBrokers.Load(req.RequestID); ok {
+		_, err = b.(*QuestionBroker).ResolveResponse(req, emitResolved)
+	} else {
+		_, err = s.questionBroker.ResolveResponse(req, emitResolved)
+	}
+	if err != nil {
+		http.Error(w, `{"error":`+strconv.Quote(err.Error())+`}`, http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1526,6 +1596,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	scopeAll := r.URL.Query().Get("scope") == "all"
 	limit, offset := parseSessionPageParams(r, scopeAll)
 	projectCWD := sessionProjectCWDFilter(r)
+	projectID := sessionProjectIDFilter(r)
 	scheduleID := strings.TrimSpace(r.URL.Query().Get("schedule_id"))
 
 	// scope=all merges the default scope with every named agent's sessions.
@@ -1552,7 +1623,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 				summaries = append(summaries, sum)
 			}
 		}
-		s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
+		s.writeSessionsPage(w, summaries, limit, offset, projectCWD, projectID, scheduleID)
 		return
 	}
 
@@ -1568,7 +1639,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// If the directory doesn't exist, return empty list.
 		if os.IsNotExist(err) {
-			s.writeSessionsPage(w, nil, limit, offset, projectCWD, scheduleID)
+			s.writeSessionsPage(w, nil, limit, offset, projectCWD, projectID, scheduleID)
 			return
 		}
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusInternalServerError)
@@ -1577,7 +1648,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	for i := range summaries {
 		summaries[i].Agent = agentName
 	}
-	s.writeSessionsPage(w, summaries, limit, offset, projectCWD, scheduleID)
+	s.writeSessionsPage(w, summaries, limit, offset, projectCWD, projectID, scheduleID)
 }
 
 // defaultSessionsPageLimit is the page size applied to scope=all when the
@@ -1635,7 +1706,7 @@ type sessionProjectSummary struct {
 // unlimitedSessionsPage (0) returns every row from `offset` on (has_more
 // false). Pinned sessions are capped well under a page, so they naturally lead
 // the first page without special-casing.
-func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int, projectCWD *string, scheduleID string) {
+func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.SessionSummary, limit, offset int, projectCWD *string, projectID *string, scheduleID string) {
 	enriched := s.enrichSummaries(summaries)
 	if scheduleID != "" {
 		filtered := enriched[:0]
@@ -1652,6 +1723,19 @@ func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.Se
 		filtered := enriched[:0]
 		for _, summary := range enriched {
 			if summary.CWD == wanted {
+				filtered = append(filtered, summary)
+			}
+		}
+		enriched = filtered
+	}
+	// project_id filter: absent = all, present+empty = unfiled sessions,
+	// present+value = that exact project entity. Plain string compare (project
+	// ids are opaque slugs, no path normalization).
+	if projectID != nil {
+		wanted := strings.TrimSpace(*projectID)
+		filtered := enriched[:0]
+		for _, summary := range enriched {
+			if summary.ProjectID == wanted {
 				filtered = append(filtered, summary)
 			}
 		}
@@ -1694,6 +1778,21 @@ func (s *Server) writeSessionsPage(w http.ResponseWriter, summaries []session.Se
 // exact normalized working directory.
 func sessionProjectCWDFilter(r *http.Request) *string {
 	values, present := r.URL.Query()["project_cwd"]
+	if !present {
+		return nil
+	}
+	value := ""
+	if len(values) > 0 {
+		value = values[0]
+	}
+	return &value
+}
+
+// sessionProjectIDFilter preserves three states mirroring the CWD filter:
+// absent = all, present+empty = unfiled sessions, present+id = that exact
+// project entity.
+func sessionProjectIDFilter(r *http.Request) *string {
+	values, present := r.URL.Query()["project_id"]
 	if !present {
 		return nil
 	}
@@ -2053,16 +2152,35 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Title    *string `json:"title,omitempty"`
-		Pinned   *bool   `json:"pinned,omitempty"`
-		Favorite *bool   `json:"favorite,omitempty"`
+		Title     *string `json:"title,omitempty"`
+		Pinned    *bool   `json:"pinned,omitempty"`
+		Favorite  *bool   `json:"favorite,omitempty"`
+		ProjectID *string `json:"project_id,omitempty"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	if body.Title == nil && body.Pinned == nil && body.Favorite == nil {
-		writeError(w, http.StatusBadRequest, "request body must include at least one of: title, pinned, favorite")
+	if body.Title == nil && body.Pinned == nil && body.Favorite == nil && body.ProjectID == nil {
+		writeError(w, http.StatusBadRequest, "request body must include at least one of: title, pinned, favorite, project_id")
 		return
+	}
+	// project_id: "" clears the tag (unfile); a non-empty value must reference an
+	// existing project so we never file a session into a ghost project.
+	if body.ProjectID != nil && *body.ProjectID != "" {
+		if err := projects.ValidateProjectID(*body.ProjectID); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Reject (don't silently file into a project that cannot exist) when the
+		// projects store isn't configured; otherwise require the project to exist.
+		if s.deps.ProjectsDir == "" {
+			writeError(w, http.StatusBadRequest, "projects not configured")
+			return
+		}
+		if _, err := projects.LoadProject(s.deps.ProjectsDir, *body.ProjectID); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("project %q not found", *body.ProjectID))
+			return
+		}
 	}
 	var title string
 	if body.Title != nil {
@@ -2108,6 +2226,17 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		if body.Favorite != nil {
 			resp["favorite"] = *body.Favorite
 		}
+	}
+	if body.ProjectID != nil {
+		if err := mgr.PatchProjectID(id, body.ProjectID); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", id))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		resp["project_id"] = *body.ProjectID
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -2786,6 +2915,16 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	// Cancel only this request's pending approvals when the SSE stream ends.
 	defer reqBroker.CancelAll()
 
+	// Per-request question broker (ask_user_question), parallel to reqBroker:
+	// its own pending map + SSE `question` sendFn, inheriting the server broker's
+	// bus hooks so question.request / question.resolved stay consistent.
+	qBroker := NewQuestionBroker(newSSEQuestionSendFn(w, flusher))
+	qBroker.onRequest = s.questionBroker.onRequest
+	qBroker.onCleanup = s.questionBroker.onCleanup
+	qBroker.onRegister = func(requestID string) { s.pendingQuestionBrokers.Store(requestID, qBroker) }
+	qBroker.onDeregister = func(requestID string) { s.pendingQuestionBrokers.Delete(requestID) }
+	defer qBroker.CancelAll()
+
 	// Resolve auto_approve: per-agent overrides global
 	cfg, _, _ := s.deps.Snapshot()
 	autoApprove := cfg.Daemon.AutoApprove
@@ -2796,7 +2935,28 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	}
 
 	handler := &sseEventHandler{w: w, flusher: flusher, broker: reqBroker, ctx: r.Context(), autoApprove: autoApprove, deps: s.deps, agent: req.Agent, source: req.Source}
-	result, err := RunAgent(r.Context(), s.deps, req, handler)
+	// Inject the QuestionAsker so ask_user_question can reach qBroker. metaFn is
+	// read lazily at ask time so the session id RunAgent resolves mid-run is
+	// captured, mirroring how OnApprovalNeeded reads handler.sessionID.
+	//
+	// Gate on the run's SOURCE, not auto_approve. auto_approve only governs
+	// whether tool EXECUTIONS are auto-approved; it says nothing about whether a
+	// human can answer a multiple-choice question. An attended Desktop/web run
+	// with auto_approve on must still be able to ask. Only unattended sources
+	// (schedule/cron, heartbeat/watcher/mcp, non-interactive channels) get no
+	// asker, so a background run can never block on an interactive question; the
+	// QuestionBroker's auto-resolution timeout backstops an attended run whose
+	// user walks away.
+	askCtx := r.Context()
+	if !isUnattendedSource(req.Source) {
+		askCtx = agent.WithQuestionAsker(askCtx, &brokerQuestionAsker{
+			broker: qBroker,
+			metaFn: func() ApprovalRequestMeta {
+				return ApprovalRequestMeta{SessionID: handler.sessionID, Source: req.Source, Agent: req.Agent}
+			},
+		})
+	}
+	result, err := RunAgent(askCtx, s.deps, req, handler)
 	if err != nil {
 		payload := map[string]string{"error": err.Error()}
 		switch {

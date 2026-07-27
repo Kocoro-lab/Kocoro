@@ -84,6 +84,7 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(bashTool)
 
 	reg.Register(&MemoryAppendTool{})
+	reg.Register(&AskUserQuestionTool{})
 	if shouldRegisterThinkTool(cfg) {
 		reg.Register(&ThinkTool{})
 	}

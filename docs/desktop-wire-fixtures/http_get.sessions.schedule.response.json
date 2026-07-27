@@ -1,25 +1,26 @@
 {
-  "sessions": [
-    {
-      "id": "2026-07-20-aaaaaaaaaaaa",
-      "title": "scheduled report",
-      "cwd": "",
-      "created_at": "2026-07-20T00:00:00Z",
-      "updated_at": "2026-07-20T00:00:00Z",
-      "msg_count": 1,
-      "source": "schedule",
-      "schedule_id": "sch-daily",
-      "kind": "schedule",
-      "agent": ""
-    }
-  ],
+  "has_more": false,
   "projects": [
     {
       "cwd": "",
-      "updated_at": "2026-07-20T00:00:00Z",
-      "session_count": 1
+      "session_count": 1,
+      "updated_at": "2026-07-20T00:00:00Z"
     }
   ],
-  "total": 1,
-  "has_more": false
+  "sessions": [
+    {
+      "agent": "",
+      "created_at": "2026-07-20T00:00:00Z",
+      "cwd": "",
+      "id": "2026-07-20-aaaaaaaaaaaa",
+      "kind": "schedule",
+      "msg_count": 1,
+      "project_id": "",
+      "schedule_id": "sch-daily",
+      "source": "schedule",
+      "title": "scheduled report",
+      "updated_at": "2026-07-20T00:00:00Z"
+    }
+  ],
+  "total": 1
 }

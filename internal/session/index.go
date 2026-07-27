@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 	schedule_id TEXT NOT NULL DEFAULT '',
     route_key  TEXT NOT NULL DEFAULT '',
     pinned     INTEGER NOT NULL DEFAULT 0,
-    favorite   INTEGER NOT NULL DEFAULT 0
+    favorite   INTEGER NOT NULL DEFAULT 0,
+    project_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -196,6 +197,26 @@ func OpenIndex(dir string) (*Index, error) {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 
+	// project_id is an additive metadata column (project entity a session
+	// belongs to). It is migrated in UNCONDITIONALLY here — not gated behind
+	// indexSchemaVersion — so existing v7 DBs gain the column without a version
+	// bump, which would otherwise force a full messages/FTS rebuild from JSON.
+	// Fresh DBs already have it from CREATE TABLE, so "duplicate column" is
+	// tolerated. Old sessions are all unfiled (project_id = '') by definition,
+	// so no data backfill is needed. The CREATE INDEX runs after the column is
+	// guaranteed to exist (it is intentionally NOT in the schema string, which
+	// runs before this ALTER on existing tables).
+	if _, err := db.Exec(`ALTER TABLE sessions ADD COLUMN project_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("add project_id column: %w", err)
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sessions_project_id_updated ON sessions(project_id, updated_at DESC)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create project_id index: %w", err)
+	}
+
 	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, indexSchemaVersion)); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("stamp user_version: %w", err)
@@ -230,8 +251,8 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		favorite = 1
 	}
 	_, err = tx.Exec(
-		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source, schedule_id, route_key, pinned, favorite)
-		 VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO sessions (id, title, cwd, created_at, updated_at, msg_count, source, schedule_id, route_key, pinned, favorite, project_id)
+		 VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
 		sess.ID, sess.Title, sess.CWD,
 		sess.CreatedAt.Format(time.RFC3339Nano),
 		sess.UpdatedAt.Format(time.RFC3339Nano),
@@ -240,6 +261,7 @@ func (idx *Index) UpsertSession(sess *Session) error {
 		sess.RouteKey,
 		pinned,
 		favorite,
+		sess.ProjectID,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert session: %w", err)
@@ -327,9 +349,30 @@ func (idx *Index) UpdateSessionFlags(id string, pinned, favorite *bool) error {
 	return nil
 }
 
+// UpdateSessionProjectID applies a narrow UPDATE to just the project_id column,
+// without touching the messages table or FTS index — so re-filing a long
+// session into a project is cheap. Returns os.ErrNotExist when no row matches id.
+func (idx *Index) UpdateSessionProjectID(id string, projectID string) error {
+	res, err := idx.db.Exec(
+		`UPDATE sessions SET project_id = ? WHERE id = ?`,
+		projectID, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update session project_id: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
 func (idx *Index) ListSessions() ([]SessionSummary, error) {
 	rows, err := idx.db.Query(
-		`SELECT id, title, cwd, created_at, updated_at, msg_count, source, schedule_id, pinned, favorite
+		`SELECT id, title, cwd, created_at, updated_at, msg_count, source, schedule_id, pinned, favorite, project_id
 		 FROM sessions ORDER BY pinned DESC, updated_at DESC`,
 	)
 	if err != nil {
@@ -342,7 +385,7 @@ func (idx *Index) ListSessions() ([]SessionSummary, error) {
 		var s SessionSummary
 		var createdStr, updatedStr string
 		var pinned, favorite int
-		if err := rows.Scan(&s.ID, &s.Title, &s.CWD, &createdStr, &updatedStr, &s.MsgCount, &s.Source, &s.ScheduleID, &pinned, &favorite); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.CWD, &createdStr, &updatedStr, &s.MsgCount, &s.Source, &s.ScheduleID, &pinned, &favorite, &s.ProjectID); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		s.CreatedAt = parseTime(createdStr)
