@@ -15,6 +15,8 @@
   "action_phase": "verifying",
   "action_result": "verified",
   "execution_path": "accessibility",
+  "execution_lane": "foreground",
+  "foreground_fallback": false,
   "pointer": null,
   "failure_code": null,
   "consequential_risk": null,

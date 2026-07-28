@@ -54,17 +54,19 @@ type WorkflowLease struct {
 }
 
 type ActionRequest struct {
-	LeaseID        string
-	TurnID         string
-	ToolName       string
-	ToolUseID      string
-	ActionKind     string
-	ActionPhase    ComputerUseActionPhase
-	TargetBundleID string
-	TargetAppName  string
-	ExecutionPath  *ComputerUseExecutionPath
-	Pointer        *ComputerUsePointer
-	Effect         ComputerUseActionEffect
+	LeaseID            string
+	TurnID             string
+	ToolName           string
+	ToolUseID          string
+	ActionKind         string
+	ActionPhase        ComputerUseActionPhase
+	TargetBundleID     string
+	TargetAppName      string
+	ExecutionPath      *ComputerUseExecutionPath
+	ExecutionLane      *ComputerUseExecutionLane
+	ForegroundFallback bool
+	Pointer            *ComputerUsePointer
+	Effect             ComputerUseActionEffect
 	// OrderedBatchAction keeps one already-observed provider screenshot valid
 	// across sequential actions. Pause, Take Over, and user interference still
 	// establish the ordinary re-observation barrier.
@@ -425,6 +427,10 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 	if parent == nil {
 		parent = context.Background()
 	}
+	if request.ExecutionLane == nil {
+		lane := ComputerUseExecutionForeground
+		request.ExecutionLane = &lane
+	}
 	if request.LeaseID == "" || request.TurnID == "" || request.ToolUseID == "" || request.ActionKind == "" {
 		return ActionHandle{}, fmt.Errorf("computer-use action lease_id, turn_id, tool_use_id, and action_kind are required")
 	}
@@ -433,6 +439,19 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 	}
 	if request.ExecutionPath != nil && !ValidComputerUseExecutionPath(*request.ExecutionPath) {
 		return ActionHandle{}, fmt.Errorf("invalid computer-use execution_path %q", *request.ExecutionPath)
+	}
+	if request.ExecutionLane == nil ||
+		!ValidComputerUseExecutionLane(*request.ExecutionLane) {
+		return ActionHandle{}, fmt.Errorf("valid computer-use execution_lane is required")
+	}
+	if request.ForegroundFallback &&
+		*request.ExecutionLane != ComputerUseExecutionForeground {
+		return ActionHandle{}, fmt.Errorf("foreground fallback requires foreground execution_lane")
+	}
+	if (*request.ExecutionLane == ComputerUseExecutionBackgroundSemantic ||
+		*request.ExecutionLane == ComputerUseExecutionBackgroundKeyboard) &&
+		request.Pointer != nil {
+		return ActionHandle{}, fmt.Errorf("background action cannot publish a physical pointer")
 	}
 	if request.Pointer != nil {
 		if err := request.Pointer.Validate(); err != nil {
@@ -538,6 +557,8 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 		state.ActionPhase = ComputerUsePhaseActing
 	}
 	state.ExecutionPath = cloneExecutionPath(request.ExecutionPath)
+	state.ExecutionLane = cloneExecutionLane(request.ExecutionLane)
+	state.ForegroundFallback = request.ForegroundFallback
 	state.Pointer = clonePointer(request.Pointer)
 	event, sink, err := c.eventLocked()
 	c.mu.Unlock()
@@ -560,6 +581,10 @@ func (c *Coordinator) BeginAction(parent context.Context, request ActionRequest)
 func (c *Coordinator) StageConsequentialRisk(parent context.Context, request ActionRequest, marker ConsequentialRiskMarkerV1) (ConsequentialRiskHandle, error) {
 	if parent == nil {
 		parent = context.Background()
+	}
+	if request.ExecutionLane == nil {
+		lane := ComputerUseExecutionForeground
+		request.ExecutionLane = &lane
 	}
 	if err := marker.Validate(); err != nil {
 		return ConsequentialRiskHandle{}, err
@@ -608,6 +633,8 @@ func (c *Coordinator) StageConsequentialRisk(parent context.Context, request Act
 	state.TargetBundleID = nonempty(request.TargetBundleID, c.active.lease.RequestedAppBundleID)
 	state.TargetAppName = nonempty(request.TargetAppName, c.active.lease.RequestedAppName)
 	state.ExecutionPath = cloneExecutionPath(request.ExecutionPath)
+	state.ExecutionLane = cloneExecutionLane(request.ExecutionLane)
+	state.ForegroundFallback = request.ForegroundFallback
 	state.ActionPhase = ComputerUsePhaseWaitingForUser
 	state.ActionResult, state.FailureCode, state.Pointer = nil, nil, nil
 	state.ConsequentialRisk = &marker
@@ -649,7 +676,10 @@ func exactConsequentialRiskActionRequest(a, b ActionRequest) bool {
 	return a.LeaseID == b.LeaseID && a.TurnID == b.TurnID && a.ToolName == b.ToolName &&
 		a.ToolUseID == b.ToolUseID && a.ActionKind == b.ActionKind && a.ActionPhase == b.ActionPhase &&
 		a.TargetBundleID == b.TargetBundleID &&
-		a.TargetAppName == b.TargetAppName && executionPathString(a.ExecutionPath) == executionPathString(b.ExecutionPath) &&
+		a.TargetAppName == b.TargetAppName &&
+		executionPathString(a.ExecutionPath) == executionPathString(b.ExecutionPath) &&
+		executionLaneString(a.ExecutionLane) == executionLaneString(b.ExecutionLane) &&
+		a.ForegroundFallback == b.ForegroundFallback &&
 		a.Effect == b.Effect && a.OrderedBatchAction == b.OrderedBatchAction &&
 		a.RiskIntentID == b.RiskIntentID && a.RiskTargetDigest == b.RiskTargetDigest
 }
@@ -1240,6 +1270,14 @@ func cloneActionResult(value *ComputerUseActionResult) *ComputerUseActionResult 
 }
 
 func cloneExecutionPath(value *ComputerUseExecutionPath) *ComputerUseExecutionPath {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneExecutionLane(value *ComputerUseExecutionLane) *ComputerUseExecutionLane {
 	if value == nil {
 		return nil
 	}

@@ -172,6 +172,10 @@ func TestTargetBoundInputV1TaggedUnionRejectsMalformedTuples(t *testing.T) {
 	for _, mutate := range []func(*TargetBoundInputRequestV1){
 		func(request *TargetBoundInputRequestV1) { request.Ref = nil },
 		func(request *TargetBoundInputRequestV1) { request.Path = nil },
+		func(request *TargetBoundInputRequestV1) {
+			path := *request.Path + " "
+			request.Path = &path
+		},
 		func(request *TargetBoundInputRequestV1) { request.ExpectedRole = nil },
 		func(request *TargetBoundInputRequestV1) { request.ExpectedFingerprint = nil },
 	} {

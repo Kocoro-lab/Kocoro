@@ -153,6 +153,15 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 			return agent.BusinessError("computer-use target-bound execution is unavailable for " + descriptor.ActionKind + "; use an accessibility action tied to an observed element"), nil
 		}
 	}
+	executionLane, laneErr := guiExecutionLane(
+		descriptor.ExecutionLane,
+		descriptor.ForegroundFallback,
+	)
+	if laneErr != nil {
+		return agent.BusinessError(
+			"computer-use policy denied invalid execution lane",
+		), nil
+	}
 	invocation, ok := w.invocationFromContext(ctx)
 	if !ok || invocation.ToolUseID == "" || invocation.ToolName != "" && invocation.ToolName != tool.Info().Name {
 		return agent.BusinessError("computer-use policy denied GUI action without exact tool invocation identity"), nil
@@ -183,6 +192,8 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 		TargetBundleID:     descriptor.TargetBundleID,
 		TargetAppName:      descriptor.TargetAppName,
 		ExecutionPath:      executionPath,
+		ExecutionLane:      executionLane,
+		ForegroundFallback: descriptor.ForegroundFallback,
 		Effect:             effect,
 		OrderedBatchAction: orderedBatchAction,
 	}
@@ -345,7 +356,9 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 		ToolName: tool.Info().Name, ToolUseID: invocation.ToolUseID,
 		ActionKind: actionRequest.ActionKind, Effect: string(actionRequest.Effect),
 		TargetBundleID: actionRequest.TargetBundleID, ExecutionPath: authorityPath,
-		RiskIntentID: actionRequest.RiskIntentID, RiskTargetDigest: actionRequest.RiskTargetDigest,
+		ExecutionLane:      string(*executionLane),
+		ForegroundFallback: descriptor.ForegroundFallback,
+		RiskIntentID:       actionRequest.RiskIntentID, RiskTargetDigest: actionRequest.RiskTargetDigest,
 	})
 	if approvedRisk != nil {
 		executionCtx = tools.ContextWithConsequentialRiskExecutionV1(
@@ -364,16 +377,34 @@ func (w *daemonGUIWorkflow) runTool(ctx context.Context, tool agent.Tool, argsJS
 	executionCtx = agent.ContextWithToolInvocation(executionCtx, agent.ToolInvocation{
 		ToolName: tool.Info().Name, ToolUseID: invocation.ToolUseID,
 	})
-	if descriptor.Effect == agent.GUIActionMutation && !orderedBatchAction {
+	if descriptor.Effect == agent.GUIActionMutation &&
+		(!orderedBatchAction || descriptor.ForegroundFallback) {
 		if restorer, ok := tool.(tools.GUIActionTargetRestorerV1); ok {
 			if err := restorer.RestoreGUIActionTargetV1(executionCtx, descriptor); err != nil {
-				return agent.BusinessError(
-					"computer-use target could not be restored safely; re-observe the app before retrying",
-				), nil
+				return guiTargetRestorePrecommitFailure(err), nil
 			}
 		}
 	}
 	return tool.Run(executionCtx, argsJSON)
+}
+
+func guiTargetRestorePrecommitFailure(err error) agent.ToolResult {
+	detail := "the exact target could not be activated"
+	if err != nil {
+		detail = strings.Join(strings.Fields(err.Error()), " ")
+	}
+	result := agent.BusinessError(
+		"computer_use_error: target_restore_failed\n" +
+			"message: the exact desktop target could not be activated before the action\n" +
+			"detail: " + detail + "\n" +
+			"recovery: obtain a fresh observation before planning another mutation",
+	)
+	result.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: "target_restore_failed",
+	}
+	return result
 }
 
 type nativeToolRequestPreparationDescriber interface {
@@ -655,6 +686,31 @@ func guiExecutionPath(value string) *guicontrol.ComputerUseExecutionPath {
 		return nil
 	}
 	return &path
+}
+
+func guiExecutionLane(
+	value string,
+	foregroundFallback bool,
+) (*guicontrol.ComputerUseExecutionLane, error) {
+	var lane guicontrol.ComputerUseExecutionLane
+	switch value {
+	case "", string(guicontrol.ComputerUseExecutionForeground):
+		lane = guicontrol.ComputerUseExecutionForeground
+	case string(guicontrol.ComputerUseExecutionBackgroundSemantic):
+		lane = guicontrol.ComputerUseExecutionBackgroundSemantic
+	case string(guicontrol.ComputerUseExecutionBackgroundKeyboard):
+		lane = guicontrol.ComputerUseExecutionBackgroundKeyboard
+	default:
+		return nil, fmt.Errorf("invalid computer-use execution lane")
+	}
+	if foregroundFallback &&
+		lane != guicontrol.ComputerUseExecutionForeground {
+		return nil, fmt.Errorf("foreground fallback requires foreground execution lane")
+	}
+	if foregroundFallback && value == "" {
+		return nil, fmt.Errorf("foreground fallback requires an explicit foreground execution lane")
+	}
+	return &lane, nil
 }
 
 func guiCoordinatorToolError(err error) agent.ToolResult {

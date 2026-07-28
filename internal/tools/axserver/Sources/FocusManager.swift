@@ -11,16 +11,60 @@ struct AppIdentityResult: Encodable {
     }
 }
 
+struct BackgroundAppBindingResult: Encodable {
+    let app: String
+    let bundleID: String
+    let pid: Int
+    let launchDate: String?
+    let preservedFrontmostPID: Int
+    let preservedFrontmostBundleID: String
+    let preservedFrontmostLaunchDate: String?
+
+    enum CodingKeys: String, CodingKey {
+        case app, pid
+        case bundleID = "bundle_id"
+        case launchDate = "launch_date"
+        case preservedFrontmostPID = "preserved_frontmost_pid"
+        case preservedFrontmostBundleID = "preserved_frontmost_bundle_id"
+        case preservedFrontmostLaunchDate = "preserved_frontmost_launch_date"
+    }
+}
+
+private let processLaunchDateFormatterV1: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}()
+
+func processLaunchDateStringV1(_ application: NSRunningApplication) -> String? {
+    application.launchDate.map(processLaunchDateFormatterV1.string(from:))
+}
+
 struct FocusManager {
-    static func resolveAppIdentity(appName: String) -> (AppIdentityResult?, ErrorInfo?) {
-        if let running = resolveRunningApplication(appName: appName),
-           let bundleID = running.bundleIdentifier, !bundleID.isEmpty {
+    static func resolveAppIdentity(
+        appName: String,
+        excludedPIDs: Set<Int> = []
+    ) -> (AppIdentityResult?, ErrorInfo?) {
+        let resolution = runningApplicationSelection(
+            appName: appName,
+            excluding: excludedPIDs)
+        if case let .selected(pid) = resolution.selection,
+           let running = resolution.applications.first(where: {
+               Int($0.processIdentifier) == pid
+           }),
+           let bundleID = running.bundleIdentifier,
+           !bundleID.isEmpty {
             return (
                 AppIdentityResult(
                     app: running.localizedName ?? appName,
                     bundleID: bundleID,
                     pid: Int(running.processIdentifier)),
                 nil)
+        }
+        if resolution.selection == .ambiguous {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "App '\(appName)' has multiple running instances and no unique visible target"))
         }
         guard let path = NSWorkspace.shared.fullPath(forApplication: appName),
               let bundle = Bundle(path: path),
@@ -38,6 +82,186 @@ struct FocusManager {
                 bundleID: bundleID,
                 pid: nil),
             nil)
+    }
+
+    /// Prepares exactly one task-owned application instance. A resolved PID is
+    /// immutable: if it disappeared or changed bundle identity, preparation
+    /// fails instead of falling back to another same-name process. When no PID
+    /// existed at resolution time, launch creates one fresh application
+    /// instance and returns the exact PID for every later observation/action.
+    static func prepareTaskApp(
+        appName: String,
+        expectedBundleID: String,
+        expectedPID: Int?,
+        excludedPIDs: Set<Int>
+    ) -> (AppIdentityResult?, ErrorInfo?) {
+        guard !expectedBundleID.isEmpty else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "Task app bundle identity is required"))
+        }
+
+        var target: NSRunningApplication?
+        if let expectedPID, expectedPID > 0 {
+            guard !excludedPIDs.contains(expectedPID),
+                  let processID = pid_t(exactly: expectedPID),
+                  let running = NSRunningApplication(processIdentifier: processID),
+                  !running.isTerminated,
+                  running.bundleIdentifier == expectedBundleID else {
+                return (nil, ErrorInfo(
+                    code: -1,
+                    message: "Resolved task app identity is no longer available"))
+            }
+            target = running
+        } else {
+            let resolution = runningApplicationSelection(
+                appName: appName,
+                excluding: excludedPIDs)
+            switch resolution.selection {
+            case let .selected(pid):
+                target = resolution.applications.first {
+                    Int($0.processIdentifier) == pid
+                }
+            case .ambiguous:
+                return (nil, ErrorInfo(
+                    code: -1,
+                    message: "App '\(appName)' has multiple running instances and no unique visible target"))
+            case .notRunning:
+                break
+            }
+        }
+
+        if target == nil {
+            let applicationURL = NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: expectedBundleID)
+            guard let applicationURL else {
+                return (nil, ErrorInfo(
+                    code: -1,
+                    message: "App '\(appName)' is not installed"))
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(
+                at: applicationURL,
+                configuration: configuration
+            ) { _, _ in }
+
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                let resolution = runningApplicationSelection(
+                    appName: appName,
+                    excluding: excludedPIDs)
+                switch resolution.selection {
+                case let .selected(pid):
+                    target = resolution.applications.first {
+                        Int($0.processIdentifier) == pid
+                    }
+                case .ambiguous:
+                    return (nil, ErrorInfo(
+                        code: -1,
+                        message: "App '\(appName)' launched into an ambiguous instance set"))
+                case .notRunning:
+                    break
+                }
+                if target != nil { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+        }
+
+        guard let target,
+              !target.isTerminated,
+              target.bundleIdentifier == expectedBundleID else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "App '\(appName)' did not expose the expected process identity"))
+        }
+        guard activateAndExposeWindow(target, timeout: 2) else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "App '\(appName)' did not expose a window"))
+        }
+        return (
+            AppIdentityResult(
+                app: target.localizedName ?? appName,
+                bundleID: expectedBundleID,
+                pid: Int(target.processIdentifier)),
+            nil)
+    }
+
+    /// Binds one already-running, visible, non-frontmost app without
+    /// activating, raising, unminimizing, reopening, or launching it. The
+    /// caller may fall back to prepareTaskApp with this same exact identity,
+    /// but this method itself is observation-only.
+    static func bindBackgroundTaskApp(
+        appName: String,
+        expectedBundleID: String,
+        expectedPID: Int?,
+        excludedPIDs: Set<Int>
+    ) -> (BackgroundAppBindingResult?, ErrorInfo?) {
+        guard !expectedBundleID.isEmpty,
+              let expectedPID,
+              expectedPID > 0,
+              !excludedPIDs.contains(expectedPID),
+              let processID = pid_t(exactly: expectedPID) else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "Background task app requires one exact running identity"))
+        }
+        refreshAppKitState()
+        guard let target = NSRunningApplication(processIdentifier: processID),
+              !target.isTerminated,
+              target.bundleIdentifier == expectedBundleID else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "Resolved background task app identity is no longer available"))
+        }
+        let candidates = currentCGWindowIdentityCandidates()
+        let visibleNormalWindowPIDs = candidates.compactMap { candidate -> Int? in
+            guard candidate.layer == 0,
+                  candidate.windowID > 0,
+                  candidate.isOnScreen,
+                  candidate.alpha > 0,
+                  candidate.frame.width > 0,
+                  candidate.frame.height > 0 else {
+                return nil
+            }
+            return candidate.ownerPID
+        }
+        guard let frontmost = NSWorkspace.shared.frontmostApplication,
+              !frontmost.isTerminated,
+              let frontmostBundleID = frontmost.bundleIdentifier,
+              !frontmostBundleID.isEmpty else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "Background task requires one exact preserved frontmost process"))
+        }
+        let frontmostPID = Int(frontmost.processIdentifier)
+        switch backgroundTaskAppEligibility(
+            targetPID: expectedPID,
+            frontmostPID: frontmostPID,
+            visibleNormalWindowPIDs: visibleNormalWindowPIDs
+        ) {
+        case .eligible:
+            return (
+                BackgroundAppBindingResult(
+                    app: target.localizedName ?? appName,
+                    bundleID: expectedBundleID,
+                    pid: expectedPID,
+                    launchDate: processLaunchDateStringV1(target),
+                    preservedFrontmostPID: frontmostPID,
+                    preservedFrontmostBundleID: frontmostBundleID,
+                    preservedFrontmostLaunchDate: processLaunchDateStringV1(frontmost)),
+                nil)
+        case .targetIsFrontmost:
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "Background task target is already frontmost"))
+        case .noVisibleWindow:
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "Background task target has no visible normal window"))
+        }
     }
 
     /// Launches an installed app by display name and activates it once the
@@ -78,9 +302,35 @@ struct FocusManager {
     }
 
     /// Activates an app by name, optionally verifying focus.
-    static func focusApp(appName: String, windowTitle: String?, verify: Bool) -> (ActionResult?, ErrorInfo?) {
-        guard let app = resolveRunningApplication(appName: appName) else {
-            return (nil, ErrorInfo(code: -1, message: "App '\(appName)' not found or not running"))
+    static func focusApp(
+        appName: String,
+        windowTitle: String?,
+        verify: Bool,
+        expectedPID: Int? = nil,
+        expectedBundleID: String? = nil,
+        excludedPIDs: Set<Int> = []
+    ) -> (ActionResult?, ErrorInfo?) {
+        let app: NSRunningApplication?
+        if let expectedPID, expectedPID > 0 {
+            if !excludedPIDs.contains(expectedPID),
+               let processID = pid_t(exactly: expectedPID),
+               let exact = NSRunningApplication(processIdentifier: processID),
+               !exact.isTerminated,
+               expectedBundleID == nil ||
+                    exact.bundleIdentifier == expectedBundleID {
+                app = exact
+            } else {
+                app = nil
+            }
+        } else {
+            app = resolveRunningApplication(
+                appName: appName,
+                excluding: excludedPIDs)
+        }
+        guard let app else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "App '\(appName)' exact target is not available"))
         }
 
         guard activateAndExposeWindow(app, timeout: 2) else {

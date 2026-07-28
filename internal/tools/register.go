@@ -104,13 +104,14 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	axClient := SharedAXClient()
 	reg.Register(&AccessibilityTool{client: axClient})
 	reg.Register(&ComputerUseTool{
-		client:                        axClient,
-		coordinateExecutor:            axClient.CoordinateMouseEventV1,
-		coordinateDragExecutor:        axClient.CoordinateDragV1,
-		coordinatePixelScrollExecutor: axClient.CoordinatePixelScrollV1,
-		semanticTextSelectionExecutor: axClient.SemanticTextSelectionV2,
-		semanticPressExecutor:         axClient.SemanticPressV2,
-		targetBoundInputExecutor:      axClient.TargetBoundInputV1,
+		client:                          axClient,
+		coordinateExecutor:              axClient.CoordinateMouseEventV1,
+		coordinateDragExecutor:          axClient.CoordinateDragV1,
+		coordinatePixelScrollExecutor:   axClient.CoordinatePixelScrollV1,
+		semanticTextSelectionExecutor:   axClient.SemanticTextSelectionV2,
+		semanticPressExecutor:           axClient.SemanticPressV2,
+		targetBoundInputExecutor:        axClient.TargetBoundInputV1,
+		backgroundTargetedInputExecutor: axClient.BackgroundTargetedInputV1,
 	})
 	reg.Register(&GhosttyTool{tabs: newTabRegistry()})
 
@@ -201,8 +202,11 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 			toolCopy.snapshot = nil
 			toolCopy.refs = nil
 			toolCopy.coordinateArtifact = nil
+			toolCopy.semanticImageArtifact = nil
 			toolCopy.coordinateFocus = nil
 			toolCopy.navigationCommit = nil
+			toolCopy.backgroundInputAuthority = nil
+			toolCopy.foregroundFallbackRestorePending = false
 			cloned.Register(wrapGUIExecutionGate(&toolCopy))
 		}
 	}

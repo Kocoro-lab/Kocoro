@@ -83,7 +83,8 @@ func emptyParams() -> Params {
         x: nil, y: nil, button: nil, clicks: nil,
         key: nil, modifiers: nil, dx: nil, dy: nil,
         windowTitle: nil, verify: nil, condition: nil,
-        timeout: nil, interval: nil, roles: nil, maxLabels: nil)
+        timeout: nil, interval: nil, roles: nil, maxLabels: nil,
+        excludedPIDs: nil)
 }
 
 /// Routes the coordinate mutation through its method-specific exact-key
@@ -104,6 +105,8 @@ func dispatchWireRequest(
         productionSemanticPressDependenciesV2,
     semanticScrollDependenciesV1: SemanticScrollDependenciesV1? = nil,
     targetBoundInputDependencies: TargetBoundInputDependencies? = nil,
+    backgroundTargetedInputDependencies:
+        BackgroundTargetedInputDependenciesV1? = nil,
     coordinateDisplayDependencies: CaptureCoordinateDisplayDependencies =
         productionCaptureCoordinateDisplayDependencies
 ) -> Response {
@@ -253,6 +256,30 @@ func dispatchWireRequest(
                 request: request.params,
                 dependencies: targetBoundInputDependencies ??
                     productionTargetBoundInputDependenciesV1(isCancelled: {
+                        FileManager.default.fileExists(atPath: cancellationURL.path)
+                    }))
+            return Response(id: request.id, result: AnyCodable(result))
+        } catch {
+            return Response(
+                id: header.id,
+                result: AnyCodable(TargetBoundInputResultV1(
+                    status: "failed", action: "unknown",
+                    inputCommitted: false, clipboardTouched: false,
+                    clipboardRestored: false, phase: "preflight",
+                    failureCode: "invalid_request")))
+        }
+    }
+    if header.method == "background_targeted_input" {
+        do {
+            let request = try decodeBackgroundTargetedInputRPCRequestV1(data)
+            let cancellationURL = targetBoundInputCancellationMarkerURLV1(
+                requestID: request.id,
+                request: request.params.input)
+            defer { try? FileManager.default.removeItem(at: cancellationURL) }
+            let result = runBackgroundTargetedInputV1(
+                request: request.params,
+                dependencies: backgroundTargetedInputDependencies ??
+                    productionBackgroundTargetedInputDependenciesV1(isCancelled: {
                         FileManager.default.fileExists(atPath: cancellationURL.path)
                     }))
             return Response(id: request.id, result: AnyCodable(result))
@@ -423,7 +450,39 @@ func dispatch(
         guard let appName = params.appName else {
             return Response(id: id, error: ErrorInfo(code: -1, message: "resolve_app_identity requires 'app_name'"))
         }
-        let (result, err) = FocusManager.resolveAppIdentity(appName: appName)
+        let (result, err) = FocusManager.resolveAppIdentity(
+            appName: appName,
+            excludedPIDs: Set(params.excludedPIDs ?? []))
+        if let err = err { return Response(id: id, error: err) }
+        return Response(id: id, result: AnyCodable(result!))
+
+    case "prepare_task_app":
+        guard let appName = params.appName,
+              let bundleID = params.bundleID else {
+            return Response(id: id, error: ErrorInfo(
+                code: -1,
+                message: "prepare_task_app requires 'app_name' and 'bundle_id'"))
+        }
+        let (result, err) = FocusManager.prepareTaskApp(
+            appName: appName,
+            expectedBundleID: bundleID,
+            expectedPID: params.pid,
+            excludedPIDs: Set(params.excludedPIDs ?? []))
+        if let err = err { return Response(id: id, error: err) }
+        return Response(id: id, result: AnyCodable(result!))
+
+    case "bind_background_task_app":
+        guard let appName = params.appName,
+              let bundleID = params.bundleID else {
+            return Response(id: id, error: ErrorInfo(
+                code: -1,
+                message: "bind_background_task_app requires 'app_name' and 'bundle_id'"))
+        }
+        let (result, err) = FocusManager.bindBackgroundTaskApp(
+            appName: appName,
+            expectedBundleID: bundleID,
+            expectedPID: params.pid,
+            excludedPIDs: Set(params.excludedPIDs ?? []))
         if let err = err { return Response(id: id, error: err) }
         return Response(id: id, result: AnyCodable(result!))
 
@@ -476,7 +535,10 @@ func dispatch(
         let (result, err) = FocusManager.focusApp(
             appName: appName,
             windowTitle: params.windowTitle,
-            verify: params.verify ?? false
+            verify: params.verify ?? false,
+            expectedPID: params.pid,
+            expectedBundleID: params.bundleID,
+            excludedPIDs: Set(params.excludedPIDs ?? [])
         )
         if let err = err { return Response(id: id, error: err) }
         return Response(id: id, result: AnyCodable(result!))

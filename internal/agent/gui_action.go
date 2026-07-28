@@ -22,12 +22,14 @@ const (
 // scripts, typed text, key content, AX values, and screenshots must never be
 // copied into this structure because it is projected into Desktop activity.
 type GUIActionDescriptor struct {
-	Participates   bool
-	ActionKind     string
-	Effect         GUIActionEffect
-	TargetBundleID string
-	TargetAppName  string
-	ExecutionPath  string
+	Participates       bool
+	ActionKind         string
+	Effect             GUIActionEffect
+	TargetBundleID     string
+	TargetAppName      string
+	ExecutionPath      string
+	ExecutionLane      string
+	ForegroundFallback bool
 }
 
 // GUIActionResult is a redacted executor-authored result. It is carried only

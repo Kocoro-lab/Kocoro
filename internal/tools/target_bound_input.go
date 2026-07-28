@@ -64,28 +64,30 @@ type TargetBoundInputResultV1 struct {
 	Postcondition     *string `json:"postcondition"`
 }
 
+var targetBoundInputParamsWireShapeV1 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
+	"schema_version":            coordinateScalarWireShape(false),
+	"pid":                       coordinateScalarWireShape(false),
+	"bundle_id":                 coordinateScalarWireShape(false),
+	"window_id":                 coordinateScalarWireShape(false),
+	"expected_window_ax_bounds": coordinateQuartzRectWireShapeV1,
+	"action":                    coordinateScalarWireShape(false),
+	"ref":                       coordinateScalarWireShape(true),
+	"path":                      coordinateScalarWireShape(true),
+	"expected_role":             coordinateScalarWireShape(true),
+	"expected_fingerprint":      coordinateScalarWireShape(true),
+	"text":                      coordinateScalarWireShape(true),
+	"key":                       coordinateScalarWireShape(true),
+	"keys": coordinateNullableWireShape(
+		coordinateArrayWireShape(coordinateScalarWireShape(false))),
+	"modifiers": coordinateNullableWireShape(
+		coordinateArrayWireShape(coordinateScalarWireShape(false))),
+	"commit_deadline_at": coordinateScalarWireShape(false),
+})
+
 var targetBoundInputRequestWireShapeV1 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
 	"id":     coordinateScalarWireShape(false),
 	"method": coordinateScalarWireShape(false),
-	"params": coordinateObjectWireShape(false, map[string]coordinateWireShape{
-		"schema_version":            coordinateScalarWireShape(false),
-		"pid":                       coordinateScalarWireShape(false),
-		"bundle_id":                 coordinateScalarWireShape(false),
-		"window_id":                 coordinateScalarWireShape(false),
-		"expected_window_ax_bounds": coordinateQuartzRectWireShapeV1,
-		"action":                    coordinateScalarWireShape(false),
-		"ref":                       coordinateScalarWireShape(true),
-		"path":                      coordinateScalarWireShape(true),
-		"expected_role":             coordinateScalarWireShape(true),
-		"expected_fingerprint":      coordinateScalarWireShape(true),
-		"text":                      coordinateScalarWireShape(true),
-		"key":                       coordinateScalarWireShape(true),
-		"keys": coordinateNullableWireShape(
-			coordinateArrayWireShape(coordinateScalarWireShape(false))),
-		"modifiers": coordinateNullableWireShape(
-			coordinateArrayWireShape(coordinateScalarWireShape(false))),
-		"commit_deadline_at": coordinateScalarWireShape(false),
-	}),
+	"params": targetBoundInputParamsWireShapeV1,
 })
 
 var targetBoundInputResultWireShapeV1 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
@@ -119,6 +121,7 @@ func (request TargetBoundInputRequestV1) Validate() error {
 	case "type":
 		elementBound := request.Ref != nil && validComputerUseRef(*request.Ref) &&
 			request.Path != nil &&
+			strictTargetBoundIdentity(*request.Path) &&
 			(*request.Path == "window[0]" || strings.HasPrefix(*request.Path, "window[0]/")) &&
 			request.ExpectedRole != nil && strictTargetBoundIdentity(*request.ExpectedRole) &&
 			request.ExpectedFingerprint != nil &&
@@ -283,17 +286,18 @@ func (result TargetBoundInputResultV1) ValidateTaggedUnion() error {
 	}
 	if result.Status == "completed_unverified" {
 		allowed := map[string]bool{
-			"postcondition_not_declared":             true,
-			"clipboard_restore_failed_after_commit":  true,
-			"verification_redacted_sensitive_target": true,
-			"target_value_readback_unavailable":      true,
-			"target_value_noop_unverifiable":         true,
-			"target_value_mismatch":                  true,
-			"target_changed_during_verification":     true,
-			"interference_detection_unavailable":     true,
-			"cancelled_after_partial_input":          true,
-			"event_post_failed":                      true,
-			"modifier_release_unconfirmed":           true,
+			"postcondition_not_declared":               true,
+			"clipboard_restore_failed_after_commit":    true,
+			"verification_redacted_sensitive_target":   true,
+			"target_value_readback_unavailable":        true,
+			"target_value_noop_unverifiable":           true,
+			"target_value_mismatch":                    true,
+			"target_changed_during_verification":       true,
+			"interference_detection_unavailable":       true,
+			"cancelled_after_partial_input":            true,
+			"event_post_failed":                        true,
+			"modifier_release_unconfirmed":             true,
+			"preserved_frontmost_changed_after_commit": true,
 		}
 		if result.FailureCode == nil {
 			return fmt.Errorf("incoherent completed_unverified target_bound_input result")
@@ -389,6 +393,22 @@ func (client *AXClient) targetBoundInputV1(
 	ctx context.Context,
 	request TargetBoundInputRequestV1,
 ) (TargetBoundInputResultV1, error) {
+	return client.targetBoundInputRPCV1(
+		ctx,
+		request,
+		func(id int64) ([]byte, error) {
+			return EncodeTargetBoundInputRPCRequestV1(TargetBoundInputRPCRequestV1{
+				ID: id, Method: "target_bound_input", Params: request,
+			})
+		},
+	)
+}
+
+func (client *AXClient) targetBoundInputRPCV1(
+	ctx context.Context,
+	request TargetBoundInputRequestV1,
+	encode func(int64) ([]byte, error),
+) (TargetBoundInputResultV1, error) {
 	if err := ctx.Err(); err != nil {
 		return TargetBoundInputResultV1{}, err
 	}
@@ -403,9 +423,7 @@ func (client *AXClient) targetBoundInputV1(
 	cancellationMarker := targetBoundInputCancellationMarkerPathV1(request, id)
 	_ = os.Remove(cancellationMarker)
 	defer os.Remove(cancellationMarker)
-	payload, err := EncodeTargetBoundInputRPCRequestV1(TargetBoundInputRPCRequestV1{
-		ID: id, Method: "target_bound_input", Params: request,
-	})
+	payload, err := encode(id)
 	if err != nil {
 		return TargetBoundInputResultV1{}, err
 	}

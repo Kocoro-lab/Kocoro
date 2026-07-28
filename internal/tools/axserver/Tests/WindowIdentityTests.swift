@@ -93,4 +93,46 @@ final class WindowIdentityTests: XCTestCase {
 
         XCTAssertEqual(matchWindowIdentity(observation, candidates: candidates), .ambiguous)
     }
+
+    func testFocusedFrontmostWindowUsesCGZOrderToResolveVisibleTwins() {
+        let observation = WindowIdentityObservation(
+            pid: 42,
+            title: "Document",
+            frame: AXFrame(x: 100, y: 200, width: 800, height: 600))
+        let candidates = [
+            CGWindowIdentityCandidate(
+                windowID: 7000,
+                ownerPID: 42,
+                layer: 0,
+                title: "Document",
+                frame: observation.frame,
+                isOnScreen: false,
+                alpha: 0),
+            CGWindowIdentityCandidate(
+                windowID: 7002,
+                ownerPID: 42,
+                layer: 0,
+                title: "Document",
+                frame: observation.frame),
+            CGWindowIdentityCandidate(
+                windowID: 7001,
+                ownerPID: 42,
+                layer: 0,
+                title: "Document",
+                frame: observation.frame),
+        ]
+
+        XCTAssertEqual(
+            matchFocusedWindowIdentity(
+                observation,
+                candidates: candidates,
+                targetProcessIsFrontmost: true),
+            .unique(7002))
+        XCTAssertEqual(
+            matchFocusedWindowIdentity(
+                observation,
+                candidates: candidates,
+                targetProcessIsFrontmost: false),
+            .ambiguous)
+    }
 }

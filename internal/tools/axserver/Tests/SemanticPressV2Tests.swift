@@ -38,6 +38,43 @@ final class SemanticPressV2Tests: XCTestCase {
         XCTAssertEqual(pressCount, 0)
     }
 
+    func testBackgroundPolicyIgnoresUnrelatedPhysicalInput() throws {
+        let changed = snapshot(hidCounter: 9, heldModifierFlags: 1)
+        let result = runSemanticPressV2(
+            request: makeRequest(interferencePolicy: "target_foreground"),
+            dependencies: makeDependencies(
+                snapshots: [changed],
+                frontmostPIDs: [11, 11, 11, 11, 11]))
+        XCTAssertEqual(result.status, "completed_unverified")
+        XCTAssertEqual(result.commitState, "committed")
+        XCTAssertEqual(result.failureCode, "postcondition_not_declared")
+    }
+
+    func testBackgroundPolicyStopsBeforePressWhenTargetBecomesFrontmost() throws {
+        var pressCount = 0
+        let result = runSemanticPressV2(
+            request: makeRequest(interferencePolicy: "target_foreground"),
+            dependencies: makeDependencies(
+                target: makeTarget(performPress: { _ in
+                    pressCount += 1
+                    return .completed(error: .success, timeoutRestored: true)
+                }),
+                frontmostPIDs: [42]))
+        XCTAssertEqual(result.status, "failed")
+        XCTAssertEqual(result.commitState, "not_committed")
+        XCTAssertEqual(result.failureCode, "target_became_frontmost")
+        XCTAssertEqual(pressCount, 0)
+    }
+
+    func testBackgroundPolicyReportsForegroundRaceAfterCommit() throws {
+        let result = runSemanticPressV2(
+            request: makeRequest(interferencePolicy: "target_foreground"),
+            dependencies: makeDependencies(frontmostPIDs: [11, 42]))
+        XCTAssertEqual(result.status, "user_interference")
+        XCTAssertEqual(result.commitState, "committed")
+        XCTAssertEqual(result.failureCode, "target_foreground_interference")
+    }
+
     func testPhysicalInputInsideSynchronousAXPressIsDetectedAfterReturn() throws {
         let clean = snapshot()
         let changed = snapshot(hidCounter: 1)
@@ -244,7 +281,9 @@ final class SemanticPressV2Tests: XCTestCase {
     }
 
     private func makeRequest(
-        deadline: Date? = nil, riskWindowTitle: String? = nil
+        deadline: Date? = nil,
+        riskWindowTitle: String? = nil,
+        interferencePolicy: String = "global_physical"
     ) -> SemanticPressRequestV2 {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -252,6 +291,7 @@ final class SemanticPressV2Tests: XCTestCase {
             pid: 42, bundleID: "com.apple.Notes", windowID: 7001,
             ref: "e1", path: "window[0]/AXButton[0]", expectedRole: "AXButton",
             expectedFingerprint: "axf_target",
+            interferencePolicy: interferencePolicy,
             commitDeadlineAt: formatter.string(
                 from: deadline ?? now.addingTimeInterval(1)),
             riskDestinationAssertion: riskWindowTitle.map {
@@ -287,11 +327,13 @@ final class SemanticPressV2Tests: XCTestCase {
         nowProvider: (() -> Date)? = nil,
         target: SemanticPressTargetV2? = nil,
         fingerprintCount: Int = 1,
-        snapshots: [PhysicalInputInterferenceSnapshotV1?]? = nil
+        snapshots: [PhysicalInputInterferenceSnapshotV1?]? = nil,
+        frontmostPIDs: [Int?]? = nil
     ) -> SemanticPressDependenciesV2 {
         var remaining = snapshots ?? [
             snapshot(), snapshot(), snapshot(), snapshot(), snapshot(),
         ]
+        var remainingFrontmost = frontmostPIDs ?? [11, 11, 11, 11, 11]
         let exactTarget = target ?? makeTarget()
         return .init(
             isPIDLive: { _ in pidLive },
@@ -301,6 +343,9 @@ final class SemanticPressV2Tests: XCTestCase {
             countFingerprint: { _, _, _ in fingerprintCount },
             windowTitle: { _, _, timeout in
                 windowTitleObservation?(timeout) ?? .value(windowTitle)
+            },
+            frontmostPID: {
+                remainingFrontmost.isEmpty ? nil : remainingFrontmost.removeFirst()
             },
             observePhysicalInput: {
                 remaining.isEmpty ? nil : remaining.removeFirst()

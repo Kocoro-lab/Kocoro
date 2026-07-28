@@ -52,6 +52,14 @@ const (
 	ComputerUseExecutionSyntheticCoordinate = guicontrol.ComputerUseExecutionSyntheticCoordinate
 )
 
+type ComputerUseExecutionLane = guicontrol.ComputerUseExecutionLane
+
+const (
+	ComputerUseExecutionForeground         = guicontrol.ComputerUseExecutionForeground
+	ComputerUseExecutionBackgroundSemantic = guicontrol.ComputerUseExecutionBackgroundSemantic
+	ComputerUseExecutionBackgroundKeyboard = guicontrol.ComputerUseExecutionBackgroundKeyboard
+)
+
 type ComputerUseCoordinateSpace = guicontrol.ComputerUseCoordinateSpace
 
 const ComputerUseCoordinateQuartzGlobalPoints = guicontrol.ComputerUseCoordinateQuartzGlobalPoints

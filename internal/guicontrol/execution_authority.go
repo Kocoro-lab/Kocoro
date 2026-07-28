@@ -13,18 +13,20 @@ import (
 // context key remain private so strings, environment variables, and a
 // zero-value ActionHandle cannot manufacture permission to execute GUI input.
 type executionAuthority struct {
-	seal             *executionAuthoritySeal
-	leaseID          string
-	actionID         string
-	toolName         string
-	toolUseID        string
-	actionKind       string
-	effect           string
-	targetBundleID   string
-	executionPath    string
-	riskIntentID     string
-	riskTargetDigest string
-	active           atomic.Bool
+	seal               *executionAuthoritySeal
+	leaseID            string
+	actionID           string
+	toolName           string
+	toolUseID          string
+	actionKind         string
+	effect             string
+	targetBundleID     string
+	executionPath      string
+	executionLane      string
+	foregroundFallback bool
+	riskIntentID       string
+	riskTargetDigest   string
+	active             atomic.Bool
 }
 
 type executionAuthoritySeal struct{}
@@ -40,12 +42,14 @@ type executionAuthorityContextKey struct{}
 // admitted action. It intentionally excludes arguments, typed text, scripts,
 // and AX values.
 type ExecutionScope struct {
-	ToolName       string
-	ToolUseID      string
-	ActionKind     string
-	Effect         string
-	TargetBundleID string
-	ExecutionPath  string
+	ToolName           string
+	ToolUseID          string
+	ActionKind         string
+	Effect             string
+	TargetBundleID     string
+	ExecutionPath      string
+	ExecutionLane      string
+	ForegroundFallback bool
 	// Consequential-risk authority is deliberately process-local. Both fields
 	// must be present together and are never activity/event payload fields.
 	RiskIntentID     string
@@ -57,18 +61,24 @@ func newExecutionAuthority(request ActionRequest, actionID string) *executionAut
 	if request.ExecutionPath != nil {
 		executionPath = string(*request.ExecutionPath)
 	}
+	executionLane := ""
+	if request.ExecutionLane != nil {
+		executionLane = string(*request.ExecutionLane)
+	}
 	authority := &executionAuthority{
-		seal:             &executionAuthoritySeal{},
-		leaseID:          request.LeaseID,
-		actionID:         actionID,
-		toolName:         request.ToolName,
-		toolUseID:        request.ToolUseID,
-		actionKind:       request.ActionKind,
-		effect:           string(request.Effect),
-		targetBundleID:   request.TargetBundleID,
-		executionPath:    executionPath,
-		riskIntentID:     request.RiskIntentID,
-		riskTargetDigest: request.RiskTargetDigest,
+		seal:               &executionAuthoritySeal{},
+		leaseID:            request.LeaseID,
+		actionID:           actionID,
+		toolName:           request.ToolName,
+		toolUseID:          request.ToolUseID,
+		actionKind:         request.ActionKind,
+		effect:             string(request.Effect),
+		targetBundleID:     request.TargetBundleID,
+		executionPath:      executionPath,
+		executionLane:      executionLane,
+		foregroundFallback: request.ForegroundFallback,
+		riskIntentID:       request.RiskIntentID,
+		riskTargetDigest:   request.RiskTargetDigest,
 	}
 	authority.active.Store(true)
 	return authority
@@ -83,6 +93,9 @@ func (h ActionHandle) AuthorizeExecution(scope ExecutionScope) context.Context {
 	ctx := h.Context
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if scope.ExecutionLane == "" {
+		scope.ExecutionLane = string(ComputerUseExecutionForeground)
 	}
 	authority := h.executionAuthority
 	if authority == nil || authority.seal == nil || !validExecutionScope(scope) ||
@@ -104,6 +117,9 @@ func ExecutionAuthorized(ctx context.Context, scope ExecutionScope) bool {
 	// explicitly on Stop / Take Over / expiry, but each of those also cancels the
 	// action context, so honoring cancellation here keeps the gate closed even if
 	// a future cancellation path forgets to revoke.
+	if scope.ExecutionLane == "" {
+		scope.ExecutionLane = string(ComputerUseExecutionForeground)
+	}
 	if ctx == nil || ctx.Err() != nil || !validExecutionScope(scope) {
 		return false
 	}
@@ -130,7 +146,10 @@ func ExecutionAuthorityPresent(ctx context.Context) bool {
 }
 
 func validExecutionScope(scope ExecutionScope) bool {
+	lane := ComputerUseExecutionLane(scope.ExecutionLane)
 	return scope.ToolName != "" && scope.ToolUseID != "" && scope.ActionKind != "" && scope.Effect != "" &&
+		ValidComputerUseExecutionLane(lane) &&
+		(!scope.ForegroundFallback || lane == ComputerUseExecutionForeground) &&
 		validConsequentialRiskExecutionScope(
 			scope.ToolName, scope.ActionKind, scope.Effect, scope.TargetBundleID,
 			scope.ExecutionPath, scope.RiskIntentID, scope.RiskTargetDigest)
@@ -139,7 +158,10 @@ func validExecutionScope(scope ExecutionScope) bool {
 func (a *executionAuthority) matches(scope ExecutionScope) bool {
 	return a != nil && a.toolName == scope.ToolName && a.toolUseID == scope.ToolUseID && a.actionKind == scope.ActionKind &&
 		a.effect == scope.Effect && a.targetBundleID == scope.TargetBundleID &&
-		a.executionPath == scope.ExecutionPath && a.riskIntentID == scope.RiskIntentID &&
+		a.executionPath == scope.ExecutionPath &&
+		a.executionLane == scope.ExecutionLane &&
+		a.foregroundFallback == scope.ForegroundFallback &&
+		a.riskIntentID == scope.RiskIntentID &&
 		a.riskTargetDigest == scope.RiskTargetDigest
 }
 
@@ -148,6 +170,13 @@ func executionPathString(path *ComputerUseExecutionPath) string {
 		return ""
 	}
 	return string(*path)
+}
+
+func executionLaneString(lane *ComputerUseExecutionLane) string {
+	if lane == nil {
+		return ""
+	}
+	return string(*lane)
 }
 
 // validConsequentialRiskExecutionScope keeps consequential grants on the two

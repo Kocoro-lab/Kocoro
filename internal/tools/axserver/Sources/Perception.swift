@@ -143,7 +143,7 @@ func annotateElements(pid: Int, roles: [String]?, maxLabels: Int) -> AnnotateRes
     let windowFrame = elementFrame(win).map {
         AXFrame(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
     }
-    let windowID = uniqueWindowID(pid: pid, title: winTitle, frame: windowFrame)
+    let windowID = focusedWindowID(pid: pid, title: winTitle, frame: windowFrame)
     let roleFilter: Set<String>? = roles.flatMap { roles in
         roles.isEmpty ? nil : Set(roles)
     }
@@ -265,7 +265,7 @@ func readTree(pid: Int, budget: Int, filter: String) -> ReadTreeResult? {
         bundleID: bundleID,
         pid: pid,
         windowTitle: winTitle,
-        windowID: uniqueWindowID(pid: pid, title: winTitle, frame: windowFrame),
+        windowID: focusedWindowID(pid: pid, title: winTitle, frame: windowFrame),
         windowFrame: windowFrame,
         focusedRef: focusedRef,
         elements: elements,

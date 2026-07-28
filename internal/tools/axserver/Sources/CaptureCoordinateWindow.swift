@@ -647,28 +647,60 @@ func runCoordinateWindowScreencapture(
     timeout: TimeInterval,
     rawByteCap: Int
 ) throws -> Data {
-    try withCoordinateWindowTemporaryFile { outputURL in
+    refreshAppKitState()
+    let exactWindow = try productionExactCoordinateWindow(windowID)
+    let foregroundCompositeBounds: DisplayTopologyRectV1?
+    if let exactWindow,
+       NSWorkspace.shared.frontmostApplication?.processIdentifier ==
+       pid_t(exactWindow.ownerPID) {
+        foregroundCompositeBounds = exactWindow.bounds
+    } else {
+        foregroundCompositeBounds = nil
+    }
+    return try withCoordinateWindowTemporaryFile { outputURL in
         try runCoordinateWindowCaptureProcess(
             executableURL: URL(fileURLWithPath: "/usr/sbin/screencapture"),
             arguments: coordinateWindowScreencaptureArguments(
                 windowID: windowID,
+                foregroundCompositeBounds: foregroundCompositeBounds,
                 outputURL: outputURL),
             timeout: timeout)
+        if foregroundCompositeBounds != nil, let exactWindow {
+            refreshAppKitState()
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier ==
+                    pid_t(exactWindow.ownerPID) else {
+                throw CaptureCoordinateWindowLiveError.failed
+            }
+        }
         return try readCoordinateWindowCaptureFile(outputURL, rawByteCap: rawByteCap)
     }
 }
 
-/// The strict coordinate frame is the selected CGWindow's own bounds. Without
-/// `-a`, screencapture expands the PNG to the union of that window and any
-/// attached sheet/popover, while CGWindowList still reports only the selected
-/// window's bounds. That produces a real, persistent dimensions mismatch and
-/// would make image coordinates ambiguous. An attached sheet that is itself
-/// the frontmost actionable layer-0 window is selected by its own window ID.
+/// Background capture isolates the selected CGWindow so overlapping apps never
+/// enter its coordinate frame. For the frontmost process, an exact region
+/// capture preserves the same frame while also showing sheets and popovers
+/// composited by WindowServer. Non-integral bounds remain fail-closed on the
+/// isolated path rather than silently rounding the coordinate anchor.
 func coordinateWindowScreencaptureArguments(
     windowID: UInt32,
+    foregroundCompositeBounds: DisplayTopologyRectV1?,
     outputURL: URL
 ) -> [String] {
-    ["-x", "-o", "-a", "-l\(windowID)", outputURL.path]
+    if let bounds = foregroundCompositeBounds,
+       bounds.x.isFinite, bounds.y.isFinite,
+       bounds.width.isFinite, bounds.height.isFinite,
+       bounds.x.rounded() == bounds.x,
+       bounds.y.rounded() == bounds.y,
+       bounds.width.rounded() == bounds.width,
+       bounds.height.rounded() == bounds.height,
+       bounds.width > 0, bounds.height > 0,
+       let x = Int(exactly: bounds.x),
+       let y = Int(exactly: bounds.y),
+       let width = Int(exactly: bounds.width),
+       let height = Int(exactly: bounds.height) {
+        return ["-x", "-R\(x),\(y),\(width),\(height)", outputURL.path]
+    }
+    return ["-x", "-o", "-a", "-l\(windowID)", outputURL.path]
 }
 
 func withCoordinateWindowTemporaryFile<T>(

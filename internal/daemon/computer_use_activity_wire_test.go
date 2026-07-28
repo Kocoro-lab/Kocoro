@@ -28,6 +28,7 @@ func fixtureComputerUseState() ComputerUseActivityState {
 		ActionPhase:    ComputerUsePhaseVerifying,
 		ActionResult:   nil,
 		ExecutionPath:  stringPointer(ComputerUseExecutionAccessibility),
+		ExecutionLane:  stringPointer(ComputerUseExecutionForeground),
 		Pointer: &ComputerUsePointer{
 			DisplayID:          1,
 			TopologyID:         "topo_mixed_001",
@@ -118,6 +119,8 @@ func TestWireFixture_ComputerUseActivityEvent(t *testing.T) {
 		ActionPhase           string              `json:"action_phase"`
 		ActionResult          *string             `json:"action_result"`
 		ExecutionPath         *string             `json:"execution_path"`
+		ExecutionLane         *string             `json:"execution_lane"`
+		ForegroundFallback    bool                `json:"foreground_fallback"`
 		Pointer               *ComputerUsePointer `json:"pointer"`
 		FailureCode           *string             `json:"failure_code"`
 		TS                    string              `json:"ts"`
@@ -127,7 +130,9 @@ func TestWireFixture_ComputerUseActivityEvent(t *testing.T) {
 	}
 	if consumer.SchemaVersion != 1 || consumer.CoordinatorInstanceID != computerUseCoordinatorFixtureID ||
 		consumer.Revision != 41 || consumer.LeaseID == "" ||
-		consumer.ExecutionPath == nil || *consumer.ExecutionPath != "accessibility" || consumer.Pointer == nil {
+		consumer.ExecutionPath == nil || *consumer.ExecutionPath != "accessibility" ||
+		consumer.ExecutionLane == nil || *consumer.ExecutionLane != "foreground" ||
+		consumer.ForegroundFallback || consumer.Pointer == nil {
 		t.Fatalf("consumer decode lost required fields: %+v", consumer)
 	}
 }
@@ -272,6 +277,7 @@ func TestComputerUseWireEnumsRejectUnknownValues(t *testing.T) {
 		{"action phase", func(v *ComputerUseActivityState) { v.ActionPhase = "clicking" }},
 		{"action result", func(v *ComputerUseActivityState) { v.ActionResult = stringPointer(ComputerUseActionResult("ok")) }},
 		{"execution path", func(v *ComputerUseActivityState) { v.ExecutionPath = stringPointer(ComputerUseExecutionPath("visual")) }},
+		{"execution lane", func(v *ComputerUseActivityState) { v.ExecutionLane = stringPointer(ComputerUseExecutionLane("hidden")) }},
 		{"coordinate space", func(v *ComputerUseActivityState) { v.Pointer.CoordinateSpace = "pixels" }},
 	}
 	for _, tc := range tests {
@@ -327,7 +333,8 @@ func TestComputerUseActivityJSONShapeHasNoUnexpectedFields(t *testing.T) {
 	want := []string{
 		"schema_version", "coordinator_instance_id", "revision", "lease_id", "session_id", "action_id", "tool_use_id",
 		"source_kind", "source_label", "target_bundle_id", "target_app_name", "action_kind",
-		"lease_state", "action_phase", "action_result", "execution_path", "pointer", "failure_code", "consequential_risk", "ts",
+		"lease_state", "action_phase", "action_result", "execution_path", "execution_lane",
+		"foreground_fallback", "pointer", "failure_code", "consequential_risk", "ts",
 	}
 	got := make([]string, 0, len(fields))
 	for key := range fields {

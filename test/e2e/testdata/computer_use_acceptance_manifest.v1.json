@@ -42,6 +42,42 @@
       "tags": ["warm_window", "click", "verification"]
     },
     {
+      "id": "calculator_background_semantic",
+      "enabled_by_default": false,
+      "prompt": "Using only Computer Use, control Calculator only. Keep TextEdit frontmost and click Calculator's 7, +, 8, and = buttons without bringing Calculator to the foreground. Stop when Calculator visibly shows the result.",
+      "preconditions": [
+        "Calculator is already running with exactly one visible normal window behind TextEdit.",
+        "TextEdit is frontmost.",
+        "No second automation agent controls the pointer."
+      ],
+      "expected_state": [
+        "Calculator visibly displays 15.",
+        "TextEdit remains frontmost throughout the task.",
+        "Computer Use activity identifies Calculator with execution_lane background_semantic and foreground_fallback false.",
+        "Kocoro neither moves the physical pointer nor renders its physical-pointer overlay."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["background_semantic", "exact_pid", "ax_press", "nonactivating", "interference"]
+    },
+    {
+      "id": "textedit_background_targeted_keyboard",
+      "enabled_by_default": false,
+      "prompt": "Using only Computer Use, control TextEdit only. Keep Calculator frontmost and type background test into the already-focused TextEdit document without bringing TextEdit to the foreground. Stop when the text is present.",
+      "preconditions": [
+        "TextEdit is already running with exactly one visible normal document window behind Calculator.",
+        "The TextEdit document's editable body is its internally focused AX element.",
+        "Calculator is frontmost."
+      ],
+      "expected_state": [
+        "The exact TextEdit document visibly contains background test.",
+        "Calculator remains frontmost throughout the task.",
+        "Computer Use activity identifies TextEdit with execution_lane background_keyboard and foreground_fallback false.",
+        "No clipboard content changes, physical pointer movement, or Kocoro physical-pointer overlay occurs."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["background_keyboard", "exact_pid", "focused_ax_element", "post_to_pid", "nonactivating"]
+    },
+    {
       "id": "chrome_cold_url_navigation",
       "enabled_by_default": true,
       "prompt": "Use Computer Use to open Chrome, enter waylandz.com, open the blog page, and summarize what is visible.",
@@ -74,6 +110,23 @@
       ],
       "risk": "ordinary_mutation",
       "tags": ["warm_window", "multiple_windows", "keyboard_focus", "url_navigation", "content_readback"]
+    },
+    {
+      "id": "managed_browser_instance_coexistence",
+      "enabled_by_default": false,
+      "prompt": "Use Computer Use to open my normal Chrome, enter waylandz.com, and stop after the page visibly loads.",
+      "preconditions": [
+        "The user's normal Chrome has one visible window.",
+        "Kocoro's dedicated CDP browser process is also running under the same Chrome bundle.",
+        "No other automation agent moves the pointer."
+      ],
+      "expected_state": [
+        "Computer Use selects the user's visible Chrome process rather than Kocoro's managed automation process.",
+        "App preparation, initial observation, keyboard input, and final observation retain one exact PID.",
+        "The dedicated CDP browser remains hidden and unchanged."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["multiple_instances", "managed_process", "pid_binding", "keyboard_focus"]
     },
     {
       "id": "textedit_calculator_cross_app",

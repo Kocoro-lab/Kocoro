@@ -1,22 +1,45 @@
 import CoreGraphics
 import Darwin
 import Foundation
+import AppKit
 
 /// The only information that may survive an ax_server crash. It is sufficient
 /// to synthesize a release, but deliberately cannot contain typed text,
-/// clipboard bytes, AX values, application identity, or coordinates.
+/// clipboard bytes, AX values, or coordinates. A targeted key release includes
+/// only the exact process-instance identity needed to avoid posting a stale
+/// key-up to a reused PID.
 struct InputReleaseMetadataV1: Codable, Equatable, Hashable {
     let kind: String
     let button: String?
     let virtualKey: UInt16?
     let eventFlags: UInt64?
+    let pid: Int?
+    let bundleID: String?
+    let launchDate: String?
 
     static func mouse(button: String) -> Self {
-        .init(kind: "mouse", button: button, virtualKey: nil, eventFlags: nil)
+        .init(
+            kind: "mouse", button: button, virtualKey: nil, eventFlags: nil,
+            pid: nil, bundleID: nil, launchDate: nil)
     }
 
     static func key(virtualKey: UInt16, eventFlags: UInt64) -> Self {
-        .init(kind: "key", button: nil, virtualKey: virtualKey, eventFlags: eventFlags)
+        .init(
+            kind: "key", button: nil, virtualKey: virtualKey, eventFlags: eventFlags,
+            pid: nil, bundleID: nil, launchDate: nil)
+    }
+
+    static func targetedKey(
+        virtualKey: UInt16,
+        eventFlags: UInt64,
+        pid: Int,
+        bundleID: String,
+        launchDate: String
+    ) -> Self {
+        .init(
+            kind: "targeted_key", button: nil, virtualKey: virtualKey,
+            eventFlags: eventFlags, pid: pid, bundleID: bundleID,
+            launchDate: launchDate)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -24,13 +47,27 @@ struct InputReleaseMetadataV1: Codable, Equatable, Hashable {
         case button
         case virtualKey = "virtual_key"
         case eventFlags = "event_flags"
+        case pid
+        case bundleID = "bundle_id"
+        case launchDate = "launch_date"
     }
 
-    init(kind: String, button: String?, virtualKey: UInt16?, eventFlags: UInt64?) {
+    init(
+        kind: String,
+        button: String?,
+        virtualKey: UInt16?,
+        eventFlags: UInt64?,
+        pid: Int?,
+        bundleID: String?,
+        launchDate: String?
+    ) {
         self.kind = kind
         self.button = button
         self.virtualKey = virtualKey
         self.eventFlags = eventFlags
+        self.pid = pid
+        self.bundleID = bundleID
+        self.launchDate = launchDate
     }
 
     init(from decoder: Decoder) throws {
@@ -44,6 +81,9 @@ struct InputReleaseMetadataV1: Codable, Equatable, Hashable {
             button = try container.decode(String.self, forKey: .button)
             virtualKey = nil
             eventFlags = nil
+            pid = nil
+            bundleID = nil
+            launchDate = nil
         case "key":
             guard Set(container.allKeys) == [.kind, .virtualKey, .eventFlags] else {
                 throw InputRecoveryJournalError.invalid
@@ -51,6 +91,21 @@ struct InputReleaseMetadataV1: Codable, Equatable, Hashable {
             button = nil
             virtualKey = try container.decode(UInt16.self, forKey: .virtualKey)
             eventFlags = try container.decode(UInt64.self, forKey: .eventFlags)
+            pid = nil
+            bundleID = nil
+            launchDate = nil
+        case "targeted_key":
+            guard Set(container.allKeys) == [
+                .kind, .virtualKey, .eventFlags, .pid, .bundleID, .launchDate,
+            ] else {
+                throw InputRecoveryJournalError.invalid
+            }
+            button = nil
+            virtualKey = try container.decode(UInt16.self, forKey: .virtualKey)
+            eventFlags = try container.decode(UInt64.self, forKey: .eventFlags)
+            pid = try container.decode(Int.self, forKey: .pid)
+            bundleID = try container.decode(String.self, forKey: .bundleID)
+            launchDate = try container.decode(String.self, forKey: .launchDate)
         default:
             throw InputRecoveryJournalError.invalid
         }
@@ -63,9 +118,15 @@ struct InputReleaseMetadataV1: Codable, Equatable, Hashable {
         try container.encode(kind, forKey: .kind)
         if kind == "mouse" {
             try container.encode(button!, forKey: .button)
+        } else if kind == "key" {
+            try container.encode(virtualKey!, forKey: .virtualKey)
+            try container.encode(eventFlags!, forKey: .eventFlags)
         } else {
             try container.encode(virtualKey!, forKey: .virtualKey)
             try container.encode(eventFlags!, forKey: .eventFlags)
+            try container.encode(pid!, forKey: .pid)
+            try container.encode(bundleID!, forKey: .bundleID)
+            try container.encode(launchDate!, forKey: .launchDate)
         }
     }
 
@@ -73,9 +134,16 @@ struct InputReleaseMetadataV1: Codable, Equatable, Hashable {
         switch kind {
         case "mouse":
             return ["left", "right", "center", "wheel", "back", "forward"].contains(button) &&
-                virtualKey == nil && eventFlags == nil
+                virtualKey == nil && eventFlags == nil &&
+                pid == nil && bundleID == nil && launchDate == nil
         case "key":
-            return button == nil && virtualKey != nil && eventFlags != nil
+            return button == nil && virtualKey != nil && eventFlags != nil &&
+                pid == nil && bundleID == nil && launchDate == nil
+        case "targeted_key":
+            return button == nil && virtualKey != nil && eventFlags != nil &&
+                pid.map { $0 > 0 } == true &&
+                bundleID.map(strictMutationIdentity) == true &&
+                launchDate.flatMap(strictMutationDate) != nil
         default:
             return false
         }
@@ -456,7 +524,37 @@ private func inputRecoveryTimestamp(_ date: Date) -> String {
 
 private func inputRecoveryMetadataSortKey(_ metadata: InputReleaseMetadataV1) -> String {
     if metadata.kind == "mouse" { return "mouse:\(metadata.button ?? "")" }
+    if metadata.kind == "targeted_key" {
+        return "targeted_key:\(metadata.pid ?? 0):\(metadata.virtualKey ?? 0):" +
+            "\(metadata.eventFlags ?? 0)"
+    }
     return "key:\(metadata.virtualKey ?? 0):\(metadata.eventFlags ?? 0)"
+}
+
+private enum InputReleaseTargetProcessStateV1 {
+    case sameInstance
+    case differentOrGone
+    case unverifiable
+}
+
+private func inputReleaseTargetProcessStateV1(
+    metadata: InputReleaseMetadataV1
+) -> InputReleaseTargetProcessStateV1 {
+    guard metadata.kind == "targeted_key",
+          let pid = metadata.pid,
+          let processID = pid_t(exactly: pid),
+          let expectedBundleID = metadata.bundleID,
+          let expectedLaunchDate = metadata.launchDate.flatMap(strictMutationDate)
+    else { return .unverifiable }
+    refreshAppKitState()
+    guard let application = NSRunningApplication(processIdentifier: processID),
+          !application.isTerminated else { return .differentOrGone }
+    guard application.bundleIdentifier == expectedBundleID else {
+        return .differentOrGone
+    }
+    guard let launchDate = application.launchDate else { return .unverifiable }
+    return abs(launchDate.timeIntervalSince(expectedLaunchDate)) < 0.001
+        ? .sameInstance : .differentOrGone
 }
 
 func productionInputRelease(
@@ -497,6 +595,33 @@ func productionInputRelease(
                     !CGEventSource.keyState(
                         .combinedSessionState, key: CGKeyCode(virtualKey))
                 })
+        }
+    case "targeted_key":
+        guard let virtualKey = metadata.virtualKey,
+              let flags = metadata.eventFlags,
+              let pid = metadata.pid,
+              let processID = pid_t(exactly: pid) else {
+            return nil
+        }
+        return PreparedInputReleaseV1(metadata: metadata) {
+            // If the original process instance is gone, there is no target
+            // left holding this synthetic key. Clear the durable journal
+            // without ever posting to a reused or mismatched PID.
+            switch inputReleaseTargetProcessStateV1(metadata: metadata) {
+            case .differentOrGone:
+                return true
+            case .unverifiable:
+                return false
+            case .sameInstance:
+                break
+            }
+            guard let event = CGEvent(
+                keyboardEventSource: eventSource,
+                virtualKey: CGKeyCode(virtualKey),
+                keyDown: false) else { return false }
+            event.flags = CGEventFlags(rawValue: flags)
+            event.postToPid(processID)
+            return true
         }
     default:
         return nil

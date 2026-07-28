@@ -79,6 +79,7 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 ) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
+	harness.tree.Elements[0].Frame = harness.tree.WindowFrame
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
 	harness.fake.queue(
 		"display_topology",
@@ -111,6 +112,7 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 			Height:      height,
 		},
 	)))
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
 
 	result, err := harness.tool.Run(context.Background(), `{
 		"action":"get_app_state","include_screenshot":true,
@@ -122,8 +124,12 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 	if harness.tool.coordinateArtifact != nil {
 		t.Fatal("visual-only screenshot minted coordinate authority")
 	}
+	if harness.tool.semanticImageArtifact == nil {
+		t.Fatal("exact off-display window did not retain semantic image authority")
+	}
 	if result.GUIObservation == nil ||
-		result.GUIObservation.CoordinateActionable {
+		result.GUIObservation.CoordinateActionable ||
+		!result.GUIObservation.SemanticActionable {
 		t.Fatalf("visual-only observation metadata = %+v", result.GUIObservation)
 	}
 	if !strings.Contains(result.Content, "visual-only") {
@@ -131,7 +137,7 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 	}
 	wantMethods := []string{
 		"read_tree", "display_topology", "capture_coordinate_window",
-		"capture_window",
+		"capture_window", "read_tree",
 	}
 	if got := fakeAXMethods(harness.fake.calls); !reflect.DeepEqual(got, wantMethods) {
 		t.Fatalf("visual-only AX sequence=%v, want %v", got, wantMethods)
@@ -143,16 +149,116 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 	if err != nil {
 		t.Fatal(err)
 	}
-	x, y := 10, 20
+	x, y := 10, 5
 	if _, err := runtime.PlanOpenAIComputerActionV1(
 		context.Background(),
 		OpenAIComputerActionV1{
-			Type: OpenAIComputerActionClickV1,
-			X:    &x,
-			Y:    &y,
+			Type:   OpenAIComputerActionClickV1,
+			Button: "left",
+			X:      &x,
+			Y:      &y,
 		},
 	); err == nil || !strings.Contains(err.Error(), "coordinate authority") {
 		t.Fatalf("visual-only screenshot authorized a coordinate click: %v", err)
+	}
+
+	runtime.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	runtime.backgroundTarget = &OpenAIComputerTaskAppV1{
+		App:      harness.tree.App,
+		BundleID: harness.tree.BundleID,
+		PID:      harness.tree.PID,
+	}
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type:   OpenAIComputerActionClickV1,
+			Button: "left",
+			X:      &x,
+			Y:      &y,
+		},
+	)
+	if err != nil {
+		t.Fatalf("background semantic projection: %v", err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "press" || args.Ref != harness.tree.Elements[0].Ref ||
+		args.ExecutionLane != "background_semantic" ||
+		args.ForegroundFallback {
+		t.Fatalf("background visual-only semantic plan = %+v", args)
+	}
+}
+
+func TestComputerUseImageDimensionFallbackNeverMintsSemanticAuthority(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.fake.queue(
+		"display_topology",
+		marshalDisplayTopology(t, harness.topology),
+	)
+	failure := captureWindowJSONMap(
+		t,
+		loadCoordinateFixture(
+			t,
+			"capture_coordinate_window.response.failure.v1.json",
+		),
+	)
+	failure["failure_code"] = "image_dimensions_mismatch"
+	failure["retry_safe"] = true
+	failure["failure_diagnostics"] = map[string]any{
+		"stage":                     "non_integral_expected_dimensions",
+		"pid":                       harness.tree.PID,
+		"bundle_id":                 harness.tree.BundleID,
+		"window_id":                 *harness.tree.WindowID,
+		"pre_window_quartz_bounds":  harness.fixture.input.CaptureRequest.ExpectedQuartzBounds,
+		"post_window_quartz_bounds": harness.fixture.input.CaptureRequest.ExpectedQuartzBounds,
+		"display_id":                harness.topology.Displays[0].DisplayID,
+		"backing_scale_factor":      2.0,
+		"expected_width_px":         16.5,
+		"expected_height_px":        12.5,
+		"metadata_width_px":         nil,
+		"metadata_height_px":        nil,
+		"decoded_width_px":          nil,
+		"decoded_height_px":         nil,
+	}
+	harness.fake.queue(
+		"capture_coordinate_window",
+		string(marshalCaptureWindowJSON(t, failure)),
+	)
+	image := harness.artifact.ImageBlock()
+	width, height, err := imageBlockDimensions(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.fake.queue("capture_window", string(marshalCaptureWindowJSON(
+		t,
+		exactAccessibilityWindowResult{
+			OK:          true,
+			ImageBase64: image.Data,
+			Width:       width,
+			Height:      height,
+		},
+	)))
+
+	result, err := harness.tool.Run(context.Background(), `{
+		"action":"get_app_state","include_screenshot":true,
+		"description":"Keep an untrusted-dimension screenshot visual-only"
+	}`)
+	if err != nil || result.IsError || len(result.Images) != 1 {
+		t.Fatalf("dimension fallback result=%+v err=%v", result, err)
+	}
+	if harness.tool.coordinateArtifact != nil ||
+		harness.tool.semanticImageArtifact != nil ||
+		result.GUIObservation == nil ||
+		result.GUIObservation.CoordinateActionable ||
+		result.GUIObservation.SemanticActionable {
+		t.Fatalf("dimension mismatch minted action authority: tool=%+v observation=%+v",
+			harness.tool.semanticImageArtifact, result.GUIObservation)
 	}
 }
 
@@ -539,7 +645,6 @@ func TestComputerUseLocationShortcutTypeFallsBackToOneShotSameWindowWitness(
 		expectedWindowAXBounds: *frame,
 		filter:                 harness.tool.snapshot.filter,
 		budget:                 harness.tool.snapshot.budget,
-		allowsWindowBoundType:  true,
 	}
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
 	var executed *TargetBoundInputRequestV1
@@ -572,7 +677,9 @@ func TestComputerUseLocationShortcutTypeFallsBackToOneShotSameWindowWitness(
 	}
 }
 
-func TestComputerUseCoordinateClickTypeRequiresEditableFocusWitness(t *testing.T) {
+func TestComputerUseCoordinateClickTypeFallsBackToVerifiedSameWindowWitness(
+	t *testing.T,
+) {
 	requireComputerUseDarwin(t)
 	harness := newComputerUseCoordinateHarness(t)
 	harness.observe(t)
@@ -587,35 +694,44 @@ func TestComputerUseCoordinateClickTypeRequiresEditableFocusWitness(t *testing.T
 		budget:                 harness.tool.snapshot.budget,
 	}
 	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
-	executed := false
+
+	var executed *TargetBoundInputRequestV1
 	harness.tool.targetBoundInputExecutor = func(
 		_ context.Context,
 		request TargetBoundInputRequestV1,
 	) (TargetBoundInputResultV1, error) {
-		executed = true
-		return TargetBoundInputResultV1{}, nil
+		executed = &request
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified", Action: "type",
+			InputCommitted: true, ClipboardTouched: true, ClipboardRestored: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
 	}
 	result, err := harness.tool.Run(
 		ContextWithOpenAINativeComputerActionV1(context.Background()),
 		fmt.Sprintf(`{
-			"action":"type","state_id":%q,"text":"must not type",
-			"description":"Require fresh editable focus"
+			"action":"type","state_id":%q,"text":"same-window input",
+			"description":"Use the verified click focus handoff"
 		}`, harness.tool.snapshot.id),
 	)
-	if err != nil || !result.IsError || executed ||
-		result.GUIOutcome == nil ||
-		result.GUIOutcome.FailureCode !=
-			"keyboard_focused_element_unavailable" ||
-		!strings.Contains(
-			result.Content,
-			"gate: keyboard_focused_element_unavailable",
-		) {
+	if err != nil || result.IsError || executed == nil ||
+		executed.Ref != nil || executed.Path != nil ||
+		executed.ExpectedRole != nil || executed.ExpectedFingerprint != nil ||
+		executed.PID != harness.tree.PID ||
+		executed.WindowID != uint32(*harness.tree.WindowID) {
 		t.Fatalf(
-			"missing focus witness result=%+v err=%v executed=%v",
+			"same-window focus result=%+v err=%v executed=%+v",
 			result,
 			err,
 			executed,
 		)
+	}
+	if got := fakeAXMethods(harness.fake.calls[len(harness.fake.calls)-1:]); !reflect.DeepEqual(
+		got,
+		[]string{"read_tree"},
+	) {
+		t.Fatalf("same-window focus calls = %v", got)
 	}
 }
 

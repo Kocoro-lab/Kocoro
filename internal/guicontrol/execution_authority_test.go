@@ -72,6 +72,54 @@ func TestExecutionAuthorityIsOpaqueExactAndRevokedOnFinish(t *testing.T) {
 	}
 }
 
+func TestExecutionAuthorityBindsExecutionLaneAndForegroundFallback(t *testing.T) {
+	coordinator := NewCoordinator(CoordinatorOptions{})
+	lease, err := coordinator.BeginWorkflow(WorkflowRequest{
+		SessionID: "session-lane-authority", TurnID: "turn-lane-authority",
+		RequestedAppBundleID: "com.example.Editor",
+		AllowedAppBundleIDs:  []string{"com.example.Editor"},
+		PolicySnapshotID:     "policy-lane-authority",
+	})
+	if err != nil {
+		t.Fatalf("BeginWorkflow: %v", err)
+	}
+	background := ComputerUseExecutionBackgroundSemantic
+	handle, err := coordinator.BeginAction(context.Background(), ActionRequest{
+		LeaseID: lease.LeaseID, TurnID: lease.TurnID,
+		ToolName: "computer_use", ToolUseID: "toolu-lane-authority",
+		ActionKind: "press", Effect: ComputerUseActionMutation,
+		TargetBundleID: "com.example.Editor",
+		ExecutionLane:  &background,
+	})
+	if err != nil {
+		t.Fatalf("BeginAction: %v", err)
+	}
+
+	scope := ExecutionScope{
+		ToolName: "computer_use", ToolUseID: "toolu-lane-authority",
+		ActionKind: "press", Effect: string(ComputerUseActionMutation),
+		TargetBundleID: "com.example.Editor",
+		ExecutionLane:  string(background),
+	}
+	authorized := handle.AuthorizeExecution(scope)
+	if !ExecutionAuthorized(authorized, scope) {
+		t.Fatal("exact background semantic authority was not admitted")
+	}
+	foreground := scope
+	foreground.ExecutionLane = string(ComputerUseExecutionForeground)
+	if ExecutionAuthorized(authorized, foreground) {
+		t.Fatal("background authority was reusable on foreground lane")
+	}
+	fallback := foreground
+	fallback.ForegroundFallback = true
+	if ExecutionAuthorized(authorized, fallback) {
+		t.Fatal("background authority was reusable as foreground fallback")
+	}
+	if ExecutionAuthorized(handle.AuthorizeExecution(fallback), fallback) {
+		t.Fatal("mismatched fallback claim manufactured execution authority")
+	}
+}
+
 // Stop / Take Over / lease expiry must kill the capability ITSELF, not merely
 // cancel its context. The final execution gate is a pure capability check, and a
 // tool can still be sitting in DescribeGUIAction or a consequential-risk

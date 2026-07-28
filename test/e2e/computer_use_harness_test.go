@@ -87,6 +87,7 @@ func TestOffline_ComputerUseAcceptanceManifestIsFrozenAndSafe(t *testing.T) {
 		"calculator_warm_window",
 		"chrome_cold_url_navigation",
 		"chrome_multi_window_url_navigation",
+		"managed_browser_instance_coexistence",
 		"textedit_calculator_cross_app",
 		"slack_draft_without_send",
 		"slack_send_with_confirmation",

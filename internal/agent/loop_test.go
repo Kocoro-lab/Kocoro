@@ -1277,9 +1277,12 @@ func (m *mockComputerUseRecoveryTool) Info() ToolInfo {
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"apps": map[string]any{
+				"controlled_apps": map[string]any{
 					"type":  "array",
 					"items": map[string]any{"type": "string"},
+				},
+				"foreground_policy": map[string]any{
+					"type": "string",
 				},
 			},
 		},
@@ -1295,7 +1298,7 @@ func (m *mockComputerUseRecoveryTool) Run(
 	if m.runs == 1 {
 		return ToolResult{
 			Content: "computer_use_error: initial_target_required\n" +
-				"recovery: retry computer_use once with apps",
+				"recovery: retry computer_use once with controlled_apps and foreground_policy",
 			IsError: true,
 			ComputerUseOutcome: &ComputerUseTaskOutcome{
 				Status:      ComputerUseTaskNotCompleted,
@@ -1878,12 +1881,12 @@ func TestAgentLoop_InitialTargetRequiredAllowsOneComputerUseRetryWithApps(
 		case 1:
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
 				toolCall("computer_use",
-					`{"task":"open the browser","description":"open browser"}`),
+					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
 				10, 5))
 		case 2:
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
 				toolCall("computer_use",
-					`{"task":"open the browser","apps":["Google Chrome"],"description":"open browser"}`),
+					`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
 				10, 5))
 		case 3:
 			json.NewEncoder(w).Encode(nativeResponse(

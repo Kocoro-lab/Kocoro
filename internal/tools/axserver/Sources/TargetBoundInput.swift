@@ -135,6 +135,154 @@ func decodeTargetBoundInputRPCRequestV1(_ payload: Data) throws -> TargetBoundIn
     return try JSONDecoder().decode(TargetBoundInputRPCRequestV1.self, from: payload)
 }
 
+private let backgroundTargetedInputMaximumUTF16V1 = 2048
+
+struct BackgroundTargetedInputRequestV1: Equatable, Decodable {
+    let schemaVersion: Int
+    let input: TargetBoundInputRequestV1
+    let focusedRef: String
+    let focusedPath: String
+    let expectedFocusedRole: String
+    let expectedFocusedFingerprint: String
+    let targetLaunchDate: String
+    let preservedFrontmostPID: Int
+    let preservedFrontmostBundleID: String
+    let preservedFrontmostLaunchDate: String
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: StrictMutationCodingKey.self)
+        try requireStrictMutationKeys(
+            container,
+            exactly: [
+                "schema_version", "input", "focused_ref", "focused_path",
+                "expected_focused_role", "expected_focused_fingerprint",
+                "target_launch_date", "preserved_frontmost_pid",
+                "preserved_frontmost_bundle_id",
+                "preserved_frontmost_launch_date",
+            ],
+            field: "background_targeted_input.params")
+        schemaVersion = try container.decode(
+            Int.self, forKey: strictMutationKey("schema_version"))
+        input = try container.decode(
+            TargetBoundInputRequestV1.self, forKey: strictMutationKey("input"))
+        focusedRef = try container.decode(
+            String.self, forKey: strictMutationKey("focused_ref"))
+        focusedPath = try container.decode(
+            String.self, forKey: strictMutationKey("focused_path"))
+        expectedFocusedRole = try container.decode(
+            String.self, forKey: strictMutationKey("expected_focused_role"))
+        expectedFocusedFingerprint = try container.decode(
+            String.self, forKey: strictMutationKey("expected_focused_fingerprint"))
+        targetLaunchDate = try container.decode(
+            String.self, forKey: strictMutationKey("target_launch_date"))
+        preservedFrontmostPID = try container.decode(
+            Int.self, forKey: strictMutationKey("preserved_frontmost_pid"))
+        preservedFrontmostBundleID = try container.decode(
+            String.self, forKey: strictMutationKey("preserved_frontmost_bundle_id"))
+        preservedFrontmostLaunchDate = try container.decode(
+            String.self, forKey: strictMutationKey("preserved_frontmost_launch_date"))
+
+        let validRef = strictMutationIdentity(focusedRef) &&
+            focusedRef.count > 1 && focusedRef.first == "e" &&
+            focusedRef.dropFirst().allSatisfy(\.isNumber)
+        let editableRole = [
+            "AXTextField", "AXTextArea", "AXComboBox",
+        ].contains(expectedFocusedRole)
+        guard schemaVersion == 1,
+              input.action == "type" || input.action == "keypress",
+              validRef,
+              strictMutationIdentity(focusedPath),
+              focusedPath == "window[0]" || focusedPath.hasPrefix("window[0]/"),
+              editableRole,
+              strictMutationIdentity(expectedFocusedFingerprint),
+              strictMutationDate(targetLaunchDate) != nil,
+              preservedFrontmostPID > 0,
+              preservedFrontmostPID != input.pid,
+              strictMutationIdentity(preservedFrontmostBundleID),
+              strictMutationDate(preservedFrontmostLaunchDate) != nil else {
+            throw StrictMutationWireError.invalid(
+                "invalid background_targeted_input authority")
+        }
+        if input.action == "type" {
+            guard input.ref == focusedRef,
+                  input.path == focusedPath,
+                  input.expectedRole == expectedFocusedRole,
+                  input.expectedFingerprint == expectedFocusedFingerprint,
+                  let text = input.text,
+                  text.unicodeScalars.allSatisfy({
+                      !CharacterSet.controlCharacters.contains($0)
+                  }),
+                  text.utf16.count <= backgroundTargetedInputMaximumUTF16V1 else {
+                throw StrictMutationWireError.invalid(
+                    "inconsistent background_targeted_input type authority")
+            }
+        } else {
+            guard !backgroundTargetedInputConsequentialKeyV1(
+                keys: input.keys!,
+                modifiers: input.modifiers!
+            ) else {
+                throw StrictMutationWireError.invalid(
+                    "unsupported consequential background key")
+            }
+        }
+    }
+}
+
+struct BackgroundTargetedInputRPCRequestV1: Equatable, Decodable {
+    let id: Int64
+    let method: String
+    let params: BackgroundTargetedInputRequestV1
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: StrictMutationCodingKey.self)
+        try requireStrictMutationKeys(
+            container, exactly: ["id", "method", "params"],
+            field: "background_targeted_input")
+        id = try container.decode(Int64.self, forKey: strictMutationKey("id"))
+        method = try container.decode(String.self, forKey: strictMutationKey("method"))
+        params = try container.decode(
+            BackgroundTargetedInputRequestV1.self,
+            forKey: strictMutationKey("params"))
+        guard id > 0, method == "background_targeted_input" else {
+            throw StrictMutationWireError.invalid(
+                "invalid background_targeted_input envelope")
+        }
+    }
+}
+
+func decodeBackgroundTargetedInputRPCRequestV1(
+    _ payload: Data
+) throws -> BackgroundTargetedInputRPCRequestV1 {
+    try rejectStrictMutationDuplicateJSONMembers(payload)
+    return try JSONDecoder().decode(
+        BackgroundTargetedInputRPCRequestV1.self,
+        from: payload)
+}
+
+private func backgroundTargetedInputConsequentialKeyV1(
+    keys: [String],
+    modifiers: [String]
+) -> Bool {
+    let modifierSet = Set(modifiers)
+    for key in keys {
+        switch key {
+        case "return":
+            if modifierSet.isEmpty ||
+                modifierSet.contains("command") ||
+                modifierSet.contains("control") {
+                return true
+            }
+        case "delete", "backspace", "forwarddelete":
+            if modifierSet.contains("shift") || modifierSet.contains("command") {
+                return true
+            }
+        default:
+            break
+        }
+    }
+    return false
+}
+
 struct TargetBoundInputResultV1: Encodable, Equatable {
     let schemaVersion = 1
     let status: String
@@ -328,6 +476,21 @@ struct TargetBoundInputDependencies {
     let prepareTypeVerification:
         (TargetBoundInputRequestV1, String) -> TargetBoundTypeVerificationPreparationV1
     let observePhysicalInput: () -> PhysicalInputInterferenceSnapshotV1?
+    let now: () -> Date
+    let sleep: (TimeInterval) -> Void
+}
+
+struct BackgroundTargetedInputDependenciesV1 {
+    let canAdmitInput: () -> Bool
+    let authorityFailure: (BackgroundTargetedInputRequestV1) -> String?
+    let postText:
+        (BackgroundTargetedInputRequestV1, String) -> TargetBoundKeySequencePostOutcomeV1
+    let postKeypress:
+        (BackgroundTargetedInputRequestV1, [String], [String]) ->
+            TargetBoundKeySequencePostOutcomeV1
+    let prepareTypeVerification:
+        (TargetBoundInputRequestV1, String) -> TargetBoundTypeVerificationPreparationV1
+    let isCancelled: () -> Bool
     let now: () -> Date
     let sleep: (TimeInterval) -> Void
 }
@@ -876,6 +1039,160 @@ func runTargetBoundInput(
         dependencies: dependencies)
 }
 
+private func backgroundTargetedInputCommittedUnverifiedV1(
+    _ request: BackgroundTargetedInputRequestV1,
+    code: String,
+    phase: String = "post_verification"
+) -> TargetBoundInputResultV1 {
+    TargetBoundInputResultV1(
+        status: "completed_unverified", action: request.input.action,
+        inputCommitted: true, clipboardTouched: false,
+        clipboardRestored: false, phase: phase, failureCode: code)
+}
+
+private func backgroundTargetedInputPostOutcomeV1(
+    _ request: BackgroundTargetedInputRequestV1,
+    outcome: TargetBoundKeySequencePostOutcomeV1
+) -> TargetBoundInputResultV1? {
+    switch outcome {
+    case .completed:
+        return nil
+    case let .cancelled(_, inputCommitted, cleanupComplete):
+        let code = cleanupComplete
+            ? (inputCommitted ? "cancelled_after_partial_input" : "cancelled_before_input")
+            : "modifier_release_unconfirmed"
+        return inputCommitted
+            ? backgroundTargetedInputCommittedUnverifiedV1(
+                request, code: code, phase: "action")
+            : targetBoundInputFailure(request.input, code: code, phase: "action")
+    case let .failed(_, inputCommitted, cleanupComplete):
+        let code = cleanupComplete ? "event_post_failed" : "modifier_release_unconfirmed"
+        return inputCommitted
+            ? backgroundTargetedInputCommittedUnverifiedV1(
+                request, code: code, phase: "action")
+            : targetBoundInputFailure(request.input, code: code, phase: "action")
+    }
+}
+
+func runBackgroundTargetedInputV1(
+    request: BackgroundTargetedInputRequestV1,
+    dependencies: BackgroundTargetedInputDependenciesV1
+) -> TargetBoundInputResultV1 {
+    guard let deadline = strictMutationDate(request.input.commitDeadlineAt) else {
+        return targetBoundInputFailure(request.input, code: "invalid_request")
+    }
+    let horizon = deadline.timeIntervalSince(dependencies.now())
+    guard horizon > 0 else {
+        return targetBoundInputFailure(request.input, code: "request_expired")
+    }
+    guard horizon <= targetBoundInputMaximumDeadlineHorizonV1 else {
+        return targetBoundInputFailure(request.input, code: "invalid_request")
+    }
+    guard dependencies.canAdmitInput() else {
+        return targetBoundInputFailure(request.input, code: "input_recovery_blocked")
+    }
+    if let failure = dependencies.authorityFailure(request) {
+        return targetBoundInputFailure(request.input, code: failure)
+    }
+    guard !dependencies.isCancelled() else {
+        return targetBoundInputFailure(request.input, code: "cancelled_before_input")
+    }
+
+    var verification: TargetBoundTypeVerificationPreparationV1?
+    if request.input.action == "type" {
+        verification = dependencies.prepareTypeVerification(
+            request.input,
+            request.input.text!)
+        if case let .failed(code) = verification! {
+            return targetBoundInputFailure(request.input, code: code, phase: "action")
+        }
+    }
+    guard dependencies.now() < deadline else {
+        return targetBoundInputFailure(
+            request.input, code: "request_expired_before_input", phase: "action")
+    }
+    if let failure = dependencies.authorityFailure(request) {
+        return targetBoundInputFailure(request.input, code: failure, phase: "action")
+    }
+    guard !dependencies.isCancelled() else {
+        return targetBoundInputFailure(
+            request.input, code: "cancelled_before_input", phase: "action")
+    }
+
+    let postOutcome: TargetBoundKeySequencePostOutcomeV1
+    if request.input.action == "type" {
+        postOutcome = dependencies.postText(request, request.input.text!)
+    } else {
+        postOutcome = dependencies.postKeypress(
+            request, request.input.keys!, request.input.modifiers!)
+    }
+    if let result = backgroundTargetedInputPostOutcomeV1(
+        request, outcome: postOutcome) {
+        return result
+    }
+
+    if let failure = dependencies.authorityFailure(request) {
+        let code = failure.hasPrefix("preserved_frontmost_")
+            ? "preserved_frontmost_changed_after_commit"
+            : "target_changed_during_verification"
+        return backgroundTargetedInputCommittedUnverifiedV1(request, code: code)
+    }
+    if request.input.action == "keypress" {
+        return backgroundTargetedInputCommittedUnverifiedV1(
+            request, code: "postcondition_not_declared")
+    }
+
+    switch verification! {
+    case let .unavailable(failureCode):
+        return backgroundTargetedInputCommittedUnverifiedV1(
+            request, code: failureCode)
+    case let .failed(failureCode):
+        return backgroundTargetedInputCommittedUnverifiedV1(
+            request, code: failureCode)
+    case let .ready(verifier):
+        let outcome: TargetedAXPostconditionOutcomeV1<Bool> =
+            runTargetedAXPostconditionVerificationV1(
+                now: dependencies.now,
+                sleep: dependencies.sleep,
+                observeWithTimeout: { timeout in
+                    if let failure = dependencies.authorityFailure(request) {
+                        return .terminal(
+                            failureCode: failure.hasPrefix("preserved_frontmost_")
+                                ? "preserved_frontmost_changed_after_commit"
+                                : "target_changed_during_verification",
+                            observation: nil)
+                    }
+                    switch verifier.observe(timeout) {
+                    case .matched:
+                        return .matched(true)
+                    case .mismatch:
+                        return .retryable(
+                            failureCode: "target_value_mismatch", observation: nil)
+                    case .unavailable:
+                        return .retryable(
+                            failureCode: "target_value_readback_unavailable",
+                            observation: nil)
+                    case .targetChanged:
+                        return .terminal(
+                            failureCode: "target_changed_during_verification",
+                            observation: nil)
+                    }
+                })
+        switch outcome {
+        case .verified:
+            return TargetBoundInputResultV1(
+                status: "verified", action: request.input.action,
+                inputCommitted: true, clipboardTouched: false,
+                clipboardRestored: false, phase: "post_verification",
+                failureCode: nil,
+                postcondition: "target_value_matches_expected_edit")
+        case let .inconclusive(failureCode, _, _):
+            return backgroundTargetedInputCommittedUnverifiedV1(
+                request, code: failureCode)
+        }
+    }
+}
+
 func targetBoundInputAXBoundsCorrelateWithCG(
     _ left: DisplayTopologyRectV1,
     _ right: DisplayTopologyRectV1
@@ -966,7 +1283,7 @@ private func targetBoundInputFocusedAXWindowIdentity(
     let frame = AXFrame(
         x: rawFrame.x, y: rawFrame.y,
         width: rawFrame.width, height: rawFrame.height)
-    guard let exact = uniqueWindowID(pid: pid, title: title, frame: frame),
+    guard let exact = focusedWindowID(pid: pid, title: title, frame: frame),
           let windowID = UInt32(exactly: exact) else { return nil }
     return TargetBoundInputFocusedAXWindowIdentityV1(
         window: window,
@@ -1073,6 +1390,109 @@ private func productionTargetBoundInputAuthorityFailure(
     return nil
 }
 
+private func backgroundTargetedInputProcessInstanceMatchesV1(
+    _ application: NSRunningApplication,
+    bundleID: String,
+    launchDate: String
+) -> Bool {
+    guard !application.isTerminated,
+          application.bundleIdentifier == bundleID,
+          let expectedLaunchDate = strictMutationDate(launchDate),
+          let actualLaunchDate = application.launchDate else { return false }
+    return abs(actualLaunchDate.timeIntervalSince(expectedLaunchDate)) < 0.001
+}
+
+private func productionBackgroundTargetedInputAuthorityFailureV1(
+    _ request: BackgroundTargetedInputRequestV1
+) -> String? {
+    refreshAppKitState()
+    guard let targetProcessID = pid_t(exactly: request.input.pid),
+          let target = NSRunningApplication(processIdentifier: targetProcessID),
+          !target.isTerminated else { return "process_not_live" }
+    guard backgroundTargetedInputProcessInstanceMatchesV1(
+        target,
+        bundleID: request.input.bundleID,
+        launchDate: request.targetLaunchDate
+    ) else {
+        return "process_identity_mismatch"
+    }
+    guard let preservedProcessID = pid_t(exactly: request.preservedFrontmostPID),
+          let preserved = NSRunningApplication(processIdentifier: preservedProcessID),
+          !preserved.isTerminated else {
+        return "preserved_frontmost_process_not_live"
+    }
+    guard backgroundTargetedInputProcessInstanceMatchesV1(
+        preserved,
+        bundleID: request.preservedFrontmostBundleID,
+        launchDate: request.preservedFrontmostLaunchDate
+    ) else {
+        return "preserved_frontmost_identity_mismatch"
+    }
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier ==
+        preservedProcessID else {
+        return "preserved_frontmost_changed"
+    }
+    guard targetProcessID != preservedProcessID else {
+        return "background_target_became_frontmost"
+    }
+    guard let window = targetBoundInputExactWindow(request.input.windowID),
+          window.ownerPID == request.input.pid else {
+        return "window_identity_mismatch"
+    }
+    guard window.layer == 0, window.isOnScreen else {
+        return "window_not_actionable"
+    }
+    guard targetBoundInputAXBoundsCorrelateWithCG(
+        request.input.expectedWindowAXBounds, window.bounds) else {
+        return "window_bounds_mismatch"
+    }
+    guard let focusedWindow = targetBoundInputFocusedAXWindowIdentity(
+        pid: request.input.pid),
+          focusedWindow.windowID == request.input.windowID else {
+        return "focused_window_mismatch"
+    }
+    guard let focused = resolveElement(
+        in: focusedWindow.window,
+        path: request.focusedPath) else {
+        return "path_not_found"
+    }
+    guard axString(focused, "AXRole") == request.expectedFocusedRole else {
+        return "role_mismatch"
+    }
+    guard targetBoundInputFingerprint(focused) ==
+        request.expectedFocusedFingerprint else {
+        return "fingerprint_mismatch"
+    }
+    guard axBool(focused, "AXEnabled") ?? true else {
+        return "focused_element_disabled"
+    }
+    let appElement = AXUIElementCreateApplication(targetProcessID)
+    guard axElementsEqual(focused, axFocusedElement(appElement)) else {
+        return "focused_element_mismatch"
+    }
+    return nil
+}
+
+private func productionBackgroundTargetedInputAuthorityFailureBoundedV1(
+    _ request: BackgroundTargetedInputRequestV1
+) -> String? {
+    guard let processID = pid_t(exactly: request.input.pid) else {
+        return "process_not_live"
+    }
+    switch withTargetedAXMessagingTimeoutV1(
+        element: AXUIElementCreateApplication(processID),
+        timeout: targetBoundInputAuthorityTimeoutV1,
+        operation: {
+            productionBackgroundTargetedInputAuthorityFailureV1(request)
+        }
+    ) {
+    case let .completed(failure):
+        return failure
+    case .unavailable:
+        return "authority_revalidation_timeout"
+    }
+}
+
 private let targetBoundInputRestorableFocusFailuresV1: Set<String> = [
     "frontmost_process_mismatch",
     "focused_window_mismatch",
@@ -1151,6 +1571,124 @@ private func productionTargetBoundPreparedKey(
             commitDown: { down.post(tap: .cghidEventTap); return true }) else { return false }
         return processInputCommitGateV1.confirmRelease(token: token)
     }
+}
+
+private func productionBackgroundTargetedPostPairV1(
+    request: BackgroundTargetedInputRequestV1,
+    virtualKey: CGKeyCode,
+    flags: CGEventFlags,
+    unicode: [UInt16]? = nil
+) -> (inputCommitted: Bool, cleanupComplete: Bool) {
+    guard let targetPID = pid_t(exactly: request.input.pid),
+          let source = physicalInputSyntheticEventSourceV1,
+          let down = CGEvent(
+            keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
+          let release = productionInputRelease(
+            metadata: .targetedKey(
+                virtualKey: UInt16(virtualKey),
+                eventFlags: 0,
+                pid: request.input.pid,
+                bundleID: request.input.bundleID,
+                launchDate: request.targetLaunchDate),
+            eventSource: source) else {
+        return (false, true)
+    }
+    down.flags = flags
+    if var unicode {
+        unicode.withUnsafeMutableBufferPointer { buffer in
+            down.keyboardSetUnicodeString(
+                stringLength: buffer.count,
+                unicodeString: buffer.baseAddress!)
+        }
+    }
+    guard let token = processInputCommitGateV1.registerPress(
+        release: release,
+        commitDown: {
+            down.postToPid(targetPID)
+            return true
+        }) else {
+        return (false, true)
+    }
+    return (true, processInputCommitGateV1.confirmRelease(token: token))
+}
+
+private func productionBackgroundTargetedPostTextV1(
+    request: BackgroundTargetedInputRequestV1,
+    text: String
+) -> TargetBoundKeySequencePostOutcomeV1 {
+    let unicode = Array(text.utf16)
+    guard !unicode.isEmpty,
+          unicode.count <= backgroundTargetedInputMaximumUTF16V1 else {
+        return .failed(
+            keyPairsCommitted: 0,
+            inputCommitted: false,
+            cleanupComplete: true)
+    }
+    let posted = productionBackgroundTargetedPostPairV1(
+        request: request,
+        virtualKey: 0,
+        flags: [],
+        unicode: unicode)
+    if !posted.inputCommitted {
+        return .failed(
+            keyPairsCommitted: 0,
+            inputCommitted: false,
+            cleanupComplete: posted.cleanupComplete)
+    }
+    guard posted.cleanupComplete else {
+        return .failed(
+            keyPairsCommitted: 1,
+            inputCommitted: true,
+            cleanupComplete: false)
+    }
+    return .completed(keyPairsCommitted: 1)
+}
+
+private func productionBackgroundTargetedPostKeypressV1(
+    request: BackgroundTargetedInputRequestV1,
+    keys: [String],
+    modifiers: [String],
+    isCancelled: () -> Bool
+) -> TargetBoundKeySequencePostOutcomeV1 {
+    guard let flags = targetBoundInputModifierFlags(modifiers) else {
+        return .failed(
+            keyPairsCommitted: 0,
+            inputCommitted: false,
+            cleanupComplete: true)
+    }
+    var committed = 0
+    for key in keys {
+        if isCancelled() {
+            return .cancelled(
+                keyPairsCommitted: committed,
+                inputCommitted: committed > 0,
+                cleanupComplete: true)
+        }
+        guard let code = keyCodeMap[key.lowercased()] else {
+            return .failed(
+                keyPairsCommitted: committed,
+                inputCommitted: committed > 0,
+                cleanupComplete: true)
+        }
+        let posted = productionBackgroundTargetedPostPairV1(
+            request: request,
+            virtualKey: code,
+            flags: flags)
+        if !posted.inputCommitted {
+            return .failed(
+                keyPairsCommitted: committed,
+                inputCommitted: committed > 0,
+                cleanupComplete: posted.cleanupComplete)
+        }
+        committed += 1
+        guard posted.cleanupComplete else {
+            return .failed(
+                keyPairsCommitted: committed,
+                inputCommitted: true,
+                cleanupComplete: false)
+        }
+    }
+    return .completed(keyPairsCommitted: committed)
 }
 
 private func productionTargetBoundPreparedKeySequence(
@@ -1389,3 +1927,24 @@ func productionTargetBoundInputDependenciesV1(
 
 let productionTargetBoundInputDependencies =
     productionTargetBoundInputDependenciesV1(isCancelled: { false })
+
+func productionBackgroundTargetedInputDependenciesV1(
+    isCancelled: @escaping () -> Bool
+) -> BackgroundTargetedInputDependenciesV1 {
+    BackgroundTargetedInputDependenciesV1(
+        canAdmitInput: processInputCommitGateV1.canAdmitInput,
+        authorityFailure:
+            productionBackgroundTargetedInputAuthorityFailureBoundedV1,
+        postText: productionBackgroundTargetedPostTextV1,
+        postKeypress: { request, keys, modifiers in
+            productionBackgroundTargetedPostKeypressV1(
+                request: request,
+                keys: keys,
+                modifiers: modifiers,
+                isCancelled: isCancelled)
+        },
+        prepareTypeVerification: productionTargetBoundTypeVerification,
+        isCancelled: isCancelled,
+        now: Date.init,
+        sleep: Thread.sleep(forTimeInterval:))
+}

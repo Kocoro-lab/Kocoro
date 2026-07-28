@@ -59,6 +59,64 @@ final class InputCrashRecoveryTests: XCTestCase {
         }
     }
 
+    func testTargetedKeyReleaseMetadataIsStrictAndContentFree() throws {
+        let metadata = InputReleaseMetadataV1.targetedKey(
+            virtualKey: 0x24,
+            eventFlags: 0,
+            pid: 42,
+            bundleID: "com.apple.Notes",
+            launchDate: "2026-07-28T06:00:00Z")
+        XCTAssertTrue(metadata.isValid)
+        let encoded = try JSONEncoder().encode(metadata)
+        XCTAssertEqual(
+            try JSONDecoder().decode(InputReleaseMetadataV1.self, from: encoded),
+            metadata)
+        let wire = String(decoding: encoded, as: UTF8.self)
+        XCTAssertTrue(wire.contains("\"kind\":\"targeted_key\""))
+        XCTAssertFalse(wire.contains("text"))
+        XCTAssertFalse(wire.contains("clipboard"))
+        XCTAssertFalse(wire.contains("AXValue"))
+
+        var malformed = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        malformed.removeValue(forKey: "launch_date")
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            InputReleaseMetadataV1.self,
+            from: JSONSerialization.data(withJSONObject: malformed)))
+    }
+
+    func testTargetedKeyJournalRecoversExactlyOnceWithExactProcessIdentity() throws {
+        let harness = try RecoveryHarness()
+        let metadata = InputReleaseMetadataV1.targetedKey(
+            virtualKey: 0x7b,
+            eventFlags: 0,
+            pid: 42,
+            bundleID: "com.apple.Notes",
+            launchDate: "2026-07-28T06:00:00Z")
+        try harness.writeJournal(createdAt: harness.now, releases: [metadata])
+
+        let gate = harness.makeGate()
+        XCTAssertEqual(gate.recoverAtStartup(), .recovered(releaseCount: 1))
+        XCTAssertEqual(harness.recovered, [metadata])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.journal.path))
+        XCTAssertTrue(gate.canAdmitInput())
+        XCTAssertEqual(harness.recovered, [metadata])
+    }
+
+    func testTargetedKeyRecoveryForGoneProcessNeverPostsGlobally() throws {
+        let metadata = InputReleaseMetadataV1.targetedKey(
+            virtualKey: 0x24,
+            eventFlags: 0,
+            pid: Int(Int32.max),
+            bundleID: "invalid.example.gone",
+            launchDate: "2026-07-28T06:00:00Z")
+        let release = try XCTUnwrap(productionInputRelease(metadata: metadata))
+
+        XCTAssertTrue(
+            release.postAndConfirm(),
+            "a gone exact process instance should clear recovery without a post")
+    }
+
     func testJournalIsDurableBeforeDownAndClearedOnlyAfterConfirmedRelease() throws {
         let harness = try RecoveryHarness()
         let gate = harness.makeGate()

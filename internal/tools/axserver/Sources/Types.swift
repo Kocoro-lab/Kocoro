@@ -42,6 +42,7 @@ struct Params: Decodable {
     let interval: Double?
     let roles: [String]?
     let maxLabels: Int?
+    let excludedPIDs: [Int]?
 
     enum CodingKeys: String, CodingKey {
         case pid, filter, path, value, query, role, identifier, type
@@ -60,6 +61,7 @@ struct Params: Decodable {
         case appName = "app_name"
         case windowTitle = "window_title"
         case maxLabels = "max_labels"
+        case excludedPIDs = "excluded_pids"
     }
 }
 

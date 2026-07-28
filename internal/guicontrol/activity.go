@@ -56,6 +56,14 @@ const (
 	ComputerUseExecutionSyntheticCoordinate ComputerUseExecutionPath = "synthetic_coordinate"
 )
 
+type ComputerUseExecutionLane string
+
+const (
+	ComputerUseExecutionForeground         ComputerUseExecutionLane = "foreground"
+	ComputerUseExecutionBackgroundSemantic ComputerUseExecutionLane = "background_semantic"
+	ComputerUseExecutionBackgroundKeyboard ComputerUseExecutionLane = "background_keyboard"
+)
+
 type ComputerUseCoordinateSpace string
 
 const ComputerUseCoordinateQuartzGlobalPoints ComputerUseCoordinateSpace = "quartz_global_points"
@@ -119,23 +127,25 @@ func (p ComputerUsePointer) Validate() error {
 // and reconnect snapshots. Never add typed text, raw tool arguments, prompts,
 // clipboard contents, screenshots, or Accessibility values to this contract.
 type ComputerUseActivityState struct {
-	LeaseID           string                     `json:"lease_id"`
-	SessionID         string                     `json:"session_id"`
-	ActionID          string                     `json:"action_id,omitempty"`
-	ToolUseID         string                     `json:"tool_use_id,omitempty"`
-	SourceKind        string                     `json:"source_kind,omitempty"`
-	SourceLabel       string                     `json:"source_label,omitempty"`
-	TargetBundleID    string                     `json:"target_bundle_id,omitempty"`
-	TargetAppName     string                     `json:"target_app_name,omitempty"`
-	ActionKind        string                     `json:"action_kind,omitempty"`
-	LeaseState        ComputerUseLeaseState      `json:"lease_state"`
-	ActionPhase       ComputerUseActionPhase     `json:"action_phase"`
-	ActionResult      *ComputerUseActionResult   `json:"action_result"`
-	ExecutionPath     *ComputerUseExecutionPath  `json:"execution_path"`
-	Pointer           *ComputerUsePointer        `json:"pointer"`
-	FailureCode       *string                    `json:"failure_code"`
-	ConsequentialRisk *ConsequentialRiskMarkerV1 `json:"consequential_risk"`
-	TS                string                     `json:"ts"`
+	LeaseID            string                     `json:"lease_id"`
+	SessionID          string                     `json:"session_id"`
+	ActionID           string                     `json:"action_id,omitempty"`
+	ToolUseID          string                     `json:"tool_use_id,omitempty"`
+	SourceKind         string                     `json:"source_kind,omitempty"`
+	SourceLabel        string                     `json:"source_label,omitempty"`
+	TargetBundleID     string                     `json:"target_bundle_id,omitempty"`
+	TargetAppName      string                     `json:"target_app_name,omitempty"`
+	ActionKind         string                     `json:"action_kind,omitempty"`
+	LeaseState         ComputerUseLeaseState      `json:"lease_state"`
+	ActionPhase        ComputerUseActionPhase     `json:"action_phase"`
+	ActionResult       *ComputerUseActionResult   `json:"action_result"`
+	ExecutionPath      *ComputerUseExecutionPath  `json:"execution_path"`
+	ExecutionLane      *ComputerUseExecutionLane  `json:"execution_lane"`
+	ForegroundFallback bool                       `json:"foreground_fallback"`
+	Pointer            *ComputerUsePointer        `json:"pointer"`
+	FailureCode        *string                    `json:"failure_code"`
+	ConsequentialRisk  *ConsequentialRiskMarkerV1 `json:"consequential_risk"`
+	TS                 string                     `json:"ts"`
 }
 
 func (s ComputerUseActivityState) Validate() error {
@@ -156,6 +166,20 @@ func (s ComputerUseActivityState) Validate() error {
 	}
 	if s.ExecutionPath != nil && !ValidComputerUseExecutionPath(*s.ExecutionPath) {
 		return fmt.Errorf("invalid computer-use execution_path %q", *s.ExecutionPath)
+	}
+	if s.ExecutionLane != nil && !ValidComputerUseExecutionLane(*s.ExecutionLane) {
+		return fmt.Errorf("invalid computer-use execution_lane %q", *s.ExecutionLane)
+	}
+	if s.ForegroundFallback &&
+		(s.ExecutionLane == nil ||
+			*s.ExecutionLane != ComputerUseExecutionForeground) {
+		return fmt.Errorf("foreground fallback requires foreground execution_lane")
+	}
+	if s.ExecutionLane != nil &&
+		(*s.ExecutionLane == ComputerUseExecutionBackgroundSemantic ||
+			*s.ExecutionLane == ComputerUseExecutionBackgroundKeyboard) &&
+		s.Pointer != nil {
+		return fmt.Errorf("background activity cannot publish a physical pointer")
 	}
 	if s.Pointer != nil {
 		if err := s.Pointer.Validate(); err != nil {
@@ -213,6 +237,16 @@ func ValidComputerUseActionResult(value ComputerUseActionResult) bool {
 func ValidComputerUseExecutionPath(value ComputerUseExecutionPath) bool {
 	switch value {
 	case ComputerUseExecutionAccessibility, ComputerUseExecutionSyntheticCoordinate:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidComputerUseExecutionLane(value ComputerUseExecutionLane) bool {
+	switch value {
+	case ComputerUseExecutionForeground, ComputerUseExecutionBackgroundSemantic,
+		ComputerUseExecutionBackgroundKeyboard:
 		return true
 	default:
 		return false

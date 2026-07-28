@@ -164,7 +164,8 @@ func TestAXClientMutationCallPreCancelledDoesNotWrite(t *testing.T) {
 func TestAXMutationMethodClassificationCoversHelperSideEffects(t *testing.T) {
 	for _, method := range []string{
 		"semantic_press", "click", "press", "set_value", "mouse_event",
-		"key_event", "type_text", "scroll", "focus", "launch_app", "request_permission",
+		"key_event", "type_text", "scroll", "focus", "launch_app",
+		"prepare_task_app", "request_permission",
 	} {
 		if !isAXMutationMethod(method) {
 			t.Errorf("method %q was not classified as a mutation", method)

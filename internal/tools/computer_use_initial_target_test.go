@@ -125,6 +125,89 @@ func TestAnthropicComputerInitialTargetUsesForegroundHintAndRestoresBeforeMutati
 	}
 }
 
+func TestComputerUseForegroundFallbackRestoresExactlyOnce(t *testing.T) {
+	fixture := &initialComputerTargetAXFixture{}
+	tool := &ComputerUseTool{
+		client: fixture,
+		initialTarget: &ComputerUseInitialTargetV1{
+			PID: 4242, AppName: "Calculator", BundleID: "com.apple.calculator",
+		},
+	}
+	if _, err := tool.Run(
+		context.Background(),
+		`{"action":"get_app_state","description":"Observe Calculator"}`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	tool.foregroundFallbackRestorePending = true
+
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	lease, err := coordinator.BeginWorkflow(guicontrol.WorkflowRequest{
+		SessionID:            "session-fallback",
+		TurnID:               "turn-fallback",
+		RequestedAppBundleID: "com.apple.calculator",
+		AllowedAppBundleIDs:  []string{"com.apple.calculator"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := guicontrol.ComputerUseExecutionSyntheticCoordinate
+	handle, err := coordinator.BeginAction(
+		context.Background(),
+		guicontrol.ActionRequest{
+			LeaseID: lease.LeaseID, TurnID: lease.TurnID,
+			ToolName: "computer_use", ToolUseID: "toolu_fallback",
+			ActionKind: "click", TargetBundleID: "com.apple.calculator",
+			TargetAppName: "Calculator", ExecutionPath: &path,
+			Effect: guicontrol.ComputerUseActionMutation,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := guicontrol.ExecutionScope{
+		ToolName: "computer_use", ToolUseID: "toolu_fallback",
+		ActionKind:     "click",
+		Effect:         string(guicontrol.ComputerUseActionMutation),
+		TargetBundleID: "com.apple.calculator",
+		ExecutionPath:  string(path),
+	}
+	ctx := agent.ContextWithToolInvocation(
+		handle.AuthorizeExecution(scope),
+		agent.ToolInvocation{
+			ToolName: "computer_use", ToolUseID: "toolu_fallback",
+		},
+	)
+	ctx = ContextWithOpenAINativeComputerActionV1(ctx)
+	descriptor := agent.GUIActionDescriptor{
+		Participates: true, ActionKind: "click",
+		Effect:             agent.GUIActionMutation,
+		TargetBundleID:     "com.apple.calculator",
+		TargetAppName:      "Calculator",
+		ExecutionPath:      string(path),
+		ExecutionLane:      string(guicontrol.ComputerUseExecutionForeground),
+		ForegroundFallback: true,
+	}
+
+	if err := tool.RestoreGUIActionTargetV1(ctx, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if tool.foregroundFallbackRestorePending ||
+		len(fixture.focusParams) != 1 {
+		t.Fatalf(
+			"first fallback restore pending=%v focus=%+v",
+			tool.foregroundFallbackRestorePending,
+			fixture.focusParams,
+		)
+	}
+	if err := tool.RestoreGUIActionTargetV1(ctx, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.focusParams) != 1 {
+		t.Fatalf("fallback restored more than once: %+v", fixture.focusParams)
+	}
+}
+
 func TestComputerUseInitialTargetRejectsPIDBundleDrift(t *testing.T) {
 	fixture := &initialComputerTargetAXFixture{}
 	tool := &ComputerUseTool{client: fixture, initialTarget: &ComputerUseInitialTargetV1{

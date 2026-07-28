@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"sync"
@@ -66,6 +67,7 @@ type restoringGUIProbeTool struct {
 	restored          bool
 	restoreAuthorized bool
 	runAfterRestore   bool
+	restoreErr        error
 }
 
 func (t *restoringGUIProbeTool) RestoreGUIActionTargetV1(
@@ -74,7 +76,7 @@ func (t *restoringGUIProbeTool) RestoreGUIActionTargetV1(
 ) error {
 	t.restored = true
 	t.restoreAuthorized = guicontrol.ExecutionAuthorityPresent(ctx)
-	return nil
+	return t.restoreErr
 }
 
 func (t *restoringGUIProbeTool) Run(context.Context, string) (agent.ToolResult, error) {
@@ -411,10 +413,28 @@ func runGUIWorkflowWithControllerAck(
 	tool agent.Tool,
 	args string,
 ) agent.ToolResult {
+	return runGUIWorkflowWithControllerAckContext(
+		t,
+		coordinator,
+		workflow,
+		context.Background(),
+		tool,
+		args,
+	)
+}
+
+func runGUIWorkflowWithControllerAckContext(
+	t *testing.T,
+	coordinator *guicontrol.Coordinator,
+	workflow *daemonGUIWorkflow,
+	ctx context.Context,
+	tool agent.Tool,
+	args string,
+) agent.ToolResult {
 	t.Helper()
 	done := make(chan agent.ToolResult, 1)
 	go func() {
-		result, _ := workflow.runTool(context.Background(), tool, args)
+		result, _ := workflow.runTool(ctx, tool, args)
 		done <- result
 	}()
 	acknowledgeController(t, coordinator)
@@ -446,6 +466,196 @@ func TestDaemonGUIWorkflowRestoresTargetAfterAuthorityBeforeMutation(t *testing.
 	if result.IsError || tool.calls != 1 || !tool.restored ||
 		!tool.restoreAuthorized || !tool.runAfterRestore {
 		t.Fatalf("result=%+v tool=%+v", result, tool)
+	}
+	workflow.EndTurn()
+}
+
+func TestDaemonGUIWorkflowRejectsInvalidExecutionLaneBeforeLease(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		executionLane      string
+		foregroundFallback bool
+	}{
+		{
+			name:          "unknown lane",
+			executionLane: "future_background_lane",
+		},
+		{
+			name:               "fallback without foreground lane",
+			foregroundFallback: true,
+		},
+		{
+			name:               "background lane cannot be fallback",
+			executionLane:      string(guicontrol.ComputerUseExecutionBackgroundSemantic),
+			foregroundFallback: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+			workflow := testGUIWorkflow(coordinator, "sess-invalid-lane", "turn-invalid-lane")
+			tool := &guiProbeTool{
+				name: "computer_use",
+				descriptor: agent.GUIActionDescriptor{
+					Participates:       true,
+					ActionKind:         "click",
+					Effect:             agent.GUIActionMutation,
+					TargetBundleID:     "com.example.Editor",
+					TargetAppName:      "Editor",
+					ExecutionPath:      "accessibility",
+					ExecutionLane:      test.executionLane,
+					ForegroundFallback: test.foregroundFallback,
+				},
+			}
+
+			result, err := workflow.runTool(context.Background(), tool, `{}`)
+			if err != nil || !result.IsError ||
+				!strings.Contains(result.Content, "invalid execution lane") {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if tool.calls != 0 {
+				t.Fatalf("invalid execution lane reached inner tool %d times", tool.calls)
+			}
+			if active := coordinator.Snapshot().Active; active != nil {
+				t.Fatalf("invalid execution lane created workflow lease: %+v", active)
+			}
+		})
+	}
+}
+
+func TestDaemonGUIWorkflowDoesNotRestoreOrderedNativeMutationsBetweenActions(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name               string
+		actionKind         string
+		targetBundleID     string
+		targetAppName      string
+		executionLane      string
+		foregroundFallback bool
+		wantRestored       bool
+	}{
+		{
+			name: "background semantic remains nonactivating", actionKind: "press",
+			targetBundleID: "com.apple.calculator", targetAppName: "Calculator",
+			executionLane: string(
+				guicontrol.ComputerUseExecutionBackgroundSemantic),
+		},
+		{
+			name: "background keyboard remains nonactivating", actionKind: "type",
+			targetBundleID: "com.apple.TextEdit", targetAppName: "TextEdit",
+			executionLane: string(
+				guicontrol.ComputerUseExecutionBackgroundKeyboard),
+		},
+		{
+			name: "ordinary foreground window stays runtime bound", actionKind: "click",
+			targetBundleID: "com.example.Editor", targetAppName: "Editor",
+			executionLane: string(guicontrol.ComputerUseExecutionForeground),
+		},
+		{
+			name: "same process popover stays runtime bound", actionKind: "type",
+			targetBundleID: "com.example.Browser", targetAppName: "Browser",
+			executionLane: string(guicontrol.ComputerUseExecutionForeground),
+		},
+		{
+			name: "attached sheet stays runtime bound", actionKind: "click",
+			targetBundleID: "com.example.Editor", targetAppName: "Editor",
+			executionLane: string(guicontrol.ComputerUseExecutionForeground),
+		},
+		{
+			name: "system file picker stays runtime bound", actionKind: "click",
+			targetBundleID: "com.example.Messenger", targetAppName: "Messenger",
+			executionLane: string(guicontrol.ComputerUseExecutionForeground),
+		},
+		{
+			name: "cross app target stays runtime bound", actionKind: "click",
+			targetBundleID: "com.example.SecondApp", targetAppName: "SecondApp",
+			executionLane: string(guicontrol.ComputerUseExecutionForeground),
+		},
+		{
+			name: "foreground fallback requests its one transition", actionKind: "click",
+			targetBundleID: "com.apple.calculator", targetAppName: "Calculator",
+			executionLane:      string(guicontrol.ComputerUseExecutionForeground),
+			foregroundFallback: true,
+			wantRestored:       true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+			workflow := testGUIWorkflow(coordinator, "sess-native-lane", "turn-native-lane")
+			tool := &restoringGUIProbeTool{guiProbeTool: guiProbeTool{
+				name: "computer_use",
+				descriptor: agent.GUIActionDescriptor{
+					Participates:       true,
+					ActionKind:         test.actionKind,
+					Effect:             agent.GUIActionMutation,
+					TargetBundleID:     test.targetBundleID,
+					TargetAppName:      test.targetAppName,
+					ExecutionPath:      "accessibility",
+					ExecutionLane:      test.executionLane,
+					ForegroundFallback: test.foregroundFallback,
+				},
+			}}
+			ctx := tools.ContextWithOpenAINativeComputerActionV1(context.Background())
+
+			result := runGUIWorkflowWithControllerAckContext(
+				t,
+				coordinator,
+				workflow,
+				ctx,
+				tool,
+				`{}`,
+			)
+			if result.IsError || tool.calls != 1 {
+				t.Fatalf("result=%+v tool=%+v", result, tool)
+			}
+			if tool.restored != test.wantRestored {
+				t.Fatalf("restored=%v, want %v", tool.restored, test.wantRestored)
+			}
+			if tool.runAfterRestore != test.wantRestored {
+				t.Fatalf("runAfterRestore=%v, want %v", tool.runAfterRestore, test.wantRestored)
+			}
+			workflow.EndTurn()
+		})
+	}
+}
+
+func TestDaemonGUIWorkflowTargetRestoreFailureIsKnownPrecommit(t *testing.T) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"sess-restore-precommit",
+		"turn-restore-precommit",
+	)
+	tool := &restoringGUIProbeTool{
+		guiProbeTool: guiProbeTool{
+			name: "computer_use",
+			descriptor: agent.GUIActionDescriptor{
+				Participates:   true,
+				ActionKind:     "click",
+				Effect:         agent.GUIActionMutation,
+				TargetBundleID: "com.example.Editor",
+				TargetAppName:  "Editor",
+				ExecutionPath:  "synthetic_coordinate",
+			},
+		},
+		restoreErr: errors.New("transient target changed"),
+	}
+
+	result := runGUIWorkflowWithControllerAck(
+		t,
+		coordinator,
+		workflow,
+		tool,
+		`{}`,
+	)
+	if !result.IsError || tool.calls != 0 || !tool.restored {
+		t.Fatalf("result=%+v tool=%+v", result, tool)
+	}
+	if result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+		result.GUIOutcome.FailureCode != "target_restore_failed" {
+		t.Fatalf("restore failure lost precommit outcome: %+v", result)
 	}
 	workflow.EndTurn()
 }

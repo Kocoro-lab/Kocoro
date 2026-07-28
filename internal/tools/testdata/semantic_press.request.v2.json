@@ -11,6 +11,7 @@
     "expected_role": "AXButton",
     "expected_fingerprint": "axf_target",
     "fallback_policy": "none",
+    "interference_policy": "global_physical",
     "commit_deadline_at": "2099-01-02T03:04:06.000000000Z",
     "risk_destination_assertion": null
   }

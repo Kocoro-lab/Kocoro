@@ -96,6 +96,12 @@ type exactAccessibilityWindowResult struct {
 	ContentSig  string `json:"content_signature"`
 }
 
+type exactVisualOnlyWindowCapture struct {
+	Image    agent.ImageBlock
+	WidthPX  int
+	HeightPX int
+}
+
 type accessibilityArgs struct {
 	Action      string   `json:"action"`
 	Description string   `json:"description"`
@@ -642,36 +648,64 @@ func decodeExactAccessibilityWindow(
 func decodeExactVisualOnlyWindow(
 	result exactAccessibilityWindowResult,
 ) (agent.ImageBlock, error) {
+	capture, err := decodeExactVisualOnlyWindowCapture(result)
+	if err != nil {
+		return agent.ImageBlock{}, err
+	}
+	return capture.Image, nil
+}
+
+func decodeExactVisualOnlyWindowCapture(
+	result exactAccessibilityWindowResult,
+) (exactVisualOnlyWindowCapture, error) {
 	if !result.OK {
 		if result.Code == "" {
 			result.Code = "capture_failed"
 		}
-		return agent.ImageBlock{},
+		return exactVisualOnlyWindowCapture{},
 			fmt.Errorf("visual-only exact window capture failed: %s", result.Code)
 	}
 	if result.Width <= 0 || result.Height <= 0 ||
 		result.ImageBase64 == "" || result.ContentSig != "" {
-		return agent.ImageBlock{},
+		return exactVisualOnlyWindowCapture{},
 			fmt.Errorf("visual-only exact window returned invalid metadata")
 	}
 	raw, err := base64.StdEncoding.Strict().DecodeString(result.ImageBase64)
 	if err != nil ||
 		base64.StdEncoding.EncodeToString(raw) != result.ImageBase64 {
-		return agent.ImageBlock{},
+		return exactVisualOnlyWindowCapture{},
 			fmt.Errorf("decode visual-only exact window image")
 	}
 	config, _, err := image.DecodeConfig(bytes.NewReader(raw))
 	if err != nil {
-		return agent.ImageBlock{},
+		return exactVisualOnlyWindowCapture{},
 			fmt.Errorf("inspect visual-only exact window image: %w", err)
 	}
 	if config.Width != result.Width || config.Height != result.Height {
-		return agent.ImageBlock{}, fmt.Errorf(
+		return exactVisualOnlyWindowCapture{}, fmt.Errorf(
 			"visual-only exact window image dimensions %dx%d do not match metadata %dx%d",
 			config.Width, config.Height, result.Width, result.Height,
 		)
 	}
-	return EncodeImageBytes(raw, "image/png")
+	block, err := EncodeImageBytes(raw, "image/png")
+	if err != nil {
+		return exactVisualOnlyWindowCapture{}, err
+	}
+	finalRaw, err := base64.StdEncoding.Strict().DecodeString(block.Data)
+	if err != nil || base64.StdEncoding.EncodeToString(finalRaw) != block.Data {
+		return exactVisualOnlyWindowCapture{},
+			fmt.Errorf("decode final visual-only exact window image")
+	}
+	finalConfig, _, err := image.DecodeConfig(bytes.NewReader(finalRaw))
+	if err != nil || finalConfig.Width <= 0 || finalConfig.Height <= 0 {
+		return exactVisualOnlyWindowCapture{},
+			fmt.Errorf("inspect final visual-only exact window image")
+	}
+	return exactVisualOnlyWindowCapture{
+		Image:    block,
+		WidthPX:  finalConfig.Width,
+		HeightPX: finalConfig.Height,
+	}, nil
 }
 
 func (t *AccessibilityTool) scroll(ctx context.Context, args accessibilityArgs) (agent.ToolResult, error) {

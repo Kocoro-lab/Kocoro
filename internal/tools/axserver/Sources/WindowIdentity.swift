@@ -89,6 +89,36 @@ func matchWindowIdentity(
     }
 }
 
+/// A focused AX window has one additional identity witness: when its process
+/// is frontmost, CGWindowList order identifies the visible topmost twin. Keep
+/// ordinary/background matching fail-closed because z-order alone does not
+/// prove which same-process window owns background focus.
+func matchFocusedWindowIdentity(
+    _ observation: WindowIdentityObservation,
+    candidates: [CGWindowIdentityCandidate],
+    targetProcessIsFrontmost: Bool,
+    tolerance: Double = 2.0
+) -> WindowIdentityMatch {
+    let strictMatch = matchWindowIdentity(
+        observation,
+        candidates: candidates,
+        tolerance: tolerance)
+    guard strictMatch == .ambiguous, targetProcessIsFrontmost else {
+        return strictMatch
+    }
+    let visibleMatches = matchingWindowCandidates(
+        observation,
+        candidates: candidates,
+        tolerance: tolerance
+    ).filter {
+        $0.windowID > 0 && $0.isOnScreen && $0.alpha > 0
+    }
+    guard let topmost = visibleMatches.first else {
+        return .ambiguous
+    }
+    return .unique(topmost.windowID)
+}
+
 func currentCGWindowIdentityCandidates() -> [CGWindowIdentityCandidate] {
     guard let entries = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] else {
         return []
@@ -125,6 +155,24 @@ func uniqueWindowID(pid: Int, title: String, frame: AXFrame?) -> Int? {
     if case let .unique(windowID) = matchWindowIdentity(
         observation,
         candidates: currentCGWindowIdentityCandidates()
+    ) {
+        return windowID
+    }
+    return nil
+}
+
+func focusedWindowID(pid: Int, title: String, frame: AXFrame?) -> Int? {
+    guard let frame else { return nil }
+    refreshAppKitState()
+    let processID = pid_t(exactly: pid)
+    let targetProcessIsFrontmost =
+        processID != nil &&
+        NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
+    let observation = WindowIdentityObservation(pid: pid, title: title, frame: frame)
+    if case let .unique(windowID) = matchFocusedWindowIdentity(
+        observation,
+        candidates: currentCGWindowIdentityCandidates(),
+        targetProcessIsFrontmost: targetProcessIsFrontmost
     ) {
         return windowID
     }

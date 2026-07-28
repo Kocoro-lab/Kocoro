@@ -255,6 +255,21 @@ type openAIComputerDaemonRuntimeProbe struct {
 	initialObservationApps []string
 	resolvedApps           []string
 	launchedApps           []tools.OpenAIComputerTaskAppV1
+	preparationOptions     []tools.OpenAIComputerTaskPreparationOptionsV1
+}
+
+type backgroundSemanticDaemonRuntimeProbe struct {
+	*openAIComputerDaemonRuntimeProbe
+}
+
+func (r *backgroundSemanticDaemonRuntimeProbe) PrepareTaskAppsV1(
+	_ context.Context,
+	apps []tools.OpenAIComputerTaskAppV1,
+	options tools.OpenAIComputerTaskPreparationOptionsV1,
+) (tools.OpenAIComputerExecutionLaneV1, error) {
+	r.launchedApps = append(r.launchedApps, apps...)
+	r.preparationOptions = append(r.preparationOptions, options)
+	return tools.OpenAIComputerExecutionBackgroundSemanticV1, r.launchErr
 }
 
 func (r *openAIComputerDaemonRuntimeProbe) ResolveTaskAppV1(
@@ -1353,7 +1368,9 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 	result, err := taskTool.Run(
 		context.Background(),
 		`{"task":"Open Slack, type hello, then switch to Calculator and click 7",`+
-			`"apps":["Slack","Calculator"],"description":"Complete the desktop task"}`,
+			`"controlled_apps":["Slack","Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil {
 		t.Fatalf("task Run: %v", err)
@@ -1519,6 +1536,8 @@ func TestOpenAIComputerChildGoalInputKeepsOriginalCrossAppRequest(t *testing.T) 
 	encoded := openAIComputerChildGoalInputV1(
 		ctx,
 		"Open TextEdit and type hello",
+		[]string{"TextEdit", "Calculator"},
+		openAIComputerForegroundAllowedV1,
 	)
 	var goal openAIComputerChildGoalV1
 	if err := json.Unmarshal([]byte(encoded), &goal); err != nil {
@@ -1531,12 +1550,46 @@ func TestOpenAIComputerChildGoalInputKeepsOriginalCrossAppRequest(t *testing.T) 
 	if goal.ParentDesktopPlan != "Open TextEdit and type hello" {
 		t.Fatalf("parent desktop plan = %q", goal.ParentDesktopPlan)
 	}
+	if got := strings.Join(goal.ControlledApps, ","); got !=
+		"TextEdit,Calculator" {
+		t.Fatalf("controlled apps = %q", got)
+	}
+	if goal.ForegroundPolicy != openAIComputerForegroundAllowedV1 {
+		t.Fatalf("foreground policy = %q", goal.ForegroundPolicy)
+	}
 }
 
 func TestOpenAIComputerChildGoalInputFallsBackForDirectInvocation(t *testing.T) {
 	const plan = "Open Calculator and enter 7+8"
-	if got := openAIComputerChildGoalInputV1(context.Background(), plan); got != plan {
+	if got := openAIComputerChildGoalInputV1(
+		context.Background(),
+		plan,
+		[]string{"Calculator"},
+		openAIComputerForegroundAllowedV1,
+	); got != plan {
 		t.Fatalf("direct child goal = %q, want %q", got, plan)
+	}
+}
+
+func TestOpenAIComputerChildGoalInputCarriesRequiredBackgroundContract(
+	t *testing.T,
+) {
+	const plan = "Press Calculator 7 without activating Calculator"
+	encoded := openAIComputerChildGoalInputV1(
+		context.Background(),
+		plan,
+		[]string{"Calculator"},
+		openAIComputerPreserveFrontmostV1,
+	)
+	var goal openAIComputerChildGoalV1
+	if err := json.Unmarshal([]byte(encoded), &goal); err != nil {
+		t.Fatalf("decode background child goal: %v", err)
+	}
+	if goal.OriginalUserRequest != plan ||
+		goal.ParentDesktopPlan != plan ||
+		strings.Join(goal.ControlledApps, ",") != "Calculator" ||
+		goal.ForegroundPolicy != openAIComputerPreserveFrontmostV1 {
+		t.Fatalf("background child goal = %+v", goal)
 	}
 }
 
@@ -1562,7 +1615,8 @@ func TestOpenAIComputerTaskToolResolverFailureDoesNotTouchDesktop(t *testing.T) 
 	for attempt := 0; attempt < 2; attempt++ {
 		result, err := taskTool.Run(
 			context.Background(),
-			`{"task":"Open Slack and type hello","apps":["Slack"],`+
+			`{"task":"Open Slack and type hello","controlled_apps":["Slack"],`+
+				`"foreground_policy":"foreground_allowed",`+
 				`"description":"Complete the desktop task"}`,
 		)
 		if err != nil {
@@ -1627,7 +1681,8 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Inspect Calculator","apps":["Calculator"],"description":"Inspect the app"}`,
+		`{"task":"Inspect Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed","description":"Inspect the app"}`,
 	)
 	if err != nil {
 		t.Fatalf("task Run: %v", err)
@@ -1674,7 +1729,8 @@ func TestOpenAIComputerTaskToolAppResolutionFailureHasExecutableRecovery(
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Open Missing App","apps":["Missing App"],`+
+		`{"task":"Open Missing App","controlled_apps":["Missing App"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Open the app"}`,
 	)
 	if err != nil {
@@ -1729,7 +1785,8 @@ func TestOpenAIComputerTaskToolLaunchFailureReportsPossiblePreparation(
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Open Calculator","apps":["Calculator"],`+
+		`{"task":"Open Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Open the app"}`,
 	)
 	if err != nil {
@@ -1785,14 +1842,18 @@ func TestOpenAIComputerTaskToolProtectedFrontmostRequestsAppHints(t *testing.T) 
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Open the browser","description":"Open the browser"}`,
+		`{"task":"Open the browser","foreground_policy":"foreground_allowed",`+
+			`"description":"Open the browser"}`,
 	)
 	if err != nil {
 		t.Fatalf("task Run: %v", err)
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "initial_target_required") ||
-		!strings.Contains(result.Content, "with the relevant app names in apps") {
+		!strings.Contains(
+			result.Content,
+			"controlled app names in controlled_apps",
+		) {
 		t.Fatalf("task result = %+v", result)
 	}
 	if result.ComputerUseOutcome == nil ||
@@ -1911,7 +1972,8 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Compute 3-10 in Calculator","apps":["Calculator"],`+
+		`{"task":"Compute 3-10 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil {
@@ -1927,6 +1989,158 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 	}
 	if !reflect.DeepEqual(waits, []int{1, 2}) {
 		t.Fatalf("initial observation waits = %v", waits)
+	}
+}
+
+func TestOpenAIComputerObservationAcceptsSemanticAuthorityOnlyForBackgroundLane(
+	t *testing.T,
+) {
+	image := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "c2VtYW50aWMtaW1hZ2U=",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			SemanticActionable: true,
+		},
+	}
+	for _, test := range []struct {
+		name          string
+		allowSemantic bool
+		wantAttempts  int
+	}{
+		{name: "foreground", allowSemantic: false, wantAttempts: 2},
+		{name: "background semantic", allowSemantic: true, wantAttempts: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attempts := 0
+			_, err := runOpenAIComputerObservationV1(
+				context.Background(),
+				2,
+				true,
+				test.allowSemantic,
+				func(context.Context, int) error { return nil },
+				func(context.Context, int) (agent.ToolResult, error) {
+					attempts++
+					return image, nil
+				},
+				nil,
+			)
+			if err != nil || attempts != test.wantAttempts {
+				t.Fatalf("semantic observation attempts=%d err=%v, want %d",
+					attempts, err, test.wantAttempts)
+			}
+		})
+	}
+}
+
+func TestOpenAIComputerTaskBackgroundLaneStartsFromSemanticOnlyImage(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-background-semantic-image",
+		"turn-openai-background-semantic-image",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	semanticImage := agent.ToolResult{
+		Content: "observed",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "c2VtYW50aWMtaW1hZ2U=",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			SemanticActionable: true,
+		},
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "pressed",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"final_screenshot": semanticImage,
+		},
+	}
+	baseRuntime := &openAIComputerDaemonRuntimeProbe{tool: probe}
+	runtime := &backgroundSemanticDaemonRuntimeProbe{
+		openAIComputerDaemonRuntimeProbe: baseRuntime,
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(
+		`{"type":"click","button":"left","x":10,"y":20}`,
+	)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_background_semantic_final",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Calculator shows the requested result while remaining in the background.\"}"}`,
+			`{"status":"completed","summary":"Calculator shows the requested result while remaining in the background."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     runtime,
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+		observationRetry: func(context.Context, int) error {
+			t.Fatal("semantic-only background image was retried")
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Press Calculator 7 in the background",`+
+			`"controlled_apps":["Calculator"],`+
+			`"foreground_policy":"preserve_frontmost",`+
+			`"description":"Complete the background desktop task"}`,
+	)
+	if err != nil || result.IsError ||
+		!strings.Contains(
+			result.Content,
+			"Calculator shows the requested result while remaining in the background.",
+		) ||
+		!strings.Contains(
+			result.Content,
+			"execution: background_semantic; foreground activation and fallback were disabled",
+		) {
+		t.Fatalf("background semantic task result=%+v err=%v", result, err)
+	}
+	if got := strings.Join(runtime.resolvedApps, ","); got != "Calculator" {
+		t.Fatalf("background controlled apps = %q", got)
+	}
+	if len(runtime.preparationOptions) != 1 ||
+		!runtime.preparationOptions[0].RequireBackground {
+		t.Fatalf("background preparation options = %+v", runtime.preparationOptions)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot" {
+		t.Fatalf("background semantic desktop runs=%q", got)
 	}
 }
 
@@ -2028,7 +2242,8 @@ func TestOpenAIComputerTaskToolAcceptsVisualSuccessAfterDynamicWindowCaptureSett
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Compute 3-10 in Calculator","apps":["Calculator"],`+
+		`{"task":"Compute 3-10 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil || result.IsError ||
@@ -2122,7 +2337,8 @@ func TestOpenAIComputerTaskToolReturnsUnverifiedInsteadOfFailureWhenFinalObserva
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Compute 3-10 in Calculator","apps":["Calculator"],`+
+		`{"task":"Compute 3-10 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil || result.IsError ||
@@ -2192,7 +2408,8 @@ func TestOpenAIComputerTaskToolExecutorFailureBeforeActionDoesNotClaimUnknownSid
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Inspect Calculator","apps":["Calculator"],"description":"Inspect the app"}`,
+		`{"task":"Inspect Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed","description":"Inspect the app"}`,
 	)
 	if err != nil {
 		t.Fatalf("task Run: %v", err)
@@ -2277,7 +2494,8 @@ func TestOpenAIComputerTaskToolPreservesEarlierCommitWhenLaterProviderCallFails(
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Click the visible control","apps":["TextEdit"],`+
+		`{"task":"Click the visible control","controlled_apps":["TextEdit"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil {
@@ -2342,7 +2560,8 @@ func TestOpenAIComputerTaskToolBoundsPrivateExecutorDuration(t *testing.T) {
 	started := time.Now()
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Open waylandz.com in Chrome","apps":["Google Chrome"],`+
+		`{"task":"Open waylandz.com in Chrome","controlled_apps":["Google Chrome"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Open the browser page"}`,
 	)
 	if err != nil {
@@ -2457,7 +2676,8 @@ func TestOpenAIComputerTaskToolBoundsAndReportsInitialProviderStall(
 	started := time.Now()
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Type hello in TextEdit","apps":["TextEdit"],`+
+		`{"task":"Type hello in TextEdit","controlled_apps":["TextEdit"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Edit the document"}`,
 	)
 	if err != nil {
@@ -2535,7 +2755,8 @@ func TestOpenAIComputerTaskToolRejectsCompletionClaimWithoutAnyDesktopAction(
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Compute 250*0.01 in Calculator","apps":["Calculator"],`+
+		`{"task":"Compute 250*0.01 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil {
@@ -2629,7 +2850,8 @@ func TestOpenAIComputerTaskToolAcceptsScreenshotVerifiedCompletionAfterFailedBat
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Compute 3+3 in Calculator","apps":["Calculator"],`+
+		`{"task":"Compute 3+3 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil {
@@ -2714,7 +2936,8 @@ func TestOpenAIComputerTaskToolReportsFailedOutcomeAfterSuccessfulBatch(
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Compute 3+3 in Calculator","apps":["Calculator"],`+
+		`{"task":"Compute 3+3 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil {
@@ -2801,7 +3024,8 @@ func TestOpenAIComputerTaskToolRejectsMalformedTerminalOutcome(t *testing.T) {
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Wait for Calculator","apps":["Calculator"],`+
+		`{"task":"Wait for Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil {
@@ -2814,14 +3038,75 @@ func TestOpenAIComputerTaskToolRejectsMalformedTerminalOutcome(t *testing.T) {
 	}
 }
 
-func TestOpenAIComputerTaskToolSchemaKeepsAppHintsOptional(t *testing.T) {
+func TestOpenAIComputerTaskToolSchemaSeparatesControlledAppsAndForegroundPolicy(
+	t *testing.T,
+) {
 	info := (&openAIComputerTaskToolV1{}).Info()
-	if got := strings.Join(info.Required, ","); got != "task,description" {
+	if got := strings.Join(info.Required, ","); got !=
+		"task,foreground_policy,description" {
 		t.Fatalf("required fields = %q", got)
 	}
 	properties := info.Parameters["properties"].(map[string]any)
-	if _, ok := properties["apps"]; !ok {
-		t.Fatal("optional app launch hints are missing")
+	if _, ok := properties["controlled_apps"]; !ok {
+		t.Fatal("controlled app targets are missing")
+	}
+	if _, ok := properties["apps"]; ok {
+		t.Fatal("ambiguous legacy app hints remain model-visible")
+	}
+	policy, ok := properties["foreground_policy"].(map[string]any)
+	if !ok || !reflect.DeepEqual(
+		policy["enum"],
+		[]string{
+			openAIComputerForegroundAllowedV1,
+			openAIComputerPreserveFrontmostV1,
+		},
+	) {
+		t.Fatalf("foreground policy schema = %+v", policy)
+	}
+}
+
+func TestOpenAIComputerTaskArgsRequireOneControlledAppWhenPreservingFrontmost(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name string
+		args openAIComputerTaskArgsV1
+		want string
+	}{
+		{
+			name: "one controlled app",
+			args: openAIComputerTaskArgsV1{
+				ControlledApps:   []string{" Calculator ", "calculator"},
+				ForegroundPolicy: openAIComputerPreserveFrontmostV1,
+			},
+			want: "Calculator",
+		},
+		{
+			name: "preserved app is not another controlled app",
+			args: openAIComputerTaskArgsV1{
+				ControlledApps:   []string{"Calculator", "TextEdit"},
+				ForegroundPolicy: openAIComputerPreserveFrontmostV1,
+			},
+		},
+		{
+			name: "policy is explicit",
+			args: openAIComputerTaskArgsV1{
+				ControlledApps: []string{"Calculator"},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			apps, err := normalizeOpenAIComputerTaskArgsV1(&test.args)
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("normalized apps = %+v, want error", apps)
+				}
+				return
+			}
+			if err != nil || strings.Join(apps, ",") != test.want {
+				t.Fatalf("normalized apps = %+v, err=%v", apps, err)
+			}
+		})
 	}
 }
 
@@ -2884,7 +3169,9 @@ func TestOpenAIComputerTaskToolRunsAgainstCurrentAppWithoutAppHints(t *testing.T
 
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Wait for the current app to settle","description":"Complete the desktop task"}`,
+		`{"task":"Wait for the current app to settle",`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
 	)
 	if err != nil || result.IsError || result.Content != "done" {
 		t.Fatalf("current-app task result = %+v / %v", result, err)

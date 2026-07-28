@@ -16,6 +16,8 @@
     "action_phase": "verifying",
     "action_result": null,
     "execution_path": "accessibility",
+    "execution_lane": "foreground",
+    "foreground_fallback": false,
     "pointer": {
       "display_id": 1,
       "topology_id": "topo_mixed_001",

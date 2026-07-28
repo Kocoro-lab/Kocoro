@@ -5,6 +5,32 @@ import (
 	"testing"
 )
 
+func TestBackgroundKeyboardActivityIsValidOnlyWithoutPhysicalPointerOrFallback(
+	t *testing.T,
+) {
+	lane := ComputerUseExecutionBackgroundKeyboard
+	state := ComputerUseActivityState{
+		LeaseID: "cul_background_keyboard", SessionID: "session",
+		LeaseState: ComputerUseLeaseActive, ActionPhase: ComputerUsePhaseActing,
+		ExecutionLane: &lane, TS: "2026-07-28T06:00:00Z",
+	}
+	if err := state.Validate(); err != nil {
+		t.Fatalf("valid background keyboard activity: %v", err)
+	}
+	state.ForegroundFallback = true
+	if err := state.Validate(); err == nil {
+		t.Fatal("background keyboard activity accepted foreground fallback")
+	}
+	state.ForegroundFallback = false
+	state.Pointer = &ComputerUsePointer{
+		DisplayID: 1, TopologyID: "topology", TopologyGeneration: 1,
+		X: 100, Y: 200, CoordinateSpace: ComputerUseCoordinateQuartzGlobalPoints,
+	}
+	if err := state.Validate(); err == nil {
+		t.Fatal("background keyboard activity published a physical pointer")
+	}
+}
+
 func TestHeartbeatRequestWireIsStrict(t *testing.T) {
 	want := ComputerUseHeartbeatRequest{
 		SchemaVersion: ComputerUseHeartbeatSchemaVersion,

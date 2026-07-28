@@ -124,6 +124,7 @@ type ToolResult struct {
 
 type GUIObservationOutcome struct {
 	CoordinateActionable bool
+	SemanticActionable   bool
 }
 
 // ToolUsage is ToolResult's per-call cost breakdown. Mirrors client.ToolUsage

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 )
 
 // axCallClient is the narrow ax_server seam used by computer_use. Keeping the
@@ -39,6 +40,91 @@ type computerUseSnapshot struct {
 	elements               []computerUseElement
 	signatures             map[string]string
 	typed                  bool
+}
+
+// computerUseSemanticImageArtifactV1 binds an exact window image to the AX
+// snapshot that produced it without granting physical coordinate authority.
+// It exists for the background semantic lane only: a window may be partly
+// outside an active display yet still support a safe, exact AXPress. Physical
+// mouse, drag, scroll, and keyboard paths never consume this artifact.
+type computerUseSemanticImageArtifactV1 struct {
+	stateID      string
+	pid          int
+	bundleID     string
+	windowID     int
+	windowBounds CoordinateQuartzRectV1
+	widthPX      int
+	heightPX     int
+	createdAt    time.Time
+	expiresAt    time.Time
+}
+
+func newComputerUseSemanticImageArtifactV1(
+	tree computerUseTree,
+	stateID string,
+	capture exactVisualOnlyWindowCapture,
+	now time.Time,
+) (*computerUseSemanticImageArtifactV1, error) {
+	if tree.SchemaVersion != 1 || tree.PID <= 0 ||
+		strings.TrimSpace(tree.BundleID) == "" ||
+		tree.WindowID == nil || *tree.WindowID <= 0 ||
+		tree.WindowFrame == nil ||
+		strings.TrimSpace(stateID) == "" ||
+		capture.WidthPX <= 0 || capture.HeightPX <= 0 ||
+		now.IsZero() {
+		return nil, fmt.Errorf(
+			"semantic image requires exact app, window, state, and image identity",
+		)
+	}
+	bounds := CoordinateQuartzRectV1{
+		X: tree.WindowFrame.X, Y: tree.WindowFrame.Y,
+		Width: tree.WindowFrame.Width, Height: tree.WindowFrame.Height,
+	}
+	if err := validateCoordinateQuartzRect("semantic image window", bounds); err != nil {
+		return nil, err
+	}
+	now = now.UTC()
+	return &computerUseSemanticImageArtifactV1{
+		stateID: stateID, pid: tree.PID, bundleID: tree.BundleID,
+		windowID: *tree.WindowID, windowBounds: bounds,
+		widthPX: capture.WidthPX, heightPX: capture.HeightPX,
+		createdAt: now, expiresAt: now.Add(computerUseCoordinateFrameTTLV1),
+	}, nil
+}
+
+func (artifact *computerUseSemanticImageArtifactV1) mapPointV1(
+	snapshot *computerUseSnapshot,
+	now time.Time,
+	x int,
+	y int,
+) (CoordinateMappedPointV1, error) {
+	if artifact == nil || snapshot == nil || !snapshot.typed ||
+		snapshot.id == "" || snapshot.id != artifact.stateID ||
+		snapshot.pid != artifact.pid ||
+		snapshot.bundleID != artifact.bundleID ||
+		snapshot.windowID == nil || *snapshot.windowID != artifact.windowID ||
+		snapshot.expectedWindowAXBounds == nil ||
+		*snapshot.expectedWindowAXBounds != artifact.windowBounds {
+		return CoordinateMappedPointV1{},
+			fmt.Errorf("semantic image does not match the current exact AX target")
+	}
+	if now.IsZero() || now.Before(artifact.createdAt) ||
+		!now.Before(artifact.expiresAt) {
+		return CoordinateMappedPointV1{},
+			fmt.Errorf("semantic image authority is stale or expired")
+	}
+	if x < 0 || y < 0 || x >= artifact.widthPX || y >= artifact.heightPX {
+		return CoordinateMappedPointV1{},
+			fmt.Errorf("semantic image coordinate is outside the exact window image")
+	}
+	pixelCenterX := float64(x) + 0.5
+	pixelCenterY := float64(y) + 0.5
+	return CoordinateMappedPointV1{
+		X: artifact.windowBounds.X +
+			pixelCenterX*artifact.windowBounds.Width/float64(artifact.widthPX),
+		Y: artifact.windowBounds.Y +
+			pixelCenterY*artifact.windowBounds.Height/float64(artifact.heightPX),
+	}, nil
 }
 
 type computerUseCoordinateExecutorV1 func(
@@ -75,6 +161,18 @@ type computerUseTargetBoundInputExecutorV1 func(
 	context.Context,
 	TargetBoundInputRequestV1,
 ) (TargetBoundInputResultV1, error)
+
+type computerUseBackgroundTargetedInputExecutorV1 func(
+	context.Context,
+	BackgroundTargetedInputRequestV1,
+) (TargetBoundInputResultV1, error)
+
+type computerUseBackgroundInputAuthorityV1 struct {
+	targetLaunchDate             string
+	preservedFrontmostPID        int
+	preservedFrontmostBundleID   string
+	preservedFrontmostLaunchDate string
+}
 
 const (
 	computerUseCoordinateMaxRawCaptureBytesV1    = 16 * 1024 * 1024
@@ -136,40 +234,43 @@ func (v *computerUseInt) UnmarshalJSON(data []byte) error {
 }
 
 type computerUseArgs struct {
-	Action            string               `json:"action"`
-	Description       string               `json:"description"`
-	StateID           string               `json:"state_id,omitempty"`
-	App               string               `json:"app,omitempty"`
-	Window            string               `json:"window,omitempty"`
-	Ref               string               `json:"ref,omitempty"`
-	Value             *string              `json:"value,omitempty"`
-	X                 *computerUseInt      `json:"x,omitempty"`
-	Y                 *computerUseInt      `json:"y,omitempty"`
-	ScrollX           *computerUseInt      `json:"scroll_x,omitempty"`
-	ScrollY           *computerUseInt      `json:"scroll_y,omitempty"`
-	StartX            *computerUseInt      `json:"start_x,omitempty"`
-	StartY            *computerUseInt      `json:"start_y,omitempty"`
-	EndX              *computerUseInt      `json:"end_x,omitempty"`
-	EndY              *computerUseInt      `json:"end_y,omitempty"`
-	Path              []computerUsePoint   `json:"path,omitempty"`
-	DurationMS        computerUseInt       `json:"duration_ms,omitempty"`
-	Range             *SemanticTextRangeV2 `json:"range,omitempty"`
-	Text              *string              `json:"text,omitempty"`
-	Keys              string               `json:"keys,omitempty"`
-	KeySequence       []string             `json:"key_sequence,omitempty"`
-	Modifiers         []string             `json:"modifiers,omitempty"`
-	Button            string               `json:"button,omitempty"`
-	Clicks            computerUseInt       `json:"clicks,omitempty"`
-	DX                computerUseInt       `json:"dx,omitempty"`
-	DY                computerUseInt       `json:"dy,omitempty"`
-	Condition         string               `json:"condition,omitempty"`
-	Query             string               `json:"query,omitempty"`
-	Role              string               `json:"role,omitempty"`
-	Timeout           float64              `json:"timeout,omitempty"`
-	Interval          float64              `json:"interval,omitempty"`
-	Filter            string               `json:"filter,omitempty"`
-	SemanticBudget    computerUseInt       `json:"semantic_budget,omitempty"`
-	IncludeScreenshot bool                 `json:"include_screenshot,omitempty"`
+	Action             string               `json:"action"`
+	Description        string               `json:"description"`
+	StateID            string               `json:"state_id,omitempty"`
+	App                string               `json:"app,omitempty"`
+	Window             string               `json:"window,omitempty"`
+	Ref                string               `json:"ref,omitempty"`
+	Value              *string              `json:"value,omitempty"`
+	X                  *computerUseInt      `json:"x,omitempty"`
+	Y                  *computerUseInt      `json:"y,omitempty"`
+	ScrollX            *computerUseInt      `json:"scroll_x,omitempty"`
+	ScrollY            *computerUseInt      `json:"scroll_y,omitempty"`
+	StartX             *computerUseInt      `json:"start_x,omitempty"`
+	StartY             *computerUseInt      `json:"start_y,omitempty"`
+	EndX               *computerUseInt      `json:"end_x,omitempty"`
+	EndY               *computerUseInt      `json:"end_y,omitempty"`
+	Path               []computerUsePoint   `json:"path,omitempty"`
+	DurationMS         computerUseInt       `json:"duration_ms,omitempty"`
+	Range              *SemanticTextRangeV2 `json:"range,omitempty"`
+	Text               *string              `json:"text,omitempty"`
+	Keys               string               `json:"keys,omitempty"`
+	KeySequence        []string             `json:"key_sequence,omitempty"`
+	Modifiers          []string             `json:"modifiers,omitempty"`
+	Button             string               `json:"button,omitempty"`
+	Clicks             computerUseInt       `json:"clicks,omitempty"`
+	DX                 computerUseInt       `json:"dx,omitempty"`
+	DY                 computerUseInt       `json:"dy,omitempty"`
+	Condition          string               `json:"condition,omitempty"`
+	Query              string               `json:"query,omitempty"`
+	Role               string               `json:"role,omitempty"`
+	Timeout            float64              `json:"timeout,omitempty"`
+	Interval           float64              `json:"interval,omitempty"`
+	Filter             string               `json:"filter,omitempty"`
+	SemanticBudget     computerUseInt       `json:"semantic_budget,omitempty"`
+	IncludeScreenshot  bool                 `json:"include_screenshot,omitempty"`
+	ExecutionLane      string               `json:"execution_lane,omitempty"`
+	ForegroundFallback bool                 `json:"foreground_fallback,omitempty"`
+	FollowFrontmost    bool                 `json:"follow_frontmost,omitempty"`
 }
 
 type computerUsePoint struct {
@@ -202,7 +303,6 @@ type computerUseCoordinateFocusV1 struct {
 	filter                 string
 	budget                 int
 	locationNavigation     bool
-	allowsWindowBoundType  bool
 }
 
 type computerUseNavigationCommitV1 struct {
@@ -254,25 +354,29 @@ func (focus *computerUseCoordinateFocusV1) matchesTree(
 // keeps only one current observation per agent run: refs are meaningful only
 // for that state_id and every ref action re-observes before touching the GUI.
 type ComputerUseTool struct {
-	client                        axCallClient
-	targetScope                   computerUseTargetScopeV1
-	initialTarget                 *ComputerUseInitialTargetV1
-	snapshot                      *computerUseSnapshot
-	refs                          map[string]refEntry
-	coordinateArtifact            *CoordinateWindowArtifactV1
-	coordinateFocus               *computerUseCoordinateFocusV1
-	navigationCommit              *computerUseNavigationCommitV1
-	coordinateExecutor            computerUseCoordinateExecutorV1
-	coordinateDragExecutor        computerUseCoordinateDragExecutorV1
-	coordinatePixelScrollExecutor computerUseCoordinatePixelScrollExecutorV1
-	semanticTextSelectionExecutor computerUseSemanticTextSelectionExecutorV2
-	semanticPressExecutor         computerUseSemanticPressExecutorV2
-	semanticScrollExecutor        computerUseSemanticScrollExecutorV1
-	targetBoundInputExecutor      computerUseTargetBoundInputExecutorV1
-	coordinateProfile             CoordinateImageProfileV1
-	coordinateCaptureLimits       CaptureCoordinateWindowLimitsV1
-	coordinateNow                 func() time.Time
-	coordinateFrameID             func() (string, error)
+	client                           axCallClient
+	targetScope                      computerUseTargetScopeV1
+	initialTarget                    *ComputerUseInitialTargetV1
+	snapshot                         *computerUseSnapshot
+	refs                             map[string]refEntry
+	coordinateArtifact               *CoordinateWindowArtifactV1
+	semanticImageArtifact            *computerUseSemanticImageArtifactV1
+	coordinateFocus                  *computerUseCoordinateFocusV1
+	navigationCommit                 *computerUseNavigationCommitV1
+	coordinateExecutor               computerUseCoordinateExecutorV1
+	coordinateDragExecutor           computerUseCoordinateDragExecutorV1
+	coordinatePixelScrollExecutor    computerUseCoordinatePixelScrollExecutorV1
+	semanticTextSelectionExecutor    computerUseSemanticTextSelectionExecutorV2
+	semanticPressExecutor            computerUseSemanticPressExecutorV2
+	semanticScrollExecutor           computerUseSemanticScrollExecutorV1
+	targetBoundInputExecutor         computerUseTargetBoundInputExecutorV1
+	backgroundTargetedInputExecutor  computerUseBackgroundTargetedInputExecutorV1
+	backgroundInputAuthority         *computerUseBackgroundInputAuthorityV1
+	foregroundFallbackRestorePending bool
+	coordinateProfile                CoordinateImageProfileV1
+	coordinateCaptureLimits          CaptureCoordinateWindowLimitsV1
+	coordinateNow                    func() time.Time
+	coordinateFrameID                func() (string, error)
 }
 
 // A Mac has one frontmost app, pointer, keyboard focus, and AX server. Keep a
@@ -443,6 +547,9 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 	}
 	if strings.TrimSpace(args.Description) == "" {
 		return agent.ValidationError("missing required parameter: description"), nil
+	}
+	if _, _, err := computerUseExecutionPresentationV1(ctx, args); err != nil {
+		return agent.ValidationError(err.Error()), nil
 	}
 	if t.requiresExplicitFirstTargetV1(ctx, args) {
 		return agent.BusinessError(
@@ -657,6 +764,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	// artifact is installed only after tree A -> topology -> capture ->
 	// finalizer -> tree B succeeds as one exact-window transaction.
 	t.coordinateArtifact = nil
+	t.semanticImageArtifact = nil
 	pendingFocus := t.coordinateFocus
 	t.coordinateFocus = nil
 
@@ -668,7 +776,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 			pid = t.snapshot.pid
 			expectedPID = t.snapshot.pid
 			expectedBundleID = t.snapshot.bundleID
-		} else if pendingFocus != nil {
+		} else if pendingFocus != nil && !args.FollowFrontmost {
 			pid = pendingFocus.pid
 			expectedPID = pendingFocus.pid
 			expectedBundleID = pendingFocus.bundleID
@@ -723,11 +831,34 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	)
 	if !ok {
 		if computerUseAllowsVisualOnlyFallbackV1(failure) {
-			image, visualErr := t.captureVisualOnlyObservationV1(ctx, tree)
+			capture, visualErr := t.captureVisualOnlyObservationV1(ctx, tree)
 			if visualErr == nil {
-				result.Images = []agent.ImageBlock{image}
+				result.Images = []agent.ImageBlock{capture.Image}
 				result.GUIObservation = &agent.GUIObservationOutcome{
 					CoordinateActionable: false,
+				}
+				if failure.GUIOutcome != nil &&
+					failure.GUIOutcome.FailureCode == "display_not_actionable" {
+					currentTree, _, currentOK := t.readTree(
+						ctx,
+						tree.PID,
+						filter,
+						budget,
+					)
+					if currentOK &&
+						computerUseCoordinateTreesStableV1(tree, currentTree) {
+						semanticArtifact, semanticErr :=
+							newComputerUseSemanticImageArtifactV1(
+								tree,
+								stateID,
+								capture,
+								t.computerUseCoordinateNowV1(),
+							)
+						if semanticErr == nil {
+							t.semanticImageArtifact = semanticArtifact
+							result.GUIObservation.SemanticActionable = true
+						}
+					}
 				}
 				result.Content += "\ncoordinate_notice: exact window screenshot is visual-only; coordinate actions require a new fully actionable observation"
 				result.GUICaptureDiagnostics = failure.GUICaptureDiagnostics
@@ -745,6 +876,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	result.Images = []agent.ImageBlock{artifact.ImageBlock()}
 	result.GUIObservation = &agent.GUIObservationOutcome{
 		CoordinateActionable: true,
+		SemanticActionable:   true,
 	}
 	return result, nil
 }
@@ -771,11 +903,11 @@ func computerUseAllowsVisualOnlyFallbackV1(
 func (t *ComputerUseTool) captureVisualOnlyObservationV1(
 	ctx context.Context,
 	tree computerUseTree,
-) (agent.ImageBlock, error) {
+) (exactVisualOnlyWindowCapture, error) {
 	if t == nil || t.client == nil || tree.PID <= 0 ||
 		tree.WindowID == nil || *tree.WindowID <= 0 ||
 		tree.WindowFrame == nil {
-		return agent.ImageBlock{},
+		return exactVisualOnlyWindowCapture{},
 			fmt.Errorf("visual-only capture requires exact window identity")
 	}
 	raw, err := t.client.Call(ctx, "capture_window", map[string]any{
@@ -791,14 +923,14 @@ func (t *ComputerUseTool) captureVisualOnlyObservationV1(
 		"max_labels": 0,
 	})
 	if err != nil {
-		return agent.ImageBlock{}, err
+		return exactVisualOnlyWindowCapture{}, err
 	}
 	var result exactAccessibilityWindowResult
 	if err := json.Unmarshal(raw, &result); err != nil {
-		return agent.ImageBlock{},
+		return exactVisualOnlyWindowCapture{},
 			fmt.Errorf("decode visual-only exact window: %w", err)
 	}
-	return decodeExactVisualOnlyWindow(result)
+	return decodeExactVisualOnlyWindowCapture(result)
 }
 
 func (t *ComputerUseTool) publishComputerUseObservation(
@@ -1332,7 +1464,12 @@ func (t *ComputerUseTool) semanticPress(ctx context.Context, args computerUseArg
 		ExpectedRole:        entry.role,
 		ExpectedFingerprint: entry.fingerprint,
 		FallbackPolicy:      "none",
+		InterferencePolicy:  "global_physical",
 		CommitDeadlineAt:    t.computerUseCoordinateNowV1().Add(time.Second).UTC().Format(time.RFC3339Nano),
+	}
+	if args.ExecutionLane ==
+		string(guicontrol.ComputerUseExecutionBackgroundSemantic) {
+		request.InterferencePolicy = "target_foreground"
 	}
 	if err := request.Validate(); err != nil {
 		return agent.BusinessError(
@@ -1677,12 +1814,6 @@ func (t *ComputerUseTool) coordinateFocusedType(
 	}
 	ref, entry, element, hasFocusedElement :=
 		computerUseFocusedElementAuthorityV1(current)
-	if !focus.allowsWindowBoundType &&
-		(!hasFocusedElement || !computerUseEditableFocusEvidenceV1(element)) {
-		return computerUseKeyboardTargetUnavailableReasonV1(
-			"keyboard_focused_element_unavailable",
-		), nil
-	}
 	deadline := t.computerUseCoordinateNowV1().Add(
 		computerUseMutationDeadlineV1,
 	)
@@ -1864,15 +1995,31 @@ func (t *ComputerUseTool) keypress(
 	if len(args.KeySequence) == 0 {
 		return agent.ValidationError("keypress requires non-empty 'key_sequence'"), nil
 	}
-	if args.Keys != "" || args.Ref != "" {
+	backgroundKeyboard := args.ExecutionLane ==
+		string(guicontrol.ComputerUseExecutionBackgroundKeyboard)
+	if args.Keys != "" || (args.Ref != "" && !backgroundKeyboard) {
 		return agent.ValidationError(
-			"keypress is window-bound and accepts key_sequence/modifiers only"), nil
+			"keypress accepts a focused ref only in background keyboard execution"), nil
+	}
+	if backgroundKeyboard && args.Ref == "" {
+		return agent.ValidationError(
+			"background keyboard keypress requires one exact focused ref"), nil
 	}
 	if len(args.KeySequence) > 64 || len(args.Modifiers) > 4 {
 		return agent.ValidationError(
 			"keypress exceeds the admitted key/modifier sequence"), nil
 	}
+	if backgroundKeyboard &&
+		backgroundTargetedInputConsequentialKeyV1(
+			args.KeySequence,
+			args.Modifiers,
+		) {
+		return consequentialRiskToolFailureV1(
+			ConsequentialRiskCodeUnsupportedPathV1,
+		), nil
+	}
 	if computerUseKeyboardNeedsExactIntentV1(args) &&
+		!backgroundKeyboard &&
 		!t.allowsLocationNavigationCommitV1(args) {
 		if _, ok := t.ordinaryKeyboardFocusWitnessV1(args); !ok {
 			t.invalidateState()
@@ -1910,10 +2057,19 @@ func (t *ComputerUseTool) targetBoundInput(
 			"target-bound input requires typed bundle and unique window authority; call get_app_state again",
 		), nil
 	}
+	backgroundKeyboard := args.ExecutionLane ==
+		string(guicontrol.ComputerUseExecutionBackgroundKeyboard)
+	if backgroundKeyboard &&
+		(args.Action != "type" && args.Action != "keypress") {
+		return computerUsePrecommitBusinessErrorV1(
+			"background_keyboard_action_invalid",
+			"background keyboard execution supports type or keypress only",
+		), nil
+	}
 	var typeEntry refEntry
 	var navigationCommit *computerUseNavigationCommitV1
 	var keyboardFocusWitness *computerUseKeyboardFocusWitnessV1
-	if args.Action == "type" {
+	if args.Action == "type" || backgroundKeyboard {
 		var exists bool
 		typeEntry, exists = t.refs[args.Ref]
 		if !exists {
@@ -1969,9 +2125,22 @@ func (t *ComputerUseTool) targetBoundInput(
 			"target-bound input window authority is invalid; call get_app_state again",
 		), nil
 	}
-	if args.Action == "type" {
+	if args.Action == "type" || backgroundKeyboard {
 		if current.FocusedRef == nil || *current.FocusedRef != args.Ref {
 			return computerUseKeyboardTargetUnavailableV1(), nil
+		}
+		if backgroundKeyboard {
+			ref, entry, element, focused :=
+				computerUseFocusedElementAuthorityV1(current)
+			if !focused || ref != args.Ref ||
+				entry.Path != typeEntry.path ||
+				entry.Role != typeEntry.role ||
+				entry.Fingerprint != typeEntry.fingerprint ||
+				!computerUseEditableFocusEvidenceV1(element) {
+				return computerUseKeyboardTargetUnavailableReasonV1(
+					"background_keyboard_focused_element_changed",
+				), nil
+			}
 		}
 	} else if navigationCommit != nil && navigationCommit.path != "" {
 		_, entry, _, focused := computerUseFocusedElementAuthorityV1(current)
@@ -2038,8 +2207,37 @@ func (t *ComputerUseTool) targetBoundInput(
 		request.Keys = &keys
 		request.Modifiers = &explicitModifiers
 	}
-	result, err := t.executeTargetBoundInput(ctx, args.Action, request)
-	if args.Action == "type" {
+	var result agent.ToolResult
+	var err error
+	if backgroundKeyboard {
+		authority := t.backgroundInputAuthority
+		if authority == nil {
+			return computerUsePrecommitBusinessErrorV1(
+				"background_keyboard_authority_unavailable",
+				"background keyboard execution has no preserved-frontmost authority",
+			), nil
+		}
+		backgroundRequest := BackgroundTargetedInputRequestV1{
+			SchemaVersion:                1,
+			Input:                        request,
+			FocusedRef:                   args.Ref,
+			FocusedPath:                  typeEntry.path,
+			ExpectedFocusedRole:          typeEntry.role,
+			ExpectedFocusedFingerprint:   typeEntry.fingerprint,
+			TargetLaunchDate:             authority.targetLaunchDate,
+			PreservedFrontmostPID:        authority.preservedFrontmostPID,
+			PreservedFrontmostBundleID:   authority.preservedFrontmostBundleID,
+			PreservedFrontmostLaunchDate: authority.preservedFrontmostLaunchDate,
+		}
+		result, err = t.executeBackgroundTargetedInput(
+			ctx,
+			args.Action,
+			backgroundRequest,
+		)
+	} else {
+		result, err = t.executeTargetBoundInput(ctx, args.Action, request)
+	}
+	if args.Action == "type" && !backgroundKeyboard {
 		ref, entry, element, focused := computerUseFocusedElementAuthorityV1(current)
 		if focused && ref == args.Ref {
 			t.recordLocationNavigationCommitV1(
@@ -2078,6 +2276,40 @@ func (t *ComputerUseTool) executeTargetBoundInput(
 		}
 	}
 	result, err := executor(ctx, request)
+	return computerUseTargetBoundInputResultV1(action, result, err)
+}
+
+func (t *ComputerUseTool) executeBackgroundTargetedInput(
+	ctx context.Context,
+	action string,
+	request BackgroundTargetedInputRequestV1,
+) (agent.ToolResult, error) {
+	if err := request.Validate(); err != nil {
+		return computerUsePrecommitBusinessErrorV1(
+			"invalid_request",
+			"background targeted input request is invalid; re-observe before retrying",
+		), nil
+	}
+	executor := t.backgroundTargetedInputExecutor
+	if executor == nil {
+		if client, ok := t.client.(*AXClient); ok {
+			executor = client.BackgroundTargetedInputV1
+		} else {
+			return computerUsePrecommitBusinessErrorV1(
+				"input_executor_unavailable",
+				"background targeted input executor is unavailable; re-observe before retrying",
+			), nil
+		}
+	}
+	result, err := executor(ctx, request)
+	return computerUseTargetBoundInputResultV1(action, result, err)
+}
+
+func computerUseTargetBoundInputResultV1(
+	action string,
+	result TargetBoundInputResultV1,
+	err error,
+) (agent.ToolResult, error) {
 	if err != nil {
 		var commitUnknown *TargetBoundInputCommitUnknownErrorV1
 		if errors.As(err, &commitUnknown) {
@@ -2993,7 +3225,7 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 		)
 		if clickFocusRecorded {
 			content = "coordinate click completed at the verified pointer; " +
-				"type may use this state_id once only if fresh AX state proves an editable focused element"
+				"type may use this state_id once in the same verified window; exact AX focus is used when available"
 		}
 		return agent.ToolResult{
 			Content:    content,
@@ -3002,7 +3234,7 @@ func (t *ComputerUseTool) coordinatePointerActionV1(
 	case "completed_unverified":
 		if clickFocusRecorded {
 			return agent.ToolResult{Content: "coordinate click completed_unverified at the verified pointer; " +
-				"type may use this state_id once only if fresh AX state proves an editable focused element; " +
+				"type may use this state_id once in the same verified window; exact AX focus is used when available; " +
 				"otherwise re-observe before the next action; do not retry the click automatically",
 				GUIOutcome: computerUseCoordinateGUIOutcomeV1(request, result)}, nil
 		}
@@ -3183,6 +3415,7 @@ func (t *ComputerUseTool) invalidateObservationState() {
 	t.snapshot = nil
 	t.refs = nil
 	t.coordinateArtifact = nil
+	t.semanticImageArtifact = nil
 }
 
 func (t *ComputerUseTool) invalidateObservationStateAfterMutationV1(

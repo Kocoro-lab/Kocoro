@@ -57,13 +57,16 @@ struct SemanticPressRequestV2: Codable, Equatable {
     let expectedRole: String
     let expectedFingerprint: String
     let fallbackPolicy: String
+    let interferencePolicy: String
     let commitDeadlineAt: String
     let riskDestinationAssertion: SemanticPressRiskDestinationAssertionV2?
 
     init(
         schemaVersion: Int = 2, pid: Int, bundleID: String, windowID: UInt32,
         ref: String, path: String, expectedRole: String, expectedFingerprint: String,
-        fallbackPolicy: String = "none", commitDeadlineAt: String,
+        fallbackPolicy: String = "none",
+        interferencePolicy: String = "global_physical",
+        commitDeadlineAt: String,
         riskDestinationAssertion: SemanticPressRiskDestinationAssertionV2? = nil
     ) {
         self.schemaVersion = schemaVersion
@@ -75,6 +78,7 @@ struct SemanticPressRequestV2: Codable, Equatable {
         self.expectedRole = expectedRole
         self.expectedFingerprint = expectedFingerprint
         self.fallbackPolicy = fallbackPolicy
+        self.interferencePolicy = interferencePolicy
         self.commitDeadlineAt = commitDeadlineAt
         self.riskDestinationAssertion = riskDestinationAssertion
     }
@@ -84,7 +88,8 @@ struct SemanticPressRequestV2: Codable, Equatable {
         try requireStrictMutationKeys(container, exactly: [
             "schema_version", "pid", "bundle_id", "window_id", "ref", "path",
             "expected_role", "expected_fingerprint", "fallback_policy",
-            "commit_deadline_at", "risk_destination_assertion",
+            "interference_policy", "commit_deadline_at",
+            "risk_destination_assertion",
         ], field: "semantic_press_v2 params")
         schemaVersion = try container.decode(
             Int.self, forKey: strictMutationKey("schema_version"))
@@ -99,6 +104,8 @@ struct SemanticPressRequestV2: Codable, Equatable {
             String.self, forKey: strictMutationKey("expected_fingerprint"))
         fallbackPolicy = try container.decode(
             String.self, forKey: strictMutationKey("fallback_policy"))
+        interferencePolicy = try container.decode(
+            String.self, forKey: strictMutationKey("interference_policy"))
         commitDeadlineAt = try container.decode(
             String.self, forKey: strictMutationKey("commit_deadline_at"))
         riskDestinationAssertion = try container.decodeIfPresent(
@@ -114,6 +121,8 @@ struct SemanticPressRequestV2: Codable, Equatable {
               strictMutationIdentity(expectedRole),
               strictMutationIdentity(expectedFingerprint),
               fallbackPolicy == "none",
+              Set(["global_physical", "target_foreground"]).contains(
+                interferencePolicy),
               strictMutationIdentity(commitDeadlineAt),
               strictMutationDate(commitDeadlineAt) != nil else {
             throw StrictMutationWireError.invalid("invalid semantic_press_v2 authority")
@@ -133,6 +142,8 @@ struct SemanticPressRequestV2: Codable, Equatable {
         try container.encode(
             expectedFingerprint, forKey: strictMutationKey("expected_fingerprint"))
         try container.encode(fallbackPolicy, forKey: strictMutationKey("fallback_policy"))
+        try container.encode(
+            interferencePolicy, forKey: strictMutationKey("interference_policy"))
         try container.encode(commitDeadlineAt, forKey: strictMutationKey("commit_deadline_at"))
         try container.encode(
             riskDestinationAssertion,
@@ -259,7 +270,10 @@ private func validateSemanticPressResultV2(_ result: SemanticPressResultV2) -> B
     case "user_interference":
         return Set(["not_committed", "committed", "unknown"]).contains(result.commitState) &&
             result.phase == "user_interference" &&
-            result.failureCode == "physical_input_interference"
+            Set([
+                "physical_input_interference",
+                "target_foreground_interference",
+            ]).contains(result.failureCode ?? "")
     case "failed":
         let preflight = Set([
             "invalid_request", "request_expired", "process_not_live",
@@ -270,6 +284,7 @@ private func validateSemanticPressResultV2(_ result: SemanticPressResultV2) -> B
             "interference_detection_unavailable", "ax_messaging_timeout_unavailable",
             "risk_destination_drift",
             "risk_destination_unavailable",
+            "target_became_frontmost",
         ])
         let exactPhase = result.failureCode.map { code in
             preflight.contains(code) ? result.phase == "preflight" :
@@ -322,6 +337,7 @@ struct SemanticPressDependenciesV2 {
     let resolveTarget: (Int, UInt32, String) -> SemanticPressTargetV2?
     let countFingerprint: (Int, UInt32, String) -> Int
     let windowTitle: (Int, UInt32, TimeInterval) -> SemanticPressRiskWindowTitleObservationV2
+    let frontmostPID: () -> Int?
     let observePhysicalInput: () -> PhysicalInputInterferenceSnapshotV1?
     let now: () -> Date
     let sleep: (TimeInterval) -> Void
@@ -335,10 +351,13 @@ private func semanticPressFailureV2(
         phase: phase, failureCode: code)
 }
 
-private func semanticPressInterferenceV2(commitState: String) -> SemanticPressResultV2 {
+private func semanticPressInterferenceV2(
+    commitState: String,
+    failureCode: String = "physical_input_interference"
+) -> SemanticPressResultV2 {
     .init(
         status: "user_interference", commitState: commitState,
-        phase: "user_interference", failureCode: "physical_input_interference")
+        phase: "user_interference", failureCode: failureCode)
 }
 
 private func semanticPressMonitoringUnavailableV2(
@@ -405,23 +424,21 @@ func runSemanticPressV2(
         return semanticPressFailureV2("request_expired")
     }
 
-    guard let initialPhysicalInput = dependencies.observePhysicalInput() else {
-        return semanticPressMonitoringUnavailableV2(commitState: "not_committed")
-    }
-    switch assessPhysicalInputInterferenceV1(
-        baseline: initialPhysicalInput, current: initialPhysicalInput,
-        expectedPointer: initialPhysicalInput.pointer, expectedSyntheticEvents: []) {
-    case .interference:
-        return semanticPressInterferenceV2(commitState: "not_committed")
-    case .unavailable:
-        return semanticPressMonitoringUnavailableV2(commitState: "not_committed")
-    case .unchanged:
-        break
-    }
-    var physicalInputBaseline: PhysicalInputInterferenceSnapshotV1? = initialPhysicalInput
+    let targetForegroundPolicy = request.interferencePolicy == "target_foreground"
+    var physicalInputBaseline: PhysicalInputInterferenceSnapshotV1?
     var physicalAssessment: PhysicalInputInterferenceAssessmentV1 = .unchanged
     let assessCheckpoint: () -> PhysicalInputInterferenceAssessmentV1 = {
         guard physicalAssessment == .unchanged else { return physicalAssessment }
+        if targetForegroundPolicy {
+            guard let frontmostPID = dependencies.frontmostPID() else {
+                physicalAssessment = .unavailable
+                return physicalAssessment
+            }
+            if frontmostPID == request.pid {
+                physicalAssessment = .interference
+            }
+            return physicalAssessment
+        }
         let current = dependencies.observePhysicalInput()
         let assessment = assessPhysicalInputInterferenceV1(
             baseline: physicalInputBaseline, current: current,
@@ -436,6 +453,33 @@ func runSemanticPressV2(
         }
         return assessment
     }
+    if targetForegroundPolicy {
+        switch assessCheckpoint() {
+        case .interference:
+            return semanticPressFailureV2("target_became_frontmost")
+        case .unavailable:
+            return semanticPressMonitoringUnavailableV2(commitState: "not_committed")
+        case .unchanged:
+            break
+        }
+    } else {
+        guard let initialPhysicalInput = dependencies.observePhysicalInput() else {
+            return semanticPressMonitoringUnavailableV2(commitState: "not_committed")
+        }
+        switch assessPhysicalInputInterferenceV1(
+            baseline: initialPhysicalInput, current: initialPhysicalInput,
+            expectedPointer: initialPhysicalInput.pointer, expectedSyntheticEvents: []) {
+        case .interference:
+            return semanticPressInterferenceV2(commitState: "not_committed")
+        case .unavailable:
+            return semanticPressMonitoringUnavailableV2(commitState: "not_committed")
+        case .unchanged:
+            physicalInputBaseline = initialPhysicalInput
+        }
+    }
+    let activeInterferenceCode = targetForegroundPolicy
+        ? "target_foreground_interference"
+        : "physical_input_interference"
 
     if let assertion = request.riskDestinationAssertion {
         let titleTimeout = min(
@@ -458,6 +502,9 @@ func runSemanticPressV2(
         // adjacent to AXPress.
         switch assessCheckpoint() {
         case .interference:
+            if targetForegroundPolicy {
+                return semanticPressFailureV2("target_became_frontmost")
+            }
             return semanticPressInterferenceV2(commitState: "not_committed")
         case .unavailable:
             return semanticPressMonitoringUnavailableV2(commitState: "not_committed")
@@ -495,7 +542,9 @@ func runSemanticPressV2(
     }
     switch assessCheckpoint() {
     case .interference:
-        return semanticPressInterferenceV2(commitState: commitState)
+        return semanticPressInterferenceV2(
+            commitState: commitState,
+            failureCode: activeInterferenceCode)
     case .unavailable:
         return semanticPressMonitoringUnavailableV2(commitState: commitState)
     case .unchanged:
@@ -507,7 +556,9 @@ func runSemanticPressV2(
         _ = assessCheckpoint()
         switch physicalAssessment {
         case .interference:
-            return semanticPressInterferenceV2(commitState: "unknown")
+            return semanticPressInterferenceV2(
+                commitState: "unknown",
+                failureCode: activeInterferenceCode)
         case .unavailable:
             return semanticPressMonitoringUnavailableV2(commitState: "unknown")
         case .unchanged:
@@ -537,7 +588,7 @@ func runSemanticPressV2(
                 switch assessCheckpoint() {
                 case .interference:
                     return .terminal(
-                        failureCode: "physical_input_interference", observation: nil)
+                        failureCode: activeInterferenceCode, observation: nil)
                 case .unavailable:
                     return .terminal(
                         failureCode: "interference_detection_unavailable", observation: nil)
@@ -548,7 +599,7 @@ func runSemanticPressV2(
                 switch assessCheckpoint() {
                 case .interference:
                     return .terminal(
-                        failureCode: "physical_input_interference", observation: nil)
+                        failureCode: activeInterferenceCode, observation: nil)
                 case .unavailable:
                     return .terminal(
                         failureCode: "interference_detection_unavailable", observation: nil)
@@ -568,7 +619,9 @@ func runSemanticPressV2(
     _ = assessCheckpoint()
     switch physicalAssessment {
     case .interference:
-        return semanticPressInterferenceV2(commitState: "committed")
+        return semanticPressInterferenceV2(
+            commitState: "committed",
+            failureCode: activeInterferenceCode)
     case .unavailable:
         return semanticPressMonitoringUnavailableV2(commitState: "committed")
     case .unchanged:
@@ -586,8 +639,10 @@ func runSemanticPressV2(
             status: "completed_unverified", commitState: "committed",
             phase: "post_verification", failureCode: "postcondition_not_declared")
     case let .inconclusive(failureCode, _, _):
-        if failureCode == "physical_input_interference" {
-            return semanticPressInterferenceV2(commitState: "committed")
+        if failureCode == activeInterferenceCode {
+            return semanticPressInterferenceV2(
+                commitState: "committed",
+                failureCode: activeInterferenceCode)
         }
         if failureCode == "interference_detection_unavailable" {
             return semanticPressMonitoringUnavailableV2(commitState: "committed")
@@ -801,6 +856,12 @@ let productionSemanticPressDependenciesV2 = SemanticPressDependenciesV2(
     windowTitle: { pid, windowID, timeout in
         liveSemanticPressRiskWindowTitleV2(
             pid: pid, windowID: windowID, timeout: timeout)
+    },
+    frontmostPID: {
+        refreshAppKitState()
+        return NSWorkspace.shared.frontmostApplication.map {
+            Int($0.processIdentifier)
+        }
     },
     observePhysicalInput: observePhysicalInputInterferenceV1,
     now: Date.init,

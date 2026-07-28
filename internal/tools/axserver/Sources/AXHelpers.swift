@@ -254,28 +254,141 @@ private func findToolbarURLField(in el: AXUIElement) -> AXUIElement? {
     return nil
 }
 
-/// Resolves a user-facing app name or bundle identifier to the main running
-/// application. Matching stays exact so a main app cannot resolve to a
-/// similarly named renderer/helper process that has no AX windows.
-func resolveRunningApplication(appName: String) -> NSRunningApplication? {
+struct RunningApplicationSelectionCandidate: Equatable {
+    let pid: Int
+    let localizedName: String?
+    let bundleID: String?
+}
+
+enum RunningApplicationSelection: Equatable {
+    case notRunning
+    case selected(Int)
+    case ambiguous
+}
+
+enum BackgroundTaskAppEligibility: Equatable {
+    case eligible
+    case targetIsFrontmost
+    case noVisibleWindow
+}
+
+func backgroundTaskAppEligibility(
+    targetPID: Int,
+    frontmostPID: Int?,
+    visibleNormalWindowPIDs: [Int]
+) -> BackgroundTaskAppEligibility {
+    if frontmostPID == targetPID {
+        return .targetIsFrontmost
+    }
+    if !visibleNormalWindowPIDs.contains(targetPID) {
+        return .noVisibleWindow
+    }
+    return .eligible
+}
+
+/// Chooses one exact user-facing process without relying on NSWorkspace's
+/// unspecified same-name ordering. Frontmost identity wins, then the first
+/// visible normal WindowServer window. Multiple windowless instances are
+/// ambiguous rather than silently binding a task to an arbitrary process.
+func selectRunningApplication(
+    appName: String,
+    candidates: [RunningApplicationSelectionCandidate],
+    excludedPIDs: Set<Int>,
+    frontmostPID: Int?,
+    visibleWindowPIDsFrontToBack: [Int]
+) -> RunningApplicationSelection {
+    let requested = appName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !requested.isEmpty else { return .notRunning }
+
+    let available = candidates.filter {
+        $0.pid > 0 && !excludedPIDs.contains($0.pid)
+    }
+    let exactName = available.filter {
+        $0.localizedName?.lowercased() == requested
+    }
+    let exactBundleID = available.filter {
+        $0.bundleID?.lowercased() == requested
+    }
+    let bundleSuffix = available.filter {
+        $0.bundleID?.split(separator: ".").last?.lowercased() == requested
+    }
+    let matches: [RunningApplicationSelectionCandidate]
+    if !exactName.isEmpty {
+        matches = exactName
+    } else if !exactBundleID.isEmpty {
+        matches = exactBundleID
+    } else {
+        matches = bundleSuffix
+    }
+    guard !matches.isEmpty else { return .notRunning }
+
+    let matchingPIDs = Set(matches.map(\.pid))
+    if let frontmostPID, matchingPIDs.contains(frontmostPID) {
+        return .selected(frontmostPID)
+    }
+    for pid in visibleWindowPIDsFrontToBack where matchingPIDs.contains(pid) {
+        return .selected(pid)
+    }
+    if matches.count == 1 {
+        return .selected(matches[0].pid)
+    }
+    return .ambiguous
+}
+
+func runningApplicationSelection(
+    appName: String,
+    excluding excludedPIDs: Set<Int> = []
+) -> (
+    selection: RunningApplicationSelection,
+    applications: [NSRunningApplication]
+) {
     // ax_server is a synchronous socket process whose main thread normally
     // blocks in read(2), so AppKit never gets a natural run-loop turn. Without
     // this pump, NSWorkspace.shared.runningApplications remains the snapshot
     // from ax_server startup and cannot see apps launched later in the session.
     refreshAppKitState()
 
-    let requested = appName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard !requested.isEmpty else { return nil }
-
     let applications = NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }
-    if let exactName = applications.first(where: { $0.localizedName?.lowercased() == requested }) {
-        return exactName
+    let candidates = applications.map {
+        RunningApplicationSelectionCandidate(
+            pid: Int($0.processIdentifier),
+            localizedName: $0.localizedName,
+            bundleID: $0.bundleIdentifier)
     }
-    if let exactBundleID = applications.first(where: { $0.bundleIdentifier?.lowercased() == requested }) {
-        return exactBundleID
+    let frontmostPID = NSWorkspace.shared.frontmostApplication.map {
+        Int($0.processIdentifier)
     }
-    return applications.first { app in
-        app.bundleIdentifier?.split(separator: ".").last?.lowercased() == requested
+    var visiblePIDs: [Int] = []
+    var seenVisiblePIDs = Set<Int>()
+    for window in currentCGWindowIdentityCandidates()
+    where window.layer == 0 && window.isOnScreen && window.alpha > 0 {
+        if seenVisiblePIDs.insert(window.ownerPID).inserted {
+            visiblePIDs.append(window.ownerPID)
+        }
+    }
+    return (
+        selectRunningApplication(
+            appName: appName,
+            candidates: candidates,
+            excludedPIDs: excludedPIDs,
+            frontmostPID: frontmostPID,
+            visibleWindowPIDsFrontToBack: visiblePIDs),
+        applications)
+}
+
+/// Resolves a user-facing app name or bundle identifier to one exact running
+/// application. Existing callers without an exclusion set retain the same
+/// name/bundle matching surface but no longer inherit arbitrary process order.
+func resolveRunningApplication(
+    appName: String,
+    excluding excludedPIDs: Set<Int> = []
+) -> NSRunningApplication? {
+    let resolved = runningApplicationSelection(
+        appName: appName,
+        excluding: excludedPIDs)
+    guard case let .selected(pid) = resolved.selection else { return nil }
+    return resolved.applications.first {
+        Int($0.processIdentifier) == pid
     }
 }
 

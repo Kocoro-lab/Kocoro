@@ -4698,7 +4698,7 @@ iterationLoop:
 			blockedByMissingComputerUseApps := computerUseNeedsApps &&
 				isAlternateDesktopControlCall(fc.Name, argsStr) &&
 				(fc.Name != "computer_use" ||
-					!computerUseCallHasApps(argsStr))
+					!computerUseCallHasControlledAppsAndPolicy(argsStr))
 			blockedRepeatedComputerUse := computerUseAlternateOnly &&
 				fc.Name == "computer_use"
 			blockedBesideComputerUse := computerUseOwnsGUIResponse &&
@@ -5116,8 +5116,9 @@ iterationLoop:
 				!computerUseAppsRecoveryUsed {
 				// This call never acquired a usable desktop target and therefore
 				// does not own the turn. Permit only one corrected computer_use
-				// call with explicit app hints; alternate control paths remain
-				// blocked while the outer model repairs the invocation.
+				// call with explicit controlled targets and foreground policy;
+				// alternate control paths remain blocked while the outer model
+				// repairs the invocation.
 				computerUseOwnsTurn = false
 				computerUseNeedsApps = true
 				computerUseAlternateOnly = false

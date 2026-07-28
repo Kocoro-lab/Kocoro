@@ -359,8 +359,49 @@ func (a *AnthropicComputerAdapter) uniqueAXPressHit(
 	if err != nil {
 		return "", false, fmt.Errorf("provider coordinate is not actionable: %w", err)
 	}
+	return a.uniqueAXPressHitAtMappedPoint(
+		observation.snapshot,
+		mapped,
+	)
+}
+
+func (a *AnthropicComputerAdapter) uniqueAXPressHitFromCurrentImage(
+	ctx context.Context,
+	x int,
+	y int,
+) (string, bool, error) {
+	if a == nil || a.raw == nil {
+		return "", false, fmt.Errorf("provider screenshot authority is unavailable")
+	}
+	if a.raw.coordinateArtifact != nil {
+		observation, err := a.actionableObservation(ctx)
+		if err != nil {
+			return "", false, err
+		}
+		return a.uniqueAXPressHit(observation, x, y)
+	}
+	mapped, err := a.raw.semanticImageArtifact.mapPointV1(
+		a.raw.snapshot,
+		a.raw.computerUseCoordinateNowV1(),
+		x,
+		y,
+	)
+	if err != nil {
+		return "", false, err
+	}
+	return a.uniqueAXPressHitAtMappedPoint(a.raw.snapshot, mapped)
+}
+
+func (a *AnthropicComputerAdapter) uniqueAXPressHitAtMappedPoint(
+	snapshot *computerUseSnapshot,
+	mapped CoordinateMappedPointV1,
+) (string, bool, error) {
+	if a == nil || a.raw == nil || snapshot == nil ||
+		snapshot != a.raw.snapshot {
+		return "", false, fmt.Errorf("provider AX snapshot authority is unavailable")
+	}
 	var candidates []anthropicTrustedElement
-	walkComputerUseElements(observation.snapshot.elements, 0, func(element computerUseElement, depth int) {
+	walkComputerUseElements(snapshot.elements, 0, func(element computerUseElement, depth int) {
 		if element.Frame == nil || mapped.X < element.Frame.X || mapped.Y < element.Frame.Y ||
 			mapped.X >= element.Frame.X+element.Frame.Width || mapped.Y >= element.Frame.Y+element.Frame.Height {
 			return

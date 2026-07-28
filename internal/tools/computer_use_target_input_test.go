@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -69,6 +70,182 @@ func TestComputerUseTargetBoundTypeUsesLatestExactStateAndRedactsContent(t *test
 		if call.method == "type_text" || call.method == "key_event" {
 			t.Fatalf("target-bound input delegated to legacy global RPC: %+v", call)
 		}
+	}
+}
+
+func TestComputerUseBackgroundTypeForwardsExactProcessAndFocusAuthority(
+	t *testing.T,
+) {
+	harness, runtime, focused := backgroundKeyboardRuntimeHarness(t)
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "private text",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	var executed *BackgroundTargetedInputRequestV1
+	foregroundExecuted := false
+	harness.tool.backgroundTargetedInputExecutor = func(
+		_ context.Context,
+		request BackgroundTargetedInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = &request
+		postcondition := "target_value_matches_expected_edit"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "verified", Action: "type",
+			InputCommitted: true, Phase: "post_verification",
+			Postcondition: &postcondition,
+		}, nil
+	}
+	harness.tool.targetBoundInputExecutor = func(
+		context.Context,
+		TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		foregroundExecuted = true
+		return TargetBoundInputResultV1{}, nil
+	}
+
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		plan.Args,
+	)
+	if err != nil || result.IsError {
+		t.Fatalf("background type result=%+v err=%v", result, err)
+	}
+	if foregroundExecuted || executed == nil {
+		t.Fatalf("background executor selection: foreground=%v request=%+v",
+			foregroundExecuted, executed)
+	}
+	if executed.Input.Action != "type" ||
+		executed.Input.Ref == nil || *executed.Input.Ref != focused ||
+		executed.Input.Text == nil || *executed.Input.Text != "private text" ||
+		executed.FocusedRef != focused ||
+		executed.FocusedPath != "window[0]/AXTextField[0]" ||
+		executed.ExpectedFocusedRole != "AXTextField" ||
+		executed.ExpectedFocusedFingerprint != "axf_e2" ||
+		executed.TargetLaunchDate != "2026-07-28T06:00:00Z" ||
+		executed.PreservedFrontmostPID != 84 ||
+		executed.PreservedFrontmostBundleID != "com.apple.TextEdit" ||
+		executed.PreservedFrontmostLaunchDate != "2026-07-28T05:00:00Z" {
+		t.Fatalf("background type authority = %+v", executed)
+	}
+}
+
+func TestComputerUseBackgroundKeypressUsesTargetedExecutorOnly(t *testing.T) {
+	harness, runtime, focused := backgroundKeyboardRuntimeHarness(t)
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionKeypressV1,
+			Keys: []string{"left"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	var executed *BackgroundTargetedInputRequestV1
+	harness.tool.backgroundTargetedInputExecutor = func(
+		_ context.Context,
+		request BackgroundTargetedInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = &request
+		failure := "postcondition_not_declared"
+		return TargetBoundInputResultV1{
+			SchemaVersion: 1, Status: "completed_unverified",
+			Action: "keypress", InputCommitted: true,
+			Phase: "post_verification", FailureCode: &failure,
+		}, nil
+	}
+
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		plan.Args,
+	)
+	if err != nil || result.IsError || executed == nil {
+		t.Fatalf("background keypress result=%+v request=%+v err=%v",
+			result, executed, err)
+	}
+	if executed.FocusedRef != focused ||
+		executed.Input.Keys == nil ||
+		!reflect.DeepEqual(*executed.Input.Keys, []string{"left"}) ||
+		executed.Input.Modifiers == nil ||
+		*executed.Input.Modifiers == nil {
+		t.Fatalf("background keypress authority = %+v", executed)
+	}
+}
+
+func TestComputerUseBackgroundKeyboardFocusDriftFailsBeforeExecutor(
+	t *testing.T,
+) {
+	harness, runtime, _ := backgroundKeyboardRuntimeHarness(t)
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "must not type",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted := cloneComputerUseTree(t, harness.tree)
+	other := "e9"
+	drifted.FocusedRef = &other
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, drifted))
+	executed := false
+	harness.tool.backgroundTargetedInputExecutor = func(
+		context.Context,
+		BackgroundTargetedInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		executed = true
+		return TargetBoundInputResultV1{}, nil
+	}
+
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		plan.Args,
+	)
+	if err != nil || !result.IsError || executed {
+		t.Fatalf("focus drift result=%+v executed=%v err=%v",
+			result, executed, err)
+	}
+	if result.GUIOutcome == nil ||
+		result.GUIOutcome.FailureCode != "keyboard_target_unavailable" {
+		t.Fatalf("focus drift outcome = %+v", result.GUIOutcome)
+	}
+}
+
+func TestComputerUseBackgroundKeyboardDescriptorNeverClaimsPointerOrFallback(
+	t *testing.T,
+) {
+	harness, runtime, _ := backgroundKeyboardRuntimeHarness(t)
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "private text",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := harness.tool.DescribeGUIAction(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		plan.Args,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.ActionKind != "type" ||
+		descriptor.ExecutionLane != "background_keyboard" ||
+		descriptor.ForegroundFallback {
+		t.Fatalf("background keyboard descriptor = %+v", descriptor)
 	}
 }
 

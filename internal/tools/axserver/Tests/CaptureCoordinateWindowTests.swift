@@ -248,12 +248,27 @@ final class CaptureCoordinateWindowTests: XCTestCase {
         }
     }
 
-    func testExactWindowCaptureArgumentsExcludeAttachedSurfaces() {
+    func testWindowCaptureArgumentsPreserveBackgroundIsolationAndForegroundSurfaces() {
         let outputURL = URL(fileURLWithPath: "/tmp/exact-window.png")
 
         XCTAssertEqual(
             coordinateWindowScreencaptureArguments(
                 windowID: 7001,
+                foregroundCompositeBounds: nil,
+                outputURL: outputURL),
+            ["-x", "-o", "-a", "-l7001", "/tmp/exact-window.png"])
+        XCTAssertEqual(
+            coordinateWindowScreencaptureArguments(
+                windowID: 7001,
+                foregroundCompositeBounds: DisplayTopologyRectV1(
+                    x: -100, y: 200, width: 800, height: 600),
+                outputURL: outputURL),
+            ["-x", "-R-100,200,800,600", "/tmp/exact-window.png"])
+        XCTAssertEqual(
+            coordinateWindowScreencaptureArguments(
+                windowID: 7001,
+                foregroundCompositeBounds: DisplayTopologyRectV1(
+                    x: -100.5, y: 200, width: 800, height: 600),
                 outputURL: outputURL),
             ["-x", "-o", "-a", "-l7001", "/tmp/exact-window.png"])
     }

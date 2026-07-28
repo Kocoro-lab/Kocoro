@@ -24,6 +24,7 @@ type SemanticPressRequestV2 struct {
 	ExpectedRole             string                                   `json:"expected_role"`
 	ExpectedFingerprint      string                                   `json:"expected_fingerprint"`
 	FallbackPolicy           string                                   `json:"fallback_policy"`
+	InterferencePolicy       string                                   `json:"interference_policy"`
 	CommitDeadlineAt         string                                   `json:"commit_deadline_at"`
 	RiskDestinationAssertion *SemanticPressRiskDestinationAssertionV2 `json:"risk_destination_assertion"`
 }
@@ -62,6 +63,7 @@ var semanticPressRequestWireShapeV2 = coordinateObjectWireShape(false, map[strin
 		"expected_role":        coordinateScalarWireShape(false),
 		"expected_fingerprint": coordinateScalarWireShape(false),
 		"fallback_policy":      coordinateScalarWireShape(false),
+		"interference_policy":  coordinateScalarWireShape(false),
 		"commit_deadline_at":   coordinateScalarWireShape(false),
 		"risk_destination_assertion": coordinateNullableWireShape(coordinateObjectWireShape(false, map[string]coordinateWireShape{
 			"kind":                  coordinateScalarWireShape(false),
@@ -97,7 +99,9 @@ func (request SemanticPressRequestV2) Validate() error {
 	}
 	if !validComputerUseRef(request.Ref) ||
 		(request.Path != "window[0]" && !strings.HasPrefix(request.Path, "window[0]/")) ||
-		request.FallbackPolicy != "none" {
+		request.FallbackPolicy != "none" ||
+		request.InterferencePolicy != "global_physical" &&
+			request.InterferencePolicy != "target_foreground" {
 		return fmt.Errorf("semantic_press_v2 ref/path/fallback policy is invalid")
 	}
 	if _, err := time.Parse(time.RFC3339Nano, request.CommitDeadlineAt); err != nil {

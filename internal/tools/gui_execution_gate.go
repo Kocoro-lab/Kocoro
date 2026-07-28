@@ -96,7 +96,9 @@ func (g *guiExecutionGate) Run(ctx context.Context, args string) (agent.ToolResu
 		ToolName: invocation.ToolName, ToolUseID: invocation.ToolUseID,
 		ActionKind: descriptor.ActionKind, Effect: string(descriptor.Effect),
 		TargetBundleID: descriptor.TargetBundleID, ExecutionPath: descriptor.ExecutionPath,
-		RiskIntentID: riskIntentID, RiskTargetDigest: riskTargetDigest,
+		ExecutionLane:      descriptor.ExecutionLane,
+		ForegroundFallback: descriptor.ForegroundFallback,
+		RiskIntentID:       riskIntentID, RiskTargetDigest: riskTargetDigest,
 	}
 	if descriptor.Effect == agent.GUIActionObservation && !guicontrol.ExecutionAuthorityPresent(ctx) {
 		return g.inner.Run(ctx, args)

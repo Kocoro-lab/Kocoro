@@ -192,6 +192,7 @@ func captureWindow(
         }
         captureArguments = coordinateWindowScreencaptureArguments(
             windowID: exactWindowID,
+            foregroundCompositeBounds: nil,
             outputURL: URL(fileURLWithPath: tmpPath))
     } else {
         // -x: silent · -o: omit window shadow · -l<id>: capture that window's content

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -26,6 +27,152 @@ func guardedOpenAIComputerRuntimeHarness(
 	return harness, runtime
 }
 
+func backgroundKeyboardRuntimeHarness(
+	t *testing.T,
+) (*computerUseCoordinateHarness, *OpenAIComputerActionRuntimeV1, string) {
+	t.Helper()
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	focused := "e2"
+	harness.tree.Elements = []computerUseElement{{
+		Ref: "e2", Fingerprint: "axf_e2", Path: "window[0]/AXTextField[0]",
+		Role: "AXTextField", Title: stringPointer("Body"),
+		Value: stringPointer("before"), ValueRedacted: false,
+		Enabled: boolPointer(true), Focused: true,
+	}}
+	harness.tree.RefPaths = map[string]computerUseRefPath{
+		"e2": {
+			Path: "window[0]/AXTextField[0]", Role: "AXTextField",
+			Fingerprint: "axf_e2",
+		},
+	}
+	harness.tree.FocusedRef = &focused
+	harness.observe(t)
+	public := wrapGUIExecutionGate(harness.tool)
+	runtime, err := NewOpenAIComputerActionRuntimeV1(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	runtime.backgroundRequired = true
+	runtime.backgroundTarget = &OpenAIComputerTaskAppV1{
+		App: harness.tree.App, BundleID: harness.tree.BundleID,
+		PID: harness.tree.PID, LaunchDate: "2026-07-28T06:00:00Z",
+	}
+	harness.tool.backgroundInputAuthority = &computerUseBackgroundInputAuthorityV1{
+		targetLaunchDate:             "2026-07-28T06:00:00Z",
+		preservedFrontmostPID:        84,
+		preservedFrontmostBundleID:   "com.apple.TextEdit",
+		preservedFrontmostLaunchDate: "2026-07-28T05:00:00Z",
+	}
+	return harness, runtime, focused
+}
+
+func TestOpenAIComputerBackgroundTypeUsesTargetedKeyboardLane(t *testing.T) {
+	harness, runtime, focused := backgroundKeyboardRuntimeHarness(t)
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "private text",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Mutation || args.Action != "type" || args.Ref != focused ||
+		args.Text == nil || *args.Text != "private text" ||
+		args.StateID != harness.tool.snapshot.id ||
+		args.ExecutionLane != "background_keyboard" ||
+		args.ForegroundFallback {
+		t.Fatalf("background type plan = %+v / %+v", plan, args)
+	}
+}
+
+func TestOpenAIComputerBackgroundSafeKeypressUsesTargetedKeyboardLane(
+	t *testing.T,
+) {
+	_, runtime, focused := backgroundKeyboardRuntimeHarness(t)
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionKeypressV1,
+			Keys: []string{"left"},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "keypress" || args.Ref != focused ||
+		!reflect.DeepEqual(args.KeySequence, []string{"left"}) ||
+		args.ExecutionLane != "background_keyboard" ||
+		args.ForegroundFallback {
+		t.Fatalf("background keypress plan = %+v", args)
+	}
+}
+
+func TestOpenAIComputerBackgroundConsequentialKeyFailsBeforeExecution(
+	t *testing.T,
+) {
+	_, runtime, _ := backgroundKeyboardRuntimeHarness(t)
+	_, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionKeypressV1,
+			Keys: []string{"return"},
+		},
+	)
+	var planErr *OpenAIComputerActionPlanErrorV1
+	if !errors.As(err, &planErr) ||
+		planErr.FailureCode !=
+			"background_keyboard_consequential_key_unsupported" {
+		t.Fatalf("background Return error = %v", err)
+	}
+}
+
+func TestOpenAIComputerBackgroundControlTextFailsBeforeExecution(t *testing.T) {
+	_, runtime, _ := backgroundKeyboardRuntimeHarness(t)
+	_, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "line one\nline two",
+		},
+	)
+	var planErr *OpenAIComputerActionPlanErrorV1
+	if !errors.As(err, &planErr) ||
+		planErr.FailureCode != "background_keyboard_control_text_unsupported" {
+		t.Fatalf("background control text error = %v", err)
+	}
+}
+
+func TestOpenAIComputerRequiredBackgroundTypeWithoutProcessAuthorityFailsClosed(
+	t *testing.T,
+) {
+	_, runtime, _ := backgroundKeyboardRuntimeHarness(t)
+	runtime.raw.backgroundInputAuthority = nil
+	_, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "must not type",
+		},
+	)
+	var planErr *OpenAIComputerActionPlanErrorV1
+	if !errors.As(err, &planErr) ||
+		planErr.FailureCode != "background_keyboard_target_unavailable" {
+		t.Fatalf("missing background authority error = %v", err)
+	}
+}
+
 func TestOpenAIComputerActionRuntimeRequiresFinalGUIExecutionGate(t *testing.T) {
 	if runtime, err := NewOpenAIComputerActionRuntimeV1(&ComputerUseTool{}); err == nil ||
 		runtime != nil {
@@ -37,8 +184,14 @@ func TestOpenAIComputerTaskAppsSupersedeForegroundHintAndRefreshFrontmost(
 	t *testing.T,
 ) {
 	fake := newFakeAXCaller()
-	fake.queue("launch_app", `{"result":"launched"}`)
-	fake.queue("launch_app", `{"result":"launched"}`)
+	fake.queue(
+		"prepare_task_app",
+		`{"app":"Slack","bundle_id":"com.tinyspeck.slackmacgap","pid":101}`,
+	)
+	fake.queue(
+		"prepare_task_app",
+		`{"app":"Calculator","bundle_id":"com.apple.calculator","pid":202}`,
+	)
 	fake.queue("focus", `{"result":"focused"}`)
 	raw := &ComputerUseTool{
 		client: fake,
@@ -48,14 +201,26 @@ func TestOpenAIComputerTaskAppsSupersedeForegroundHintAndRefreshFrontmost(
 		},
 		snapshot: &computerUseSnapshot{id: "old"},
 	}
-	runtime := &OpenAIComputerActionRuntimeV1{raw: raw}
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: raw,
+		taskAppExcludedPIDs: func() []int {
+			return []int{9002}
+		},
+	}
 
+	apps := []OpenAIComputerTaskAppV1{
+		{
+			App: "Slack", BundleID: "com.tinyspeck.slackmacgap",
+			PID: 101,
+		},
+		{
+			App: "Calculator", BundleID: "com.apple.calculator",
+			PID: 202,
+		},
+	}
 	err := runtime.LaunchAndFocusTaskAppsV1(
 		context.Background(),
-		[]OpenAIComputerTaskAppV1{
-			{App: "Slack", BundleID: "com.tinyspeck.slackmacgap"},
-			{App: "Calculator", BundleID: "com.apple.calculator"},
-		},
+		apps,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -65,15 +230,310 @@ func TestOpenAIComputerTaskAppsSupersedeForegroundHintAndRefreshFrontmost(
 			raw.initialTarget, raw.snapshot)
 	}
 	if len(fake.calls) != 3 ||
-		fake.calls[0].method != "launch_app" ||
-		fake.calls[1].method != "launch_app" ||
+		fake.calls[0].method != "prepare_task_app" ||
+		fake.calls[1].method != "prepare_task_app" ||
 		fake.calls[2].method != "focus" {
 		t.Fatalf("app preparation calls = %+v", fake.calls)
+	}
+	for index, expectedPID := range []int{101, 202} {
+		if fake.calls[index].params["pid"] != expectedPID ||
+			!reflect.DeepEqual(
+				fake.calls[index].params["excluded_pids"],
+				[]int{9002},
+			) {
+			t.Fatalf("prepare params %d = %+v", index, fake.calls[index].params)
+		}
+	}
+	if fake.calls[2].params["pid"] != 101 ||
+		fake.calls[2].params["bundle_id"] !=
+			"com.tinyspeck.slackmacgap" ||
+		!reflect.DeepEqual(
+			fake.calls[2].params["excluded_pids"],
+			[]int{9002},
+		) {
+		t.Fatalf("exact focus params = %+v", fake.calls[2].params)
+	}
+}
+
+func TestOpenAIComputerTaskAppResolutionExcludesManagedAutomationPIDs(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"resolve_app_identity",
+		`{"app":"Google Chrome","bundle_id":"com.google.Chrome","pid":77}`,
+	)
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: &ComputerUseTool{client: fake},
+		taskAppExcludedPIDs: func() []int {
+			return []int{9002, 9002, -1}
+		},
+	}
+
+	app, err := runtime.ResolveTaskAppV1(context.Background(), "Google Chrome")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.PID != 77 || app.BundleID != "com.google.Chrome" {
+		t.Fatalf("resolved app = %+v", app)
+	}
+	if len(fake.calls) != 1 ||
+		!reflect.DeepEqual(
+			fake.calls[0].params["excluded_pids"],
+			[]int{9002},
+		) {
+		t.Fatalf("resolve params = %+v", fake.calls)
+	}
+}
+
+func TestOpenAIComputerTaskPreparationPinsExistingPIDAndLearnsLaunchedPID(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"prepare_task_app",
+		`{"app":"Slack","bundle_id":"com.tinyspeck.slackmacgap","pid":55}`,
+	)
+	fake.queue(
+		"prepare_task_app",
+		`{"app":"Calculator","bundle_id":"com.apple.calculator","pid":88}`,
+	)
+	fake.queue("focus", `{"result":"focused"}`)
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: &ComputerUseTool{client: fake},
+		taskAppExcludedPIDs: func() []int {
+			return []int{9002}
+		},
+	}
+	apps := []OpenAIComputerTaskAppV1{
+		{App: "Slack", BundleID: "com.tinyspeck.slackmacgap"},
+		{
+			App: "Calculator", BundleID: "com.apple.calculator",
+			PID: 88,
+		},
+	}
+
+	if err := runtime.LaunchAndFocusTaskAppsV1(
+		context.Background(),
+		apps,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if apps[0].PID != 55 || apps[1].PID != 88 {
+		t.Fatalf("prepared app identities = %+v", apps)
+	}
+	if _, present := fake.calls[0].params["pid"]; present {
+		t.Fatalf("unlaunched app carried invented pid: %+v", fake.calls[0].params)
+	}
+	if fake.calls[1].params["pid"] != 88 {
+		t.Fatalf("existing app lost exact pid: %+v", fake.calls[1].params)
+	}
+}
+
+func TestOpenAIComputerTaskPreparationRejectsExistingPIDSubstitution(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"prepare_task_app",
+		`{"app":"Google Chrome","bundle_id":"com.google.Chrome","pid":78}`,
+	)
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: &ComputerUseTool{client: fake},
+		taskAppExcludedPIDs: func() []int {
+			return []int{9002}
+		},
+	}
+
+	err := runtime.LaunchAndFocusTaskAppsV1(
+		context.Background(),
+		[]OpenAIComputerTaskAppV1{{
+			App: "Google Chrome", BundleID: "com.google.Chrome", PID: 77,
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "changed exact pid") {
+		t.Fatalf("pid substitution error = %v", err)
+	}
+}
+
+func TestOpenAIComputerForegroundAllowedPreparationUsesForegroundPath(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"prepare_task_app",
+		`{"app":"Calculator","bundle_id":"com.apple.calculator","pid":77}`,
+	)
+	raw := &ComputerUseTool{client: fake}
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: raw,
+		taskAppExcludedPIDs: func() []int {
+			return []int{9002}
+		},
+	}
+	apps := []OpenAIComputerTaskAppV1{{
+		App: "Calculator", BundleID: "com.apple.calculator", PID: 77,
+	}}
+
+	lane, err := runtime.PrepareTaskAppsV1(
+		context.Background(),
+		apps,
+		OpenAIComputerTaskPreparationOptionsV1{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lane != OpenAIComputerExecutionForegroundV1 {
+		t.Fatalf("preparation lane = %q", lane)
+	}
+	if len(fake.calls) != 1 ||
+		fake.calls[0].method != "prepare_task_app" ||
+		fake.calls[0].params["pid"] != 77 ||
+		fake.calls[0].params["bundle_id"] != "com.apple.calculator" {
+		t.Fatalf("foreground preparation calls = %+v", fake.calls)
+	}
+}
+
+func TestOpenAIComputerTaskPreparationInstallsExactBackgroundKeyboardAuthority(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"bind_background_task_app",
+		`{"app":"Calculator","bundle_id":"com.apple.calculator","pid":77,`+
+			`"launch_date":"2026-07-28T06:00:00Z",`+
+			`"preserved_frontmost_pid":84,`+
+			`"preserved_frontmost_bundle_id":"com.apple.TextEdit",`+
+			`"preserved_frontmost_launch_date":"2026-07-28T05:00:00Z"}`,
+	)
+	raw := &ComputerUseTool{client: fake}
+	runtime := &OpenAIComputerActionRuntimeV1{raw: raw}
+	apps := []OpenAIComputerTaskAppV1{{
+		App: "Calculator", BundleID: "com.apple.calculator", PID: 77,
+	}}
+
+	lane, err := runtime.PrepareTaskAppsV1(
+		context.Background(),
+		apps,
+		OpenAIComputerTaskPreparationOptionsV1{RequireBackground: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := raw.backgroundInputAuthority
+	if lane != OpenAIComputerExecutionBackgroundSemanticV1 ||
+		authority == nil ||
+		authority.targetLaunchDate != "2026-07-28T06:00:00Z" ||
+		authority.preservedFrontmostPID != 84 ||
+		authority.preservedFrontmostBundleID != "com.apple.TextEdit" ||
+		authority.preservedFrontmostLaunchDate != "2026-07-28T05:00:00Z" {
+		t.Fatalf("background keyboard authority = %+v, lane=%q", authority, lane)
+	}
+}
+
+func TestOpenAIComputerTaskPreparationRejectsPartialBackgroundProcessAuthority(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"bind_background_task_app",
+		`{"app":"Calculator","bundle_id":"com.apple.calculator","pid":77,`+
+			`"launch_date":"2026-07-28T06:00:00Z",`+
+			`"preserved_frontmost_pid":84}`,
+	)
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: &ComputerUseTool{client: fake},
+	}
+	_, err := runtime.PrepareTaskAppsV1(
+		context.Background(),
+		[]OpenAIComputerTaskAppV1{{
+			App: "Calculator", BundleID: "com.apple.calculator", PID: 77,
+		}},
+		OpenAIComputerTaskPreparationOptionsV1{RequireBackground: true},
+	)
+	if err == nil || !strings.Contains(
+		err.Error(), "invalid preserved frontmost identity") {
+		t.Fatalf("partial background authority error = %v", err)
+	}
+}
+
+func TestOpenAIComputerForegroundAllowedPreparationDoesNotProbeBackground(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"prepare_task_app",
+		`{"app":"Calculator","bundle_id":"com.apple.calculator","pid":77}`,
+	)
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: &ComputerUseTool{client: fake},
+	}
+	apps := []OpenAIComputerTaskAppV1{{
+		App: "Calculator", BundleID: "com.apple.calculator", PID: 77,
+	}}
+
+	lane, err := runtime.PrepareTaskAppsV1(
+		context.Background(),
+		apps,
+		OpenAIComputerTaskPreparationOptionsV1{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lane != OpenAIComputerExecutionForegroundV1 {
+		t.Fatalf("foreground lane = %q", lane)
+	}
+	if len(fake.calls) != 1 ||
+		fake.calls[0].method != "prepare_task_app" {
+		t.Fatalf("foreground preparation probed background: %+v", fake.calls)
+	}
+}
+
+func TestOpenAIComputerTaskRequiredBackgroundBindNeverActivatesTarget(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.errors["bind_background_task_app"] = []error{
+		errors.New("background target is unavailable"),
+	}
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: &ComputerUseTool{client: fake},
+	}
+	apps := []OpenAIComputerTaskAppV1{{
+		App: "Calculator", BundleID: "com.apple.calculator", PID: 77,
+	}}
+
+	_, err := runtime.PrepareTaskAppsV1(
+		context.Background(),
+		apps,
+		OpenAIComputerTaskPreparationOptionsV1{
+			RequireBackground: true,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "required background bind") {
+		t.Fatalf("required background error = %v", err)
+	}
+	if len(fake.calls) != 1 ||
+		fake.calls[0].method != "bind_background_task_app" {
+		t.Fatalf("required background preparation activated target: %+v", fake.calls)
+	}
+	if !runtime.backgroundRequired || runtime.foregroundFallback {
+		t.Fatalf("required background state = %+v", runtime)
 	}
 }
 
 func TestOpenAIComputerTaskInitialObservationPinsFirstAppHint(t *testing.T) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"read_tree",
+		`{"schema_version":1,"app":"Google Chrome","app_name":"Google Chrome",`+
+			`"bundle_id":"com.google.Chrome","pid":77,"window":"waylandz.com",`+
+			`"window_title":"waylandz.com","window_id":7001,`+
+			`"window_frame":{"x":0,"y":0,"width":1200,"height":800},`+
+			`"elements":[],"ref_paths":{}}`,
+	)
 	raw := &ComputerUseTool{
+		client:   fake,
 		snapshot: &computerUseSnapshot{id: "stale"},
 	}
 	runtime := &OpenAIComputerActionRuntimeV1{
@@ -84,9 +544,10 @@ func TestOpenAIComputerTaskInitialObservationPinsFirstAppHint(t *testing.T) {
 		&OpenAIComputerTaskAppV1{
 			App:      "Google Chrome",
 			BundleID: "com.google.Chrome",
+			PID:      77,
 		},
 		"Capture the initial browser state",
-		true,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -99,9 +560,26 @@ func TestOpenAIComputerTaskInitialObservationPinsFirstAppHint(t *testing.T) {
 		t.Fatal(err)
 	}
 	if args.Action != "get_app_state" ||
-		args.App != "Google Chrome" ||
-		!args.IncludeScreenshot {
+		args.App != "" ||
+		args.IncludeScreenshot {
 		t.Fatalf("initial observation args = %+v", args)
+	}
+	if raw.initialTarget == nil ||
+		raw.initialTarget.PID != 77 ||
+		raw.initialTarget.AppName != "Google Chrome" ||
+		raw.initialTarget.BundleID != "com.google.Chrome" {
+		t.Fatalf("exact initial target = %+v", raw.initialTarget)
+	}
+	if result, runErr := plan.Tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		plan.Args,
+	); runErr != nil || result.IsError {
+		t.Fatalf("initial observation result = %+v err=%v", result, runErr)
+	}
+	if len(fake.calls) != 1 ||
+		fake.calls[0].method != "read_tree" ||
+		fake.calls[0].params["pid"] != 77 {
+		t.Fatalf("initial observation calls = %+v", fake.calls)
 	}
 
 	next, err := runtime.PlanOpenAIComputerObservationV1(
@@ -117,6 +595,9 @@ func TestOpenAIComputerTaskInitialObservationPinsFirstAppHint(t *testing.T) {
 	}
 	if args.App != "" {
 		t.Fatalf("continuation froze optional app hint: %+v", args)
+	}
+	if raw.initialTarget != nil {
+		t.Fatalf("continuation retained first-app target: %+v", raw.initialTarget)
 	}
 }
 
@@ -190,6 +671,133 @@ func TestOpenAIComputerActionRuntimeKeepsAXHitOnVisibleCoordinatePath(t *testing
 		args.X == nil || int(*args.X) != x ||
 		args.Y == nil || int(*args.Y) != y {
 		t.Fatalf("AX-hit click did not remain on visible coordinate path: %+v", args)
+	}
+}
+
+func TestOpenAIComputerBackgroundClickUsesUniqueAXPressWithoutCoordinateInput(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree.Elements[0].Frame = harness.tree.WindowFrame
+	harness.observe(t)
+	harness.fake.queue(
+		"display_topology",
+		marshalDisplayTopologyNoTest(harness.topology),
+	)
+	runtime, err := NewOpenAIComputerActionRuntimeV1(
+		wrapGUIExecutionGate(harness.tool),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	runtime.backgroundTarget = &OpenAIComputerTaskAppV1{
+		App: harness.tree.App, BundleID: harness.tree.BundleID, PID: harness.tree.PID,
+	}
+	x, y := 4, 5
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionClickV1, Button: "left", X: &x, Y: &y,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "press" || args.Ref != harness.tree.Elements[0].Ref ||
+		args.X != nil || args.Y != nil ||
+		args.ExecutionLane != "background_semantic" ||
+		args.ForegroundFallback {
+		t.Fatalf("background semantic plan = %+v", args)
+	}
+}
+
+func TestOpenAIComputerUnsupportedBackgroundActionFallsBackMonotonically(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	runtime.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	runtime.backgroundTarget = &OpenAIComputerTaskAppV1{
+		App: harness.tree.App, BundleID: harness.tree.BundleID, PID: harness.tree.PID,
+	}
+	harness.fake.queue(
+		"display_topology",
+		marshalDisplayTopologyNoTest(harness.topology),
+	)
+	x, y := 4, 5
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionMoveV1,
+			X:    &x,
+			Y:    &y,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.ExecutionLane != "foreground" || !args.ForegroundFallback {
+		t.Fatalf("foreground fallback plan = %+v", args)
+	}
+	if runtime.executionLane != OpenAIComputerExecutionForegroundV1 ||
+		!runtime.foregroundFallback ||
+		runtime.backgroundTarget != nil ||
+		!harness.tool.foregroundFallbackRestorePending {
+		t.Fatalf("runtime did not transition monotonically: %+v", runtime)
+	}
+
+	next, err := runtime.PlanOpenAIComputerObservationV1(
+		"Capture after fallback",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args = computerUseArgs{}
+	if err := json.Unmarshal([]byte(next.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.ExecutionLane != "foreground" || !args.ForegroundFallback {
+		t.Fatalf("fallback was not retained by later observation: %+v", args)
+	}
+}
+
+func TestOpenAIComputerRequiredBackgroundActionNeverFallsBack(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	runtime.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	runtime.backgroundRequired = true
+	runtime.backgroundTarget = &OpenAIComputerTaskAppV1{
+		App: harness.tree.App, BundleID: harness.tree.BundleID, PID: harness.tree.PID,
+	}
+	x, y := 4, 5
+	_, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionMoveV1,
+			X:    &x,
+			Y:    &y,
+		},
+	)
+	var planErr *OpenAIComputerActionPlanErrorV1
+	if !errors.As(err, &planErr) ||
+		planErr.FailureCode != "background_action_unsupported" {
+		t.Fatalf("required background action error = %v", err)
+	}
+	if runtime.executionLane != OpenAIComputerExecutionBackgroundSemanticV1 ||
+		runtime.foregroundFallback ||
+		runtime.backgroundTarget == nil {
+		t.Fatalf("required background action changed lane: %+v", runtime)
 	}
 }
 
@@ -444,6 +1052,11 @@ func TestOpenAIComputerActionRuntimeRejectsPixelScrollWithoutFrameAuthority(t *t
 		!strings.Contains(err.Error(), "coordinate authority is unavailable") {
 		t.Fatalf("pixel scroll plan=%+v err=%v", plan, err)
 	}
+	var planErr *OpenAIComputerActionPlanErrorV1
+	if !errors.As(err, &planErr) ||
+		planErr.FailureCode != "coordinate_authority_unavailable" {
+		t.Fatalf("pixel scroll typed plan error = %v", err)
+	}
 	if len(harness.fake.calls) != callCount {
 		t.Fatalf("pixel scroll reached AX/legacy helper calls: %+v",
 			harness.fake.calls[callCount:])
@@ -598,6 +1211,16 @@ func TestOpenAIComputerActionRuntimeInternalRefreshFollowsNewFrontmostApp(
 	t *testing.T,
 ) {
 	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	frame := harness.tool.snapshot.expectedWindowAXBounds
+	harness.tool.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID:                harness.tool.snapshot.id,
+		pid:                    harness.tree.PID,
+		bundleID:               harness.tree.BundleID,
+		windowID:               uint32(*harness.tree.WindowID),
+		expectedWindowAXBounds: *frame,
+		filter:                 harness.tool.snapshot.filter,
+		budget:                 harness.tool.snapshot.budget,
+	}
 	next := harness.tree
 	next.App = "Calculator"
 	next.BundleID = "com.apple.calculator"
@@ -617,7 +1240,10 @@ func TestOpenAIComputerActionRuntimeInternalRefreshFollowsNewFrontmostApp(
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := harness.tool.Run(context.Background(), refresh.Args)
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		refresh.Args,
+	)
 	if err != nil || result.IsError {
 		t.Fatalf("refresh result=%+v err=%v", result, err)
 	}
@@ -627,5 +1253,71 @@ func TestOpenAIComputerActionRuntimeInternalRefreshFollowsNewFrontmostApp(
 		harness.tool.snapshot.windowID == nil ||
 		*harness.tool.snapshot.windowID != nextWindowID {
 		t.Fatalf("refresh retained old target: %+v", harness.tool.snapshot)
+	}
+	if harness.tool.coordinateFocus != nil {
+		t.Fatalf(
+			"frontmost app switch retained old click focus: %+v",
+			harness.tool.coordinateFocus,
+		)
+	}
+}
+
+func TestOpenAIComputerActionRuntimeCarriesVerifiedClickFocusAcrossSameWindowObservation(
+	t *testing.T,
+) {
+	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
+	frame := harness.tool.snapshot.expectedWindowAXBounds
+	harness.tool.coordinateFocus = &computerUseCoordinateFocusV1{
+		stateID:                harness.tool.snapshot.id,
+		pid:                    harness.tree.PID,
+		bundleID:               harness.tree.BundleID,
+		windowID:               uint32(*harness.tree.WindowID),
+		expectedWindowAXBounds: *frame,
+		filter:                 harness.tool.snapshot.filter,
+		budget:                 harness.tool.snapshot.budget,
+	}
+	harness.fake.queue(
+		"read_tree",
+		marshalComputerUseTree(t, harness.tree),
+	)
+
+	observation, err := runtime.PlanOpenAIComputerObservationV1(
+		"Observe the same window after a verified click",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		observation.Args,
+	)
+	if err != nil || result.IsError {
+		t.Fatalf("observation result=%+v err=%v", result, err)
+	}
+	if harness.tool.coordinateFocus == nil ||
+		harness.tool.coordinateFocus.stateID != harness.tool.snapshot.id {
+		t.Fatalf(
+			"same-window observation lost verified click focus: focus=%+v snapshot=%+v",
+			harness.tool.coordinateFocus,
+			harness.tool.snapshot,
+		)
+	}
+	typed, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionTypeTextV1,
+			Text: "type after observation",
+		},
+	)
+	if err != nil {
+		t.Fatalf("type after same-window observation: %v", err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(typed.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "type" || args.Ref != "" {
+		t.Fatalf("same-window type projection = %+v", args)
 	}
 }

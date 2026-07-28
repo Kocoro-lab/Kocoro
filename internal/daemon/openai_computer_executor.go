@@ -747,6 +747,7 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 		ctx,
 		maxOpenAIComputerFinalObservationsV1,
 		false,
+		false,
 		e.observationRetry,
 		func(
 			attemptCtx context.Context,

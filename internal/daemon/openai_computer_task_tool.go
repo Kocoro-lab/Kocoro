@@ -19,15 +19,24 @@ import (
 )
 
 type openAIComputerTaskArgsV1 struct {
-	Task        string   `json:"task"`
-	Apps        []string `json:"apps,omitempty"`
-	Description string   `json:"description,omitempty"`
+	Task             string   `json:"task"`
+	ControlledApps   []string `json:"controlled_apps,omitempty"`
+	LegacyApps       []string `json:"apps,omitempty"`
+	ForegroundPolicy string   `json:"foreground_policy"`
+	Description      string   `json:"description,omitempty"`
 }
 
 type openAIComputerChildGoalV1 struct {
-	OriginalUserRequest string `json:"original_user_request"`
-	ParentDesktopPlan   string `json:"parent_desktop_plan"`
+	OriginalUserRequest string   `json:"original_user_request"`
+	ParentDesktopPlan   string   `json:"parent_desktop_plan"`
+	ControlledApps      []string `json:"controlled_apps,omitempty"`
+	ForegroundPolicy    string   `json:"foreground_policy,omitempty"`
 }
+
+const (
+	openAIComputerForegroundAllowedV1 = "foreground_allowed"
+	openAIComputerPreserveFrontmostV1 = "preserve_frontmost"
+)
 
 type openAIComputerInitialResponseUnavailableV1 struct {
 	Attempts int
@@ -164,24 +173,83 @@ const (
 func openAIComputerChildGoalInputV1(
 	ctx context.Context,
 	parentDesktopPlan string,
+	controlledApps []string,
+	foregroundPolicy string,
 ) string {
 	parentDesktopPlan = strings.TrimSpace(parentDesktopPlan)
 	invocation, ok := agent.ToolInvocationFromContext(ctx)
-	if !ok {
+	if !ok && foregroundPolicy != openAIComputerPreserveFrontmostV1 {
 		return parentDesktopPlan
 	}
-	originalUserRequest := strings.TrimSpace(invocation.UserRequest)
-	if originalUserRequest == "" || originalUserRequest == parentDesktopPlan {
+	originalUserRequest := parentDesktopPlan
+	if ok {
+		if request := strings.TrimSpace(invocation.UserRequest); request != "" {
+			originalUserRequest = request
+		}
+	}
+	if originalUserRequest == parentDesktopPlan &&
+		foregroundPolicy != openAIComputerPreserveFrontmostV1 {
 		return parentDesktopPlan
 	}
 	encoded, err := json.Marshal(openAIComputerChildGoalV1{
 		OriginalUserRequest: originalUserRequest,
 		ParentDesktopPlan:   parentDesktopPlan,
+		ControlledApps:      append([]string(nil), controlledApps...),
+		ForegroundPolicy:    foregroundPolicy,
 	})
 	if err != nil {
 		return parentDesktopPlan
 	}
 	return string(encoded)
+}
+
+func normalizeOpenAIComputerTaskArgsV1(
+	args *openAIComputerTaskArgsV1,
+) ([]string, error) {
+	if args == nil {
+		return nil, fmt.Errorf("arguments are required")
+	}
+	args.ForegroundPolicy = strings.TrimSpace(args.ForegroundPolicy)
+	switch args.ForegroundPolicy {
+	case openAIComputerForegroundAllowedV1,
+		openAIComputerPreserveFrontmostV1:
+	default:
+		return nil, fmt.Errorf(
+			"foreground_policy must be %q or %q",
+			openAIComputerForegroundAllowedV1,
+			openAIComputerPreserveFrontmostV1,
+		)
+	}
+	if len(args.ControlledApps) > 0 && len(args.LegacyApps) > 0 {
+		return nil, fmt.Errorf(
+			"controlled_apps and legacy apps cannot both be provided",
+		)
+	}
+	requestedApps := args.ControlledApps
+	if len(requestedApps) == 0 {
+		requestedApps = args.LegacyApps
+	}
+	seen := make(map[string]struct{}, len(requestedApps))
+	controlledApps := make([]string, 0, len(requestedApps))
+	for _, requested := range requestedApps {
+		requested = strings.TrimSpace(requested)
+		if requested == "" {
+			continue
+		}
+		key := strings.ToLower(requested)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		controlledApps = append(controlledApps, requested)
+	}
+	if args.ForegroundPolicy == openAIComputerPreserveFrontmostV1 &&
+		len(controlledApps) != 1 {
+		return nil, fmt.Errorf(
+			"preserve_frontmost requires exactly one controlled app",
+		)
+	}
+	return controlledApps, nil
 }
 
 // openAIComputerTaskOutcomeV1 is the private executor's terminal contract.
@@ -327,6 +395,14 @@ type openAIComputerTaskRuntimeV1 interface {
 		string,
 		bool,
 	) (tools.OpenAIComputerActionPlanV1, error)
+}
+
+type openAIComputerTaskLanePreparerV1 interface {
+	PrepareTaskAppsV1(
+		context.Context,
+		[]tools.OpenAIComputerTaskAppV1,
+		tools.OpenAIComputerTaskPreparationOptionsV1,
+	) (tools.OpenAIComputerExecutionLaneV1, error)
 }
 
 // openAIComputerTaskToolV1 is the only model-visible desktop-control surface.
@@ -526,6 +602,19 @@ type openAIComputerObservationRecorderV1 func(
 	time.Duration,
 )
 
+func openAIComputerObservationMeetsActionRequirementV1(
+	result agent.ToolResult,
+	requireCoordinateActionable bool,
+	allowSemanticActionable bool,
+) bool {
+	if !requireCoordinateActionable || result.GUIObservation == nil {
+		return true
+	}
+	return result.GUIObservation.CoordinateActionable ||
+		(allowSemanticActionable &&
+			result.GUIObservation.SemanticActionable)
+}
+
 // runOpenAIComputerObservationV1 is the single retry owner for initial and
 // post-batch/final screenshots. Each retry invokes only the observation
 // closure; it has no action payload and therefore cannot replay input.
@@ -533,6 +622,7 @@ func runOpenAIComputerObservationV1(
 	ctx context.Context,
 	maxAttempts int,
 	requireCoordinateActionable bool,
+	allowSemanticActionable bool,
 	retryWait func(context.Context, int) error,
 	attempt openAIComputerObservationAttemptV1,
 	record openAIComputerObservationRecorderV1,
@@ -555,10 +645,13 @@ func runOpenAIComputerObservationV1(
 		if record != nil {
 			record(attemptIndex, result, err, time.Since(started))
 		}
-		actionable := result.GUIObservation == nil ||
-			result.GUIObservation.CoordinateActionable
+		actionable := openAIComputerObservationMeetsActionRequirementV1(
+			result,
+			requireCoordinateActionable,
+			allowSemanticActionable,
+		)
 		if err == nil && !result.IsError && len(result.Images) == 1 &&
-			(!requireCoordinateActionable || actionable) {
+			actionable {
 			return result, nil
 		}
 		if attemptIndex == maxAttempts ||
@@ -576,13 +669,16 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "computer_use",
 		Description: "Operate native macOS desktop apps to complete one full user goal. " +
-			"Give the complete task once; the computer executor launches/focuses apps, " +
+			"Give the complete task once; the computer executor prepares exact app targets, " +
+			"keeps an eligible running app in the background for supported semantic actions, " +
+			"and falls back to the foreground only when foreground_policy permits it. It " +
 			"observes the current UI, performs the needed actions, and verifies the result internally. " +
 			"Do not split clicks, typing, screenshots, or app switches into separate calls. " +
 			"For reading or summarization, this call returns the requested content itself; " +
 			"treat that result as final rather than calling computer_use again to retrieve hidden observations. " +
 			"Do not omit a later step or app from the user's request. " +
-			"List app names in apps when known; the executor may switch apps itself.",
+			"List only apps whose UI may be read or changed in controlled_apps; never list an app " +
+			"merely because the user wants it to remain frontmost and untouched.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -590,15 +686,23 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 					"type":        "string",
 					"description": "The complete desktop task and desired end state.",
 				},
-				"apps": map[string]any{
+				"controlled_apps": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Optional installed macOS app names to launch before starting.",
+					"description": "Optional macOS app names whose UI the executor may read or change. Exclude any app named only as the frontmost app to preserve.",
+				},
+				"foreground_policy": map[string]any{
+					"type": "string",
+					"enum": []string{
+						openAIComputerForegroundAllowedV1,
+						openAIComputerPreserveFrontmostV1,
+					},
+					"description": "Use preserve_frontmost only when the user explicitly requires the single controlled app to remain in the background. This forbids foreground activation and fallback; unsupported actions fail without changing focus. Use foreground_allowed otherwise.",
 				},
 				"description": agent.DescriptionFieldSpec,
 			},
 		},
-		Required: []string{"task", "description"},
+		Required: []string{"task", "foreground_policy", "description"},
 	}
 }
 
@@ -616,6 +720,11 @@ func (t *openAIComputerTaskToolV1) Run(
 	args.Description = strings.TrimSpace(args.Description)
 	if args.Task == "" {
 		return agent.ValidationError("task is required"), nil
+	}
+	controlledAppNames, validationErr :=
+		normalizeOpenAIComputerTaskArgsV1(&args)
+	if validationErr != nil {
+		return agent.ValidationError(validationErr.Error()), nil
 	}
 	if args.Description == "" {
 		return agent.ValidationError("description is required"), nil
@@ -698,18 +807,12 @@ func (t *openAIComputerTaskToolV1) Run(
 		), nil
 	}
 
-	seen := make(map[string]struct{}, len(args.Apps))
-	apps := make([]tools.OpenAIComputerTaskAppV1, 0, len(args.Apps))
-	for _, requested := range args.Apps {
-		requested = strings.TrimSpace(requested)
-		if requested == "" {
-			continue
-		}
-		key := strings.ToLower(requested)
-		if _, duplicate := seen[key]; duplicate {
-			continue
-		}
-		seen[key] = struct{}{}
+	apps := make(
+		[]tools.OpenAIComputerTaskAppV1,
+		0,
+		len(controlledAppNames),
+	)
+	for _, requested := range controlledAppNames {
 		resolutionStarted := time.Now()
 		identity, err := t.runtime.ResolveTaskAppV1(ctx, requested)
 		if err != nil {
@@ -789,11 +892,40 @@ func (t *openAIComputerTaskToolV1) Run(
 			), nil
 		}
 	}
-	if err := t.runtime.LaunchAndFocusTaskAppsV1(ctx, apps); err != nil {
+	var preparationErr error
+	executionLane := tools.OpenAIComputerExecutionForegroundV1
+	backgroundRequired :=
+		args.ForegroundPolicy == openAIComputerPreserveFrontmostV1
+	if preparer, ok := t.runtime.(openAIComputerTaskLanePreparerV1); ok {
+		executionLane, preparationErr = preparer.PrepareTaskAppsV1(
+			ctx,
+			apps,
+			tools.OpenAIComputerTaskPreparationOptionsV1{
+				RequireBackground: backgroundRequired,
+			},
+		)
+	} else if backgroundRequired {
+		preparationErr = fmt.Errorf(
+			"the runtime does not support required background execution",
+		)
+	} else {
+		preparationErr = t.runtime.LaunchAndFocusTaskAppsV1(ctx, apps)
+	}
+	if preparationErr != nil {
+		failureCode := "app_launch_focus_failed"
+		message := "Computer Use could not finish preparing the requested app target"
+		recovery := openAIComputerPreActionRecoveryV1(len(apps) > 0)
+		outcomeRecovery := agent.ComputerUseRecoveryAlternateControl
+		if backgroundRequired {
+			failureCode = "background_required_unavailable"
+			message = "Computer Use could not bind the controlled app without changing the user's foreground app"
+			recovery = "do not activate the controlled app or retry through a foreground desktop-control path in this turn; report that required background execution is unavailable"
+			outcomeRecovery = agent.ComputerUseRecoveryNone
+		}
 		event := openAIComputerTraceEventV1{
 			Phase:       "app_launch_focus",
 			Status:      "failed",
-			FailureCode: "app_launch_focus_failed",
+			FailureCode: failureCode,
 			DurationMS:  time.Since(preparationStarted).Milliseconds(),
 		}
 		if len(apps) > 0 {
@@ -802,15 +934,15 @@ func (t *openAIComputerTaskToolV1) Run(
 		trace.record(event)
 		return withOpenAIComputerTaskFailureOutcomeV1(
 			agent.BusinessError(
-				"computer_use_error: app_launch_focus_failed\n"+
-					"message: Computer Use could not finish preparing the requested app target\n"+
-					"recovery: "+openAIComputerPreActionRecoveryV1(len(apps) > 0)+"\n"+
-					"detail: "+err.Error(),
+				"computer_use_error: "+failureCode+"\n"+
+					"message: "+message+"\n"+
+					"recovery: "+recovery+"\n"+
+					"detail: "+preparationErr.Error(),
 			),
 			agent.ComputerUseTaskNotCompleted,
 			agent.ComputerUseCommitNone,
-			"app_launch_focus_failed",
-			agent.ComputerUseRecoveryAlternateControl,
+			failureCode,
+			outcomeRecovery,
 		), nil
 	}
 	preparationEvent := openAIComputerTraceEventV1{
@@ -838,6 +970,7 @@ func (t *openAIComputerTaskToolV1) Run(
 		ctx,
 		maxOpenAIComputerInitialObservationsV1,
 		true,
+		executionLane == tools.OpenAIComputerExecutionBackgroundSemanticV1,
 		retryObservation,
 		func(
 			attemptCtx context.Context,
@@ -871,6 +1004,12 @@ func (t *openAIComputerTaskToolV1) Run(
 			attemptErr error,
 			duration time.Duration,
 		) {
+			actionable := openAIComputerObservationMeetsActionRequirementV1(
+				result,
+				true,
+				executionLane ==
+					tools.OpenAIComputerExecutionBackgroundSemanticV1,
+			)
 			event := openAIComputerTraceEventV1{
 				Phase:      "initial_observation",
 				Status:     openAIComputerTraceStatusV1(result, attemptErr),
@@ -878,7 +1017,7 @@ func (t *openAIComputerTaskToolV1) Run(
 				DurationMS: duration.Milliseconds(),
 			}
 			if attemptErr == nil && !result.IsError &&
-				len(result.Images) == 1 {
+				len(result.Images) == 1 && actionable {
 				observationDetail = ""
 			} else {
 				event.Status = "failed"
@@ -887,12 +1026,20 @@ func (t *openAIComputerTaskToolV1) Run(
 					attemptErr,
 				)
 				if event.FailureCode == "" {
-					event.FailureCode = "initial_image_unavailable"
+					if len(result.Images) == 1 && !actionable {
+						event.FailureCode =
+							"initial_action_authority_unavailable"
+					} else {
+						event.FailureCode = "initial_image_unavailable"
+					}
 				}
 				if attemptErr != nil {
 					observationDetail = boundOpenAIComputerObservationDetailV1(
 						attemptErr.Error(),
 					)
+				} else if len(result.Images) == 1 && !actionable {
+					observationDetail =
+						"the exact window image did not mint the required action authority"
 				} else {
 					observationDetail =
 						openAIComputerObservationResultDetailV1(result)
@@ -907,7 +1054,13 @@ func (t *openAIComputerTaskToolV1) Run(
 			))
 		},
 	)
-	if observationErr != nil || initial.IsError || len(initial.Images) != 1 {
+	initialActionable := openAIComputerObservationMeetsActionRequirementV1(
+		initial,
+		true,
+		executionLane == tools.OpenAIComputerExecutionBackgroundSemanticV1,
+	)
+	if observationErr != nil || initial.IsError || len(initial.Images) != 1 ||
+		!initialActionable {
 		detail := observationDetail
 		if detail == "" && observationErr != nil {
 			detail = boundOpenAIComputerObservationDetailV1(
@@ -934,7 +1087,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			result := withOpenAIComputerTaskOutcomeV1(agent.BusinessError(
 				"computer_use_error: initial_target_required\n"+
 					"message: Computer Use cannot infer a safe initial target while the protected Kocoro Desktop window is frontmost\n"+
-					"recovery: retry computer_use once in this turn with the relevant app names in apps; do not switch to another desktop-control tool\n"+
+					"recovery: retry computer_use once in this turn with the relevant controlled app names in controlled_apps and an explicit foreground_policy; do not switch to another desktop-control tool\n"+
 					"detail: no desktop action was attempted",
 			), agent.ComputerUseTaskNotCompleted, agent.ComputerUseCommitNone)
 			result.ComputerUseOutcome.FailureCode = "initial_target_required"
@@ -1022,6 +1175,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			"Complete the user's entire desktop goal with the native computer tool. " +
 			"When the child input is JSON, original_user_request is authoritative: complete every desktop step it requests, including later steps in other apps. " +
 			"parent_desktop_plan is only a planning hint and may accidentally omit a requested step; never treat that omission as permission to stop early. " +
+			"When foreground_policy is preserve_frontmost, Kocoro has bound exactly one controlled app to a no-activation lane: use only actions Kocoro admits, never request or claim foreground fallback, and do not invent an input mechanism such as Command-click. " +
 			"The initial image is the current verified app window and is sufficient to plan the first useful action. " +
 			"Because the first response must call the computer tool, make that first batch perform the first useful goal action; do not spend it on screenshot or wait unless the initial image is unreadable or visibly loading. " +
 			"Batch adjacent deterministic actions that are justified by the same latest screenshot, and stop the batch before an action needs a newly changed visual target. " +
@@ -1071,7 +1225,12 @@ func (t *openAIComputerTaskToolV1) Run(
 	providerStarted := time.Now()
 	reply, _, err := child.Run(
 		taskCtx,
-		openAIComputerChildGoalInputV1(ctx, args.Task),
+		openAIComputerChildGoalInputV1(
+			ctx,
+			args.Task,
+			controlledAppNames,
+			args.ForegroundPolicy,
+		),
 		content,
 		nil,
 	)
@@ -1396,7 +1555,13 @@ func (t *openAIComputerTaskToolV1) Run(
 		DurationMS: time.Since(taskStarted).Milliseconds(),
 	})
 	return withOpenAIComputerTaskOutcomeV1(
-		agent.ToolResult{Content: outcome.Summary},
+		agent.ToolResult{Content: func() string {
+			if backgroundRequired {
+				return outcome.Summary +
+					"\nexecution: background_semantic; foreground activation and fallback were disabled"
+			}
+			return outcome.Summary
+		}()},
 		agent.ComputerUseTaskCompleted,
 		stats.TaskEffect,
 	), nil

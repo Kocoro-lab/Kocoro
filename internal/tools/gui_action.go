@@ -103,6 +103,62 @@ func validComputerUseAction(action string) bool {
 	}
 }
 
+func computerUseExecutionPresentationV1(
+	ctx context.Context,
+	args computerUseArgs,
+) (string, bool, error) {
+	lane := strings.TrimSpace(args.ExecutionLane)
+	if lane == "" {
+		if args.ForegroundFallback {
+			return "", false, fmt.Errorf(
+				"foreground fallback requires an explicit foreground execution lane",
+			)
+		}
+		return string(guicontrol.ComputerUseExecutionForeground), false, nil
+	}
+	if !hasOpenAINativeComputerActionV1(ctx) {
+		return "", false, fmt.Errorf(
+			"execution lane is restricted to an admitted OpenAI native computer action",
+		)
+	}
+	switch lane {
+	case string(guicontrol.ComputerUseExecutionForeground):
+		return lane, args.ForegroundFallback, nil
+	case string(guicontrol.ComputerUseExecutionBackgroundSemantic):
+		if args.ForegroundFallback {
+			return "", false, fmt.Errorf(
+				"background semantic execution cannot claim foreground fallback",
+			)
+		}
+		switch args.Action {
+		case "get_app_state", "screenshot", "get_value", "wait", "press":
+			return lane, false, nil
+		default:
+			return "", false, fmt.Errorf(
+				"action %q is not supported by background semantic execution",
+				args.Action,
+			)
+		}
+	case string(guicontrol.ComputerUseExecutionBackgroundKeyboard):
+		if args.ForegroundFallback {
+			return "", false, fmt.Errorf(
+				"background keyboard execution cannot claim foreground fallback",
+			)
+		}
+		switch args.Action {
+		case "type", "keypress":
+			return lane, false, nil
+		default:
+			return "", false, fmt.Errorf(
+				"action %q is not supported by background keyboard execution",
+				args.Action,
+			)
+		}
+	default:
+		return "", false, fmt.Errorf("invalid computer-use execution lane")
+	}
+}
+
 func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string) (agent.GUIActionDescriptor, error) {
 	var args computerUseArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
@@ -117,6 +173,11 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 	if args.Action == "pixel_scroll" && !hasOpenAINativeComputerActionV1(ctx) {
 		return agent.GUIActionDescriptor{}, fmt.Errorf(
 			"pixel_scroll is restricted to an admitted OpenAI native computer action")
+	}
+	executionLane, foregroundFallback, err :=
+		computerUseExecutionPresentationV1(ctx, args)
+	if err != nil {
+		return agent.GUIActionDescriptor{}, err
 	}
 	// A pure delay has no GUI target. Likewise, an unattended first
 	// observation without an explicit app is intentionally classified as
@@ -138,6 +199,8 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 		path = "synthetic_coordinate"
 	}
 	descriptor := guiDescriptor(args.Action, effect, path)
+	descriptor.ExecutionLane = executionLane
+	descriptor.ForegroundFallback = foregroundFallback
 
 	var target guiAXTarget
 	pid := 0
@@ -250,7 +313,20 @@ func (t *ComputerUseTool) RestoreGUIActionTargetV1(
 	if !descriptor.Participates || descriptor.Effect != agent.GUIActionMutation {
 		return fmt.Errorf("computer-use target restore requires an admitted mutation")
 	}
-	if descriptor.ActionKind == "type" && t != nil && t.coordinateFocus != nil {
+	orderedNativeAction := hasOpenAINativeComputerActionV1(ctx)
+	foregroundFallbackTransition :=
+		orderedNativeAction &&
+			descriptor.ForegroundFallback &&
+			t != nil &&
+			t.foregroundFallbackRestorePending
+	if orderedNativeAction && !foregroundFallbackTransition {
+		// The runtime already activated the first foreground target. Later
+		// ordered actions stay bound to their current observation; re-focusing
+		// here would collapse popovers, sheets, file panels, or cross-app state.
+		return nil
+	}
+	if descriptor.ActionKind == "type" && t != nil &&
+		t.coordinateFocus != nil && !foregroundFallbackTransition {
 		if descriptor.TargetBundleID == t.coordinateFocus.bundleID &&
 			descriptor.TargetAppName == t.coordinateFocus.app {
 			// A coordinate-focused type must use the focus left by the verified
@@ -268,14 +344,19 @@ func (t *ComputerUseTool) RestoreGUIActionTargetV1(
 		return fmt.Errorf("computer-use target restore identity does not match the observation")
 	}
 	params := map[string]any{
-		"app_name": t.snapshot.app,
-		"verify":   true,
+		"app_name":  t.snapshot.app,
+		"verify":    true,
+		"pid":       t.snapshot.pid,
+		"bundle_id": t.snapshot.bundleID,
 	}
 	if window := strings.TrimSpace(t.snapshot.window); window != "" {
 		params["window_title"] = window
 	}
 	if _, err := t.client.Call(ctx, "focus", params); err != nil {
 		return fmt.Errorf("restore observed computer-use target: %w", err)
+	}
+	if foregroundFallbackTransition {
+		t.foregroundFallbackRestorePending = false
 	}
 	return nil
 }

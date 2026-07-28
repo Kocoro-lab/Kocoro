@@ -59,14 +59,19 @@ func alternateDesktopControlBlockedResult() ToolResult {
 	}
 }
 
-func computerUseCallHasApps(argsJSON string) bool {
+func computerUseCallHasControlledAppsAndPolicy(argsJSON string) bool {
 	var args struct {
-		Apps []string `json:"apps"`
+		ControlledApps   []string `json:"controlled_apps"`
+		ForegroundPolicy string   `json:"foreground_policy"`
 	}
 	if json.Unmarshal([]byte(argsJSON), &args) != nil {
 		return false
 	}
-	for _, app := range args.Apps {
+	if args.ForegroundPolicy != "foreground_allowed" &&
+		args.ForegroundPolicy != "preserve_frontmost" {
+		return false
+	}
+	for _, app := range args.ControlledApps {
 		if strings.TrimSpace(app) != "" {
 			return true
 		}
@@ -78,7 +83,7 @@ func computerUseAppsRequiredResult() ToolResult {
 	return ToolResult{
 		Content: "computer_use_error: initial_target_required\n" +
 			"message: the previous computer_use call attempted no desktop action because it lacked a safe initial app target\n" +
-			"recovery: retry computer_use with the relevant app names in apps; alternate desktop-control tools remain blocked",
+			"recovery: retry computer_use with the relevant controlled app names in controlled_apps and an explicit foreground_policy; alternate desktop-control tools remain blocked",
 		IsError:       true,
 		ErrorCategory: ErrCategoryBusiness,
 	}
