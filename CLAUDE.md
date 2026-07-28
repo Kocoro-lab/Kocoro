@@ -345,7 +345,7 @@ fields, drift patterns). Invariants:
 
 ### Anti-Hallucination
 
-XML `<tool_exec>` delimiters with random hex call_id. Preamble suppressed when response has tool calls. Fabricated tool calls detected and stripped.
+XML `<tool_exec>` delimiters use random hex call_id. Model-authored preambles are preserved. In attended runs, a silent first tool batch falls back to its user-facing `description` or `purpose`; unattended runs remain silent. Fabricated tool calls are detected and stripped.
 
 ## Testing
 

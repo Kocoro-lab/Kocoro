@@ -3,10 +3,13 @@ package e2e
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
@@ -14,6 +17,98 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
+
+func TestOffline_OneShotPrintsFallbackPreambleBeforeTool(t *testing.T) {
+	var calls atomic.Int32
+	fakeGateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/completions" {
+			_ = json.NewEncoder(w).Encode([]any{})
+			return
+		}
+		switch calls.Add(1) {
+		case 1:
+			args := map[string]any{
+				"pattern":     "fallbackPreambleFromToolCalls",
+				"path":        filepath.Join(repoRoot(), "internal", "agent", "preamble.go"),
+				"output_mode": "content",
+				"description": "Locate the preamble helper.",
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model":         "e2e-silent-tool-model",
+				"output_text":   "",
+				"finish_reason": "tool_use",
+				"tool_calls": []map[string]any{{
+					"id":        "toolu_e2e_preamble",
+					"name":      "grep",
+					"arguments": args,
+				}},
+				"content_blocks": []map[string]any{{
+					"type":  "tool_use",
+					"id":    "toolu_e2e_preamble",
+					"name":  "grep",
+					"input": args,
+				}},
+				"usage": map[string]any{"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+			})
+		case 2:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model":         "e2e-silent-tool-model",
+				"output_text":   "Located.",
+				"finish_reason": "end_turn",
+				"usage":         map[string]any{"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+			})
+		case 3:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model":         "e2e-silent-tool-model",
+				"output_text":   "Preamble E2E",
+				"finish_reason": "end_turn",
+				"usage":         map[string]any{"input_tokens": 10, "output_tokens": 3, "total_tokens": 13},
+			})
+		default:
+			http.Error(w, "unexpected completion request", http.StatusInternalServerError)
+		}
+	}))
+	defer fakeGateway.Close()
+
+	tempHome := t.TempDir()
+	shannonDir := filepath.Join(tempHome, ".shannon")
+	if err := os.MkdirAll(shannonDir, 0o700); err != nil {
+		t.Fatalf("mkdir shannon dir: %v", err)
+	}
+	configYAML := "provider: gateway\n" +
+		"endpoint: " + fakeGateway.URL + "\n" +
+		"auto_update_check: false\n" +
+		"agent:\n" +
+		"  skill_discovery: false\n" +
+		"mcp_servers:\n" +
+		"  playwright:\n" +
+		"    disabled: true\n"
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(configYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := exec.Command(testBinary(t), "-y", "locate the preamble helper")
+	cmd.Dir = repoRoot()
+	cmd.Env = append(os.Environ(), "HOME="+tempHome)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("shan one-shot: %v\n%s", err, output)
+	}
+
+	text := string(output)
+	preambleAt := strings.Index(text, "Locate the preamble helper.")
+	toolAt := strings.Index(text, "⏵ grep")
+	finalAt := strings.Index(text, "Located.")
+	if preambleAt < 0 || toolAt < 0 || finalAt < 0 {
+		t.Fatalf("missing preamble, tool, or final output:\n%s", text)
+	}
+	if !(preambleAt < toolAt && toolAt < finalAt) {
+		t.Fatalf("unexpected output order (preamble=%d tool=%d final=%d):\n%s", preambleAt, toolAt, finalAt, text)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("completion calls = %d, want 3 (tool turn, final turn, and one-shot title)", got)
+	}
+}
 
 // ---------- Agent loading & builtin ----------
 
@@ -290,5 +385,3 @@ func TestOffline_MCPServe_ToolsList(t *testing.T) {
 		}
 	}
 }
-
-

@@ -118,6 +118,28 @@ func TestSystemPromptAudit(t *testing.T) {
 	t.Logf("  total redundancy candidates: %d", flagged)
 }
 
+func TestCoreOperationalRulesDoNotSuppressOperationalPreambles(t *testing.T) {
+	for _, forbidden := range []string{
+		"No reasoning preamble.",
+		"Never apologize for, comment on, or explain your own tool calls.",
+		"Reserve narration for reporting the result after the action is complete.",
+	} {
+		if strings.Contains(coreOperationalRules+contrastExamplesCore, forbidden) {
+			t.Errorf("runtime prompt still contains preamble-suppressing instruction %q", forbidden)
+		}
+	}
+
+	for _, required := range []string{
+		"brief user-facing preamble",
+		"same response",
+		"Do not stop after announcing",
+	} {
+		if !strings.Contains(coreOperationalRules+contrastExamplesCore, required) {
+			t.Errorf("runtime prompt missing operational-preamble guard %q", required)
+		}
+	}
+}
+
 func dumpConst(t *testing.T, label, content string) {
 	t.Helper()
 	t.Logf("%s: %d chars / ~%.0f tokens", label, len(content), tokensFromChars(len(content)))

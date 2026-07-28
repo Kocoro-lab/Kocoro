@@ -184,7 +184,7 @@ Context-window defaults are only seeds; model responses may auto-adjust the acti
 
 ### Anti-Hallucination
 
-Keep random XML tool execution delimiters, suppress preamble when tool calls are present, and strip fabricated tool calls.
+Keep random XML tool execution delimiters and strip fabricated tool calls. For attended runs, preserve model-authored preambles; if the first tool batch is silent, surface its user-facing description without exposing raw arguments. Unattended runs remain silent.
 
 ## Tests
 
