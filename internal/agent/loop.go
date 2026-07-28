@@ -1202,12 +1202,13 @@ func (a *AgentLoop) operationalRules() string {
 // buildAssistantMessage constructs an assistant client.Message from a
 // CompletionResponse + the preamble already normalized by the caller.
 //
-// When resp.ContentBlocks is non-empty (Cloud ≥ 2026-05), it is the source
-// of truth. The ordered list is preserved verbatim unless the caller recovered
-// a fallback preamble and the blocks contain no visible text; in that case the
-// runtime synthesizes a text block immediately before the first tool_use block.
-// That inserted text did not come from the provider response. Thinking content,
-// signatures, and relative ordering remain intact.
+// When resp.ContentBlocks is non-empty (Cloud ≥ 2026-05), it is the source of
+// truth for block ordering. The ordered list is preserved verbatim unless it
+// contains no visible text and normalizedToolText is non-empty; in that case a
+// text block is inserted immediately before the first tool_use block. The text
+// may be provider-authored OutputText omitted from ContentBlocks or a runtime
+// fallback recovered by the caller. Thinking content, signatures, and relative
+// ordering remain intact.
 //
 // When resp.ContentBlocks is empty (legacy Cloud or non-Anthropic provider
 // that never populates it), fall back to assembling text+tool_use blocks
@@ -3179,6 +3180,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			}
 		}
 		latestUserText = strings.Join(texts, "\n\n")
+		// A committed injection starts a new user turn inside this Run. Give it
+		// its own activity cadence so the first silent tool batch does not
+		// inherit the prior turn's every-third-batch rate limit.
+		preambleEmitted = false
+		silentNarratableBatches = 0
 		messages = append(messages, newMsg)
 		stampMessage()
 		a.injectedMessages = append(a.injectedMessages, texts...)

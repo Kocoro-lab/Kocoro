@@ -5165,6 +5165,51 @@ func TestAgentLoop_LongSilentToolChainGetsPeriodicFallback(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_InjectedTurnGetsFreshFallbackPreamble(t *testing.T) {
+	injectCh := make(chan InjectedMessage, 1)
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			// The follow-up arrives after this iteration's top-of-loop drain,
+			// so it is committed before the next model call.
+			injectCh <- InjectedMessage{Text: "now inspect the follow-up", ClientMessageID: "follow-up-1"}
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("noop_tool", `{"description":"Inspect the first request."}`, "toolu_inject_preamble_1"), 12, 8))
+		case 2:
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("noop_tool", `{"description":"Inspect the follow-up."}`, "toolu_inject_preamble_2"), 12, 8))
+		default:
+			_ = json.NewEncoder(w).Encode(nativeResponse("Finished.", "end_turn", nil, 5, 4))
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetInjectCh(injectCh)
+	loop.SetHandler(handler)
+
+	result, _, err := loop.Run(context.Background(), "inspect the first request", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Finished." {
+		t.Fatalf("result = %q, want Finished.", result)
+	}
+	want := []string{"Inspect the first request.", "Inspect the follow-up."}
+	if !reflect.DeepEqual(handler.preambleCalls, want) {
+		t.Fatalf("injected turn inherited prior preamble cadence: got %#v, want %#v", handler.preambleCalls, want)
+	}
+}
+
 // TestAgentLoop_LastSentRequest_DeepCopyOnRead pins the deep-copy contract on
 // the getter: mutating the returned snapshot's Messages/Tools slices must NOT
 // leak into a subsequent call to LastSentRequest(). Without per-call backing-
