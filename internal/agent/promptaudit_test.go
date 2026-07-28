@@ -36,14 +36,16 @@ func TestSystemPromptAudit(t *testing.T) {
 	dumpConst(t, "  cloudDelegationGuidance (conditional)", cloudDelegationGuidance)
 	dumpConst(t, "  contrastExamplesCloud (conditional)", contrastExamplesCloud)
 
-	// Mimic a typical post-categorical-defer one-shot CLI tool registry.
-	// 17 tools after browser/computer/schedule/etc. are filtered out by
-	// buildLocalActiveSchemas (see cache-action-plan §1.2).
+	// Default gateway + native-thinking Direct set. The exhaustive production
+	// registration matrix is pinned by tools.TestRegisteredLocalToolExposureMatrix;
+	// `think` is intentionally absent because default native thinking skips it.
 	tools := []string{
-		"bash", "clipboard", "cloud_delegate", "directory_list",
-		"file_edit", "file_read", "file_write", "glob", "grep", "http",
-		"memory_append", "notify", "session_search", "system_info", "think",
-		"tool_search", "use_skill",
+		"archive_extract", "archive_inspect", "ask_user_question", "bash",
+		"clipboard", "directory_list", "docx_to_text", "file_edit",
+		"file_read", "file_write", "glob", "grep", "http", "memory_append",
+		"notify", "pdf_to_text", "pptx_to_text", "present_deliverable",
+		"schedule_list", "schedule_show", "system_info", "tool_search",
+		"use_skill", "xlsx_to_text",
 	}
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
 		BasePrompt:     basePrompt,
@@ -114,6 +116,26 @@ func TestSystemPromptAudit(t *testing.T) {
 		}
 	}
 	t.Logf("  total redundancy candidates: %d", flagged)
+}
+
+func TestCoreOperationalRulesDoNotSuppressOperationalPreambles(t *testing.T) {
+	for _, forbidden := range []string{
+		"No reasoning preamble.",
+		"Never apologize for, comment on, or explain your own tool calls.",
+		"Reserve narration for reporting the result after the action is complete.",
+	} {
+		if strings.Contains(coreOperationalRules+contrastExamplesCore, forbidden) {
+			t.Errorf("runtime prompt still contains preamble-suppressing instruction %q", forbidden)
+		}
+	}
+
+	const requiredPreambleGuard = "give one brief user-facing preamble and continue with the tool calls in the same response"
+	if !strings.Contains(coreOperationalRules+contrastExamplesCore, requiredPreambleGuard) {
+		t.Errorf("runtime prompt missing operational-preamble guard %q", requiredPreambleGuard)
+	}
+	if !strings.Contains(coreOperationalRules, "Do not apologize for routine tool use.") {
+		t.Error("runtime prompt missing routine tool-use apology guard")
+	}
 }
 
 func dumpConst(t *testing.T, label, content string) {

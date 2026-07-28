@@ -171,13 +171,13 @@ func TestToolSearchTool_KeywordSearchTokenizesMultiWordQuery(t *testing.T) {
 		"calendar_list_events":             true,
 	})
 
-	result, err := ts.Run(context.Background(), `{"query":"email mail inbox"}`)
+	result, err := ts.Run(context.Background(), `{"query":"gmail inbox messages"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	header := strings.SplitN(result.Content, "\n", 2)[0]
 	if !strings.Contains(header, "search_gmail_messages") {
-		t.Fatalf("multi-word query should match Gmail tools by token; got header: %s", header)
+		t.Fatalf("multi-word query should match Gmail tools by BM25 terms; got header: %s", header)
 	}
 	if strings.Contains(header, "calendar_list_events") {
 		t.Fatalf("multi-word Gmail query should not match unrelated calendar tool; got header: %s", header)
@@ -237,6 +237,25 @@ func TestToolSearchTool_KeywordSearchShortToken(t *testing.T) {
 	}
 }
 
+func TestToolSearchTool_KeywordSearchFallsBackToTokenPrefix(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockDescTool{name: "schedule_create", desc: "Create a timed job."})
+	reg.Register(&mockDescTool{name: "calendar_list", desc: "List calendar events."})
+	ts := newToolSearchTool(reg, map[string]bool{
+		"schedule_create": true,
+		"calendar_list":   true,
+	})
+
+	result, err := ts.Run(context.Background(), `{"query":"sched"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:schedule_create" {
+		t.Fatalf("prefix fallback header = %q, want LOADED:schedule_create", header)
+	}
+}
+
 func TestToolSearchTool_NoMatches(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	result, err := ts.Run(context.Background(), `{"query":"nonexistent_xyz"}`)
@@ -259,6 +278,27 @@ func TestToolSearchTool_OnlySearchesDeferred(t *testing.T) {
 	if strings.Contains(header, "bash") {
 		t.Error("tool_search should not find local tool 'bash'")
 	}
+	if !strings.Contains(result.Content, `Tool "bash" is already directly available`) {
+		t.Fatalf("Direct selection should explain that bash is already available, got %q", result.Content)
+	}
+}
+
+func TestToolSearchTool_SelectMixedDirectAndDeferred(t *testing.T) {
+	ts := newTestToolSearchAgent()
+	result, err := ts.Run(context.Background(), `{"query":"select:bash,mock_mcp_a"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:mock_mcp_a" {
+		t.Fatalf("mixed selection header = %q, want LOADED:mock_mcp_a", header)
+	}
+	if !strings.Contains(result.Content, `Tool "bash" is already directly available`) {
+		t.Fatalf("mixed selection should guide the Direct call, got %q", result.Content)
+	}
+	if len(result.ContentBlocks) != 1 || result.ContentBlocks[0].ToolName != "mock_mcp_a" {
+		t.Fatalf("mixed selection blocks = %+v, want one deferred reference", result.ContentBlocks)
+	}
 }
 
 func TestToolSearchTool_IsReadOnly(t *testing.T) {
@@ -272,6 +312,13 @@ func TestToolSearchTool_RequiresApproval(t *testing.T) {
 	ts := newTestToolSearchAgent()
 	if ts.RequiresApproval() {
 		t.Error("tool_search should not require approval")
+	}
+}
+
+func TestToolSearchTool_ExposureDirect(t *testing.T) {
+	ts := newTestToolSearchAgent()
+	if got := ts.ToolExposure(); got != ToolExposureDirect {
+		t.Fatalf("tool_search exposure = %q, want %q", got, ToolExposureDirect)
 	}
 }
 
@@ -290,8 +337,15 @@ func TestExpandDeferredFamilyCore_LoadsBrowserCore(t *testing.T) {
 	if len(expanded) != len(FamilyRegistry["browser"].Core) {
 		t.Fatalf("expected browser family core only, got %v", expanded)
 	}
-	expected := append([]string(nil), FamilyRegistry["browser"].Core...)
-	sort.Strings(expected)
+	expected := []string{"browser_navigate"}
+	remaining := make([]string, 0, len(FamilyRegistry["browser"].Core)-1)
+	for _, name := range FamilyRegistry["browser"].Core {
+		if name != "browser_navigate" {
+			remaining = append(remaining, name)
+		}
+	}
+	sort.Strings(remaining)
+	expected = append(expected, remaining...)
 	for i, name := range expected {
 		if expanded[i] != name {
 			t.Fatalf("index %d: expected %q, got %q", i, name, expanded[i])
@@ -480,28 +534,24 @@ func TestHasAnyNonDeferred(t *testing.T) {
 	}
 }
 
-// Categorical defer (cache-action-plan §1.2) — local tools whose names match
-// shouldDeferByCategory must enter the deferred set even though they are
-// classified as "local" by partitionBySource. Without this, big-schema rare-
-// use tools (browser_*, computer, schedule_*, …) ride the cold-start tools[]
-// for every one-shot CLI session and pay full cache_creation cost.
-
-func TestDeferredToolNames_IncludesLocalCategoricals(t *testing.T) {
+func TestDeferredToolNames_IncludesExplicitDeferredLocals(t *testing.T) {
 	reg := NewToolRegistry()
-	// Common local tools that must NOT be deferred:
 	reg.Register(&mockTool{name: "bash"})
 	reg.Register(&mockTool{name: "file_read"})
 	reg.Register(&mockTool{name: "file_write"})
 	reg.Register(&mockTool{name: "ask_user_question"})
-	// Categorical local tools that MUST be deferred:
-	reg.Register(&mockTool{name: "computer"})
-	reg.Register(&mockTool{name: "computer_use"})
-	reg.Register(&mockTool{name: "schedule_create"})
-	reg.Register(&mockTool{name: "browser_navigate"})
+	for _, name := range []string{"computer", "computer_use", "schedule_create", "browser"} {
+		reg.Register(&exposureTestTool{
+			name:     name,
+			source:   SourceLocal,
+			exposure: ToolExposureDeferred,
+			explicit: true,
+		})
+	}
 
 	deferred := deferredToolNames(reg)
 
-	mustDefer := []string{"computer", "computer_use", "schedule_create", "browser_navigate"}
+	mustDefer := []string{"computer", "computer_use", "schedule_create", "browser"}
 	for _, n := range mustDefer {
 		if !deferred[n] {
 			t.Errorf("expected %q to be in deferred set, got %v", n, mapKeys(deferred))
@@ -515,18 +565,18 @@ func TestDeferredToolNames_IncludesLocalCategoricals(t *testing.T) {
 	}
 }
 
-func TestDeferredToolNames_BrowserPrefixCovered(t *testing.T) {
+func TestDeferredToolNames_MCPBrowserToolsFollowSourceDefault(t *testing.T) {
 	reg := NewToolRegistry()
-	reg.Register(&mockTool{name: "browser_click"})
-	reg.Register(&mockTool{name: "browser_take_screenshot"})
-	reg.Register(&mockTool{name: "browser_run_code"})
+	reg.Register(&mockMCPTool{name: "browser_click"})
+	reg.Register(&mockMCPTool{name: "browser_take_screenshot"})
+	reg.Register(&mockMCPTool{name: "browser_run_code"})
 	reg.Register(&mockTool{name: "file_read"}) // control: must stay non-deferred
 
 	deferred := deferredToolNames(reg)
 
 	for _, name := range []string{"browser_click", "browser_take_screenshot", "browser_run_code"} {
 		if !deferred[name] {
-			t.Errorf("browser_* prefix not covered: %q missing from %v", name, mapKeys(deferred))
+			t.Errorf("MCP source default not applied: %q missing from %v", name, mapKeys(deferred))
 		}
 	}
 	if deferred["file_read"] {
@@ -534,15 +584,17 @@ func TestDeferredToolNames_BrowserPrefixCovered(t *testing.T) {
 	}
 }
 
-// web_search / web_fetch are gateway tools but must be excluded from the
-// deferred set (neverDeferTools in toolbudget.go) — they are the common
-// first-message-of-a-session tools, and deferring them costs an extra
-// tool_search round-trip before every new session's first search. Other
-// gateway tools stay deferred-eligible as before.
-func TestDeferredToolNames_ExcludesNeverDeferGatewayTools(t *testing.T) {
+// Common gateway openers explicitly override their source's Deferred default.
+func TestDeferredToolNames_RespectsDirectGatewayOverrides(t *testing.T) {
 	reg := NewToolRegistry()
-	reg.Register(&mockSourcedTool{name: "web_search", source: SourceGateway})
-	reg.Register(&mockSourcedTool{name: "web_fetch", source: SourceGateway})
+	for _, name := range []string{"web_search", "web_fetch"} {
+		reg.Register(&exposureTestTool{
+			name:     name,
+			source:   SourceGateway,
+			exposure: ToolExposureDirect,
+			explicit: true,
+		})
+	}
 	reg.Register(&mockSourcedTool{name: "alpaca_news", source: SourceGateway})
 	reg.Register(&mockMCPTool{name: "mcp_a"})
 
@@ -560,30 +612,6 @@ func TestDeferredToolNames_ExcludesNeverDeferGatewayTools(t *testing.T) {
 	}
 }
 
-func TestHasCategoricalDeferred(t *testing.T) {
-	cases := []struct {
-		name string
-		cold map[string]bool
-		want bool
-	}{
-		{"empty cold set", map[string]bool{}, false},
-		{"only mcp tools (non-categorical)", map[string]bool{"mcp_a": true}, false},
-		{"contains computer", map[string]bool{"mcp_a": true, "computer": true}, true},
-		{"contains browser_*", map[string]bool{"browser_click": true}, true},
-		{"contains schedule_*", map[string]bool{"schedule_remove": true}, true},
-		{"contains process", map[string]bool{"process": true}, true},
-		{"ask user question stays direct", map[string]bool{"ask_user_question": true}, false},
-		{"memory_recall no longer always-deferred", map[string]bool{"memory_recall": true}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := hasCategoricalDeferred(tc.cold); got != tc.want {
-				t.Errorf("hasCategoricalDeferred(%v) = %v, want %v", tc.cold, got, tc.want)
-			}
-		})
-	}
-}
-
 func mapKeys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -592,23 +620,31 @@ func mapKeys(m map[string]bool) []string {
 	return out
 }
 
-// End-to-end schema build (tool-ref-supported path, loop.go's
-// buildFullSchemasWithDefer call): with deferredMode active because of an
-// unrelated categorical tool (computer), web_search/web_fetch schemas must
-// still ship with DeferLoading=false — full schema, not deferred — while the
-// categorical tool and an ordinary gateway tool stay DeferLoading=true.
-func TestBuildFullSchemasWithDefer_WebToolsNeverDeferred(t *testing.T) {
+// End-to-end schema build for the tool-reference path: explicit Direct gateway
+// openers stay full schemas while independent Deferred tools carry the flag.
+func TestBuildFullSchemasWithDefer_RespectsEffectiveExposure(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockTool{name: "bash"})
-	reg.Register(&mockTool{name: "computer"})
+	reg.Register(&exposureTestTool{
+		name:     "computer",
+		source:   SourceLocal,
+		exposure: ToolExposureDeferred,
+		explicit: true,
+	})
 	reg.Register(&mockTool{name: "ask_user_question"})
-	reg.Register(&mockSourcedTool{name: "web_search", source: SourceGateway})
-	reg.Register(&mockSourcedTool{name: "web_fetch", source: SourceGateway})
+	for _, name := range []string{"web_search", "web_fetch"} {
+		reg.Register(&exposureTestTool{
+			name:     name,
+			source:   SourceGateway,
+			exposure: ToolExposureDirect,
+			explicit: true,
+		})
+	}
 	reg.Register(&mockSourcedTool{name: "alpaca_news", source: SourceGateway})
 
 	cold := deferredToolNames(reg) // no preseeded/warmed schemas
-	if !hasCategoricalDeferred(cold) {
-		t.Fatal("expected computer to trigger the categorical-defer condition")
+	if !cold["computer"] {
+		t.Fatal("expected explicitly Deferred computer in the cold set")
 	}
 
 	schemas := buildFullSchemasWithDefer(reg, cold)
@@ -632,10 +668,8 @@ func TestBuildFullSchemasWithDefer_WebToolsNeverDeferred(t *testing.T) {
 	}
 }
 
-// Legacy path (modelTier-based; toolRefSupported=false) must filter cold
-// deferred tools out of the active tools[] array. Otherwise categorical local
-// tools ride the wire even though deferredMode triggered.
-func TestBuildLocalActiveSchemas_FiltersCold(t *testing.T) {
+// Legacy path must omit every cold Deferred schema.
+func TestBuildActiveSchemas_FiltersCold(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockTool{name: "bash"})
 	reg.Register(&mockTool{name: "file_read"})
@@ -646,7 +680,7 @@ func TestBuildLocalActiveSchemas_FiltersCold(t *testing.T) {
 
 	cold := map[string]bool{"computer": true, "schedule_create": true, "browser_navigate": true}
 
-	schemas := buildLocalActiveSchemas(reg, cold)
+	schemas := buildActiveSchemas(reg, cold)
 	names := liveToolNames(schemas)
 
 	want := []string{"ask_user_question", "bash", "file_read"}
@@ -665,41 +699,41 @@ func TestBuildLocalActiveSchemas_FiltersCold(t *testing.T) {
 	}
 }
 
-func TestBuildLocalActiveSchemas_NoColdReturnsAllLocals(t *testing.T) {
+func TestBuildActiveSchemas_NoColdReturnsAllTools(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockTool{name: "bash"})
 	reg.Register(&mockTool{name: "file_read"})
 
-	schemas := buildLocalActiveSchemas(reg, nil)
+	schemas := buildActiveSchemas(reg, nil)
 	if len(schemas) != 2 {
 		t.Errorf("nil cold set: expected 2 schemas, got %d", len(schemas))
 	}
-	schemas = buildLocalActiveSchemas(reg, map[string]bool{})
+	schemas = buildActiveSchemas(reg, map[string]bool{})
 	if len(schemas) != 2 {
 		t.Errorf("empty cold set: expected 2 schemas, got %d", len(schemas))
 	}
 }
 
-// Legacy path (modelSupportsToolRef returns false — reached for local/
-// non-primary providers, small-tier model failover, or the invariant-
-// violation downgrade in loop.go) assembles tools[] via
-// buildLocalActiveSchemas → rebuildSchemas, and scopes tool_search to
-// coldDeferred (deferredToolNames()). Before the neverDeferTools graft in
-// buildLocalActiveSchemas, web_search/web_fetch were completely unreachable
-// there: buildLocalActiveSchemas is local-only (gateway tools filtered out)
-// and deferredToolNames() also excludes them from the cold/tool_search set
-// (see toolbudget.go neverDeferTools) — regression introduced by commit
-// ca91d14e. This pins the fix: web_search/web_fetch ship full schemas on the
-// legacy path, while other gateway tools (alpaca_news) and MCP tools stay
-// cold/tool_search-only, in deterministic canonical order (local alpha ->
-// MCP alpha -> gateway alpha).
-func TestBuildLocalActiveSchemas_LegacyPathWebToolsReachable(t *testing.T) {
+// Legacy path assembles all effective Direct schemas regardless of source,
+// while Deferred gateway/MCP schemas remain tool_search-only.
+func TestBuildActiveSchemas_LegacyPathDirectGatewayToolsReachable(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockTool{name: "bash"})
 	reg.Register(&mockTool{name: "file_read"})
-	reg.Register(&mockTool{name: "computer"}) // categorical always-defer local tool
-	reg.Register(&mockSourcedTool{name: "web_search", source: SourceGateway})
-	reg.Register(&mockSourcedTool{name: "web_fetch", source: SourceGateway})
+	reg.Register(&exposureTestTool{
+		name:     "computer",
+		source:   SourceLocal,
+		exposure: ToolExposureDeferred,
+		explicit: true,
+	})
+	for _, name := range []string{"web_search", "web_fetch"} {
+		reg.Register(&exposureTestTool{
+			name:     name,
+			source:   SourceGateway,
+			exposure: ToolExposureDirect,
+			explicit: true,
+		})
+	}
 	reg.Register(&mockSourcedTool{name: "alpaca_news", source: SourceGateway}) // must stay tool_search-only
 	reg.Register(&mockMCPTool{name: "mcp_a"})
 
@@ -712,11 +746,11 @@ func TestBuildLocalActiveSchemas_LegacyPathWebToolsReachable(t *testing.T) {
 	}
 	for _, n := range []string{"web_search", "web_fetch"} {
 		if cold[n] {
-			t.Fatalf("expected %q to be excluded from the cold set (neverDeferTools)", n)
+			t.Fatalf("expected explicit Direct tool %q to be excluded from the cold set", n)
 		}
 	}
 
-	baseSchemas := buildLocalActiveSchemas(reg, cold)
+	baseSchemas := buildActiveSchemas(reg, cold)
 	assertLegacyWebToolsAssembly(t, baseSchemas)
 
 	// rebuildSchemas with an empty loaded set (no warmed deferred schemas yet,
@@ -726,7 +760,7 @@ func TestBuildLocalActiveSchemas_LegacyPathWebToolsReachable(t *testing.T) {
 	assertLegacyWebToolsAssembly(t, rebuilt)
 
 	// Determinism: repeated assembly produces byte-identical name ordering.
-	again := buildLocalActiveSchemas(reg, cold)
+	again := buildActiveSchemas(reg, cold)
 	names1 := liveToolNames(baseSchemas)
 	names2 := liveToolNames(again)
 	if len(names1) != len(names2) {

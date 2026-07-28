@@ -537,8 +537,12 @@ func (h *cliEventHandler) OnToolResult(name string, args string, toolUseID strin
 	fmt.Printf("  ⏵ %s(%s)  %s%s\n", name, keyArg, icon, brief)
 }
 
-func (h *cliEventHandler) OnText(text string)     {}
-func (h *cliEventHandler) OnPreamble(text string) {}
+func (h *cliEventHandler) OnText(text string) {}
+func (h *cliEventHandler) OnPreamble(text string) {
+	if text = strings.TrimSpace(text); text != "" {
+		fmt.Println(text)
+	}
+}
 
 func (h *cliEventHandler) OnStreamDelta(delta string) {
 	fmt.Print(delta)

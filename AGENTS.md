@@ -55,6 +55,14 @@ Tool priority is local tools, then MCP tools, then gateway tools. Deduplicate by
 
 Skill-exempt tools must be pure infrastructure with no external side effects. Do not exempt side-effecting tools from skill restrictions.
 
+Tool exposure resolves per tool: explicit `ToolExposure` first, then source
+defaults. Local tools default Direct; MCP, gateway, and integration tools
+default Deferred. `tool_search` discovers cold Deferred tools through
+deterministic BM25 over canonical name, description, schema, source, and
+namespace metadata, with exact `select:` lookup for known names. Schema-size
+budgets are regression diagnostics only and must never reclassify tools at
+runtime.
+
 ### Tool Concurrency
 
 The dispatcher batches tool calls by `IsConcurrencySafeCall`, not `IsReadOnlyCall`. Tools without an explicit `ConcurrencySafeChecker` implementation fall back to their `IsReadOnlyCall` value — so file_read / grep / glob etc. keep batching concurrently as before, and writers stay serial. Adding the new interface to one tool has no effect on any other tool's grouping.
@@ -176,7 +184,7 @@ Context-window defaults are only seeds; model responses may auto-adjust the acti
 
 ### Anti-Hallucination
 
-Keep random XML tool execution delimiters, suppress preamble when tool calls are present, and strip fabricated tool calls.
+Keep random XML tool execution delimiters and strip fabricated tool calls. For attended runs, preserve model-authored preambles; if the first tool batch is silent, a local tool may surface its required user-facing `description` without exposing other arguments. External tool descriptions are never used as runtime fallback text. Unattended runs remain silent.
 
 ## Tests
 
@@ -205,6 +213,6 @@ Schedule tests use temp directories and do not write to the real LaunchAgents di
 
 ## Tools
 
-Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. `computer_use` is the primary native-GUI tool: Accessibility-first observations return a per-run `state_id`; ref mutations reject stale state; screenshots are explicit; windowless apps are reopened generically; integer-shaped strings are tolerated; bounded delay waits need no shell fallback; pointer actions move the real cursor visibly; observations skip approval while mutations retain normal approval policy; whole calls serialize across concurrent routes on one GUI-operation lock shared with the legacy `accessibility` / `computer` / `applescript` tools; unattended runs (including auto-approve transports and IM/voice channels without an approval UI) can never invoke it — observation actions included — even via persisted or broker Always Allow. The standalone `screenshot` tool also requires approval and is denied on unattended runs. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
+Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. Common openers and compact local utilities are Direct; process/GUI automation and uncommon mutations are Deferred and loaded through `tool_search` when needed. `computer_use` is the primary native-GUI tool: Accessibility-first observations return a per-run `state_id`; ref mutations reject stale state; screenshots are explicit; windowless apps are reopened generically; integer-shaped strings are tolerated; bounded delay waits need no shell fallback; pointer actions move the real cursor visibly; observations skip approval while mutations retain normal approval policy; whole calls serialize across concurrent routes on one GUI-operation lock shared with the legacy `accessibility` / `computer` / `applescript` tools; unattended runs (including auto-approve transports and IM/voice channels without an approval UI) can never invoke it — observation actions included — even via persisted or broker Always Allow. The standalone `screenshot` tool also requires approval and is denied on unattended runs. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
 
 Every approval-required tool must expose a short human-readable description or equivalent purpose field for approval UI. Destructive or paid/public cloud tools require approval.

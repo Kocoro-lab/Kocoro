@@ -435,6 +435,7 @@ mcp_servers:
 
 Per-server: `command`/`args` (stdio), `type: http` + `url` (HTTP), `env`, `context` (LLM guidance — critical), `disabled: true` (skip without removing).
 
+- **On-demand discovery** — large MCP and integration catalogs are searched and loaded as needed; common openers and core local tools remain immediately available.
 - **`context` is critical** — tells the LLM what auth, capabilities, and queries to use. Without it, the LLM guesses wrong.
 - **All MCP tools require approval.** Use `-y` for auto-approve in one-shot.
 - **Local tools take priority** — same-name local tool wins over MCP.
@@ -827,6 +828,7 @@ Remote workflows (`/research`, `/swarm`) stream events:
 ## UI Behavior
 
 - **Inline terminal rendering** (no alt screen) — allows normal mouse text selection
+- **Visible activity updates** — attended sessions show a brief goal before tool work instead of appearing idle
 - **Scrollable viewport** with Up/Down/PgUp/PgDn
 - **Slash command menu**: appears on `/`, filters as you type, Tab/Enter to select
 - **Session picker**: navigable list with Up/Down

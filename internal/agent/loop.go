@@ -396,7 +396,7 @@ const coreOperationalRules = `
 - Go straight to the point. Try the simplest approach first. Only do what was asked — don't over-engineer.
 - If an approach fails, diagnose why before doing anything else. The next action should follow from the diagnosis, not from the available toolbox.
 - When the cause requires the user to act, state the exact action and wait. Do not substitute a worse method to hide the blocker.
-- Lead with the answer or action. No reasoning preamble.
+- Lead with the answer or action. Do not open with internal reasoning. For non-trivial tool work, give one brief user-facing preamble and continue with the tool calls in the same response.
 - You can handle multi-step, multi-file tasks. Do not refuse as too complex — plan it and execute methodically.
 - Do not give time estimates or predictions for how long tasks will take.
 
@@ -416,7 +416,8 @@ When an obstacle appears, identify the root cause. Do not bypass safety checks (
 ## Core Rules
 - Always use tools to perform actions, not just describe them.
 - Be concise. Summarize tool results — do not echo raw output. Exception: cloud_delegate results are already user-facing deliverables — present them in full.
-- Never apologize for, comment on, or explain your own tool calls. Just answer the user's question with the information you have.
+- Do not expose tool mechanics or raw arguments. State the user-facing goal or status, then answer the user's question with the information you have.
+- Do not apologize for routine tool use.
 - Read before modifying: always use file_read before file_edit or file_write on existing files. Never propose changes to code you haven't read.
 - Use absolute paths in tool calls (e.g. /Users/name/Desktop/file.txt). The ~ prefix is expanded automatically, but prefer full absolute paths to avoid ambiguity.
 - Never fabricate URLs. Only use URLs provided by the user, found in project files, or returned by search results.
@@ -523,7 +524,7 @@ Correct: For side-effecting actions, treat the tool result as the first source o
 
 ### Narrating instead of acting
 Anti-pattern: The user asks for a concrete action and you explain what you would do, list the steps, or ask unnecessary permission for a clearly safe, reversible step.
-Correct: When the next step is clear and low-risk, act first with the appropriate tool. If the user asked for a plan, or the action is ambiguous or high-risk, explain first — that is not narration, that is appropriate caution. Reserve narration for reporting the result after the action is complete.
+Correct: When the next step is clear and low-risk, give one brief user-facing preamble and call the appropriate tool in the same response. Do not stop after announcing the action. If the user asked for a plan, or the action is ambiguous or high-risk, explain first — that is appropriate caution.
 
 ### Acting on remembered context the user did not invoke
 Anti-pattern: Memory (MEMORY.md, a private_memory block, or recall results) shows a past preference, plan, or task — e.g. "user likes to auto-merge after green CI" — so you carry it out even though the user's current message only asked something else.
@@ -1201,10 +1202,13 @@ func (a *AgentLoop) operationalRules() string {
 // buildAssistantMessage constructs an assistant client.Message from a
 // CompletionResponse + the preamble already normalized by the caller.
 //
-// When resp.ContentBlocks is non-empty (Cloud ≥ 2026-05), it is the source
-// of truth: the verbatim ordered list of blocks Anthropic returned. This
-// preserves thinking content + signatures + their interleaved positions,
-// satisfying the thinking-block preservation rule (blocks survive the assistant trajectory).
+// When resp.ContentBlocks is non-empty (Cloud ≥ 2026-05), it is the source of
+// truth for block ordering. The ordered list is preserved verbatim unless it
+// contains no visible text and normalizedToolText is non-empty; in that case a
+// text block is inserted immediately before the first tool_use block. The text
+// may be provider-authored OutputText omitted from ContentBlocks or a runtime
+// fallback recovered by the caller. Thinking content, signatures, and relative
+// ordering remain intact.
 //
 // When resp.ContentBlocks is empty (legacy Cloud or non-Anthropic provider
 // that never populates it), fall back to assembling text+tool_use blocks
@@ -1229,6 +1233,25 @@ func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText s
 		// as read-only post-construction (the loop's existing invariant).
 		blocks := make([]client.ContentBlock, len(resp.ContentBlocks))
 		copy(blocks, resp.ContentBlocks)
+		hasVisibleText := false
+		for _, block := range blocks {
+			if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+				hasVisibleText = true
+				break
+			}
+		}
+		if normalizedToolText != "" && !hasVisibleText {
+			insertAt := len(blocks)
+			for i, block := range blocks {
+				if block.Type == "tool_use" {
+					insertAt = i
+					break
+				}
+			}
+			blocks = append(blocks, client.ContentBlock{})
+			copy(blocks[insertAt+1:], blocks[insertAt:])
+			blocks[insertAt] = client.ContentBlock{Type: "text", Text: normalizedToolText}
+		}
 		return client.Message{
 			Role:    "assistant",
 			Content: client.NewBlockContent(blocks),
@@ -2153,21 +2176,21 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	if a.workingSet == nil {
 		a.workingSet = NewWorkingSet()
 	}
-	a.workingSet.SyncToolset(a.tools)
+	toolsetChanged := a.workingSet.SyncToolset(a.tools)
 
-	// Deferred mode: pre-seed session-warmed deferred schemas, then only keep
-	// the remaining cold deferred tools behind tool_search when the full toolset
-	// exceeds the schema token budget.
+	// Resolve exposure independently for every tool, then pre-seed schemas that
+	// this session already loaded. Any remaining Deferred tool activates
+	// tool_search; schema size is diagnostic only and never reclassifies tools.
 	deferred := deferredToolNames(a.tools)
 	loadedDeferred := preseedDeferredSchemas(a.workingSet, deferred)
 	coldDeferred := remainingDeferredNames(deferred, loadedDeferred)
-	// Trigger deferred mode when EITHER the total schema budget is exceeded
-	// OR any cold deferred tool belongs to an always-defer category. The
-	// categorical clause lets us shrink cold-start tools[] for one-shot CLI
-	// even when total tokens stay under schemaTokenBudget.
-	deferredMode := len(coldDeferred) > 0 &&
-		(shouldDefer(a.tools, a.tools.SortedNames(), schemaTokenBudget) ||
-			hasCategoricalDeferred(coldDeferred))
+	deferredMode := len(coldDeferred) > 0
+	if toolsetChanged {
+		if report := directSchemaBudgetReport(a.tools, directSchemaTokenBudget); report.Exceeded() {
+			log.Printf("[tool-search] Direct schema budget exceeded: total=%d budget=%d contributors=%s",
+				report.Total, report.Budget, formatSchemaBudgetContributors(report, 12))
+		}
+	}
 
 	// sessionCWD may legitimately be empty for daemon runs that arrive without
 	// a CWD (pure web / reasoning tasks). Do NOT fall back to os.Getwd() here:
@@ -2266,7 +2289,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// New path: send full tools[] with defer_loading flags; Anthropic strips
 		// deferred entries from the prefix hash so tools_h stays stable, while
 		// tool_search returns tool_reference blocks that the server expands inline.
-		tsSearch := newToolSearchTool(a.tools, coldDeferred)
+		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
 
@@ -2310,11 +2333,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// the system prompt's Deferred Tools section would list each tool twice.
 		deferredSummaries = nil
 
-		tsSearch := newToolSearchTool(a.tools, coldDeferred)
+		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
 
-		baseSchemas = buildLocalActiveSchemas(effTools, coldDeferred)
+		baseSchemas = buildActiveSchemas(effTools, coldDeferred)
 		toolSchemas = baseSchemas
 		if len(loadedDeferred) > 0 {
 			toolSchemas = rebuildSchemas(effTools, baseSchemas, loadedDeferred)
@@ -2677,14 +2700,16 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
 		// short-circuits the distance check until a real failure streak writes it.
-		lastSummaryFailureIter int
-		toolSearchFired        bool
-		latestUserText         = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
-		cloudNudgeFired        bool
-		cloudDelegateClaimed   bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
-		cloudResultContent     string // non-empty when a cloud deliverable should bypass LLM summarization
-		lastDiscoveryInput     string // dedup: skip discovery when user text hasn't changed between iterations
-		contextBloatStatusSent bool
+		lastSummaryFailureIter  int
+		toolSearchFired         bool
+		preambleEmitted         bool
+		silentNarratableBatches int
+		latestUserText          = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
+		cloudNudgeFired         bool
+		cloudDelegateClaimed    bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
+		cloudResultContent      string // non-empty when a cloud deliverable should bypass LLM summarization
+		lastDiscoveryInput      string // dedup: skip discovery when user text hasn't changed between iterations
+		contextBloatStatusSent  bool
 
 		// Cross-iteration dedup: cache successful results from previous iteration
 		// to prevent re-execution of identical tool calls across consecutive iterations.
@@ -3155,6 +3180,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			}
 		}
 		latestUserText = strings.Join(texts, "\n\n")
+		// A committed injection starts a new user turn inside this Run. Give it
+		// its own activity cadence so the first silent tool batch does not
+		// inherit the prior turn's every-third-batch rate limit.
+		preambleEmitted = false
+		silentNarratableBatches = 0
 		messages = append(messages, newMsg)
 		stampMessage()
 		a.injectedMessages = append(a.injectedMessages, texts...)
@@ -4279,9 +4309,28 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 
 		// Execute all tool calls
 		toolCalls := resp.AllToolCalls()
-		normalizedToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
+		modelToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
+		normalizedToolText := modelToolText
+		if normalizedToolText == "" && !a.unattendedRun {
+			if fallback := fallbackPreambleFromToolCalls(toolCalls, effTools); fallback != "" {
+				silentNarratableBatches++
+				// Always recover the first visible activity update. After that,
+				// recover only every third silent narratable batch so long tool
+				// chains stay visible without narrating each individual call.
+				if !preambleEmitted || silentNarratableBatches >= 3 {
+					normalizedToolText = fallback
+				}
+			}
+		}
 		if normalizedToolText != "" {
-			lastText = normalizedToolText
+			preambleEmitted = true
+			silentNarratableBatches = 0
+			if modelToolText != "" {
+				// Only provider-authored prose may become the partial-answer
+				// return value on cancellation or synthesis failure. Runtime
+				// fallback text remains activity narration in the trajectory.
+				lastText = modelToolText
+			}
 			// Forward real preamble to handlers via OnPreamble (TUI inline
 			// render, daemon LLM_OUTPUT, SSE assistant_text). normalize above
 			// returns "" for serialized tool-call pseudo-preambles, so this

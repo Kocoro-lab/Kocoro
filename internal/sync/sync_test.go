@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 
 // stubAudit captures audit events for assertions.
 type stubAudit struct {
+	mu     stdsync.Mutex
 	events []map[string]any
 }
 
@@ -25,7 +27,16 @@ func (s *stubAudit) Log(event string, fields map[string]any) {
 	for k, v := range fields {
 		merged[k] = v
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, merged)
+}
+
+func (s *stubAudit) snapshot() []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]map[string]any(nil), s.events...)
 }
 
 // stubUploader returns a canned response without hitting the network.
@@ -113,7 +124,7 @@ func TestSyncRun_HappyPath(t *testing.T) {
 		t.Errorf("LastSyncOutcome: got %q, want %q", m.LastSyncOutcome, OutcomeOK)
 	}
 
-	if len(audit.events) == 0 {
+	if len(audit.snapshot()) == 0 {
 		t.Errorf("expected at least one audit event")
 	}
 }
@@ -140,8 +151,9 @@ func TestSyncRun_DisabledIsNoop(t *testing.T) {
 	if uploader.calls != 0 {
 		t.Errorf("expected 0 upload calls, got %d", uploader.calls)
 	}
-	if len(audit.events) != 1 || audit.events[0]["outcome"] != OutcomeNoop {
-		t.Errorf("expected single noop audit event, got %+v", audit.events)
+	events := audit.snapshot()
+	if len(events) != 1 || events[0]["outcome"] != OutcomeNoop {
+		t.Errorf("expected single noop audit event, got %+v", events)
 	}
 }
 
@@ -469,7 +481,8 @@ func TestSyncRun_SentCountReflectsAttemptedBatchesOnly(t *testing.T) {
 
 	// Find the main session_sync audit event (not the noop variants).
 	var mainEvent map[string]any
-	for _, e := range auditSink.events {
+	events := auditSink.snapshot()
+	for _, e := range events {
 		if e["_event"] == "session_sync" {
 			if _, hasSent := e["sent"]; hasSent {
 				mainEvent = e
@@ -478,7 +491,7 @@ func TestSyncRun_SentCountReflectsAttemptedBatchesOnly(t *testing.T) {
 		}
 	}
 	if mainEvent == nil {
-		t.Fatalf("expected a session_sync audit event with 'sent' field; got %+v", auditSink.events)
+		t.Fatalf("expected a session_sync audit event with 'sent' field; got %+v", events)
 	}
 	gotSent, _ := mainEvent["sent"].(int)
 	if gotSent != 2 {

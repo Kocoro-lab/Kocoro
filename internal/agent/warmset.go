@@ -13,6 +13,8 @@ type WorkingSet struct {
 	mu          sync.RWMutex
 	fingerprint string
 	schemas     map[string]client.Tool
+	searchKey   string
+	searchIndex *toolSearchIndex
 }
 
 // NewWorkingSet creates an empty working set.
@@ -105,6 +107,8 @@ func (ws *WorkingSet) EnsureFingerprint(fingerprint string) bool {
 	}
 	ws.fingerprint = fingerprint
 	ws.schemas = make(map[string]client.Tool)
+	ws.searchKey = ""
+	ws.searchIndex = nil
 	return true
 }
 
@@ -123,4 +127,40 @@ func (ws *WorkingSet) Invalidate() {
 	defer ws.mu.Unlock()
 	ws.fingerprint = ""
 	ws.schemas = make(map[string]client.Tool)
+	ws.searchKey = ""
+	ws.searchIndex = nil
+}
+
+// toolSearchIndex reuses the tokenized BM25 index while the effective toolset
+// fingerprint and Deferred name set are unchanged. AgentLoop synchronizes the
+// full metadata fingerprint before discovery; cache hits therefore hash only
+// the small Deferred name set instead of rebuilding every search document.
+func (ws *WorkingSet) toolSearchIndex(reg *ToolRegistry, deferred map[string]bool) *toolSearchIndex {
+	if ws == nil {
+		return newToolSearchIndex(reg, deferred)
+	}
+	if ws.Fingerprint() == "" {
+		ws.SyncToolset(reg)
+	}
+	searchKey := ws.Fingerprint() + "\x00" + deferredToolSearchKey(deferred)
+
+	ws.mu.RLock()
+	if ws.searchIndex != nil && ws.searchKey == searchKey {
+		index := ws.searchIndex
+		ws.mu.RUnlock()
+		return index
+	}
+	ws.mu.RUnlock()
+
+	index := newToolSearchIndex(reg, deferred)
+	ws.mu.Lock()
+	if ws.searchIndex != nil && ws.searchKey == searchKey {
+		cached := ws.searchIndex
+		ws.mu.Unlock()
+		return cached
+	}
+	ws.searchKey = searchKey
+	ws.searchIndex = index
+	ws.mu.Unlock()
+	return index
 }

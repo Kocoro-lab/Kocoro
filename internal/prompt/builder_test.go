@@ -840,9 +840,9 @@ func TestBuildSystemPrompt_InstructionsTruncation(t *testing.T) {
 }
 
 // TestBuildSystemPrompt_DeferredToolsExcludedFromSystem asserts deferred
-// tools are NOT rendered in the system prompt — they vary per user (only
-// appear when total tool count > 30) so they break BP #1 byte stability
-// (issue #107). Routed to BuildToolListing instead.
+// tools are NOT rendered in the system prompt — the effective Deferred set
+// varies by source and user, so it breaks BP #1 byte stability (issue #107).
+// Routed to BuildToolListing instead.
 func TestBuildSystemPrompt_DeferredToolsExcludedFromSystem(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt:     "Base.",
