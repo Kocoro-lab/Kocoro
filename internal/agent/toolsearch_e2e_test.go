@@ -65,6 +65,7 @@ func TestToolSearchE2E_LegacyFallbackLoadsBM25MatchAndContinues(t *testing.T) {
 					"type":        "string",
 					"description": "Title for the calendar appointment.",
 				},
+				"description": DescriptionFieldSpec,
 			},
 		},
 		result: "event-created",
@@ -92,7 +93,7 @@ func TestToolSearchE2E_LegacyFallbackLoadsBM25MatchAndContinues(t *testing.T) {
 				toolCallWithID("tool_search", `{"query":"google calendar appointment title"}`, "toolu_search"), 10, 5))
 		case 2:
 			_ = json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCallWithID("calendar_create_event", `{"event_title":"Planning"}`, "toolu_calendar"), 10, 5))
+				toolCallWithID("calendar_create_event", `{"event_title":"Planning","description":"Create the planning calendar event."}`, "toolu_calendar"), 10, 5))
 		case 3:
 			_ = json.NewEncoder(w).Encode(nativeResponse("Created.", "end_turn", nil, 10, 5))
 		default:
@@ -103,8 +104,10 @@ func TestToolSearchE2E_LegacyFallbackLoadsBM25MatchAndContinues(t *testing.T) {
 	defer server.Close()
 
 	ws := NewWorkingSet()
+	handler := &preambleHandler{}
 	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 8, 2000, 200, nil, nil, nil)
 	loop.SetWorkingSet(ws)
+	loop.SetHandler(handler)
 	result, _, err := loop.Run(context.Background(), "Create a planning appointment in Google Calendar.", nil, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -133,6 +136,9 @@ func TestToolSearchE2E_LegacyFallbackLoadsBM25MatchAndContinues(t *testing.T) {
 	if !ws.Contains("calendar_create_event") {
 		t.Fatal("loaded Deferred schema was not warmed in the session WorkingSet")
 	}
+	if len(handler.preambleCalls) != 0 {
+		t.Fatalf("external tool description must not become a fallback preamble, got %#v", handler.preambleCalls)
+	}
 }
 
 func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.T) {
@@ -151,7 +157,8 @@ func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.
 		params: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"url": map[string]any{"type": "string", "description": "Destination URL."},
+				"url":         map[string]any{"type": "string", "description": "Destination URL."},
+				"description": DescriptionFieldSpec,
 			},
 		},
 		result: "navigated",
@@ -179,7 +186,7 @@ func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.
 				toolCallWithID("tool_search", `{"query":"playwright navigate destination"}`, "toolu_search"), 10, 5))
 		case 2:
 			_ = json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCallWithID("browser_navigate", `{"url":"https://example.com"}`, "toolu_browser"), 10, 5))
+				toolCallWithID("browser_navigate", `{"url":"https://example.com","description":"Open example.com in the browser."}`, "toolu_browser"), 10, 5))
 		case 3:
 			_ = json.NewEncoder(w).Encode(nativeResponse("Opened.", "end_turn", nil, 10, 5))
 		default:
@@ -189,8 +196,10 @@ func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.
 	}))
 	defer server.Close()
 
+	handler := &preambleHandler{}
 	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 8, 2000, 200, nil, nil, nil)
 	loop.SetSpecificModel("claude-sonnet-4-6")
+	loop.SetHandler(handler)
 	result, _, err := loop.Run(context.Background(), "Open example.com in the browser.", nil, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -213,6 +222,9 @@ func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.
 	}
 	if deferred.runs != 1 {
 		t.Fatalf("browser_navigate runs = %d, want 1", deferred.runs)
+	}
+	if len(handler.preambleCalls) != 0 {
+		t.Fatalf("external tool description must not become a fallback preamble, got %#v", handler.preambleCalls)
 	}
 }
 

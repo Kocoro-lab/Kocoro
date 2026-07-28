@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
@@ -80,5 +82,36 @@ func TestOneShotRuntimeConfig_UsesResolvedProjectCWD(t *testing.T) {
 	}
 	if got := runCfg.Permissions.AllowedCommands; len(got) != 2 || got[0] != "git status" || got[1] != "make test" {
 		t.Fatalf("unexpected allowed commands: %#v", got)
+	}
+}
+
+func TestCLIEventHandlerOnPreambleWritesText(t *testing.T) {
+	// This test replaces process-global stdout and therefore must not run in
+	// parallel with another stdout-capturing test in this package.
+	original := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = writer
+	t.Cleanup(func() {
+		os.Stdout = original
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	handler := &cliEventHandler{}
+	handler.OnPreamble("Reading the relevant files.")
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	os.Stdout = original
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read captured stdout: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "Reading the relevant files." {
+		t.Fatalf("stdout = %q, want preamble text", string(got))
 	}
 }

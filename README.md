@@ -828,6 +828,7 @@ Remote workflows (`/research`, `/swarm`) stream events:
 ## UI Behavior
 
 - **Inline terminal rendering** (no alt screen) — allows normal mouse text selection
+- **Visible activity updates** — attended sessions show a brief goal before tool work instead of appearing idle
 - **Scrollable viewport** with Up/Down/PgUp/PgDn
 - **Slash command menu**: appears on `/`, filters as you type, Tab/Enter to select
 - **Session picker**: navigable list with Up/Down

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4990,6 +4991,225 @@ func TestAgentLoop_ToolCallBranch_TriggersOnText(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_SilentFirstToolBatchUsesDescriptionAsFallbackPreamble(t *testing.T) {
+	const fallback = "Locate the function definition."
+	callCount := 0
+	var secondRequest client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		switch callCount {
+		case 1:
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("noop_tool", `{"description":"Locate the function definition."}`, "toolu_fallback_1"), 12, 8))
+		case 2:
+			secondRequest = req
+			_ = json.NewEncoder(w).Encode(nativeResponse("Found it.", "end_turn", nil, 5, 4))
+		default:
+			t.Fatalf("unexpected LLM call %d", callCount)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	result, _, err := loop.Run(context.Background(), "find the function", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Found it." {
+		t.Fatalf("result = %q, want Found it.", result)
+	}
+	if len(handler.preambleCalls) != 1 || handler.preambleCalls[0] != fallback {
+		t.Fatalf("fallback preambles = %#v, want [%q]", handler.preambleCalls, fallback)
+	}
+
+	foundPersisted := false
+	for _, msg := range secondRequest.Messages {
+		if msg.Role != "assistant" || !msg.Content.HasBlocks() {
+			continue
+		}
+		for _, block := range msg.Content.Blocks() {
+			if block.Type == "text" && block.Text == fallback {
+				foundPersisted = true
+			}
+		}
+	}
+	if !foundPersisted {
+		t.Fatalf("fallback preamble %q was not persisted into the next model request", fallback)
+	}
+}
+
+func TestAgentLoop_ModelPreambleWinsOverDescriptionFallback(t *testing.T) {
+	const authored = "I’ll inspect the relevant implementation first."
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID(authored, "tool_use",
+				toolCallWithID("noop_tool", `{"description":"Locate the function definition."}`, "toolu_authored_1"), 12, 8))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(nativeResponse("Found it.", "end_turn", nil, 5, 4))
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	if _, _, err := loop.Run(context.Background(), "find the function", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(handler.preambleCalls) != 1 || handler.preambleCalls[0] != authored {
+		t.Fatalf("preambles = %#v, want only authored preamble %q", handler.preambleCalls, authored)
+	}
+}
+
+func TestAgentLoop_UnattendedSilentToolBatchStaysSilent(t *testing.T) {
+	callCount := 0
+	var secondRequest client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if callCount == 1 {
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("noop_tool", `{"description":"Check the scheduled task."}`, "toolu_unattended_1"), 12, 8))
+			return
+		}
+		secondRequest = req
+		_ = json.NewEncoder(w).Encode(nativeResponse("Finished.", "end_turn", nil, 5, 4))
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+	loop.SetUnattendedRun(true)
+
+	if _, _, err := loop.Run(context.Background(), "run the scheduled check", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(handler.preambleCalls) != 0 {
+		t.Fatalf("unattended preambles = %#v, want none", handler.preambleCalls)
+	}
+	for _, msg := range secondRequest.Messages {
+		if msg.Role != "assistant" || !msg.Content.HasBlocks() {
+			continue
+		}
+		for _, block := range msg.Content.Blocks() {
+			if block.Type == "text" && block.Text == "Check the scheduled task." {
+				t.Fatal("unattended fallback preamble was persisted into model history")
+			}
+		}
+	}
+}
+
+func TestAgentLoop_LongSilentToolChainGetsPeriodicFallback(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount <= 4 {
+			description := fmt.Sprintf("Inspect step %d.", callCount)
+			args := fmt.Sprintf(`{"description":%q}`, description)
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("noop_tool", args, fmt.Sprintf("toolu_periodic_%d", callCount)), 12, 8))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(nativeResponse("Finished.", "end_turn", nil, 5, 4))
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	if _, _, err := loop.Run(context.Background(), "inspect all four steps", nil, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{"Inspect step 1.", "Inspect step 4."}
+	if !reflect.DeepEqual(handler.preambleCalls, want) {
+		t.Fatalf("preambles = %#v, want %#v", handler.preambleCalls, want)
+	}
+}
+
+func TestAgentLoop_InjectedTurnGetsFreshFallbackPreamble(t *testing.T) {
+	injectCh := make(chan InjectedMessage, 1)
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			// The follow-up arrives after this iteration's top-of-loop drain,
+			// so it is committed before the next model call.
+			injectCh <- InjectedMessage{Text: "now inspect the follow-up", ClientMessageID: "follow-up-1"}
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("noop_tool", `{"description":"Inspect the first request."}`, "toolu_inject_preamble_1"), 12, 8))
+		case 2:
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("noop_tool", `{"description":"Inspect the follow-up."}`, "toolu_inject_preamble_2"), 12, 8))
+		default:
+			_ = json.NewEncoder(w).Encode(nativeResponse("Finished.", "end_turn", nil, 5, 4))
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetInjectCh(injectCh)
+	loop.SetHandler(handler)
+
+	result, _, err := loop.Run(context.Background(), "inspect the first request", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Finished." {
+		t.Fatalf("result = %q, want Finished.", result)
+	}
+	want := []string{"Inspect the first request.", "Inspect the follow-up."}
+	if !reflect.DeepEqual(handler.preambleCalls, want) {
+		t.Fatalf("injected turn inherited prior preamble cadence: got %#v, want %#v", handler.preambleCalls, want)
+	}
+}
+
 // TestAgentLoop_LastSentRequest_DeepCopyOnRead pins the deep-copy contract on
 // the getter: mutating the returned snapshot's Messages/Tools slices must NOT
 // leak into a subsequent call to LastSentRequest(). Without per-call backing-
@@ -5223,6 +5443,32 @@ func TestBuildAssistantMessage_EmptyPreambleSkipsTextBlock(t *testing.T) {
 	}
 	if blocks[0].Type != "tool_use" {
 		t.Errorf("expected tool_use only, got %q", blocks[0].Type)
+	}
+}
+
+func TestBuildAssistantMessage_InsertsNormalizedTextBeforeNativeToolUse(t *testing.T) {
+	resp := &client.CompletionResponse{
+		FinishReason: "tool_use",
+		ToolCalls:    []client.FunctionCall{{ID: "t1", Name: "file_read", Arguments: json.RawMessage(`{"path":"/x"}`)}},
+		ContentBlocks: []client.ContentBlock{
+			{Type: "thinking", Thinking: "private reasoning", Signature: "sig"},
+			{Type: "tool_use", ID: "t1", Name: "file_read", Input: json.RawMessage(`{"path":"/x"}`)},
+		},
+	}
+
+	msg := buildAssistantMessage(resp, "Reading the target file.")
+	blocks := msg.Content.Blocks()
+	if len(blocks) != 3 {
+		t.Fatalf("expected thinking + text + tool_use, got %d blocks: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "thinking" || blocks[0].Signature != "sig" {
+		t.Fatalf("thinking block changed: %+v", blocks[0])
+	}
+	if blocks[1].Type != "text" || blocks[1].Text != "Reading the target file." {
+		t.Fatalf("normalized text was not inserted before tool_use: %+v", blocks)
+	}
+	if blocks[2].Type != "tool_use" || blocks[2].ID != "t1" {
+		t.Fatalf("tool_use block changed: %+v", blocks[2])
 	}
 }
 
