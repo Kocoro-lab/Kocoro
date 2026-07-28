@@ -2153,21 +2153,21 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	if a.workingSet == nil {
 		a.workingSet = NewWorkingSet()
 	}
-	a.workingSet.SyncToolset(a.tools)
+	toolsetChanged := a.workingSet.SyncToolset(a.tools)
 
-	// Deferred mode: pre-seed session-warmed deferred schemas, then only keep
-	// the remaining cold deferred tools behind tool_search when the full toolset
-	// exceeds the schema token budget.
+	// Resolve exposure independently for every tool, then pre-seed schemas that
+	// this session already loaded. Any remaining Deferred tool activates
+	// tool_search; schema size is diagnostic only and never reclassifies tools.
 	deferred := deferredToolNames(a.tools)
 	loadedDeferred := preseedDeferredSchemas(a.workingSet, deferred)
 	coldDeferred := remainingDeferredNames(deferred, loadedDeferred)
-	// Trigger deferred mode when EITHER the total schema budget is exceeded
-	// OR any cold deferred tool belongs to an always-defer category. The
-	// categorical clause lets us shrink cold-start tools[] for one-shot CLI
-	// even when total tokens stay under schemaTokenBudget.
-	deferredMode := len(coldDeferred) > 0 &&
-		(shouldDefer(a.tools, a.tools.SortedNames(), schemaTokenBudget) ||
-			hasCategoricalDeferred(coldDeferred))
+	deferredMode := len(coldDeferred) > 0
+	if toolsetChanged {
+		if report := directSchemaBudgetReport(a.tools, directSchemaTokenBudget); report.Exceeded() {
+			log.Printf("[tool-search] Direct schema budget exceeded: total=%d budget=%d contributors=%s",
+				report.Total, report.Budget, formatSchemaBudgetContributors(report, 12))
+		}
+	}
 
 	// sessionCWD may legitimately be empty for daemon runs that arrive without
 	// a CWD (pure web / reasoning tasks). Do NOT fall back to os.Getwd() here:
@@ -2266,7 +2266,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// New path: send full tools[] with defer_loading flags; Anthropic strips
 		// deferred entries from the prefix hash so tools_h stays stable, while
 		// tool_search returns tool_reference blocks that the server expands inline.
-		tsSearch := newToolSearchTool(a.tools, coldDeferred)
+		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
 
@@ -2310,11 +2310,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// the system prompt's Deferred Tools section would list each tool twice.
 		deferredSummaries = nil
 
-		tsSearch := newToolSearchTool(a.tools, coldDeferred)
+		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
 
-		baseSchemas = buildLocalActiveSchemas(effTools, coldDeferred)
+		baseSchemas = buildActiveSchemas(effTools, coldDeferred)
 		toolSchemas = baseSchemas
 		if len(loadedDeferred) > 0 {
 			toolSchemas = rebuildSchemas(effTools, baseSchemas, loadedDeferred)
