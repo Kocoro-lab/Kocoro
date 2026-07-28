@@ -86,6 +86,8 @@ func TestOneShotRuntimeConfig_UsesResolvedProjectCWD(t *testing.T) {
 }
 
 func TestCLIEventHandlerOnPreambleWritesText(t *testing.T) {
+	// This test replaces process-global stdout and therefore must not run in
+	// parallel with another stdout-capturing test in this package.
 	original := os.Stdout
 	reader, writer, err := os.Pipe()
 	if err != nil {

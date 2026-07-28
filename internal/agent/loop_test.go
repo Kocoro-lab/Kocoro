@@ -5015,9 +5015,10 @@ func TestAgentLoop_SilentFirstToolBatchUsesDescriptionAsFallbackPreamble(t *test
 	defer server.Close()
 
 	reg := NewToolRegistry()
-	reg.Register(&mockSimpleTool{
-		name:   "noop_tool",
-		result: ToolResult{Content: "ok"},
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
 	})
 	handler := &preambleHandler{}
 	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
@@ -5065,7 +5066,11 @@ func TestAgentLoop_ModelPreambleWinsOverDescriptionFallback(t *testing.T) {
 	defer server.Close()
 
 	reg := NewToolRegistry()
-	reg.Register(&mockSimpleTool{name: "noop_tool", result: ToolResult{Content: "ok"}})
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
 	handler := &preambleHandler{}
 	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
 	loop.SetHandler(handler)
@@ -5098,7 +5103,11 @@ func TestAgentLoop_UnattendedSilentToolBatchStaysSilent(t *testing.T) {
 	defer server.Close()
 
 	reg := NewToolRegistry()
-	reg.Register(&mockSimpleTool{name: "noop_tool", result: ToolResult{Content: "ok"}})
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
 	handler := &preambleHandler{}
 	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
 	loop.SetHandler(handler)
@@ -5138,7 +5147,11 @@ func TestAgentLoop_LongSilentToolChainGetsPeriodicFallback(t *testing.T) {
 	defer server.Close()
 
 	reg := NewToolRegistry()
-	reg.Register(&mockSimpleTool{name: "noop_tool", result: ToolResult{Content: "ok"}})
+	reg.Register(preambleTestTool{
+		name:     "noop_tool",
+		source:   SourceLocal,
+		required: []string{"description"},
+	})
 	handler := &preambleHandler{}
 	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
 	loop.SetHandler(handler)

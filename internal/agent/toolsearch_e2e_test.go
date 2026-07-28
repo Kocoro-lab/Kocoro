@@ -136,8 +136,8 @@ func TestToolSearchE2E_LegacyFallbackLoadsBM25MatchAndContinues(t *testing.T) {
 	if !ws.Contains("calendar_create_event") {
 		t.Fatal("loaded Deferred schema was not warmed in the session WorkingSet")
 	}
-	if len(handler.preambleCalls) != 1 || handler.preambleCalls[0] != "Create the planning calendar event." {
-		t.Fatalf("preambles = %#v, want one fallback after silent tool_search", handler.preambleCalls)
+	if len(handler.preambleCalls) != 0 {
+		t.Fatalf("external tool description must not become a fallback preamble, got %#v", handler.preambleCalls)
 	}
 }
 
@@ -223,8 +223,8 @@ func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.
 	if deferred.runs != 1 {
 		t.Fatalf("browser_navigate runs = %d, want 1", deferred.runs)
 	}
-	if len(handler.preambleCalls) != 1 || handler.preambleCalls[0] != "Open example.com in the browser." {
-		t.Fatalf("preambles = %#v, want one fallback after silent tool_search", handler.preambleCalls)
+	if len(handler.preambleCalls) != 0 {
+		t.Fatalf("external tool description must not become a fallback preamble, got %#v", handler.preambleCalls)
 	}
 }
 

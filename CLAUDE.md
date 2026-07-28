@@ -345,7 +345,7 @@ fields, drift patterns). Invariants:
 
 ### Anti-Hallucination
 
-XML `<tool_exec>` delimiters use random hex call_id. Model-authored preambles are preserved. In attended runs, a silent first tool batch falls back to its user-facing `description` or `purpose`; unattended runs remain silent. Fabricated tool calls are detected and stripped.
+XML `<tool_exec>` delimiters use random hex call_id. Model-authored preambles are preserved. In attended runs, a silent first tool batch may fall back to a local tool's required user-facing `description`; external tool descriptions and generic `purpose` fields remain silent. Unattended runs remain silent. Fabricated tool calls are detected and stripped.
 
 ## Testing
 

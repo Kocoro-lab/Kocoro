@@ -129,14 +129,12 @@ func TestCoreOperationalRulesDoNotSuppressOperationalPreambles(t *testing.T) {
 		}
 	}
 
-	for _, required := range []string{
-		"brief user-facing preamble",
-		"same response",
-		"Do not stop after announcing",
-	} {
-		if !strings.Contains(coreOperationalRules+contrastExamplesCore, required) {
-			t.Errorf("runtime prompt missing operational-preamble guard %q", required)
-		}
+	const requiredPreambleGuard = "give one brief user-facing preamble and continue with the tool calls in the same response"
+	if !strings.Contains(coreOperationalRules+contrastExamplesCore, requiredPreambleGuard) {
+		t.Errorf("runtime prompt missing operational-preamble guard %q", requiredPreambleGuard)
+	}
+	if !strings.Contains(coreOperationalRules, "Do not apologize for routine tool use.") {
+		t.Error("runtime prompt missing routine tool-use apology guard")
 	}
 }
 

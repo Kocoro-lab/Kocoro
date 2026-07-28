@@ -417,6 +417,7 @@ When an obstacle appears, identify the root cause. Do not bypass safety checks (
 - Always use tools to perform actions, not just describe them.
 - Be concise. Summarize tool results — do not echo raw output. Exception: cloud_delegate results are already user-facing deliverables — present them in full.
 - Do not expose tool mechanics or raw arguments. State the user-facing goal or status, then answer the user's question with the information you have.
+- Do not apologize for routine tool use.
 - Read before modifying: always use file_read before file_edit or file_write on existing files. Never propose changes to code you haven't read.
 - Use absolute paths in tool calls (e.g. /Users/name/Desktop/file.txt). The ~ prefix is expanded automatically, but prefer full absolute paths to avoid ambiguity.
 - Never fabricate URLs. Only use URLs provided by the user, found in project files, or returned by search results.
@@ -1204,8 +1205,9 @@ func (a *AgentLoop) operationalRules() string {
 // When resp.ContentBlocks is non-empty (Cloud ≥ 2026-05), it is the source
 // of truth. The ordered list is preserved verbatim unless the caller recovered
 // a fallback preamble and the blocks contain no visible text; in that case the
-// text is inserted immediately before the first tool_use block. Thinking
-// content, signatures, and relative ordering remain intact.
+// runtime synthesizes a text block immediately before the first tool_use block.
+// That inserted text did not come from the provider response. Thinking content,
+// signatures, and relative ordering remain intact.
 //
 // When resp.ContentBlocks is empty (legacy Cloud or non-Anthropic provider
 // that never populates it), fall back to assembling text+tool_use blocks
@@ -4301,9 +4303,10 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 
 		// Execute all tool calls
 		toolCalls := resp.AllToolCalls()
-		normalizedToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
+		modelToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
+		normalizedToolText := modelToolText
 		if normalizedToolText == "" && !a.unattendedRun {
-			if fallback := fallbackPreambleFromToolCalls(toolCalls); fallback != "" {
+			if fallback := fallbackPreambleFromToolCalls(toolCalls, effTools); fallback != "" {
 				silentNarratableBatches++
 				// Always recover the first visible activity update. After that,
 				// recover only every third silent narratable batch so long tool
@@ -4316,7 +4319,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		if normalizedToolText != "" {
 			preambleEmitted = true
 			silentNarratableBatches = 0
-			lastText = normalizedToolText
+			if modelToolText != "" {
+				// Only provider-authored prose may become the partial-answer
+				// return value on cancellation or synthesis failure. Runtime
+				// fallback text remains activity narration in the trajectory.
+				lastText = modelToolText
+			}
 			// Forward real preamble to handlers via OnPreamble (TUI inline
 			// render, daemon LLM_OUTPUT, SSE assistant_text). normalize above
 			// returns "" for serialized tool-call pseudo-preambles, so this

@@ -25,7 +25,13 @@ func (c *ctxCancellingTool) Info() ToolInfo {
 	return ToolInfo{
 		Name:        "cancel_run",
 		Description: "cancels the run context for testing",
-		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"description": DescriptionFieldSpec,
+			},
+		},
+		Required: []string{"description"},
 	}
 }
 
@@ -69,7 +75,7 @@ func TestAgentLoop_CancelAfterNativeToolPreamble_NoDuplicateText(t *testing.T) {
 		mu.Unlock()
 		if n == 1 {
 			_ = json.NewEncoder(w).Encode(nativeResponseWithID(preamble, "tool_use",
-				toolCallWithID("cancel_run", `{}`, "toolu_cancel_1"), 10, 5))
+				toolCallWithID("cancel_run", `{"description":"Check the daemon connection."}`, "toolu_cancel_1"), 10, 5))
 			return
 		}
 		// The cancelled context should prevent a second LLM call entirely;
@@ -121,7 +127,7 @@ func TestAgentLoop_CancelAfterXMLToolPreamble_FlushStillRecordsText(t *testing.T
 		if n == 1 {
 			// No tool-call ID → hasNativeToolIDs is false → XML fallback path.
 			_ = json.NewEncoder(w).Encode(nativeResponse(preamble, "tool_use",
-				toolCall("cancel_run", `{}`), 10, 5))
+				toolCall("cancel_run", `{"description":"Check the legacy tool."}`), 10, 5))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(nativeResponse("should not be reached", "end_turn", nil, 10, 5))
@@ -143,6 +149,42 @@ func TestAgentLoop_CancelAfterXMLToolPreamble_FlushStillRecordsText(t *testing.T
 			t.Logf("msg[%d] role=%s text=%q", i, m.Role, m.Content.Text())
 		}
 		t.Errorf("XML-path preamble must be flushed exactly once, found in %d assistant messages", got)
+	}
+}
+
+// A runtime-recovered fallback is activity narration, not model-authored
+// partial answer text. Cancellation may preserve it in the tool trajectory,
+// but must not return it as the run's final reply.
+func TestAgentLoop_CancelAfterSynthesizedFallback_DoesNotReturnAsAnswer(t *testing.T) {
+	const fallback = "Inspect the current state."
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+			toolCallWithID("cancel_run", `{"description":"Inspect the current state."}`, "toolu_cancel_fallback"), 10, 5))
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(&ctxCancellingTool{cancel: cancel})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 10, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	text, _, err := loop.Run(ctx, "inspect it", nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if text != "" {
+		t.Fatalf("cancelled run returned synthesized fallback %q as its answer", text)
+	}
+	if len(handler.preambleCalls) != 1 || handler.preambleCalls[0] != fallback {
+		t.Fatalf("preamble calls = %#v, want [%q]", handler.preambleCalls, fallback)
+	}
+	if got := countAssistantMessagesContaining(loop.RunMessages(), fallback); got != 1 {
+		t.Fatalf("fallback must remain in the tool trajectory exactly once, got %d", got)
 	}
 }
 
@@ -193,3 +235,58 @@ func TestAgentLoop_MaxIterFallback_NoDuplicateText(t *testing.T) {
 		t.Errorf("preamble must be persisted exactly once, found in %d assistant messages", got)
 	}
 }
+
+func TestAgentLoop_MaxIterAfterSynthesizedFallback_DoesNotReturnAsAnswer(t *testing.T) {
+	const fallback = "Inspect the current state."
+
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			_ = json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("capture_snapshot", `{"description":"Inspect the current state."}`, "toolu_cap_fallback"), 10, 5))
+			return
+		}
+		http.Error(w, `{"error":"forced synthesis failure"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(&requiredDescriptionSnapshotTool{})
+	handler := &preambleHandler{}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 1, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	text, _, err := loop.Run(context.Background(), "hit the cap", nil, nil)
+	if !errors.Is(err, ErrMaxIterReached) {
+		t.Fatalf("expected ErrMaxIterReached, got %v", err)
+	}
+	if text != "" {
+		t.Fatalf("iteration-limited run returned synthesized fallback %q as its answer", text)
+	}
+	if len(handler.preambleCalls) != 1 || handler.preambleCalls[0] != fallback {
+		t.Fatalf("preamble calls = %#v, want [%q]", handler.preambleCalls, fallback)
+	}
+}
+
+type requiredDescriptionSnapshotTool struct{}
+
+func (requiredDescriptionSnapshotTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "capture_snapshot",
+		Description: "captures a snapshot for testing",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"description": DescriptionFieldSpec,
+			},
+		},
+		Required: []string{"description"},
+	}
+}
+
+func (requiredDescriptionSnapshotTool) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{Content: "ok"}, nil
+}
+
+func (requiredDescriptionSnapshotTool) RequiresApproval() bool { return false }
