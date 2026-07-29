@@ -71,25 +71,39 @@ type GUICaptureRect struct {
 	Height float64
 }
 
+type GUIDisplayActionabilityDiagnostics struct {
+	DisplayID           uint32
+	QuartzBounds        GUICaptureRect
+	IsActive            bool
+	IsOnline            bool
+	IsAsleep            bool
+	IsMirrorFollower    bool
+	RotationDegrees     float64
+	FullyContainsWindow bool
+	FailedPredicates    []string
+}
+
 // GUICaptureDiagnostics is a local-only projection of a rejected exact-window
 // capture. It is intentionally attached to ToolResult outside provider-visible
 // content so local traces can explain geometry failures without exposing AX
 // state, window titles, screenshots, or typed content.
 type GUICaptureDiagnostics struct {
-	Stage              string
-	PID                int
-	BundleID           string
-	WindowID           uint32
-	PreWindowBounds    GUICaptureRect
-	PostWindowBounds   GUICaptureRect
-	DisplayID          uint32
-	BackingScaleFactor float64
-	ExpectedWidthPX    float64
-	ExpectedHeightPX   float64
-	MetadataWidthPX    int
-	MetadataHeightPX   int
-	DecodedWidthPX     int
-	DecodedHeightPX    int
+	Stage                  string
+	PID                    int
+	BundleID               string
+	WindowID               uint32
+	PreWindowBounds        GUICaptureRect
+	PostWindowBounds       GUICaptureRect
+	DisplayID              uint32
+	BackingScaleFactor     float64
+	ExpectedWidthPX        float64
+	ExpectedHeightPX       float64
+	MetadataWidthPX        int
+	MetadataHeightPX       int
+	DecodedWidthPX         int
+	DecodedHeightPX        int
+	ActionableDisplayCount int
+	DisplayCandidates      []GUIDisplayActionabilityDiagnostics
 }
 
 type GUIActionOutcome struct {
@@ -97,6 +111,12 @@ type GUIActionOutcome struct {
 	Phase       GUIActionPhase
 	Pointer     *GUIActionPointer
 	FailureCode string
+	// SameObservationContinuationSafe is primitive-authored proof that this
+	// completed_unverified action fully committed and that a later action
+	// already planned from the same provider observation may still run. The
+	// batch adapter must not reconstruct this proof from action names or
+	// failure-code strings.
+	SameObservationContinuationSafe bool
 }
 
 var guiActionFailureCodePattern = regexp.MustCompile(`^[a-z0-9_]{1,80}$`)
@@ -169,6 +189,12 @@ func (o GUIActionOutcome) Validate() error {
 	}
 	if o.Result == GUIActionResultCompletedUnverified && o.FailureCode == "" {
 		return fmt.Errorf("unverified GUI action requires a failure code")
+	}
+	if o.SameObservationContinuationSafe &&
+		o.Result != GUIActionResultCompletedUnverified {
+		return fmt.Errorf(
+			"same-observation continuation requires a completed-unverified GUI action",
+		)
 	}
 	if (o.Result == GUIActionResultFailed || o.Result == GUIActionResultCancelled ||
 		o.Result == GUIActionResultUserInterference) && o.FailureCode == "" {

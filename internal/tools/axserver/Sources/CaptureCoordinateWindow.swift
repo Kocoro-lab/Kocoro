@@ -117,6 +117,47 @@ struct CaptureCoordinateWindowFailureDiagnosticsV1: Encodable, Equatable {
     }
 }
 
+struct CaptureCoordinateWindowDisplayCandidateDiagnosticsV2: Encodable, Equatable {
+    let displayID: UInt32
+    let quartzBounds: DisplayTopologyRectV1
+    let isActive: Bool
+    let isOnline: Bool
+    let isAsleep: Bool
+    let isMirrorFollower: Bool
+    let rotationDegrees: Double
+    let fullyContainsWindow: Bool
+    let failedPredicates: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case displayID = "display_id"
+        case quartzBounds = "quartz_bounds"
+        case isActive = "is_active"
+        case isOnline = "is_online"
+        case isAsleep = "is_asleep"
+        case isMirrorFollower = "is_mirror_follower"
+        case rotationDegrees = "rotation_degrees"
+        case fullyContainsWindow = "fully_contains_window"
+        case failedPredicates = "failed_predicates"
+    }
+}
+
+struct CaptureCoordinateWindowDisplayDiagnosticsV2: Encodable, Equatable {
+    let pid: Int
+    let bundleID: String
+    let windowID: UInt32
+    let windowQuartzBounds: DisplayTopologyRectV1
+    let actionableDisplayCount: Int
+    let displays: [CaptureCoordinateWindowDisplayCandidateDiagnosticsV2]
+
+    enum CodingKeys: String, CodingKey {
+        case pid, displays
+        case bundleID = "bundle_id"
+        case windowID = "window_id"
+        case windowQuartzBounds = "window_quartz_bounds"
+        case actionableDisplayCount = "actionable_display_count"
+    }
+}
+
 enum CaptureCoordinateWindowLiveError: Error, Equatable {
     case invalidRequest
     case timeout
@@ -134,12 +175,15 @@ struct CaptureCoordinateWindowDependencies {
     let captureTimeout: TimeInterval
 }
 
+// The RPC method remains V1. Its original result schema stays byte-compatible;
+// only display_not_actionable with local diagnostics uses result schema 2.
 struct CaptureCoordinateWindowResultV1: Encodable {
     let schemaVersion: Int
     let status: String
     let failureCode: String?
     let retrySafe: Bool
     let failureDiagnostics: CaptureCoordinateWindowFailureDiagnosticsV1?
+    let displayDiagnostics: CaptureCoordinateWindowDisplayDiagnosticsV2?
     let topologyRef: CaptureCoordinateWindowTopologyRefV1?
     let helperBootID: String?
     let pid: Int?
@@ -162,6 +206,7 @@ struct CaptureCoordinateWindowResultV1: Encodable {
         case failureCode = "failure_code"
         case retrySafe = "retry_safe"
         case failureDiagnostics = "failure_diagnostics"
+        case displayDiagnostics = "display_diagnostics"
         case topologyRef = "topology_ref"
         case helperBootID = "helper_boot_id"
         case bundleID = "bundle_id"
@@ -198,6 +243,7 @@ struct CaptureCoordinateWindowResultV1: Encodable {
             failureCode: nil,
             retrySafe: false,
             failureDiagnostics: nil,
+            displayDiagnostics: nil,
             topologyRef: topologyRef,
             helperBootID: helperBootID,
             pid: pid,
@@ -218,14 +264,16 @@ struct CaptureCoordinateWindowResultV1: Encodable {
     static func failed(
         code: String,
         retrySafe: Bool,
-        diagnostics: CaptureCoordinateWindowFailureDiagnosticsV1? = nil
+        diagnostics: CaptureCoordinateWindowFailureDiagnosticsV1? = nil,
+        displayDiagnostics: CaptureCoordinateWindowDisplayDiagnosticsV2? = nil
     ) -> Self {
         Self(
-            schemaVersion: 1,
+            schemaVersion: displayDiagnostics == nil ? 1 : 2,
             status: "failed",
             failureCode: code,
             retrySafe: retrySafe,
             failureDiagnostics: diagnostics,
+            displayDiagnostics: displayDiagnostics,
             topologyRef: nil,
             helperBootID: nil,
             pid: nil,
@@ -250,6 +298,9 @@ struct CaptureCoordinateWindowResultV1: Encodable {
         try encodeNullable(failureCode, into: &container, key: .failureCode)
         try container.encode(retrySafe, forKey: .retrySafe)
         try encodeNullable(failureDiagnostics, into: &container, key: .failureDiagnostics)
+        if schemaVersion >= 2 {
+            try encodeNullable(displayDiagnostics, into: &container, key: .displayDiagnostics)
+        }
         try encodeNullable(topologyRef, into: &container, key: .topologyRef)
         try encodeNullable(helperBootID, into: &container, key: .helperBootID)
         try encodeNullable(pid, into: &container, key: .pid)
@@ -342,7 +393,14 @@ func captureCoordinateWindow(
             coordinateWindowRect(display.quartzBounds, fullyContains: preWindow.bounds)
     }
     guard containingDisplays.count == 1 else {
-        return .failed(code: "display_not_actionable", retrySafe: true)
+        return .failed(
+            code: "display_not_actionable",
+            retrySafe: true,
+            displayDiagnostics: captureCoordinateWindowDisplayDiagnostics(
+                request: request,
+                window: preWindow,
+                topology: preTopology,
+                actionableDisplayCount: containingDisplays.count))
     }
     let display = containingDisplays[0]
 
@@ -472,6 +530,54 @@ func captureCoordinateWindow(
         return .failed(code: "response_too_large", retrySafe: false)
     }
     return result
+}
+
+private func captureCoordinateWindowDisplayDiagnostics(
+    request: CaptureCoordinateWindowRequestV1,
+    window: CaptureCoordinateWindowWindowSnapshot,
+    topology: DisplayTopologyV1,
+    actionableDisplayCount: Int
+) -> CaptureCoordinateWindowDisplayDiagnosticsV2 {
+    CaptureCoordinateWindowDisplayDiagnosticsV2(
+        pid: request.pid,
+        bundleID: request.bundleID,
+        windowID: request.windowID,
+        windowQuartzBounds: window.bounds,
+        actionableDisplayCount: actionableDisplayCount,
+        displays: topology.displays.map { display in
+            let fullyContainsWindow = coordinateWindowRect(
+                display.quartzBounds,
+                fullyContains: window.bounds)
+            var failedPredicates: [String] = []
+            if !display.isActive {
+                failedPredicates.append("inactive")
+            }
+            if !display.isOnline {
+                failedPredicates.append("offline")
+            }
+            if display.isAsleep {
+                failedPredicates.append("asleep")
+            }
+            if display.mirrorMasterDisplayID != nil {
+                failedPredicates.append("mirror_follower")
+            }
+            if display.rotationDegrees != 0 {
+                failedPredicates.append("rotated")
+            }
+            if !fullyContainsWindow {
+                failedPredicates.append("does_not_fully_contain_window")
+            }
+            return CaptureCoordinateWindowDisplayCandidateDiagnosticsV2(
+                displayID: display.displayID,
+                quartzBounds: display.quartzBounds,
+                isActive: display.isActive,
+                isOnline: display.isOnline,
+                isAsleep: display.isAsleep,
+                isMirrorFollower: display.mirrorMasterDisplayID != nil,
+                rotationDegrees: display.rotationDegrees,
+                fullyContainsWindow: fullyContainsWindow,
+                failedPredicates: failedPredicates)
+        })
 }
 
 private func coordinateWindowRectsEqual(

@@ -78,7 +78,8 @@ func TestComputerUseRefClickAndPressUseAtomicSemanticPress(t *testing.T) {
 			if result.GUIOutcome == nil ||
 				result.GUIOutcome.Result != agent.GUIActionResultCompletedUnverified ||
 				result.GUIOutcome.Phase != agent.GUIActionPhaseVerifying ||
-				result.GUIOutcome.FailureCode != "postcondition_not_declared" {
+				result.GUIOutcome.FailureCode != "postcondition_not_declared" ||
+				!result.GUIOutcome.SameObservationContinuationSafe {
 				t.Fatalf("semantic typed outcome=%+v", result.GUIOutcome)
 			}
 			if len(fake.calls) != 1 || fake.calls[0].method != "read_tree" || executed == nil {
@@ -99,6 +100,42 @@ func TestComputerUseRefClickAndPressUseAtomicSemanticPress(t *testing.T) {
 				t.Fatal("committed semantic press did not invalidate state")
 			}
 		})
+	}
+}
+
+func TestComputerUseNativeBatchKeepsSemanticPressObservationUntilBatchEnd(
+	t *testing.T,
+) {
+	windowID := 7001
+	tool, fake, stateID := semanticPressTestTool(t, &windowID)
+	fake.queue("read_tree", semanticPressTreeFixture(&windowID))
+	tool.semanticPressExecutor = func(
+		_ context.Context, request SemanticPressRequestV2,
+	) (SemanticPressResultV2, error) {
+		code := "postcondition_not_declared"
+		return SemanticPressResultV2{
+			SchemaVersion: 2,
+			Status:        "completed_unverified",
+			CommitState:   "committed",
+			Phase:         "post_verification",
+			RetrySafe:     false,
+			FailureCode:   &code,
+		}, nil
+	}
+	ctx := ContextWithOpenAINativeComputerActionV1(context.Background())
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := tool.Run(
+			ctx,
+			`{"action":"press","state_id":"`+stateID+
+				`","ref":"e1","description":"Press exact target"}`,
+		)
+		if err != nil || result.IsError {
+			t.Fatalf("native semantic press %d result=%+v err=%v",
+				attempt+1, result, err)
+		}
+	}
+	if tool.snapshot == nil || tool.refs == nil {
+		t.Fatal("native provider batch lost its source observation between actions")
 	}
 }
 
@@ -124,6 +161,38 @@ func TestComputerUseSemanticPressCompletedUnverifiedIsNotRetryable(t *testing.T)
 	}
 	if tool.snapshot != nil || tool.refs != nil {
 		t.Fatal("completed_unverified did not invalidate state")
+	}
+}
+
+func TestComputerUseSemanticPressSeparatesLaneTransitionFromUserInput(
+	t *testing.T,
+) {
+	targetForeground := "target_foreground_interference"
+	laneOutcome := computerUseSemanticPressGUIOutcomeV2(
+		SemanticPressResultV2{
+			SchemaVersion: 2,
+			Status:        "user_interference",
+			CommitState:   "not_committed",
+			Phase:         "user_interference",
+			FailureCode:   &targetForeground,
+		},
+	)
+	if laneOutcome.Result != agent.GUIActionResultFailed {
+		t.Fatalf("lane transition outcome = %+v", laneOutcome)
+	}
+
+	physicalInput := "physical_input_interference"
+	userOutcome := computerUseSemanticPressGUIOutcomeV2(
+		SemanticPressResultV2{
+			SchemaVersion: 2,
+			Status:        "user_interference",
+			CommitState:   "not_committed",
+			Phase:         "user_interference",
+			FailureCode:   &physicalInput,
+		},
+	)
+	if userOutcome.Result != agent.GUIActionResultUserInterference {
+		t.Fatalf("physical input outcome = %+v", userOutcome)
 	}
 }
 

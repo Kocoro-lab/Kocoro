@@ -60,7 +60,8 @@ func TestComputerUseTargetBoundTypeUsesLatestExactStateAndRedactsContent(t *test
 	}
 	if result.GUIOutcome == nil ||
 		result.GUIOutcome.Result != agent.GUIActionResultCompletedUnverified ||
-		result.GUIOutcome.Phase != agent.GUIActionPhaseVerifying {
+		result.GUIOutcome.Phase != agent.GUIActionPhaseVerifying ||
+		!result.GUIOutcome.SameObservationContinuationSafe {
 		t.Fatalf("typed acknowledgement lost GUI outcome: %+v", result.GUIOutcome)
 	}
 	if tool.snapshot != nil || tool.refs != nil {

@@ -232,6 +232,101 @@ func TestOpenAIComputerTrajectorySerializesOnlyRedactedFailureFeedback(t *testin
 	}
 }
 
+func TestClassifyOpenAIComputerRecoveryUsesStableCategories(t *testing.T) {
+	tests := []struct {
+		name        string
+		effect      ComputerUseCommitEffect
+		result      GUIActionResult
+		phase       GUIActionPhase
+		failure     string
+		want        OpenAIComputerRecoveryCategoryV1
+		continuable bool
+	}{
+		{
+			name:        "same app authority drift reobserves",
+			effect:      ComputerUseCommitNone,
+			result:      GUIActionResultFailed,
+			phase:       GUIActionPhaseActing,
+			failure:     "frontmost_window_mismatch",
+			want:        OpenAIComputerRecoveryReobserveSameAppV1,
+			continuable: true,
+		},
+		{
+			name:    "physical user input stops",
+			effect:  ComputerUseCommitNone,
+			result:  GUIActionResultUserInterference,
+			phase:   GUIActionPhaseActing,
+			failure: "pointer_interference",
+			want:    OpenAIComputerRecoveryUserIntervenedV1,
+		},
+		{
+			name:    "unknown commit stops",
+			effect:  ComputerUseCommitUnknown,
+			result:  GUIActionResultCompletedUnverified,
+			phase:   GUIActionPhaseInputCommitted,
+			failure: "commit_unknown",
+			want:    OpenAIComputerRecoveryUnknownCommitV1,
+		},
+		{
+			name:        "unsupported projection replans from fresh image",
+			effect:      ComputerUseCommitNone,
+			result:      GUIActionResultFailed,
+			phase:       GUIActionPhaseActing,
+			failure:     "action_projection_failed",
+			want:        OpenAIComputerRecoveryReobserveSameAppV1,
+			continuable: true,
+		},
+		{
+			name:    "typed user interference always stops",
+			effect:  ComputerUseCommitKnown,
+			result:  GUIActionResultUserInterference,
+			phase:   GUIActionPhaseVerifying,
+			failure: "target_foreground_interference",
+			want:    OpenAIComputerRecoveryUserIntervenedV1,
+		},
+		{
+			name:        "lane transition is an ordinary recoverable failure",
+			effect:      ComputerUseCommitNone,
+			result:      GUIActionResultFailed,
+			phase:       GUIActionPhaseActing,
+			failure:     "target_foreground_interference",
+			want:        OpenAIComputerRecoveryReobserveSameAppV1,
+			continuable: true,
+		},
+		{
+			name:    "capture loss stops",
+			effect:  ComputerUseCommitNone,
+			result:  GUIActionResultFailed,
+			phase:   GUIActionPhaseObserving,
+			failure: "final_observation_unavailable",
+			want:    OpenAIComputerRecoveryCaptureUnavailableV1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			execution := OpenAIComputerBatchExecution{
+				ActionEffect: test.effect,
+				Result: ToolResult{
+					IsError: true,
+					GUIOutcome: &GUIActionOutcome{
+						Result:      test.result,
+						Phase:       test.phase,
+						FailureCode: test.failure,
+					},
+				},
+			}
+			got := ClassifyOpenAIComputerRecoveryV1(execution)
+			if got != test.want {
+				t.Fatalf("category = %q, want %q", got, test.want)
+			}
+			if got.ContinuationAllowed() != test.continuable {
+				t.Fatalf("category %q continuation = %t, want %t",
+					got, got.ContinuationAllowed(), test.continuable)
+			}
+		})
+	}
+}
+
 func TestOpenAIComputerSafetyAcknowledgementIsExplicitBoundAndOneShot(t *testing.T) {
 	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
 	const callWithSafety = `{"type":"computer_call","provider":"openai","api_surface":"openai_responses","tool_contract":"openai.computer.v1","response_id":"` + openAIContinuationTokenSecondary + `","call_id":"call_safe","actions":[{"type":"click","button":"left","x":405,"y":157}],"pending_safety_checks":[{"id":"check_1","code":"malicious_instructions","message":"Confirm the direct user request."},{"id":"check_2","code":null,"message":null}],"status":"completed"}`

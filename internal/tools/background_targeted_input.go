@@ -15,8 +15,10 @@ const backgroundTargetedInputMaximumUTF16V1 = 2048
 
 // BackgroundTargetedInputRequestV1 is a distinct capability from the existing
 // foreground target_bound_input RPC. It binds one already-focused editable AX
-// element inside an exact non-frontmost process and one exact process that must
-// remain frontmost for the entire commit. It never authorizes activation.
+// element inside an exact non-frontmost process. PreservedFrontmost* records
+// the planning-time foreground witness, but execution permits the user to move
+// among other apps as long as the exact target remains non-frontmost. It never
+// authorizes activation.
 type BackgroundTargetedInputRequestV1 struct {
 	SchemaVersion                int                       `json:"schema_version"`
 	Input                        TargetBoundInputRequestV1 `json:"input"`

@@ -429,6 +429,42 @@ func TestOpenAIComputerAdapterExecutesOrderedBatchAsOneResult(t *testing.T) {
 	}
 }
 
+func TestOpenAIComputerAdapterStopsAtFreshObservationBoundary(t *testing.T) {
+	executor := &openAIComputerExecutorProbe{
+		executions: []OpenAIComputerActionExecutionV1{{
+			CommitState:              OpenAIComputerCommitVerifiedV1,
+			RequiresFreshObservation: true,
+		}},
+		finalResult: finalOpenAIComputerObservation(),
+	}
+	adapter := newOpenAIComputerAdapterV1(executor)
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		[]byte(openAIComputerCallWithActions(
+			`{"type":"keypress","keys":["META","TAB"]},`+
+				`{"type":"keypress","keys":["9"]}`,
+		)),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if result.ToolResult.IsError || len(result.ToolResult.Images) != 1 {
+		t.Fatalf("tool result = %#v", result.ToolResult)
+	}
+	if len(executor.actions) != 1 ||
+		executor.actions[0].Type != OpenAIComputerActionKeypressV1 {
+		t.Fatalf("actions past fresh-observation boundary executed: %#v",
+			executor.actions)
+	}
+	if executor.finalCalls != 1 {
+		t.Fatalf("final capture calls = %d, want 1", executor.finalCalls)
+	}
+	if !strings.Contains(result.ToolResult.Content, "Executed 1 ") {
+		t.Fatalf("result reported unexecuted actions: %q",
+			result.ToolResult.Content)
+	}
+}
+
 func TestOpenAIComputerAdapterRejectsWholeCallBeforeAuthorityOnUnknownAction(t *testing.T) {
 	executor := &openAIComputerExecutorProbe{finalResult: finalOpenAIComputerObservation()}
 	adapter := newOpenAIComputerAdapterV1(executor)
@@ -544,6 +580,12 @@ func TestOpenAIComputerAdapterCancellationStopsAtActionBoundary(t *testing.T) {
 		!strings.Contains(result.ToolResult.Content, "cancelled") {
 		t.Fatalf("tool result = %#v", result.ToolResult)
 	}
+	if result.ToolResult.GUIOutcome == nil ||
+		result.ToolResult.GUIOutcome.Result != agent.GUIActionResultCancelled ||
+		result.ToolResult.GUIOutcome.Phase != agent.GUIActionPhaseInputCommitted ||
+		result.ToolResult.GUIOutcome.FailureCode != "cancelled" {
+		t.Fatalf("cancellation outcome = %#v", result.ToolResult.GUIOutcome)
+	}
 	if len(executor.actions) != 1 {
 		t.Fatalf("executed %d actions after cancellation, want 1", len(executor.actions))
 	}
@@ -607,9 +649,10 @@ func TestOpenAIComputerAdapterContinuesFullyCommittedScrollAndDrag(t *testing.T)
 					{
 						CommitState: OpenAIComputerCommitUnverifiedV1,
 						Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
-							Result:      agent.GUIActionResultCompletedUnverified,
-							Phase:       agent.GUIActionPhaseVerifying,
-							FailureCode: test.failureCode,
+							Result:                          agent.GUIActionResultCompletedUnverified,
+							Phase:                           agent.GUIActionPhaseVerifying,
+							FailureCode:                     test.failureCode,
+							SameObservationContinuationSafe: true,
 						}},
 					},
 					{CommitState: OpenAIComputerCommitVerifiedV1},
@@ -645,9 +688,10 @@ func TestOpenAIComputerAdapterContinuesKeypressWhenOnlyPhysicalMonitoringWasLost
 			{
 				CommitState: OpenAIComputerCommitUnverifiedV1,
 				Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
-					Result:      agent.GUIActionResultCompletedUnverified,
-					Phase:       agent.GUIActionPhaseVerifying,
-					FailureCode: "interference_detection_unavailable",
+					Result:                          agent.GUIActionResultCompletedUnverified,
+					Phase:                           agent.GUIActionPhaseVerifying,
+					FailureCode:                     "interference_detection_unavailable",
+					SameObservationContinuationSafe: true,
 				}},
 			},
 			{CommitState: OpenAIComputerCommitVerifiedV1},
@@ -710,7 +754,7 @@ func TestOpenAIComputerAdapterObservesButDoesNotReplayDragAfterMonitoringLoss(
 	}
 }
 
-func TestOpenAIComputerAdapterStopsAfterCommittedActionWhenTargetRefreshFails(
+func TestOpenAIComputerAdapterStopsAfterCommittedActionWhenExecutorReturnsError(
 	t *testing.T,
 ) {
 	executor := &openAIComputerExecutorProbe{
@@ -726,7 +770,7 @@ func TestOpenAIComputerAdapterStopsAfterCommittedActionWhenTargetRefreshFails(
 			{CommitState: OpenAIComputerCommitVerifiedV1},
 		},
 		executionErrs: []error{
-			errors.New("target refresh failed after the committed keypress"),
+			errors.New("executor failed after the committed keypress"),
 		},
 		finalResult: finalOpenAIComputerObservation(),
 	}
@@ -738,7 +782,7 @@ func TestOpenAIComputerAdapterStopsAfterCommittedActionWhenTargetRefreshFails(
 		)),
 	)
 	if err != nil || !result.ToolResult.IsError ||
-		!strings.Contains(result.ToolResult.Content, "target refresh failed") ||
+		!strings.Contains(result.ToolResult.Content, "executor failed") ||
 		len(executor.actions) != 1 || executor.finalCalls != 1 {
 		t.Fatalf(
 			"result=%+v actions=%d final=%d err=%v",
@@ -747,6 +791,45 @@ func TestOpenAIComputerAdapterStopsAfterCommittedActionWhenTargetRefreshFails(
 			executor.finalCalls,
 			err,
 		)
+	}
+}
+
+func TestOpenAIComputerAdapterRejectsInvalidFreshObservationBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		actions string
+	}{
+		{
+			name:    "non-keypress",
+			actions: `{"type":"click","button":"left","x":1,"y":2},{"type":"wait"}`,
+		},
+		{
+			name:    "last-action",
+			actions: `{"type":"keypress","keys":["META","TAB"]}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor := &openAIComputerExecutorProbe{
+				executions: []OpenAIComputerActionExecutionV1{{
+					CommitState:              OpenAIComputerCommitVerifiedV1,
+					RequiresFreshObservation: true,
+				}},
+				finalResult: finalOpenAIComputerObservation(),
+			}
+			result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(
+				context.Background(),
+				[]byte(openAIComputerCallWithActions(test.actions)),
+			)
+			if err != nil || !result.ToolResult.IsError ||
+				!strings.Contains(
+					result.ToolResult.Content,
+					"fresh-observation boundary is invalid",
+				) ||
+				executor.finalCalls != 1 {
+				t.Fatalf("result=%+v final=%d err=%v",
+					result.ToolResult, executor.finalCalls, err)
+			}
+		})
 	}
 }
 
@@ -760,6 +843,42 @@ func TestOpenAIComputerAdapterStopsPartiallyCommittedScroll(t *testing.T) {
 				FailureCode: "scroll_not_committed",
 			}},
 		}},
+		finalResult: finalOpenAIComputerObservation(),
+	}
+	result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(
+		context.Background(),
+		[]byte(openAIComputerCallWithActions(
+			`{"type":"scroll","x":7,"y":8,"scroll_x":0,"scroll_y":-618},`+
+				`{"type":"click","button":"left","x":9,"y":10}`,
+		)),
+	)
+	if err != nil || !result.ToolResult.IsError ||
+		len(executor.actions) != 1 || executor.finalCalls != 1 {
+		t.Fatalf(
+			"result=%+v actions=%d final=%d err=%v",
+			result.ToolResult,
+			len(executor.actions),
+			executor.finalCalls,
+			err,
+		)
+	}
+}
+
+func TestOpenAIComputerAdapterDoesNotInferContinuationFromFailureCode(
+	t *testing.T,
+) {
+	executor := &openAIComputerExecutorProbe{
+		executions: []OpenAIComputerActionExecutionV1{
+			{
+				CommitState: OpenAIComputerCommitUnverifiedV1,
+				Result: agent.ToolResult{GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultCompletedUnverified,
+					Phase:       agent.GUIActionPhaseVerifying,
+					FailureCode: "scroll_postcondition_not_declared",
+				}},
+			},
+			{CommitState: OpenAIComputerCommitVerifiedV1},
+		},
 		finalResult: finalOpenAIComputerObservation(),
 	}
 	result, err := newOpenAIComputerAdapterV1(executor).ExecuteBatchV1(

@@ -89,11 +89,9 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 		t,
 		loadCoordinateFixture(
 			t,
-			"capture_coordinate_window.response.failure.v1.json",
+			"capture_coordinate_window.response.display_not_actionable.v2.json",
 		),
 	)
-	failure["failure_code"] = "display_not_actionable"
-	failure["retry_safe"] = true
 	harness.fake.queue(
 		"capture_coordinate_window",
 		string(marshalCaptureWindowJSON(t, failure)),
@@ -129,7 +127,9 @@ func TestComputerUseObservationUsesExactVisualOnlyFallbackWithoutCoordinateAutho
 	}
 	if result.GUIObservation == nil ||
 		result.GUIObservation.CoordinateActionable ||
-		!result.GUIObservation.SemanticActionable {
+		!result.GUIObservation.SemanticActionable ||
+		result.GUIObservation.ActionabilityFailureCode !=
+			"display_not_actionable" {
 		t.Fatalf("visual-only observation metadata = %+v", result.GUIObservation)
 	}
 	if !strings.Contains(result.Content, "visual-only") {
@@ -256,7 +256,9 @@ func TestComputerUseImageDimensionFallbackNeverMintsSemanticAuthority(
 		harness.tool.semanticImageArtifact != nil ||
 		result.GUIObservation == nil ||
 		result.GUIObservation.CoordinateActionable ||
-		result.GUIObservation.SemanticActionable {
+		result.GUIObservation.SemanticActionable ||
+		result.GUIObservation.ActionabilityFailureCode !=
+			"image_dimensions_mismatch" {
 		t.Fatalf("dimension mismatch minted action authority: tool=%+v observation=%+v",
 			harness.tool.semanticImageArtifact, result.GUIObservation)
 	}
@@ -470,6 +472,7 @@ func TestComputerUseCoordinateClickMapsCurrentArtifactAndConsumesIt(t *testing.T
 	}
 	if result.GUIOutcome == nil || result.GUIOutcome.Result != agent.GUIActionResultCompletedUnverified ||
 		result.GUIOutcome.Phase != agent.GUIActionPhaseVerifying || result.GUIOutcome.Pointer == nil ||
+		result.GUIOutcome.SameObservationContinuationSafe ||
 		result.GUIOutcome.Pointer.DisplayID != 9 ||
 		result.GUIOutcome.Pointer.TopologyID != harness.topology.TopologyID ||
 		result.GUIOutcome.Pointer.TopologyGeneration != harness.topology.Generation ||
@@ -546,6 +549,14 @@ func TestOpenAINativeComputerBatchReusesStableWindowFrameAcrossCoordinateActions
 		}`, stateID, index))
 		if err != nil || result.IsError {
 			t.Fatalf("native click %d result=%+v err=%v", index+1, result, err)
+		}
+		if result.GUIOutcome == nil ||
+			!result.GUIOutcome.SameObservationContinuationSafe {
+			t.Fatalf(
+				"native click %d omitted same-observation continuation receipt: %+v",
+				index+1,
+				result.GUIOutcome,
+			)
 		}
 		if harness.tool.snapshot == nil || harness.tool.coordinateArtifact == nil {
 			t.Fatalf("native click %d consumed batch frame authority", index+1)

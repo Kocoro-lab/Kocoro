@@ -238,12 +238,17 @@ func TestComputerUseVerifiedLocationTypeAuthorizesOneReturn(
 	harness.tree.RefPaths = map[string]computerUseRefPath{}
 	harness.tree.FocusedRef = nil
 	harness.observe(t)
-	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
-		OpenAIComputerActionV1{
-			Type: OpenAIComputerActionKeypressV1,
-			Keys: []string{"command", "l"},
-		},
+	keypress := OpenAIComputerActionV1{
+		Type: OpenAIComputerActionKeypressV1,
+		Keys: []string{"command", "l"},
+	}
+	if _, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		keypress,
 	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(keypress); err != nil {
 		t.Fatal(err)
 	}
 	typePlan, err := runtime.PlanOpenAIComputerActionV1(
@@ -339,12 +344,17 @@ func TestComputerUseLocationReturnSurvivesTypedFieldFingerprintChange(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
-		OpenAIComputerActionV1{
-			Type: OpenAIComputerActionKeypressV1,
-			Keys: []string{"command", "l"},
-		},
+	keypress := OpenAIComputerActionV1{
+		Type: OpenAIComputerActionKeypressV1,
+		Keys: []string{"command", "l"},
+	}
+	if _, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		keypress,
 	); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(keypress); err != nil {
 		t.Fatal(err)
 	}
 	typePlan, err := runtime.PlanOpenAIComputerActionV1(

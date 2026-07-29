@@ -42,6 +42,101 @@ func TestOpenAIComputerTaskOutcomeSeparatesNotCompletedFromUnverified(
 	}
 }
 
+func TestOpenAIComputerBatchContinuationPolicyUsesStableRecoveryCategory(
+	t *testing.T,
+) {
+	image := agent.ImageBlock{MediaType: "image/png", Data: "final"}
+	tests := []struct {
+		name      string
+		execution agent.OpenAIComputerBatchExecution
+		err       error
+		want      bool
+	}{
+		{
+			name: "successful batch",
+			execution: agent.OpenAIComputerBatchExecution{
+				Result: agent.ToolResult{Images: []agent.ImageBlock{image}},
+			},
+			want: true,
+		},
+		{
+			name: "same app drift can reobserve",
+			execution: agent.OpenAIComputerBatchExecution{
+				Result: agent.ToolResult{
+					IsError: true,
+					Images:  []agent.ImageBlock{image},
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result:      agent.GUIActionResultFailed,
+						Phase:       agent.GUIActionPhaseActing,
+						FailureCode: "frontmost_window_mismatch",
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "physical user input stops",
+			execution: agent.OpenAIComputerBatchExecution{
+				Result: agent.ToolResult{
+					IsError: true,
+					Images:  []agent.ImageBlock{image},
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result:      agent.GUIActionResultUserInterference,
+						Phase:       agent.GUIActionPhaseActing,
+						FailureCode: "pointer_interference",
+					},
+				},
+			},
+		},
+		{
+			name: "precommit lane failure can replan from fresh image",
+			execution: agent.OpenAIComputerBatchExecution{
+				Result: agent.ToolResult{
+					IsError: true,
+					Images:  []agent.ImageBlock{image},
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result:      agent.GUIActionResultFailed,
+						Phase:       agent.GUIActionPhaseActing,
+						FailureCode: "background_target_became_frontmost",
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "unknown commit stops",
+			execution: agent.OpenAIComputerBatchExecution{
+				ActionEffect: agent.ComputerUseCommitUnknown,
+				Result: agent.ToolResult{
+					IsError: true,
+					Images:  []agent.ImageBlock{image},
+				},
+			},
+		},
+		{
+			name:      "missing screenshot stops",
+			execution: agent.OpenAIComputerBatchExecution{},
+		},
+		{
+			name: "executor error stops",
+			execution: agent.OpenAIComputerBatchExecution{
+				Result: agent.ToolResult{Images: []agent.ImageBlock{image}},
+			},
+			err: errors.New("executor failed"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := openAIComputerBatchContinuationAllowedV1(
+				test.execution,
+				test.err,
+			); got != test.want {
+				t.Fatalf("continuation = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestOpenAIComputerCommitStatePreservesUnknownAcknowledgements(t *testing.T) {
 	for _, code := range []string{
 		"commit_unknown",
@@ -62,6 +157,60 @@ func TestOpenAIComputerCommitStatePreservesUnknownAcknowledgements(t *testing.T)
 				t.Fatalf("commit state = %q", got)
 			}
 		})
+	}
+}
+
+func TestOpenAIComputerCommitStateDistinguishesPrecommitIntervention(t *testing.T) {
+	for _, result := range []agent.GUIActionResult{
+		agent.GUIActionResultUserInterference,
+		agent.GUIActionResultCancelled,
+	} {
+		t.Run(string(result), func(t *testing.T) {
+			precommit := agent.ToolResult{
+				IsError: true,
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result:      result,
+					Phase:       agent.GUIActionPhaseActing,
+					FailureCode: "pointer_interference",
+				},
+			}
+			if got := openAIComputerCommitStateV1(
+				precommit,
+				nil,
+			); got != tools.OpenAIComputerNotCommittedV1 {
+				t.Fatalf("precommit intervention state = %q", got)
+			}
+
+			afterCommit := precommit
+			afterCommit.GUIOutcome = &agent.GUIActionOutcome{
+				Result:      result,
+				Phase:       agent.GUIActionPhaseInputCommitted,
+				FailureCode: "pointer_interference",
+			}
+			if got := openAIComputerCommitStateV1(
+				afterCommit,
+				nil,
+			); got != tools.OpenAIComputerCommitUnknownV1 {
+				t.Fatalf("post-commit intervention state = %q", got)
+			}
+		})
+	}
+}
+
+func TestOpenAIComputerNoEffectInterventionIsNotReportedAsUnknown(t *testing.T) {
+	result := openAIComputerNoEffectInterventionResultV1(
+		"the user moved the pointer before the click committed",
+	)
+	if !result.IsError ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskNotCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		result.ComputerUseOutcome.FailureCode !=
+			string(agent.OpenAIComputerRecoveryUserIntervenedV1) ||
+		result.ComputerUseOutcome.Recovery != agent.ComputerUseRecoveryNone ||
+		strings.Contains(result.Content, "action_effect: unknown") ||
+		!strings.Contains(result.Content, "computer_use_error: user_intervened") {
+		t.Fatalf("precommit intervention result = %+v", result)
 	}
 }
 
@@ -222,6 +371,17 @@ func (t *openAIComputerDaemonProbeTool) Run(
 	if queue := t.resultQueues[name]; len(queue) > 0 {
 		result = queue[0]
 		t.resultQueues[name] = queue[1:]
+	}
+	// Production get_app_state always carries local actionability metadata.
+	// Keep shared screenshot fixtures faithful to that contract while tests
+	// for visual-only or rejected observations provide an explicit outcome.
+	if name == "final_screenshot" &&
+		len(result.Images) == 1 &&
+		result.GUIObservation == nil {
+		result.GUIObservation = &agent.GUIObservationOutcome{
+			CoordinateActionable: true,
+			SemanticActionable:   true,
+		}
 	}
 	afterRun := t.afterRun
 	t.mu.Unlock()
@@ -604,9 +764,10 @@ func newOpenAIComputerDaemonExecutorFixture(
 			"keypress": {
 				Content: "keypress committed without a declared postcondition",
 				GUIOutcome: &agent.GUIActionOutcome{
-					Result:      agent.GUIActionResultCompletedUnverified,
-					Phase:       agent.GUIActionPhaseVerifying,
-					FailureCode: "postcondition_not_declared",
+					Result:                          agent.GUIActionResultCompletedUnverified,
+					Phase:                           agent.GUIActionPhaseVerifying,
+					FailureCode:                     "postcondition_not_declared",
+					SameObservationContinuationSafe: true,
 				},
 			},
 			"reobserve": {Content: "observed"},
@@ -1090,9 +1251,10 @@ func TestDaemonOpenAIComputerExecutorContinuesKnownAtomicCommitWithoutInternalRe
 	probe.results["click"] = agent.ToolResult{
 		Content: "click committed without a declared postcondition",
 		GUIOutcome: &agent.GUIActionOutcome{
-			Result:      agent.GUIActionResultCompletedUnverified,
-			Phase:       agent.GUIActionPhaseVerifying,
-			FailureCode: "click_postcondition_not_declared",
+			Result:                          agent.GUIActionResultCompletedUnverified,
+			Phase:                           agent.GUIActionPhaseVerifying,
+			FailureCode:                     "click_postcondition_not_declared",
+			SameObservationContinuationSafe: true,
 		},
 	}
 
@@ -1161,6 +1323,11 @@ func TestDaemonOpenAIComputerExecutorRunsProviderWaitWithoutGUIPolicyProjection(
 ) {
 	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
 	defer executor.EndBatchV1()
+	settleCalls := 0
+	executor.postBatchSettle = func(context.Context, int) error {
+		settleCalls++
+		return nil
+	}
 
 	result, err := adapter.ExecuteBatchV1(
 		context.Background(),
@@ -1174,6 +1341,70 @@ func TestDaemonOpenAIComputerExecutorRunsProviderWaitWithoutGUIPolicyProjection(
 	}
 	if got := strings.Join(probe.runNames(), ","); got != "wait,final_screenshot" {
 		t.Fatalf("execution order = %q", got)
+	}
+	if settleCalls != 0 {
+		t.Fatalf("observation-only batch settled %d times", settleCalls)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorSettlesOnceWithoutHiddenObservation(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	var events []string
+	probe.afterRun = func(name string) {
+		events = append(events, name)
+	}
+	executor.postBatchSettle = func(_ context.Context, _ int) error {
+		events = append(events, "settle")
+		return nil
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"click","button":"left","x":10,"y":20}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if result.ToolResult.IsError || len(result.ToolResult.Images) != 1 {
+		t.Fatalf("result = %+v", result.ToolResult)
+	}
+	if got := strings.Join(events, ","); got !=
+		"click,settle,final_screenshot" {
+		t.Fatalf("post-batch settle order = %q", got)
+	}
+}
+
+func TestDaemonOpenAIComputerExecutorCancelledSettleDoesNotObserveOrReplay(
+	t *testing.T,
+) {
+	executor, adapter, probe, _ := newOpenAIComputerDaemonExecutorFixture(t)
+	defer executor.EndBatchV1()
+	executor.postBatchSettle = func(context.Context, int) error {
+		return context.Canceled
+	}
+
+	result, err := adapter.ExecuteBatchV1(
+		context.Background(),
+		openAIComputerDaemonCall(
+			`{"type":"click","button":"left","x":10,"y":20}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ExecuteBatchV1: %v", err)
+	}
+	if !result.ToolResult.IsError ||
+		result.ActionEffect != agent.ComputerUseCommitKnown ||
+		result.ToolResult.GUIOutcome == nil ||
+		result.ToolResult.GUIOutcome.Result != agent.GUIActionResultCancelled {
+		t.Fatalf("cancelled settle result = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got != "click" {
+		t.Fatalf("cancelled settle executed more work = %q", got)
 	}
 }
 
@@ -1192,9 +1423,10 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 			"click": {
 				Content: "click committed without a declared postcondition",
 				GUIOutcome: &agent.GUIActionOutcome{
-					Result:      agent.GUIActionResultCompletedUnverified,
-					Phase:       agent.GUIActionPhaseVerifying,
-					FailureCode: "click_postcondition_not_declared",
+					Result:                          agent.GUIActionResultCompletedUnverified,
+					Phase:                           agent.GUIActionPhaseVerifying,
+					FailureCode:                     "click_postcondition_not_declared",
+					SameObservationContinuationSafe: true,
 				},
 			},
 			"type": {
@@ -1211,6 +1443,10 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 					MediaType: "image/png",
 					Data:      "ZmluYWwtaW1hZ2U=",
 				}},
+				GUIObservation: &agent.GUIObservationOutcome{
+					CoordinateActionable: true,
+					SemanticActionable:   true,
+				},
 			},
 		},
 	}
@@ -1299,9 +1535,10 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			"click": {
 				Content: "click committed without a declared postcondition",
 				GUIOutcome: &agent.GUIActionOutcome{
-					Result:      agent.GUIActionResultCompletedUnverified,
-					Phase:       agent.GUIActionPhaseVerifying,
-					FailureCode: "click_postcondition_not_declared",
+					Result:                          agent.GUIActionResultCompletedUnverified,
+					Phase:                           agent.GUIActionPhaseVerifying,
+					FailureCode:                     "click_postcondition_not_declared",
+					SameObservationContinuationSafe: true,
 				},
 			},
 			"type": {
@@ -1460,6 +1697,12 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			) && strings.Contains(
 				message.Content.Text(),
 				"Do not add routine fixed waits",
+			) && strings.Contains(
+				message.Content.Text(),
+				"Kocoro applies one short bounded settle",
+			) && !strings.Contains(
+				message.Content.Text(),
+				"bounded adaptive settle",
 			) && strings.Contains(
 				message.Content.Text(),
 				"make that first batch perform the first useful goal action",
@@ -1894,10 +2137,15 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 			MediaType: "image/png",
 			Data:      "Y29sZC1hcHAtcmVhZHk=",
 		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			CoordinateActionable: true,
+			SemanticActionable:   true,
+		},
 	}
 	initialVisualOnly := initialSuccess
 	initialVisualOnly.GUIObservation = &agent.GUIObservationOutcome{
-		CoordinateActionable: false,
+		CoordinateActionable:     false,
+		ActionabilityFailureCode: "image_dimensions_mismatch",
 	}
 	probe := &openAIComputerDaemonProbeTool{
 		targetBundleID: "com.example.calculator",
@@ -1992,6 +2240,204 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 	}
 }
 
+func TestOpenAIComputerTaskToolRecoversInitialDisplayBeforeProviderAction(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-display-recovery",
+		"turn-openai-display-recovery",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	displayFailure := agent.ToolResult{
+		Content: "observed visual-only display geometry",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "ZGlzcGxheS1mYWlsdXJl",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			SemanticActionable:       true,
+			ActionabilityFailureCode: "display_not_actionable",
+		},
+	}
+	actionable := agent.ToolResult{
+		Content: "observed actionable window",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "YWN0aW9uYWJsZQ==",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			CoordinateActionable: true,
+			SemanticActionable:   true,
+		},
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "clicked",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"final_screenshot": displayFailure,
+		},
+	}
+	initialRuns := 0
+	probe.afterRun = func(name string) {
+		if name != "final_screenshot" {
+			return
+		}
+		initialRuns++
+		if initialRuns == 1 {
+			probe.mu.Lock()
+			probe.results["final_screenshot"] = actionable
+			probe.mu.Unlock()
+		}
+	}
+
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	call := openAIComputerDaemonCall(
+		`{"type":"click","button":"left","x":10,"y":20}`,
+	)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(call),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_display_recovery_final",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Calculator visibly shows the requested result.\"}"}`,
+			`{"status":"completed","summary":"Calculator visibly shows the requested result."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	var waits []int
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+		observationRetry: func(_ context.Context, attempt int) error {
+			waits = append(waits, attempt)
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 3-10 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if result.IsError ||
+		result.Content != "Calculator visibly shows the requested result." {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,final_screenshot,click,final_screenshot" {
+		t.Fatalf("desktop runs = %q", got)
+	}
+	if !reflect.DeepEqual(waits, []int{1}) {
+		t.Fatalf("display observation waits = %v", waits)
+	}
+}
+
+func TestOpenAIComputerTaskToolStopsAfterSecondInitialDisplayFailure(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-display-terminal",
+		"turn-openai-display-terminal",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	displayFailure := agent.ToolResult{
+		Content: "observed visual-only display geometry",
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "ZGlzcGxheS1mYWlsdXJl",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			ActionabilityFailureCode: "display_not_actionable",
+		},
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": displayFailure,
+		},
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     &openAIComputerDaemonLoopLLM{},
+		profile:     trustedOpenAIComputerProfileForDaemon(t),
+		childTools:  agent.NewToolRegistry(),
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+		observationRetry: func(context.Context, int) error {
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Compute 3-10 in Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "computer_use_error: display_not_actionable") ||
+		!strings.Contains(
+			result.Content,
+			"fully contained in one active, online, awake, unmirrored, unrotated display",
+		) {
+		t.Fatalf("terminal display result = %+v", result)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskNotCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		result.ComputerUseOutcome.FailureCode != "display_not_actionable" ||
+		result.ComputerUseOutcome.Recovery != agent.ComputerUseRecoveryNone {
+		t.Fatalf("terminal display outcome = %+v", result.ComputerUseOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,final_screenshot" {
+		t.Fatalf("terminal display runs = %q", got)
+	}
+}
+
 func TestOpenAIComputerObservationAcceptsSemanticAuthorityOnlyForBackgroundLane(
 	t *testing.T,
 ) {
@@ -2001,7 +2447,8 @@ func TestOpenAIComputerObservationAcceptsSemanticAuthorityOnlyForBackgroundLane(
 			Data:      "c2VtYW50aWMtaW1hZ2U=",
 		}},
 		GUIObservation: &agent.GUIObservationOutcome{
-			SemanticActionable: true,
+			SemanticActionable:       true,
+			ActionabilityFailureCode: "display_not_actionable",
 		},
 	}
 	for _, test := range []struct {
@@ -2014,7 +2461,7 @@ func TestOpenAIComputerObservationAcceptsSemanticAuthorityOnlyForBackgroundLane(
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			attempts := 0
-			_, err := runOpenAIComputerObservationV1(
+			_, err := runOpenAIComputerInitialObservationV1(
 				context.Background(),
 				2,
 				true,
@@ -2031,6 +2478,208 @@ func TestOpenAIComputerObservationAcceptsSemanticAuthorityOnlyForBackgroundLane(
 					attempts, err, test.wantAttempts)
 			}
 		})
+	}
+}
+
+func TestOpenAIComputerInitialDisplayRecoveryStopsAfterOneObservationOnlyRetry(
+	t *testing.T,
+) {
+	displayFailure := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "ZGlzcGxheS1mYWlsdXJl",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			ActionabilityFailureCode: "display_not_actionable",
+		},
+	}
+	attempts := 0
+	result, err := runOpenAIComputerInitialObservationV1(
+		context.Background(),
+		maxOpenAIComputerInitialObservationsV1,
+		true,
+		false,
+		func(context.Context, int) error { return nil },
+		func(context.Context, int) (agent.ToolResult, error) {
+			attempts++
+			return displayFailure, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("initial observation: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("display observation attempts = %d, want 2", attempts)
+	}
+	if got := openAIComputerTraceFailureCodeV1(result, nil); got !=
+		"display_not_actionable" {
+		t.Fatalf("terminal failure code = %q", got)
+	}
+	if got := openAIComputerObservationResultDetailV1(result); !strings.Contains(
+		got,
+		"display_not_actionable",
+	) {
+		t.Fatalf("terminal failure detail = %q", got)
+	}
+}
+
+func TestOpenAIComputerInitialDisplayRecoveryContinuesAfterActionableSecondObservation(
+	t *testing.T,
+) {
+	displayFailure := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "ZGlzcGxheS1mYWlsdXJl",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			ActionabilityFailureCode: "display_not_actionable",
+		},
+	}
+	actionable := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "YWN0aW9uYWJsZQ==",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			CoordinateActionable: true,
+			SemanticActionable:   true,
+		},
+	}
+	attempts := 0
+	result, err := runOpenAIComputerInitialObservationV1(
+		context.Background(),
+		maxOpenAIComputerInitialObservationsV1,
+		true,
+		false,
+		func(context.Context, int) error { return nil },
+		func(context.Context, int) (agent.ToolResult, error) {
+			attempts++
+			if attempts == 1 {
+				return displayFailure, nil
+			}
+			return actionable, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("initial observation: %v", err)
+	}
+	if attempts != 2 || !result.GUIObservation.CoordinateActionable {
+		t.Fatalf("actionable recovery result=%+v attempts=%d", result, attempts)
+	}
+}
+
+func TestOpenAIComputerInitialActionableObservationDoesNotRetry(
+	t *testing.T,
+) {
+	actionable := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "YWN0aW9uYWJsZQ==",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			CoordinateActionable: true,
+			SemanticActionable:   true,
+		},
+	}
+	attempts := 0
+	result, err := runOpenAIComputerInitialObservationV1(
+		context.Background(),
+		maxOpenAIComputerInitialObservationsV1,
+		true,
+		false,
+		func(context.Context, int) error {
+			t.Fatal("an actionable initial observation was delayed for retry")
+			return nil
+		},
+		func(context.Context, int) (agent.ToolResult, error) {
+			attempts++
+			return actionable, nil
+		},
+		nil,
+	)
+	if err != nil || attempts != 1 ||
+		result.GUIObservation == nil ||
+		!result.GUIObservation.CoordinateActionable {
+		t.Fatalf(
+			"actionable initial observation result=%+v attempts=%d err=%v",
+			result,
+			attempts,
+			err,
+		)
+	}
+}
+
+func TestOpenAIComputerInitialIdentityMismatchDoesNotRetry(
+	t *testing.T,
+) {
+	identityFailure := agent.BusinessError(
+		"computer_use_error: process_identity_mismatch",
+	)
+	identityFailure.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseObserving,
+		FailureCode: "process_identity_mismatch",
+	}
+	attempts := 0
+	_, err := runOpenAIComputerInitialObservationV1(
+		context.Background(),
+		maxOpenAIComputerInitialObservationsV1,
+		true,
+		false,
+		func(context.Context, int) error { return nil },
+		func(context.Context, int) (agent.ToolResult, error) {
+			attempts++
+			return identityFailure, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("initial observation: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("process identity observation attempts = %d, want 1", attempts)
+	}
+}
+
+func TestOpenAIComputerObservationRequiresExplicitActionabilityProof(
+	t *testing.T,
+) {
+	imageWithoutProof := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "bm8tYWN0aW9uYWJpbGl0eS1wcm9vZg==",
+		}},
+	}
+	if openAIComputerObservationMeetsActionRequirementV1(
+		imageWithoutProof,
+		true,
+		false,
+	) {
+		t.Fatal("coordinate action observation accepted without local actionability proof")
+	}
+	if !openAIComputerObservationMeetsActionRequirementV1(
+		imageWithoutProof,
+		false,
+		false,
+	) {
+		t.Fatal("visual-only final observation unexpectedly required actionability proof")
+	}
+}
+
+func TestOpenAIComputerObservationRetryPolicySeparatesIdentityDrift(
+	t *testing.T,
+) {
+	if retryableOpenAIComputerObservationFailureCodeV1(
+		"process_identity_mismatch",
+	) {
+		t.Fatal("an exact process identity mismatch cannot heal by repeating capture")
+	}
+	if !retryableOpenAIComputerObservationFailureCodeV1(
+		"window_identity_mismatch",
+	) {
+		t.Fatal("a transient window transition should remain observation-retryable")
 	}
 }
 
@@ -2054,7 +2703,8 @@ func TestOpenAIComputerTaskBackgroundLaneStartsFromSemanticOnlyImage(
 			Data:      "c2VtYW50aWMtaW1hZ2U=",
 		}},
 		GUIObservation: &agent.GUIObservationOutcome{
-			SemanticActionable: true,
+			SemanticActionable:       true,
+			ActionabilityFailureCode: "display_not_actionable",
 		},
 	}
 	probe := &openAIComputerDaemonProbeTool{
@@ -2443,9 +3093,10 @@ func TestOpenAIComputerTaskToolPreservesEarlierCommitWhenLaterProviderCallFails(
 			"click": {
 				Content: "click committed",
 				GUIOutcome: &agent.GUIActionOutcome{
-					Result:      agent.GUIActionResultCompletedUnverified,
-					Phase:       agent.GUIActionPhaseVerifying,
-					FailureCode: "click_postcondition_not_declared",
+					Result:                          agent.GUIActionResultCompletedUnverified,
+					Phase:                           agent.GUIActionPhaseVerifying,
+					FailureCode:                     "click_postcondition_not_declared",
+					SameObservationContinuationSafe: true,
 				},
 			},
 			"final_screenshot": {

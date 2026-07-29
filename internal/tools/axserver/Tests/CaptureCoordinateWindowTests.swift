@@ -32,6 +32,17 @@ final class CaptureCoordinateWindowTests: XCTestCase {
         try assertResult(
             .failed(code: "window_bounds_mismatch", retrySafe: true),
             matches: "capture_coordinate_window.response.failure.v1.json")
+
+        var displayState = CaptureFixtureState()
+        let inactiveTopology = Self.topology(displayTwoIsActive: false)
+        displayState.preTopology = inactiveTopology
+        displayState.postTopology = inactiveTopology
+        let displayFailure = captureCoordinateWindow(
+            request: request,
+            dependencies: displayState.dependencies())
+        try assertResult(
+            displayFailure,
+            matches: "capture_coordinate_window.response.display_not_actionable.v2.json")
     }
 
     func testInjectedCaptureRunsExactPreflightCapturePostflightSequence() throws {
@@ -141,20 +152,52 @@ final class CaptureCoordinateWindowTests: XCTestCase {
 
     func testInjectedCaptureRejectsCrossDisplayMirrorFollowerAndRotation() throws {
         let request = Self.request()
-        for (name, topology) in [
-            ("cross display", Self.topology(windowNotFullyContained: true)),
-            ("mirror follower", Self.topology(displayTwoMirrorMaster: 1)),
-            ("rotated", Self.topology(displayTwoRotation: 90)),
-            ("inactive", Self.topology(displayTwoIsActive: false)),
-            ("offline", Self.topology(displayTwoIsOnline: false)),
-            ("asleep", Self.topology(displayTwoIsAsleep: true)),
-            ("ambiguous overlap", Self.topology(displayOneContainsWindow: true)),
+        for (name, topology, expectedPredicate, expectedActionableCount) in [
+            (
+                "cross display",
+                Self.topology(windowNotFullyContained: true),
+                "does_not_fully_contain_window",
+                0
+            ),
+            (
+                "mirror follower",
+                Self.topology(displayTwoMirrorMaster: 1),
+                "mirror_follower",
+                0
+            ),
+            ("rotated", Self.topology(displayTwoRotation: 90), "rotated", 0),
+            ("inactive", Self.topology(displayTwoIsActive: false), "inactive", 0),
+            ("offline", Self.topology(displayTwoIsOnline: false), "offline", 0),
+            ("asleep", Self.topology(displayTwoIsAsleep: true), "asleep", 0),
+            ("ambiguous overlap", Self.topology(displayOneContainsWindow: true), nil, 2),
         ] {
             var state = CaptureFixtureState()
             state.preTopology = topology
             state.postTopology = topology
             let result = captureCoordinateWindow(request: request, dependencies: state.dependencies())
             XCTAssertEqual(result.failureCode, "display_not_actionable", name)
+            let diagnostics = try XCTUnwrap(result.displayDiagnostics, name)
+            XCTAssertEqual(diagnostics.pid, request.pid, name)
+            XCTAssertEqual(diagnostics.bundleID, request.bundleID, name)
+            XCTAssertEqual(diagnostics.windowID, request.windowID, name)
+            XCTAssertEqual(diagnostics.windowQuartzBounds, Self.window().bounds, name)
+            XCTAssertEqual(
+                diagnostics.actionableDisplayCount,
+                expectedActionableCount,
+                name)
+            XCTAssertEqual(diagnostics.displays.count, topology.displays.count, name)
+            if let expectedPredicate {
+                let targetDisplay = try XCTUnwrap(
+                    diagnostics.displays.first { $0.displayID == 2 },
+                    name)
+                XCTAssertTrue(
+                    targetDisplay.failedPredicates.contains(expectedPredicate),
+                    name)
+            } else {
+                XCTAssertTrue(
+                    diagnostics.displays.allSatisfy { $0.failedPredicates.isEmpty },
+                    name)
+            }
         }
     }
 

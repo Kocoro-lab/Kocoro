@@ -70,6 +70,77 @@ func TestComputerUseSemanticScrollRequiresExactAuthorityAndNeverCallsLegacyScrol
 	}
 }
 
+func TestComputerUseNativeBatchKeepsSemanticScrollObservationUntilBatchEnd(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	tool, fake, stateID := semanticScrollTestTool(t)
+	fake.queue("read_tree", semanticScrollTreeFixture("List"))
+	tool.semanticScrollExecutor = func(
+		_ context.Context, request SemanticScrollRequestV1,
+	) (SemanticScrollResultV1, error) {
+		initial, final := 0.25, 0.5
+		postcondition := "scroll_value_changed_in_direction"
+		return SemanticScrollResultV1{
+			SchemaVersion:  1,
+			Status:         "verified",
+			CommitState:    "committed",
+			Phase:          "post_verification",
+			Postcondition:  &postcondition,
+			InitialValue:   &initial,
+			FinalValue:     &final,
+			StepsCompleted: request.Steps,
+			ExpectedSteps:  request.Steps,
+		}, nil
+	}
+	ctx := ContextWithOpenAINativeComputerActionV1(context.Background())
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := tool.Run(ctx, fmt.Sprintf(
+			`{"action":"scroll","state_id":%q,"ref":"e3","dx":0,"dy":1,"description":"Scroll exact target"}`,
+			stateID,
+		))
+		if err != nil || result.IsError {
+			t.Fatalf("native semantic scroll %d result=%+v err=%v",
+				attempt+1, result, err)
+		}
+	}
+	if tool.snapshot == nil || tool.refs == nil {
+		t.Fatal("native provider batch lost its source observation between actions")
+	}
+}
+
+func TestComputerUseSemanticScrollSeparatesLaneTransitionFromUserInput(
+	t *testing.T,
+) {
+	targetForeground := "target_foreground_interference"
+	laneOutcome := computerUseSemanticScrollGUIOutcomeV1(
+		SemanticScrollResultV1{
+			SchemaVersion: 1,
+			Status:        "user_interference",
+			CommitState:   "not_committed",
+			Phase:         "user_interference",
+			FailureCode:   &targetForeground,
+		},
+	)
+	if laneOutcome.Result != agent.GUIActionResultFailed {
+		t.Fatalf("lane transition outcome = %+v", laneOutcome)
+	}
+
+	physicalInput := "physical_input_interference"
+	userOutcome := computerUseSemanticScrollGUIOutcomeV1(
+		SemanticScrollResultV1{
+			SchemaVersion: 1,
+			Status:        "user_interference",
+			CommitState:   "not_committed",
+			Phase:         "user_interference",
+			FailureCode:   &physicalInput,
+		},
+	)
+	if userOutcome.Result != agent.GUIActionResultUserInterference {
+		t.Fatalf("physical input outcome = %+v", userOutcome)
+	}
+}
+
 func TestComputerUseSemanticScrollMapsProviderSignsToExactAXDirection(t *testing.T) {
 	for _, test := range []struct {
 		dx, dy          int

@@ -431,6 +431,47 @@ func TestOpenAIComputerTaskPreparationInstallsExactBackgroundKeyboardAuthority(
 	}
 }
 
+func TestOpenAIComputerTaskPreparationLaunchesBackgroundTargetWithoutPID(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"bind_background_task_app",
+		`{"app":"Calculator","bundle_id":"com.apple.calculator","pid":77,`+
+			`"launch_date":"2026-07-28T06:00:00Z",`+
+			`"preserved_frontmost_pid":84,`+
+			`"preserved_frontmost_bundle_id":"com.apple.TextEdit",`+
+			`"preserved_frontmost_launch_date":"2026-07-28T05:00:00Z"}`,
+	)
+	raw := &ComputerUseTool{client: fake}
+	runtime := &OpenAIComputerActionRuntimeV1{raw: raw}
+	apps := []OpenAIComputerTaskAppV1{{
+		App: "Calculator", BundleID: "com.apple.calculator",
+	}}
+
+	lane, err := runtime.PrepareTaskAppsV1(
+		context.Background(),
+		apps,
+		OpenAIComputerTaskPreparationOptionsV1{RequireBackground: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lane != OpenAIComputerExecutionBackgroundSemanticV1 ||
+		len(fake.calls) != 1 ||
+		fake.calls[0].method != "bind_background_task_app" {
+		t.Fatalf("background launch lane/calls = %q / %+v", lane, fake.calls)
+	}
+	if _, suppliedPID := fake.calls[0].params["pid"]; suppliedPID {
+		t.Fatalf("unresolved background launch supplied a pid: %+v", fake.calls[0])
+	}
+	if runtime.backgroundTarget == nil ||
+		runtime.backgroundTarget.PID != 77 ||
+		runtime.backgroundTarget.LaunchDate != "2026-07-28T06:00:00Z" {
+		t.Fatalf("launched background target = %+v", runtime.backgroundTarget)
+	}
+}
+
 func TestOpenAIComputerTaskPreparationRejectsPartialBackgroundProcessAuthority(
 	t *testing.T,
 ) {
@@ -452,7 +493,7 @@ func TestOpenAIComputerTaskPreparationRejectsPartialBackgroundProcessAuthority(
 		OpenAIComputerTaskPreparationOptionsV1{RequireBackground: true},
 	)
 	if err == nil || !strings.Contains(
-		err.Error(), "invalid preserved frontmost identity") {
+		err.Error(), "invalid initial foreground witness") {
 		t.Fatalf("partial background authority error = %v", err)
 	}
 }
@@ -930,7 +971,7 @@ func TestOpenAIComputerActionRuntimeUsesVerifiedCoordinateFocusWithoutAXRefForTy
 	}
 }
 
-func TestOpenAIComputerActionRuntimeBindsPostKeypressObservationForOneType(
+func TestOpenAIComputerActionRuntimeBindsRefreshedPostKeypressWindowForType(
 	t *testing.T,
 ) {
 	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
@@ -939,15 +980,44 @@ func TestOpenAIComputerActionRuntimeBindsPostKeypressObservationForOneType(
 	harness.tree.FocusedRef = nil
 	harness.observe(t)
 
-	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(
-		OpenAIComputerActionV1{
-			Type: OpenAIComputerActionKeypressV1,
-			Keys: []string{"command", "l"},
-		},
+	keypress := OpenAIComputerActionV1{
+		Type: OpenAIComputerActionKeypressV1,
+		Keys: []string{"command", "l"},
+	}
+	if _, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		keypress,
 	); err != nil {
+		t.Fatalf("PlanOpenAIComputerActionV1(keypress): %v", err)
+	}
+
+	refreshed := harness.tree
+	refreshedWindowID := *harness.tree.WindowID + 1
+	refreshed.WindowID = &refreshedWindowID
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, refreshed))
+	refreshPlan, err := runtime.PlanOpenAIComputerObservationV1(
+		"Refresh the target after the committed focus shortcut",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("PlanOpenAIComputerObservationV1: %v", err)
+	}
+	refreshResult, err := harness.tool.Run(
+		ContextWithOpenAINativeComputerActionV1(context.Background()),
+		refreshPlan.Args,
+	)
+	if err != nil || refreshResult.IsError ||
+		harness.tool.snapshot == nil ||
+		harness.tool.snapshot.windowID == nil ||
+		*harness.tool.snapshot.windowID != refreshedWindowID {
+		t.Fatalf("post-keypress refresh result=%+v snapshot=%+v err=%v",
+			refreshResult, harness.tool.snapshot, err)
+	}
+
+	if err := runtime.AuthorizeOpenAIComputerTypeAfterKeypressV1(keypress); err != nil {
 		t.Fatalf("AuthorizeOpenAIComputerTypeAfterKeypressV1: %v", err)
 	}
-	plan, err := runtime.PlanOpenAIComputerActionV1(
+	typePlan, err := runtime.PlanOpenAIComputerActionV1(
 		context.Background(),
 		OpenAIComputerActionV1{
 			Type: OpenAIComputerActionTypeTextV1,
@@ -955,10 +1025,10 @@ func TestOpenAIComputerActionRuntimeBindsPostKeypressObservationForOneType(
 		},
 	)
 	if err != nil {
-		t.Fatalf("PlanOpenAIComputerActionV1: %v", err)
+		t.Fatalf("PlanOpenAIComputerActionV1(type): %v", err)
 	}
 	var args computerUseArgs
-	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+	if err := json.Unmarshal([]byte(typePlan.Args), &args); err != nil {
 		t.Fatal(err)
 	}
 	if args.Action != "type" || args.Ref != "" ||
@@ -966,26 +1036,36 @@ func TestOpenAIComputerActionRuntimeBindsPostKeypressObservationForOneType(
 		t.Fatalf("post-keypress type plan = %+v", args)
 	}
 
-	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	var typedWindowID uint32
 	harness.tool.targetBoundInputExecutor = func(
 		_ context.Context,
 		request TargetBoundInputRequestV1,
 	) (TargetBoundInputResultV1, error) {
+		typedWindowID = request.WindowID
 		failure := "postcondition_not_declared"
 		return TargetBoundInputResultV1{
-			SchemaVersion: 1, Status: "completed_unverified", Action: request.Action,
-			InputCommitted: true, ClipboardTouched: true, ClipboardRestored: true,
-			Phase: "post_verification", FailureCode: &failure,
+			SchemaVersion:     1,
+			Status:            "completed_unverified",
+			Action:            request.Action,
+			InputCommitted:    true,
+			ClipboardTouched:  true,
+			ClipboardRestored: true,
+			Phase:             "post_verification",
+			FailureCode:       &failure,
 		}, nil
 	}
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, refreshed))
 	typed, err := harness.tool.Run(
 		ContextWithOpenAINativeComputerActionV1(context.Background()),
-		plan.Args,
+		typePlan.Args,
 	)
 	if err != nil || typed.IsError {
 		t.Fatalf("post-keypress type result=%+v err=%v", typed, err)
 	}
-
+	if typedWindowID != uint32(refreshedWindowID) {
+		t.Fatalf("typed window id = %d, want refreshed %d",
+			typedWindowID, refreshedWindowID)
+	}
 	if harness.tool.coordinateFocus != nil {
 		t.Fatal("post-keypress one-shot coordinate target was reusable")
 	}
@@ -1216,7 +1296,7 @@ func TestOpenAIComputerActionRuntimePreservesEveryOfficialClickButton(t *testing
 	}
 }
 
-func TestOpenAIComputerActionRuntimeSeparatesInternalRefreshFromFinalScreenshot(t *testing.T) {
+func TestOpenAIComputerActionRuntimeSeparatesStateRefreshFromExactScreenshot(t *testing.T) {
 	harness, runtime := guardedOpenAIComputerRuntimeHarness(t)
 	refresh, err := runtime.PlanOpenAIComputerObservationV1(
 		"Refresh state",

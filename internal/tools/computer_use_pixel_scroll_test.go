@@ -80,7 +80,8 @@ func TestComputerUsePixelScrollMapsExactFramePointAndPreservesProviderDeltas(t *
 	if result.GUIOutcome == nil ||
 		result.GUIOutcome.Result != agent.GUIActionResultCompletedUnverified ||
 		result.GUIOutcome.Phase != agent.GUIActionPhaseVerifying ||
-		result.GUIOutcome.Pointer == nil {
+		result.GUIOutcome.Pointer == nil ||
+		!result.GUIOutcome.SameObservationContinuationSafe {
 		t.Fatalf("typed outcome=%+v", result.GUIOutcome)
 	}
 	if harness.tool.snapshot == nil || harness.tool.coordinateArtifact == nil {

@@ -11,6 +11,7 @@ final class SemanticScrollV1WireFixtureTests: XCTestCase {
         for name in [
             "semantic_scroll.response.verified.v1.json",
             "semantic_scroll.response.fallback_required.v1.json",
+            "semantic_scroll.response.target_became_frontmost.v1.json",
             "semantic_scroll.response.commit_unknown.v1.json",
         ] {
             let expected = try decodeSemanticScrollResultV1(fixture(name))

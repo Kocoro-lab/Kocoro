@@ -33,7 +33,9 @@ func TestSemanticPressV2CanonicalFixturesAndStrictWire(t *testing.T) {
 		"semantic_press.response.completed_unverified.v2.json",
 		"semantic_press.response.user_interference_precommit.v2.json",
 		"semantic_press.response.user_interference_postcommit.v2.json",
+		"semantic_press.response.target_foreground_interference.v2.json",
 		"semantic_press.response.failed.v2.json",
+		"semantic_press.response.target_became_frontmost.v2.json",
 		"semantic_press.response.monitor_lost_postcommit.v2.json",
 		"semantic_press.response.commit_unknown.v2.json",
 	} {

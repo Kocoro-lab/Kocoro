@@ -58,6 +58,29 @@ type openAIComputerCaptureDiagnosticEventV1 struct {
 	PostWindowSize     [2]float64 `json:"post_window_size"`
 }
 
+type openAIComputerDisplayDiagnosticEventV1 struct {
+	SchemaVersion          int        `json:"schema_version"`
+	Phase                  string     `json:"phase"`
+	Attempt                int        `json:"attempt,omitempty"`
+	BatchIndex             int        `json:"batch_index,omitempty"`
+	ActionIndex            int        `json:"action_index,omitempty"`
+	AppBundleID            string     `json:"app_bundle_id,omitempty"`
+	CaptureStage           string     `json:"capture_stage"`
+	TargetPID              int        `json:"target_pid"`
+	TargetWindowID         uint32     `json:"target_window_id"`
+	TargetWindowBounds     [4]float64 `json:"target_window_bounds"`
+	ActionableDisplayCount int        `json:"actionable_display_count"`
+}
+
+type openAIComputerDisplayCandidateDiagnosticEventV1 struct {
+	SchemaVersion    int        `json:"schema_version"`
+	TargetPID        int        `json:"target_pid"`
+	TargetWindowID   uint32     `json:"target_window_id"`
+	DisplayID        uint32     `json:"display_id"`
+	DisplayBounds    [4]float64 `json:"display_bounds"`
+	FailedPredicates []string   `json:"failed_predicates"`
+}
+
 type openAIComputerTraceV1 struct {
 	auditor   *audit.AuditLogger
 	sessionID string
@@ -94,6 +117,10 @@ func (t *openAIComputerTraceV1) record(event openAIComputerTraceEventV1) {
 		InputSummary: string(payload),
 	})
 	if diagnostics == nil {
+		return
+	}
+	if diagnostics.Stage == "display_actionability" {
+		t.recordDisplayDiagnostics(event, diagnostics)
 		return
 	}
 	diagnosticEvent := openAIComputerCaptureDiagnosticEventV1{
@@ -144,6 +171,74 @@ func (t *openAIComputerTraceV1) record(event openAIComputerTraceEventV1) {
 	})
 }
 
+func (t *openAIComputerTraceV1) recordDisplayDiagnostics(
+	event openAIComputerTraceEventV1,
+	diagnostics *agent.GUICaptureDiagnostics,
+) {
+	header := openAIComputerDisplayDiagnosticEventV1{
+		SchemaVersion:  1,
+		Phase:          event.Phase,
+		Attempt:        event.Attempt,
+		BatchIndex:     event.BatchIndex,
+		ActionIndex:    event.ActionIndex,
+		AppBundleID:    event.AppBundleID,
+		CaptureStage:   diagnostics.Stage,
+		TargetPID:      diagnostics.PID,
+		TargetWindowID: diagnostics.WindowID,
+		TargetWindowBounds: [4]float64{
+			diagnostics.PreWindowBounds.X,
+			diagnostics.PreWindowBounds.Y,
+			diagnostics.PreWindowBounds.Width,
+			diagnostics.PreWindowBounds.Height,
+		},
+		ActionableDisplayCount: diagnostics.ActionableDisplayCount,
+	}
+	if header.AppBundleID == "" {
+		header.AppBundleID = diagnostics.BundleID
+	}
+	t.recordDiagnosticPayload(
+		"computer_use_display_diagnostic_v1",
+		header,
+	)
+	for _, display := range diagnostics.DisplayCandidates {
+		t.recordDiagnosticPayload(
+			"computer_use_display_candidate_diagnostic_v1",
+			openAIComputerDisplayCandidateDiagnosticEventV1{
+				SchemaVersion:  1,
+				TargetPID:      diagnostics.PID,
+				TargetWindowID: diagnostics.WindowID,
+				DisplayID:      display.DisplayID,
+				DisplayBounds: [4]float64{
+					display.QuartzBounds.X,
+					display.QuartzBounds.Y,
+					display.QuartzBounds.Width,
+					display.QuartzBounds.Height,
+				},
+				FailedPredicates: append(
+					[]string(nil),
+					display.FailedPredicates...,
+				),
+			},
+		)
+	}
+}
+
+func (t *openAIComputerTraceV1) recordDiagnosticPayload(
+	eventName string,
+	payload any,
+) {
+	diagnosticPayload, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	t.auditor.Log(audit.AuditEntry{
+		Timestamp:    time.Now(),
+		SessionID:    t.sessionID,
+		Event:        eventName,
+		InputSummary: string(diagnosticPayload),
+	})
+}
+
 func openAIComputerTraceStatusV1(result agent.ToolResult, err error) string {
 	if err != nil || result.IsError {
 		return "failed"
@@ -158,6 +253,14 @@ func openAIComputerTraceFailureCodeV1(
 	if result.GUIOutcome != nil &&
 		strings.TrimSpace(result.GUIOutcome.FailureCode) != "" {
 		return strings.TrimSpace(result.GUIOutcome.FailureCode)
+	}
+	if result.GUIObservation != nil &&
+		strings.TrimSpace(
+			result.GUIObservation.ActionabilityFailureCode,
+		) != "" {
+		return strings.TrimSpace(
+			result.GUIObservation.ActionabilityFailureCode,
+		)
 	}
 	for _, line := range strings.Split(result.Content, "\n") {
 		line = strings.TrimSpace(line)

@@ -76,6 +76,7 @@ func TestCaptureCoordinateWindowV1CanonicalRequestAndResults(t *testing.T) {
 	for _, name := range []string{
 		"capture_coordinate_window.response.success.v1.json",
 		"capture_coordinate_window.response.failure.v1.json",
+		"capture_coordinate_window.response.display_not_actionable.v2.json",
 	} {
 		payload := loadCoordinateFixture(t, name)
 		result, err := AdmitCaptureCoordinateWindowV1(
@@ -91,6 +92,34 @@ func TestCaptureCoordinateWindowV1CanonicalRequestAndResults(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertCoordinateJSONRoundTrip(t, payload, produced)
+	}
+}
+
+func TestComputerUseCaptureFailureProjectsDisplayDiagnosticsLocally(
+	t *testing.T,
+) {
+	result, ok := computerUseCaptureFailureV1(
+		loadCoordinateFixture(
+			t,
+			"capture_coordinate_window.response.display_not_actionable.v2.json",
+		),
+		computerUseTree{AppName: "Fixture"},
+	)
+	if !ok || !result.IsError || !result.IsRetryable {
+		t.Fatalf("display failure result = %+v ok=%v", result, ok)
+	}
+	diagnostics := result.GUICaptureDiagnostics
+	if diagnostics == nil ||
+		diagnostics.Stage != "display_actionability" ||
+		diagnostics.PID != 4242 ||
+		diagnostics.WindowID != 7001 ||
+		diagnostics.ActionableDisplayCount != 0 ||
+		len(diagnostics.DisplayCandidates) != 2 {
+		t.Fatalf("display diagnostics = %+v", diagnostics)
+	}
+	if got := diagnostics.DisplayCandidates[1].FailedPredicates; len(got) != 1 ||
+		got[0] != "inactive" {
+		t.Fatalf("display predicate diagnostics = %v", got)
 	}
 }
 
@@ -151,6 +180,59 @@ func TestCaptureCoordinateWindowV1StrictWireRejectsMalformedUnion(t *testing.T) 
 	if _, err := DecodeCaptureCoordinateWindowResultV1(marshalCaptureWindowJSON(t, failure)); err == nil {
 		t.Fatal("failure union accepted success payload")
 	}
+	displayFailure := captureWindowJSONMap(
+		t,
+		loadCoordinateFixture(
+			t,
+			"capture_coordinate_window.response.display_not_actionable.v2.json",
+		),
+	)
+	displayFailure["display_diagnostics"] = nil
+	if _, err := DecodeCaptureCoordinateWindowResultV1(
+		marshalCaptureWindowJSON(t, displayFailure),
+	); err == nil {
+		t.Fatal("display_not_actionable accepted missing display diagnostics")
+	}
+	invalidDisplayRotation := captureWindowJSONMap(
+		t,
+		loadCoordinateFixture(
+			t,
+			"capture_coordinate_window.response.display_not_actionable.v2.json",
+		),
+	)
+	displayDiagnostics := invalidDisplayRotation["display_diagnostics"].(map[string]any)
+	displayCandidates := displayDiagnostics["displays"].([]any)
+	displayCandidates[0].(map[string]any)["rotation_degrees"] = float64(360)
+	if _, err := DecodeCaptureCoordinateWindowResultV1(
+		marshalCaptureWindowJSON(t, invalidDisplayRotation),
+	); err == nil {
+		t.Fatal("display diagnostics accepted rotation outside [0, 360)")
+	}
+	legacyDisplayFailure := captureWindowJSONMap(
+		t,
+		loadCoordinateFixture(t, "capture_coordinate_window.response.failure.v1.json"),
+	)
+	legacyDisplayFailure["failure_code"] = "display_not_actionable"
+	if result, err := DecodeCaptureCoordinateWindowResultV1(
+		marshalCaptureWindowJSON(t, legacyDisplayFailure),
+	); err != nil || result.DisplayDiagnostics != nil || !result.RetrySafe {
+		t.Fatalf(
+			"legacy v1 display failure lost compatibility: result=%+v err=%v",
+			result,
+			err,
+		)
+	}
+	otherFailureWithDisplayDiagnostics := captureWindowJSONMap(
+		t,
+		loadCoordinateFixture(t, "capture_coordinate_window.response.failure.v1.json"),
+	)
+	otherFailureWithDisplayDiagnostics["display_diagnostics"] =
+		canonicalCaptureWindowDisplayDiagnosticsJSON()
+	if _, err := DecodeCaptureCoordinateWindowResultV1(
+		marshalCaptureWindowJSON(t, otherFailureWithDisplayDiagnostics),
+	); err == nil {
+		t.Fatal("non-display failure accepted display diagnostics")
+	}
 	for _, test := range []struct {
 		name   string
 		mutate func(map[string]any)
@@ -206,6 +288,11 @@ func TestCaptureCoordinateWindowV1FailurePolicyMatrix(t *testing.T) {
 			if code == "image_dimensions_mismatch" {
 				candidate["failure_diagnostics"] = canonicalCaptureWindowFailureDiagnosticsJSON()
 			}
+			if code == "display_not_actionable" {
+				candidate["schema_version"] = float64(2)
+				candidate["display_diagnostics"] =
+					canonicalCaptureWindowDisplayDiagnosticsJSON()
+			}
 			if _, err := DecodeCaptureCoordinateWindowResultV1(marshalCaptureWindowJSON(t, candidate)); err != nil {
 				t.Fatalf("known policy rejected: %v", err)
 			}
@@ -214,6 +301,40 @@ func TestCaptureCoordinateWindowV1FailurePolicyMatrix(t *testing.T) {
 				t.Fatal("inverse retry_safe policy passed")
 			}
 		})
+	}
+}
+
+func canonicalCaptureWindowDisplayDiagnosticsJSON() map[string]any {
+	return map[string]any{
+		"pid":                      float64(4242),
+		"bundle_id":                "com.example.fixture",
+		"window_id":                float64(7001),
+		"window_quartz_bounds":     map[string]any{"x": -100.0, "y": 200.0, "width": 1.0, "height": 1.0},
+		"actionable_display_count": float64(0),
+		"displays": []any{
+			map[string]any{
+				"display_id":            float64(1),
+				"quartz_bounds":         map[string]any{"x": 0.0, "y": 0.0, "width": 1280.0, "height": 800.0},
+				"is_active":             true,
+				"is_online":             true,
+				"is_asleep":             false,
+				"is_mirror_follower":    false,
+				"rotation_degrees":      float64(0),
+				"fully_contains_window": false,
+				"failed_predicates":     []any{"does_not_fully_contain_window"},
+			},
+			map[string]any{
+				"display_id":            float64(2),
+				"quartz_bounds":         map[string]any{"x": -1600.0, "y": 100.0, "width": 1600.0, "height": 900.0},
+				"is_active":             false,
+				"is_online":             true,
+				"is_asleep":             false,
+				"is_mirror_follower":    false,
+				"rotation_degrees":      float64(0),
+				"fully_contains_window": true,
+				"failed_predicates":     []any{"inactive"},
+			},
+		},
 	}
 }
 

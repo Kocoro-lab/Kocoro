@@ -74,12 +74,17 @@ func (request CaptureCoordinateWindowRequestV1) Validate() error {
 	return nil
 }
 
+// CaptureCoordinateWindowResultV1 is the result family for the V1 RPC method.
+// Schema 1 is the original exact wire. Schema 2 is used only for the additive
+// display_not_actionable diagnostic payload, so a new daemon still admits an
+// older helper's schema-1 failure without weakening either exact shape.
 type CaptureCoordinateWindowResultV1 struct {
 	SchemaVersion      int                                          `json:"schema_version"`
 	Status             string                                       `json:"status"`
 	FailureCode        *string                                      `json:"failure_code"`
 	RetrySafe          bool                                         `json:"retry_safe"`
 	FailureDiagnostics *CaptureCoordinateWindowFailureDiagnosticsV1 `json:"failure_diagnostics"`
+	DisplayDiagnostics *CaptureCoordinateWindowDisplayDiagnosticsV2 `json:"display_diagnostics,omitempty"`
 	TopologyRef        *CoordinateTopologyRefV1                     `json:"topology_ref"`
 	HelperBootID       *string                                      `json:"helper_boot_id"`
 	PID                *int                                         `json:"pid"`
@@ -114,6 +119,27 @@ type CaptureCoordinateWindowFailureDiagnosticsV1 struct {
 	DecodedHeightPX        *int                   `json:"decoded_height_px"`
 }
 
+type CaptureCoordinateWindowDisplayDiagnosticsV2 struct {
+	PID                    int                                                    `json:"pid"`
+	BundleID               string                                                 `json:"bundle_id"`
+	WindowID               uint32                                                 `json:"window_id"`
+	WindowQuartzBounds     CoordinateQuartzRectV1                                 `json:"window_quartz_bounds"`
+	ActionableDisplayCount int                                                    `json:"actionable_display_count"`
+	Displays               []CaptureCoordinateWindowDisplayCandidateDiagnosticsV2 `json:"displays"`
+}
+
+type CaptureCoordinateWindowDisplayCandidateDiagnosticsV2 struct {
+	DisplayID           uint32                 `json:"display_id"`
+	QuartzBounds        CoordinateQuartzRectV1 `json:"quartz_bounds"`
+	IsActive            bool                   `json:"is_active"`
+	IsOnline            bool                   `json:"is_online"`
+	IsAsleep            bool                   `json:"is_asleep"`
+	IsMirrorFollower    bool                   `json:"is_mirror_follower"`
+	RotationDegrees     float64                `json:"rotation_degrees"`
+	FullyContainsWindow bool                   `json:"fully_contains_window"`
+	FailedPredicates    []string               `json:"failed_predicates"`
+}
+
 var captureCoordinateWindowFailureDiagnosticsWireShapeV1 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
 	"stage":                     coordinateScalarWireShape(false),
 	"pid":                       coordinateScalarWireShape(false),
@@ -131,36 +157,98 @@ var captureCoordinateWindowFailureDiagnosticsWireShapeV1 = coordinateObjectWireS
 	"decoded_height_px":         coordinateScalarWireShape(true),
 })
 
-var captureCoordinateWindowResultWireShapeV1 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
-	"schema_version":       coordinateScalarWireShape(false),
-	"status":               coordinateScalarWireShape(false),
-	"failure_code":         coordinateScalarWireShape(true),
-	"retry_safe":           coordinateScalarWireShape(false),
-	"failure_diagnostics":  coordinateNullableWireShape(captureCoordinateWindowFailureDiagnosticsWireShapeV1),
-	"topology_ref":         coordinateNullableWireShape(coordinateTopologyRefWireShapeV1),
-	"helper_boot_id":       coordinateScalarWireShape(true),
-	"pid":                  coordinateScalarWireShape(true),
-	"bundle_id":            coordinateScalarWireShape(true),
-	"window_id":            coordinateScalarWireShape(true),
-	"window_quartz_bounds": coordinateNullableWireShape(coordinateQuartzRectWireShapeV1),
-	"display_id":           coordinateScalarWireShape(true),
-	"backing_scale_factor": coordinateScalarWireShape(true),
-	"media_type":           coordinateScalarWireShape(true),
-	"width_px":             coordinateScalarWireShape(true),
-	"height_px":            coordinateScalarWireShape(true),
-	"byte_length":          coordinateScalarWireShape(true),
-	"sha256":               coordinateScalarWireShape(true),
-	"image_base64":         coordinateScalarWireShape(true),
-	"captured_at":          coordinateScalarWireShape(true),
+var captureCoordinateWindowDisplayCandidateDiagnosticsWireShapeV2 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
+	"display_id":            coordinateScalarWireShape(false),
+	"quartz_bounds":         coordinateQuartzRectWireShapeV1,
+	"is_active":             coordinateScalarWireShape(false),
+	"is_online":             coordinateScalarWireShape(false),
+	"is_asleep":             coordinateScalarWireShape(false),
+	"is_mirror_follower":    coordinateScalarWireShape(false),
+	"rotation_degrees":      coordinateScalarWireShape(false),
+	"fully_contains_window": coordinateScalarWireShape(false),
+	"failed_predicates":     coordinateArrayWireShape(coordinateScalarWireShape(false)),
 })
 
+var captureCoordinateWindowDisplayDiagnosticsWireShapeV2 = coordinateObjectWireShape(false, map[string]coordinateWireShape{
+	"pid":                      coordinateScalarWireShape(false),
+	"bundle_id":                coordinateScalarWireShape(false),
+	"window_id":                coordinateScalarWireShape(false),
+	"window_quartz_bounds":     coordinateQuartzRectWireShapeV1,
+	"actionable_display_count": coordinateScalarWireShape(false),
+	"displays":                 coordinateArrayWireShape(captureCoordinateWindowDisplayCandidateDiagnosticsWireShapeV2),
+})
+
+func captureCoordinateWindowResultWireFieldsV1() map[string]coordinateWireShape {
+	return map[string]coordinateWireShape{
+		"schema_version":       coordinateScalarWireShape(false),
+		"status":               coordinateScalarWireShape(false),
+		"failure_code":         coordinateScalarWireShape(true),
+		"retry_safe":           coordinateScalarWireShape(false),
+		"failure_diagnostics":  coordinateNullableWireShape(captureCoordinateWindowFailureDiagnosticsWireShapeV1),
+		"topology_ref":         coordinateNullableWireShape(coordinateTopologyRefWireShapeV1),
+		"helper_boot_id":       coordinateScalarWireShape(true),
+		"pid":                  coordinateScalarWireShape(true),
+		"bundle_id":            coordinateScalarWireShape(true),
+		"window_id":            coordinateScalarWireShape(true),
+		"window_quartz_bounds": coordinateNullableWireShape(coordinateQuartzRectWireShapeV1),
+		"display_id":           coordinateScalarWireShape(true),
+		"backing_scale_factor": coordinateScalarWireShape(true),
+		"media_type":           coordinateScalarWireShape(true),
+		"width_px":             coordinateScalarWireShape(true),
+		"height_px":            coordinateScalarWireShape(true),
+		"byte_length":          coordinateScalarWireShape(true),
+		"sha256":               coordinateScalarWireShape(true),
+		"image_base64":         coordinateScalarWireShape(true),
+		"captured_at":          coordinateScalarWireShape(true),
+	}
+}
+
+var captureCoordinateWindowResultWireShapeV1 = coordinateObjectWireShape(
+	false,
+	captureCoordinateWindowResultWireFieldsV1(),
+)
+
+var captureCoordinateWindowResultWireShapeV2 = func() coordinateWireShape {
+	fields := captureCoordinateWindowResultWireFieldsV1()
+	fields["display_diagnostics"] = coordinateNullableWireShape(
+		captureCoordinateWindowDisplayDiagnosticsWireShapeV2,
+	)
+	return coordinateObjectWireShape(false, fields)
+}()
+
 func DecodeCaptureCoordinateWindowResultV1(payload []byte) (CaptureCoordinateWindowResultV1, error) {
-	if err := validateCoordinateWireShape("capture_coordinate_window result v1", payload, captureCoordinateWindowResultWireShapeV1); err != nil {
+	if err := rejectDuplicateCoordinateJSONMembers(payload); err != nil {
+		return CaptureCoordinateWindowResultV1{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return CaptureCoordinateWindowResultV1{}, fmt.Errorf(
+			"decode capture_coordinate_window result schema: %w",
+			err,
+		)
+	}
+	var schemaVersion int
+	if err := json.Unmarshal(fields["schema_version"], &schemaVersion); err != nil {
+		return CaptureCoordinateWindowResultV1{}, fmt.Errorf(
+			"decode capture_coordinate_window result schema_version: %w",
+			err,
+		)
+	}
+	wireShape := captureCoordinateWindowResultWireShapeV1
+	label := "capture_coordinate_window result v1"
+	if schemaVersion == 2 {
+		wireShape = captureCoordinateWindowResultWireShapeV2
+		label = "capture_coordinate_window result v2"
+	}
+	if err := validateCoordinateWireShape(label, payload, wireShape); err != nil {
 		return CaptureCoordinateWindowResultV1{}, err
 	}
 	var result CaptureCoordinateWindowResultV1
 	if err := decodeStrictCoordinateJSON(payload, &result); err != nil {
-		return CaptureCoordinateWindowResultV1{}, fmt.Errorf("decode capture_coordinate_window result v1: %w", err)
+		return CaptureCoordinateWindowResultV1{}, fmt.Errorf(
+			"decode capture_coordinate_window result: %w",
+			err,
+		)
 	}
 	if err := result.ValidateTaggedUnion(); err != nil {
 		return CaptureCoordinateWindowResultV1{}, err
@@ -176,7 +264,7 @@ func EncodeCaptureCoordinateWindowResultV1(result CaptureCoordinateWindowResultV
 }
 
 func (result CaptureCoordinateWindowResultV1) ValidateTaggedUnion() error {
-	if result.SchemaVersion != 1 {
+	if result.SchemaVersion != 1 && result.SchemaVersion != 2 {
 		return fmt.Errorf("unsupported capture_coordinate_window result schema_version %d", result.SchemaVersion)
 	}
 	successFields := []bool{
@@ -188,7 +276,11 @@ func (result CaptureCoordinateWindowResultV1) ValidateTaggedUnion() error {
 	}
 	switch result.Status {
 	case "captured":
-		if result.FailureCode != nil || result.RetrySafe || result.FailureDiagnostics != nil {
+		if result.SchemaVersion != 1 {
+			return fmt.Errorf("captured result must use schema_version 1")
+		}
+		if result.FailureCode != nil || result.RetrySafe ||
+			result.FailureDiagnostics != nil || result.DisplayDiagnostics != nil {
 			return fmt.Errorf("captured result cannot carry failure metadata")
 		}
 		for _, present := range successFields {
@@ -233,8 +325,134 @@ func (result CaptureCoordinateWindowResultV1) ValidateTaggedUnion() error {
 		} else if result.FailureDiagnostics != nil {
 			return fmt.Errorf("failure_diagnostics are only valid for image_dimensions_mismatch")
 		}
+		if *result.FailureCode == "display_not_actionable" {
+			if result.SchemaVersion == 1 {
+				if result.DisplayDiagnostics != nil {
+					return fmt.Errorf(
+						"schema_version 1 cannot carry display_diagnostics",
+					)
+				}
+				break
+			}
+			if result.DisplayDiagnostics == nil {
+				return fmt.Errorf(
+					"schema_version 2 display_not_actionable requires display_diagnostics",
+				)
+			}
+			if err := result.DisplayDiagnostics.Validate(); err != nil {
+				return err
+			}
+			if result.DisplayDiagnostics.ActionableDisplayCount == 1 {
+				return fmt.Errorf("display_not_actionable cannot report exactly one actionable display")
+			}
+		} else if result.SchemaVersion != 1 {
+			return fmt.Errorf(
+				"schema_version 2 is reserved for display_not_actionable diagnostics",
+			)
+		} else if result.DisplayDiagnostics != nil {
+			return fmt.Errorf("display_diagnostics are only valid for display_not_actionable")
+		}
 	default:
 		return fmt.Errorf("invalid capture_coordinate_window status %q", result.Status)
+	}
+	return nil
+}
+
+func (diagnostics CaptureCoordinateWindowDisplayDiagnosticsV2) Validate() error {
+	if diagnostics.PID <= 0 || diagnostics.BundleID == "" ||
+		diagnostics.WindowID == 0 || diagnostics.ActionableDisplayCount < 0 ||
+		len(diagnostics.Displays) == 0 {
+		return fmt.Errorf("display diagnostics contain invalid identity or counts")
+	}
+	if err := validateCoordinateQuartzRect(
+		"display_diagnostics.window_quartz_bounds",
+		diagnostics.WindowQuartzBounds,
+	); err != nil {
+		return err
+	}
+	seenDisplayIDs := make(map[uint32]struct{}, len(diagnostics.Displays))
+	actionableDisplayCount := 0
+	for index, display := range diagnostics.Displays {
+		if display.DisplayID == 0 {
+			return fmt.Errorf(
+				"display_diagnostics.displays[%d] requires display_id",
+				index,
+			)
+		}
+		if _, duplicate := seenDisplayIDs[display.DisplayID]; duplicate {
+			return fmt.Errorf(
+				"display_diagnostics contains duplicate display_id %d",
+				display.DisplayID,
+			)
+		}
+		seenDisplayIDs[display.DisplayID] = struct{}{}
+		if err := validateCoordinateQuartzRect(
+			fmt.Sprintf(
+				"display_diagnostics.displays[%d].quartz_bounds",
+				index,
+			),
+			display.QuartzBounds,
+		); err != nil {
+			return err
+		}
+		if !finiteCoordinate(display.RotationDegrees) ||
+			display.RotationDegrees < 0 ||
+			display.RotationDegrees >= 360 {
+			return fmt.Errorf(
+				"display_diagnostics.displays[%d] has invalid rotation",
+				index,
+			)
+		}
+		fullyContainsWindow := captureCoordinateWindowRectContains(
+			DisplayTopologyRectV1{
+				X:      display.QuartzBounds.X,
+				Y:      display.QuartzBounds.Y,
+				Width:  display.QuartzBounds.Width,
+				Height: display.QuartzBounds.Height,
+			},
+			diagnostics.WindowQuartzBounds,
+		)
+		if display.FullyContainsWindow != fullyContainsWindow {
+			return fmt.Errorf(
+				"display_diagnostics.displays[%d] containment mismatch",
+				index,
+			)
+		}
+		expectedPredicates := make([]string, 0, 6)
+		if !display.IsActive {
+			expectedPredicates = append(expectedPredicates, "inactive")
+		}
+		if !display.IsOnline {
+			expectedPredicates = append(expectedPredicates, "offline")
+		}
+		if display.IsAsleep {
+			expectedPredicates = append(expectedPredicates, "asleep")
+		}
+		if display.IsMirrorFollower {
+			expectedPredicates = append(expectedPredicates, "mirror_follower")
+		}
+		if display.RotationDegrees != 0 {
+			expectedPredicates = append(expectedPredicates, "rotated")
+		}
+		if !fullyContainsWindow {
+			expectedPredicates = append(
+				expectedPredicates,
+				"does_not_fully_contain_window",
+			)
+		}
+		if strings.Join(display.FailedPredicates, "\x00") !=
+			strings.Join(expectedPredicates, "\x00") {
+			return fmt.Errorf(
+				"display_diagnostics.displays[%d] predicate mismatch",
+				index,
+			)
+		}
+		if len(expectedPredicates) == 0 {
+			actionableDisplayCount++
+		}
+	}
+	if diagnostics.ActionableDisplayCount != actionableDisplayCount {
+		return fmt.Errorf("display diagnostics actionable display count mismatch")
 	}
 	return nil
 }

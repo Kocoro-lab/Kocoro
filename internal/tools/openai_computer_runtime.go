@@ -205,7 +205,7 @@ func decodeOpenAIComputerBackgroundBindingV1(
 		strings.TrimSpace(identity.PreservedFrontmostLaunchDate) == "" {
 		// A pre-keyboard helper can still provide the already-qualified
 		// background semantic lane. Keyboard planning will fail closed because
-		// no preserved-frontmost authority is installed.
+		// no planning-time foreground witness is installed.
 		return binding, nil
 	}
 	if identity.PreservedFrontmostPID == nil ||
@@ -213,7 +213,7 @@ func decodeOpenAIComputerBackgroundBindingV1(
 		*identity.PreservedFrontmostPID == target.PID ||
 		strings.TrimSpace(identity.PreservedFrontmostBundleID) == "" {
 		return openAIComputerBackgroundBindingV1{},
-			fmt.Errorf("background app binding returned invalid preserved frontmost identity")
+			fmt.Errorf("background app binding returned an invalid initial foreground witness")
 	}
 	binding.preservedFrontmostPID = *identity.PreservedFrontmostPID
 	binding.preservedFrontmostBundleID =
@@ -342,8 +342,10 @@ func (r *OpenAIComputerActionRuntimeV1) LaunchAndFocusTaskAppsV1(
 // Background execution is an explicit user constraint, never an opportunistic
 // optimization: probing it for foreground-allowed work adds a fragile
 // background-to-foreground transition before common keyboard actions.
-// A required background task binds one already-running exact process with one
-// visible non-frontmost window and fails before activation when unavailable.
+// A required background task binds one exact process with one visible
+// non-frontmost window. If the app is not running, the helper may launch it
+// with an explicit non-activating LaunchServices configuration; this path
+// never falls back to foreground activation.
 func (r *OpenAIComputerActionRuntimeV1) PrepareTaskAppsV1(
 	ctx context.Context,
 	apps []OpenAIComputerTaskAppV1,
@@ -366,7 +368,7 @@ func (r *OpenAIComputerActionRuntimeV1) PrepareTaskAppsV1(
 		return r.executionLane, nil
 	}
 
-	if len(apps) == 1 && apps[0].PID > 0 {
+	if len(apps) == 1 {
 		excludedPIDs := r.excludedTaskAppPIDsV1()
 		raw, err := r.raw.client.Call(
 			ctx,
@@ -384,7 +386,7 @@ func (r *OpenAIComputerActionRuntimeV1) PrepareTaskAppsV1(
 			}
 			prepared := binding.target
 			if !strings.EqualFold(prepared.BundleID, apps[0].BundleID) ||
-				prepared.PID != apps[0].PID {
+				(apps[0].PID > 0 && prepared.PID != apps[0].PID) {
 				return "", fmt.Errorf(
 					"bind background app %q changed exact identity",
 					apps[0].App,
@@ -426,7 +428,7 @@ func (r *OpenAIComputerActionRuntimeV1) PrepareTaskAppsV1(
 	}
 
 	return "", fmt.Errorf(
-		"required background execution needs one already-running exact app target",
+		"required background execution needs one exact app target",
 	)
 }
 
@@ -464,7 +466,7 @@ func (r *OpenAIComputerActionRuntimeV1) backgroundKeyboardFocusedRefV1(
 ) (string, error) {
 	if r == nil || r.raw == nil || r.raw.backgroundInputAuthority == nil ||
 		helpers == nil {
-		return "", fmt.Errorf("preserved-frontmost keyboard authority is unavailable")
+		return "", fmt.Errorf("background keyboard target witness is unavailable")
 	}
 	ref, err := helpers.uniqueFocusedRef()
 	if err != nil {
@@ -509,7 +511,7 @@ func (r *OpenAIComputerActionRuntimeV1) plan(
 
 // PlanOpenAIComputerObservationV1 creates either an AX-only state refresh or
 // the one exact final screenshot. Internal refreshes intentionally set
-// include_screenshot=false so an action batch performs image capture only at
+// includeScreenshot=false so an action batch performs image capture only at
 // its terminal observation boundary.
 func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerObservationV1(
 	description string,

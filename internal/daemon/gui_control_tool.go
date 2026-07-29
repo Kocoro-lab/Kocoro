@@ -568,8 +568,13 @@ func consequentialRiskDaemonFailure(code string) agent.ToolResult {
 	// authority, so no GUI input can have committed. Preserve that fact for the
 	// native adapter instead of degrading a deterministic policy rejection to
 	// commit_unknown.
+	outcomeResult := agent.GUIActionResultFailed
+	if code == "consequential_risk_confirmation_cancelled" ||
+		code == "consequential_risk_confirmation_denied" {
+		outcomeResult = agent.GUIActionResultCancelled
+	}
 	result.GUIOutcome = &agent.GUIActionOutcome{
-		Result:      agent.GUIActionResultFailed,
+		Result:      outcomeResult,
 		Phase:       agent.GUIActionPhaseActing,
 		FailureCode: code,
 	}

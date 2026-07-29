@@ -169,7 +169,8 @@ func (result SemanticPressResultV2) ValidateTaggedUnion() error {
 	case "user_interference":
 		if (result.CommitState != "not_committed" && result.CommitState != "committed" &&
 			result.CommitState != "unknown") || result.Phase != "user_interference" || result.FailureCode == nil ||
-			*result.FailureCode != "physical_input_interference" {
+			(*result.FailureCode != "physical_input_interference" &&
+				*result.FailureCode != "target_foreground_interference") {
 			return fmt.Errorf("invalid user_interference semantic_press_v2 result")
 		}
 	case "failed":
@@ -186,6 +187,7 @@ func (result SemanticPressResultV2) ValidateTaggedUnion() error {
 			"ax_messaging_timeout_unavailable":   true,
 			"risk_destination_drift":             true,
 			"risk_destination_unavailable":       true,
+			"target_became_frontmost":            true,
 		}
 		exactPhase := result.FailureCode != nil &&
 			((preflight[*result.FailureCode] && result.Phase == "preflight") ||

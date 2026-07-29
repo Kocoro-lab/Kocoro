@@ -163,6 +163,113 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 	}
 }
 
+func TestOpenAIComputerTraceV1WritesBoundedDisplayPredicateDiagnostics(
+	t *testing.T,
+) {
+	logDir := t.TempDir()
+	logger, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := newOpenAIComputerTraceV1(logger, daemonGUIWorkflowRequest{
+		SessionID: "session-display-diagnostics",
+		TurnID:    "turn-display-diagnostics",
+	})
+	trace.record(openAIComputerTraceWithCaptureDiagnosticsV1(
+		openAIComputerTraceEventV1{
+			Phase:       "initial_observation",
+			Status:      "failed",
+			Attempt:     1,
+			AppBundleID: "com.example.Editor",
+			FailureCode: "display_not_actionable",
+			DurationMS:  17,
+		},
+		agent.ToolResult{
+			GUICaptureDiagnostics: &agent.GUICaptureDiagnostics{
+				Stage:                  "display_actionability",
+				PID:                    4242,
+				BundleID:               "com.example.Editor",
+				WindowID:               7001,
+				PreWindowBounds:        agent.GUICaptureRect{X: -100, Y: 200, Width: 800, Height: 600},
+				PostWindowBounds:       agent.GUICaptureRect{X: -100, Y: 200, Width: 800, Height: 600},
+				ActionableDisplayCount: 0,
+				DisplayCandidates: []agent.GUIDisplayActionabilityDiagnostics{
+					{
+						DisplayID:        1,
+						QuartzBounds:     agent.GUICaptureRect{X: 0, Y: 0, Width: 1280, Height: 800},
+						IsActive:         true,
+						IsOnline:         true,
+						FailedPredicates: []string{"does_not_fully_contain_window"},
+					},
+					{
+						DisplayID:           2,
+						QuartzBounds:        agent.GUICaptureRect{X: -1600, Y: 100, Width: 1600, Height: 900},
+						IsOnline:            true,
+						FullyContainsWindow: true,
+						FailedPredicates:    []string{"inactive"},
+					},
+				},
+			},
+		},
+	))
+	if err := logger.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(logDir, "audit.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []struct {
+		Event        string `json:"event"`
+		InputSummary string `json:"input_summary"`
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var entry struct {
+			Event        string `json:"event"`
+			InputSummary string `json:"input_summary"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("display diagnostic entries = %d, want 4: %s", len(entries), raw)
+	}
+	if entries[1].Event != "computer_use_display_diagnostic_v1" {
+		t.Fatalf("display header event = %q", entries[1].Event)
+	}
+	var header map[string]any
+	if err := json.Unmarshal([]byte(entries[1].InputSummary), &header); err != nil {
+		t.Fatal(err)
+	}
+	targetBounds, _ := header["target_window_bounds"].([]any)
+	if len(targetBounds) != 4 || targetBounds[0] != float64(-100) ||
+		header["actionable_display_count"] != float64(0) {
+		t.Fatalf("display header diagnostics = %s", entries[1].InputSummary)
+	}
+	for index, entry := range entries[2:] {
+		if entry.Event != "computer_use_display_candidate_diagnostic_v1" {
+			t.Fatalf("candidate %d event = %q", index, entry.Event)
+		}
+		if len(entry.InputSummary) >= 500 {
+			t.Fatalf(
+				"candidate %d exceeded audit summary limit: %d",
+				index,
+				len(entry.InputSummary),
+			)
+		}
+		var candidate map[string]any
+		if err := json.Unmarshal([]byte(entry.InputSummary), &candidate); err != nil {
+			t.Fatal(err)
+		}
+		if _, found := candidate["window_title"]; found {
+			t.Fatal("display diagnostics retained window content")
+		}
+	}
+}
+
 func TestOpenAIComputerTraceV1ExtractsNestedScreenshotFailureCode(
 	t *testing.T,
 ) {
@@ -197,5 +304,36 @@ func TestOpenAIComputerObservationRetryAllowsTransientImageDimensionDrift(
 	}
 	if !retryOpenAIComputerObservationV1(result, nil) {
 		t.Fatal("transient window image dimension drift was not retried")
+	}
+}
+
+func TestOpenAIComputerObservationPreservesVisualOnlyActionabilityFailure(
+	t *testing.T,
+) {
+	result := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "dmlzdWFsLW9ubHk=",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			ActionabilityFailureCode: "display_not_actionable",
+		},
+	}
+	if got := openAIComputerTraceFailureCodeV1(result, nil); got !=
+		"display_not_actionable" {
+		t.Fatalf("failure code = %q", got)
+	}
+	if got := openAIComputerObservationResultDetailV1(result); got !=
+		"display_not_actionable: the target window was not fully contained in exactly one active, online, awake, unmirrored, unrotated display" {
+		t.Fatalf("observation detail = %q", got)
+	}
+	if retryOpenAIComputerObservationV1(result, nil) {
+		t.Fatal("deterministic visual-only display geometry was retried")
+	}
+
+	result.GUIObservation.ActionabilityFailureCode =
+		"image_dimensions_mismatch"
+	if !retryOpenAIComputerObservationV1(result, nil) {
+		t.Fatal("transient visual-only image dimension drift was not retried")
 	}
 }

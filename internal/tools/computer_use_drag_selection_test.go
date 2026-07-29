@@ -108,6 +108,7 @@ func TestComputerUseDragMapsBothCurrentFramePointsAndReturnsTypedPointer(t *test
 	}
 	if result.GUIOutcome == nil || result.GUIOutcome.Result != agent.GUIActionResultCompletedUnverified ||
 		result.GUIOutcome.Phase != agent.GUIActionPhaseVerifying || result.GUIOutcome.Pointer == nil ||
+		!result.GUIOutcome.SameObservationContinuationSafe ||
 		result.GUIOutcome.Pointer.DisplayID != end.DisplayID ||
 		result.GUIOutcome.Pointer.TopologyID != harness.topology.TopologyID ||
 		result.GUIOutcome.Pointer.TopologyGeneration != harness.topology.Generation ||

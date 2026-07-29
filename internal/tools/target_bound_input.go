@@ -286,18 +286,19 @@ func (result TargetBoundInputResultV1) ValidateTaggedUnion() error {
 	}
 	if result.Status == "completed_unverified" {
 		allowed := map[string]bool{
-			"postcondition_not_declared":               true,
-			"clipboard_restore_failed_after_commit":    true,
-			"verification_redacted_sensitive_target":   true,
-			"target_value_readback_unavailable":        true,
-			"target_value_noop_unverifiable":           true,
-			"target_value_mismatch":                    true,
-			"target_changed_during_verification":       true,
-			"interference_detection_unavailable":       true,
-			"cancelled_after_partial_input":            true,
-			"event_post_failed":                        true,
-			"modifier_release_unconfirmed":             true,
-			"preserved_frontmost_changed_after_commit": true,
+			"postcondition_not_declared":                      true,
+			"clipboard_restore_failed_after_commit":           true,
+			"verification_redacted_sensitive_target":          true,
+			"target_value_readback_unavailable":               true,
+			"target_value_noop_unverifiable":                  true,
+			"target_value_mismatch":                           true,
+			"target_changed_during_verification":              true,
+			"interference_detection_unavailable":              true,
+			"cancelled_after_partial_input":                   true,
+			"event_post_failed":                               true,
+			"modifier_release_unconfirmed":                    true,
+			"preserved_frontmost_changed_after_commit":        true,
+			"background_target_became_frontmost_after_commit": true,
 		}
 		if result.FailureCode == nil {
 			return fmt.Errorf("incoherent completed_unverified target_bound_input result")

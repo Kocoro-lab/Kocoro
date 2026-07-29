@@ -100,6 +100,8 @@ func TestGUIActionOutcomeValidationRequiresCoherentFailureCodes(t *testing.T) {
 		{name: "verified", outcome: GUIActionOutcome{Result: GUIActionResultVerified, Phase: GUIActionPhaseVerifying, Pointer: validPointer}, valid: true},
 		{name: "verified with failure", outcome: GUIActionOutcome{Result: GUIActionResultVerified, Phase: GUIActionPhaseVerifying, FailureCode: "unexpected"}},
 		{name: "unverified with reason", outcome: GUIActionOutcome{Result: GUIActionResultCompletedUnverified, Phase: GUIActionPhaseVerifying, FailureCode: "postcondition_not_observed"}, valid: true},
+		{name: "unverified same-observation continuation", outcome: GUIActionOutcome{Result: GUIActionResultCompletedUnverified, Phase: GUIActionPhaseVerifying, FailureCode: "postcondition_not_observed", SameObservationContinuationSafe: true}, valid: true},
+		{name: "failed cannot continue same observation", outcome: GUIActionOutcome{Result: GUIActionResultFailed, Phase: GUIActionPhaseActing, FailureCode: "action_failed", SameObservationContinuationSafe: true}},
 		{name: "unverified without reason", outcome: GUIActionOutcome{Result: GUIActionResultCompletedUnverified, Phase: GUIActionPhaseVerifying}},
 		{name: "failed with unsafe code", outcome: GUIActionOutcome{Result: GUIActionResultFailed, Phase: GUIActionPhaseActing, FailureCode: "secret: leaked"}},
 	} {

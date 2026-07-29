@@ -209,6 +209,7 @@ func (result SemanticScrollResultV1) ValidateTaggedUnion() error {
 			"sensitive_target": true, "enabled_unknown": true, "target_disabled": true,
 			"scroll_boundary": true, "interference_detection_unavailable": true,
 			"ax_messaging_timeout_unavailable": true,
+			"target_became_frontmost":          true,
 		}
 		exactPhase := result.FailureCode != nil &&
 			((preflight[*result.FailureCode] && result.Phase == "preflight") ||

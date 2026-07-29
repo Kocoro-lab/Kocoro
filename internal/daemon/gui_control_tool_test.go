@@ -201,6 +201,23 @@ func TestConsequentialRiskDaemonFailureIsKnownPrecommit(t *testing.T) {
 	}
 }
 
+func TestConsequentialRiskUserDecisionIsTypedCancellation(t *testing.T) {
+	for _, code := range []string{
+		"consequential_risk_confirmation_cancelled",
+		"consequential_risk_confirmation_denied",
+	} {
+		t.Run(code, func(t *testing.T) {
+			result := consequentialRiskDaemonFailure(code)
+			if !result.IsError || result.GUIOutcome == nil ||
+				result.GUIOutcome.Result != agent.GUIActionResultCancelled ||
+				result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+				result.GUIOutcome.FailureCode != code {
+				t.Fatalf("user decision lost cancellation outcome: %+v", result)
+			}
+		})
+	}
+}
+
 func testGUIWorkflow(coordinator *guicontrol.Coordinator, sessionID, turnID string) *daemonGUIWorkflow {
 	workflow := newDaemonGUIWorkflow(coordinator, daemonGUIWorkflowRequest{
 		SessionID:   sessionID,

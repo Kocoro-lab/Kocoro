@@ -34,6 +34,7 @@ func TestSemanticScrollV1StrictWireAndTaggedResults(t *testing.T) {
 	for _, name := range []string{
 		"semantic_scroll.response.verified.v1.json",
 		"semantic_scroll.response.fallback_required.v1.json",
+		"semantic_scroll.response.target_became_frontmost.v1.json",
 		"semantic_scroll.response.commit_unknown.v1.json",
 	} {
 		result, err := DecodeSemanticScrollResultV1(loadSemanticScrollFixture(t, name))

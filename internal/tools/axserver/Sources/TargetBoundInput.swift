@@ -1074,6 +1074,20 @@ private func backgroundTargetedInputPostOutcomeV1(
     }
 }
 
+private func backgroundTargetedInputPostAuthorityFailureCodeV1(
+    _ failure: String
+) -> String {
+    switch failure {
+    case "background_target_became_frontmost":
+        return "background_target_became_frontmost_after_commit"
+    case let code where code.hasPrefix("preserved_frontmost_"):
+        // Retained for compatibility with older injected helper seams.
+        return "preserved_frontmost_changed_after_commit"
+    default:
+        return "target_changed_during_verification"
+    }
+}
+
 func runBackgroundTargetedInputV1(
     request: BackgroundTargetedInputRequestV1,
     dependencies: BackgroundTargetedInputDependenciesV1
@@ -1132,10 +1146,9 @@ func runBackgroundTargetedInputV1(
     }
 
     if let failure = dependencies.authorityFailure(request) {
-        let code = failure.hasPrefix("preserved_frontmost_")
-            ? "preserved_frontmost_changed_after_commit"
-            : "target_changed_during_verification"
-        return backgroundTargetedInputCommittedUnverifiedV1(request, code: code)
+        return backgroundTargetedInputCommittedUnverifiedV1(
+            request,
+            code: backgroundTargetedInputPostAuthorityFailureCodeV1(failure))
     }
     if request.input.action == "keypress" {
         return backgroundTargetedInputCommittedUnverifiedV1(
@@ -1157,9 +1170,9 @@ func runBackgroundTargetedInputV1(
                 observeWithTimeout: { timeout in
                     if let failure = dependencies.authorityFailure(request) {
                         return .terminal(
-                            failureCode: failure.hasPrefix("preserved_frontmost_")
-                                ? "preserved_frontmost_changed_after_commit"
-                                : "target_changed_during_verification",
+                            failureCode:
+                                backgroundTargetedInputPostAuthorityFailureCodeV1(
+                                    failure),
                             observation: nil)
                     }
                     switch verifier.observe(timeout) {
@@ -1416,24 +1429,11 @@ private func productionBackgroundTargetedInputAuthorityFailureV1(
     ) else {
         return "process_identity_mismatch"
     }
-    guard let preservedProcessID = pid_t(exactly: request.preservedFrontmostPID),
-          let preserved = NSRunningApplication(processIdentifier: preservedProcessID),
-          !preserved.isTerminated else {
-        return "preserved_frontmost_process_not_live"
-    }
-    guard backgroundTargetedInputProcessInstanceMatchesV1(
-        preserved,
-        bundleID: request.preservedFrontmostBundleID,
-        launchDate: request.preservedFrontmostLaunchDate
-    ) else {
-        return "preserved_frontmost_identity_mismatch"
-    }
-    guard NSWorkspace.shared.frontmostApplication?.processIdentifier ==
-        preservedProcessID else {
-        return "preserved_frontmost_changed"
-    }
-    guard targetProcessID != preservedProcessID else {
-        return "background_target_became_frontmost"
+    if let failure = backgroundTargetedInputForegroundFailureV1(
+        targetPID: targetProcessID,
+        frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier
+    ) {
+        return failure
     }
     guard let window = targetBoundInputExactWindow(request.input.windowID),
           window.ownerPID == request.input.pid else {
@@ -1471,6 +1471,18 @@ private func productionBackgroundTargetedInputAuthorityFailureV1(
         return "focused_element_mismatch"
     }
     return nil
+}
+
+func backgroundTargetedInputForegroundFailureV1(
+    targetPID: pid_t,
+    frontmostPID: pid_t?
+) -> String? {
+    guard targetPID > 0, let frontmostPID, frontmostPID > 0 else {
+        return "frontmost_process_unavailable"
+    }
+    return frontmostPID == targetPID
+        ? "background_target_became_frontmost"
+        : nil
 }
 
 private func productionBackgroundTargetedInputAuthorityFailureBoundedV1(

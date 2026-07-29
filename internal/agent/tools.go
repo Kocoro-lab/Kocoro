@@ -125,6 +125,11 @@ type ToolResult struct {
 type GUIObservationOutcome struct {
 	CoordinateActionable bool
 	SemanticActionable   bool
+	// ActionabilityFailureCode preserves the typed reason why a useful exact
+	// screenshot could not mint action authority. It is local-only and lets
+	// retry/trace policy distinguish transient capture drift from stable
+	// geometry without parsing provider-visible prose.
+	ActionabilityFailureCode string
 }
 
 // ToolUsage is ToolResult's per-call cost breakdown. Mirrors client.ToolUsage

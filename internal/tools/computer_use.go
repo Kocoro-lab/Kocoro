@@ -834,8 +834,10 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 			capture, visualErr := t.captureVisualOnlyObservationV1(ctx, tree)
 			if visualErr == nil {
 				result.Images = []agent.ImageBlock{capture.Image}
-				result.GUIObservation = &agent.GUIObservationOutcome{
-					CoordinateActionable: false,
+				result.GUIObservation.CoordinateActionable = false
+				if failure.GUIOutcome != nil {
+					result.GUIObservation.ActionabilityFailureCode =
+						failure.GUIOutcome.FailureCode
 				}
 				if failure.GUIOutcome != nil &&
 					failure.GUIOutcome.FailureCode == "display_not_actionable" {
@@ -874,10 +876,8 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	}
 	t.coordinateArtifact = &artifact
 	result.Images = []agent.ImageBlock{artifact.ImageBlock()}
-	result.GUIObservation = &agent.GUIObservationOutcome{
-		CoordinateActionable: true,
-		SemanticActionable:   true,
-	}
+	result.GUIObservation.CoordinateActionable = true
+	result.GUIObservation.SemanticActionable = true
 	return result, nil
 }
 
@@ -1001,7 +1001,10 @@ func (t *ComputerUseTool) publishComputerUseObservation(
 	lines = append(lines, "elements:")
 	lines = append(lines, formatComputerUseElements(tree.Elements)...)
 
-	return agent.ToolResult{Content: strings.Join(lines, "\n")}, id
+	return agent.ToolResult{
+		Content:        strings.Join(lines, "\n"),
+		GUIObservation: &agent.GUIObservationOutcome{},
+	}, id
 }
 
 func (t *ComputerUseTool) captureCoordinateObservationV1(
@@ -1175,6 +1178,42 @@ func computerUseCaptureFailureV1(
 		}
 		if value.DecodedHeightPX != nil {
 			diagnostics.DecodedHeightPX = *value.DecodedHeightPX
+		}
+	}
+	if result.DisplayDiagnostics != nil {
+		value := result.DisplayDiagnostics
+		diagnostics = &agent.GUICaptureDiagnostics{
+			Stage:                  "display_actionability",
+			PID:                    value.PID,
+			BundleID:               value.BundleID,
+			WindowID:               value.WindowID,
+			PreWindowBounds:        guiCaptureRectV1(value.WindowQuartzBounds),
+			PostWindowBounds:       guiCaptureRectV1(value.WindowQuartzBounds),
+			ActionableDisplayCount: value.ActionableDisplayCount,
+			DisplayCandidates: make(
+				[]agent.GUIDisplayActionabilityDiagnostics,
+				0,
+				len(value.Displays),
+			),
+		}
+		for _, display := range value.Displays {
+			diagnostics.DisplayCandidates = append(
+				diagnostics.DisplayCandidates,
+				agent.GUIDisplayActionabilityDiagnostics{
+					DisplayID:           display.DisplayID,
+					QuartzBounds:        guiCaptureRectV1(display.QuartzBounds),
+					IsActive:            display.IsActive,
+					IsOnline:            display.IsOnline,
+					IsAsleep:            display.IsAsleep,
+					IsMirrorFollower:    display.IsMirrorFollower,
+					RotationDegrees:     display.RotationDegrees,
+					FullyContainsWindow: display.FullyContainsWindow,
+					FailedPredicates: append(
+						[]string(nil),
+						display.FailedPredicates...,
+					),
+				},
+			)
 		}
 	}
 	if result.RetrySafe {
@@ -1434,10 +1473,10 @@ func legacySemanticPressV1ParamsForFixture(windowID int, entry refEntry) map[str
 }
 
 func (t *ComputerUseTool) semanticPress(ctx context.Context, args computerUseArgs) (agent.ToolResult, error) {
-	// A semantic press attempt consumes its observation regardless of whether
-	// freshness, helper transport, preflight, action, or verification fails.
-	// The caller must re-observe before making any further decision.
-	defer t.invalidateState()
+	// Generic calls consume their observation. A trusted provider batch keeps
+	// its source observation for later ordered actions; every semantic target
+	// is still re-resolved and revalidated at its own commit boundary.
+	defer t.invalidateStateAfterMutationV1(ctx)
 
 	entry, failure, ok := t.preflightRef(ctx, args)
 	if !ok {
@@ -1580,6 +1619,10 @@ func computerUseSemanticPressGUIOutcomeV2(
 	switch result.Status {
 	case "user_interference":
 		outcome.Result = agent.GUIActionResultUserInterference
+		if result.FailureCode != nil &&
+			*result.FailureCode == "target_foreground_interference" {
+			outcome.Result = agent.GUIActionResultFailed
+		}
 		if result.CommitState != "not_committed" {
 			outcome.Phase = agent.GUIActionPhaseInputCommitted
 		}
@@ -1589,6 +1632,11 @@ func computerUseSemanticPressGUIOutcomeV2(
 	if result.Status == "completed_unverified" && result.CommitState == "unknown" {
 		outcome.Phase = agent.GUIActionPhaseInputCommitted
 	}
+	outcome.SameObservationContinuationSafe =
+		result.Status == "completed_unverified" &&
+			result.CommitState == "committed" &&
+			result.FailureCode != nil &&
+			*result.FailureCode == "postcondition_not_declared"
 	return outcome
 }
 
@@ -1598,10 +1646,10 @@ func (t *ComputerUseTool) scroll(ctx context.Context, args computerUseArgs) (age
 		return agent.ValidationError(
 			"scroll requires exactly one non-zero dx or dy semantic step count between -10 and 10"), nil
 	}
-	// Every semantically valid scroll attempt consumes its observation. A
-	// fallback-required or preflight failure still changes what the planner now
-	// knows about the target and must not leave reusable authority behind.
-	defer t.invalidateState()
+	// Match coordinate, drag, and keyboard batch semantics: generic calls
+	// consume their observation, while one trusted provider batch keeps its
+	// source observation until the executor-owned final screenshot.
+	defer t.invalidateStateAfterMutationV1(ctx)
 	entry, failure, ok := t.preflightRef(ctx, args)
 	if !ok {
 		return failure, nil
@@ -1755,6 +1803,10 @@ func computerUseSemanticScrollGUIOutcomeV1(
 		outcome.Result = agent.GUIActionResultVerified
 	case "user_interference":
 		outcome.Result = agent.GUIActionResultUserInterference
+		if result.FailureCode != nil &&
+			*result.FailureCode == "target_foreground_interference" {
+			outcome.Result = agent.GUIActionResultFailed
+		}
 	case "cancelled":
 		outcome.Result = agent.GUIActionResultCancelled
 	case "fallback_required", "failed":
@@ -2219,7 +2271,7 @@ func (t *ComputerUseTool) targetBoundInput(
 		if authority == nil {
 			return computerUsePrecommitBusinessErrorV1(
 				"background_keyboard_authority_unavailable",
-				"background keyboard execution has no preserved-frontmost authority",
+				"background keyboard execution has no initial foreground witness",
 			), nil
 		}
 		backgroundRequest := BackgroundTargetedInputRequestV1{
@@ -2402,6 +2454,12 @@ func computerUseTargetBoundInputGUIOutcomeV1(
 			outcome.Result = agent.GUIActionResultUserInterference
 		}
 	}
+	outcome.SameObservationContinuationSafe =
+		result.Status == "completed_unverified" &&
+			result.InputCommitted &&
+			result.FailureCode != nil &&
+			(*result.FailureCode == "postcondition_not_declared" ||
+				*result.FailureCode == "interference_detection_unavailable")
 	return outcome
 }
 
@@ -2634,6 +2692,14 @@ func computerUsePixelScrollGUIOutcomeV1(
 			X:                  result.PointerEndpoint.Observed.X, Y: result.PointerEndpoint.Observed.Y,
 		}
 	}
+	outcome.SameObservationContinuationSafe =
+		result.Status == "committed_unverified" &&
+			result.PointerMoveCommitState == "committed" &&
+			result.ScrollCommitState == "committed" &&
+			result.FailureCode != nil &&
+			*result.FailureCode == "scroll_postcondition_not_declared" &&
+			result.PointerEndpoint != nil &&
+			result.PointerEndpoint.Verified
 	return outcome
 }
 
@@ -2869,6 +2935,16 @@ func computerUseDragGUIOutcomeV1(
 			Y:                  result.PointerEndpoint.Observed.Y,
 		}
 	}
+	outcome.SameObservationContinuationSafe =
+		result.Status == "completed_unverified" &&
+			result.DragCommitted &&
+			result.MouseDownCommitted &&
+			result.PointerMotionCommitted &&
+			result.MouseUpCommitted &&
+			result.FailureCode != nil &&
+			*result.FailureCode == "drop_postcondition_not_declared" &&
+			result.PointerEndpoint != nil &&
+			result.PointerEndpoint.Verified
 	return outcome
 }
 
@@ -3326,6 +3402,20 @@ func computerUseCoordinateGUIOutcomeV1(
 			Y:                  result.PointerEndpoint.Observed.Y,
 		}
 	}
+	outcome.SameObservationContinuationSafe =
+		result.Status == "completed_unverified" &&
+			result.Action == "click" &&
+			result.PrimaryActionCommitted &&
+			result.PointerMotionCommitted &&
+			request.Button != nil &&
+			*request.Button == "left" &&
+			request.ClickCount != nil &&
+			*request.ClickCount == 1 &&
+			len(request.Modifiers) == 0 &&
+			result.FailureCode != nil &&
+			*result.FailureCode == "click_postcondition_not_declared" &&
+			result.PointerEndpoint != nil &&
+			result.PointerEndpoint.Verified
 	return outcome
 }
 

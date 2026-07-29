@@ -371,6 +371,28 @@ func withOpenAIComputerTaskFailureOutcomeV1(
 	return result
 }
 
+func openAIComputerNoEffectInterventionResultV1(
+	detail string,
+) agent.ToolResult {
+	detail = boundOpenAIComputerObservationDetailV1(detail)
+	if detail == "" {
+		detail = "desktop control stopped before any input action committed"
+	}
+	category := string(agent.OpenAIComputerRecoveryUserIntervenedV1)
+	return withOpenAIComputerTaskFailureOutcomeV1(
+		agent.BusinessError(
+			"computer_use_error: "+category+"\n"+
+				"message: Computer Use yielded to user control before a desktop input committed\n"+
+				"recovery: do not replay the interrupted action in this turn\n"+
+				"detail: "+detail,
+		),
+		agent.ComputerUseTaskNotCompleted,
+		agent.ComputerUseCommitNone,
+		category,
+		agent.ComputerUseRecoveryNone,
+	)
+}
+
 func openAIComputerPreActionRecoveryV1(
 	appPreparationMayHaveOccurred bool,
 ) string {
@@ -436,9 +458,12 @@ type openAIComputerTaskToolV1 struct {
 	// Tests replace this seam so initial and final observation retries never sleep.
 	// The argument is the one-based failed attempt that precedes the wait.
 	observationRetry func(context.Context, int) error
-	permissions      *permissions.PermissionsConfig
-	auditor          *audit.AuditLogger
-	hookRunner       *hooks.HookRunner
+	// Production installs one short bounded settle before the post-batch
+	// observation. Tests opt in explicitly so timing stays deterministic.
+	postBatchSettle func(context.Context, int) error
+	permissions     *permissions.PermissionsConfig
+	auditor         *audit.AuditLogger
+	hookRunner      *hooks.HookRunner
 }
 
 const (
@@ -478,6 +503,22 @@ func waitOpenAIComputerObservationRetryV1(
 	}
 }
 
+const openAIComputerPostBatchSettleDelayV1 = 200 * time.Millisecond
+
+func waitOpenAIComputerPostBatchSettleV1(
+	ctx context.Context,
+	_ int,
+) error {
+	timer := time.NewTimer(openAIComputerPostBatchSettleDelayV1)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func boundOpenAIComputerObservationDetailV1(value string) string {
 	value = strings.TrimSpace(value)
 	runes := []rune(value)
@@ -495,6 +536,18 @@ func openAIComputerObservationResultDetailV1(result agent.ToolResult) string {
 	if result.GUIObservation != nil &&
 		!result.GUIObservation.CoordinateActionable &&
 		len(result.Images) == 1 {
+		if code := strings.TrimSpace(
+			result.GUIObservation.ActionabilityFailureCode,
+		); code != "" {
+			if code == "display_not_actionable" {
+				return boundOpenAIComputerObservationDetailV1(
+					code + ": the target window was not fully contained in " +
+						"exactly one active, online, awake, unmirrored, " +
+						"unrotated display",
+				)
+			}
+			return boundOpenAIComputerObservationDetailV1(code)
+		}
 		return "the exact target window image was visual-only and could not safely seed desktop actions"
 	}
 	content := result.Content
@@ -555,10 +608,6 @@ func retryOpenAIComputerObservationV1(
 	if result.IsRetryable {
 		return true
 	}
-	if result.GUIObservation != nil &&
-		!result.GUIObservation.CoordinateActionable {
-		return true
-	}
 	if retryableOpenAIComputerObservationFailureCodeV1(
 		openAIComputerTraceFailureCodeV1(result, nil),
 	) {
@@ -574,7 +623,6 @@ func retryableOpenAIComputerObservationFailureCodeV1(code string) bool {
 	switch strings.TrimSpace(code) {
 	case "window_not_found",
 		"window_not_actionable",
-		"display_not_actionable",
 		"window_bounds_mismatch",
 		"window_changed",
 		"topology_changed",
@@ -583,7 +631,6 @@ func retryableOpenAIComputerObservationFailureCodeV1(code string) bool {
 		"capture_failed",
 		"image_dimensions_mismatch",
 		"topology_unavailable",
-		"process_identity_mismatch",
 		"window_identity_mismatch":
 		return true
 	default:
@@ -603,13 +650,22 @@ type openAIComputerObservationRecorderV1 func(
 	time.Duration,
 )
 
+type openAIComputerObservationRetryDecisionV1 func(
+	int,
+	agent.ToolResult,
+	error,
+) bool
+
 func openAIComputerObservationMeetsActionRequirementV1(
 	result agent.ToolResult,
 	requireCoordinateActionable bool,
 	allowSemanticActionable bool,
 ) bool {
-	if !requireCoordinateActionable || result.GUIObservation == nil {
+	if !requireCoordinateActionable {
 		return true
+	}
+	if result.GUIObservation == nil {
+		return false
 	}
 	return result.GUIObservation.CoordinateActionable ||
 		(allowSemanticActionable &&
@@ -628,9 +684,81 @@ func runOpenAIComputerObservationV1(
 	attempt openAIComputerObservationAttemptV1,
 	record openAIComputerObservationRecorderV1,
 ) (agent.ToolResult, error) {
+	return runOpenAIComputerObservationWithRetryDecisionV1(
+		ctx,
+		maxAttempts,
+		requireCoordinateActionable,
+		allowSemanticActionable,
+		retryWait,
+		attempt,
+		record,
+		func(_ int, result agent.ToolResult, err error) bool {
+			return retryOpenAIComputerObservationV1(result, err)
+		},
+	)
+}
+
+// runOpenAIComputerInitialObservationV1 preserves the existing cold-window
+// retry policy, with one deliberately narrower exception: when the very first
+// foreground observation is display_not_actionable, repeat observation once.
+// That second result is terminal unless it is actionable. The closure contains
+// no action payload, so this recovery cannot call the provider or replay input.
+func runOpenAIComputerInitialObservationV1(
+	ctx context.Context,
+	maxAttempts int,
+	requireCoordinateActionable bool,
+	allowSemanticActionable bool,
+	retryWait func(context.Context, int) error,
+	attempt openAIComputerObservationAttemptV1,
+	record openAIComputerObservationRecorderV1,
+) (agent.ToolResult, error) {
+	displayRecoveryActive := false
+	return runOpenAIComputerObservationWithRetryDecisionV1(
+		ctx,
+		maxAttempts,
+		requireCoordinateActionable,
+		allowSemanticActionable,
+		retryWait,
+		attempt,
+		record,
+		func(
+			attemptIndex int,
+			result agent.ToolResult,
+			err error,
+		) bool {
+			if displayRecoveryActive {
+				return false
+			}
+			if openAIComputerTraceFailureCodeV1(result, err) ==
+				"display_not_actionable" {
+				if attemptIndex != 1 {
+					return false
+				}
+				displayRecoveryActive = true
+				return true
+			}
+			return retryOpenAIComputerObservationV1(result, err)
+		},
+	)
+}
+
+func runOpenAIComputerObservationWithRetryDecisionV1(
+	ctx context.Context,
+	maxAttempts int,
+	requireCoordinateActionable bool,
+	allowSemanticActionable bool,
+	retryWait func(context.Context, int) error,
+	attempt openAIComputerObservationAttemptV1,
+	record openAIComputerObservationRecorderV1,
+	retryDecision openAIComputerObservationRetryDecisionV1,
+) (agent.ToolResult, error) {
 	if maxAttempts <= 0 || attempt == nil {
 		return agent.ToolResult{},
 			fmt.Errorf("OpenAI computer observation runner is unavailable")
+	}
+	if retryDecision == nil {
+		return agent.ToolResult{},
+			fmt.Errorf("OpenAI computer observation retry policy is unavailable")
 	}
 	if retryWait == nil {
 		retryWait = waitOpenAIComputerObservationRetryV1
@@ -656,7 +784,7 @@ func runOpenAIComputerObservationV1(
 			return result, nil
 		}
 		if attemptIndex == maxAttempts ||
-			!retryOpenAIComputerObservationV1(result, err) {
+			!retryDecision(attemptIndex, result, err) {
 			return result, err
 		}
 		if waitErr := retryWait(ctx, attemptIndex); waitErr != nil {
@@ -967,7 +1095,7 @@ func (t *openAIComputerTaskToolV1) Run(
 	if retryObservation == nil {
 		retryObservation = waitOpenAIComputerObservationRetryV1
 	}
-	initial, observationErr = runOpenAIComputerObservationV1(
+	initial, observationErr = runOpenAIComputerInitialObservationV1(
 		ctx,
 		maxOpenAIComputerInitialObservationsV1,
 		true,
@@ -1040,7 +1168,7 @@ func (t *openAIComputerTaskToolV1) Run(
 					)
 				} else if len(result.Images) == 1 && !actionable {
 					observationDetail =
-						"the exact window image did not mint the required action authority"
+						openAIComputerObservationResultDetailV1(result)
 				} else {
 					observationDetail =
 						openAIComputerObservationResultDetailV1(result)
@@ -1096,16 +1224,17 @@ func (t *openAIComputerTaskToolV1) Run(
 				agent.ComputerUseRecoveryRetryWithApps
 			return result, nil
 		}
-		trace.record(openAIComputerTraceEventV1{
-			Phase:       "task",
-			Status:      "failed",
-			FailureCode: "initial_observation_unavailable",
-			DurationMS:  time.Since(taskStarted).Milliseconds(),
-		})
+		terminalFailureCode := "initial_observation_unavailable"
+		if failureCode == "display_not_actionable" {
+			terminalFailureCode = failureCode
+		}
 		recovery := agent.ComputerUseRecoveryNone
 		recoveryText :=
 			"report that the initial desktop state could not be safely observed"
-		if failureCode == "initial_image_unavailable" ||
+		if failureCode == "display_not_actionable" {
+			recoveryText =
+				"move or resize the target window so it is fully contained in one active, online, awake, unmirrored, unrotated display, then retry the task"
+		} else if failureCode == "initial_image_unavailable" ||
 			retryableOpenAIComputerObservationFailureCodeV1(failureCode) {
 			recovery = agent.ComputerUseRecoveryAlternateControl
 			recoveryText = openAIComputerPreActionRecoveryV1(len(apps) > 0)
@@ -1113,16 +1242,22 @@ func (t *openAIComputerTaskToolV1) Run(
 			recoveryText =
 				"do not retry or bypass the protected-app boundary with another desktop-control path"
 		}
+		trace.record(openAIComputerTraceEventV1{
+			Phase:       "task",
+			Status:      "failed",
+			FailureCode: terminalFailureCode,
+			DurationMS:  time.Since(taskStarted).Milliseconds(),
+		})
 		return withOpenAIComputerTaskFailureOutcomeV1(
 			agent.BusinessError(
-				"computer_use_error: initial_observation_unavailable\n"+
+				"computer_use_error: "+terminalFailureCode+"\n"+
 					"message: Computer Use could not capture the verified initial app window\n"+
 					"recovery: "+recoveryText+"\n"+
 					"detail: "+detail,
 			),
 			agent.ComputerUseTaskNotCompleted,
 			agent.ComputerUseCommitNone,
-			"initial_observation_unavailable",
+			terminalFailureCode,
 			recovery,
 		), nil
 	}
@@ -1157,6 +1292,7 @@ func (t *openAIComputerTaskToolV1) Run(
 	}
 	runner.trace = trace
 	runner.observationRetry = retryObservation
+	runner.postBatchSettle = t.postBatchSettle
 	privateGateway := newOpenAIComputerInitialResponseClientV1(
 		t.gateway,
 		t.initialResponseTimeout,
@@ -1196,7 +1332,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			"If all requested end states are already visible, your next response must be the completed JSON object, not another computer call. " +
 			"Never move or drag merely to park the cursor, rearrange windows, clean up the screen, or prepare the final response. " +
 			"For inspection or summarization, read from screenshots and use scroll only when more content must be revealed; do not drag-select text unless the user explicitly requested selection or dragging. " +
-			"Do not add routine fixed waits: Kocoro already settles and re-observes after actions; use wait only while the latest UI visibly shows loading or an in-progress transition. " +
+			"Do not add routine fixed waits: Kocoro applies one short bounded settle before the post-batch screenshot; use wait only while the latest UI visibly shows loading or an in-progress transition. " +
 			"Continue across app switches, " +
 			"and stop as soon as the requested end state is verified. " +
 			"Keyboard actions are bound to the latest verified target app, window, and focus; re-observe whenever that target is uncertain. " +
@@ -1396,22 +1532,14 @@ func (t *openAIComputerTaskToolV1) Run(
 		if stats.LastGUIResult == agent.GUIActionResultCancelled ||
 			stats.LastGUIResult == agent.GUIActionResultUserInterference {
 			failureCode := stats.LastFailureCode
-			if stats.LastGUIResult == agent.GUIActionResultCancelled {
-				failureCode = "cancelled"
-			} else if stats.LastGUIResult ==
-				agent.GUIActionResultUserInterference {
-				failureCode = "user_interference"
-			}
 			trace.record(openAIComputerTraceEventV1{
 				Phase:       "task",
 				Status:      "failed",
 				FailureCode: failureCode,
 				DurationMS:  time.Since(taskStarted).Milliseconds(),
 			})
-			return openAIComputerTaskUnverifiedResultV1(
-				failureCode,
+			return openAIComputerNoEffectInterventionResultV1(
 				err.Error(),
-				agent.ComputerUseCommitUnknown,
 			), nil
 		}
 		if stats.LastBatchHadFreshObservation {

@@ -77,24 +77,42 @@ final class BackgroundTargetedInputTests: XCTestCase {
         XCTAssertEqual(harness.postKeypressCount, 0)
     }
 
-    func testPreservedFrontmostDriftBeforeCommitNeverPosts() throws {
+    func testForegroundGuardAllowsUserToSwitchBetweenOtherApps() {
+        XCTAssertNil(backgroundTargetedInputForegroundFailureV1(
+            targetPID: 41, frontmostPID: 84))
+        XCTAssertNil(backgroundTargetedInputForegroundFailureV1(
+            targetPID: 41, frontmostPID: 96))
+    }
+
+    func testForegroundGuardRejectsTargetActivationAndUnavailableState() {
+        XCTAssertEqual(
+            backgroundTargetedInputForegroundFailureV1(
+                targetPID: 41, frontmostPID: 41),
+            "background_target_became_frontmost")
+        XCTAssertEqual(
+            backgroundTargetedInputForegroundFailureV1(
+                targetPID: 41, frontmostPID: nil),
+            "frontmost_process_unavailable")
+    }
+
+    func testBackgroundTargetActivationBeforeCommitNeverPosts() throws {
         let request = try runnableRequest(action: "type")
         let harness = BackgroundTargetedInputHarness()
-        harness.authorityFailures = ["preserved_frontmost_changed"]
+        harness.authorityFailures = ["background_target_became_frontmost"]
 
         let result = runBackgroundTargetedInputV1(
             request: request, dependencies: harness.dependencies())
 
         XCTAssertEqual(result.status, "failed")
         XCTAssertFalse(result.inputCommitted)
-        XCTAssertEqual(result.failureCode, "preserved_frontmost_changed")
+        XCTAssertEqual(result.failureCode, "background_target_became_frontmost")
         XCTAssertEqual(harness.postTextCount, 0)
     }
 
-    func testPreservedFrontmostDriftAfterCommitIsUnverifiedAndNeverReplayed() throws {
+    func testBackgroundTargetActivationAfterCommitIsUnverifiedAndNeverReplayed() throws {
         let request = try runnableRequest(action: "type")
         let harness = BackgroundTargetedInputHarness()
-        harness.authorityFailures = [nil, nil, "preserved_frontmost_changed"]
+        harness.authorityFailures = [nil, nil, "background_target_became_frontmost"]
 
         let result = runBackgroundTargetedInputV1(
             request: request, dependencies: harness.dependencies())
@@ -102,7 +120,7 @@ final class BackgroundTargetedInputTests: XCTestCase {
         XCTAssertEqual(result.status, "completed_unverified")
         XCTAssertTrue(result.inputCommitted)
         XCTAssertEqual(
-            result.failureCode, "preserved_frontmost_changed_after_commit")
+            result.failureCode, "background_target_became_frontmost_after_commit")
         XCTAssertEqual(harness.postTextCount, 1)
     }
 

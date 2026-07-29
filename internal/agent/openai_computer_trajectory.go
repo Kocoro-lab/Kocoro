@@ -263,6 +263,46 @@ func (trajectory *openAIComputerTrajectory) buildNextRequest(
 
 const openAIComputerContinuationFeedbackPrefixV1 = "kocoro.computer_action_outcome.v1:"
 
+type OpenAIComputerRecoveryCategoryV1 string
+
+const (
+	OpenAIComputerRecoveryReobserveSameAppV1   OpenAIComputerRecoveryCategoryV1 = "reobserve_same_app"
+	OpenAIComputerRecoveryUserIntervenedV1     OpenAIComputerRecoveryCategoryV1 = "user_intervened"
+	OpenAIComputerRecoveryUnknownCommitV1      OpenAIComputerRecoveryCategoryV1 = "unknown_commit"
+	OpenAIComputerRecoveryCaptureUnavailableV1 OpenAIComputerRecoveryCategoryV1 = "capture_unavailable"
+)
+
+func (category OpenAIComputerRecoveryCategoryV1) ContinuationAllowed() bool {
+	return category == OpenAIComputerRecoveryReobserveSameAppV1
+}
+
+// ClassifyOpenAIComputerRecoveryV1 is the single local recovery classifier for
+// the provider action loop. It derives daemon control flow from the typed
+// effect/result/phase contract rather than maintaining a growing list of
+// helper failure codes. The category is intentionally not serialized into
+// Cloud's stable kocoro.computer_action_outcome.v1 feedback contract.
+func ClassifyOpenAIComputerRecoveryV1(
+	execution OpenAIComputerBatchExecution,
+) OpenAIComputerRecoveryCategoryV1 {
+	if execution.ActionEffect == ComputerUseCommitUnknown {
+		return OpenAIComputerRecoveryUnknownCommitV1
+	}
+	outcome := execution.Result.GUIOutcome
+	if outcome == nil {
+		return OpenAIComputerRecoveryCaptureUnavailableV1
+	}
+	if outcome.Phase == GUIActionPhaseObserving {
+		return OpenAIComputerRecoveryCaptureUnavailableV1
+	}
+	if outcome.Result == GUIActionResultCancelled {
+		return OpenAIComputerRecoveryUserIntervenedV1
+	}
+	if outcome.Result == GUIActionResultUserInterference {
+		return OpenAIComputerRecoveryUserIntervenedV1
+	}
+	return OpenAIComputerRecoveryReobserveSameAppV1
+}
+
 type openAIComputerContinuationGUIOutcomeV1 struct {
 	Result      GUIActionResult `json:"result"`
 	Phase       GUIActionPhase  `json:"phase"`

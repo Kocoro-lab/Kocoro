@@ -674,9 +674,13 @@ const (
 // OpenAIComputerActionExecutionV1 is the executor's redacted action
 // acknowledgement. Intermediate images are forbidden: the provider receives
 // one final screenshot for the whole computer_call, never one per action.
+// RequiresFreshObservation ends the current provider batch after this action
+// committed successfully. The adapter captures that one screenshot and lets
+// the provider plan the remaining goal from current visual state.
 type OpenAIComputerActionExecutionV1 struct {
-	CommitState OpenAIComputerCommitStateV1
-	Result      agent.ToolResult
+	CommitState              OpenAIComputerCommitStateV1
+	Result                   agent.ToolResult
+	RequiresFreshObservation bool
 }
 
 // OpenAIComputerBatchActionExecutorV1 is deliberately stronger than
@@ -815,6 +819,7 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 		return result, nil
 	}
 
+	executedActions := 0
 	for index, action := range call.Actions {
 		if err := ctx.Err(); err != nil {
 			result.ToolResult = openAIComputerCancellationResultV1(
@@ -834,11 +839,17 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 			scope,
 			action,
 		)
+		executedActions++
 		result.ActionEffect = agent.MergeComputerUseCommitEffect(
 			result.ActionEffect,
 			openAIComputerActionEffectV1(execution.CommitState),
 		)
-		if invalid := validateOpenAIComputerActionExecutionV1(action, execution, executeErr); invalid != "" {
+		if invalid := validateOpenAIComputerActionExecutionV1(
+			action,
+			execution,
+			executeErr,
+			index+1 < len(call.Actions),
+		); invalid != "" {
 			failure := agent.BusinessError(
 				fmt.Sprintf(
 					"OpenAI computer action %d of %d returned an invalid per-action acknowledgement: %s",
@@ -883,6 +894,9 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 			)
 			return result, nil
 		}
+		if execution.RequiresFreshObservation {
+			break
+		}
 	}
 
 	final, finalErr := a.executor.CaptureFinalOpenAIComputerObservationV1(
@@ -921,7 +935,7 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 	}
 	final.Content = fmt.Sprintf(
 		"Executed %d OpenAI computer actions in order; one final exact screenshot is attached.",
-		len(call.Actions),
+		executedActions,
 	)
 	final.GUIOutcome = nil
 	result.ToolResult = final
@@ -954,7 +968,7 @@ func openAIComputerActionCanContinueV1(
 		return executeErr == nil
 	case OpenAIComputerCommitUnverifiedV1:
 		return executeErr == nil &&
-			openAIComputerKnownCommitCanContinueV1(action, execution)
+			openAIComputerSameObservationContinuationSafeV1(execution)
 	default:
 		return false
 	}
@@ -964,6 +978,7 @@ func validateOpenAIComputerActionExecutionV1(
 	action OpenAIComputerActionV1,
 	execution OpenAIComputerActionExecutionV1,
 	executeErr error,
+	hasFollowingAction bool,
 ) string {
 	switch execution.CommitState {
 	case OpenAIComputerNotCommittedV1, OpenAIComputerCommitVerifiedV1,
@@ -983,6 +998,15 @@ func validateOpenAIComputerActionExecutionV1(
 		execution.CommitState == OpenAIComputerNotCommittedV1 {
 		return "successful mutation did not acknowledge its commit"
 	}
+	if execution.RequiresFreshObservation &&
+		(action.Type != OpenAIComputerActionKeypressV1 ||
+			executeErr != nil ||
+			execution.Result.IsError ||
+			(execution.CommitState != OpenAIComputerCommitVerifiedV1 &&
+				execution.CommitState != OpenAIComputerCommitUnverifiedV1) ||
+			!hasFollowingAction) {
+		return "fresh-observation boundary is invalid"
+	}
 	return ""
 }
 
@@ -991,34 +1015,11 @@ func openAIComputerActionMutatesV1(action OpenAIComputerActionV1) bool {
 		action.Type != OpenAIComputerActionWaitV1
 }
 
-func openAIComputerKnownCommitCanContinueV1(
-	action OpenAIComputerActionV1,
+func openAIComputerSameObservationContinuationSafeV1(
 	execution OpenAIComputerActionExecutionV1,
 ) bool {
-	failureCode := ""
-	if execution.Result.GUIOutcome != nil {
-		failureCode = execution.Result.GUIOutcome.FailureCode
-	}
-	switch action.Type {
-	case OpenAIComputerActionClickV1,
-		OpenAIComputerActionDoubleClickV1:
-		return failureCode == "click_postcondition_not_declared" ||
-			failureCode == "postcondition_not_declared" ||
-			failureCode == "postcondition_not_observed"
-	case OpenAIComputerActionMoveV1:
-		return false
-	case OpenAIComputerActionTypeTextV1,
-		OpenAIComputerActionKeypressV1:
-		return failureCode == "postcondition_not_declared" ||
-			failureCode == "postcondition_not_observed" ||
-			failureCode == "interference_detection_unavailable"
-	case OpenAIComputerActionScrollV1:
-		return failureCode == "scroll_postcondition_not_declared"
-	case OpenAIComputerActionDragV1:
-		return failureCode == "drop_postcondition_not_declared"
-	default:
-		return false
-	}
+	return execution.Result.GUIOutcome != nil &&
+		execution.Result.GUIOutcome.SameObservationContinuationSafe
 }
 
 func openAIComputerActionFailureV1(
@@ -1055,10 +1056,18 @@ func openAIComputerActionFailureV1(
 
 func openAIComputerCancellationResultV1(committed bool) agent.ToolResult {
 	message := "OpenAI computer batch cancelled at an action boundary"
+	phase := agent.GUIActionPhaseActing
 	if committed {
 		message += "; an earlier action may have committed; do not retry automatically"
+		phase = agent.GUIActionPhaseInputCommitted
 	}
-	return agent.BusinessError(message)
+	result := agent.BusinessError(message)
+	result.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultCancelled,
+		Phase:       phase,
+		FailureCode: "cancelled",
+	}
+	return result
 }
 
 func (a *OpenAIComputerAdapterV1) attachOpenAIComputerFinalObservationV1(
