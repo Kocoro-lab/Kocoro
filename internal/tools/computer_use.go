@@ -834,6 +834,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 			capture, visualErr := t.captureVisualOnlyObservationV1(ctx, tree)
 			if visualErr == nil {
 				result.Images = []agent.ImageBlock{capture.Image}
+				result.IsRetryable = failure.IsRetryable
 				result.GUIObservation.CoordinateActionable = false
 				if failure.GUIOutcome != nil {
 					result.GUIObservation.ActionabilityFailureCode =
@@ -871,6 +872,11 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 			return failure, nil
 		}
 		result.Content += "\nscreenshot_warning: " + failure.Content
+		result.IsRetryable = failure.IsRetryable
+		if failure.GUIOutcome != nil && result.GUIObservation != nil {
+			result.GUIObservation.ActionabilityFailureCode =
+				failure.GUIOutcome.FailureCode
+		}
 		result.GUICaptureDiagnostics = failure.GUICaptureDiagnostics
 		return result, nil
 	}
@@ -1368,7 +1374,10 @@ func (t *ComputerUseTool) preflightRef(ctx context.Context, args computerUseArgs
 	}
 	if computerUseStateID(current) != t.snapshot.id {
 		t.invalidateState()
-		return refEntry{}, agent.BusinessError("stale state detected before GUI action; call get_app_state again"), false
+		return refEntry{}, computerUsePrecommitBusinessErrorV1(
+			"stale_state",
+			"stale state detected before GUI action; call get_app_state again",
+		), false
 	}
 	return entry, agent.ToolResult{}, true
 }
@@ -1993,10 +2002,10 @@ func computerUseKeyboardTargetUnavailableReasonV1(
 	)
 }
 
-// computerUsePrecommitFailureV1 is the single classification seam for an input
-// action rejected before executeTargetBoundInput invokes the helper. These
-// failures may require a fresh observation, but they can never make the input
-// commit status unknown because no input request crossed the mutation boundary.
+// computerUsePrecommitFailureV1 is the single classification seam for a GUI
+// mutation rejected before its action helper is invoked. These failures may
+// require a fresh observation, but they can never make the commit status
+// unknown because no mutation request crossed the helper boundary.
 func computerUsePrecommitFailureV1(
 	result agent.ToolResult,
 	failureCode string,
@@ -2368,6 +2377,13 @@ func computerUseTargetBoundInputResultV1(
 	err error,
 ) (agent.ToolResult, error) {
 	if err != nil {
+		var notCommitted *TargetBoundInputNotCommittedErrorV1
+		if errors.As(err, &notCommitted) {
+			return computerUsePrecommitBusinessErrorV1(
+				"target_bound_input_not_committed",
+				notCommitted.Error()+"; re-observe before retrying",
+			), nil
+		}
 		var commitUnknown *TargetBoundInputCommitUnknownErrorV1
 		if errors.As(err, &commitUnknown) {
 			detail := commitUnknown.Error()
@@ -2443,6 +2459,9 @@ func computerUseTargetBoundInputGUIOutcomeV1(
 	}
 	if result.Status == "user_interference" {
 		outcome.Result = agent.GUIActionResultUserInterference
+		if result.InputCommitted {
+			outcome.Phase = agent.GUIActionPhaseInputCommitted
+		}
 	}
 	if result.FailureCode != nil {
 		outcome.FailureCode = *result.FailureCode

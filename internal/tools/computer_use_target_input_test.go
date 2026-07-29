@@ -303,6 +303,7 @@ func TestComputerUseTargetBoundHotkeyPropagatesPhysicalInterference(t *testing.T
 		stateID))
 	if err != nil || !result.IsError || result.GUIOutcome == nil ||
 		result.GUIOutcome.Result != agent.GUIActionResultUserInterference ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseInputCommitted ||
 		result.GUIOutcome.FailureCode != "physical_input_interference" ||
 		!strings.Contains(result.Content, "re-observe") {
 		t.Fatalf("physical interference result=%+v err=%v", result, err)
@@ -344,19 +345,37 @@ func TestComputerUseTargetBoundTypeMapsExactReadbackToVerifiedWithoutLeakingCont
 }
 
 func TestComputerUseTargetBoundTypeMapsFocusDriftToFailureWithoutPausing(t *testing.T) {
-	for _, failureCode := range []string{
-		"focused_window_mismatch",
-		"frontmost_window_mismatch",
-		"focused_element_mismatch",
+	for _, test := range []struct {
+		failureCode string
+		helperPhase string
+		wantPhase   agent.GUIActionPhase
+	}{
+		{
+			failureCode: "frontmost_window_mismatch",
+			helperPhase: "preflight",
+			wantPhase:   agent.GUIActionPhaseObserving,
+		},
+		{
+			failureCode: "focused_window_mismatch",
+			helperPhase: "action",
+			wantPhase:   agent.GUIActionPhaseActing,
+		},
+		{
+			failureCode: "focused_element_mismatch",
+			helperPhase: "action",
+			wantPhase:   agent.GUIActionPhaseActing,
+		},
 	} {
 		result := TargetBoundInputResultV1{
 			SchemaVersion: 1, Status: "failed", Action: "type",
-			InputCommitted: false, Phase: "action", FailureCode: &failureCode,
+			InputCommitted: false, Phase: test.helperPhase,
+			FailureCode: &test.failureCode,
 		}
 		outcome := computerUseTargetBoundInputGUIOutcomeV1(result)
 		if outcome.Result != agent.GUIActionResultFailed ||
-			outcome.FailureCode != failureCode {
-			t.Fatalf("%s outcome=%+v", failureCode, outcome)
+			outcome.Phase != test.wantPhase ||
+			outcome.FailureCode != test.failureCode {
+			t.Fatalf("%s outcome=%+v", test.failureCode, outcome)
 		}
 	}
 }
@@ -491,6 +510,32 @@ func TestComputerUseTargetBoundTypeRequiresFocusedRefOrCoordinateFocus(t *testin
 		!strings.Contains(result.Content, "keyboard_target_unavailable") ||
 		!strings.Contains(result.Content, "do not retry automatically") {
 		t.Fatalf("missing ref result=%+v err=%v", result, err)
+	}
+}
+
+func TestComputerUseTargetBoundInputPreWriteErrorIsNotCommitted(t *testing.T) {
+	requireComputerUseDarwin(t)
+	fake := newFakeAXCaller()
+	tool := newTestComputerUse(fake)
+	stateID := observeNotes(t, tool, fake, treeFixture("Save"))
+	fake.queue("read_tree", treeFixture("Save"))
+	tool.targetBoundInputExecutor = func(
+		context.Context,
+		TargetBoundInputRequestV1,
+	) (TargetBoundInputResultV1, error) {
+		return TargetBoundInputResultV1{},
+			newTargetBoundInputNotCommittedV1(context.Canceled)
+	}
+
+	result, err := tool.Run(context.Background(), fmt.Sprintf(
+		`{"action":"hotkey","state_id":%q,"keys":"command+c","description":"Copy"}`,
+		stateID))
+	if err != nil || !result.IsError || result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+		result.GUIOutcome.FailureCode != "target_bound_input_not_committed" ||
+		strings.Contains(result.Content, "commit status is unknown") {
+		t.Fatalf("pre-write result=%+v err=%v", result, err)
 	}
 }
 

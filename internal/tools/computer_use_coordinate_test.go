@@ -249,7 +249,8 @@ func TestComputerUseImageDimensionFallbackNeverMintsSemanticAuthority(
 		"action":"get_app_state","include_screenshot":true,
 		"description":"Keep an untrusted-dimension screenshot visual-only"
 	}`)
-	if err != nil || result.IsError || len(result.Images) != 1 {
+	if err != nil || result.IsError || !result.IsRetryable ||
+		len(result.Images) != 1 {
 		t.Fatalf("dimension fallback result=%+v err=%v", result, err)
 	}
 	if harness.tool.coordinateArtifact != nil ||
@@ -330,6 +331,41 @@ func TestComputerUseObservationFailureAndNonScreenshotClearPriorArtifact(t *test
 	}`)
 	if err != nil || plain.IsError || len(plain.Images) != 0 || harness.tool.coordinateArtifact != nil {
 		t.Fatalf("AX-only observation retained artifact: result=%+v err=%v", plain, err)
+	}
+}
+
+func TestComputerUseObservationPreservesCaptureRetryEligibility(t *testing.T) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.fake.queue("read_tree", marshalComputerUseTree(t, harness.tree))
+	harness.fake.queue(
+		"display_topology",
+		marshalDisplayTopology(t, harness.topology),
+	)
+	failure := captureWindowJSONMap(
+		t,
+		loadCoordinateFixture(
+			t,
+			"capture_coordinate_window.response.failure.v1.json",
+		),
+	)
+	failure["failure_code"] = "window_bounds_mismatch"
+	failure["retry_safe"] = true
+	harness.fake.queue(
+		"capture_coordinate_window",
+		string(marshalCaptureWindowJSON(t, failure)),
+	)
+
+	result, err := harness.tool.Run(context.Background(), `{
+		"action":"get_app_state","include_screenshot":true,
+		"description":"Observe retry-safe capture failure"
+	}`)
+	if err != nil || result.IsError || !result.IsRetryable ||
+		result.GUIObservation == nil ||
+		result.GUIObservation.ActionabilityFailureCode !=
+			"window_bounds_mismatch" ||
+		len(result.Images) != 0 {
+		t.Fatalf("retry-safe observation result=%+v err=%v", result, err)
 	}
 }
 

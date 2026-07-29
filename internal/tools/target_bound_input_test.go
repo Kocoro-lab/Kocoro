@@ -389,6 +389,25 @@ func TestAXClientTargetBoundInputV1PostWriteAmbiguityIsCommitUnknown(t *testing.
 	}
 }
 
+func TestAXClientTargetBoundInputV1PreWriteCancellationIsNotCommitted(t *testing.T) {
+	writer := &coordinateMouseTestWriter{}
+	client := coordinateMouseTestClient(writer)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.targetBoundInputV1(
+		ctx,
+		canonicalTargetBoundInputRequest(t, "type"),
+	)
+	var notCommitted *TargetBoundInputNotCommittedErrorV1
+	if !errors.As(err, &notCommitted) || !notCommitted.RetrySafe() {
+		t.Fatalf("error %T %v is not typed pre-write not_committed", err, err)
+	}
+	if writer.writeCount() != 0 {
+		t.Fatalf("pre-write cancellation wrote %d requests", writer.writeCount())
+	}
+}
+
 func canonicalTargetBoundInputRequest(t *testing.T, action string) TargetBoundInputRequestV1 {
 	t.Helper()
 	deadline := time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)

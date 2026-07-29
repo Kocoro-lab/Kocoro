@@ -300,7 +300,8 @@ func TestOpenAIComputerObservationRetryAllowsTransientImageDimensionDrift(
 		Content: "state_id: private\nscreenshot_warning: " +
 			"[transient error] computer_use_error: image_dimensions_mismatch\n" +
 			"message: the exact target window capture was rejected",
-		IsError: true,
+		IsError:     true,
+		IsRetryable: true,
 	}
 	if !retryOpenAIComputerObservationV1(result, nil) {
 		t.Fatal("transient window image dimension drift was not retried")
@@ -333,6 +334,7 @@ func TestOpenAIComputerObservationPreservesVisualOnlyActionabilityFailure(
 
 	result.GUIObservation.ActionabilityFailureCode =
 		"image_dimensions_mismatch"
+	result.IsRetryable = true
 	if !retryOpenAIComputerObservationV1(result, nil) {
 		t.Fatal("transient visual-only image dimension drift was not retried")
 	}

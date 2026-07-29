@@ -243,10 +243,10 @@ func TestClassifyOpenAIComputerRecoveryUsesStableCategories(t *testing.T) {
 		continuable bool
 	}{
 		{
-			name:        "same app authority drift reobserves",
+			name:        "preflight same app authority drift reobserves",
 			effect:      ComputerUseCommitNone,
 			result:      GUIActionResultFailed,
-			phase:       GUIActionPhaseActing,
+			phase:       GUIActionPhaseObserving,
 			failure:     "frontmost_window_mismatch",
 			want:        OpenAIComputerRecoveryReobserveSameAppV1,
 			continuable: true,
@@ -296,7 +296,7 @@ func TestClassifyOpenAIComputerRecoveryUsesStableCategories(t *testing.T) {
 		{
 			name:    "capture loss stops",
 			effect:  ComputerUseCommitNone,
-			result:  GUIActionResultFailed,
+			result:  GUIActionResultCompletedUnverified,
 			phase:   GUIActionPhaseObserving,
 			failure: "final_observation_unavailable",
 			want:    OpenAIComputerRecoveryCaptureUnavailableV1,

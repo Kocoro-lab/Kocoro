@@ -21,6 +21,7 @@ import (
 type OpenAIComputerBatchExecution struct {
 	CallID              string
 	ContinuationAllowed bool
+	MutationAttempted   bool
 	ActionEffect        ComputerUseCommitEffect
 	Result              ToolResult
 }
@@ -291,14 +292,22 @@ func ClassifyOpenAIComputerRecoveryV1(
 	if outcome == nil {
 		return OpenAIComputerRecoveryCaptureUnavailableV1
 	}
-	if outcome.Phase == GUIActionPhaseObserving {
-		return OpenAIComputerRecoveryCaptureUnavailableV1
-	}
 	if outcome.Result == GUIActionResultCancelled {
 		return OpenAIComputerRecoveryUserIntervenedV1
 	}
 	if outcome.Result == GUIActionResultUserInterference {
 		return OpenAIComputerRecoveryUserIntervenedV1
+	}
+	// A mutation helper can reject an action during its preflight authority
+	// check. That phase maps to observing, but the typed failed result still
+	// proves the current action was not committed. The daemon continuation gate
+	// separately requires one fresh exact screenshot before this category can
+	// continue.
+	if outcome.Result == GUIActionResultFailed {
+		return OpenAIComputerRecoveryReobserveSameAppV1
+	}
+	if outcome.Phase == GUIActionPhaseObserving {
+		return OpenAIComputerRecoveryCaptureUnavailableV1
 	}
 	return OpenAIComputerRecoveryReobserveSameAppV1
 }

@@ -710,12 +710,13 @@ type OpenAIComputerBatchActionExecutorV1 interface {
 }
 
 type OpenAIComputerBatchResultV1 struct {
-	CallID       string
-	Provider     string
-	APISurface   string
-	ToolContract string
-	ActionEffect agent.ComputerUseCommitEffect
-	ToolResult   agent.ToolResult
+	CallID            string
+	Provider          string
+	APISurface        string
+	ToolContract      string
+	MutationAttempted bool
+	ActionEffect      agent.ComputerUseCommitEffect
+	ToolResult        agent.ToolResult
 }
 
 // OpenAIComputerAdapterV1 is the strict executor seam and provider-schema
@@ -832,6 +833,9 @@ func (a *OpenAIComputerAdapterV1) ExecuteBatchV1(
 			APISurface: call.APISurface, ToolContract: call.ToolContract,
 			ActionID:    call.CallID + "/action/" + strconv.Itoa(index+1),
 			ActionIndex: index, ActionCount: len(call.Actions),
+		}
+		if openAIComputerActionMutatesV1(action) {
+			result.MutationAttempted = true
 		}
 		execution, executeErr := a.executor.ExecuteAuthorizedOpenAIComputerActionV1(
 			ctx,

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -99,6 +101,52 @@ func observeNotes(t *testing.T, tool *ComputerUseTool, fake *fakeAXCaller, tree 
 	}
 	t.Fatalf("observation missing state_id: %s", result.Content)
 	return ""
+}
+
+func TestComputerUseSemanticPressStaleRefIsTypedPrecommitAndCanReobserve(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	tool := newTestComputerUse(fake)
+	stateID := observeNotes(t, tool, fake, treeFixture("Save"))
+
+	fake.queue("read_tree", treeFixture("Save As"))
+	result, err := tool.Run(
+		context.Background(),
+		fmt.Sprintf(
+			`{"action":"press","state_id":%q,"ref":"e1","description":"Press Save"}`,
+			stateID,
+		),
+	)
+	if err != nil {
+		t.Fatalf("stale press: %v", err)
+	}
+	if !result.IsError ||
+		result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseActing ||
+		result.GUIOutcome.FailureCode != "stale_state" {
+		t.Fatalf("stale press outcome = %+v", result)
+	}
+	if got := fakeAXMethods(fake.calls); !reflect.DeepEqual(
+		got,
+		[]string{"resolve_pid", "read_tree", "read_tree"},
+	) {
+		t.Fatalf("stale press reached a mutation helper: %v", got)
+	}
+
+	fake.queue("resolve_pid", `{"pid":42}`)
+	fake.queue("read_tree", treeFixture("Save As"))
+	fresh, err := tool.Run(
+		context.Background(),
+		`{"action":"get_app_state","app":"Notes","description":"Re-observe Notes"}`,
+	)
+	if err != nil || fresh.IsError {
+		t.Fatalf("fresh observation result=%+v err=%v", fresh, err)
+	}
+	if strings.Contains(fresh.Content, "state_id: "+stateID) {
+		t.Fatalf("fresh observation reused stale state: %q", fresh.Content)
+	}
 }
 
 func TestComputerUse_InfoSafetyAndSerialization(t *testing.T) {

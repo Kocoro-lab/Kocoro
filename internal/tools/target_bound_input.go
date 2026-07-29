@@ -380,6 +380,25 @@ func newTargetBoundInputCommitUnknownV1(cause error) error {
 	return &TargetBoundInputCommitUnknownErrorV1{cause: cause}
 }
 
+// TargetBoundInputNotCommittedErrorV1 is returned only while the target-bound
+// input request is still local to the Go client. Once writer.Write is called,
+// transport failures remain commit-unknown because the helper may have
+// received a partial or complete mutation request.
+type TargetBoundInputNotCommittedErrorV1 struct{ cause error }
+
+func (err *TargetBoundInputNotCommittedErrorV1) Error() string {
+	return fmt.Sprintf("target_bound_input did not reach helper write: %v", err.cause)
+}
+func (err *TargetBoundInputNotCommittedErrorV1) Unwrap() error   { return err.cause }
+func (err *TargetBoundInputNotCommittedErrorV1) RetrySafe() bool { return true }
+
+func newTargetBoundInputNotCommittedV1(cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("target-bound input failed before helper write")
+	}
+	return &TargetBoundInputNotCommittedErrorV1{cause: cause}
+}
+
 func (client *AXClient) TargetBoundInputV1(
 	ctx context.Context,
 	request TargetBoundInputRequestV1,
@@ -411,13 +430,13 @@ func (client *AXClient) targetBoundInputRPCV1(
 	encode func(int64) ([]byte, error),
 ) (TargetBoundInputResultV1, error) {
 	if err := ctx.Err(); err != nil {
-		return TargetBoundInputResultV1{}, err
+		return TargetBoundInputResultV1{}, newTargetBoundInputNotCommittedV1(err)
 	}
 	if err := request.Validate(); err != nil {
-		return TargetBoundInputResultV1{}, err
+		return TargetBoundInputResultV1{}, newTargetBoundInputNotCommittedV1(err)
 	}
 	if err := client.Ensure(ctx); err != nil {
-		return TargetBoundInputResultV1{}, err
+		return TargetBoundInputResultV1{}, newTargetBoundInputNotCommittedV1(err)
 	}
 
 	id := client.nextID.Add(1)
@@ -426,7 +445,7 @@ func (client *AXClient) targetBoundInputRPCV1(
 	defer os.Remove(cancellationMarker)
 	payload, err := encode(id)
 	if err != nil {
-		return TargetBoundInputResultV1{}, err
+		return TargetBoundInputResultV1{}, newTargetBoundInputNotCommittedV1(err)
 	}
 	payload = append(payload, '\n')
 	responses := make(chan AXResponse, 1)
@@ -443,7 +462,7 @@ func (client *AXClient) targetBoundInputRPCV1(
 	if err := ctx.Err(); err != nil {
 		client.writeMu.Unlock()
 		removePending()
-		return TargetBoundInputResultV1{}, err
+		return TargetBoundInputResultV1{}, newTargetBoundInputNotCommittedV1(err)
 	}
 	written, writeErr := client.writer.Write(payload)
 	if writeErr == nil && written < len(payload) {

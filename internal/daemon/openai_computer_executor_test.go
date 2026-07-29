@@ -60,14 +60,14 @@ func TestOpenAIComputerBatchContinuationPolicyUsesStableRecoveryCategory(
 			want: true,
 		},
 		{
-			name: "same app drift can reobserve",
+			name: "preflight same app drift can reobserve from fresh image",
 			execution: agent.OpenAIComputerBatchExecution{
 				Result: agent.ToolResult{
 					IsError: true,
 					Images:  []agent.ImageBlock{image},
 					GUIOutcome: &agent.GUIActionOutcome{
 						Result:      agent.GUIActionResultFailed,
-						Phase:       agent.GUIActionPhaseActing,
+						Phase:       agent.GUIActionPhaseObserving,
 						FailureCode: "frontmost_window_mismatch",
 					},
 				},
@@ -114,8 +114,17 @@ func TestOpenAIComputerBatchContinuationPolicyUsesStableRecoveryCategory(
 			},
 		},
 		{
-			name:      "missing screenshot stops",
-			execution: agent.OpenAIComputerBatchExecution{},
+			name: "preflight failure without fresh screenshot stops",
+			execution: agent.OpenAIComputerBatchExecution{
+				Result: agent.ToolResult{
+					IsError: true,
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result:      agent.GUIActionResultFailed,
+						Phase:       agent.GUIActionPhaseObserving,
+						FailureCode: "frontmost_window_mismatch",
+					},
+				},
+			},
 		},
 		{
 			name: "executor error stops",
@@ -236,6 +245,33 @@ func TestOpenAIComputerBatchStatsAccumulateTaskEffectMonotonically(t *testing.T)
 	stats = runner.BatchStatsV1()
 	if stats.TaskEffect != agent.ComputerUseCommitUnknown {
 		t.Fatalf("unknown effect was downgraded: %+v", stats)
+	}
+}
+
+func TestOpenAIComputerBatchStatsPreserveFailedMutationEvidence(t *testing.T) {
+	runner := &daemonOpenAIComputerBatchRunnerV1{}
+	failure := agent.BusinessError("target not found")
+	failure.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: "target_not_found",
+	}
+	runner.recordBatchV1(agent.OpenAIComputerBatchExecution{
+		MutationAttempted: true,
+		ActionEffect:      agent.ComputerUseCommitNone,
+		Result:            failure,
+	}, nil)
+	runner.recordBatchV1(agent.OpenAIComputerBatchExecution{
+		ActionEffect: agent.ComputerUseCommitNone,
+		Result:       agent.ToolResult{Content: "observed"},
+	}, nil)
+
+	stats := runner.BatchStatsV1()
+	if !stats.MutationAttempted ||
+		stats.TaskEffect != agent.ComputerUseCommitNone ||
+		stats.LastFailureCode != "target_not_found" ||
+		!strings.Contains(stats.LastFailureDetail, "target not found") {
+		t.Fatalf("failed mutation evidence = %+v", stats)
 	}
 }
 
@@ -575,13 +611,25 @@ func trustedOpenAIComputerProvenanceForDaemon(
 }
 
 func openAIComputerDaemonCall(actions string) []byte {
+	return openAIComputerDaemonCallForResponse(
+		openAIComputerDaemonContinuationToken,
+		"call_daemon_001",
+		actions,
+	)
+}
+
+func openAIComputerDaemonCallForResponse(
+	responseID string,
+	callID string,
+	actions string,
+) []byte {
 	return []byte(`{
 		"type":"computer_call",
 		"provider":"openai",
 		"api_surface":"openai_responses",
 		"tool_contract":"openai.computer.v1",
-		"response_id":"` + openAIComputerDaemonContinuationToken + `",
-		"call_id":"call_daemon_001",
+		"response_id":"` + responseID + `",
+		"call_id":"` + callID + `",
 		"actions":[` + actions + `],
 		"pending_safety_checks":[],
 		"status":"completed"
@@ -883,6 +931,7 @@ func TestDaemonOpenAIComputerExecutorRetriesFinalObservationWithoutReplayingActi
 				Content: "state_id: must-not-escape\nref=e17\nscreenshot_warning: " +
 					"[transient error] computer_use_error: capture_timeout\n" +
 					"message: the exact window capture timed out",
+				IsRetryable: true,
 			},
 			{
 				Content: "observed",
@@ -925,6 +974,7 @@ func TestDaemonOpenAIComputerExecutorReportsCommittedBatchAsUnverifiedWhenFinalO
 		Content: "state_id: must-not-escape\nref=e17\nscreenshot_warning: " +
 			"[transient error] computer_use_error: capture_timeout\n" +
 			"message: the exact window capture timed out",
+		IsRetryable: true,
 	}
 
 	result, err := adapter.ExecuteBatchV1(
@@ -1517,6 +1567,144 @@ func TestDaemonOpenAIComputerBatchRunnerBridgesAgentLoopToGuardedWorkflow(t *tes
 	}
 }
 
+func TestOpenAIComputerTaskReplansAfterPreflightNotCommittedActionWithEarlierCommit(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-current-action-outcome",
+		"turn-openai-current-action-outcome",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	notCommitted := agent.BusinessError(
+		"the current target changed before text input",
+	)
+	notCommitted.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseObserving,
+		FailureCode: "frontmost_window_mismatch",
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.apple.Notes",
+		targetAppName:  "Notes",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "clicked",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "ZnJlc2gtc3RhdGU=",
+				}},
+			},
+		},
+		resultQueues: map[string][]agent.ToolResult{
+			"type": {
+				notCommitted,
+				{
+					Content: "typed after replanning",
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result: agent.GUIActionResultVerified,
+						Phase:  agent.GUIActionPhaseVerifying,
+					},
+				},
+			},
+		},
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	firstCall := openAIComputerDaemonCall(
+		`{"type":"click","button":"left","x":10,"y":20},` +
+			`{"type":"type","text":"draft"}`,
+	)
+	secondResponseID := "shct_pOIBMOn2gmZdU7TJZm93xdhEM1SNRTRle-n9A0mz76h"
+	secondCall := openAIComputerDaemonCallForResponse(
+		secondResponseID,
+		"call_daemon_current_action_replan",
+		`{"type":"type","text":"draft"}`,
+	)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(firstCall),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			secondResponseID,
+			string(secondCall),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_current_action_done",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Draft completed after replanning.\"}"}`,
+			`{"status":"completed","summary":"Draft completed after replanning."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     5,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Complete the draft in Notes","controlled_apps":["Notes"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if result.IsError ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitKnown {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,type,final_screenshot,type,final_screenshot" {
+		t.Fatalf("desktop run order = %q", got)
+	}
+	if len(llm.requests) != 3 {
+		t.Fatalf("provider requests = %d, want 3", len(llm.requests))
+	}
+	blocks := llm.requests[1].Messages[len(llm.requests[1].Messages)-1].Content.Blocks()
+	if len(blocks) != 1 || blocks[0].Type != "tool_result" ||
+		!blocks[0].IsError {
+		t.Fatalf("first continuation result block = %#v", blocks)
+	}
+	nested, ok := blocks[0].ToolContent.([]client.ContentBlock)
+	if !ok || len(nested) != 2 ||
+		nested[0].Type != "image" ||
+		nested[1].Type != "text" ||
+		nested[1].Text !=
+			`kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"committed","gui_outcome":{"result":"failed","phase":"observing","failure_code":"frontmost_window_mismatch"}}` {
+		t.Fatalf("first continuation tool content = %#v", blocks[0].ToolContent)
+	}
+}
+
 func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *testing.T) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
 	workflow := testGUIWorkflow(
@@ -1907,7 +2095,8 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 					"[transient error] computer_use_error: window_changed\n" +
 					"message: Calculator's window changed during capture\n" +
 					"recovery: stop moving or resizing the window, then retry once",
-				IsError: true,
+				IsError:     true,
+				IsRetryable: true,
 			},
 		},
 	}
@@ -2130,6 +2319,7 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 			"[business error] computer_use_error: window_not_found\n" +
 			"message: Calculator has no unique capturable window\n" +
 			"recovery: open one normal app window, bring it forward, and retry",
+		IsRetryable: true,
 	}
 	initialSuccess := agent.ToolResult{
 		Content: "observed",
@@ -2147,6 +2337,7 @@ func TestOpenAIComputerTaskToolWaitsForColdAppInitialWindow(
 		CoordinateActionable:     false,
 		ActionabilityFailureCode: "image_dimensions_mismatch",
 	}
+	initialVisualOnly.IsRetryable = true
 	probe := &openAIComputerDaemonProbeTool{
 		targetBundleID: "com.example.calculator",
 		targetAppName:  "Calculator",
@@ -2254,7 +2445,8 @@ func TestOpenAIComputerTaskToolRecoversInitialDisplayBeforeProviderAction(
 	defer workflow.EndTurn()
 
 	displayFailure := agent.ToolResult{
-		Content: "observed visual-only display geometry",
+		Content:     "observed visual-only display geometry",
+		IsRetryable: true,
 		Images: []agent.ImageBlock{{
 			MediaType: "image/png",
 			Data:      "ZGlzcGxheS1mYWlsdXJl",
@@ -2377,7 +2569,8 @@ func TestOpenAIComputerTaskToolStopsAfterSecondInitialDisplayFailure(
 	defer workflow.EndTurn()
 
 	displayFailure := agent.ToolResult{
-		Content: "observed visual-only display geometry",
+		Content:     "observed visual-only display geometry",
+		IsRetryable: true,
 		Images: []agent.ImageBlock{{
 			MediaType: "image/png",
 			Data:      "ZGlzcGxheS1mYWlsdXJl",
@@ -2456,7 +2649,7 @@ func TestOpenAIComputerObservationAcceptsSemanticAuthorityOnlyForBackgroundLane(
 		allowSemantic bool
 		wantAttempts  int
 	}{
-		{name: "foreground", allowSemantic: false, wantAttempts: 2},
+		{name: "foreground", allowSemantic: false, wantAttempts: 1},
 		{name: "background semantic", allowSemantic: true, wantAttempts: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -2481,7 +2674,7 @@ func TestOpenAIComputerObservationAcceptsSemanticAuthorityOnlyForBackgroundLane(
 	}
 }
 
-func TestOpenAIComputerInitialDisplayRecoveryStopsAfterOneObservationOnlyRetry(
+func TestOpenAIComputerInitialDisplayDoesNotOverrideNonRetryableHelperResult(
 	t *testing.T,
 ) {
 	displayFailure := agent.ToolResult{
@@ -2509,8 +2702,8 @@ func TestOpenAIComputerInitialDisplayRecoveryStopsAfterOneObservationOnlyRetry(
 	if err != nil {
 		t.Fatalf("initial observation: %v", err)
 	}
-	if attempts != 2 {
-		t.Fatalf("display observation attempts = %d, want 2", attempts)
+	if attempts != 1 {
+		t.Fatalf("display observation attempts = %d, want 1", attempts)
 	}
 	if got := openAIComputerTraceFailureCodeV1(result, nil); got !=
 		"display_not_actionable" {
@@ -2528,6 +2721,7 @@ func TestOpenAIComputerInitialDisplayRecoveryContinuesAfterActionableSecondObser
 	t *testing.T,
 ) {
 	displayFailure := agent.ToolResult{
+		IsRetryable: true,
 		Images: []agent.ImageBlock{{
 			MediaType: "image/png",
 			Data:      "ZGlzcGxheS1mYWlsdXJl",
@@ -2671,15 +2865,19 @@ func TestOpenAIComputerObservationRequiresExplicitActionabilityProof(
 func TestOpenAIComputerObservationRetryPolicySeparatesIdentityDrift(
 	t *testing.T,
 ) {
-	if retryableOpenAIComputerObservationFailureCodeV1(
-		"process_identity_mismatch",
-	) {
-		t.Fatal("an exact process identity mismatch cannot heal by repeating capture")
+	identityDrift := agent.BusinessError("window identity changed")
+	identityDrift.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultFailed,
+		Phase:       agent.GUIActionPhaseObserving,
+		FailureCode: "window_identity_mismatch",
 	}
-	if !retryableOpenAIComputerObservationFailureCodeV1(
-		"window_identity_mismatch",
-	) {
-		t.Fatal("a transient window transition should remain observation-retryable")
+	if retryOpenAIComputerObservationV1(identityDrift, nil) {
+		t.Fatal("daemon must not override helper retry_safe=false by failure code")
+	}
+	transientCapture := identityDrift
+	transientCapture.IsRetryable = true
+	if !retryOpenAIComputerObservationV1(transientCapture, nil) {
+		t.Fatal("helper retry_safe=true must remain observation-retryable")
 	}
 }
 
@@ -2818,7 +3016,8 @@ func TestOpenAIComputerTaskToolAcceptsVisualSuccessAfterDynamicWindowCaptureSett
 		Content: "state_id: must-not-escape\nscreenshot_warning: " +
 			"[transient error] computer_use_error: image_dimensions_mismatch\n" +
 			"message: the exact target window capture was rejected",
-		IsError: true,
+		IsError:     true,
+		IsRetryable: true,
 	}
 	final := agent.ToolResult{
 		Content: "observed",
@@ -2937,6 +3136,7 @@ func TestOpenAIComputerTaskToolReturnsUnverifiedInsteadOfFailureWhenFinalObserva
 		Content: "state_id: must-not-escape\nref=e17\nscreenshot_warning: " +
 			"[transient error] computer_use_error: capture_timeout\n" +
 			"message: the exact window capture timed out",
+		IsRetryable: true,
 	}
 	probe := &openAIComputerDaemonProbeTool{
 		targetBundleID: "com.example.calculator",
@@ -3429,7 +3629,7 @@ func TestOpenAIComputerTaskToolRejectsCompletionClaimWithoutAnyDesktopAction(
 	}
 }
 
-func TestOpenAIComputerTaskToolAcceptsScreenshotVerifiedCompletionAfterFailedBatch(
+func TestOpenAIComputerTaskToolRejectsScreenshotOnlyCompletionAfterFailedMutation(
 	t *testing.T,
 ) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
@@ -3508,7 +3708,10 @@ func TestOpenAIComputerTaskToolAcceptsScreenshotVerifiedCompletionAfterFailedBat
 	if err != nil {
 		t.Fatalf("task Run: %v", err)
 	}
-	if result.IsError || result.Content != "Calculator visibly shows 6." {
+	if result.IsError || result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskUnverified ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		!strings.Contains(result.Content, "target_not_found") {
 		t.Fatalf("task result = %+v", result)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=

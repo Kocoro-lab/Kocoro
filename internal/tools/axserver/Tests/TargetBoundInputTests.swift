@@ -310,6 +310,7 @@ final class TargetBoundInputTests: XCTestCase {
 
         XCTAssertEqual(result.status, "failed")
         XCTAssertEqual(result.failureCode, "frontmost_window_mismatch")
+        XCTAssertEqual(result.phase, "preflight")
         XCTAssertFalse(result.inputCommitted)
         XCTAssertFalse(result.clipboardTouched)
         XCTAssertEqual(harness.prepareClipboardCount, 0)

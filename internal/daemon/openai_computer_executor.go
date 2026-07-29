@@ -57,6 +57,7 @@ type daemonOpenAIComputerBatchRunnerV1 struct {
 // reports the judgment through openAIComputerTaskOutcomeV1.
 type openAIComputerBatchStatsV1 struct {
 	Batches                         int
+	MutationAttempted               bool
 	LastFailureDetail               string
 	LastFailureCode                 string
 	LastGUIResult                   agent.GUIActionResult
@@ -73,8 +74,12 @@ func (r *daemonOpenAIComputerBatchRunnerV1) recordBatchV1(
 	r.statsMu.Lock()
 	defer r.statsMu.Unlock()
 	r.stats.Batches++
-	r.stats.LastFailureCode =
-		openAIComputerTraceFailureCodeV1(execution.Result, err)
+	r.stats.MutationAttempted =
+		r.stats.MutationAttempted || execution.MutationAttempted
+	if err != nil || execution.Result.IsError {
+		r.stats.LastFailureCode =
+			openAIComputerTraceFailureCodeV1(execution.Result, err)
+	}
 	r.stats.LastGUIResult = ""
 	if execution.Result.GUIOutcome != nil {
 		r.stats.LastGUIResult = execution.Result.GUIOutcome.Result
@@ -293,9 +298,10 @@ func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 	result, executeErr := tools.NewOpenAIComputerAdapterV1(executor).
 		ExecuteBatchV1(ctx, payload)
 	execution = agent.OpenAIComputerBatchExecution{
-		CallID:       result.CallID,
-		ActionEffect: result.ActionEffect,
-		Result:       result.ToolResult,
+		CallID:            result.CallID,
+		MutationAttempted: result.MutationAttempted,
+		ActionEffect:      result.ActionEffect,
+		Result:            result.ToolResult,
 	}
 	execution.ContinuationAllowed =
 		openAIComputerBatchContinuationAllowedV1(execution, executeErr)
