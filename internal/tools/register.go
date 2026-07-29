@@ -428,6 +428,9 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 		rootCandidates := mcp.DefaultWorkspaceRootCandidates(config.ShannonDir())
 		rootCandidates = append(rootCandidates, cfg.MCP.WorkspaceRoots...)
 		mcpMgr.SetRootsHandler(mcp.NewRootsHandler(rootCandidates))
+		if cfg.MCP.ToolTimeoutSecs > 0 {
+			mcpMgr.SetToolCallTimeout(time.Duration(cfg.MCP.ToolTimeoutSecs) * time.Second)
+		}
 		mcpTools, mcpErr := mcpMgr.ConnectAll(ctx, mcpServers)
 		if mcpErr != nil {
 			log.Printf("MCP connection warning: %v", mcpErr)
@@ -550,6 +553,9 @@ func CompleteRegistrationAsync(ctx context.Context, gw *client.GatewayClient, cf
 		rootCandidates := mcp.DefaultWorkspaceRootCandidates(config.ShannonDir())
 		rootCandidates = append(rootCandidates, cfg.MCP.WorkspaceRoots...)
 		mcpMgr.SetRootsHandler(mcp.NewRootsHandler(rootCandidates))
+		if cfg.MCP.ToolTimeoutSecs > 0 {
+			mcpMgr.SetToolCallTimeout(time.Duration(cfg.MCP.ToolTimeoutSecs) * time.Second)
+		}
 		// Pre-register all configs so supervisor.Start (called by daemon
 		// between this return and StartMCPFunc invocation) sees the full
 		// server set and creates per-server probe entries.

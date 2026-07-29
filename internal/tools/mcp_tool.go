@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -141,6 +142,22 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		}
 	}
 
+	// Known-dead dispatch gate: when the supervisor has already marked this
+	// server disconnected (subprocess died or wedged while idle), reconcile
+	// via ProbeNow BEFORE dispatching instead of discovering the corpse
+	// mid-call. Without this, the call lands on the stale client and blocks
+	// until the per-call timeout — 2026-07-29 incident: google-workspace was
+	// marked disconnected at 11:53, a 14:11 tool call sat ~6.5 minutes on
+	// the dead pipe before erroring, while the eventual reconnect took 12s.
+	// ProbeNow re-probes transport and, only if still disconnected, attempts
+	// an on-demand reconnect (bounded: 10s probe + 15s reconnect).
+	if t.supervisor != nil {
+		if h := t.supervisor.HealthFor(t.serverName); h.State == mcp.StateDisconnected {
+			log.Printf("[mcp-tool] %s/%s: server known-disconnected, probing before dispatch", t.serverName, t.tool.Name)
+			t.supervisor.ProbeNow(t.serverName)
+		}
+	}
+
 	// Relative output filenames for known file-producing MCP tools: if the
 	// caller passed a bare name ("snapshot.md"), rewrite it to an absolute
 	// path under the session CWD so both the MCP server and our subsequent
@@ -148,22 +165,23 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	rewrittenOutPath := maybeRewriteFileProducingArg(ctx, t.serverName, t.tool.Name, args)
 
 	content, isError, err := t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
-	if err != nil && t.supervisor != nil {
-		// Connection dead — attempt on-demand reconnect and retry once.
-		h := t.supervisor.HealthFor(t.serverName)
-		if h.State == mcp.StateDisconnected {
-			log.Printf("[mcp-tool] %s/%s: connection dead, triggering on-demand reconnect", t.serverName, t.tool.Name)
-			// Re-ensure Chrome CDP is available before reconnecting — Chrome may
-			// have died along with the MCP connection.
-			if t.serverName == "playwright" {
-				if cfg, ok := t.manager.ConfigFor(t.serverName); ok && isPlaywrightCDPMode(cfg) {
-					_ = ensureChromeDebugPort(playwrightCDPPort(cfg))
-				}
+	if err != nil && t.supervisor != nil && ctx.Err() == nil {
+		// Call failed at the transport/protocol level. Probe for FRESH health
+		// evidence (the cached state may predate the failure — or, after the
+		// pre-dispatch gate above, postdate the connection's death) and retry
+		// once if the server comes back healthy. Skipped when ctx is already
+		// cancelled: a retry after user interrupt is wasted work.
+		log.Printf("[mcp-tool] %s/%s: call failed (%v), probing for on-demand reconnect", t.serverName, t.tool.Name, err)
+		// Re-ensure Chrome CDP is available before reconnecting — Chrome may
+		// have died along with the MCP connection.
+		if t.serverName == "playwright" {
+			if cfg, ok := t.manager.ConfigFor(t.serverName); ok && isPlaywrightCDPMode(cfg) {
+				_ = ensureChromeDebugPort(playwrightCDPPort(cfg))
 			}
-			reconHealth := t.supervisor.ProbeNow(t.serverName)
-			if reconHealth.State == mcp.StateHealthy {
-				content, isError, err = t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
-			}
+		}
+		reconHealth := t.supervisor.ProbeNow(t.serverName)
+		if reconHealth.State == mcp.StateHealthy {
+			content, isError, err = t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
 		}
 	}
 	if err != nil {
@@ -176,6 +194,12 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	}
 	if !isError && rewrittenOutPath != "" {
 		content = annotateAbsPath(content, rewrittenOutPath)
+	}
+	if !isError {
+		// Translate server-relative artifact links (e.g. playwright's
+		// first-root-relative screenshot paths) to absolute paths the model
+		// can act on. No-op for servers with unknown path semantics.
+		content = maybeAnnotateResultPaths(t.serverName, content, t.manager)
 	}
 	return agent.ToolResult{Content: content, IsError: isError}, nil
 }
@@ -196,18 +220,43 @@ func (t *MCPTool) ServerName() string { return t.serverName }
 // missing, or arg has an unexpected type). This is a best-effort helper —
 // a failed rewrite is never fatal; the call continues with original args.
 func maybeRewriteFileProducingArg(ctx context.Context, serverName, toolName string, args map[string]any) string {
-	argNames, ok := fileProducingMCPArgs[serverName+"/"+toolName]
+	key := serverName + "/" + toolName
+	argNames, ok := fileProducingMCPArgs[key]
 	if !ok {
 		return ""
 	}
-	cwd := cwdctx.FromContext(ctx)
-	if cwd == "" || !filepath.IsAbs(cwd) {
+	// Target directory precedence: artifact scratch dir (daemon-served runs;
+	// keeps machine-generated intermediates out of user-visible folders like
+	// ~/Desktop) > session CWD (TUI / one-shot CLI, where artifacts belong in
+	// the working directory). Absolute model-supplied paths always win below.
+	targetDir := cwdctx.ArtifactDirFromContext(ctx)
+	if targetDir == "" || !filepath.IsAbs(targetDir) {
+		targetDir = cwdctx.FromContext(ctx)
+	}
+	if targetDir == "" || !filepath.IsAbs(targetDir) {
 		return ""
 	}
 	for _, name := range argNames {
 		raw, present := args[name]
 		if !present {
-			continue
+			// Missing output filename: the server would pick its own default
+			// location and report a path relative to its own workspace — the
+			// ambiguity behind the 2026-07-29 whole-disk search. Inject a
+			// deterministic absolute name in the artifact dir instead. Only
+			// when an artifact dir is present: CWD-only runs keep the legacy
+			// no-injection behavior (the server default + result translation
+			// cover them).
+			if cwdctx.ArtifactDirFromContext(ctx) == "" {
+				continue
+			}
+			def := defaultOutputName(key, args)
+			if def == "" {
+				continue
+			}
+			abs := filepath.Join(targetDir, def)
+			_ = os.MkdirAll(filepath.Dir(abs), 0o755)
+			args[name] = abs
+			return abs
 		}
 		s, isStr := raw.(string)
 		if !isStr {
@@ -238,31 +287,57 @@ func maybeRewriteFileProducingArg(ctx context.Context, serverName, toolName stri
 				expanded = filepath.Join(home, strings.TrimPrefix(trimmed, "~/"))
 			}
 			expanded = filepath.Clean(expanded)
+			// Best-effort parent creation: playwright-mcp does not create
+			// missing directories and fails with ENOENT.
+			_ = os.MkdirAll(filepath.Dir(expanded), 0o755)
 			args[name] = expanded
 			return expanded
 		}
 		if filepath.IsAbs(trimmed) {
 			continue
 		}
-		// Reject anything that tries to climb out of the session CWD. Keeping
-		// the rewrite inside the session sandbox avoids accidentally aiming
-		// the MCP server at (say) ~/.ssh. Also reject values that resolve to
-		// the session CWD itself (".", "./", trailing ".."): the MCP server
-		// needs a real filename, and passing the directory path would produce
+		// Reject anything that tries to climb out of the target dir. Keeping
+		// the rewrite inside the sandbox avoids accidentally aiming the MCP
+		// server at (say) ~/.ssh. Also reject values that resolve to the
+		// target dir itself (".", "./", trailing ".."): the MCP server needs
+		// a real filename, and passing the directory path would produce
 		// malformed artifacts. On reject we fall through (empty return); the
 		// original relative value still goes to the server, which will use its
 		// own CWD — behavior unchanged from pre-fix for that edge case.
-		abs := filepath.Clean(filepath.Join(cwd, trimmed))
-		if abs == cwd {
+		abs := filepath.Clean(filepath.Join(targetDir, trimmed))
+		if abs == targetDir {
 			continue
 		}
-		if !strings.HasPrefix(abs+string(filepath.Separator), cwd+string(filepath.Separator)) {
+		if !strings.HasPrefix(abs+string(filepath.Separator), targetDir+string(filepath.Separator)) {
 			continue
 		}
+		// Parent creation fixes the 2026-07-29 ENOENT on nested names like
+		// ".playwright-mcp/snapshot.md" — the server does not mkdir for us.
+		_ = os.MkdirAll(filepath.Dir(abs), 0o755)
 		args[name] = abs
 		return abs
 	}
 	return ""
+}
+
+// defaultOutputName returns the deterministic filename injected when the
+// model omits the output arg of a file-producing MCP tool, or "" for tools
+// without a default. The timestamp keeps repeated captures from overwriting
+// each other.
+func defaultOutputName(key string, args map[string]any) string {
+	var stem, ext string
+	switch key {
+	case "playwright/browser_take_screenshot":
+		stem, ext = "screenshot", ".png"
+		if t, _ := args["type"].(string); strings.EqualFold(t, "jpeg") {
+			ext = ".jpeg"
+		}
+	case "playwright/browser_snapshot":
+		stem, ext = "snapshot", ".md"
+	default:
+		return ""
+	}
+	return stem + "-" + time.Now().Format("20060102-150405.000") + ext
 }
 
 // annotateAbsPath ensures a "Saved to: <abs>" line is present in an MCP tool

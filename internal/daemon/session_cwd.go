@@ -63,7 +63,20 @@ func isCloudSource(source string) bool {
 // filepath.Clean defensively to keep any future ID format change from
 // escaping the tmp root.
 func ensureCloudSessionTmpDir(shannonDir, sessionID, source string) (string, error) {
-	if shannonDir == "" || sessionID == "" || !isCloudSource(source) {
+	if !isCloudSource(source) {
+		return "", nil
+	}
+	return ensureSessionScratchDir(shannonDir, sessionID)
+}
+
+// ensureSessionScratchDir creates (or confirms) the per-session scratch
+// directory <shannonDir>/tmp/sessions/<sessionID>/ without any source gate.
+// Cloud sources use it as their effective CWD (via ensureCloudSessionTmpDir);
+// every other daemon-served run uses it as the artifact scratch dir — the
+// default landing zone for file-producing MCP artifacts, keeping
+// machine-generated intermediates out of user-visible folders like ~/Desktop.
+func ensureSessionScratchDir(shannonDir, sessionID string) (string, error) {
+	if shannonDir == "" || sessionID == "" {
 		return "", nil
 	}
 	// filepath.Join+Clean flattens any embedded "../" attempts; combined with
@@ -74,7 +87,7 @@ func ensureCloudSessionTmpDir(shannonDir, sessionID, source string) (string, err
 		return "", fmt.Errorf("session id %q escapes tmp sessions root", sessionID)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create cloud session cwd: %w", err)
+		return "", fmt.Errorf("create session scratch dir: %w", err)
 	}
 	return dir, nil
 }

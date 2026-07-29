@@ -2533,6 +2533,27 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	ctx = cwdctx.WithSessionCWD(ctx, effectiveCWD)
 
+	// Artifact scratch dir: default landing zone for file-producing MCP
+	// artifacts (screenshots, snapshots) so machine-generated intermediates
+	// never pile up in user-visible folders like ~/Desktop — the Desktop
+	// default CWD is a READ context ("stuff in front of me"), not a dump
+	// site. Cloud runs already work out of the per-session scratch (their
+	// effective CWD); every other daemon-served run gets the same
+	// per-session dir without touching the effective CWD. Deliverables go
+	// wherever the model addresses them with an absolute path. TUI/one-shot
+	// runs never reach this path and keep artifacts in their working dir.
+	artifactDir := cloudSessionCWD
+	if artifactDir == "" {
+		if dir, err := ensureSessionScratchDir(deps.ShannonDir, sess.ID); err != nil {
+			log.Printf("daemon: failed to allocate artifact scratch for %s: %v", sess.ID, err)
+		} else if dir != "" {
+			artifactDir = dir
+		}
+	}
+	if artifactDir != "" {
+		ctx = cwdctx.WithArtifactDir(ctx, artifactDir)
+	}
+
 	// Wrap the transport handler with a bus-emitting handler so every run
 	// publishes progress events regardless of transport. See
 	// docs/superpowers/specs/2026-04-23-event-bus-progress-coverage-design.md.
@@ -3128,11 +3149,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 	sessMgr.OnSessionClose(sess.ID, func() { _ = filePreview.Close() })
-	if cloudSessionCWD != "" {
+	if artifactDir != "" {
 		// Reclaim the per-session scratch dir when the session is closed
 		// (SessionCache eviction, daemon shutdown). Artifacts live across turns
-		// of the same session but don't accumulate across sessions.
-		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(cloudSessionCWD))
+		// of the same session but don't accumulate across sessions. Covers
+		// both the cloud-source CWD scratch and the artifact scratch — for
+		// cloud runs they are the same directory.
+		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(artifactDir))
 	}
 	// Tear down per-session suggestion state on explicit session close
 	// (session delete/switch, TUI quit, daemon shutdown). Forget drops the

@@ -127,6 +127,7 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	if strings.TrimSpace(args.Description) == "" {
 		return agent.ValidationError("file_read: missing required `description` parameter"), nil
 	}
+	origPath := args.Path
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.Path)
 	if resolveErr != nil {
 		if errors.Is(resolveErr, cwdctx.ErrNoSessionCWD) {
@@ -137,6 +138,19 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		return agent.ValidationError(fmt.Sprintf("file_read: %v", resolveErr)), nil
 	}
 	args.Path = resolved
+
+	// Just-in-time lost-artifact hint: a relative path (or one naming the
+	// playwright artifact dir) that misses is almost always an MCP artifact
+	// the model resolved against the wrong base. Point it at the workspace
+	// roots instead of letting it improvise a filesystem-wide search.
+	if _, statErr := os.Stat(args.Path); statErr != nil && os.IsNotExist(statErr) {
+		if hint := lostMCPArtifactHint(origPath); hint != "" {
+			return agent.ToolResult{
+				Content: fmt.Sprintf("error reading file: %v\n\n%s", statErr, hint),
+				IsError: true,
+			}, nil
+		}
+	}
 
 	// Image files: return as vision image block instead of text lines.
 	ext := strings.ToLower(filepath.Ext(args.Path))

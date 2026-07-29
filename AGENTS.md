@@ -53,6 +53,8 @@ Agent names must match `^[a-z0-9][a-z0-9_-]{0,63}$`. Validate before path constr
 
 Tool priority is local tools, then MCP tools, then gateway tools. Deduplicate by name. Skill `allowed-tools` is enforced at execution time, not by schema filtering, to keep prompt-cache tool arrays stable.
 
+MCP tool dispatch is resilience-guarded: a supervisor-known-disconnected server is probed and reconnected before the call is sent (never dispatch onto a known-dead connection), every tools/call attempt is bounded by per-server `tool_timeout_secs` falling back to `mcp.tool_timeout_secs` (default 300s), and a failed call probes fresh health and retries once. Artifact paths from file-producing MCP servers are made unambiguous on both sides: results from servers with known path semantics (playwright, or any server with `workspace_base`) get "Saved to:" absolute-path annotations for files that verifiably exist, and output filenames default into the per-session artifact scratch dir (`~/.shannon/tmp/sessions/<id>/`) on daemon-served runs so intermediates stay out of user-visible folders.
+
 Skill-exempt tools must be pure infrastructure with no external side effects. Do not exempt side-effecting tools from skill restrictions.
 
 Tool exposure resolves per tool: explicit `ToolExposure` first, then source

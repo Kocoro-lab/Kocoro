@@ -61,6 +61,68 @@ func TestMCPTool_Run_ReconnectOnDisconnected(t *testing.T) {
 	}
 }
 
+// --- Test: known-disconnected server is probed BEFORE dispatch ---
+//
+// 2026-07-29 incident: google-workspace was marked disconnected at 11:53; a
+// 14:11 tool call was dispatched onto the stale connection anyway and sat
+// ~6.5 minutes on the dead pipe before the transport error surfaced (the
+// eventual reconnect then took 12 seconds). The dispatch path must consult
+// supervisor health FIRST and reconcile via ProbeNow, not discover the
+// corpse mid-call.
+func TestMCPTool_Run_ProbesKnownDisconnectedBeforeDispatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("gws", mcp.MCPServerConfig{Command: "dummy"})
+
+	sup := mcp.NewSupervisor(mgr)
+	sup.Start(ctx)
+	defer sup.Stop()
+
+	// Initial probe fails (no client) → StateDisconnected.
+	time.Sleep(100 * time.Millisecond)
+	if h := sup.HealthFor("gws"); h.State != mcp.StateDisconnected {
+		t.Fatalf("precondition: expected disconnected, got %v", h.State)
+	}
+
+	// Seed a fully working client. Supervisor state is now stale — the same
+	// dispatch-vs-health disagreement as the incident. The gate's contract:
+	// when health says disconnected, resolve it via ProbeNow before the
+	// first CallTool ever fires.
+	fake := &countingSuccessClient{}
+	mgr.SeedClient("gws", fake)
+
+	mt := NewMCPTool("gws", mcpgo.Tool{Name: "search_files"}, mgr)
+	mt.SetSupervisor(sup)
+
+	result, err := mt.Run(ctx, `{"q":"x"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success, got error result: %s", result.Content)
+	}
+	if got := fake.callToolCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 dispatch, got %d", got)
+	}
+	// The pre-dispatch probe must have reconciled the stale health state.
+	if h := sup.HealthFor("gws"); h.State != mcp.StateHealthy {
+		t.Fatalf("expected pre-dispatch probe to mark server healthy, got %v", h.State)
+	}
+}
+
+// countingSuccessClient is successCallToolClient plus a CallTool counter.
+type countingSuccessClient struct {
+	successCallToolClient
+	callToolCount atomic.Int32
+}
+
+func (c *countingSuccessClient) CallTool(ctx context.Context, r mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	c.callToolCount.Add(1)
+	return c.successCallToolClient.CallTool(ctx, r)
+}
+
 // --- Test 2: No cache → disconnected server tools NOT injected ---
 
 func TestRebuildRegistryForHealth_DisconnectedNoCache(t *testing.T) {
