@@ -130,6 +130,27 @@ final class SemanticScrollV1Tests: XCTestCase {
         XCTAssertEqual(afterResult.commitState, "committed")
     }
 
+    func testBackgroundScrollIgnoresOtherAppInputButStopsIfTargetBecomesFrontmost() {
+        let background = ScrollHarness(
+            values: [0.2, 0.3],
+            snapshots: [ScrollHarness.snapshot(heldModifierFlags: 1)],
+            frontmostPID: 7)
+        let result = runSemanticScrollV1(
+            request: request(interferencePolicy: "target_foreground"),
+            dependencies: background.dependencies(now: now))
+        XCTAssertEqual(result.status, "verified")
+        XCTAssertEqual(background.actions, ["AXIncrement"])
+        XCTAssertEqual(background.snapshots.count, 1)
+
+        let foreground = ScrollHarness(values: [0.2], frontmostPID: 42)
+        let blocked = runSemanticScrollV1(
+            request: request(interferencePolicy: "target_foreground"),
+            dependencies: foreground.dependencies(now: now))
+        XCTAssertEqual(blocked.status, "failed")
+        XCTAssertEqual(blocked.failureCode, "target_became_frontmost")
+        XCTAssertEqual(foreground.actions.count, 0)
+    }
+
     func testCommitDeadlineIsRecheckedBeforeEverySemanticStep() {
         var actionCommitted = false
         var postActionNowCalls = 0
@@ -180,7 +201,9 @@ final class SemanticScrollV1Tests: XCTestCase {
         XCTAssertEqual(after.actions.count, 1)
     }
 
-    private func request(steps: Int = 1) -> SemanticScrollRequestV1 {
+    private func request(
+        steps: Int = 1, interferencePolicy: String = "global_physical"
+    ) -> SemanticScrollRequestV1 {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return .init(
@@ -188,6 +211,7 @@ final class SemanticScrollV1Tests: XCTestCase {
             ref: "e3", path: "window[0]/AXScrollArea[0]",
             expectedRole: "AXScrollArea", expectedFingerprint: "axf_scroll_target",
             axis: "vertical", direction: "increment", steps: steps,
+            interferencePolicy: interferencePolicy,
             commitDeadlineAt: formatter.string(from: now.addingTimeInterval(1)))
     }
 }
@@ -205,6 +229,7 @@ private final class ScrollHarness {
     let cancelled: () -> Bool
     let targetTimeoutUnavailable: Bool
     let fingerprintTimeoutUnavailable: Bool
+    let frontmostPID: Int?
 
     init(
         values: [Double], bundleID: String? = "com.apple.Notes",
@@ -215,7 +240,8 @@ private final class ScrollHarness {
             repeating: ScrollHarness.snapshot(), count: 100),
         cancelled: @escaping () -> Bool = ScrollHarness.neverCancelled,
         targetTimeoutUnavailable: Bool = false,
-        fingerprintTimeoutUnavailable: Bool = false
+        fingerprintTimeoutUnavailable: Bool = false,
+        frontmostPID: Int? = 7
     ) {
         self.values = values
         self.bundleID = bundleID
@@ -226,6 +252,7 @@ private final class ScrollHarness {
         self.cancelled = cancelled
         self.targetTimeoutUnavailable = targetTimeoutUnavailable
         self.fingerprintTimeoutUnavailable = fingerprintTimeoutUnavailable
+        self.frontmostPID = frontmostPID
     }
 
     func dependencies(
@@ -262,6 +289,7 @@ private final class ScrollHarness {
                 if self.fingerprintTimeoutUnavailable { return .timeoutUnavailable }
                 return .count(self.fingerprintCount)
             },
+            frontmostPID: { self.frontmostPID },
             observePhysicalInput: {
                 self.snapshots.isEmpty ? nil : self.snapshots.removeFirst()
             },

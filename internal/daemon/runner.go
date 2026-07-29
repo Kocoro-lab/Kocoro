@@ -1486,6 +1486,9 @@ type ServerDeps struct {
 	// daemon tool wrappers. Production leaves this nil and resolves
 	// guicontrol.ProcessCoordinator; tests may inject an isolated coordinator.
 	ComputerUseCoordinator *guicontrol.Coordinator
+	// ComputerUsePreview is the process-memory last-frame seam shared with the
+	// trusted local Desktop. It is nil-safe for CLI and isolated tests.
+	ComputerUsePreview *ComputerUsePreviewStore
 	// ComputerUseAppPolicy is the process-wide Ask/Blocked policy store shared
 	// by daemon admission and the Desktop local-presence API. Tests may inject
 	// an isolated in-memory-directory-backed store before the first run.
@@ -2922,6 +2925,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			childTools:     childComputerTools,
 			workflow:       guiWorkflow,
 			runtime:        openAIComputerRuntime,
+			preview:        deps.ComputerUsePreview,
 			appPolicy:      guiWorkflow.appPolicy,
 			handler:        handler,
 			modelTier:      "large",

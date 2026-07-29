@@ -30,6 +30,7 @@ type SemanticScrollRequestV1 struct {
 	Direction           string `json:"direction"`
 	Steps               int    `json:"steps"`
 	FallbackPolicy      string `json:"fallback_policy"`
+	InterferencePolicy  string `json:"interference_policy"`
 	CommitDeadlineAt    string `json:"commit_deadline_at"`
 }
 
@@ -63,7 +64,8 @@ var semanticScrollRequestWireShapeV1 = coordinateObjectWireShape(false, map[stri
 		"expected_fingerprint": coordinateScalarWireShape(false),
 		"axis":                 coordinateScalarWireShape(false), "direction": coordinateScalarWireShape(false),
 		"steps": coordinateScalarWireShape(false), "fallback_policy": coordinateScalarWireShape(false),
-		"commit_deadline_at": coordinateScalarWireShape(false),
+		"interference_policy": coordinateScalarWireShape(false),
+		"commit_deadline_at":  coordinateScalarWireShape(false),
 	}),
 })
 
@@ -92,7 +94,10 @@ func (request SemanticScrollRequestV1) Validate() error {
 		(request.Path != "window[0]" && !strings.HasPrefix(request.Path, "window[0]/")) ||
 		(request.Axis != "vertical" && request.Axis != "horizontal") ||
 		(request.Direction != "increment" && request.Direction != "decrement") ||
-		request.Steps < 1 || request.Steps > 10 || request.FallbackPolicy != "report_unsupported" {
+		request.Steps < 1 || request.Steps > 10 ||
+		request.FallbackPolicy != "report_unsupported" ||
+		request.InterferencePolicy != "global_physical" &&
+			request.InterferencePolicy != "target_foreground" {
 		return fmt.Errorf("semantic_scroll_v1 target or step authority is invalid")
 	}
 	if _, err := time.Parse(time.RFC3339Nano, request.CommitDeadlineAt); err != nil {
@@ -171,7 +176,10 @@ func (result SemanticScrollResultV1) ValidateTaggedUnion() error {
 	case "user_interference":
 		if (result.CommitState != "not_committed" && result.CommitState != "committed" &&
 			result.CommitState != "unknown") || result.Phase != "user_interference" ||
-			result.FailureCode == nil || *result.FailureCode != "physical_input_interference" || !nilPayload {
+			result.FailureCode == nil ||
+			(*result.FailureCode != "physical_input_interference" &&
+				*result.FailureCode != "target_foreground_interference") ||
+			!nilPayload {
 			return fmt.Errorf("invalid user_interference semantic_scroll_v1 result")
 		}
 		if result.CommitState == "not_committed" && result.StepsCompleted != 0 {

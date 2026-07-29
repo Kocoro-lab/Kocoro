@@ -418,6 +418,7 @@ type openAIComputerTaskToolV1 struct {
 	childTools      *agent.ToolRegistry
 	workflow        *daemonGUIWorkflow
 	runtime         openAIComputerTaskRuntimeV1
+	preview         *ComputerUsePreviewStore
 	appPolicy       *ComputerUseAppPolicyStore
 	handler         agent.EventHandler
 
@@ -1125,10 +1126,20 @@ func (t *openAIComputerTaskToolV1) Run(
 			recovery,
 		), nil
 	}
+	var taskPreview *ComputerUsePreviewStore
+	if executionLane == tools.OpenAIComputerExecutionBackgroundSemanticV1 {
+		taskPreview = t.preview
+	}
+	if lease, ok := t.workflow.currentLease(); ok && taskPreview != nil {
+		// Preview is presentation-only. A decode failure must not invalidate an
+		// observation already admitted by the action runtime.
+		_ = taskPreview.Publish(lease.LeaseID, initial.Images[0])
+	}
 
 	runner, err := newDaemonOpenAIComputerBatchRunnerV1(
 		t.workflow,
 		t.runtime,
+		taskPreview,
 	)
 	if err != nil {
 		return withOpenAIComputerTaskFailureOutcomeV1(

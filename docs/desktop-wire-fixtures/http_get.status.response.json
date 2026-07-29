@@ -35,6 +35,7 @@
     "message_idempotency_receipt_v2",
     "computer_use_topology_v1",
     "computer_use_control_v1",
+    "computer_use_preview_v1",
     "computer_use_app_policy_v1",
     "computer_use_physical_interference_v1",
     "computer_use_risk_confirmation_v1"

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -396,8 +397,70 @@ func (a *AnthropicComputerAdapter) uniqueAXPressHitAtMappedPoint(
 	snapshot *computerUseSnapshot,
 	mapped CoordinateMappedPointV1,
 ) (string, bool, error) {
+	return a.uniqueTrustedAXHitAtMappedPoint(
+		snapshot,
+		mapped,
+		func(element computerUseElement) bool {
+			return slices.Contains(element.Actions, "AXPress")
+		},
+		"AXPress",
+	)
+}
+
+func (a *AnthropicComputerAdapter) uniqueAXScrollHitFromCurrentImage(
+	ctx context.Context,
+	x int,
+	y int,
+) (string, bool, error) {
+	if a == nil || a.raw == nil {
+		return "", false, fmt.Errorf("provider screenshot authority is unavailable")
+	}
+	var mapped CoordinateMappedPointV1
+	var err error
+	if a.raw.coordinateArtifact != nil {
+		observation, observationErr := a.actionableObservation(ctx)
+		if observationErr != nil {
+			return "", false, observationErr
+		}
+		mapped, err = MapCoordinatePixelCenterV1(
+			observation.frame,
+			observation.frame.TopologyRef,
+			observation.snapshot.id,
+			observation.frame.FrameID,
+			a.raw.computerUseCoordinateNowV1(),
+			float64(x),
+			float64(y),
+		)
+	} else {
+		mapped, err = a.raw.semanticImageArtifact.mapPointV1(
+			a.raw.snapshot,
+			a.raw.computerUseCoordinateNowV1(),
+			x,
+			y,
+		)
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return a.uniqueTrustedAXHitAtMappedPoint(
+		a.raw.snapshot,
+		mapped,
+		func(element computerUseElement) bool {
+			return element.Role == "AXScrollArea" ||
+				element.Role == "AXScrollBar"
+		},
+		"scroll",
+	)
+}
+
+func (a *AnthropicComputerAdapter) uniqueTrustedAXHitAtMappedPoint(
+	snapshot *computerUseSnapshot,
+	mapped CoordinateMappedPointV1,
+	supports func(computerUseElement) bool,
+	label string,
+) (string, bool, error) {
 	if a == nil || a.raw == nil || snapshot == nil ||
-		snapshot != a.raw.snapshot {
+		snapshot != a.raw.snapshot || supports == nil || label == "" {
 		return "", false, fmt.Errorf("provider AX snapshot authority is unavailable")
 	}
 	var candidates []anthropicTrustedElement
@@ -406,14 +469,8 @@ func (a *AnthropicComputerAdapter) uniqueAXPressHitAtMappedPoint(
 			mapped.X >= element.Frame.X+element.Frame.Width || mapped.Y >= element.Frame.Y+element.Frame.Height {
 			return
 		}
-		hasPress := false
-		for _, action := range element.Actions {
-			if action == "AXPress" {
-				hasPress = true
-			}
-		}
 		entry, trusted := trustedAnthropicElement(a.raw, element)
-		if hasPress && trusted {
+		if supports(element) && trusted {
 			candidates = append(candidates, anthropicTrustedElement{element: element, entry: entry, depth: depth})
 		}
 	})
@@ -433,7 +490,10 @@ func (a *AnthropicComputerAdapter) uniqueAXPressHitAtMappedPoint(
 		}
 	}
 	if len(selected) != 1 {
-		return "", false, fmt.Errorf("provider coordinate resolves to ambiguous trusted AXPress targets")
+		return "", false, fmt.Errorf(
+			"provider coordinate resolves to ambiguous trusted %s targets",
+			label,
+		)
 	}
 	return selected[0].element.Ref, true, nil
 }

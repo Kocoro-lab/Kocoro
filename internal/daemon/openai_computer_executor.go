@@ -41,6 +41,7 @@ type daemonOpenAIComputerPrivateRuntimeV1 struct {
 type daemonOpenAIComputerBatchRunnerV1 struct {
 	workflow         *daemonGUIWorkflow
 	runtime          openAIComputerActionRuntimeV1
+	preview          *ComputerUsePreviewStore
 	trace            *openAIComputerTraceV1
 	observationRetry func(context.Context, int) error
 
@@ -121,6 +122,7 @@ func (r *daemonOpenAIComputerBatchRunnerV1) nextBatchIndexV1() int {
 func newDaemonOpenAIComputerBatchRunnerV1(
 	workflow *daemonGUIWorkflow,
 	runtime openAIComputerActionRuntimeV1,
+	previews ...*ComputerUsePreviewStore,
 ) (*daemonOpenAIComputerBatchRunnerV1, error) {
 	if workflow == nil || workflow.coordinator == nil {
 		return nil, fmt.Errorf("OpenAI computer daemon workflow is unavailable")
@@ -128,9 +130,14 @@ func newDaemonOpenAIComputerBatchRunnerV1(
 	if runtime == nil {
 		return nil, fmt.Errorf("OpenAI computer action runtime is unavailable")
 	}
+	var preview *ComputerUsePreviewStore
+	if len(previews) > 0 {
+		preview = previews[0]
+	}
 	return &daemonOpenAIComputerBatchRunnerV1{
 		workflow: workflow,
 		runtime:  runtime,
+		preview:  preview,
 	}, nil
 }
 
@@ -271,6 +278,7 @@ func (r *daemonOpenAIComputerBatchRunnerV1) ExecuteOpenAIComputerBatch(
 		r.workflow,
 		r.runtime,
 		provenance,
+		r.preview,
 	)
 	if err != nil {
 		return agent.OpenAIComputerBatchExecution{}, err
@@ -305,6 +313,7 @@ type daemonOpenAIComputerExecutorV1 struct {
 
 	workflow         *daemonGUIWorkflow
 	runtime          openAIComputerActionRuntimeV1
+	preview          *ComputerUsePreviewStore
 	provenance       tools.OpenAIComputerExecutionProvenanceV1
 	trace            *openAIComputerTraceV1
 	batchIndex       int
@@ -321,6 +330,7 @@ func newDaemonOpenAIComputerExecutorV1(
 	workflow *daemonGUIWorkflow,
 	runtime openAIComputerActionRuntimeV1,
 	provenance tools.OpenAIComputerExecutionProvenanceV1,
+	previews ...*ComputerUsePreviewStore,
 ) (*daemonOpenAIComputerExecutorV1, error) {
 	if workflow == nil || workflow.coordinator == nil {
 		return nil, fmt.Errorf("OpenAI computer daemon workflow is unavailable")
@@ -331,8 +341,13 @@ func newDaemonOpenAIComputerExecutorV1(
 	if !provenance.IsTrusted() {
 		return nil, fmt.Errorf("OpenAI computer execution provenance is untrusted")
 	}
+	var preview *ComputerUsePreviewStore
+	if len(previews) > 0 {
+		preview = previews[0]
+	}
 	return &daemonOpenAIComputerExecutorV1{
 		workflow: workflow, runtime: runtime,
+		preview:    preview,
 		provenance: provenance,
 	}, nil
 }
@@ -505,6 +520,7 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 	}
 	nativeActionCtx := tools.ContextWithOpenAINativeComputerActionV1(ctx)
 	actionToolUseID := openAIComputerActionToolUseIDV1(scope.ActionID)
+	e.recordPreviewCursorV1(authority.LeaseID, action)
 
 	result, runErr := e.runPlanV1(nativeActionCtx, plan, actionToolUseID)
 	execution = tools.OpenAIComputerActionExecutionV1{
@@ -805,6 +821,9 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 		},
 	)
 	if err == nil && !result.IsError && len(result.Images) == 1 {
+		if e.preview != nil {
+			_ = e.preview.Publish(authority.LeaseID, result.Images[0])
+		}
 		result.GUIOutcome = nil
 		return result, nil
 	}
@@ -847,6 +866,32 @@ func (e *daemonOpenAIComputerExecutorV1) CaptureFinalOpenAIComputerObservationV1
 		"OpenAI computer final exact screenshot is unavailable: %s",
 		detail,
 	)
+}
+
+func (e *daemonOpenAIComputerExecutorV1) recordPreviewCursorV1(
+	leaseID string,
+	action tools.OpenAIComputerActionV1,
+) {
+	if e == nil || e.preview == nil {
+		return
+	}
+	var x, y *int
+	switch action.Type {
+	case tools.OpenAIComputerActionClickV1,
+		tools.OpenAIComputerActionDoubleClickV1,
+		tools.OpenAIComputerActionMoveV1,
+		tools.OpenAIComputerActionScrollV1:
+		x, y = action.X, action.Y
+	case tools.OpenAIComputerActionDragV1:
+		if len(action.Path) > 0 {
+			last := action.Path[len(action.Path)-1]
+			x, y = &last.X, &last.Y
+		}
+	}
+	if x == nil || y == nil {
+		return
+	}
+	e.preview.SetCursor(leaseID, *x, *y, string(action.Type))
 }
 
 func (e *daemonOpenAIComputerExecutorV1) runPlanV1(

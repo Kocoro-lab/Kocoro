@@ -241,6 +241,9 @@ const (
 	// control plane. Desktop must gate the authoritative runtime with this token;
 	// a token-advertising daemon that returns an endpoint error fails closed.
 	CapComputerUseControlV1 = "computer_use_control_v1"
+	// CapComputerUsePreviewV1 advertises the local-presence protected,
+	// process-memory-only current-lease frame used by Desktop PiP.
+	CapComputerUsePreviewV1 = "computer_use_preview_v1"
 	// CapComputerUseAppPolicyV1 advertises the local-presence protected,
 	// Ask/Blocked-only per-app GUI mutation policy API. It deliberately does
 	// not advertise an Always Allow scope.
@@ -289,6 +292,7 @@ var Capabilities = []string{
 	CapMessageIdempotencyReceiptV2,
 	CapComputerUseTopologyV1,
 	CapComputerUseControlV1,
+	CapComputerUsePreviewV1,
 	CapComputerUseAppPolicyV1,
 	CapComputerUsePhysicalInterferenceV1,
 	CapComputerUseRiskConfirmationV1,

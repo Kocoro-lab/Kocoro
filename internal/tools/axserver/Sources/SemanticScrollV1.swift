@@ -16,13 +16,15 @@ struct SemanticScrollRequestV1: Codable, Equatable {
     let direction: String
     let steps: Int
     let fallbackPolicy: String
+    let interferencePolicy: String
     let commitDeadlineAt: String
 
     init(
         schemaVersion: Int = 1, pid: Int, bundleID: String, windowID: UInt32,
         ref: String, path: String, expectedRole: String, expectedFingerprint: String,
         axis: String, direction: String, steps: Int,
-        fallbackPolicy: String = "report_unsupported", commitDeadlineAt: String
+        fallbackPolicy: String = "report_unsupported",
+        interferencePolicy: String = "global_physical", commitDeadlineAt: String
     ) {
         self.schemaVersion = schemaVersion
         self.pid = pid
@@ -36,6 +38,7 @@ struct SemanticScrollRequestV1: Codable, Equatable {
         self.direction = direction
         self.steps = steps
         self.fallbackPolicy = fallbackPolicy
+        self.interferencePolicy = interferencePolicy
         self.commitDeadlineAt = commitDeadlineAt
     }
 
@@ -44,7 +47,7 @@ struct SemanticScrollRequestV1: Codable, Equatable {
         try requireStrictMutationKeys(container, exactly: [
             "schema_version", "pid", "bundle_id", "window_id", "ref", "path",
             "expected_role", "expected_fingerprint", "axis", "direction", "steps",
-            "fallback_policy", "commit_deadline_at",
+            "fallback_policy", "interference_policy", "commit_deadline_at",
         ], field: "semantic_scroll_v1 params")
         schemaVersion = try container.decode(Int.self, forKey: strictMutationKey("schema_version"))
         pid = try container.decode(Int.self, forKey: strictMutationKey("pid"))
@@ -60,6 +63,8 @@ struct SemanticScrollRequestV1: Codable, Equatable {
         steps = try container.decode(Int.self, forKey: strictMutationKey("steps"))
         fallbackPolicy = try container.decode(
             String.self, forKey: strictMutationKey("fallback_policy"))
+        interferencePolicy = try container.decode(
+            String.self, forKey: strictMutationKey("interference_policy"))
         commitDeadlineAt = try container.decode(
             String.self, forKey: strictMutationKey("commit_deadline_at"))
         guard schemaVersion == 1, pid > 0,
@@ -74,6 +79,7 @@ struct SemanticScrollRequestV1: Codable, Equatable {
               Set(["vertical", "horizontal"]).contains(axis),
               Set(["increment", "decrement"]).contains(direction),
               (1...10).contains(steps), fallbackPolicy == "report_unsupported",
+              Set(["global_physical", "target_foreground"]).contains(interferencePolicy),
               strictMutationDate(commitDeadlineAt) != nil else {
             throw StrictMutationWireError.invalid("invalid semantic_scroll_v1 authority")
         }
@@ -94,6 +100,8 @@ struct SemanticScrollRequestV1: Codable, Equatable {
         try container.encode(direction, forKey: strictMutationKey("direction"))
         try container.encode(steps, forKey: strictMutationKey("steps"))
         try container.encode(fallbackPolicy, forKey: strictMutationKey("fallback_policy"))
+        try container.encode(
+            interferencePolicy, forKey: strictMutationKey("interference_policy"))
         try container.encode(commitDeadlineAt, forKey: strictMutationKey("commit_deadline_at"))
     }
 }
@@ -242,7 +250,10 @@ private func validateSemanticScrollResultV1(_ result: SemanticScrollResultV1) ->
     case "user_interference":
         return Set(["not_committed", "committed", "unknown"]).contains(result.commitState) &&
             result.phase == "user_interference" &&
-            result.failureCode == "physical_input_interference" && result.postcondition == nil &&
+            Set([
+                "physical_input_interference",
+                "target_foreground_interference",
+            ]).contains(result.failureCode ?? "") && result.postcondition == nil &&
             (result.commitState != "not_committed" || result.stepsCompleted == 0)
     case "cancelled":
         return Set(["not_committed", "committed", "unknown"]).contains(result.commitState) &&
@@ -261,6 +272,7 @@ private func validateSemanticScrollResultV1(_ result: SemanticScrollResultV1) ->
             "fingerprint_not_found", "fingerprint_ambiguous", "sensitive_target",
             "enabled_unknown", "target_disabled", "scroll_boundary",
             "interference_detection_unavailable", "ax_messaging_timeout_unavailable",
+            "target_became_frontmost",
         ])
         let exactPhase = result.failureCode.map {
             preflight.contains($0) ? result.phase == "preflight" :
@@ -313,6 +325,7 @@ struct SemanticScrollDependenciesV1 {
         SemanticScrollTargetResolutionV1
     let countFingerprint: (Int, UInt32, String, TimeInterval) ->
         SemanticScrollFingerprintCountV1
+    let frontmostPID: () -> Int?
     let observePhysicalInput: () -> PhysicalInputInterferenceSnapshotV1?
     let isCancelled: () -> Bool
     let now: () -> Date
@@ -345,7 +358,10 @@ private func semanticScrollInterferenceV1(
 ) -> SemanticScrollResultV1 {
     scrollResultV1(
         request, status: "user_interference", commitState: commitState,
-        phase: "user_interference", failureCode: "physical_input_interference",
+        phase: "user_interference",
+        failureCode: request.interferencePolicy == "target_foreground"
+            ? "target_foreground_interference"
+            : "physical_input_interference",
         initial: initial, final: final, completed: completed)
 }
 
@@ -453,10 +469,24 @@ func runSemanticScrollV1(
             initialFingerprintCount == 0 ? "fingerprint_not_found" : "fingerprint_ambiguous")
     }
 
+    let targetForegroundPolicy = request.interferencePolicy == "target_foreground"
+    let activeInterferenceCode = targetForegroundPolicy
+        ? "target_foreground_interference"
+        : "physical_input_interference"
     var physicalBaseline: PhysicalInputInterferenceSnapshotV1?
-    var physicalAssessment: PhysicalInputInterferenceAssessmentV1 = .unchanged
+    var interferenceAssessment: PhysicalInputInterferenceAssessmentV1 = .unchanged
     let assessCheckpoint: () -> PhysicalInputInterferenceAssessmentV1 = {
-        guard physicalAssessment == .unchanged else { return physicalAssessment }
+        guard interferenceAssessment == .unchanged else { return interferenceAssessment }
+        if targetForegroundPolicy {
+            guard let frontmostPID = dependencies.frontmostPID() else {
+                interferenceAssessment = .unavailable
+                return interferenceAssessment
+            }
+            if frontmostPID == request.pid {
+                interferenceAssessment = .interference
+            }
+            return interferenceAssessment
+        }
         let current = dependencies.observePhysicalInput()
         let assessment: PhysicalInputInterferenceAssessmentV1
         if physicalBaseline == nil {
@@ -469,8 +499,18 @@ func runSemanticScrollV1(
                 expectedPointer: physicalBaseline?.pointer, expectedSyntheticEvents: [])
         }
         if assessment == .unchanged { physicalBaseline = current }
-        else { physicalAssessment = assessment }
+        else { interferenceAssessment = assessment }
         return assessment
+    }
+    if targetForegroundPolicy {
+        switch assessCheckpoint() {
+        case .interference:
+            return semanticScrollFailureV1(request, "target_became_frontmost")
+        case .unavailable:
+            return semanticScrollFailureV1(request, "interference_detection_unavailable")
+        case .unchanged:
+            break
+        }
     }
 
     var initialValue: Double?
@@ -689,7 +729,7 @@ func runSemanticScrollV1(
                     }
                     switch assessCheckpoint() {
                     case .interference:
-                        return .terminal(failureCode: "physical_input_interference", observation: nil)
+                        return .terminal(failureCode: activeInterferenceCode, observation: nil)
                     case .unavailable:
                         return .terminal(failureCode: "interference_detection_unavailable", observation: nil)
                     case .unchanged: break
@@ -719,7 +759,7 @@ func runSemanticScrollV1(
                     }
                     switch assessCheckpoint() {
                     case .interference:
-                        return .terminal(failureCode: "physical_input_interference", observation: nil)
+                        return .terminal(failureCode: activeInterferenceCode, observation: nil)
                     case .unavailable:
                         return .terminal(failureCode: "interference_detection_unavailable", observation: nil)
                     case .unchanged: break
@@ -750,12 +790,12 @@ func runSemanticScrollV1(
                 request, commitState: "committed", initial: initialValue,
                 final: finalValue, completed: completed)
         }
-        if physicalAssessment == .interference {
+        if interferenceAssessment == .interference {
             return semanticScrollInterferenceV1(
                 request, commitState: "committed", initial: initialValue,
                 final: finalValue, completed: completed)
         }
-        if physicalAssessment == .unavailable {
+        if interferenceAssessment == .unavailable {
             return semanticScrollPartialV1(
                 request, code: "interference_detection_unavailable",
                 initial: initialValue, final: finalValue, completed: completed)
@@ -775,7 +815,8 @@ func runSemanticScrollV1(
                     request, commitState: "committed", initial: initialValue,
                     final: value ?? finalValue, completed: completed)
             }
-            if code == "physical_input_interference" {
+            if code == "physical_input_interference" ||
+                code == "target_foreground_interference" {
                 return semanticScrollInterferenceV1(
                     request, commitState: "committed", initial: initialValue,
                     final: value ?? finalValue, completed: completed)
@@ -1129,6 +1170,12 @@ func productionSemanticScrollDependenciesV1(
         guard remaining > 0 else { return .timeoutUnavailable }
         return countSemanticScrollFingerprintV1(
             in: window, fingerprint: fingerprint, timeout: remaining)
+    },
+    frontmostPID: {
+        refreshAppKitState()
+        return NSWorkspace.shared.frontmostApplication.map {
+            Int($0.processIdentifier)
+        }
     },
     observePhysicalInput: observePhysicalInputInterferenceV1,
     isCancelled: { FileManager.default.fileExists(atPath: cancellationURL.path) },

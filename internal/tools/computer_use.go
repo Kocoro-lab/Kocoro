@@ -1620,8 +1620,13 @@ func (t *ComputerUseTool) scroll(ctx context.Context, args computerUseArgs) (age
 		WindowID: uint32(*t.snapshot.windowID), Ref: args.Ref, Path: entry.path,
 		ExpectedRole: entry.role, ExpectedFingerprint: entry.fingerprint,
 		Axis: axis, Direction: direction, Steps: steps,
-		FallbackPolicy:   "report_unsupported",
-		CommitDeadlineAt: t.computerUseCoordinateNowV1().Add(computerUseMutationDeadlineV1).UTC().Format(time.RFC3339Nano),
+		FallbackPolicy:     "report_unsupported",
+		InterferencePolicy: "global_physical",
+		CommitDeadlineAt:   t.computerUseCoordinateNowV1().Add(computerUseMutationDeadlineV1).UTC().Format(time.RFC3339Nano),
+	}
+	if args.ExecutionLane ==
+		string(guicontrol.ComputerUseExecutionBackgroundSemantic) {
+		request.InterferencePolicy = "target_foreground"
 	}
 	if err := request.Validate(); err != nil {
 		return agent.BusinessError("scroll authority is invalid; call get_app_state again"), nil

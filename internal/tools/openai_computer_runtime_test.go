@@ -717,6 +717,60 @@ func TestOpenAIComputerBackgroundClickUsesUniqueAXPressWithoutCoordinateInput(
 	}
 }
 
+func TestOpenAIComputerBackgroundScrollUsesUniqueAXTargetWithoutPointerInput(
+	t *testing.T,
+) {
+	requireComputerUseDarwin(t)
+	harness := newComputerUseCoordinateHarness(t)
+	harness.tree.Elements[0].Frame = harness.tree.WindowFrame
+	harness.tree.Elements[0].Role = "AXScrollArea"
+	harness.tree.Elements[0].Path = "window[0]/AXScrollArea[0]"
+	harness.tree.Elements[0].Actions = nil
+	harness.tree.RefPaths["e1"] = computerUseRefPath{
+		Path:        "window[0]/AXScrollArea[0]",
+		Role:        "AXScrollArea",
+		Fingerprint: harness.tree.Elements[0].Fingerprint,
+	}
+	harness.observe(t)
+	harness.fake.queue(
+		"display_topology",
+		marshalDisplayTopologyNoTest(harness.topology),
+	)
+	runtime, err := NewOpenAIComputerActionRuntimeV1(
+		wrapGUIExecutionGate(harness.tool),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	runtime.backgroundRequired = true
+	runtime.backgroundTarget = &OpenAIComputerTaskAppV1{
+		App: harness.tree.App, BundleID: harness.tree.BundleID, PID: harness.tree.PID,
+	}
+	x, y, scrollX, scrollY := 4, 5, 0, 450
+	plan, err := runtime.PlanOpenAIComputerActionV1(
+		context.Background(),
+		OpenAIComputerActionV1{
+			Type: OpenAIComputerActionScrollV1,
+			X:    &x, Y: &y, ScrollX: &scrollX, ScrollY: &scrollY,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var args computerUseArgs
+	if err := json.Unmarshal([]byte(plan.Args), &args); err != nil {
+		t.Fatal(err)
+	}
+	if args.Action != "scroll" || args.Ref != harness.tree.Elements[0].Ref ||
+		args.DX != 0 || args.DY != 5 ||
+		args.X != nil || args.Y != nil ||
+		args.ExecutionLane != "background_semantic" ||
+		args.ForegroundFallback {
+		t.Fatalf("background semantic scroll plan = %+v", args)
+	}
+}
+
 func TestOpenAIComputerUnsupportedBackgroundActionFallsBackMonotonically(
 	t *testing.T,
 ) {

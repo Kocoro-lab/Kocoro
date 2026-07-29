@@ -14,6 +14,7 @@
     "direction": "increment",
     "steps": 3,
     "fallback_policy": "report_unsupported",
+    "interference_policy": "global_physical",
     "commit_deadline_at": "2027-01-15T08:00:01.000000000Z"
   }
 }

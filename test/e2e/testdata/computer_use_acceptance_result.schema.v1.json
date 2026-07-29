@@ -11,8 +11,10 @@
     "started_at",
     "finished_at",
     "outcome",
+    "classification",
     "build",
     "metrics",
+    "trace_expectation_met",
     "visual_verification",
     "failures"
   ],
@@ -24,6 +26,16 @@
     "finished_at": {"type": "string", "format": "date-time"},
     "outcome": {
       "enum": ["passed", "failed", "partial", "blocked", "not_run"]
+    },
+    "classification": {
+      "enum": [
+        "capability_pass",
+        "public_capability_regression",
+        "unsupported_provider_action",
+        "invalid_precondition_or_stale_state",
+        "expected_safety_block",
+        "inconclusive"
+      ]
     },
     "build": {
       "type": "object",
@@ -41,19 +53,45 @@
       "additionalProperties": false,
       "required": [
         "duration_ms",
+        "model_calls",
+        "model_timeouts",
         "initial_observation_attempts",
+        "final_observation_attempts",
         "provider_batches",
         "actions",
+        "action_types",
+        "attempted_mutating_actions",
+        "committed_mutating_actions",
+        "unknown_commit_actions",
+        "not_committed_mutating_actions",
+        "task_count",
+        "task_ordinal",
+        "failed_batches",
         "confirmations"
       ],
       "properties": {
         "duration_ms": {"type": "integer", "minimum": 0},
+        "model_calls": {"type": "integer", "minimum": 0},
+        "model_timeouts": {"type": "integer", "minimum": 0},
         "initial_observation_attempts": {"type": "integer", "minimum": 0},
+        "final_observation_attempts": {"type": "integer", "minimum": 0},
         "provider_batches": {"type": "integer", "minimum": 0},
         "actions": {"type": "integer", "minimum": 0},
+        "action_types": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "attempted_mutating_actions": {"type": "integer", "minimum": 0},
+        "committed_mutating_actions": {"type": "integer", "minimum": 0},
+        "unknown_commit_actions": {"type": "integer", "minimum": 0},
+        "not_committed_mutating_actions": {"type": "integer", "minimum": 0},
+        "task_count": {"type": "integer", "minimum": 1},
+        "task_ordinal": {"type": "integer", "minimum": 1},
+        "failed_batches": {"type": "integer", "minimum": 0},
         "confirmations": {"type": "integer", "minimum": 0}
       }
     },
+    "trace_expectation_met": {"type": "boolean"},
     "visual_verification": {
       "type": "object",
       "additionalProperties": false,
@@ -76,5 +114,16 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"outcome": {"const": "passed"}},
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {"trace_expectation_met": {"const": true}}
+      }
+    }
+  ]
 }

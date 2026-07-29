@@ -11,6 +11,30 @@
     "non_safety_reproduction_required": 2,
     "out_of_scope_behavior": "record_only"
   },
+  "performance_baseline": {
+    "captured_at": "2026-07-28T19:10:00+09:00",
+    "kind": "mixed_completed_trace_warning_only",
+    "sample_size": 15,
+    "duration_p50_ms": 29825,
+    "duration_p95_ms": 66485,
+    "model_calls_p50": 6,
+    "model_calls_p95": 15,
+    "provider_batches_p50": 5,
+    "provider_batches_p95": 14,
+    "model_timeouts": 1
+  },
+  "evidence_policy": {
+    "summary_scope": "latest_task_boundary",
+    "passed_mutation_requires_committed_action": true,
+    "observation_only_completion": "inconclusive",
+    "provider_action_mismatch": "classify_before_runtime_change",
+    "fix_boundary": "one_bounded_cycle",
+    "failure_classes": [
+      "public_capability_regression",
+      "unsupported_provider_action",
+      "invalid_precondition_or_stale_state"
+    ]
+  },
   "scenarios": [
     {
       "id": "calculator_cold_launch",
@@ -25,7 +49,12 @@
         "The final answer agrees with the visible result."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["cold_launch", "initial_observation", "click", "verification"]
+      "tags": ["cold_launch", "initial_observation", "click", "verification"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 6,
+        "provider_batches": 5
+      }
     },
     {
       "id": "calculator_warm_window",
@@ -39,7 +68,12 @@
         "The final answer agrees with the visible result."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["warm_window", "click", "verification"]
+      "tags": ["warm_window", "click", "verification"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 6,
+        "provider_batches": 5
+      }
     },
     {
       "id": "calculator_background_semantic",
@@ -54,10 +88,16 @@
         "Calculator visibly displays 15.",
         "TextEdit remains frontmost throughout the task.",
         "Computer Use activity identifies Calculator with execution_lane background_semantic and foreground_fallback false.",
+        "The trace contains four committed click actions; a screenshot-only completion is inconclusive even if Calculator already shows 15.",
         "Kocoro neither moves the physical pointer nor renders its physical-pointer overlay."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["background_semantic", "exact_pid", "ax_press", "nonactivating", "interference"]
+      "tags": ["background_semantic", "exact_pid", "ax_press", "nonactivating", "interference"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 6,
+        "provider_batches": 5
+      }
     },
     {
       "id": "textedit_background_targeted_keyboard",
@@ -72,10 +112,62 @@
         "The exact TextEdit document visibly contains background test.",
         "Calculator remains frontmost throughout the task.",
         "Computer Use activity identifies TextEdit with execution_lane background_keyboard and foreground_fallback false.",
+        "The trace contains at least one committed type action; a pre-existing matching document is not execution evidence.",
         "No clipboard content changes, physical pointer movement, or Kocoro physical-pointer overlay occurs."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["background_keyboard", "exact_pid", "focused_ax_element", "post_to_pid", "nonactivating"]
+      "tags": ["background_keyboard", "exact_pid", "focused_ax_element", "post_to_pid", "nonactivating"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 6,
+        "provider_batches": 5
+      }
+    },
+    {
+      "id": "textedit_background_scroll_preview",
+      "enabled_by_default": false,
+      "prompt": "Using only Computer Use, control TextEdit only. Keep Calculator frontmost and scroll the already-open long TextEdit document to the bottom without bringing TextEdit forward. Stop when the bottom is visible.",
+      "preconditions": [
+        "TextEdit has exactly one visible normal document window behind Calculator.",
+        "The TextEdit document contains enough lines to scroll.",
+        "Calculator is frontmost."
+      ],
+      "expected_state": [
+        "The exact TextEdit document scroll position reaches the bottom.",
+        "Calculator remains frontmost and the physical pointer does not move.",
+        "Computer Use activity identifies TextEdit with execution_lane background_semantic and foreground_fallback false.",
+        "The trace contains a committed scroll action; a provider drag is classified as unsupported_provider_action rather than opening a runtime fix.",
+        "The nonactivating PiP shows the exact TextEdit frame and Kocoro software cursor, can be hidden and restored, and exposes Pause, Take Over, and Stop."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["background_semantic", "ax_scroll", "pip", "software_cursor", "nonactivating"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 6,
+        "provider_batches": 5
+      }
+    },
+    {
+      "id": "background_required_drag_rejection",
+      "enabled_by_default": false,
+      "prompt": "Using only Computer Use, control Calculator only. Keep TextEdit frontmost and drag the Calculator window without bringing Calculator forward.",
+      "preconditions": [
+        "Calculator has exactly one visible normal window behind TextEdit.",
+        "TextEdit is frontmost."
+      ],
+      "expected_state": [
+        "The request returns a typed background_action_unsupported failure before mutation.",
+        "The trace contains a not_committed drag action and no committed mutating action.",
+        "TextEdit remains frontmost, Calculator does not move, and the physical pointer does not move.",
+        "Kocoro does not silently claim background drag support or switch to another desktop-control tool."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["background_required", "unsupported_action", "drag", "fail_before_commit"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 4,
+        "provider_batches": 2
+      }
     },
     {
       "id": "chrome_cold_url_navigation",
@@ -91,7 +183,12 @@
         "The summary is grounded in the final visible page."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["cold_launch", "keyboard_focus", "url_navigation", "content_readback"]
+      "tags": ["cold_launch", "keyboard_focus", "url_navigation", "content_readback"],
+      "performance_budget": {
+        "duration_ms": 80000,
+        "model_calls": 18,
+        "provider_batches": 17
+      }
     },
     {
       "id": "chrome_multi_window_url_navigation",
@@ -109,7 +206,12 @@
         "The parent does not make a second computer_use call in the same turn."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["warm_window", "multiple_windows", "keyboard_focus", "url_navigation", "content_readback"]
+      "tags": ["warm_window", "multiple_windows", "keyboard_focus", "url_navigation", "content_readback"],
+      "performance_budget": {
+        "duration_ms": 80000,
+        "model_calls": 18,
+        "provider_batches": 17
+      }
     },
     {
       "id": "managed_browser_instance_coexistence",
@@ -126,7 +228,12 @@
         "The dedicated CDP browser remains hidden and unchanged."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["multiple_instances", "managed_process", "pid_binding", "keyboard_focus"]
+      "tags": ["multiple_instances", "managed_process", "pid_binding", "keyboard_focus"],
+      "performance_budget": {
+        "duration_ms": 45000,
+        "model_calls": 10,
+        "provider_batches": 9
+      }
     },
     {
       "id": "textedit_calculator_cross_app",
@@ -142,7 +249,12 @@
         "Both app states were produced in one computer_use call."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["cross_app", "type", "app_switch", "click", "partial_completion"]
+      "tags": ["cross_app", "type", "app_switch", "click", "partial_completion"],
+      "performance_budget": {
+        "duration_ms": 60000,
+        "model_calls": 12,
+        "provider_batches": 11
+      }
     },
     {
       "id": "slack_draft_without_send",
@@ -158,7 +270,12 @@
         "No message was sent and no consequential confirmation appeared."
       ],
       "risk": "draft_only",
-      "tags": ["electron", "search", "type", "no_send", "destination_verification"]
+      "tags": ["electron", "search", "type", "no_send", "destination_verification"],
+      "performance_budget": {
+        "duration_ms": 80000,
+        "model_calls": 18,
+        "provider_batches": 17
+      }
     },
     {
       "id": "slack_send_with_confirmation",
@@ -175,7 +292,12 @@
         "Denial sends nothing and ends the task honestly."
       ],
       "risk": "consequential_send",
-      "tags": ["electron", "send", "confirmation", "exactly_once"]
+      "tags": ["electron", "send", "confirmation", "exactly_once"],
+      "performance_budget": {
+        "duration_ms": 80000,
+        "model_calls": 18,
+        "provider_batches": 17
+      }
     },
     {
       "id": "pointer_interference",
@@ -190,7 +312,78 @@
         "Resume requires a fresh verified observation."
       ],
       "risk": "ordinary_mutation",
-      "tags": ["interference", "pause", "resume", "false_success"]
+      "tags": ["interference", "pause", "resume", "false_success"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 6,
+        "provider_batches": 5
+      }
+    },
+    {
+      "id": "pause_resume_during_background_input",
+      "enabled_by_default": false,
+      "prompt": "Using only Computer Use, keep Calculator frontmost and type pause resume test into the already-focused background TextEdit document without bringing TextEdit forward. Stop when the text is present.",
+      "preconditions": [
+        "TextEdit has one background document with its editable body internally focused.",
+        "Calculator is frontmost.",
+        "A human presses Pause after at least one input pair, waits two seconds, then presses Resume."
+      ],
+      "expected_state": [
+        "No new targeted key pair commits while the lease is paused.",
+        "Resume requires and obtains a fresh verified TextEdit observation before further input.",
+        "The final text contains no duplicate segment and Calculator remains frontmost.",
+        "No key remains logically held after pause, resume, or completion."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["background_keyboard", "pause", "resume", "fresh_observation", "no_stuck_input"],
+      "performance_budget": {
+        "duration_ms": 60000,
+        "model_calls": 12,
+        "provider_batches": 10
+      }
+    },
+    {
+      "id": "take_over_during_foreground_action",
+      "enabled_by_default": false,
+      "prompt": "Using only Computer Use, open Calculator and calculate 123+456, one button at a time.",
+      "preconditions": [
+        "A human presses Take Over while an ordinary Calculator action is active.",
+        "No second automation agent operates the pointer."
+      ],
+      "expected_state": [
+        "Take Over returns only after the daemon reports the active action quiesced.",
+        "Kocoro stops issuing input and then brings the exact controlled Calculator process forward for the user.",
+        "No mouse button or modifier remains held.",
+        "The task does not claim a completed result unless the visible Calculator state proves it."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["foreground", "take_over", "quiescence", "no_stuck_input", "truthful_outcome"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 8,
+        "provider_batches": 6
+      }
+    },
+    {
+      "id": "stop_during_wait",
+      "enabled_by_default": false,
+      "prompt": "Using only Computer Use, open Chrome, navigate to waylandz.com, and wait for the page to finish loading before stopping.",
+      "preconditions": [
+        "A human presses Stop while the executor is waiting or observing after navigation."
+      ],
+      "expected_state": [
+        "The local Stop request is admitted without waiting for the provider.",
+        "The active action acknowledges cancellation and the lease becomes terminal within the local stop budget.",
+        "No committed action is replayed and no mouse button or modifier remains held.",
+        "No later Computer Use activity mutates the target after terminal acknowledgement."
+      ],
+      "risk": "ordinary_mutation",
+      "tags": ["stop", "wait", "cancellation", "terminal_ack", "no_stuck_input"],
+      "performance_budget": {
+        "duration_ms": 30000,
+        "model_calls": 6,
+        "provider_batches": 4
+      }
     }
   ]
 }

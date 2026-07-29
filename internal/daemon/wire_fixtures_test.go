@@ -851,6 +851,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	if !has(CapComputerUseControlV1) {
 		t.Fatalf("capabilities lost %q: %v", CapComputerUseControlV1, *status.Capabilities)
 	}
+	if !has(CapComputerUsePreviewV1) {
+		t.Fatalf("capabilities lost %q: %v", CapComputerUsePreviewV1, *status.Capabilities)
+	}
 	if !has(CapComputerUseAppPolicyV1) {
 		t.Fatalf("capabilities lost %q: %v", CapComputerUseAppPolicyV1, *status.Capabilities)
 	}

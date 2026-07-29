@@ -714,6 +714,42 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 				return r.plan(args, true)
 			}
 		}
+		if action.Type == OpenAIComputerActionScrollV1 &&
+			action.X != nil && action.Y != nil &&
+			action.ScrollX != nil && action.ScrollY != nil {
+			dx, dy, valid := openAIComputerSemanticScrollDeltasV1(
+				*action.ScrollX,
+				*action.ScrollY,
+			)
+			if !valid {
+				return OpenAIComputerActionPlanV1{},
+					&OpenAIComputerActionPlanErrorV1{
+						FailureCode: "scroll_delta_invalid",
+						Detail:      "OpenAI computer scroll deltas are invalid",
+					}
+			}
+			ref, found, hitErr := anthropicHelpers.
+				uniqueAXScrollHitFromCurrentImage(
+					ctx,
+					*action.X,
+					*action.Y,
+				)
+			if hitErr != nil {
+				return OpenAIComputerActionPlanV1{},
+					&OpenAIComputerActionPlanErrorV1{
+						FailureCode: "background_semantic_projection_unavailable",
+						Detail: "the background semantic image could not be " +
+							"mapped to one exact AX scroll target: " +
+							hitErr.Error(),
+					}
+			}
+			if found {
+				args.Action, args.Ref = "scroll", ref
+				args.DX, args.DY = dx, dy
+				r.applyExecutionLaneV1(&args)
+				return r.plan(args, true)
+			}
+		}
 		if action.Type == OpenAIComputerActionTypeTextV1 {
 			if strings.IndexFunc(action.Text, unicode.IsControl) >= 0 {
 				return OpenAIComputerActionPlanV1{},
@@ -931,6 +967,53 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 		return OpenAIComputerActionPlanV1{},
 			fmt.Errorf("OpenAI computer action %q is not safely supported", action.Type)
 	}
+}
+
+func openAIComputerSemanticScrollDeltasV1(
+	scrollX int,
+	scrollY int,
+) (computerUseInt, computerUseInt, bool) {
+	if !coordinatePixelScrollProviderDeltasV1(
+		int64(scrollX),
+		int64(scrollY),
+	) {
+		return 0, 0, false
+	}
+	value := scrollY
+	vertical := true
+	if absIntV1(scrollX) > absIntV1(scrollY) {
+		value = scrollX
+		vertical = false
+	}
+	if value == 0 {
+		return 0, 0, false
+	}
+	// Native computer deltas are pixels while AX exposes discrete increments.
+	// Preserve direction and coarse magnitude without turning one provider
+	// action into an unbounded local loop.
+	steps := (absIntV1(value) + 99) / 100
+	if steps < 1 {
+		steps = 1
+	}
+	if steps > 10 {
+		steps = 10
+	}
+	if value < 0 {
+		steps = -steps
+	}
+	if vertical {
+		return 0, computerUseInt(steps), true
+	}
+	return computerUseInt(steps), 0, true
+}
+
+func absIntV1(value int) int {
+	if value < 0 {
+		// Provider deltas are constrained to signed 32-bit range before this
+		// helper, so negation cannot overflow the host int.
+		return -value
+	}
+	return value
 }
 
 func openAIComputerKeySequenceV1(keys []string) ([]string, []string, error) {

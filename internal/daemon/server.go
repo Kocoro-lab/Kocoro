@@ -69,6 +69,9 @@ type Server struct {
 	// replace it before serving requests.
 	computerUseCoordinator    *guicontrol.Coordinator
 	computerUseExpiryInterval time.Duration
+	// computerUsePreview is a process-memory-only last-frame projection for
+	// the trusted local Desktop. It is never serialized onto the event bus.
+	computerUsePreview *ComputerUsePreviewStore
 	// consequentialRiskBroker is deliberately process-memory-only. The HTTP
 	// authorizer is set before serving and defaults to the same local-presence
 	// identity used by the Desktop computer-use control plane.
@@ -313,6 +316,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		eventBus:                        NewEventBus(),
 		computerUseCoordinator:          guicontrol.ProcessCoordinator(),
 		computerUseExpiryInterval:       defaultComputerUseExpiryInterval,
+		computerUsePreview:              NewComputerUsePreviewStore(),
 		consequentialRiskBroker:         newDefaultConsequentialRiskBroker(),
 		consequentialRiskHTTPAuthorizer: localPresenceAuthorized,
 		notifyApprovalResolved:          func(p ApprovalResolvedPayload) error { return nil },
@@ -342,6 +346,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	if deps != nil {
 		deps.Suggestions = s.suggestions
 		deps.ComputerUseCoordinator = s.computerUseCoordinator
+		deps.ComputerUsePreview = s.computerUsePreview
 		deps.ConsequentialRiskBroker = s.consequentialRiskBroker
 		if deps.ApprovalTracker == nil {
 			deps.ApprovalTracker = NewApprovalTracker()
@@ -464,6 +469,9 @@ func (s *Server) SetComputerUseCoordinator(coordinator *guicontrol.Coordinator) 
 		return
 	}
 	coordinator.SetSink(func(event guicontrol.ComputerUseActivityEvent) {
+		if event.LeaseState == guicontrol.ComputerUseLeaseTerminal {
+			s.computerUsePreview.ClearLease(event.LeaseID)
+		}
 		payload, err := json.Marshal(event)
 		if err != nil {
 			return
@@ -608,12 +616,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /local/computer-use/topology", s.handleComputerUseTopology)
 	mux.HandleFunc("GET /local/computer-use/activity", s.handleComputerUseActivity)
+	mux.HandleFunc("GET /local/computer-use/preview", s.handleComputerUsePreview)
 	mux.HandleFunc("POST /local/computer-use/control", s.handleComputerUseControl)
 	mux.HandleFunc("POST /local/computer-use/heartbeat", s.handleComputerUseHeartbeat)
 	mux.HandleFunc("GET /local/computer-use/risk-intents/{intent_id}", s.handleConsequentialRiskDetail)
 	mux.HandleFunc("POST /local/computer-use/risk-intents/{intent_id}/decision", s.handleConsequentialRiskDecision)
 	mux.HandleFunc("/local/computer-use/app-policy", s.handleComputerUseAppPolicy)
 	mux.HandleFunc("/local/computer-use/activity", s.handleComputerUseMethodNotAllowed(http.MethodGet))
+	mux.HandleFunc("/local/computer-use/preview", s.handleComputerUseMethodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/local/computer-use/control", s.handleComputerUseMethodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/local/computer-use/heartbeat", s.handleComputerUseMethodNotAllowed(http.MethodPost))
 	mux.HandleFunc("/local/computer-use/risk-intents/{intent_id}", s.handleConsequentialRiskMethodNotAllowed(http.MethodGet))
