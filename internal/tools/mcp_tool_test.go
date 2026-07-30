@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
+	mcpclient "github.com/mark3labs/mcp-go/client"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -29,11 +31,13 @@ func TestMCPTool_Run_ReconnectOnDisconnected(t *testing.T) {
 	defer sup.Stop()
 
 	// Let the initial probe cycle run and mark the server disconnected.
-	time.Sleep(100 * time.Millisecond)
-
-	h := sup.HealthFor("playwright")
-	if h.State != mcp.StateDisconnected {
-		t.Fatalf("expected disconnected after initial probe, got %v", h.State)
+	// Poll instead of a fixed sleep so CI load can't flake it.
+	deadline := time.Now().Add(3 * time.Second)
+	for sup.HealthFor("playwright").State != mcp.StateDisconnected {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected disconnected after initial probe, got %v", sup.HealthFor("playwright").State)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Now inject a controllable client: CallTool fails once (io.EOF), then
@@ -80,10 +84,14 @@ func TestMCPTool_Run_ProbesKnownDisconnectedBeforeDispatch(t *testing.T) {
 	sup.Start(ctx)
 	defer sup.Stop()
 
-	// Initial probe fails (no client) → StateDisconnected.
-	time.Sleep(100 * time.Millisecond)
-	if h := sup.HealthFor("gws"); h.State != mcp.StateDisconnected {
-		t.Fatalf("precondition: expected disconnected, got %v", h.State)
+	// Initial probe fails (no client) → StateDisconnected. Poll instead of
+	// a fixed sleep so CI load can't flake it.
+	deadline := time.Now().Add(3 * time.Second)
+	for sup.HealthFor("gws").State != mcp.StateDisconnected {
+		if time.Now().After(deadline) {
+			t.Fatalf("precondition: expected disconnected, got %v", sup.HealthFor("gws").State)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Seed a fully working client. Supervisor state is now stale — the same
@@ -121,6 +129,110 @@ type countingSuccessClient struct {
 func (c *countingSuccessClient) CallTool(ctx context.Context, r mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 	c.callToolCount.Add(1)
 	return c.successCallToolClient.CallTool(ctx, r)
+}
+
+// alwaysErrClient fails every CallTool with a fixed error (ListTools stays
+// healthy so supervisor probes succeed). Optional onCall hook fires before
+// returning.
+type alwaysErrClient struct {
+	successCallToolClient
+	err           error
+	onCall        func()
+	callToolCount atomic.Int32
+}
+
+func (c *alwaysErrClient) CallTool(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	c.callToolCount.Add(1)
+	if c.onCall != nil {
+		c.onCall()
+	}
+	return nil, c.err
+}
+
+// newHealthySupervisedTool builds a manager+supervisor around client, waits
+// for the initial probe to mark the server healthy, and returns the wired
+// MCPTool. Polls instead of a fixed sleep so CI load can't flake it.
+func newHealthySupervisedTool(t *testing.T, ctx context.Context, server, toolName string, client mcpclient.MCPClient) (*MCPTool, *mcp.Supervisor) {
+	t.Helper()
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig(server, mcp.MCPServerConfig{Command: "dummy"})
+	mgr.SeedClient(server, client)
+	sup := mcp.NewSupervisor(mgr)
+	sup.Start(ctx)
+	t.Cleanup(sup.Stop)
+	deadline := time.Now().Add(3 * time.Second)
+	for sup.HealthFor(server).State != mcp.StateHealthy {
+		if time.Now().After(deadline) {
+			t.Fatal("precondition: server never became healthy")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mt := NewMCPTool(server, mcpgo.Tool{Name: toolName}, mgr)
+	mt.SetSupervisor(sup)
+	return mt, sup
+}
+
+// A retry re-executes the tool. Timeouts and protocol errors are NOT
+// evidence the server didn't act (a write tool may time out AFTER its side
+// effect landed) and a protocol error will fail identically on retry — so
+// only transport-level failures (dead pipe: the request provably never got a
+// response channel) may re-dispatch.
+func TestMCPTool_Run_NoRetryOnNonTransportError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := &alwaysErrClient{err: fmt.Errorf("jsonrpc: invalid params")}
+	mt, _ := newHealthySupervisedTool(t, ctx, "gws", "send_message", fake)
+
+	result, err := mt.Run(ctx, `{"to":"x"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected error result")
+	}
+	if got := fake.callToolCount.Load(); got != 1 {
+		t.Fatalf("non-transport error must not be retried, got %d dispatches", got)
+	}
+}
+
+func TestMCPTool_Run_NoRetryOnPerCallTimeoutError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := &alwaysErrClient{err: fmt.Errorf("no response within per-call timeout 1s: %w", context.DeadlineExceeded)}
+	mt, _ := newHealthySupervisedTool(t, ctx, "gws", "send_message", fake)
+
+	result, err := mt.Run(ctx, `{"to":"x"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected error result")
+	}
+	if got := fake.callToolCount.Load(); got != 1 {
+		t.Fatalf("per-call timeout must not be retried (possible duplicate side effect), got %d dispatches", got)
+	}
+}
+
+func TestMCPTool_Run_NoRetryAfterCtxCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := &alwaysErrClient{err: io.EOF} // transport error — would normally retry
+	fake.onCall = cancel                  // but the run ctx dies mid-call (user interrupt)
+	mt, _ := newHealthySupervisedTool(t, ctx, "gws", "search", fake)
+
+	result, err := mt.Run(ctx, `{"q":"x"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected error result")
+	}
+	if got := fake.callToolCount.Load(); got != 1 {
+		t.Fatalf("cancelled ctx must not retry, got %d dispatches", got)
+	}
 }
 
 // --- Test 2: No cache → disconnected server tools NOT injected ---

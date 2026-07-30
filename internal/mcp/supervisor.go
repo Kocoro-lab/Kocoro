@@ -176,6 +176,19 @@ func (s *Supervisor) HealthFor(serverName string) ServerHealth {
 
 // ProbeNow requests an immediate probe for a server. Before Start(), returns current health.
 // Uses waiter list for coalescing: all concurrent callers get the same result.
+// MarkTransportSuspect invalidates the freshness of a server's cached
+// transport health so the next ProbeNow performs a REAL probe instead of
+// returning the <60s cached Healthy. Called by the tool dispatch path after
+// a call failure: the failure itself is evidence the cached state may be
+// stale, and retrying against an unverified connection wastes a dispatch.
+func (s *Supervisor) MarkTransportSuspect(serverName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, ok := s.servers[serverName]; ok {
+		entry.health.LastTransportOK = time.Time{}
+	}
+}
+
 func (s *Supervisor) ProbeNow(serverName string) ServerHealth {
 	s.mu.Lock()
 	if !s.started {

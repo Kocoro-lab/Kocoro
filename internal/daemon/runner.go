@@ -2544,8 +2544,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// runs never reach this path and keep artifacts in their working dir.
 	artifactDir := cloudSessionCWD
 	if artifactDir == "" {
-		if dir, err := ensureSessionScratchDir(deps.ShannonDir, sess.ID); err != nil {
-			log.Printf("daemon: failed to allocate artifact scratch for %s: %v", sess.ID, err)
+		// Path only — the directory is created lazily on the first artifact
+		// filename injection, so sessions that never produce files leave no
+		// empty dirs behind. Reclaim is the age-based sweep at daemon start.
+		if dir, err := sessionScratchDirPath(deps.ShannonDir, sess.ID); err != nil {
+			log.Printf("daemon: failed to resolve artifact scratch for %s: %v", sess.ID, err)
 		} else if dir != "" {
 			artifactDir = dir
 		}

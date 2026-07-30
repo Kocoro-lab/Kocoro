@@ -13,7 +13,7 @@ import (
 // When the model omits the output filename, playwright writes to its own
 // default location and reports a path relative to its own workspace — the
 // ambiguity behind the 2026-07-29 `find /` spiral. With an artifact scratch
-// dir on ctx, the daemon injects a deterministic absolute filename there.
+// dir on ctx, the daemon injects an absolute filename there.
 func TestMaybeRewriteFileProducingArg_InjectsDefaultIntoArtifactDir(t *testing.T) {
 	scratch := t.TempDir()
 	ctx := cwdctx.WithArtifactDir(cwdctx.WithSessionCWD(context.Background(), t.TempDir()), scratch)
@@ -77,6 +77,24 @@ func TestMaybeRewriteFileProducingArg_CWDFallbackCreatesParentDir(t *testing.T) 
 	}
 	if _, err := os.Stat(filepath.Dir(got)); err != nil {
 		t.Fatalf("parent dir must be created under cwd fallback: %v", err)
+	}
+}
+
+// browser_snapshot's filename is a MODE SWITCH, not a location: playwright's
+// schema reads "Save snapshot to markdown file instead of returning it in
+// the response". Omitted filename = inline accessibility snapshot — the
+// model's primary page-reading channel. Injecting a default here would turn
+// every daemon-served page read into a file round-trip, so snapshot must
+// never receive a default filename (explicit model-supplied filenames are
+// still relocated).
+func TestMaybeRewriteFileProducingArg_SnapshotNoFilenameStaysInline(t *testing.T) {
+	ctx := cwdctx.WithArtifactDir(cwdctx.WithSessionCWD(context.Background(), t.TempDir()), t.TempDir())
+	args := map[string]any{}
+	if got := maybeRewriteFileProducingArg(ctx, "playwright", "browser_snapshot", args); got != "" {
+		t.Fatalf("browser_snapshot without filename must stay inline, got injection %q", got)
+	}
+	if _, present := args["filename"]; present {
+		t.Fatal("browser_snapshot args must stay untouched so the server returns the snapshot inline")
 	}
 }
 

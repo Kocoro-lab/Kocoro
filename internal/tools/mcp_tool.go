@@ -165,13 +165,22 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	rewrittenOutPath := maybeRewriteFileProducingArg(ctx, t.serverName, t.tool.Name, args)
 
 	content, isError, err := t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
-	if err != nil && t.supervisor != nil && ctx.Err() == nil {
-		// Call failed at the transport/protocol level. Probe for FRESH health
-		// evidence (the cached state may predate the failure — or, after the
-		// pre-dispatch gate above, postdate the connection's death) and retry
-		// once if the server comes back healthy. Skipped when ctx is already
-		// cancelled: a retry after user interrupt is wasted work.
-		log.Printf("[mcp-tool] %s/%s: call failed (%v), probing for on-demand reconnect", t.serverName, t.tool.Name, err)
+	if err != nil && t.supervisor != nil && ctx.Err() == nil && mcp.IsTransportError(err) {
+		// Retry gate — TRANSPORT failures only. A retry re-executes the
+		// tool, so it is only safe when the request provably never reached a
+		// live server: dead pipe, EOF, killed process. Deliberately excluded:
+		//   - per-call timeouts: not evidence the server didn't act — a
+		//     write tool (send email, create event) may time out AFTER its
+		//     side effect landed, and a retry would duplicate it;
+		//   - JSON-RPC/protocol errors (mcp-go returns them as err): a
+		//     second identical dispatch fails identically;
+		//   - cancelled ctx: retry after user interrupt is wasted work.
+		// MarkTransportSuspect invalidates the supervisor's <60s health-cache
+		// freshness so ProbeNow performs a REAL probe (and, if the transport
+		// is confirmed dead, an on-demand reconnect) instead of blessing a
+		// retry with cached pre-failure state.
+		log.Printf("[mcp-tool] %s/%s: transport failure (%v), probing for on-demand reconnect", t.serverName, t.tool.Name, err)
+		t.supervisor.MarkTransportSuspect(t.serverName)
 		// Re-ensure Chrome CDP is available before reconnecting — Chrome may
 		// have died along with the MCP connection.
 		if t.serverName == "playwright" {
@@ -236,27 +245,50 @@ func maybeRewriteFileProducingArg(ctx context.Context, serverName, toolName stri
 	if targetDir == "" || !filepath.IsAbs(targetDir) {
 		return ""
 	}
+	// Scratch-internal dirs stay owner-only to match the 0o700 scratch root;
+	// non-scratch targets (session CWD fallback) keep conventional 0o755.
+	dirPerm := os.FileMode(0o755)
+	if artifact := cwdctx.ArtifactDirFromContext(ctx); artifact != "" && targetDir == artifact {
+		dirPerm = 0o700
+	}
+	// Missing output filename: the server would pick its own default
+	// location and report a path relative to its own workspace — the
+	// ambiguity behind the 2026-07-29 whole-disk search. Inject an absolute
+	// name in the artifact dir instead. Guards: only when an artifact dir is
+	// present (CWD-only runs keep the legacy no-injection behavior — the
+	// server default + result translation cover them), only for tools with a
+	// default (see defaultOutputName), and only when EVERY output arg is
+	// absent — if the caller supplied any of them, injecting a sibling would
+	// silently redirect output the model already addressed.
+	anyPresent := false
+	for _, name := range argNames {
+		if _, present := args[name]; present {
+			anyPresent = true
+			break
+		}
+	}
+	if !anyPresent {
+		if cwdctx.ArtifactDirFromContext(ctx) == "" {
+			return ""
+		}
+		def := defaultOutputName(key, args)
+		if def == "" {
+			return ""
+		}
+		abs := filepath.Join(targetDir, def)
+		// The scratch dir is created lazily here (0o700 to match its
+		// intended root perms); playwright-mcp does not mkdir for us.
+		_ = os.MkdirAll(filepath.Dir(abs), dirPerm)
+		// argNames is priority-ordered; the first name is the canonical
+		// output arg for the tool.
+		args[argNames[0]] = abs
+		return abs
+	}
+
 	for _, name := range argNames {
 		raw, present := args[name]
 		if !present {
-			// Missing output filename: the server would pick its own default
-			// location and report a path relative to its own workspace — the
-			// ambiguity behind the 2026-07-29 whole-disk search. Inject a
-			// deterministic absolute name in the artifact dir instead. Only
-			// when an artifact dir is present: CWD-only runs keep the legacy
-			// no-injection behavior (the server default + result translation
-			// cover them).
-			if cwdctx.ArtifactDirFromContext(ctx) == "" {
-				continue
-			}
-			def := defaultOutputName(key, args)
-			if def == "" {
-				continue
-			}
-			abs := filepath.Join(targetDir, def)
-			_ = os.MkdirAll(filepath.Dir(abs), 0o755)
-			args[name] = abs
-			return abs
+			continue
 		}
 		s, isStr := raw.(string)
 		if !isStr {
@@ -313,17 +345,24 @@ func maybeRewriteFileProducingArg(ctx context.Context, serverName, toolName stri
 		}
 		// Parent creation fixes the 2026-07-29 ENOENT on nested names like
 		// ".playwright-mcp/snapshot.md" — the server does not mkdir for us.
-		_ = os.MkdirAll(filepath.Dir(abs), 0o755)
+		_ = os.MkdirAll(filepath.Dir(abs), dirPerm)
 		args[name] = abs
 		return abs
 	}
 	return ""
 }
 
-// defaultOutputName returns the deterministic filename injected when the
-// model omits the output arg of a file-producing MCP tool, or "" for tools
-// without a default. The timestamp keeps repeated captures from overwriting
-// each other.
+// defaultOutputName returns the filename injected when the model omits the
+// output arg of a file-producing MCP tool, or "" for tools without a
+// default. The millisecond timestamp keeps repeated captures from
+// overwriting each other.
+//
+// Only tools that ALWAYS write a file belong here — for them the filename
+// controls location only. browser_snapshot is deliberately absent: its
+// filename is a MODE switch (playwright: "Save snapshot to markdown file
+// instead of returning it in the response"), and an omitted filename means
+// the inline accessibility snapshot the model reads pages through. Injecting
+// a default there would add a file round-trip to every page read.
 func defaultOutputName(key string, args map[string]any) string {
 	var stem, ext string
 	switch key {
@@ -332,8 +371,6 @@ func defaultOutputName(key string, args map[string]any) string {
 		if t, _ := args["type"].(string); strings.EqualFold(t, "jpeg") {
 			ext = ".jpeg"
 		}
-	case "playwright/browser_snapshot":
-		stem, ext = "snapshot", ".md"
 	default:
 		return ""
 	}

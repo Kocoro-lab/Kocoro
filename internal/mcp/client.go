@@ -638,7 +638,7 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 	}
 
 	result, err := callToolOnce(ctx)
-	if err != nil && isTransportError(err) {
+	if err != nil && IsTransportError(err) {
 		m.mu.Lock()
 		skip := m.supervised
 		m.mu.Unlock()
@@ -953,11 +953,11 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 	return m.connect(ctx, serverName, cfg)
 }
 
-// isTransportError reports whether err indicates a transport/connection failure
+// IsTransportError reports whether err indicates a transport/connection failure
 // (process exited, broken pipe, EOF) rather than a tool-logic or protocol error.
 // Only transport errors should trigger a reconnect attempt — retrying on logic
 // errors risks duplicating non-idempotent side effects.
-func isTransportError(err error) bool {
+func IsTransportError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}

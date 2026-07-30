@@ -38,18 +38,25 @@ var resultPathsRelativeToFirstRoot = map[string]bool{
 // further in markdownRelPathCandidates.
 var mdRelLinkRe = regexp.MustCompile(`\[[^\]\n]*\]\(([^)\s]+)\)`)
 
-// maxResultPathCandidates bounds per-result annotation work. A tool result
-// legitimately references a handful of artifacts (screenshot + snapshot);
-// beyond that the extra links are page content, not artifacts. When it binds,
-// later links are simply not annotated — no override needed.
-const maxResultPathCandidates = 4
+// maxResultPathCandidates bounds per-result annotation work. Candidates are
+// only stat'ed (cheap) and only annotate when the file exists, so the bound
+// exists to keep pathological link-heavy results from doing unbounded work —
+// not to model how many artifacts a result "should" have. A snapshot page
+// can legitimately contain several relative links ahead of the artifact
+// link, so the bound is deliberately generous. When it binds, later links
+// are simply not annotated.
+const maxResultPathCandidates = 16
+
+// maxResultLinkMatches bounds the regex scan itself so a very large snapshot
+// does not materialize every markdown link before the candidate cap applies.
+const maxResultLinkMatches = 64
 
 // markdownRelPathCandidates extracts relative-path-looking markdown link
 // targets from content, in order, deduplicated. URLs, anchors, mailto and
 // absolute paths are skipped: absolute paths need no translation, the rest
 // are not filesystem paths.
 func markdownRelPathCandidates(content string) []string {
-	matches := mdRelLinkRe.FindAllStringSubmatch(content, -1)
+	matches := mdRelLinkRe.FindAllStringSubmatch(content, maxResultLinkMatches)
 	seen := make(map[string]struct{}, len(matches))
 	var out []string
 	for _, m := range matches {
@@ -124,6 +131,21 @@ func maybeAnnotateResultPaths(serverName, content string, manager *mcp.ClientMan
 		}
 		info, err := os.Stat(abs)
 		if err != nil || info.IsDir() {
+			continue
+		}
+		// Defense in depth: the lexical containment above does not resolve
+		// symlinks, and the annotated path is handed back to the model which
+		// will file_read it. Re-check containment on the RESOLVED paths so a
+		// symlink planted under the base cannot point the model outside it.
+		resolvedAbs, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			continue
+		}
+		resolvedBase, err := filepath.EvalSymlinks(base)
+		if err != nil {
+			continue
+		}
+		if !strings.HasPrefix(resolvedAbs+sep, resolvedBase+sep) {
 			continue
 		}
 		content = annotateAbsPath(content, abs)

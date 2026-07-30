@@ -6,19 +6,25 @@ import (
 )
 
 // lostMCPArtifactHint returns a just-in-time hint for a file_read miss whose
-// original path matches the lost-MCP-artifact pattern: a relative path (the
-// model resolved a server-workspace-relative link against the session CWD)
-// or any path mentioning the playwright artifact directory. 2026-07-29
-// incident: such a miss sent the model into a 242-second `find /`. Empty
-// string when the pattern does not apply (absolute non-artifact paths, and
-// tilde paths, keep their plain error).
+// original path carries the lost-MCP-artifact SIGNATURE: the playwright
+// artifact directory, or a filename following the browser-artifact naming
+// convention (page-* from playwright's own defaults, screenshot-/snapshot-*
+// from the daemon's injected names). 2026-07-29 incident: such a miss sent
+// the model into a 242-second `find /`. Deliberately NOT triggered by
+// ordinary relative misses (a missing README.md is not an artifact — pointing
+// the model at the daemon's scratch dirs for it would be misdirection).
 func lostMCPArtifactHint(origPath string) string {
 	trimmed := strings.TrimSpace(origPath)
-	if trimmed == "" || strings.HasPrefix(trimmed, "~") {
+	if trimmed == "" {
 		return ""
 	}
-	if filepath.IsAbs(trimmed) && !strings.Contains(trimmed, ".playwright-mcp") {
-		return ""
+	if !strings.Contains(trimmed, ".playwright-mcp") {
+		base := filepath.Base(trimmed)
+		if !strings.HasPrefix(base, "page-") &&
+			!strings.HasPrefix(base, "screenshot-") &&
+			!strings.HasPrefix(base, "snapshot-") {
+			return ""
+		}
 	}
 	return "[hint] The path was not found here. MCP tool artifacts (screenshots, snapshots) are saved under the daemon's advertised workspace roots, not the session working directory — use the absolute path from the tool result's \"Saved to:\" line, or list ~/.shannon/tmp/attachments/ and ~/.shannon/tmp/sessions/. Do NOT scan the filesystem (e.g. `find /`) for it."
 }

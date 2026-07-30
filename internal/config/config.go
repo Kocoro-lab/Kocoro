@@ -502,6 +502,9 @@ func Load() (*Config, error) {
 	// (Intercom) override to ~300s in the built-in catalog.
 	viper.SetDefault("mcp.default_connect_timeout_secs", 60)
 	viper.SetDefault("mcp.tool_timeout_secs", 300)
+	// Age window for reclaiming per-session artifact scratch dirs
+	// (~/.shannon/tmp/sessions/<id>/) at daemon startup. 0 disables the sweep.
+	viper.SetDefault("daemon.scratch_max_age_days", 14)
 	viper.SetDefault("skills.marketplace.clawhub_url", "https://clawhub.ai")
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	// skills.marketplace.max_attempts / .retry_base_backoff_secs: in-client

@@ -433,7 +433,7 @@ mcp_servers:
     context: "Remote MCP server providing custom tools."
 ```
 
-Per-server: `command`/`args` (stdio), `type: http` + `url` (HTTP), `env`, `context` (LLM guidance — critical), `disabled: true` (skip without removing), `tool_timeout_secs` (bound a single tool call; default from `mcp.tool_timeout_secs`, 300s — raise for long-running tools), `workspace_base` (for file-producing servers: the directory their results render relative paths against, so the daemon can report absolute artifact paths).
+Per-server: `command`/`args` (stdio), `type: http` + `url` (HTTP), `env`, `context` (LLM guidance — critical), `disabled: true` (skip without removing), `tool_timeout_secs` (bound a single tool call; default from `mcp.tool_timeout_secs`, 300s — raise for long-running tools; cannot be disabled, `0` means the default), `workspace_base` (for file-producing servers: the directory their results render relative paths against, so the daemon can report absolute artifact paths).
 
 - **On-demand discovery** — large MCP and integration catalogs are searched and loaded as needed; common openers and core local tools remain immediately available.
 - **`context` is critical** — tells the LLM what auth, capabilities, and queries to use. Without it, the LLM guesses wrong.
