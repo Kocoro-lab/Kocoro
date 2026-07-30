@@ -958,6 +958,19 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 // Only transport errors should trigger a reconnect attempt — retrying on logic
 // errors risks duplicating non-idempotent side effects.
 func IsTransportError(err error) bool {
+	// mcp-go wraps every transport-level send failure in *transport.Error
+	// and signals a dead stdio subprocess with transport.ErrTransportClosed.
+	// Classify by TYPE first — live 2026-07-30 repro: a kill -9'd
+	// workspace-mcp produced "transport error: transport closed", which the
+	// string list below does not match, so the dead-connection retry never
+	// fired and the model just saw a hard failure.
+	var te *transport.Error
+	if errors.As(err, &te) {
+		return true
+	}
+	if errors.Is(err, transport.ErrTransportClosed) {
+		return true
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}

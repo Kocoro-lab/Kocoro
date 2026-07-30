@@ -2,9 +2,11 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -87,6 +89,25 @@ func TestCallTool_CallerDeadlineStillWins(t *testing.T) {
 	}
 	if elapsed > 3*time.Second {
 		t.Errorf("caller deadline was extended by per-call timeout, took %v", elapsed)
+	}
+}
+
+// mcp-go wraps every transport-level send failure in *transport.Error and
+// signals a dead stdio subprocess with transport.ErrTransportClosed — live
+// 2026-07-30 repro: a kill -9'd workspace-mcp produced "tools/call failed:
+// transport error: transport closed", which the string-matching classifier
+// missed, so the dead-connection retry never fired. Classify by TYPE, not
+// message text.
+func TestIsTransportErrorMatchesMCPGoTransportError(t *testing.T) {
+	wrapped := fmt.Errorf("tools/call failed: %w", transport.NewError(transport.ErrTransportClosed))
+	if !IsTransportError(wrapped) {
+		t.Fatalf("mcp-go transport.Error must classify as transport failure: %v", wrapped)
+	}
+	if IsTransportError(fmt.Errorf("jsonrpc: invalid params")) {
+		t.Fatal("protocol errors must not classify as transport failures")
+	}
+	if IsTransportError(fmt.Errorf("per-call timeout: %w", context.DeadlineExceeded)) {
+		t.Fatal("deadline errors must not classify as transport failures")
 	}
 }
 
