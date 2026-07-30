@@ -4,6 +4,8 @@
 
 Skills are knowledge packages that teach agents specific abilities — like reading PDFs, writing presentations, or analyzing spreadsheets. A skill contains instructions, example workflows, and sometimes custom tools that the agent can use. You install a skill once, then attach it to any agent that needs it.
 
+The skill reminder injected into a conversation is scoped to the current agent. It is not the complete global installation inventory, and different agents may see different enabled sets. Use `GET /skills` as the source of truth for globally installed skills; use `GET /agents/{name}` and inspect `skills` for a named agent's enabled set.
+
 ## API Endpoints
 
 ### List installed skills
@@ -131,7 +133,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Method: DELETE
 - Path: /skills/{slug}?confirm=true
 - Response: `{"status": "deleted"}`
-- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Automatically detaches from all agents that use it and clears any stored API keys from the OS keychain.
+- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Before removing the global files, the daemon removes both slug and legacy display-name references from every readable agent manifest. If any manifest is corrupt or unreadable, deletion fails and the global skill remains installed rather than reporting success with dangling references. Stored API keys are cleared from the OS keychain after deletion.
 
 ### Set skill secrets (API keys / env vars)
 - Method: PUT
@@ -175,6 +177,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 
 ### "Completely remove a skill"
 1. DELETE /skills/{skill-name}?confirm=true — removes skill and detaches from ALL agents
+2. If a skill directory was removed manually instead of through the API, daemon startup prunes unresolved references from agent manifests.
 
 ### "Configure API keys for a skill" (e.g., image-gen, figma)
 Some skills need API keys to call external services. These are declared by the skill and fetched at runtime from the OS keychain — NEVER edit `.env` or agent config to set them.

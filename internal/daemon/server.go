@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
@@ -104,6 +106,11 @@ type Server struct {
 	remoteRunOutbox   sync.Map // map[string][]remoteRunEventRecord
 	onReload          func()   // called after config reload to restart watchers/heartbeat
 
+	configRevisionMu      sync.Mutex
+	loadedConfigRevision  string
+	warnedConfigRevision  string
+	configRevisionTracked bool
+
 	marketplace                *skills.MarketplaceClient // static registry → /skills/marketplace/*
 	catalog                    skills.CatalogProvider
 	clawhub                    *skills.MarketplaceClient // ClawHub live catalog → /skills/clawhub/*
@@ -169,6 +176,79 @@ func (s *Server) requireDeps(w http.ResponseWriter) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Server) currentConfigRevision() (string, error) {
+	if s == nil || s.deps == nil || s.deps.ShannonDir == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(filepath.Join(s.deps.ShannonDir, "config.yaml"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "missing", nil
+		}
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", sum), nil
+}
+
+// recordConfigFileApplied records that the current on-disk global config has
+// been reflected in the daemon's live state. API handlers that update both
+// disk and memory call this after the in-memory mutation; /config/reload calls
+// it only after the new config has been installed successfully.
+func (s *Server) recordConfigFileApplied() {
+	revision, err := s.currentConfigRevision()
+	if err != nil {
+		log.Printf("daemon: WARNING: cannot record loaded config.yaml revision: %v", err)
+		return
+	}
+	if revision == "" {
+		return
+	}
+	s.configRevisionMu.Lock()
+	s.loadedConfigRevision = revision
+	s.warnedConfigRevision = ""
+	s.configRevisionTracked = true
+	s.configRevisionMu.Unlock()
+}
+
+func (s *Server) configReloadState() (required bool, reason, warningKey string) {
+	s.configRevisionMu.Lock()
+	loaded := s.loadedConfigRevision
+	tracked := s.configRevisionTracked
+	s.configRevisionMu.Unlock()
+	if !tracked {
+		return false, "", ""
+	}
+
+	current, err := s.currentConfigRevision()
+	if err != nil {
+		return true,
+			fmt.Sprintf("config.yaml cannot be read: %v; fix the file and call POST /config/reload or restart the daemon", err),
+			"error:" + err.Error()
+	}
+	if current == loaded {
+		return false, "", current
+	}
+	return true,
+		"config.yaml changed on disk after the running config was loaded; call POST /config/reload or restart the daemon",
+		current
+}
+
+func (s *Server) warnIfConfigReloadRequired() {
+	required, reason, warningKey := s.configReloadState()
+	if !required {
+		return
+	}
+	s.configRevisionMu.Lock()
+	if s.warnedConfigRevision == warningKey {
+		s.configRevisionMu.Unlock()
+		return
+	}
+	s.warnedConfigRevision = warningKey
+	s.configRevisionMu.Unlock()
+	log.Printf("daemon: WARNING: %s; this request will continue with the previous in-memory global config", reason)
 }
 
 // auditHTTPOp logs an HTTP API write operation to the audit log.
@@ -365,6 +445,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	if deps != nil && !skillRecommendationsEnabled(deps.Config) {
 		s.skillRecommendationsOff.Store(true)
 	}
+	s.recordConfigFileApplied()
 	// Wire approval bus hooks so SSE per-request brokers (which inherit from
 	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
 	// EventApprovalResolved alongside the WS path's broker. The cloud notifier
@@ -1336,12 +1417,16 @@ func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Reques
 			"chrome_profile": req.Profile,
 		}
 	}
+	configWasStale, _, _ := s.configReloadState()
 	prevProfile := s.configuredChromeProfile()
 	if err := s.patchGlobalConfig(patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.setConfiguredChromeProfile(req.Profile)
+	if !configWasStale {
+		s.recordConfigFileApplied()
+	}
 	stopChromeFn()
 	if err := resetChromeProfileCloneFn(); err != nil {
 		rollbackPatch := map[string]interface{}{
@@ -1359,6 +1444,9 @@ func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		s.setConfiguredChromeProfile(prevProfile)
+		if !configWasStale {
+			s.recordConfigFileApplied()
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2810,6 +2898,7 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "daemon deps not configured")
 		return
 	}
+	s.warnIfConfigReloadRequired()
 	id := r.PathValue("id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "session id required")
@@ -2968,6 +3057,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"daemon deps not configured"}`, http.StatusInternalServerError)
 		return
 	}
+	s.warnIfConfigReloadRequired()
 
 	var req RunAgentRequest
 	if !decodeBody(w, r, &req) {
@@ -3769,6 +3859,57 @@ func skillNamesFromRequest(entries []*skills.Skill) []string {
 	return names
 }
 
+// lockSkillIdentifiers serializes agent attachment writes with global
+// install/update/delete operations. Display-name aliases are canonicalized to
+// their on-disk slug before locking so legacy and current API callers share the
+// same mutex. Locks are sorted to keep multi-skill agent updates deadlock-free.
+func (s *Server) lockSkillIdentifiers(names []string) func() {
+	if len(names) == 0 || s.slugLocks == nil {
+		return func() {}
+	}
+	seen := make(map[string]struct{}, len(names))
+	canonical := make([]string, 0, len(names))
+	for _, name := range names {
+		if slug, ok := s.resolveSkillIdent(name); ok {
+			name = slug
+		}
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		canonical = append(canonical, name)
+	}
+	sort.Strings(canonical)
+	unlocks := make([]func(), 0, len(canonical))
+	for _, name := range canonical {
+		unlocks = append(unlocks, s.slugLocks.Lock(name))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
+func (s *Server) lockAgentRoutes(names []string) func() {
+	if len(names) == 0 || s == nil || s.deps == nil || s.deps.SessionCache == nil {
+		return func() {}
+	}
+	names = append([]string(nil), names...)
+	sort.Strings(names)
+	for _, name := range names {
+		s.deps.SessionCache.LockRoute("agent:" + name)
+	}
+	return func() {
+		for i := len(names) - 1; i >= 0; i-- {
+			s.deps.SessionCache.UnlockRoute("agent:" + names[i])
+		}
+	}
+}
+
 func (s *Server) validateInstalledSkills(names []string) error {
 	if len(names) == 0 {
 		return nil
@@ -4017,7 +4158,20 @@ func pruneEmptyMaps(m map[string]interface{}) bool {
 
 func (s *Server) patchGlobalConfig(patch map[string]interface{}) error {
 	globalPath := filepath.Join(s.deps.ShannonDir, "config.yaml")
-	globalData, _ := os.ReadFile(globalPath)
+	lockFile, err := os.OpenFile(globalPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open config lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return fmt.Errorf("lock config: %w", err)
+	}
+	defer fslock.Unlock(lockFile.Fd())
+
+	globalData, err := os.ReadFile(globalPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read config: %w", err)
+	}
 	var current map[string]interface{}
 	if len(globalData) > 0 {
 		if err := yaml.Unmarshal(globalData, &current); err != nil {
@@ -4155,7 +4309,10 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Config.DisplayName = req.DisplayName
 	}
-	if err := s.validateInstalledSkills(skillNamesFromRequest(req.Skills)); err != nil {
+	skillNames := skillNamesFromRequest(req.Skills)
+	unlockSkills := s.lockSkillIdentifiers(skillNames)
+	defer unlockSkills()
+	if err := s.validateInstalledSkills(skillNames); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -4210,7 +4367,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(req.Skills) > 0 {
-		if err := agents.SetAttachedSkills(s.deps.AgentsDir, req.Name, skillNamesFromRequest(req.Skills)); err != nil {
+		if err := agents.SetAttachedSkills(s.deps.AgentsDir, req.Name, skillNames); err != nil {
 			rollback()
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write skill manifest: %v", err))
 			return
@@ -4345,7 +4502,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.validateInstalledSkills(skillNamesFromRequest(req.Skills)); err != nil {
+	skillNames := skillNamesFromRequest(req.Skills)
+	unlockSkills := s.lockSkillIdentifiers(skillNames)
+	defer unlockSkills()
+	if err := s.validateInstalledSkills(skillNames); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -4426,7 +4586,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Skills != nil {
 		// Write attached skills manifest — agent loader resolves content from global/bundled.
-		if err := agents.SetAttachedSkills(s.deps.AgentsDir, name, skillNamesFromRequest(req.Skills)); err != nil {
+		if err := agents.SetAttachedSkills(s.deps.AgentsDir, name, skillNames); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write skill manifest: %v", err))
 			return
 		}
@@ -4732,6 +4892,7 @@ func (s *Server) handleAddGlobalAlwaysAllow(w http.ResponseWriter, r *http.Reque
 			"tool requires fresh approval each call and cannot be persisted as always-allow")
 		return
 	}
+	configWasStale, _, _ := s.configReloadState()
 	if err := config.AppendGlobalAlwaysAllowTool(s.deps.ShannonDir, req.Tool); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4751,6 +4912,9 @@ func (s *Server) handleAddGlobalAlwaysAllow(w http.ResponseWriter, r *http.Reque
 		perms.AlwaysAllowTools = append(perms.AlwaysAllowTools, req.Tool)
 	}
 	s.deps.WriteUnlock()
+	if !configWasStale {
+		s.recordConfigFileApplied()
+	}
 	s.auditHTTPOp("POST", "/permissions/always-allow", "added "+req.Tool)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "added"})
 }
@@ -4769,6 +4933,7 @@ func (s *Server) handleRemoveGlobalAlwaysAllow(w http.ResponseWriter, r *http.Re
 	if req.Tool == "computer_use" && !requireComputerUseLocalPresence(w, r) {
 		return
 	}
+	configWasStale, _, _ := s.configReloadState()
 	if err := config.RemoveGlobalAlwaysAllowTool(s.deps.ShannonDir, req.Tool); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4784,6 +4949,9 @@ func (s *Server) handleRemoveGlobalAlwaysAllow(w http.ResponseWriter, r *http.Re
 	}
 	perms.AlwaysAllowTools = filtered
 	s.deps.WriteUnlock()
+	if !configWasStale {
+		s.recordConfigFileApplied()
+	}
 	s.auditHTTPOp("DELETE", "/permissions/always-allow", "removed "+req.Tool)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
@@ -4849,6 +5017,7 @@ func (s *Server) handleAddGlobalDisabledSkill(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "skill, skills, or prefix is required")
 		return
 	}
+	configWasStale, _, _ := s.configReloadState()
 	if err := config.AppendGlobalDisabledSkills(s.deps.ShannonDir, targets); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4866,6 +5035,9 @@ func (s *Server) handleAddGlobalDisabledSkill(w http.ResponseWriter, r *http.Req
 		}
 	}
 	s.deps.WriteUnlock()
+	if !configWasStale {
+		s.recordConfigFileApplied()
+	}
 	s.auditHTTPOp("POST", "/skills/disabled", fmt.Sprintf("disabled %d skill(s)", len(targets)))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "disabled", "count": len(targets), "skills": targets})
 }
@@ -4886,6 +5058,7 @@ func (s *Server) handleRemoveGlobalDisabledSkill(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "skill, skills, or prefix is required")
 		return
 	}
+	configWasStale, _, _ := s.configReloadState()
 	if err := config.RemoveGlobalDisabledSkills(s.deps.ShannonDir, targets); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4904,6 +5077,9 @@ func (s *Server) handleRemoveGlobalDisabledSkill(w http.ResponseWriter, r *http.
 	}
 	sk.Disabled = filtered
 	s.deps.WriteUnlock()
+	if !configWasStale {
+		s.recordConfigFileApplied()
+	}
 	s.auditHTTPOp("DELETE", "/skills/disabled", fmt.Sprintf("enabled %d skill(s)", len(targets)))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "removed", "count": len(targets), "skills": targets})
 }
@@ -4926,6 +5102,7 @@ func (s *Server) handleAddDefaultAgentDisabledMCP(w http.ResponseWriter, r *http
 		writeError(w, http.StatusBadRequest, "server is required")
 		return
 	}
+	configWasStale, _, _ := s.configReloadState()
 	if err := config.AppendDefaultAgentDisabledMCPServer(s.deps.ShannonDir, req.Server); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4943,6 +5120,9 @@ func (s *Server) handleAddDefaultAgentDisabledMCP(w http.ResponseWriter, r *http
 		mc.DefaultAgentDisabled = append(mc.DefaultAgentDisabled, req.Server)
 	}
 	s.deps.WriteUnlock()
+	if !configWasStale {
+		s.recordConfigFileApplied()
+	}
 	s.auditHTTPOp("POST", "/mcp/default-disabled", "disabled "+req.Server)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
 }
@@ -4958,6 +5138,7 @@ func (s *Server) handleRemoveDefaultAgentDisabledMCP(w http.ResponseWriter, r *h
 		writeError(w, http.StatusBadRequest, "server is required")
 		return
 	}
+	configWasStale, _, _ := s.configReloadState()
 	if err := config.RemoveDefaultAgentDisabledMCPServer(s.deps.ShannonDir, req.Server); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4972,6 +5153,9 @@ func (s *Server) handleRemoveDefaultAgentDisabledMCP(w http.ResponseWriter, r *h
 	}
 	mc.DefaultAgentDisabled = filtered
 	s.deps.WriteUnlock()
+	if !configWasStale {
+		s.recordConfigFileApplied()
+	}
 	s.auditHTTPOp("DELETE", "/mcp/default-disabled", "enabled "+req.Server)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
@@ -5058,9 +5242,19 @@ func (s *Server) handlePutSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "skill name in body must match URL")
 		return
 	}
+	unlockSkill := s.lockSkillIdentifiers([]string{skillName})
+	defer unlockSkill()
 	if err := s.validateInstalledSkills([]string{skillName}); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if s.deps.SessionCache != nil {
+		routeKey := "agent:" + agentName
+		s.deps.SessionCache.LockRoute(routeKey)
+		defer s.deps.SessionCache.UnlockRoute(routeKey)
+		if !s.agentExists(w, agentName) {
+			return
+		}
 	}
 	// Materialize builtin AFTER validation passes — avoids orphaned override dirs on bad input.
 	if !s.materializeIfBuiltin(w, agentName) {
@@ -5074,6 +5268,7 @@ func (s *Server) handlePutSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "attached"})
 }
 
@@ -5087,11 +5282,21 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	if !s.agentExists(w, agentName) {
 		return
 	}
-	if !s.materializeIfBuiltin(w, agentName) {
-		return
-	}
 	if err := skills.ValidateSkillName(skillName); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	unlockSkill := s.lockSkillIdentifiers([]string{skillName})
+	defer unlockSkill()
+	if s.deps.SessionCache != nil {
+		routeKey := "agent:" + agentName
+		s.deps.SessionCache.LockRoute(routeKey)
+		defer s.deps.SessionCache.UnlockRoute(routeKey)
+		if !s.agentExists(w, agentName) {
+			return
+		}
+	}
+	if !s.materializeIfBuiltin(w, agentName) {
 		return
 	}
 	if err := agents.DetachSkill(s.deps.AgentsDir, agentName, skillName); err != nil {
@@ -5102,6 +5307,7 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -6113,12 +6319,55 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in global directory", name))
 		return
 	}
-	if err := skills.DeleteGlobalSkill(s.deps.ShannonDir, name); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	identifiers := []string{name}
+	if sources, err := s.skillSources(); err == nil {
+		if loaded, err := skills.LoadSkills(sources...); err == nil {
+			for _, skill := range loaded {
+				if skill.Slug == name && skill.Name != "" && skill.Name != name {
+					identifiers = append(identifiers, skill.Name)
+					break
+				}
+			}
+		}
+	}
+	affectedAgents, err := agents.AgentsAttachingSkillAliasesStrict(
+		s.deps.AgentsDir,
+		identifiers...,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("cannot inspect agent skill attachments: %v", err))
 		return
 	}
-	s.auditHTTPOp("DELETE", "/skills/"+name, "deleted skill")
+	unlockAgentRoutes := s.lockAgentRoutes(affectedAgents)
+	defer unlockAgentRoutes()
+	detachedAgents, err := agents.DetachSkillAliasesFromAllAgents(
+		s.deps.AgentsDir,
+		identifiers...,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("cannot detach skill from all agents: %v", err))
+		return
+	}
+	if err := skills.DeleteGlobalSkill(s.deps.ShannonDir, name); err != nil {
+		rollbackErrs := make([]error, 0)
+		for _, agentName := range detachedAgents {
+			if rollbackErr := agents.AttachSkill(s.deps.AgentsDir, agentName, name); rollbackErr != nil {
+				rollbackErrs = append(rollbackErrs,
+					fmt.Errorf("restore skill attachment for agent %q: %w", agentName, rollbackErr))
+			}
+		}
+		writeError(w, http.StatusInternalServerError,
+			errors.Join(append([]error{err}, rollbackErrs...)...).Error())
+		return
+	}
+	s.auditHTTPOp("DELETE", "/skills/"+name,
+		fmt.Sprintf("deleted skill and detached %d agent(s)", len(detachedAgents)))
 	s.secretsStore.Delete(name)
+	if len(detachedAgents) > 0 {
+		s.triggerAgentSync()
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -6637,11 +6886,17 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"global":    globalMap,
 		"effective": effectiveMap,
 		"sources":   sources,
-	})
+	}
+	reloadRequired, reloadReason, _ := s.configReloadState()
+	resp["reload_required"] = reloadRequired
+	if reloadRequired {
+		resp["reload_reason"] = reloadReason
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -6659,7 +6914,7 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	if reason, isProtected := checkProtectedFields(patch); isProtected {
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error":   "protected_field",
-			"message": reason + " — edit ~/.shannon/config.yaml directly",
+			"message": reason + " — edit ~/.shannon/config.yaml directly, then call POST /config/reload",
 		})
 		return
 	}
@@ -6732,6 +6987,11 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 	cfg, _, _ := s.deps.Snapshot()
 	resp := make(map[string]interface{})
+	reloadRequired, reloadReason, _ := s.configReloadState()
+	resp["reload_required"] = reloadRequired
+	if reloadRequired {
+		resp["reload_reason"] = reloadReason
+	}
 
 	if cfg != nil && len(cfg.MCPServers) > 0 {
 		// Build set of live-connected server names from MCPManager.
@@ -7217,6 +7477,8 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		resp["restart_required"] = true
 		resp["restart_reason"] = reason
 	}
+
+	s.recordConfigFileApplied()
 
 	// MCP server status for UI indicators
 	if len(newCfg.MCPServers) > 0 {

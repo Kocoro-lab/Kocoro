@@ -9,27 +9,27 @@ Global settings control how Shannon behaves across all agents — which AI model
 ### Get current config
 - Method: GET
 - Path: /config
-- Response: `{"global": {...}, "effective": {...}, "sources": {"provider": "global", "endpoint": "global"}}`
-- Notes: `effective` is the merged result. `sources` shows which config file each setting came from.
+- Response: `{"global": {...}, "effective": {...}, "sources": [...], "reload_required": false, "reload_reason": "..."}`
+- Notes: `effective` is the daemon's currently loaded result. `sources` shows which config files contributed settings. If `reload_required` is true, `global` contains newer on-disk content that has not been applied to `effective`; call POST /config/reload or restart the daemon.
 
 ### Update config (deep merge)
 - Method: PATCH
 - Path: /config
 - Body: `{"agent": {"model": "claude-opus-4-5"}}`
 - Response: `{"status": "updated"}`
-- Notes: PATCH merges deeply — you only need to include the fields you want to change. Protected fields (`endpoint`, `api_key`, their nested aliases `cloud.endpoint` / `cloud.api_key`, the legacy alias `gateway_url`, `sync.endpoint`, and `permissions.denied_commands`) return HTTP 409 and cannot be changed through this API. Unknown keys are rejected with HTTP 400 `{"error":"unknown_config_field","field":"<dotted.path>"}` — the daemon does not read such keys, so writing them would silently change nothing (e.g. `daemon.endpoint` is invalid; the real key is top-level `endpoint`). Setting a NON-protected key to `null` deletes it, including unknown/stray keys (that is the cleanup path for leftovers like a misplaced `daemon.endpoint`); protected fields return 409 even for `null` — removing a stray `gateway_url` requires editing `~/.shannon/config.yaml` directly. Keys are exact-case snake_case (`{"agent":{"Model":...}}` is rejected as unknown; protected fields are matched case-insensitively so case variants 409 rather than bypassing).
+- Notes: PATCH merges deeply — you only need to include the fields you want to change. It writes the global file; follow it with POST /config/reload, then verify `effective` with GET /config. Protected fields (`endpoint`, `api_key`, their nested aliases `cloud.endpoint` / `cloud.api_key`, the legacy alias `gateway_url`, `sync.endpoint`, and `permissions.denied_commands`) return HTTP 409 and cannot be changed through this API. Unknown keys are rejected with HTTP 400 `{"error":"unknown_config_field","field":"<dotted.path>"}` — the daemon does not read such keys, so writing them would silently change nothing (e.g. `daemon.endpoint` is invalid; the real key is top-level `endpoint`). Setting a NON-protected key to `null` deletes it, including unknown/stray keys (that is the cleanup path for leftovers like a misplaced `daemon.endpoint`); protected fields return 409 even for `null` — removing a stray `gateway_url` requires editing `~/.shannon/config.yaml` directly. Keys are exact-case snake_case (`{"agent":{"Model":...}}` is rejected as unknown; protected fields are matched case-insensitively so case variants 409 rather than bypassing).
 
 ### Reload config from disk
 - Method: POST
 - Path: /config/reload
-- Response: `{"status": "reloaded"}`
-- Notes: Picks up changes made directly to config files on disk. Also reconnects MCP servers.
+- Response: `{"status": "reloaded", "restart_required": true, "restart_reason": "..."}` (`restart_*` fields appear only when needed)
+- Notes: Picks up changes made directly to config files on disk and clears `reload_required`. Also reconnects MCP servers. Endpoint changes and some legacy API-key changes still require the daemon restart reported by the response.
 
 ### Get config status
 - Method: GET
 - Path: /config/status
-- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "...", "audio_processing": "auto"|"mac_voice"|"clean_device", "fast_effort": bool|null}}`
-- Notes: Shows live connection status for MCP servers and provider health. The `koe` block reflects the voice front brain's settings (managed by Kocoro Desktop's settings panel; credential-free — Koe mints via the daemon, no key here).
+- Response: `{"reload_required": false, "reload_reason": "...", "mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "...", "audio_processing": "auto"|"mac_voice"|"clean_device", "fast_effort": bool|null}}`
+- Notes: Shows whether on-disk config is pending reload, plus live connection status for MCP servers and provider health. The `koe` block reflects the voice front brain's settings (managed by Kocoro Desktop's settings panel; credential-free — Koe mints via the daemon, no key here).
 
 ### Get daemon status
 - Method: GET
@@ -87,12 +87,13 @@ Global settings control how Shannon behaves across all agents — which AI model
 
 ### "Change the AI model"
 1. PATCH /config with `{"agent": {"model": "claude-opus-4-5"}}`
-2. POST /config/reload (optional — model is picked up on next conversation)
+2. POST /config/reload
 3. Verify: GET /config → check `effective.agent.model`
 
 ### "Increase bash command timeout"
 1. PATCH /config with `{"tools": {"bash_timeout": 300}}`
-2. Bash commands can now run up to 5 minutes before timing out.
+2. POST /config/reload
+3. Verify: GET /config → check `effective.tools.bash_timeout`
 
 ### "Check which model is being used"
 1. GET /config → look at `effective.agent.model`

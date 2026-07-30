@@ -129,8 +129,8 @@ func (p *AgentPermissionsConfig) Clone() *AgentPermissionsConfig {
 
 // AgentModelConfig holds per-agent model/iteration overrides.
 type AgentModelConfig struct {
-	Model         *string  `yaml:"model" json:"model,omitempty"`
-	ModelTier     *string  `yaml:"model_tier" json:"model_tier,omitempty"`
+	Model     *string `yaml:"model" json:"model,omitempty"`
+	ModelTier *string `yaml:"model_tier" json:"model_tier,omitempty"`
 	// EffortTier is the per-agent reasoning-effort override (unified tier names
 	// "low"/"high"/"xhigh"/"max"). nil = inherit the global agent.effort_tier;
 	// a value overrides it for this agent. Applied to the loop via
@@ -361,7 +361,7 @@ func WriteAttachedSkills(agentsDir, agentName string, names []string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "_attached.yaml"), data, 0600)
+	return AtomicWrite(filepath.Join(dir, "_attached.yaml"), data)
 }
 
 // DeleteAttachedSkills removes the _attached.yaml manifest.

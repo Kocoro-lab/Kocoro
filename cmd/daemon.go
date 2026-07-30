@@ -81,6 +81,18 @@ var daemonStartCmd = &cobra.Command{
 		if err := skills.EnsureBuiltinSkills(shanDir); err != nil {
 			log.Printf("WARNING: failed to sync builtin skills: %v", err)
 		}
+		if cleanups, err := agents.PruneDanglingSkillAttachments(agentsDir, shanDir); err != nil {
+			log.Printf("WARNING: failed to prune dangling agent skill references: %v", err)
+		} else if len(cleanups) > 0 {
+			removed := 0
+			agentNames := make([]string, 0, len(cleanups))
+			for _, cleanup := range cleanups {
+				removed += len(cleanup.Skills)
+				agentNames = append(agentNames, cleanup.Agent)
+			}
+			log.Printf("daemon: pruned %d dangling skill reference(s) from agents: %s",
+				removed, strings.Join(agentNames, ", "))
+		}
 
 		force, _ := cmd.Flags().GetBool("force")
 		if force {

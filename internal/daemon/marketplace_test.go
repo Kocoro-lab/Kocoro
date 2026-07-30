@@ -478,6 +478,103 @@ func TestHandleLocalSkillCollisionStaysLocal(t *testing.T) {
 	}
 }
 
+func TestHandleDeleteGlobalSkillDetachesAllAgents(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	daemonTestWriteFile(t,
+		filepath.Join(s.deps.ShannonDir, "skills", "docker", "SKILL.md"),
+		"---\nname: Docker\ndescription: containers\n---\nbody\n",
+	)
+	if err := agents.SetAttachedSkills(s.deps.AgentsDir, "analyst", []string{"Docker", "other"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := agents.SetAttachedSkills(s.deps.AgentsDir, "operator", []string{"docker"}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("DELETE", "/skills/docker?confirm=true", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(s.deps.ShannonDir, "skills", "docker")); !os.IsNotExist(err) {
+		t.Fatalf("global skill directory still exists: %v", err)
+	}
+	analyst, err := agents.ReadAttachedSkills(s.deps.AgentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analyst) != 1 || analyst[0] != "other" {
+		t.Errorf("analyst skills = %v, want [other]", analyst)
+	}
+	if _, err := os.Stat(filepath.Join(s.deps.AgentsDir, "operator", "_attached.yaml")); !os.IsNotExist(err) {
+		t.Errorf("operator manifest should be removed, stat error = %v", err)
+	}
+}
+
+func TestHandleDeleteGlobalSkillPreservesSkillWhenAgentManifestIsCorrupt(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	skillFile := filepath.Join(s.deps.ShannonDir, "skills", "docker", "SKILL.md")
+	daemonTestWriteFile(t, skillFile, "---\nname: docker\ndescription: containers\n---\nbody\n")
+	daemonTestWriteFile(t,
+		filepath.Join(s.deps.AgentsDir, "broken", "_attached.yaml"),
+		"not: a-list\n",
+	)
+
+	req := httptest.NewRequest("DELETE", "/skills/docker?confirm=true", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(skillFile); err != nil {
+		t.Fatalf("skill should remain after failed detach: %v", err)
+	}
+}
+
+func TestHandleDeleteGlobalSkillDoesNotLockUnrelatedAgentRoutes(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	s.deps.SessionCache = NewSessionCache(t.TempDir())
+	daemonTestWriteFile(t,
+		filepath.Join(s.deps.ShannonDir, "skills", "docker", "SKILL.md"),
+		"---\nname: docker\ndescription: containers\n---\nbody\n",
+	)
+	if err := agents.SetAttachedSkills(s.deps.AgentsDir, "analyst", []string{"docker"}); err != nil {
+		t.Fatal(err)
+	}
+	daemonTestWriteFile(t, filepath.Join(s.deps.AgentsDir, "writer", "AGENT.md"), "writer")
+
+	unrelatedRoute := "agent:writer"
+	s.deps.SessionCache.LockRoute(unrelatedRoute)
+	routeLocked := true
+	defer func() {
+		if routeLocked {
+			s.deps.SessionCache.UnlockRoute(unrelatedRoute)
+		}
+	}()
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest("DELETE", "/skills/docker?confirm=true", nil)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		done <- rr
+	}()
+
+	select {
+	case rr := <-done:
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(time.Second):
+		s.deps.SessionCache.UnlockRoute(unrelatedRoute)
+		routeLocked = false
+		t.Fatal("global skill deletion blocked on an unrelated agent route")
+	}
+	s.deps.SessionCache.UnlockRoute(unrelatedRoute)
+	routeLocked = false
+}
+
 // TestE2E_RealClawHubOntology installs the real ontology skill from
 // ClawHub's Convex-hosted zip, exercising the full marketplace handler
 // stack end-to-end with a real HTTP upstream.
