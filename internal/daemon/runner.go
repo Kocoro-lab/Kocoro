@@ -1900,14 +1900,34 @@ func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []cli
 	return sess.HistoryForLoop()
 }
 
-func mergeAgentAlwaysAllowTools(global, perAgent []string) []string {
-	merged := append([]string(nil), global...)
-	for _, tool := range perAgent {
-		if agents.IsToolAlwaysAllowable(tool) {
-			merged = append(merged, tool)
+func configureDaemonComputerUseDispatcher(
+	reg *agent.ToolRegistry,
+	dispatcherReady bool,
+) bool {
+	if reg == nil || !reg.Has("computer_use") {
+		return false
+	}
+	// The unwrapped core is never model-visible on daemon runs. If private
+	// dispatcher construction failed, omit only this core and preserve every
+	// legacy fallback that the filtered registry still exposes.
+	reg.Remove("computer_use")
+	if !dispatcherReady {
+		return false
+	}
+	// There is exactly one model-visible desktop surface. Remove the low-level
+	// legacy GUI fallbacks only after both the filtered public dispatcher and
+	// its private executor are known to be available. A named agent that
+	// excludes computer_use keeps its explicitly selected legacy tools and
+	// normal bash behavior.
+	reg.Remove(client.NativeComputerToolName)
+	reg.Remove("accessibility")
+	reg.Remove("applescript")
+	if raw, ok := reg.Get("bash"); ok {
+		if bash, ok := raw.(*tools.BashTool); ok {
+			bash.LegacyGUIAutomationDisabled = true
 		}
 	}
-	return merged
+	return true
 }
 
 const interruptedTurnContinuation = "[system] The previous turn was interrupted after a durable checkpoint. Continue the existing request from the saved tool results and partial work. Do not repeat completed tool calls."
@@ -2816,23 +2836,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// (config.mcp.default_agent_disabled). No-op when empty.
 		reg = tools.ApplyMCPServerScope(reg, runCfg)
 	}
-	computerUseDispatcherEnabled := reg.Has("computer_use")
-	// There is exactly one model-visible desktop surface. The low-level
-	// computer_use core and native computer marker live only in computerReg;
-	// legacy GUI tools cannot compete with the dispatcher.
-	reg.Remove("computer_use")
-	reg.Remove(client.NativeComputerToolName)
-	reg.Remove("accessibility")
-	reg.Remove("applescript")
-	if raw, ok := reg.Get("bash"); ok {
-		if bash, ok := raw.(*tools.BashTool); ok {
-			bash.LegacyGUIAutomationDisabled = true
-		}
-	}
-	if openAIComputerPrivate == nil || computerReg == nil ||
-		!computerReg.Has(client.NativeComputerToolName) {
-		computerUseDispatcherEnabled = false
-	}
+	computerUseDispatcherEnabled := configureDaemonComputerUseDispatcher(
+		reg,
+		openAIComputerPrivate != nil && computerReg != nil &&
+			computerReg.Has(client.NativeComputerToolName),
+	)
 
 	// Attach SecretsStore to the session-scoped bash tool so use_skill
 	// activations can expose skill secrets as child-process env vars.
@@ -3011,13 +3019,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// global (~/.shannon/config.yaml permissions.always_allow_tools) and
 		// per-agent (agents/<name>/config.yaml permissions.always_allow_tools)
 		// — global lets the user authorize a tool once and have it apply to
-		// every agent; per-agent narrows trust to a single agent.
-		// SetAlwaysAllowTools dedups internally so simple append is fine.
+		// every agent; permitted per-agent entries narrow trust to one agent.
+		// MergeAlwaysAllowTools filters stale per-agent high-risk grants, and
+		// SetAlwaysAllowTools deduplicates the merged result.
 		var perAgentAlwaysAllow []string
 		if agentOverride.Config != nil && agentOverride.Config.Permissions != nil {
 			perAgentAlwaysAllow = agentOverride.Config.Permissions.AlwaysAllowTools
 		}
-		loop.SetAlwaysAllowTools(mergeAgentAlwaysAllowTools(
+		loop.SetAlwaysAllowTools(agents.MergeAlwaysAllowTools(
 			runCfg.Permissions.AlwaysAllowTools,
 			perAgentAlwaysAllow,
 		))

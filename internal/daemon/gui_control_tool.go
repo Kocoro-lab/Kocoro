@@ -769,6 +769,12 @@ type daemonGUIToolBase struct {
 
 func (t *daemonGUIToolBase) Info() agent.ToolInfo   { return t.inner.Info() }
 func (t *daemonGUIToolBase) RequiresApproval() bool { return t.inner.RequiresApproval() }
+func (t *daemonGUIToolBase) ToolExposure() agent.ToolExposure {
+	if provider, ok := t.inner.(agent.ToolExposureProvider); ok {
+		return provider.ToolExposure()
+	}
+	return agent.ToolExposureDefault
+}
 func (t *daemonGUIToolBase) ApprovalAdmission(ctx context.Context, args string) agent.ApprovalAdmissionDecision {
 	describer, ok := t.inner.(agent.GUIActionDescriber)
 	if !ok {

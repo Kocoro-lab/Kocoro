@@ -579,7 +579,7 @@ func TestWireFixture_HTTPComputerUseTopology(t *testing.T) {
 	rec := httptest.NewRecorder()
 	NewServer(0, nil, nil, "test").Handler().ServeHTTP(
 		rec,
-		httptest.NewRequest(http.MethodGet, "/local/computer-use/topology", nil))
+		authorizedComputerUseTopologyRequest(t))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /local/computer-use/topology = %d: %s", rec.Code, rec.Body.Bytes())
 	}

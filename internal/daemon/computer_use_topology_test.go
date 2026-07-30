@@ -42,6 +42,14 @@ func canonicalHelperDisplayTopology(t *testing.T) tools.DisplayTopologyV1 {
 	return topology
 }
 
+func authorizedComputerUseTopologyRequest(t *testing.T) *http.Request {
+	t.Helper()
+	t.Setenv(localPresenceEnv, computerUseHTTPPresenceToken)
+	req := httptest.NewRequest(http.MethodGet, "/local/computer-use/topology", nil)
+	req.Header.Set(localPresenceHeader, computerUseHTTPPresenceToken)
+	return req
+}
+
 func TestComputerUseTopologyFixtureMatchesHelperContract(t *testing.T) {
 	daemonFixture := canonicalHTTPComputerUseTopology(t)
 	helperFixture := canonicalHelperDisplayTopology(t)
@@ -64,7 +72,7 @@ func TestComputerUseTopologyHandlerReturnsStrictTopologyWithoutWrapper(t *testin
 		return want, nil
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/local/computer-use/topology", nil)
+	req := authorizedComputerUseTopologyRequest(t)
 	req = req.WithContext(context.WithValue(req.Context(), key, "request-context"))
 	rec := httptest.NewRecorder()
 	(&Server{}).handleComputerUseTopology(rec, req)
@@ -112,7 +120,7 @@ func TestComputerUseTopologyHandlerReturnsStable502(t *testing.T) {
 			rec := httptest.NewRecorder()
 			(&Server{}).handleComputerUseTopology(
 				rec,
-				httptest.NewRequest(http.MethodGet, "/local/computer-use/topology", nil))
+				authorizedComputerUseTopologyRequest(t))
 			if rec.Code != http.StatusBadGateway {
 				t.Fatalf("status = %d, want 502", rec.Code)
 			}

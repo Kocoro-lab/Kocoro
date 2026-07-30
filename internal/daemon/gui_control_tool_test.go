@@ -1263,6 +1263,17 @@ func TestWrapDaemonGUIToolsPreservesSchemasAndSafetyTraits(t *testing.T) {
 	if wrapped, _ := reg.Get("applescript"); wrapped.RequiresApproval() != true {
 		t.Fatal("wrapped applescript changed approval semantics")
 	}
+	for _, name := range []string{
+		"computer", "computer_use", "accessibility", "applescript", "ghostty",
+	} {
+		wrapped, ok := reg.Get(name)
+		if !ok {
+			t.Fatalf("wrapped GUI tool %s is missing", name)
+		}
+		if got := agent.EffectiveToolExposure(wrapped); got != agent.ToolExposureDeferred {
+			t.Fatalf("%s exposure = %q, want deferred", name, got)
+		}
+	}
 }
 
 func TestWrapDaemonGUIToolsPreservesEveryNativeToolTraitAndRunDelegation(t *testing.T) {

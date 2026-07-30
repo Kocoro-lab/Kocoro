@@ -393,7 +393,7 @@ func TestHandleAlwaysAllowDecision_ComputerUseNamedAgentPersistsGlobally(t *test
 }
 
 func TestMergeAgentAlwaysAllowToolsIgnoresPerAgentComputerUseResidue(t *testing.T) {
-	merged := mergeAgentAlwaysAllowTools(
+	merged := agents.MergeAlwaysAllowTools(
 		[]string{"computer_use", "global_tool"},
 		[]string{"computer_use", "agent_tool"},
 	)

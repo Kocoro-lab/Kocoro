@@ -23,6 +23,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
+	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
 func TestCacheSourceFromDaemonSource(t *testing.T) {
@@ -58,6 +59,74 @@ func TestCacheSourceFromDaemonSource(t *testing.T) {
 			t.Errorf("cacheSourceFromDaemonSource(%q) = %q, want %q", c.source, got, c.want)
 		}
 	}
+}
+
+func TestConfigureDaemonComputerUseDispatcherPreservesLegacyToolsUntilReady(t *testing.T) {
+	newRegistry := func() (*agent.ToolRegistry, *tools.BashTool) {
+		reg := agent.NewToolRegistry()
+		reg.Register(&tools.ComputerUseTool{})
+		reg.Register(&tools.ComputerTool{})
+		reg.Register(&tools.AccessibilityTool{})
+		reg.Register(&tools.AppleScriptTool{})
+		bash := &tools.BashTool{}
+		reg.Register(bash)
+		return reg, bash
+	}
+
+	t.Run("private executor unavailable", func(t *testing.T) {
+		reg, bash := newRegistry()
+		if configureDaemonComputerUseDispatcher(reg, false) {
+			t.Fatal("dispatcher enabled without its private executor")
+		}
+		if reg.Has("computer_use") {
+			t.Fatal("unwrapped computer_use core survived dispatcher failure")
+		}
+		for _, name := range []string{
+			client.NativeComputerToolName, "accessibility", "applescript",
+		} {
+			if !reg.Has(name) {
+				t.Fatalf("%s was removed while dispatcher was unavailable", name)
+			}
+		}
+		if bash.LegacyGUIAutomationDisabled {
+			t.Fatal("bash legacy GUI automation was disabled without a dispatcher")
+		}
+	})
+
+	t.Run("named agent filtered public dispatcher", func(t *testing.T) {
+		reg, bash := newRegistry()
+		reg.Remove("computer_use")
+		if configureDaemonComputerUseDispatcher(reg, true) {
+			t.Fatal("dispatcher enabled after the agent filter removed computer_use")
+		}
+		for _, name := range []string{
+			client.NativeComputerToolName, "accessibility", "applescript",
+		} {
+			if !reg.Has(name) {
+				t.Fatalf("%s was removed from the filtered agent registry", name)
+			}
+		}
+		if bash.LegacyGUIAutomationDisabled {
+			t.Fatal("filtered agent lost legacy GUI bash commands")
+		}
+	})
+
+	t.Run("ready dispatcher owns the GUI surface", func(t *testing.T) {
+		reg, bash := newRegistry()
+		if !configureDaemonComputerUseDispatcher(reg, true) {
+			t.Fatal("ready dispatcher was not enabled")
+		}
+		for _, name := range []string{
+			"computer_use", client.NativeComputerToolName, "accessibility", "applescript",
+		} {
+			if reg.Has(name) {
+				t.Fatalf("%s survived dispatcher activation", name)
+			}
+		}
+		if !bash.LegacyGUIAutomationDisabled {
+			t.Fatal("dispatcher did not disable legacy GUI bash commands")
+		}
+	})
 }
 
 func TestIsMessagingPlatform(t *testing.T) {

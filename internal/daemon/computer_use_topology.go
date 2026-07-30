@@ -18,6 +18,9 @@ var readDisplayTopologyVia = func(ctx context.Context) (tools.DisplayTopologyV1,
 // response body itself. There is deliberately no wrapper and no capture/image
 // route in this phase.
 func (s *Server) handleComputerUseTopology(w http.ResponseWriter, r *http.Request) {
+	if !requireComputerUseLocalPresence(w, r) {
+		return
+	}
 	topology, err := readDisplayTopologyVia(r.Context())
 	if err != nil {
 		writeErrorCode(

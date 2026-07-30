@@ -54,6 +54,20 @@ func IsToolAlwaysAllowable(toolName string) bool {
 	return !isHighRiskTool(toolName) && toolName != "computer_use"
 }
 
+// MergeAlwaysAllowTools combines the global product-level grant set with one
+// named agent's grant set. Per-agent entries are filtered here so every runtime
+// surface honors the same scope boundary: computer_use may be granted only
+// globally, and legacy GUI wrappers may not bypass fresh approval.
+func MergeAlwaysAllowTools(global, perAgent []string) []string {
+	merged := append([]string(nil), global...)
+	for _, tool := range perAgent {
+		if IsToolAlwaysAllowable(tool) {
+			merged = append(merged, tool)
+		}
+	}
+	return merged
+}
+
 // ValidateAgentPermissionsConfig rejects approval bypasses that are a category
 // error at per-agent scope. computer_use is the only such case: its grant is a
 // single GLOBAL product permission, so silently dropping a per-agent entry

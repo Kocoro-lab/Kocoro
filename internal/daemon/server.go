@@ -636,6 +636,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /local/computer-use/risk-intents/{intent_id}", s.handleConsequentialRiskDetail)
 	mux.HandleFunc("POST /local/computer-use/risk-intents/{intent_id}/decision", s.handleConsequentialRiskDecision)
 	mux.HandleFunc("/local/computer-use/app-policy", s.handleComputerUseAppPolicy)
+	mux.HandleFunc("/local/computer-use/topology", s.handleComputerUseMethodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/local/computer-use/activity", s.handleComputerUseMethodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/local/computer-use/preview", s.handleComputerUseMethodNotAllowed(http.MethodGet))
 	mux.HandleFunc("/local/computer-use/control", s.handleComputerUseMethodNotAllowed(http.MethodPost))

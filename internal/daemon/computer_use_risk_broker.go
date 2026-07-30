@@ -14,6 +14,15 @@ import (
 )
 
 const (
+	// One pending entry represents one attended Desktop confirmation. Sixty
+	// seconds covers ordinary read-and-click latency; a shorter bound causes
+	// visible confirmation dialogs to expire while the user is reading them.
+	// One grant covers only the immediate matching action, so ten seconds bounds
+	// scheduler/GUI handoff delay without leaving reusable authority behind.
+	// ConsequentialRiskBrokerOptions may lower either value for tests or embedded
+	// callers, but the maxima are intentionally not operator-configurable:
+	// lifting them would weaken the freshness guarantee rather than increase
+	// supported workload.
 	defaultConsequentialRiskPendingTTL = 60 * time.Second
 	defaultConsequentialRiskGrantTTL   = 10 * time.Second
 	maxConsequentialRiskPendingTTL     = 60 * time.Second

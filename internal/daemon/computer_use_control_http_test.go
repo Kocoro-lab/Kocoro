@@ -112,6 +112,7 @@ func TestComputerUseControlPlaneRequiresLocalPresenceEvenWithLocalCORS(t *testin
 	requests := []struct {
 		name, method, path, body string
 	}{
+		{name: "topology", method: http.MethodGet, path: "/local/computer-use/topology"},
 		{name: "activity", method: http.MethodGet, path: "/local/computer-use/activity"},
 		{name: "control", method: http.MethodPost, path: "/local/computer-use/control", body: `{"lease_id":"cul_http_fixture","action":"stop","idempotency_key":"stop_http"}`},
 		{name: "heartbeat", method: http.MethodPost, path: "/local/computer-use/heartbeat", body: `{"schema_version":1,"lease_id":"cul_http_fixture"}`},
@@ -143,6 +144,7 @@ func TestComputerUseControlPlaneRoutesRejectWrongMethods(t *testing.T) {
 	for _, request := range []struct {
 		method, path, allow string
 	}{
+		{method: http.MethodPost, path: "/local/computer-use/topology", allow: http.MethodGet},
 		{method: http.MethodPost, path: "/local/computer-use/activity", allow: http.MethodGet},
 		{method: http.MethodGet, path: "/local/computer-use/control", allow: http.MethodPost},
 		{method: http.MethodGet, path: "/local/computer-use/heartbeat", allow: http.MethodPost},
