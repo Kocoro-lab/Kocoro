@@ -286,15 +286,15 @@ func (category OpenAIComputerRecoveryCategoryV1) ContinuationAllowed() bool {
 func ClassifyOpenAIComputerRecoveryV1(
 	execution OpenAIComputerBatchExecution,
 ) OpenAIComputerRecoveryCategoryV1 {
+	outcome := execution.Result.GUIOutcome
+	if outcome != nil && outcome.Result == GUIActionResultCancelled {
+		return OpenAIComputerRecoveryUserIntervenedV1
+	}
 	if execution.ActionEffect == ComputerUseCommitUnknown {
 		return OpenAIComputerRecoveryUnknownCommitV1
 	}
-	outcome := execution.Result.GUIOutcome
 	if outcome == nil {
 		return OpenAIComputerRecoveryCaptureUnavailableV1
-	}
-	if outcome.Result == GUIActionResultCancelled {
-		return OpenAIComputerRecoveryUserIntervenedV1
 	}
 	if outcome.Result == GUIActionResultUserInterference {
 		// Physical input is a state change to observe, not a goal-level cancel.

@@ -18,6 +18,31 @@ type guiAXTarget struct {
 	AppName  string
 }
 
+func decodeGUIAXTarget(raw json.RawMessage, fallbackPID int) (guiAXTarget, error) {
+	var tree struct {
+		PID      int    `json:"pid"`
+		App      string `json:"app"`
+		AppName  string `json:"app_name"`
+		BundleID string `json:"bundle_id"`
+	}
+	if json.Unmarshal(raw, &tree) != nil || strings.TrimSpace(tree.BundleID) == "" {
+		return guiAXTarget{}, fmt.Errorf("AX target resolver returned no bundle")
+	}
+	name := strings.TrimSpace(tree.AppName)
+	if name == "" {
+		name = strings.TrimSpace(tree.App)
+	}
+	resolvedPID := tree.PID
+	if resolvedPID <= 0 {
+		resolvedPID = fallbackPID
+	}
+	return guiAXTarget{
+		PID:      resolvedPID,
+		BundleID: strings.TrimSpace(tree.BundleID),
+		AppName:  name,
+	}, nil
+}
+
 // GUIActionTargetRestorerV1 restores a previously observed app only after the
 // daemon has minted exact execution authority for an admitted mutation.
 type GUIActionTargetRestorerV1 interface {
@@ -59,28 +84,21 @@ func resolveGUIAXTarget(ctx context.Context, client axCallClient, appName string
 			return guiAXTarget{}, err
 		}
 	}
-	var tree struct {
-		PID      int    `json:"pid"`
-		App      string `json:"app"`
-		AppName  string `json:"app_name"`
-		BundleID string `json:"bundle_id"`
+	return decodeGUIAXTarget(raw, pid)
+}
+
+func resolveGUIFrontmostWindowTargetV1(
+	ctx context.Context,
+	client axCallClient,
+) (guiAXTarget, error) {
+	if client == nil {
+		return guiAXTarget{}, fmt.Errorf("AX target resolver is unavailable")
 	}
-	if json.Unmarshal(raw, &tree) != nil || strings.TrimSpace(tree.BundleID) == "" {
-		return guiAXTarget{}, fmt.Errorf("AX target resolver returned no bundle")
+	raw, err := client.Call(ctx, "read_window_target", map[string]any{})
+	if err != nil {
+		return guiAXTarget{}, err
 	}
-	name := strings.TrimSpace(tree.AppName)
-	if name == "" {
-		name = strings.TrimSpace(tree.App)
-	}
-	resolvedPID := tree.PID
-	if resolvedPID <= 0 {
-		resolvedPID = pid
-	}
-	return guiAXTarget{
-		PID:      resolvedPID,
-		BundleID: strings.TrimSpace(tree.BundleID),
-		AppName:  name,
-	}, nil
+	return decodeGUIAXTarget(raw, 0)
 }
 
 func (t *ComputerUseTool) computerUseFrontmostDiversionNowV1(
@@ -89,7 +107,7 @@ func (t *ComputerUseTool) computerUseFrontmostDiversionNowV1(
 	if t == nil || t.client == nil {
 		return ""
 	}
-	target, err := resolveGUIAXTarget(ctx, t.client, "", 0)
+	target, err := resolveGUIFrontmostWindowTargetV1(ctx, t.client)
 	if err != nil {
 		return ""
 	}
@@ -264,7 +282,7 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 			if usesInitialTarget && resolved.BundleID != t.initialTarget.BundleID {
 				return agent.GUIActionDescriptor{}, fmt.Errorf("initial computer-use target identity changed")
 			}
-			if args.FollowFrontmost && args.App == "" &&
+			if args.FollowFrontmost && args.App == "" && !usesInitialTarget &&
 				t.lastTaskTarget != nil &&
 				t.frontmostDiversionV1(
 					resolved.PID,

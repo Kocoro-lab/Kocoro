@@ -439,6 +439,93 @@ func TestOpenAIComputerTaskPreparationInstallsExactBackgroundKeyboardAuthority(
 	}
 }
 
+func TestOpenAIComputerBackgroundAuthorityInstallPreservesValidAuthorityOnFailure(
+	t *testing.T,
+) {
+	previous := &computerUseBackgroundInputAuthorityV1{
+		targetLaunchDate:             "2026-07-28T06:00:00Z",
+		preservedFrontmostPID:        84,
+		preservedFrontmostBundleID:   "com.apple.TextEdit",
+		preservedFrontmostLaunchDate: "2026-07-28T05:00:00Z",
+	}
+	raw := &ComputerUseTool{backgroundInputAuthority: previous}
+	runtime := &OpenAIComputerActionRuntimeV1{raw: raw}
+
+	if runtime.installBackgroundInputAuthorityV1(
+		openAIComputerBackgroundBindingV1{},
+	) {
+		t.Fatal("invalid background authority was installed")
+	}
+	if raw.backgroundInputAuthority != previous {
+		t.Fatalf(
+			"failed install destroyed valid authority: got=%+v want=%+v",
+			raw.backgroundInputAuthority,
+			previous,
+		)
+	}
+}
+
+func TestOpenAIComputerBackgroundAuthorityRefreshRejectsTaskTargetDrift(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	raw := &ComputerUseTool{
+		client: fake,
+		snapshot: &computerUseSnapshot{
+			app: "Slack", bundleID: "com.tinyspeck.slackmacgap", pid: 77,
+		},
+	}
+	runtime := &OpenAIComputerActionRuntimeV1{
+		raw: raw,
+		backgroundTarget: &OpenAIComputerTaskAppV1{
+			App: "Calculator", BundleID: "com.apple.calculator", PID: 42,
+		},
+	}
+
+	err := runtime.refreshBackgroundInputAuthorityV1(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "controlled task target") {
+		t.Fatalf("background target drift error = %v", err)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("target drift reached background binder: %+v", fake.calls)
+	}
+}
+
+func TestOpenAIComputerPlanOmitsFallbackReasonOutsideForegroundFallback(
+	t *testing.T,
+) {
+	raw := &ComputerUseTool{}
+	runtime := &OpenAIComputerActionRuntimeV1{
+		public:                   raw,
+		raw:                      raw,
+		foregroundFallbackReason: "frontmost_controller",
+	}
+
+	background, err := runtime.plan(computerUseArgs{
+		Action:             "press",
+		ExecutionLane:      string(OpenAIComputerExecutionBackgroundSemanticV1),
+		ForegroundFallback: false,
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if background.FallbackReason != "" {
+		t.Fatalf("background plan retained fallback reason: %+v", background)
+	}
+
+	foreground, err := runtime.plan(computerUseArgs{
+		Action:             "click",
+		ExecutionLane:      string(OpenAIComputerExecutionForegroundV1),
+		ForegroundFallback: true,
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foreground.FallbackReason != "frontmost_controller" {
+		t.Fatalf("foreground fallback lost reason: %+v", foreground)
+	}
+}
+
 func TestOpenAIComputerTaskPreparationLaunchesBackgroundTargetWithoutPID(
 	t *testing.T,
 ) {
@@ -1823,7 +1910,10 @@ func TestOpenAIComputerControllerActivationBetweenObservationAndActionUsesBackgr
 	controller.PID = 909
 	controllerWindowID := 9909
 	controller.WindowID = &controllerWindowID
-	harness.fake.queue("read_tree", marshalComputerUseTree(t, controller))
+	harness.fake.queue(
+		"read_window_target",
+		marshalComputerUseTree(t, controller),
+	)
 	harness.fake.queue(
 		"display_topology",
 		marshalDisplayTopologyNoTest(harness.topology),
@@ -1852,7 +1942,10 @@ func TestOpenAIComputerControllerActivationBetweenObservationAndActionUsesBackgr
 		t.Fatalf("late controller activation action = %+v", args)
 	}
 
-	harness.fake.queue("read_tree", marshalComputerUseTree(t, controller))
+	harness.fake.queue(
+		"read_window_target",
+		marshalComputerUseTree(t, controller),
+	)
 	harness.fake.queue(
 		"display_topology",
 		marshalDisplayTopologyNoTest(harness.topology),

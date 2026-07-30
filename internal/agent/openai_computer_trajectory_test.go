@@ -270,6 +270,14 @@ func TestClassifyOpenAIComputerRecoveryUsesStableCategories(t *testing.T) {
 			continuable: true,
 		},
 		{
+			name:    "explicit cancellation wins over unknown commit",
+			effect:  ComputerUseCommitUnknown,
+			result:  GUIActionResultCancelled,
+			phase:   GUIActionPhaseInputCommitted,
+			failure: "control_cancelled",
+			want:    OpenAIComputerRecoveryUserIntervenedV1,
+		},
+		{
 			name:        "unsupported projection replans from fresh image",
 			effect:      ComputerUseCommitNone,
 			result:      GUIActionResultFailed,

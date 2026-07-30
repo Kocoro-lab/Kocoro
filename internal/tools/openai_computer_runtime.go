@@ -458,20 +458,25 @@ func (r *OpenAIComputerActionRuntimeV1) resolveBackgroundTaskAppV1(
 
 func (r *OpenAIComputerActionRuntimeV1) installBackgroundInputAuthorityV1(
 	binding openAIComputerBackgroundBindingV1,
-) {
-	r.raw.backgroundInputAuthority = nil
-	prepared := binding.target
-	if prepared.LaunchDate != "" &&
-		binding.preservedFrontmostPID > 0 &&
-		binding.preservedFrontmostBundleID != "" &&
-		binding.preservedFrontmostLaunchDate != "" {
-		r.raw.backgroundInputAuthority = &computerUseBackgroundInputAuthorityV1{
-			targetLaunchDate:             prepared.LaunchDate,
-			preservedFrontmostPID:        binding.preservedFrontmostPID,
-			preservedFrontmostBundleID:   binding.preservedFrontmostBundleID,
-			preservedFrontmostLaunchDate: binding.preservedFrontmostLaunchDate,
-		}
+) bool {
+	if r == nil || r.raw == nil {
+		return false
 	}
+	prepared := binding.target
+	if prepared.LaunchDate == "" ||
+		binding.preservedFrontmostPID <= 0 ||
+		binding.preservedFrontmostBundleID == "" ||
+		binding.preservedFrontmostLaunchDate == "" {
+		return false
+	}
+	authority := &computerUseBackgroundInputAuthorityV1{
+		targetLaunchDate:             prepared.LaunchDate,
+		preservedFrontmostPID:        binding.preservedFrontmostPID,
+		preservedFrontmostBundleID:   binding.preservedFrontmostBundleID,
+		preservedFrontmostLaunchDate: binding.preservedFrontmostLaunchDate,
+	}
+	r.raw.backgroundInputAuthority = authority
+	return true
 }
 
 func (r *OpenAIComputerActionRuntimeV1) refreshBackgroundInputAuthorityV1(
@@ -485,6 +490,16 @@ func (r *OpenAIComputerActionRuntimeV1) refreshBackgroundInputAuthorityV1(
 		strings.TrimSpace(snapshot.bundleID) == "" {
 		return fmt.Errorf("background keyboard target identity is invalid")
 	}
+	if target := r.backgroundTarget; target != nil &&
+		(snapshot.pid != target.PID ||
+			!strings.EqualFold(
+				strings.TrimSpace(snapshot.bundleID),
+				strings.TrimSpace(target.BundleID),
+			)) {
+		return fmt.Errorf(
+			"background keyboard snapshot does not match the controlled task target",
+		)
+	}
 	binding, err := r.resolveBackgroundTaskAppV1(ctx, OpenAIComputerTaskAppV1{
 		App:      strings.TrimSpace(snapshot.app),
 		BundleID: strings.TrimSpace(snapshot.bundleID),
@@ -493,8 +508,7 @@ func (r *OpenAIComputerActionRuntimeV1) refreshBackgroundInputAuthorityV1(
 	if err != nil {
 		return err
 	}
-	r.installBackgroundInputAuthorityV1(binding)
-	if r.raw.backgroundInputAuthority == nil {
+	if !r.installBackgroundInputAuthorityV1(binding) {
 		return fmt.Errorf("background keyboard target witness is unavailable")
 	}
 	return nil
@@ -620,13 +634,17 @@ func (r *OpenAIComputerActionRuntimeV1) plan(
 		return OpenAIComputerActionPlanV1{},
 			fmt.Errorf("marshal internal OpenAI computer action")
 	}
+	fallbackReason := ""
+	if args.ForegroundFallback {
+		fallbackReason = r.foregroundFallbackReason
+	}
 	return OpenAIComputerActionPlanV1{
 		Tool:               r.public,
 		Args:               string(payload),
 		Mutation:           mutation,
 		ExecutionLane:      OpenAIComputerExecutionLaneV1(args.ExecutionLane),
 		ForegroundFallback: args.ForegroundFallback,
-		FallbackReason:     r.foregroundFallbackReason,
+		FallbackReason:     fallbackReason,
 		FrontmostClass:     string(r.raw.frontmostDiversion),
 	}, nil
 }

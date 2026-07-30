@@ -117,6 +117,21 @@ func TestOpenAIComputerBatchContinuationPolicyUsesStableRecoveryCategory(
 			want: true,
 		},
 		{
+			name: "explicit cancellation after commit refuses continuation",
+			execution: agent.OpenAIComputerBatchExecution{
+				ActionEffect: agent.ComputerUseCommitUnknown,
+				Result: agent.ToolResult{
+					IsError: true,
+					Images:  []agent.ImageBlock{image},
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result:      agent.GUIActionResultCancelled,
+						Phase:       agent.GUIActionPhaseInputCommitted,
+						FailureCode: "control_cancelled",
+					},
+				},
+			},
+		},
+		{
 			name: "preflight failure without fresh screenshot stops",
 			execution: agent.OpenAIComputerBatchExecution{
 				Result: agent.ToolResult{
