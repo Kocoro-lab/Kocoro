@@ -31,8 +31,8 @@ func classifyAPIError(e *client.APIError) (Code, *Detail) {
 	return CodeUnexpected, nil
 }
 
-// parse429 disambiguates the four 429 response shapes the gateway emits
-// (per shannon-cloud middleware/quota.go, ratelimit.go, openai/handler.go):
+// parse429 disambiguates the four 429 response shapes in the public gateway
+// error contract:
 //
 //	A. Token quota exceeded: {error: "Token quota exceeded", window, reset_at}
 //	B. Credits exhausted:    {error: "credits_exhausted", auto_refill_started, ...}

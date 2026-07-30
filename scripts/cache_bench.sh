@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# cache_bench.sh — fixture-based cache benchmark for before/after comparison.
+# cache_bench.sh — synthetic cache-diagnostics example.
+#
+# The fixtures and warning threshold below are intentionally synthetic. They
+# are not Kocoro release QA, product targets, or production baselines. Running
+# this script still invokes the configured model and may consume paid quota.
 #
 # Usage:
-#   scripts/cache_bench.sh [runs]          # default 3 runs per fixture
+#   scripts/cache_bench.sh [runs]          # default 2 runs per fixture
 #   scripts/cache_bench.sh 1               # quick sanity (1 run per fixture)
 #
 # Requires SHANNON_CACHE_DEBUG=1 (auto-set). Assumes `shan` is on PATH and
@@ -12,7 +16,7 @@
 
 set -euo pipefail
 
-RUNS=${1:-3}
+RUNS=${1:-2}
 LOG="$HOME/.shannon/logs/cache-debug.log"
 
 # Ensure the log exists so tail won't fail
@@ -26,8 +30,8 @@ BEFORE_SIZE=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
 export SHANNON_CACHE_DEBUG=1
 
 FIXTURES=(
-  "short: read README.md and the first file in internal/agent/ that looks like the main loop, then report the filename"
-  "research: use x_search to find 3 recent Japanese SaaS discussions on Twitter and summarize them in 3 bullets"
+  "synthetic-short: read the first heading in README.md and return it"
+  "synthetic-list: list the top-level Markdown files and return their names"
 )
 
 # Multi-turn fixture exercises rolling cache_control: turns 2/3 must read the
@@ -129,7 +133,7 @@ avg_sub_cc = sum(subsequent_cc) / len(subsequent_cc) if subsequent_cc else 0
 avg_sub_cr = sum(subsequent_cr) / len(subsequent_cr) if subsequent_cr else 0
 # Rolling efficiency on subsequent calls: each rolling write should be a tiny
 # delta while reads accumulate the full prefix. Amplification = cr/cc per
-# subsequent call. Healthy rolling marker: amplification >> 10.
+# subsequent call. The warning threshold below is an arbitrary illustration.
 # Note: ratio-vs-first-call is unreliable because warm starts make first_cc=0,
 # so we report absolute subsequent values + amplification instead.
 amplification = avg_sub_cr / avg_sub_cc if avg_sub_cc else float("inf")
@@ -153,17 +157,16 @@ if multi_turn_sessions:
             continue
         print(f"  call#{turn_idx+1}: avg_cc={sum(ccs)/len(ccs):.0f}  avg_cr={sum(crs)/len(crs):.0f}  n={len(ccs)}")
 
-# Sanity warnings
+# Synthetic diagnostic warnings (not release gates)
 if all(len(e) == 1 for e in sessions.values()):
-    print("WARN: every session had exactly 1 call — fixtures may be too simple "
-          "or session_id plumbing isn't active (check commit 43749b5 is on this binary)")
-if multi_turn_sessions and amplification < 5:
+    print("WARN: every session had exactly 1 call — the synthetic fixture "
+          "did not exercise session correlation")
+if multi_turn_sessions and amplification < 2:
     print(f"WARN: read/write amplification is only {amplification:.1f}x on subsequent calls — "
-          "rolling cache_control marker may not be reaching the gateway "
-          "(check commit 0f944e29 is deployed on shannon-cloud → Shannon → llm-service container)")
+          "inspect the public cache contract and local request bytes")
 elif multi_turn_sessions:
-    print(f"OK: amplification={amplification:.1f}x — each rolling write is amortized over "
-          "many reads, marker is healthy")
+    print(f"INFO: amplification={amplification:.1f}x — above the synthetic "
+          "illustration threshold; this is not a release result")
 PY
 )
 tail -c "+$((BEFORE_SIZE + 1))" "$LOG" | python3 -c "$AGG_SCRIPT"

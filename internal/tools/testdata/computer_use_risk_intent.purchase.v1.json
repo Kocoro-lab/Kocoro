@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "intent_id": "cri_ICEiIyQlJicoKSorLC0uLw",
+  "request_id": "req_purchase_01HXYZ",
+  "kind": "purchase",
+  "expires_at": "2026-07-23T00:02:00Z",
+  "target": {
+    "bundle_id": "com.apple.Safari",
+    "app_name": "Safari",
+    "pid": 422,
+    "window_id": 1003,
+    "state_id": "s_2123456789abcdef",
+    "action_kind": "press",
+    "execution_path": "accessibility",
+    "element_ref": "e5",
+    "role": "AXButton",
+    "fingerprint": "axf_3333333333333333333333333333333333333333333333333333333333333333",
+    "coordinate_authority": null,
+    "target_digest": "tdv1_9b43b3c548713385b7b59ac3ec41bd92f30bbefdc58b7840e70dba3f18905d59"
+  },
+  "send": null,
+  "delete": null,
+  "purchase": {
+    "merchant_label": "Example Store",
+    "item_label": "Desk lamp",
+    "amount_minor": 12999,
+    "currency": "USD"
+  }
+}

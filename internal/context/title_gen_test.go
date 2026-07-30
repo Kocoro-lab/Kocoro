@@ -201,17 +201,17 @@ func TestDecorateTitle(t *testing.T) {
 		{"line", "", "", "Daily standup", "LINE · Daily standup"},
 		{"wecom", "", "", "Daily standup", "WeCom · Daily standup"},
 		// Sender preserved through the upgrade (shared-channel distinction).
-		{"slack", "Wayland", "", "My smart title", "Slack · Wayland · My smart title"},
+		{"slack", "Alice", "", "My smart title", "Slack · Alice · My smart title"},
 		// No sender → channel fallback mirrors routeTitle ("Slack · #general").
 		{"slack", "", "#general", "My smart title", "Slack · #general · My smart title"},
 		// Sender wins over channel when both are present.
-		{"slack", "Wayland", "#general", "My smart title", "Slack · Wayland · My smart title"},
+		{"slack", "Alice", "#general", "My smart title", "Slack · Alice · My smart title"},
 		// Channel equal to the source is dropped (avoid "Slack · slack").
 		{"slack", "", "slack", "T", "Slack · T"},
 		{"slack", "", "", "T", "Slack · T"},
 		// Interactive sources drop label, sender, and channel.
-		{"desktop", "Wayland", "#general", "Daily standup", "Daily standup"},
-		{"", "Wayland", "", "Daily standup", "Daily standup"},
+		{"desktop", "Alice", "#general", "Daily standup", "Daily standup"},
+		{"", "Alice", "", "Daily standup", "Daily standup"},
 		{"kocoro", "", "", "Daily standup", "Daily standup"},
 	}
 	for _, c := range cases {
@@ -237,11 +237,11 @@ func TestUpgradeTitle(t *testing.T) {
 	fc := &fakeCompleter{out: "创建定时任务"}
 	fp := &fakePatcher{}
 	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("帮我设置任务")}}
-	got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "Wayland", "", msgs, 3)
-	if got != "Slack · Wayland · 创建定时任务" {
-		t.Errorf("returned %q, want Slack · Wayland · 创建定时任务", got)
+	got := UpgradeTitle(context.Background(), fc, fp, "s1", "slack", "Alice", "", msgs, 3)
+	if got != "Slack · Alice · 创建定时任务" {
+		t.Errorf("returned %q, want Slack · Alice · 创建定时任务", got)
 	}
-	if fp.wroteTitle != "Slack · Wayland · 创建定时任务" || fp.atTurns != 3 {
+	if fp.wroteTitle != "Slack · Alice · 创建定时任务" || fp.atTurns != 3 {
 		t.Errorf("persisted title=%q turns=%d", fp.wroteTitle, fp.atTurns)
 	}
 }

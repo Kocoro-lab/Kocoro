@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "captured",
+  "failure_code": null,
+  "retry_safe": false,
+  "topology_ref": {"topology_id": "topo_display_001", "generation": 9},
+  "helper_boot_id": "helper_display_001",
+  "display_id": 2,
+  "display_quartz_bounds": {"x": -100, "y": 200, "width": 1, "height": 1},
+  "backing_scale_factor": 1,
+  "media_type": "image/png",
+  "width_px": 1,
+  "height_px": 1,
+  "byte_length": 68,
+  "sha256": "431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460",
+  "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "captured_at": "2026-07-23T01:02:03Z"
+}

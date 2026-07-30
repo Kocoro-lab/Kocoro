@@ -14,8 +14,8 @@ import "time"
 
 // SourcePaths holds resolved absolute paths to Claude Code's two source roots.
 type SourcePaths struct {
-	ClaudeHome       string // e.g. /Users/wayland/.claude
-	ClaudeUserConfig string // e.g. /Users/wayland/.claude.json
+	ClaudeHome       string // e.g. /Users/alice/.claude
+	ClaudeUserConfig string // e.g. /Users/alice/.claude.json
 }
 
 // SymbolicPaths holds ~/-prefixed forms suitable for default API responses.
@@ -146,7 +146,7 @@ type Plan struct {
 	ExpiresAt    time.Time
 	SourcePaths  SourcePaths
 	Symbolic     SymbolicPaths
-	TargetPath   string                       // absolute, e.g. /Users/wayland/.shannon
+	TargetPath   string                       // absolute, e.g. /Users/alice/.shannon
 	SourceHashes map[string]SourceFingerprint // src_abs_path → fingerprint, for TOCTOU re-check.
 	// Key is the path that will be re-fingerprinted at apply time. For dir-layout
 	// skills the path is the skill directory; for everything else it's the file.

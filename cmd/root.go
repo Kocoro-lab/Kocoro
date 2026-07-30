@@ -325,11 +325,14 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		agentDir := filepath.Join(shannonDir, "agents", agentName)
 		loop.SwitchAgent(agentOverride.Prompt, agentDir, nil, scopedMCPCtx, loadedSkills)
 		loop.SetAgentName(agentName)
-		merged := append([]string(nil), runCfg.Permissions.AlwaysAllowTools...)
+		var perAgentAlwaysAllow []string
 		if agentOverride.Config != nil && agentOverride.Config.Permissions != nil {
-			merged = append(merged, agentOverride.Config.Permissions.AlwaysAllowTools...)
+			perAgentAlwaysAllow = agentOverride.Config.Permissions.AlwaysAllowTools
 		}
-		loop.SetAlwaysAllowTools(merged)
+		loop.SetAlwaysAllowTools(agents.MergeAlwaysAllowTools(
+			runCfg.Permissions.AlwaysAllowTools,
+			perAgentAlwaysAllow,
+		))
 	} else {
 		loop.SetAgentName("") // explicit: default agent
 		// Default agent: memory lives in shannonDir/memory/

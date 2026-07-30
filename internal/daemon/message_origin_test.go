@@ -77,7 +77,7 @@ func TestParseMessageOrigin_LarkWithS1bFields(t *testing.T) {
 }
 
 func TestParseMessageOrigin_Line(t *testing.T) {
-	// Producer shape: shannon-cloud buildIMStatusContext "line" case emits
+	// Public producer shape for LINE emits
 	// {platform, line_user_id, channel_registry_id} and drops the whole blob
 	// when either id is empty — so a parsed blob always carries the user id.
 	blob := json.RawMessage(`{"platform":"line","line_user_id":"U4af4980629abc","channel_registry_id":"850fe961-2ccb-421b-81ad-8db8bcd8e91c"}`)

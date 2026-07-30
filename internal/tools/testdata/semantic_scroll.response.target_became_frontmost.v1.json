@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "commit_state": "not_committed",
+  "phase": "preflight",
+  "failure_code": "target_became_frontmost",
+  "retry_safe": false,
+  "postcondition": null,
+  "initial_value": null,
+  "final_value": null,
+  "steps_completed": 0,
+  "expected_steps": 3
+}

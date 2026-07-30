@@ -836,7 +836,9 @@ func TestRepairEmptyAssistantContent_FastPathReturnsInputUnchanged(t *testing.T)
 // "Prompt Cache": all wire-shape mutators MUST log.
 //
 // We trigger all three actions in one fixture:
-//   user("first") → assistant("") → assistant([thinking,""]) → user("我的图呢")
+//
+//	user("first") → assistant("") → assistant([thinking,""]) → user("我的图呢")
+//
 // After repair: drop the bare-empty assistant, strip the empty text block from
 // the next assistant, then merge the two users (the second drop creates
 // user/user adjacency between user("first") and user("我的图呢")). Wait — that
@@ -912,8 +914,8 @@ func TestRepairEmptyAssistantContent_EmitsCacheCompactEvents(t *testing.T) {
 }
 
 // Whitespace-only assistant content must be treated identically to bare
-// empty content — both Cloud's _mark_last_block rstrip+stamp pipeline AND
-// the wire-time gate in agent/loop.go strip whitespace before deciding
+// empty content — both Cloud normalization and the wire-time gate in
+// agent/loop.go strip whitespace before deciding
 // what to do with the message. If sanitize keeps "   " but loop trims it
 // to "", the two layers disagree and the bug class re-opens.
 func TestSanitizeHistory_DropsWhitespaceOnlyAssistant(t *testing.T) {

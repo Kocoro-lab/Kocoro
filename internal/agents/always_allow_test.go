@@ -2,10 +2,12 @@ package agents
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -188,6 +190,32 @@ func TestAppendAlwaysAllowTool_PersistsFormerlyHighRisk(t *testing.T) {
 		if !want[tool] {
 			t.Errorf("unexpected tool persisted: %q", tool)
 		}
+	}
+}
+
+func TestAppendAlwaysAllowToolRejectsGlobalComputerUsePermission(t *testing.T) {
+	dir, name := setupAgent(t, "computeruse")
+	err := AppendAlwaysAllowTool(dir, name, "computer_use")
+	if !errors.Is(err, ErrToolNotPersistable) {
+		t.Fatalf("err=%v, want ErrToolNotPersistable", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, name, "config.yaml")); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected per-agent grant wrote config.yaml: %v", statErr)
+	}
+}
+
+func TestMergeAlwaysAllowToolsKeepsGlobalComputerUseAndFiltersAgentResidue(t *testing.T) {
+	global := []string{"computer_use", "global_tool"}
+	perAgent := []string{
+		"computer_use", "computer", "accessibility", "applescript", "ghostty", "agent_tool",
+	}
+	got := MergeAlwaysAllowTools(global, perAgent)
+	want := []string{"computer_use", "global_tool", "agent_tool"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merged tools = %v, want %v", got, want)
+	}
+	if !reflect.DeepEqual(global, []string{"computer_use", "global_tool"}) {
+		t.Fatalf("global input mutated: %v", global)
 	}
 }
 

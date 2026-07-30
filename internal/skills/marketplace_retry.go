@@ -11,9 +11,9 @@ import (
 )
 
 // Marketplace retry policy. ClawHub (clawhub.ai) and the static GitHub registry
-// occasionally return transient 5xx/429 under load (a 50-request load test saw
-// ~22% 503s); with no client retry a single upstream blip surfaced as a
-// user-visible "marketplace unavailable". These bound the in-client retry that
+// occasionally return transient 5xx/429 under load; with no client retry a
+// single upstream blip surfaced as a user-visible "marketplace unavailable".
+// These bound the in-client retry that
 // absorbs those blips. Symptom when they bind: browse/install fails with
 // "status 503" only after exhausting attempts (vs. immediately before).
 // Override the catalog-GET values via config.yaml

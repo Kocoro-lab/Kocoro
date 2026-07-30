@@ -53,8 +53,7 @@ func TestScenario_CloudSessionCWD_EndToEnd(t *testing.T) {
 	// 4) Now a downstream agent call (file_read, bash, etc.) passes the
 	// same relative filename the model originally used. cwdctx must
 	// resolve it against the scratch dir rather than erroring with
-	// ErrNoSessionCWD — that error is the exact production failure mode
-	// this scenario guards against.
+	// ErrNoSessionCWD — the failure this synthetic scenario guards against.
 	resolved, err := cwdctx.ResolveFilesystemPath(ctx, "note_editor.md")
 	if err != nil {
 		t.Fatalf("ResolveFilesystemPath on relative name failed: %v", err)

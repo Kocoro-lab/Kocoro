@@ -1,0 +1,62 @@
+{
+  "id": 803,
+  "method": "coordinate_mouse_event",
+  "params": {
+    "schema_version": 1,
+    "topology_ref": {
+      "topology_id": "topo_mixed_001",
+      "generation": 7
+    },
+    "helper_boot_id": "helper_boot_demo",
+    "pid": 4242,
+    "bundle_id": "com.example.fixture",
+    "window_id": 7001,
+    "expected_window_quartz_bounds": {
+      "x": 100,
+      "y": 100,
+      "width": 800,
+      "height": 600
+    },
+    "display_id": 1,
+    "quartz_point": {
+      "x": 200.5,
+      "y": 300.5
+    },
+    "action": "click",
+    "button": "left",
+    "click_count": 1,
+    "modifiers": [],
+    "commit_deadline_at": "2026-07-22T12:03:30.500Z",
+    "risk_assertion": {
+      "kind": "consequential_click_v1",
+      "risk_kind": "send",
+      "element_ref": "e12",
+      "expected_role": "AXButton",
+      "expected_fingerprint": "axf_1111111111111111111111111111111111111111111111111111111111111111",
+      "coordinate_authority": {
+        "element_path": "window[0]/AXButton[0]",
+        "frame_id": "frame_00112233445566778899aabbccddeeff",
+        "frame_expires_at": "2026-07-22T12:03:40Z",
+        "final_image_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "topology_ref": {
+          "topology_id": "topo_mixed_001",
+          "generation": 7
+        },
+        "helper_boot_id": "helper_boot_demo",
+        "display_id": 1,
+        "source_pixel": {
+          "x": 100,
+          "y": 200
+        },
+        "quartz_point": {
+          "x": 200.5,
+          "y": 300.5
+        }
+      },
+      "destination_assertion": {
+        "kind": "exact_window_title",
+        "expected_window_title": "Fixture Window"
+      }
+    }
+  }
+}

@@ -34,6 +34,49 @@ func TestBash_Run(t *testing.T) {
 	}
 }
 
+func TestBash_LegacyGUIAutomationDisabled(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{LegacyGUIAutomationDisabled: true}
+	for _, command := range []string{
+		`osascript -e 'tell application "System Events" to keystroke "Zoro"'`,
+		`/usr/bin/osascript -e 'tell application "Slack" to activate'`,
+		`printf before && cliclick c:10,20`,
+	} {
+		args, err := json.Marshal(map[string]string{
+			"command": command, "description": "Operate a native app",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := tool.Run(context.Background(), string(args))
+		if err != nil {
+			t.Fatalf("Run(%q): %v", command, err)
+		}
+		if !result.IsError || !strings.Contains(result.Content, "computer_use") {
+			t.Fatalf("Run(%q) = %+v, want explicit computer_use rejection", command, result)
+		}
+	}
+}
+
+func TestBash_LegacyGUIAutomationGateDoesNotBlockTextArguments(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash tests not supported on Windows")
+	}
+	tool := &BashTool{LegacyGUIAutomationDisabled: true}
+	result, err := tool.Run(
+		context.Background(),
+		`{"command":"printf '%s' osascript","description":"Print a word"}`,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.IsError || result.Content != "osascript" {
+		t.Fatalf("Run = %+v, want ordinary text argument to remain allowed", result)
+	}
+}
+
 func TestBash_DescriptionDoesNotClaimShellStatePersists(t *testing.T) {
 	desc := (&BashTool{}).Info().Description
 	if strings.Contains(desc, "working directory persists between commands") {

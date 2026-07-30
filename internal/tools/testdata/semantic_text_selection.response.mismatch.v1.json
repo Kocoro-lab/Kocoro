@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "completed_unverified",
+  "selection_committed": true,
+  "phase": "post_verification",
+  "failure_code": "selected_range_mismatch",
+  "retry_safe": false,
+  "postcondition": null,
+  "selected_range": {"location": 1, "length": 2}
+}

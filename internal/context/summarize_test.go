@@ -401,8 +401,8 @@ func TestSummarizePrompt_RequiresStructuredSections(t *testing.T) {
 }
 
 // Helper-tier callers tag CacheSource="helper" so analysts can separate them
-// from main-turn traffic in cache-debug.log. Cloud currently uses the same
-// short TTL for both.
+// from main-turn traffic in cache-debug.log. The test intentionally makes no
+// assertion about Cloud TTL policy.
 func TestGenerateSummary_TagsHelperCacheSource(t *testing.T) {
 	mock := &mockCompleter{
 		response: &client.CompletionResponse{OutputText: "<summary>x</summary>"},

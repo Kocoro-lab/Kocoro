@@ -1188,29 +1188,29 @@ func TestIsReadMCPName(t *testing.T) {
 		// Data-transfer / property-mutation verbs (GitHub/Linear/Notion/
 		// Slack MCP patterns). Each pairs a position-0 read with a
 		// write verb that earlier versions of writeVerbs missed.
-		{"get_and_add_member", false},        // get + add
-		{"list_and_set_properties", false},   // list + set
-		{"search_and_replace", false},        // search + replace
-		{"get_and_write_cache", false},       // get + write
-		{"find_and_patch_record", false},     // find + patch
-		{"query_and_put_result", false},      // query + put
-		{"list_and_clear_flags", false},      // list + clear
-		{"get_and_post_update", false},       // get + post
-		{"list_and_push_changes", false},     // list + push
-		{"fetch_and_publish_item", false},    // fetch + publish
-		{"get_and_submit_form", false},       // get + submit
-		{"list_and_drop_table", false},       // list + drop
-		{"find_and_prune_entries", false},    // find + prune
+		{"get_and_add_member", false},      // get + add
+		{"list_and_set_properties", false}, // list + set
+		{"search_and_replace", false},      // search + replace
+		{"get_and_write_cache", false},     // get + write
+		{"find_and_patch_record", false},   // find + patch
+		{"query_and_put_result", false},    // query + put
+		{"list_and_clear_flags", false},    // list + clear
+		{"get_and_post_update", false},     // get + post
+		{"list_and_push_changes", false},   // list + push
+		{"fetch_and_publish_item", false},  // fetch + publish
+		{"get_and_submit_form", false},     // get + submit
+		{"list_and_drop_table", false},     // list + drop
+		{"find_and_prune_entries", false},  // find + prune
 		// "run"/"execute" are in writeVerbs (fail-closed on ambiguous
 		// action verbs). Snowflake/ClickHouse "run_query" used to be
 		// accepted as SELECT convention, but a Medium review finding
 		// pointed out that ambiguity should fall on the safe side —
 		// the server is free to rename to "query_database" if it wants
 		// NoProgress relief.
-		{"run_query", false},       // run is a write verb (fail closed)
-		{"execute_script", false},  // execute is a write verb (fail closed)
-		{"transform_data", false},  // no read verb
-		{"process_batch", false},   // no read verb
+		{"run_query", false},      // run is a write verb (fail closed)
+		{"execute_script", false}, // execute is a write verb (fail closed)
+		{"transform_data", false}, // no read verb
+		{"process_batch", false},  // no read verb
 		// Pathological: write name with a read-verb at position 4+ must
 		// NOT match (token scan stops at position 3).
 		{"request_write_access_and_get_token_afterwards", false},
@@ -1224,11 +1224,9 @@ func TestIsReadMCPName(t *testing.T) {
 	}
 }
 
-// TestLoopDetector_NoProgress_BashUniqueArgs_NoNudge covers the Task 5
-// benchmark pattern: ~15 bash calls during a multi-step investigation, each
-// with distinct argsJSON. Pre-gate, this force-stops via maxNudges escalation.
-// With bash in the batchTolerant set and ≥50% unique argsHashes, NoProgress
-// must treat this as a legitimate batch and stay Continue.
+// TestLoopDetector_NoProgress_BashUniqueArgs_NoNudge uses a synthetic batch
+// with distinct argsJSON. The uniqueness gate must treat it as legitimate and
+// stay Continue.
 func TestLoopDetector_NoProgress_BashUniqueArgs_NoNudge(t *testing.T) {
 	ld := NewLoopDetector()
 	ld.batchTolerant = map[string]bool{"bash": true}
@@ -1242,11 +1240,10 @@ func TestLoopDetector_NoProgress_BashUniqueArgs_NoNudge(t *testing.T) {
 	}
 }
 
-// TestLoopDetector_NoProgress_MCPUniqueArgs_NoNudge covers the Task 6
-// benchmark pattern: 16 MCP-tool calls each querying a distinct UUID during a
-// legitimate Notion database enumeration. Pre-gate, this hit the generic
-// NoProgress threshold at count=8. With the MCP tool registered in
-// batchTolerant, unique-args enumeration stays Continue.
+// TestLoopDetector_NoProgress_MCPUniqueArgs_NoNudge uses a synthetic
+// read-oriented MCP enumeration with a distinct identifier on every call.
+// With the tool registered in batchTolerant, unique-args enumeration stays
+// Continue.
 func TestLoopDetector_NoProgress_MCPUniqueArgs_NoNudge(t *testing.T) {
 	ld := NewLoopDetector()
 	ld.batchTolerant = map[string]bool{"API-query-data-source": true}

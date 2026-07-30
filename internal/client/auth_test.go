@@ -278,7 +278,7 @@ func TestAuthClient_MeWithAPIKey_XAPIKey(t *testing.T) {
 }
 
 // TestAuthClient_MeWithAPIKey_RealCloudShape pins the authoritative Cloud
-// wire shape (shannon-cloud MeResponse): the canonical id is the top-level
+// public Cloud wire shape: the canonical id is the top-level
 // `user_id` (NOT `id`) and the plan is the top-level `tier`, with no nested
 // `user` object. The prior decoder only read `user.id` / `id`, so against
 // this real body it returned an empty ID with a populated tier — the

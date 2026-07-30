@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "pointer_move_commit_state": "not_committed",
+  "scroll_commit_state": "not_committed",
+  "phase": "preflight",
+  "failure_code": "point_occluded",
+  "retry_safe": false,
+  "requested": {
+    "quartz_point": {"x": 350.5, "y": 450.5},
+    "unit": "pixel",
+    "provider_delta_x": 37,
+    "provider_delta_y": -618,
+    "provider_to_quartz_scale_x": 1,
+    "provider_to_quartz_scale_y": 1,
+    "cg_point_delta_axis1": 618,
+    "cg_point_delta_axis2": -37
+  },
+  "pointer_endpoint": null
+}

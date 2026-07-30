@@ -13,10 +13,7 @@ import (
 )
 
 // ErrToolNotPersistable is returned when a tool cannot be persisted to a
-// per-agent always-allow list. The list of non-persistable tools is currently
-// empty (see highRiskTools below); this error and the surrounding plumbing
-// are preserved so a future genuinely-irreversible tool (account deletion,
-// payment authorization) can be added without rewiring callers.
+// per-agent always-allow list.
 var ErrToolNotPersistable = errors.New("tool cannot be persisted as always-allow")
 
 // highRiskTools mirrors internal/agent/tools.go autoApprovalDenyList to avoid
@@ -24,12 +21,15 @@ var ErrToolNotPersistable = errors.New("tool cannot be persisted as always-allow
 // instructions). Drift between the two is guarded by TestHighRiskListConsistency
 // in internal/agent/tools_test.go.
 //
-// As of 2026-05-18 this list is empty — see autoApprovalDenyList for the
-// product-decision context. publish_to_web, generate_image, and edit_image
-// now can be persisted as "always allow" once the user opts in; runtime
-// approval still prompts the first time because their RequiresApproval()
-// returns true.
-var highRiskTools = []string{}
+// Legacy GUI tools require fresh consent. computer_use is intentionally kept
+// out of this list because it is persistable at the global product-permission
+// layer; it is rejected separately for per-agent persistence below.
+var highRiskTools = []string{
+	"computer",
+	"accessibility",
+	"applescript",
+	"ghostty",
+}
 
 // HighRiskTools returns a copy of the tools that cannot be persisted to a
 // per-agent always-allow list. Exposed for cross-package consistency tests.
@@ -49,12 +49,70 @@ func isHighRiskTool(toolName string) bool {
 }
 
 // IsToolAlwaysAllowable reports whether a tool may be persisted to an agent's
-// permissions.always_allow_tools list. The current policy permits every tool
-// (highRiskTools is empty); the function and the call sites remain so a
-// future tool that truly demands per-call approval can be denied persistence
-// without rewriting callers.
+// permissions.always_allow_tools list.
 func IsToolAlwaysAllowable(toolName string) bool {
-	return !isHighRiskTool(toolName)
+	return !isHighRiskTool(toolName) && toolName != "computer_use"
+}
+
+// MergeAlwaysAllowTools combines the global product-level grant set with one
+// named agent's grant set. Per-agent entries are filtered here so every runtime
+// surface honors the same scope boundary: computer_use may be granted only
+// globally, and legacy GUI wrappers may not bypass fresh approval.
+func MergeAlwaysAllowTools(global, perAgent []string) []string {
+	merged := append([]string(nil), global...)
+	for _, tool := range perAgent {
+		if IsToolAlwaysAllowable(tool) {
+			merged = append(merged, tool)
+		}
+	}
+	return merged
+}
+
+// ValidateAgentPermissionsConfig rejects approval bypasses that are a category
+// error at per-agent scope. computer_use is the only such case: its grant is a
+// single GLOBAL product permission, so silently dropping a per-agent entry
+// would leave the caller believing a grant exists that never will.
+//
+// Legacy GUI wrappers are deliberately NOT rejected here. They were legitimately
+// persistable before joining highRiskTools, so real on-disk agent configs
+// contain them; rejecting on write would make every such agent permanently
+// uneditable through the API (config writes are full-replace, so a Desktop
+// round-trip resubmits the stale entry and can never clear it). Those entries
+// are dropped by SanitizeAgentPermissionsConfig instead, which is safe because
+// the runtime gate in loop.go already refuses to honor them.
+func ValidateAgentPermissionsConfig(config *AgentPermissionsConfig) error {
+	if config == nil {
+		return nil
+	}
+	for _, tool := range config.AlwaysAllowTools {
+		if tool == "computer_use" {
+			return fmt.Errorf("%w: %s", ErrToolNotPersistable, tool)
+		}
+	}
+	return nil
+}
+
+// SanitizeAgentPermissionsConfig returns a copy with always-allow entries the
+// runtime will never honor removed, so a config written before a tool joined
+// the non-persistable set self-heals on the next write instead of bricking the
+// agent. The receiver is never mutated; the original pointer is returned when
+// nothing needs dropping.
+func SanitizeAgentPermissionsConfig(config *AgentPermissionsConfig) *AgentPermissionsConfig {
+	if config == nil {
+		return nil
+	}
+	kept := make([]string, 0, len(config.AlwaysAllowTools))
+	for _, tool := range config.AlwaysAllowTools {
+		if IsToolAlwaysAllowable(tool) {
+			kept = append(kept, tool)
+		}
+	}
+	if len(kept) == len(config.AlwaysAllowTools) {
+		return config
+	}
+	cleaned := *config
+	cleaned.AlwaysAllowTools = kept
+	return &cleaned
 }
 
 // AppendAlwaysAllowTool adds a tool name to the agent's
@@ -67,7 +125,7 @@ func IsToolAlwaysAllowable(toolName string) bool {
 //
 // Idempotent: duplicate calls are no-ops (the list is deduplicated and sorted).
 //
-// Defense-in-depth: high-risk tools (isHighRiskTool) are rejected with
+// Defense-in-depth: tools invalid at per-agent scope are rejected with
 // ErrToolNotPersistable. The runtime check at internal/agent/loop.go
 // checkPermissionAndApproval also refuses to honor such entries.
 func AppendAlwaysAllowTool(agentsDir, agentName, tool string) error {
@@ -77,7 +135,7 @@ func AppendAlwaysAllowTool(agentsDir, agentName, tool string) error {
 	if tool == "" {
 		return fmt.Errorf("tool name is empty")
 	}
-	if isHighRiskTool(tool) {
+	if !IsToolAlwaysAllowable(tool) {
 		return fmt.Errorf("%w: %s", ErrToolNotPersistable, tool)
 	}
 

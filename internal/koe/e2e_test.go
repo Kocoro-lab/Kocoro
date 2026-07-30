@@ -52,7 +52,7 @@ const e2ePersona = "You are a voice assistant. For any request that is real work
 
 func TestKoeVoiceE2E(t *testing.T) {
 	if os.Getenv("KOE_E2E") != "1" {
-		t.Skip("headless voice E2E: set KOE_E2E=1 + OPENAI_API_KEY (live OpenAI, ~$0.01)")
+		t.Skip("headless voice E2E: set KOE_E2E=1 + OPENAI_API_KEY (paid live OpenAI test)")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

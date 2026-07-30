@@ -227,6 +227,9 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 		}
 		return nil
 	}
+	if err := ValidateAgentPermissionsConfig(cfg.Permissions); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
@@ -257,8 +260,8 @@ func WriteAgentConfig(agentsDir, name string, cfg *AgentConfigAPI) error {
 		}
 		m["mcp_servers"] = servers
 	}
-	if cfg.Permissions != nil && !cfg.Permissions.IsEmpty() {
-		m["permissions"] = cfg.Permissions
+	if perms := SanitizeAgentPermissionsConfig(cfg.Permissions); perms != nil && !perms.IsEmpty() {
+		m["permissions"] = perms
 	}
 	if cfg.AutoApprove != nil {
 		m["auto_approve"] = *cfg.AutoApprove
@@ -456,6 +459,9 @@ func (r *AgentCreateRequest) Validate() error {
 			return err
 		}
 		if err := ValidateAgentModelConfig(r.Config.Agent); err != nil {
+			return err
+		}
+		if err := ValidateAgentPermissionsConfig(r.Config.Permissions); err != nil {
 			return err
 		}
 	}

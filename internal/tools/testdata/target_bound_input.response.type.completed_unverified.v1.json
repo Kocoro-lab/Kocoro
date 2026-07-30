@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "status": "completed_unverified",
+  "action": "type",
+  "input_committed": true,
+  "clipboard_touched": true,
+  "clipboard_restored": true,
+  "phase": "post_verification",
+  "failure_code": "postcondition_not_declared",
+  "retry_safe": false,
+  "postcondition": null
+}

@@ -1,19 +1,30 @@
 package tools
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"image"
 	"log"
+	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
+
+type screenGeometry struct {
+	LogicalWidth  int
+	LogicalHeight int
+	CaptureWidth  int
+	CaptureHeight int
+}
 
 const (
 	DefaultAPIWidth  = 1280
@@ -161,6 +172,45 @@ func ResizeImage(path string, maxDim int) error {
 	return nil
 }
 
+func resizeImageContext(ctx context.Context, path string, maxDim int) error {
+	return runBoundedLegacyImageResizeCommand(
+		ctx,
+		"sips",
+		[]string{"--resampleHeightWidthMax", strconv.Itoa(maxDim), path},
+		8*time.Second)
+}
+
+func imageFileDimensions(path string) (int, int, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer file.Close()
+	config, _, err := image.DecodeConfig(file)
+	if err != nil {
+		return 0, 0, err
+	}
+	if config.Width <= 0 || config.Height <= 0 {
+		return 0, 0, fmt.Errorf("image has invalid dimensions")
+	}
+	return config.Width, config.Height, nil
+}
+
+func imageBlockDimensions(block agent.ImageBlock) (int, int, error) {
+	if block.Data == "" {
+		return 0, 0, fmt.Errorf("image block has no data")
+	}
+	config, _, err := image.DecodeConfig(base64.NewDecoder(
+		base64.StdEncoding, strings.NewReader(block.Data)))
+	if err != nil {
+		return 0, 0, err
+	}
+	if config.Width <= 0 || config.Height <= 0 {
+		return 0, 0, fmt.Errorf("image block has invalid dimensions")
+	}
+	return config.Width, config.Height, nil
+}
+
 // CaptureAndEncode takes a fullscreen screenshot (-x flag for no sound), resizes, and base64-encodes.
 // Returns the file path and encoded image block.
 func CaptureAndEncode(maxDim int) (string, agent.ImageBlock, error) {
@@ -193,59 +243,300 @@ func CaptureAndEncode(maxDim int) (string, agent.ImageBlock, error) {
 	return path, block, nil
 }
 
-// GetScreenDimensions returns the logical screen dimensions (points, not physical pixels)
-// of the main display. Uses Quartz CGDisplayPixelsWide/High which returns the coordinate
-// space that CGEvent mouse clicks operate in. Falls back to system_profiler parsing.
-func GetScreenDimensions() (width, height int, err error) {
-	// Primary: Quartz CGDisplayPixelsWide/High — returns logical points (what CGEvent uses)
-	out, err := exec.Command("python3", "-c",
-		`import Quartz; d=Quartz.CGMainDisplayID(); print(Quartz.CGDisplayPixelsWide(d), Quartz.CGDisplayPixelsHigh(d))`).CombinedOutput()
+// legacyMainDisplayCaptureArgs is intentionally separate from
+// CaptureAndEncode. The latter is shared by AppleScript, Ghostty, browser
+// fallbacks and the standalone screenshot tool; changing its fullscreen
+// semantics would widen the regression surface. Legacy function computer uses
+// -m so one declared tool canvas is always backed by exactly the main display.
+func legacyMainDisplayCaptureArgs(output string) []string {
+	return []string{"-x", "-m", output}
+}
+
+func runLegacyMainDisplayCapture(output string) error {
+	return runBoundedLegacyMainDisplayCapture(
+		"screencapture", legacyMainDisplayCaptureArgs(output), 8*time.Second)
+}
+
+func runLegacyMainDisplayCaptureContext(ctx context.Context, output string) error {
+	return runBoundedLegacyMainDisplayCaptureContext(
+		ctx, "screencapture", legacyMainDisplayCaptureArgs(output), 8*time.Second)
+}
+
+func runBoundedLegacyMainDisplayCapture(executable string, args []string, timeout time.Duration) error {
+	return runBoundedLegacyMainDisplayCaptureContext(
+		context.Background(), executable, args, timeout)
+}
+
+func runBoundedLegacyMainDisplayCaptureContext(
+	parent context.Context,
+	executable string,
+	args []string,
+	timeout time.Duration,
+) error {
+	return runBoundedLegacyCommand(parent, "main display capture", executable, args, timeout)
+}
+
+func runBoundedLegacyImageResizeCommand(
+	parent context.Context,
+	executable string,
+	args []string,
+	timeout time.Duration,
+) error {
+	return runBoundedLegacyCommand(parent, "main display image resize", executable, args, timeout)
+}
+
+func runBoundedLegacyCommand(
+	parent context.Context,
+	operation, executable string,
+	args []string,
+	timeout time.Duration,
+) error {
+	if parent == nil {
+		return fmt.Errorf("%s context is required", operation)
+	}
+	if executable == "" || timeout <= 0 {
+		return fmt.Errorf("%s command and positive timeout are required", operation)
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, args...)
+	// If an unexpected descendant inherits stdout/stderr, do not let pipe
+	// closure extend the capture timeout indefinitely after the direct process
+	// has been killed. CombinedOutput still calls Wait, so the child is reaped
+	// before this function returns.
+	cmd.WaitDelay = 500 * time.Millisecond
+	out, err := cmd.CombinedOutput()
+	if parent.Err() != nil {
+		return fmt.Errorf("%s canceled: %w", operation, parent.Err())
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("%s timed out after %s", operation, timeout)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %v\n%s", operation, err, string(out))
+	}
+	return nil
+}
+
+// CaptureMainDisplayAndEncode is the legacy computer tool's dedicated capture
+// path. A private directory contains every filename screencapture may emit, so
+// unexpected multi-display sibling files are detected, rejected, and removed.
+// The one admitted image is moved to a standalone temporary path before the
+// scratch directory is deleted.
+func CaptureMainDisplayAndEncode(maxDim int) (string, agent.ImageBlock, error) {
+	return captureMainDisplayAndEncode(maxDim, runLegacyMainDisplayCapture)
+}
+
+func CaptureMainDisplayAndEncodeContext(
+	ctx context.Context,
+	maxDim int,
+) (string, agent.ImageBlock, error) {
+	return captureMainDisplayAndEncodeContext(
+		ctx, maxDim, runLegacyMainDisplayCaptureContext, resizeImageContext)
+}
+
+func captureMainDisplayAndEncode(
+	maxDim int,
+	capture func(output string) error,
+) (string, agent.ImageBlock, error) {
+	if capture == nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("main display capture runner is required")
+	}
+	return captureMainDisplayAndEncodeContext(
+		context.Background(),
+		maxDim,
+		func(_ context.Context, output string) error { return capture(output) },
+		func(_ context.Context, path string, max int) error { return ResizeImage(path, max) })
+}
+
+func captureMainDisplayAndEncodeContext(
+	ctx context.Context,
+	maxDim int,
+	capture func(context.Context, string) error,
+	resize func(context.Context, string, int) error,
+) (string, agent.ImageBlock, error) {
+	if ctx == nil || capture == nil || resize == nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("main display capture context, runner, and resizer are required")
+	}
+	scratch, err := os.MkdirTemp("", "kocoro-legacy-main-capture-*")
+	if err != nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("create main display capture directory: %w", err)
+	}
+	defer os.RemoveAll(scratch)
+
+	output := filepath.Join(scratch, "main.png")
+	if err := capture(ctx, output); err != nil {
+		return "", agent.ImageBlock{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", agent.ImageBlock{}, err
+	}
+	entries, err := os.ReadDir(scratch)
+	if err != nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("inspect main display capture: %w", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "main.png" || !entries[0].Type().IsRegular() {
+		return "", agent.ImageBlock{}, fmt.Errorf(
+			"main display capture produced %d outputs; expected exactly main.png", len(entries))
+	}
+	if maxDim > 0 {
+		if err := resize(ctx, output, maxDim); err != nil {
+			return "", agent.ImageBlock{}, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", agent.ImageBlock{}, err
+	}
+
+	finalFile, err := os.CreateTemp("", "kocoro-legacy-main-*.png")
+	if err != nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("create main display image: %w", err)
+	}
+	finalPath := finalFile.Name()
+	keepFinal := false
+	defer func() {
+		if !keepFinal {
+			_ = os.Remove(finalPath)
+		}
+	}()
+	if err := finalFile.Close(); err != nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("close main display image: %w", err)
+	}
+	if err := os.Remove(finalPath); err != nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("prepare main display image: %w", err)
+	}
+	if err := os.Rename(output, finalPath); err != nil {
+		return "", agent.ImageBlock{}, fmt.Errorf("retain main display image: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", agent.ImageBlock{}, err
+	}
+
+	block, err := EncodeImage(finalPath)
+	if err != nil {
+		return "", agent.ImageBlock{}, err
+	}
+	keepFinal = true
+	return finalPath, block, nil
+}
+
+// GetMainScreenGeometry binds the legacy function computer tool's coordinate
+// image space to the screenshot pixels that screencapture will produce while
+// preserving the logical-point space consumed by CGEvent. Keeping both values
+// prevents a 16:9 image from being interpreted as an old fixed 1280x800 canvas.
+func GetMainScreenGeometry() (screenGeometry, error) {
+	// NSScreen.screens[0] is the primary display (the one with the menu bar),
+	// matching screencapture -m. NSScreen.mainScreen can instead follow the key
+	// window onto another monitor and silently break the declared tool canvas.
+	const script = `ObjC.import("AppKit"); var s=$.NSScreen.screens.objectAtIndex(0); var f=s.frame; var k=Number(s.backingScaleFactor); console.log(Number(f.size.width)+" "+Number(f.size.height)+" "+k)`
+	out, err := exec.Command("/usr/bin/osascript", "-l", "JavaScript", "-e", script).CombinedOutput()
 	if err == nil {
 		var w, h int
-		if _, parseErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d %d", &w, &h); parseErr == nil && w > 0 && h > 0 {
-			return w, h, nil
+		var scale float64
+		if _, parseErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d %d %f", &w, &h, &scale); parseErr == nil &&
+			w > 0 && h > 0 && scale > 0 && !math.IsNaN(scale) && !math.IsInf(scale, 0) {
+			return screenGeometry{
+				LogicalWidth: w, LogicalHeight: h,
+				CaptureWidth:  int(math.Round(float64(w) * scale)),
+				CaptureHeight: int(math.Round(float64(h) * scale)),
+			}, nil
 		}
 	}
 
-	// Fallback: system_profiler (may return physical pixels on Retina without "UI Looks like:")
+	// Fallback for restricted/minimal environments where osascript is unavailable.
 	out, err = exec.Command("system_profiler", "SPDisplaysDataType").CombinedOutput()
 	if err != nil {
-		return 0, 0, fmt.Errorf("screen dimensions: %v", err)
+		return screenGeometry{}, fmt.Errorf("screen dimensions: %v", err)
 	}
-	return parseScreenDimensions(string(out))
+	return parseScreenGeometry(string(out))
+}
+
+// GetScreenDimensions returns the main display's logical point dimensions.
+func GetScreenDimensions() (width, height int, err error) {
+	geometry, err := GetMainScreenGeometry()
+	if err != nil {
+		return 0, 0, err
+	}
+	return geometry.LogicalWidth, geometry.LogicalHeight, nil
 }
 
 // resolutionRe matches "WxH" or "W x H" with optional surrounding text.
 var resolutionRe = regexp.MustCompile(`(\d+)\s*x\s*(\d+)`)
 
 func parseScreenDimensions(output string) (int, int, error) {
-	// Prefer "UI Looks like:" (logical resolution on Retina) over raw "Resolution:".
-	for line := range strings.SplitSeq(output, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "UI Looks like:") {
-			m := resolutionRe.FindStringSubmatch(trimmed)
-			if m != nil {
-				w, _ := strconv.Atoi(m[1])
-				h, _ := strconv.Atoi(m[2])
-				return w, h, nil
-			}
+	geometry, err := parseScreenGeometry(output)
+	if err != nil {
+		return 0, 0, err
+	}
+	return geometry.LogicalWidth, geometry.LogicalHeight, nil
+}
+
+func parseScreenGeometry(output string) (screenGeometry, error) {
+	type candidate struct {
+		geometry screenGeometry
+		main     bool
+	}
+	var candidates []candidate
+	var current *candidate
+	flush := func() {
+		if current != nil && current.geometry.CaptureWidth > 0 && current.geometry.CaptureHeight > 0 {
+			candidates = append(candidates, *current)
 		}
+		current = nil
 	}
 
-	// Fall back to "Resolution:" line.
 	for line := range strings.SplitSeq(output, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "Resolution:") {
-			m := resolutionRe.FindStringSubmatch(trimmed)
-			if m != nil {
-				w, _ := strconv.Atoi(m[1])
-				h, _ := strconv.Atoi(m[2])
-				return w, h, nil
+		switch {
+		case strings.HasPrefix(trimmed, "Resolution:"):
+			flush()
+			match := resolutionRe.FindStringSubmatch(trimmed)
+			if match == nil {
+				continue
 			}
+			physicalWidth, _ := strconv.Atoi(match[1])
+			physicalHeight, _ := strconv.Atoi(match[2])
+			logicalWidth, logicalHeight := physicalWidth, physicalHeight
+			if strings.Contains(strings.ToLower(trimmed), "retina") {
+				logicalWidth /= 2
+				logicalHeight /= 2
+			}
+			current = &candidate{geometry: screenGeometry{
+				LogicalWidth: logicalWidth, LogicalHeight: logicalHeight,
+				CaptureWidth: physicalWidth, CaptureHeight: physicalHeight,
+			}}
+		case strings.HasPrefix(trimmed, "UI Looks like:") && current != nil:
+			if match := resolutionRe.FindStringSubmatch(trimmed); match != nil {
+				current.geometry.LogicalWidth, _ = strconv.Atoi(match[1])
+				current.geometry.LogicalHeight, _ = strconv.Atoi(match[2])
+			}
+		case strings.HasPrefix(trimmed, "Main Display:") && current != nil:
+			current.main = strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(trimmed, "Main Display:")), "yes")
 		}
 	}
+	flush()
+	for _, display := range candidates {
+		if display.main {
+			return display.geometry, nil
+		}
+	}
+	if len(candidates) > 0 {
+		// system_profiler omits "Main Display" on some one-display systems.
+		return candidates[0].geometry, nil
+	}
+	return screenGeometry{}, fmt.Errorf("no display resolution found in system_profiler output")
+}
 
-	return 0, 0, fmt.Errorf("no display resolution found in system_profiler output")
+// resizeDimensions mirrors sips --resampleHeightWidthMax: preserve aspect,
+// never upscale, and bind the tool declaration to the final pixel dimensions.
+func resizeDimensions(width, height, maxDimension int) (int, int) {
+	if width <= 0 || height <= 0 || maxDimension <= 0 ||
+		(width <= maxDimension && height <= maxDimension) {
+		return width, height
+	}
+	scale := float64(maxDimension) / float64(max(width, height))
+	return max(1, int(math.Round(float64(width)*scale))),
+		max(1, int(math.Round(float64(height)*scale)))
 }
 
 // ScaleCoordinates maps coordinates from API space to logical screen space.

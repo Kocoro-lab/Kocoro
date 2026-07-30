@@ -234,10 +234,10 @@ type GenerateSuggestionResult struct {
 // transport failure; filter rejection is signaled by empty string + nil error
 // (caller treats both as "no suggestion to display").
 //
-// Cost: 1 LLM call. With a warm prompt cache, input cost ≈ cache_read for the
-// prefix + full price for ~150 tokens (SuggestionPrompt + small overhead).
-// Output is capped by the filter to ≤100 chars (~30 tokens). Skipped by the
-// caller (suggestion_handler) when the cache is cold per
+// This performs one potentially billed helper LLM call. Product cost and token
+// baselines are maintained outside this public repository. Output is capped by
+// the public functional filter to ≤100 chars. Skipped by the caller
+// (suggestion_handler) when the cache is cold per
 // agent.prompt_suggestion.cache_cold_threshold_tokens.
 //
 // Thin wrapper over GenerateSuggestionWithUsage that discards the Usage/Model

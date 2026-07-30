@@ -107,3 +107,62 @@ func TestIsContextLengthError(t *testing.T) {
 		})
 	}
 }
+
+func TestIsOpenAIComputerContinuationExpired(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "typed envelope",
+			err: &client.APIError{
+				StatusCode: 409,
+				Body: `{"error":{"type":"computer_continuation_expired",` +
+					`"code":"invalid_request","message":"spent","status":409}}`,
+			},
+			want: true,
+		},
+		{
+			name: "wrapped typed envelope",
+			err: fmt.Errorf("complete: %w", &client.APIError{
+				StatusCode: 409,
+				Body:       `{"error":{"type":"computer_continuation_expired"}}`,
+			}),
+			want: true,
+		},
+		{
+			name: "unrelated conflict",
+			err: &client.APIError{
+				StatusCode: 409,
+				Body:       `{"error":{"type":"conflict"}}`,
+			},
+		},
+		{
+			name: "type on wrong status",
+			err: &client.APIError{
+				StatusCode: 400,
+				Body:       `{"error":{"type":"computer_continuation_expired"}}`,
+			},
+		},
+		{
+			name: "text mention is not structured contract",
+			err: &client.APIError{
+				StatusCode: 409,
+				Body:       `computer_continuation_expired`,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isOpenAIComputerContinuationExpired(tt.err); got != tt.want {
+				t.Fatalf(
+					"isOpenAIComputerContinuationExpired(%v)=%v, want %v",
+					tt.err,
+					got,
+					tt.want,
+				)
+			}
+		})
+	}
+}

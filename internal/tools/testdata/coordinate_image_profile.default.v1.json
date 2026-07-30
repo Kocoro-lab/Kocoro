@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "provider_balanced_png",
+  "version": 1,
+  "media_type": "image/png",
+  "fallback_media_type": "image/jpeg",
+  "target_long_edge_px": 1280,
+  "max_long_edge_px": 1568,
+  "max_total_pixels": 1600000,
+  "max_encoded_bytes": 3929088,
+  "jpeg_quality_ladder": [90, 82, 74],
+  "padding_mode": "none",
+  "requires_exact_coordinate_dimensions": true
+}

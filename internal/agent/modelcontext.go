@@ -5,7 +5,7 @@ import "strings"
 // modelContextWindow maps known model IDs to their context window in tokens.
 //
 // Source of truth: Anthropic / OpenAI / Google / xAI official model docs and
-// shannon-cloud/config/models.yaml. Update both when bumping a window.
+// Cloud's published model catalog. Update both when bumping a window.
 //
 // Used by AgentLoop.reportLLMUsage to auto-adjust the compaction threshold
 // based on the model that actually served the request (read from
@@ -15,10 +15,10 @@ import "strings"
 // Unknown models leave contextWindow untouched (graceful degradation).
 var modelContextWindow = map[string]int{
 	// --- Anthropic (1M-context: GA, no beta header, standard pricing) ---
-	"claude-sonnet-4-6":          1_000_000,
-	"claude-opus-4-6":            1_000_000,
-	"claude-opus-4-7":            1_000_000,
-	"claude-mythos-preview":      1_000_000,
+	"claude-sonnet-4-6":     1_000_000,
+	"claude-opus-4-6":       1_000_000,
+	"claude-opus-4-7":       1_000_000,
+	"claude-mythos-preview": 1_000_000,
 
 	// --- Anthropic (200K, dated forms) ---
 	"claude-sonnet-4-5-20250929": 200_000,
@@ -39,12 +39,12 @@ var modelContextWindow = map[string]int{
 	"claude-opus-4-1":   200_000,
 
 	// --- OpenAI ---
-	"gpt-5.1":                400_000,
-	"gpt-5.1-chat-latest":    400_000,
-	"gpt-5-pro-2025-10-06":   400_000,
-	"gpt-5-mini-2025-08-07":  400_000,
-	"gpt-5-nano-2025-08-07":  400_000,
-	"gpt-4.1-2025-04-14":     128_000,
+	"gpt-5.1":               400_000,
+	"gpt-5.1-chat-latest":   400_000,
+	"gpt-5-pro-2025-10-06":  400_000,
+	"gpt-5-mini-2025-08-07": 400_000,
+	"gpt-5-nano-2025-08-07": 400_000,
+	"gpt-4.1-2025-04-14":    128_000,
 
 	// --- Google Gemini ---
 	"gemini-3-pro-preview":  1_000_000,

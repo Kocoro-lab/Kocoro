@@ -2,13 +2,7 @@
 
 **An AI cowork agent that lives on your Mac.**
 
-<p align="center">
-  <a href="https://kocoro.ai/en/start/">
-    <img src="assets/kocoro-demo.gif" alt="Kocoro demo — AI agents working hands-on across your Mac" width="720">
-  </a>
-  <br>
-  <sub><a href="https://kocoro.ai/en/start/">▶ Watch the full demo (with audio) →</a></sub>
-</p>
+See the [Kocoro product site](https://kocoro.ai/en/start/) for the current product demo.
 
 Kocoro runs AI agents locally with full computer access — files, apps, browser, terminal, screen — and connects to your team's Slack / LINE / Feishu / Telegram channels via Shannon Cloud. Named agents with their own memory and tools, MCP-native, daemon-driven. The `shan` CLI is the runtime; **Kocoro Desktop** is the recommended way to use it.
 
@@ -22,8 +16,6 @@ Kocoro runs AI agents locally with full computer access — files, apps, browser
 > **Coming from Claude Code?** Kocoro Desktop can import your existing agents, skills, and instructions from `~/.claude/` in one click — preview-then-apply via the daemon's `/migrate/claude-code/*` endpoints.
 
 Built on **[Shannon](https://github.com/Kocoro-lab/Shannon)** — the open-source multi-agent framework that powers both the Shannon Cloud SaaS and the self-hosted Shannon Gateway.
-
-[**Interactive architecture diagram →**](https://www.waylandz.com/diagrams/shanclaw-architecture.html)
 
 ## Contents
 
@@ -98,7 +90,7 @@ shan --setup
 
 ```bash
 shan                                         # interactive TUI
-shan "who is wayland zhang"                  # one-shot
+shan "who was Ada Lovelace"                # one-shot
 shan --agent ops-bot "check prod health"     # named agent
 shan --setup                                 # configure endpoint + API key
 ```
@@ -139,7 +131,7 @@ shan -y "kill the process on port 3000"
 shan -y "open Safari and navigate to github.com"
 shan -y "set my Mac volume to 50%"
 
-# Unified native GUI control — semantic state → state_id + ref action
+# Unified native GUI control — delegate one complete desktop goal
 shan -y "open Calendar and show me today's events"
 shan -y "open TextEdit and type '你好世界 🌍'"
 
@@ -186,7 +178,7 @@ Add one when you find a task shape you keep coming back to; [`examples/cookbook/
 
 ```bash
 shan                              # interactive TUI
-shan "who is wayland zhang"       # one-shot (prompts for tool approval)
+shan "who was Ada Lovelace"     # one-shot (prompts for tool approval)
 shan -y "query"                   # auto-approve all tools
 shan --agent ops-bot "query"      # use a named agent
 shan --setup                      # configure endpoint + API key
@@ -275,12 +267,12 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 
 | Tool | Approval | Description |
 |------|----------|-------------|
-| `computer_use` | Observe: No; mutate: Yes | **Primary native-GUI tool.** Accessibility-first, provider-neutral workflow: `get_app_state` returns a compact tree plus `state_id`; ref actions re-observe and reject stale state. Supports focus/launch (including app-agnostic window reopen), click/press/value, scroll, type/hotkey, coordinate fallback, condition or bounded-delay waits, and explicit screenshots. Numeric strings from model providers are tolerated for integer fields, and pointer actions visibly move the real cursor. State and refs are isolated per run; whole calls serialize across concurrent inbound routes (one GUI-operation lock, shared with `accessibility`/`computer`/`applescript`); screenshots are never attached automatically. Unattended runs can never auto-approve it — see the deny-list note under Security. |
+| `computer_use` | One task approval | **Primary native-GUI tool on daemon runs.** The Sonnet parent delegates one complete desktop goal; for one named app Kocoro binds its exact visible window in the background first, then activates it only when an action has no exact background primitive and foreground use is allowed. Multi-app tasks retain foreground app switching. A private OpenAI native Computer Use trajectory keeps screenshots, pointer actions, typing, re-observation, continuation, and `state_id`/ref steps inside the call. Exact CGWindow fallback supports apps with incomplete AX trees, and foreground pointer actions visibly move the real cursor. Unattended runs require the explicit persisted global Computer Use grant; blanket auto-approve is denied. |
 | `accessibility` | Read: No; mutate: Yes | Legacy low-level AX tool retained for compatibility. Reads the macOS accessibility tree via persistent `ax_server`; refs are isolated per run. Mutations require a user-visible `description` and attended approval; read-only actions do not prompt. Actions: `read_tree`, `click`, `press`, `set_value`, `get_value`, `find`, `scroll`, `annotate`. |
 | `wait_for` | No | Wait for UI conditions: `elementExists`, `elementGone`, `titleContains`, `urlContains`, `titleChanged`, `urlChanged`. Use instead of sleep after navigation or app launch. |
 | `clipboard` | Yes | Read/write system clipboard. |
 | `notify` | Yes | macOS desktop notifications. |
-| `applescript` | Yes | Arbitrary AppleScript. Use for operations with no AX equivalent. |
+| `applescript` | Yes | Arbitrary AppleScript. Use for operations with no AX equivalent. **Not available on daemon runs** where `computer_use` is registered — it is removed from the model's toolset there (along with `accessibility`), and `bash` rejects `osascript`/`cliclick`, so a failed semantic path cannot bypass `computer_use` target binding. Still available in TUI / one-shot CLI / MCP. |
 | `screenshot` | No | Screen capture (fullscreen/window/region). |
 | `computer` | Yes | Mouse/keyboard via CGEvent (CJK/emoji safe). Click, type, hotkey, move, screenshot. No Python dependency. |
 | `browser` | Yes | Playwright MCP (preferred), pinchtab, or chromedp fallback. When Playwright MCP is configured, the legacy browser tool is auto-disabled. Pinchtab connects to user's real browser for authenticated sessions; chromedp uses an isolated profile. |
@@ -299,7 +291,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 
 ### Calendar (registered only when daemon is a Kocoro Desktop subprocess)
 
-Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calendars configured under **System Settings → Internet Accounts**. EventKit access lives in Kocoro Desktop (.app); daemon talks to Desktop over a local Unix domain socket. Not available in TUI / one-shot CLI / MCP / scheduled-task modes (fall back to `applescript` driving Calendar.app).
+Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calendars configured under **System Settings → Internet Accounts**. EventKit access lives in Kocoro Desktop (.app); daemon talks to Desktop over a local Unix domain socket. Not available in TUI / one-shot CLI / MCP / scheduled-task modes. In TUI / one-shot CLI / MCP, fall back to `applescript` driving Calendar.app; scheduled tasks run through the daemon, where `applescript` is removed whenever `computer_use` is registered, so use `computer_use` against Calendar.app there instead.
 
 | Tool | Approval | Description |
 |------|----------|-------------|
@@ -320,8 +312,8 @@ Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calenda
 | `publish_to_web` | Yes ⚠️ | Upload to a **public** S3 URL on Shannon Cloud (50 MiB cap). Path blocklist (`.env`, `.ssh`, `credentials`, `*.pem`, …) and extension allowlist (html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…). Extend allowlist via `cloud.publish_allowed_extensions`. Uploads are tagged `kind=other` server-side (Desktop UI's "All / Image / HTML / PDF / Other" filter sits alongside a separate "Session" bucket for daemon-side session shares). Files retractable via `retract_published_file`, but **anyone with the URL can read content until then** plus up to 5 minutes after via CDN edge cache. |
 | `list_my_published_files` | No | List the user's still-active published files. Paginated (`limit` default 20, max 100). Optional `kind` filter (`session_share` / `report` / `landing_page` / `image` / `other`) — omit to list every category. |
 | `retract_published_file` | Yes ⚠️ | Retract a published file by `id` (UUID from list, **not** the URL). Owner-only; cross-user calls return a friendly 404 (cloud conflates not-found/already-retracted/not-yours to prevent existence leaks). NOT on the high-risk auto-approval denylist — user can opt in to `always_allow_tools`. CDN edges may serve content for up to 5 min after success. |
-| `generate_image` | Yes ⚠️ | Generate via `POST /api/v1/images/generations` (`gpt-image-2`); returns a **public permanent** CDN URL. Args: `prompt`, `size`, `quality` (latency 30s→180s), `n` (1–10), `background`. Each call consumes paid quota. For charts use `kocoro-generative-ui` instead. |
-| `edit_image` | Yes ⚠️ | Edit via `POST /api/v1/images/edits`. Args: `prompt` + `image_urls` (1–4, must start with `https://static.kocoro.ai/` — external URLs rejected; pipe through `generate_image` / `publish_to_web` first). No mask field — describe the region in prose. Latency 40s–350s. |
+| `generate_image` | Yes ⚠️ | Generate via `POST /api/v1/images/generations` (`gpt-image-2`); returns a **public permanent** CDN URL. Args: `prompt`, `size`, `quality`, `n` (1–10), `background`. Latency varies and each call consumes paid quota. For charts use `kocoro-generative-ui` instead. |
+| `edit_image` | Yes ⚠️ | Edit via `POST /api/v1/images/edits`. Args: `prompt` + `image_urls` (1–4, must start with `https://static.kocoro.ai/` — external URLs rejected; pipe through `generate_image` / `publish_to_web` first). No mask field — describe the region in prose. Latency varies and each call consumes paid quota. |
 
 ### Tool Approval Flow
 
@@ -356,7 +348,7 @@ Bash command resolution order:
 2. **Denied commands** — `permissions.denied_commands` in config
 3. **Compound split** — `&&`, `||`, `;`, `|`, bare `&`, and `(...)` subshells split and checked per sub-command. Bare `&` is preserved so background launches still trigger always-ask.
 4. **Always-ask high-risk gate** — runs BEFORE the allowlist. (a) fixed-prefix list (`python -c`, `bash -c`, `pip install`, `npx`, `rm -rf`, etc.); (b) dangerous-flag token scan for `git push` (`--force`, `-f`, `--force-with-lease`, `--mirror`, `--delete`, `--prune`, etc.). "Always Allow" on a high-risk command is honored once but NOT persisted.
-5. **Allowed commands** — literal/glob match against the full command, then a token-prefix family fallback (depth N=2 for known CLIs like git/kubectl/docker/npm, N=3 for unknowns). So `ptengine-cli config get` covers `ptengine-cli config show --json` but not `ptengine-cli heatmap query`. The always-ask gate above prevents family expansion from silently widening scope to destructive variants.
+5. **Allowed commands** — literal/glob match against the full command, then a token-prefix family fallback (depth N=2 for known CLIs like git/kubectl/docker/npm, N=3 for unknowns). So `terraform workspace list` covers `terraform workspace show` but not `terraform import`. The always-ask gate above prevents family expansion from silently widening scope to destructive variants.
 6. **Default safe** — built-in safe list (ls, git status, go test, make).
 7. **User approval** — interactive prompt or `-y`.
 
@@ -581,17 +573,17 @@ Slack/LINE ──webhook──▶ Shannon Cloud ──WebSocket──▶ shan da
 
 #### Interactive approval + always-allow
 
-Tools requiring approval send requests to the client app (via WS relay through Shannon Cloud). "Always Allow" persists tool-level at two scopes:
+Tools requiring approval send requests to the client app (via WS relay through Shannon Cloud). General tools support two persisted tool-level scopes:
 
 - **Global** (`~/.shannon/config.yaml permissions.always_allow_tools`) — every agent, including default
 - **Per-agent** (`~/.shannon/agents/<name>/config.yaml permissions.always_allow_tools`) — single agent
 
-Clicking it writes the tool name to the appropriate scope (named agent → per-agent; default agent → global); future calls of that tool skip approval.
+For ordinary tools, clicking it writes the tool name to the appropriate scope (named agent → per-agent; default agent → global). `computer_use` is deliberately simpler: **Always Allow Computer Use is one global product permission**, regardless of which agent or app initiated the prompt. It applies to interactive and unattended tasks. Without that explicit grant, an attended user may Allow Once, while an unattended run fails closed.
 
 **Safety gates remain regardless of what either list contains** — checked by separate code paths, hand-edited config cannot bypass:
 
 - **High-risk bash commands** (`pip install`, `rm -rf`, `python -c`, `git push --force`, etc.) still prompt every call. Enforced by the runtime gate in `internal/agent/loop.go` against `permissions.alwaysAskPrefixes`.
-- **Attended vs unattended auto-approval** — two parallel deny-lists (`agent.DisallowsAutoApproval` / `agent.DisallowsUnattendedAutoApproval`) block persistence or unattended execution of specific tools. The attended list is empty as of 2026-05-18: `publish_to_web`, `generate_image`, and `edit_image` used to be on it; the product call moved them off — they are now ordinary approval-required tools (fresh prompt the first time, "always allow" persists for the rest). The unattended list contains `computer_use` (since 2026-07-22): schedules, heartbeat, watcher, MCP, synchronous HTTP, remote/SSE `auto_approve`, and IM/voice channels without an approval UI cannot run this tool at all — observation actions (including screenshots) are denied alongside mutations, and neither persisted "Always Allow" nor an in-memory broker allow changes that. Attended Desktop/interactive-IM/TUI approvals remain unchanged. For patch compatibility, legacy `accessibility`, `computer`, and `applescript` are not yet on the unattended list; existing schedules using them still work and retain the corresponding GUI-automation risk.
+- **Computer Use consent is explicit** — `computer_use` remains on the unattended auto-approval deny-list so blanket `daemon.auto_approve`, a missing approval UI, or a transient broker flag cannot silently grant desktop control. The agent loop overrides that default denial only for the persisted global `computer_use` grant. Legacy `computer`, `accessibility`, `applescript`, and `ghostty` wrappers cannot be persisted as Always Allow and remain denied for unattended execution. Built-in sensitive-app blocks, explicit Pause/Take Over/Stop, fresh re-observation after ambient physical interference, and separate point-of-risk confirmation remain authoritative even when the global grant is enabled.
 
 #### Approval-card descriptions
 
@@ -663,7 +655,11 @@ agent:
 
 Or toggle from Desktop: Settings → Suggestions → Enable next-prompt suggestion.
 
-**Cost** depends on `agent.thinking`. Without thinking, each suggestion is ~5–20% of one main-turn (input mostly cache_read, output capped ~30 tokens). With thinking, the fork inherits the same `thinking.budget_tokens` (cannot be trimmed without invalidating Anthropic's cache key), so cost rises to ~50–90% of one main-turn. Disabled by default. Skipped when the prompt cache is cold (`cache_cold_threshold_tokens`).
+**Cost** varies with the configured model, cache state, and
+`agent.thinking`. Each suggestion is a potentially billed helper call; exact
+product measurements and cost baselines are intentionally not published here.
+Disabled by default. Skipped when the prompt cache is cold
+(`cache_cold_threshold_tokens`).
 
 ## Memory (Kocoro Cloud feature)
 
@@ -859,7 +855,7 @@ Koe voice tests link cgo audio deps on macOS; install them with `brew install op
 
 ## Known Limitations
 
-- **Vision**: screenshots are captured, resized (1200px max), sent as base64 image content blocks. The `computer` tool uses Anthropic's native `computer_20251124` schema with coordinate scaling for retina displays. Vision models may blend what they see with training knowledge — verify critical details.
+- **Vision**: screenshots are captured, resized, and sent as base64 image content blocks. On daemon runs, the Sonnet parent delegates one complete desktop goal to `computer_use`; only that call lazily starts a private OpenAI Responses trajectory with native Computer Use. Provider coordinates stay bound to the exact screenshot bytes and map into AppKit logical points. Anthropic-native execution and generic model-visible GUI fallbacks are not admitted on this path. Vision models may blend what they see with training knowledge — verify critical details.
 - **Streaming**: one-shot mode does not stream; waits for the full LLM response before display.
 - **Windows/Linux**: local tools (clipboard, notifications, AppleScript, screenshot, computer) and scheduled tasks (launchd) are macOS-only.
 - **Account login**: email/password sign-in stores the api_key in a per-platform credential store — **macOS Keychain**, **Windows Credential Manager**, and on **Linux** a file store at `~/.shannon/credentials.json` (mode 0600). On Linux the sign-in key is moved out of `config.yaml` into that file; if you manage `config.yaml` with IaC (Ansible/Puppet) note the key now lives in `credentials.json`. On unsupported platforms, set `api_key` in `~/.shannon/config.yaml` instead.

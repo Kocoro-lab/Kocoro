@@ -13,13 +13,14 @@ Prompt:
 ## Key tools (in order)
 
 1. `tool_search` — load `browser_*` and `web_search` schemas (deferred-tool mode).
-2. `web_search` + `web_fetch` — 5 calls across Truth Social URLs, Reuters, CNBC. Picks up the exact post text, date, and surrounding context.
+2. `web_search` + `web_fetch` — several calls across the primary posts and independent news sources. Picks up the exact post text, date, and surrounding context.
 3. `browser_navigate` (Playwright MCP) → `https://note.com/notes/new`. The user's Chrome profile is already authenticated, so the editor opens directly.
 4. `browser_click` on title → `browser_type` with the Japanese headline.
 5. `browser_click` on body → `browser_type` with the full article body.
 6. `browser_click` on the "Proceed to publish" button, then the "Publish" button to ship the article.
 
-~36 LLM calls, ~12 minutes, ~$0.98. Published successfully.
+Synthetic illustration only: 30 model calls, 10 minutes, and 1 cost unit.
+These values are invented and are not a product baseline or QA result.
 
 ## Gotchas
 

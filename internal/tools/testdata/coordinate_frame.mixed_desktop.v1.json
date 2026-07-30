@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "frame_id": "frame_mixed_desktop_overview_001",
+  "topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+  "state_id": "s_desktop_001",
+  "scope": "desktop",
+  "actionable": false,
+  "display_id": null,
+  "target_pid": null,
+  "target_bundle_id": null,
+  "target_window_id": null,
+  "captured_quartz_rect": {"x": -1600, "y": 0, "width": 2880, "height": 1000},
+  "raw_image": {"width_px": 2880, "height_px": 1000},
+  "final_image": {
+    "media_type": "image/png",
+    "width_px": 1440,
+    "height_px": 500,
+    "byte_length": 98765,
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "provider_profile": {"id": "provider_balanced_png", "version": 1},
+  "pixel_origin": "top_left_pixel_centers",
+  "transform_regions": [
+    {
+      "display_id": 2,
+      "pixel_rect": {"x": 0, "y": 50, "width": 800, "height": 450},
+      "quartz_rect": {"x": -1600, "y": 100, "width": 1600, "height": 900},
+      "affine": {"a": 2, "b": 0, "c": 0, "d": 2, "tx": -1600, "ty": 0}
+    },
+    {
+      "display_id": 1,
+      "pixel_rect": {"x": 800, "y": 0, "width": 640, "height": 400},
+      "quartz_rect": {"x": 0, "y": 0, "width": 1280, "height": 800},
+      "affine": {"a": 2, "b": 0, "c": 0, "d": 2, "tx": -1600, "ty": 0}
+    }
+  ],
+  "created_at": "2026-07-22T12:03:00Z",
+  "expires_at": "2026-07-22T12:04:00Z"
+}

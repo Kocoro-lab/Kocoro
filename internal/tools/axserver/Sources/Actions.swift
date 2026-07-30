@@ -12,7 +12,9 @@ func performClick(pid: Int, path: String, expectedRole: String?) -> (ActionResul
     let ctx = currentContext(pid: pid)
     let err: AXError
     if let (cx, cy) = elementCenter(el) {
-        InputDriver.movePointer(to: CGPoint(x: cx, y: cy))
+        if let moveError = InputDriver.movePointer(to: CGPoint(x: cx, y: cy)) {
+            return (nil, moveError)
+        }
         err = AXUIElementPerformAction(el, "AXPress" as CFString)
     } else {
         err = AXUIElementPerformAction(el, "AXPress" as CFString)
@@ -44,7 +46,7 @@ func setValue(pid: Int, path: String, value: String, expectedRole: String?) -> (
     let err = AXUIElementSetAttributeValue(el, "AXValue" as CFString, value as CFTypeRef)
     if err == .success {
         let ctx = currentContext(pid: pid)
-        return (ActionResult(result: "set value on \(role) to '\(value)'", role: role, context: ctx), nil)
+        return (ActionResult(result: "set value on \(role)", role: role, context: ctx), nil)
     }
     return (nil, ErrorInfo(code: Int(err.rawValue), message: "set_value failed on \(role) (error \(err.rawValue)). Element may not be settable."))
 }
@@ -54,6 +56,9 @@ func getValue(pid: Int, path: String) -> (ActionResult?, ErrorInfo?) {
         return (nil, ErrorInfo(code: -1, message: "Element not found at path '\(path)'. UI may have changed — call read_tree to refresh."))
     }
     let role = axString(el, "AXRole") ?? "unknown"
+    if isSensitiveAXValue(axValueSensitivityMetadata(el, role: role)) {
+        return (nil, ErrorInfo(code: -1, message: "get_value is unavailable for sensitive accessibility fields"))
+    }
     let val = axValue(el, "AXValue")
     let valStr = val != nil ? "\(val!)" : ""
     return (ActionResult(result: valStr, role: role), nil)

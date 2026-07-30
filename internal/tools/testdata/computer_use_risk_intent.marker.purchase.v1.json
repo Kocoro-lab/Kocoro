@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "required": true,
+  "kind": "purchase",
+  "intent_id": "cri_ICEiIyQlJicoKSorLC0uLw",
+  "expires_at": "2026-07-23T00:02:00Z"
+}

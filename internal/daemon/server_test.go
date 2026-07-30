@@ -2222,9 +2222,9 @@ func TestServer_EditMessage_Validation(t *testing.T) {
 			wantErr:    "new_content or content is required",
 		},
 		{
-			name:       "empty new_content with content blocks passes validation",
-			sessionID:  "nonexistent",
-			body:       `{"message_index":0,"new_content":"","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}`,
+			name:      "empty new_content with content blocks passes validation",
+			sessionID: "nonexistent",
+			body:      `{"message_index":0,"new_content":"","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}`,
 			// Validation passes; the load then 404s because the session is
 			// missing (Store.Load now returns os.ErrNotExist unwrapped, so
 			// handleEditMessage maps it to 404 like the sibling handlers).
@@ -2932,6 +2932,7 @@ func TestServer_UploadSkill_Builtin(t *testing.T) {
 // future tool re-occupies the deny-list slot.
 func TestHandleAddGlobalAlwaysAllow(t *testing.T) {
 	shannonDir := t.TempDir()
+	t.Setenv(localPresenceEnv, "global-permission-presence")
 	srv := NewServer(0, nil, &ServerDeps{
 		ShannonDir: shannonDir,
 		Config:     &config.Config{},
@@ -2961,6 +2962,26 @@ func TestHandleAddGlobalAlwaysAllow(t *testing.T) {
 		t.Errorf("disk config should contain 'bash', got: %s", cfgData)
 	}
 
+	// Computer Use is the product-level global grant: it applies across apps
+	// and may be inherited by unattended runs through the agent-loop gate. It
+	// additionally requires proof that the caller is the local Desktop app.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/permissions/always-allow",
+		strings.NewReader(`{"tool":"computer_use"}`))
+	srv.handleAddGlobalAlwaysAllow(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("computer_use grant without local presence status = %d, want 403; body=%s",
+			rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/permissions/always-allow",
+		strings.NewReader(`{"tool":"computer_use"}`))
+	req.Header.Set(localPresenceHeader, "global-permission-presence")
+	srv.handleAddGlobalAlwaysAllow(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("computer_use global grant status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
 	// (b) publish_to_web is no longer non-persistable — should accept 200.
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/permissions/always-allow",
@@ -2984,11 +3005,12 @@ func TestHandleAddGlobalAlwaysAllow(t *testing.T) {
 // TestHandleRemoveGlobalAlwaysAllow covers the symmetric remove endpoint.
 func TestHandleRemoveGlobalAlwaysAllow(t *testing.T) {
 	shannonDir := t.TempDir()
+	t.Setenv(localPresenceEnv, "global-permission-presence")
 	srv := NewServer(0, nil, &ServerDeps{
 		ShannonDir: shannonDir,
 		Config: &config.Config{
 			Permissions: permissions.PermissionsConfig{
-				AlwaysAllowTools: []string{"bash", "file_write"},
+				AlwaysAllowTools: []string{"bash", "file_write", "computer_use"},
 			},
 		},
 	}, "test")
@@ -2998,6 +3020,35 @@ func TestHandleRemoveGlobalAlwaysAllow(t *testing.T) {
 	}
 	if err := config.AppendGlobalAlwaysAllowTool(shannonDir, "file_write"); err != nil {
 		t.Fatal(err)
+	}
+	if err := config.AppendGlobalAlwaysAllowTool(shannonDir, "computer_use"); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := httptest.NewRecorder()
+	blockedReq := httptest.NewRequest(http.MethodDelete, "/permissions/always-allow",
+		strings.NewReader(`{"tool":"computer_use"}`))
+	srv.handleRemoveGlobalAlwaysAllow(blocked, blockedReq)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("computer_use removal without local presence status=%d, want 403",
+			blocked.Code)
+	}
+	foundComputerUse := false
+	for _, tool := range srv.deps.Config.Permissions.AlwaysAllowTools {
+		foundComputerUse = foundComputerUse || tool == "computer_use"
+	}
+	if !foundComputerUse {
+		t.Fatal("forbidden removal changed in-memory computer_use grant")
+	}
+
+	allowed := httptest.NewRecorder()
+	allowedReq := httptest.NewRequest(http.MethodDelete, "/permissions/always-allow",
+		strings.NewReader(`{"tool":"computer_use"}`))
+	allowedReq.Header.Set(localPresenceHeader, "global-permission-presence")
+	srv.handleRemoveGlobalAlwaysAllow(allowed, allowedReq)
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("computer_use removal with local presence status=%d body=%s",
+			allowed.Code, allowed.Body.String())
 	}
 
 	rec := httptest.NewRecorder()

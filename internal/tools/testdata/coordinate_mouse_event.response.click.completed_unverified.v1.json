@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "completed_unverified",
+  "action": "click",
+  "primary_action_committed": true,
+  "pointer_motion_committed": true,
+  "phase": "post_verification",
+  "failure_code": "click_postcondition_not_declared",
+  "retry_safe": false,
+  "pointer_endpoint": {
+    "requested": {"x": 200.5, "y": 300.5},
+    "observed": {"x": 200.5, "y": 300.5},
+    "tolerance": 2,
+    "verified": true
+  }
+}

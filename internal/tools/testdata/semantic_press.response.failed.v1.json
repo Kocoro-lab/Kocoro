@@ -1,0 +1,8 @@
+{
+  "failure_code": "fingerprint_ambiguous",
+  "phase": "preflight",
+  "postcondition": null,
+  "press_committed": false,
+  "retry_safe": false,
+  "status": "failed"
+}

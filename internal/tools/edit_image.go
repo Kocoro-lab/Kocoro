@@ -69,14 +69,9 @@ func (t *EditImageTool) Info() agent.ToolInfo {
 			"NO MASK is supported — describe the region in natural language " +
 			"(\"change the cat's color to orange\", \"add a moon in the upper-left\", " +
 			"\"remove the text in the bottom-right corner\").\n\n" +
-			"Latency vs. quality (single source, 1024×1024):\n" +
-			"  - quality=low      ~40–70s\n" +
-			"  - quality=auto     ~100–180s (default)\n" +
-			"  - quality=high     ~150–250s\n" +
-			"4-image edits add 50–100% to those numbers; quality=high with 4 sources " +
-			"can take 200–350s. Pick the lowest quality that satisfies the request.\n\n" +
-			"Cost: each call consumes Shannon Cloud image-generation credits, and " +
-			"each source image charges ~85 image-tokens on top of the prompt. Use " +
+			"Higher quality and more source images generally take longer. Pick the " +
+			"lowest quality that satisfies the request; exact latency varies by workload.\n\n" +
+			"Cost: each call consumes Shannon Cloud image-generation credits. Use " +
 			"n=1 unless the user explicitly asks for multiple variants." +
 			agent.DescriptionGuidance,
 		Parameters: map[string]any{

@@ -38,8 +38,6 @@ func TestApprovalToolsRequireDescription(t *testing.T) {
 	// when args.description is absent.
 	exemptions := map[string]string{
 		"bash": "PR 4 wrote a bespoke schema before the helper existed; changing it would invalidate prompt cache.",
-		"computer": "Registered as an Anthropic native tool (NativeToolDef); agent.buildToolSchema drops Parameters/Description from the wire. " +
-			"A `description` field in Info().Parameters would never reach the model. UI clients must synthesize a label from action/x/y.",
 	}
 
 	reg, _, cleanup := RegisterLocalTools(&config.Config{}, nil)

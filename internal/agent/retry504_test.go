@@ -6,8 +6,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
-// nginx504Body is the verbatim edge-nginx 504 page seen in production
-// (surfaced in the daemon as "API returned 504: <html>...").
+// nginx504Body is a synthetic edge-nginx 504 fixture.
 const nginx504Body = `<html>
 <head><title>504 Gateway Time-out</title></head>
 <body>
@@ -17,8 +16,7 @@ const nginx504Body = `<html>
 
 // TestIsRetryableLLMError_GatewayClass guards that a 504 from the Cloud edge is
 // treated as a transient gateway-class error (sibling of 502/503) and retried,
-// rather than killing the agent loop on the first attempt. Regression for the
-// production incident where a single edge 504 ended a run with zero retries.
+// rather than killing the agent loop on the first attempt.
 func TestIsRetryableLLMError_GatewayClass(t *testing.T) {
 	cases := []struct {
 		status        int

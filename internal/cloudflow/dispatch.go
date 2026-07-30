@@ -29,10 +29,10 @@ type Request struct {
 	Gateway      *client.GatewayClient
 	APIKey       string
 	Query        string
-	WorkflowType string         // "research", "swarm", "auto", or ""
-	Strategy     string         // "quick" | "standard" | "deep" | "academic" — research only
-	SessionID    string         // optional; passed to Gateway for correlation
-	UserContext  string         // optional free-text context appended to the request
+	WorkflowType string // "research", "swarm", "auto", or ""
+	Strategy     string // "quick" | "standard" | "deep" | "academic" — research only
+	SessionID    string // optional; passed to Gateway for correlation
+	UserContext  string // optional free-text context appended to the request
 
 	// Timeout is the workflow deadline. Zero falls back to the package default (30 minutes).
 	Timeout time.Duration
@@ -279,7 +279,7 @@ func Run(ctx context.Context, req Request, handler agent.EventHandler) (Result, 
 		case "DATA_PROCESSING":
 			// Use a semantic label for pre-planning / data prep. Was "synthesis",
 			// which confusingly implies the final summarization step and also
-			// collides with Shannon Cloud's real `synthesis` agent ID (filter above).
+			// collides with a reserved Cloud agent ID (filter above).
 			// `preparing` reflects what DATA_PROCESSING actually is.
 			if msg := event.Message; msg != "" && len(msg) <= 150 && handler != nil {
 				handler.OnCloudAgent("preparing", "processing", msg)

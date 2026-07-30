@@ -20,7 +20,7 @@ func buildHappyPlan(t *testing.T) (*Plan, string) {
 	}
 	scan, _ := Scan(src)
 	target := t.TempDir()
-	p, err := BuildPlan(scan, src, target, "/Users/wayland", time.Now())
+	p, err := BuildPlan(scan, src, target, "/Users/alice", time.Now())
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestApply_RejectsStaleSource(t *testing.T) {
 	srcPaths := SourcePaths{ClaudeHome: home, ClaudeUserConfig: filepath.Join(t.TempDir(), "none.json")}
 	scan, _ := Scan(srcPaths)
 	target := t.TempDir()
-	p, _ := BuildPlan(scan, srcPaths, target, "/Users/wayland", time.Now())
+	p, _ := BuildPlan(scan, srcPaths, target, "/Users/alice", time.Now())
 
 	// Mutate the source file after plan, before apply.
 	if err := os.WriteFile(src, []byte("MUTATED CONTENT\n"), 0o644); err != nil {
