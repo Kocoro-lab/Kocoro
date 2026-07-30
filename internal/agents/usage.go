@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
 // AgentsAttachingSkill returns the names of agents whose _attached.yaml
@@ -64,6 +66,28 @@ type attachedSkillsChange struct {
 type SkillAttachmentCleanup struct {
 	Agent  string
 	Skills []string
+}
+
+// DetachSkillAliases removes every matching slug or legacy display name from a
+// single agent manifest.
+func DetachSkillAliases(agentsDir, agentName string, identifiers ...string) error {
+	targets := make(map[string]struct{}, len(identifiers))
+	for _, identifier := range identifiers {
+		if identifier != "" {
+			targets[identifier] = struct{}{}
+		}
+	}
+	names, err := ReadAttachedSkills(agentsDir, agentName)
+	if err != nil {
+		return err
+	}
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, remove := targets[name]; !remove {
+			filtered = append(filtered, name)
+		}
+	}
+	return SetAttachedSkills(agentsDir, agentName, filtered)
 }
 
 // DetachSkillAliasesFromAllAgents removes every matching slug or legacy display
@@ -178,22 +202,16 @@ func installedSkillIdentifiers(shannonDir string) (map[string]struct{}, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(skillsDir, entry.Name(), "SKILL.md")); err == nil {
-			present[entry.Name()] = struct{}{}
+		skillFile := filepath.Join(skillsDir, entry.Name(), "SKILL.md")
+		if _, err := os.Stat(skillFile); err != nil {
+			continue
 		}
-	}
-
-	loaded, err := LoadGlobalSkills(shannonDir)
-	if err != nil {
-		return nil, fmt.Errorf("load global skills: %w", err)
-	}
-	for _, skill := range loaded {
-		if skill.Slug != "" {
-			present[skill.Slug] = struct{}{}
+		present[entry.Name()] = struct{}{}
+		displayName, err := skills.LoadSkillIdentity(skillFile, entry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("cannot safely resolve aliases for installed skill %q: %w", entry.Name(), err)
 		}
-		if skill.Name != "" {
-			present[skill.Name] = struct{}{}
-		}
+		present[displayName] = struct{}{}
 	}
 	return present, nil
 }

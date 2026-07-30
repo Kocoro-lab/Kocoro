@@ -426,31 +426,48 @@ func PeekYAMLAPIKey(shannonDir string) string {
 // confirmed written to the Keychain, so the stripped value is never the last
 // copy of anything recoverable.
 func StripYAMLAPIKey(shannonDir string) error {
+	_, err := StripYAMLAPIKeyWithRevision(shannonDir)
+	return err
+}
+
+// StripYAMLAPIKeyWithRevision is StripYAMLAPIKey plus the exact revision
+// written. An empty revision means the file was not changed.
+func StripYAMLAPIKeyWithRevision(shannonDir string) (string, error) {
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
+	lockFile, err := os.OpenFile(cfgPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer lockFile.Close()
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return "", err
+	}
+	defer fslock.Unlock(lockFile.Fd())
+
 	raw, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
 	newRaw, removed := removeTopLevelLine(raw, "api_key")
 	if !removed {
-		return nil
+		return "", nil
 	}
 	info, err := os.Stat(cfgPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	tmpPath := cfgPath + ".selfheal.tmp"
 	if err := os.WriteFile(tmpPath, newRaw, info.Mode().Perm()); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return "", err
 	}
-	return nil
+	return BytesRevision(newRaw), nil
 }
 
 // removeTopLevelLine deletes the first occurrence of a top-level

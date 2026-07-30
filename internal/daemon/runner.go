@@ -1670,8 +1670,15 @@ func computeReportedUsage(usage *agent.TurnUsage, handler agent.EventHandler) Ru
 // ServerDeps holds shared dependencies required by both the WS callback
 // and the HTTP server for running agent loops.
 type ServerDeps struct {
-	mu                   sync.RWMutex // guards Config, Registry, Cleanup during reload
-	Config               *config.Config
+	mu     sync.RWMutex // guards Config, Registry, Cleanup during reload
+	Config *config.Config
+	// ConfigRevision is the exact config.yaml content identity returned with
+	// Config at startup. The callbacks are installed by NewServer so non-HTTP
+	// mutation paths (for example approval persistence) participate in the same
+	// external-edit observability contract.
+	ConfigRevision       string
+	ConfigReloadRequired func() bool
+	RecordConfigRevision func(string)
 	GW                   *client.GatewayClient
 	Registry             *agent.ToolRegistry
 	MCPManager           *mcp.ClientManager  // live MCP connections; swapped on reload

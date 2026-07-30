@@ -114,7 +114,7 @@ func TestAppendDynamicUserBlocks_SkillScopeStaysOutsideCachedPrefix(t *testing.T
 	result := appendDynamicUserBlocks(scaffolded, "", listing, "")
 
 	cacheBreak := strings.Index(result, "<!-- cache_break -->")
-	scopeNotice := strings.Index(result, "current agent's enabled skill set")
+	scopeNotice := strings.Index(result, "enabled for the current agent")
 	if cacheBreak < 0 || scopeNotice < 0 {
 		t.Fatalf("expected cache marker and skill scope notice:\n%s", result)
 	}
@@ -202,8 +202,9 @@ func TestBuildSkillListing_FlagsMultilingualTriggersAsNonLanguageSignal(t *testi
 	required := []string{
 		"<system-reminder>",
 		"## Available Skills",
-		"current agent's enabled skill set",
-		"not the complete inventory",
+		"enabled for the current agent",
+		"not the agent's exhaustive set",
+		"never the complete inventory",
 		"GET /skills",
 		"multilingual trigger keywords",
 		"NOT a signal",

@@ -532,6 +532,41 @@ func TestHandleDeleteGlobalSkillPreservesSkillWhenAgentManifestIsCorrupt(t *test
 	}
 }
 
+func TestHandleDeleteGlobalSkillUsesIdentityFromIncompleteMetadata(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	skillFile := filepath.Join(s.deps.ShannonDir, "skills", "docker", "SKILL.md")
+	daemonTestWriteFile(t, skillFile, "---\nname: Docker\n---\nbody\n")
+	if err := agents.SetAttachedSkills(s.deps.AgentsDir, "analyst", []string{"Docker"}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("DELETE", "/skills/docker?confirm=true", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(s.deps.AgentsDir, "analyst", "_attached.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("legacy display-name attachment remains: %v", err)
+	}
+}
+
+func TestHandleDeleteGlobalSkillRefusesUnparseableIdentity(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	skillFile := filepath.Join(s.deps.ShannonDir, "skills", "broken", "SKILL.md")
+	daemonTestWriteFile(t, skillFile, "no frontmatter")
+
+	req := httptest.NewRequest("DELETE", "/skills/broken?confirm=true", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(skillFile); err != nil {
+		t.Fatalf("unparseable skill was removed: %v", err)
+	}
+}
+
 func TestHandleDeleteGlobalSkillDoesNotLockUnrelatedAgentRoutes(t *testing.T) {
 	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
 	s.deps.SessionCache = NewSessionCache(t.TempDir())

@@ -311,19 +311,26 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 			continue
 		}
 
+		syncSkillNames, writeSyncedSkills := decodeSyncedSkillNames(it.AgentKey, it.Skills)
+		unlockSkills := s.lockSkillIdentifiers(syncSkillNames)
+
 		// Materialize/overwrite under the same per-route lock the create/update
-		// handlers take. Lock per-item (not the whole loop) to keep critical
-		// sections short.
+		// handlers take. Skill locks are acquired first, matching the global
+		// delete path's slug -> route order, so a pull cannot reattach a skill
+		// after its directory was removed.
 		s.deps.SessionCache.LockRoute(routeKey)
 		if _, statErr := os.Stat(dir); statErr == nil {
 			// LWW: only overwrite when cloud is strictly newer than local.
 			if !it.UpdatedAt.After(agentLastModified(dir)) {
 				s.deps.SessionCache.UnlockRoute(routeKey)
+				unlockSkills()
 				continue // local newer or equal — keep local edits.
 			}
 		}
-		materializeAgentFromItem(agentsDir, it)
+		syncSkillNames = filterInstalledSyncedSkills(filepath.Dir(agentsDir), syncSkillNames)
+		materializeAgentFromItem(agentsDir, it, syncSkillNames, writeSyncedSkills)
 		s.deps.SessionCache.UnlockRoute(routeKey)
+		unlockSkills()
 	}
 	return nil
 }
@@ -341,7 +348,7 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 // Note: SyncAgentItem.DisplayName is intentionally NOT applied here — the
 // display name is sourced from the config blob (AgentConfigAPI.DisplayName), so
 // the top-level field would be redundant/conflicting.
-func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
+func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNames []string, writeSyncedSkills bool) {
 	writeFailed := false
 
 	// Capture the local cwd before any writes. It is device-local state: remote
@@ -436,32 +443,10 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 		writeFailed = true
 	}
 
-	// skills — attached-skills manifest. The blob mirrors api.Skills
-	// ([]skills.SkillMeta); SetAttachedSkills wants the slug (fallback name).
-	// An empty / JSON null / empty-array skills field means skills were cleared
-	// → SetAttachedSkills([]) removes _attached.yaml (DeleteAttachedSkills).
-	var skillNames []string
-	skillsClear := true
-	if len(it.Skills) > 0 && !isJSONNull(it.Skills) {
-		var metas []skills.SkillMeta
-		if err := json.Unmarshal(it.Skills, &metas); err != nil {
-			// Malformed-but-present skills is NOT a clear signal — leave the
-			// existing manifest untouched rather than wiping attached skills.
-			log.Printf("agentsync: pull of %q: skills decode (skipped): %v", it.AgentKey, err)
-			skillsClear = false
-		} else {
-			for _, m := range metas {
-				ident := m.Slug
-				if ident == "" {
-					ident = m.Name
-				}
-				if ident != "" {
-					skillNames = append(skillNames, ident)
-				}
-			}
-		}
-	}
-	if skillsClear || len(skillNames) > 0 {
+	// skills — decoded before locking, then installation-filtered while the
+	// matching slug and route locks are held. A malformed-but-present blob
+	// leaves the existing manifest untouched.
+	if writeSyncedSkills {
 		if err := agents.SetAttachedSkills(agentsDir, it.AgentKey, skillNames); err != nil {
 			log.Printf("agentsync: write skills for %q failed: %v", it.AgentKey, err)
 			writeFailed = true
@@ -551,4 +536,62 @@ func deleteAgentDefinitionFiles(dir string) {
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
 		_ = os.Remove(dir)
 	}
+}
+
+func decodeSyncedSkillNames(agentKey string, raw json.RawMessage) ([]string, bool) {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return nil, true
+	}
+	var metas []skills.SkillMeta
+	if err := json.Unmarshal(raw, &metas); err != nil {
+		log.Printf("agentsync: pull of %q: skills decode (skipped): %v", agentKey, err)
+		return nil, false
+	}
+	names := make([]string, 0, len(metas))
+	for _, meta := range metas {
+		ident := meta.Slug
+		if ident == "" {
+			ident = meta.Name
+		}
+		if ident != "" {
+			names = append(names, ident)
+		}
+	}
+	return names, true
+}
+
+func filterInstalledSyncedSkills(shannonDir string, names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	globalDir := filepath.Join(shannonDir, "skills")
+	loaded, _ := skills.LoadSkills(skills.SkillSource{Dir: globalDir, Source: skills.SourceGlobal})
+	aliases := make(map[string]string, len(loaded)*2)
+	for _, skill := range loaded {
+		aliases[skill.Slug] = skill.Slug
+		aliases[skill.Name] = skill.Slug
+	}
+	filtered := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		canonical := ""
+		if err := skills.ValidateSkillName(name); err == nil {
+			if _, err := os.Stat(filepath.Join(globalDir, name, "SKILL.md")); err == nil {
+				canonical = name
+			}
+		}
+		if canonical == "" {
+			canonical = aliases[name]
+		}
+		if canonical == "" {
+			log.Printf("agentsync: dropping attachment to uninstalled skill %q", name)
+			continue
+		}
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		filtered = append(filtered, canonical)
+	}
+	return filtered
 }

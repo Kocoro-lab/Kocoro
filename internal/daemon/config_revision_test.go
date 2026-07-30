@@ -192,10 +192,56 @@ func TestPatchConfigMakesPendingReloadObservable(t *testing.T) {
 		t.Fatal("PATCH /config should remain pending until POST /config/reload")
 	}
 
-	srv.recordConfigFileApplied()
+	revision, err := config.FileRevision(shannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.recordConfigRevisionApplied(revision)
 	required, _, _ = srv.configReloadState()
 	if required {
 		t.Fatal("recording a successful reload should clear reload_required")
+	}
+}
+
+func TestAppliedRevisionDoesNotBlessLaterExternalEdit(t *testing.T) {
+	shannonDir := t.TempDir()
+	configPath := filepath.Join(shannonDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("agent:\n  temperature: 0.2\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(0, nil, &ServerDeps{
+		ShannonDir: shannonDir,
+		Config:     &config.Config{Agent: config.AgentConfig{Temperature: 0.2}},
+	}, "test")
+	loadedRevision, err := config.FileRevision(shannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(configPath, []byte("agent:\n  temperature: 0.9\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	srv.recordConfigRevisionApplied(loadedRevision)
+	if required, _, _ := srv.configReloadState(); !required {
+		t.Fatal("a later external edit was incorrectly marked as applied")
+	}
+}
+
+func TestAlwaysAllowInternalWriteAdvancesAppliedRevision(t *testing.T) {
+	shannonDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	deps := &ServerDeps{ShannonDir: shannonDir, Config: &config.Config{}}
+	srv := NewServer(0, nil, deps, "test")
+	broker := NewApprovalBroker(func(ApprovalRequest) error { return nil })
+
+	persistGlobalToolAlwaysAllow(deps, broker, "bash")
+	if required, _, _ := srv.configReloadState(); required {
+		t.Fatal("daemon-owned always-allow write was misclassified as an external edit")
+	}
+	if got := deps.Config.Permissions.AlwaysAllowTools; len(got) != 1 || got[0] != "bash" {
+		t.Fatalf("live always-allow state = %v, want [bash]", got)
 	}
 }
 

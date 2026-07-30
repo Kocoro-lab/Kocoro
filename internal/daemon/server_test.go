@@ -1661,6 +1661,46 @@ func TestServer_DeleteSkill_DetachesManifestAndCleansLegacySkillDir(t *testing.T
 	}
 }
 
+func TestServer_DeleteSkill_DetachesLegacyDisplayName(t *testing.T) {
+	shannonDir := t.TempDir()
+	agentsDir := filepath.Join(shannonDir, "agents")
+	if err := os.MkdirAll(filepath.Join(agentsDir, "analyst"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "analyst", "AGENT.md"), []byte("analyst"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(shannonDir, "skills", "docker")
+	if err := os.MkdirAll(skillDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: Docker\ndescription: containers\n---\nbody\n"),
+		0600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := agents.SetAttachedSkills(agentsDir, "analyst", []string{"Docker"}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := NewServer(0, nil, &ServerDeps{
+		ShannonDir:   shannonDir,
+		AgentsDir:    agentsDir,
+		SessionCache: NewSessionCache(t.TempDir()),
+	}, "test")
+	req := httptest.NewRequest(http.MethodDelete, "/agents/analyst/skills/docker", nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("DELETE alias attachment = %d, body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(agentsDir, "analyst", "_attached.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("legacy display-name attachment remains: %v", err)
+	}
+}
+
 // --- deepMerge unit tests ---
 
 func TestDeepMerge(t *testing.T) {
@@ -2822,6 +2862,33 @@ func TestServer_PutGlobalSkill_Builtin(t *testing.T) {
 			if !strings.Contains(string(b), "skill_is_builtin") {
 				t.Errorf("PUT %s%s: body = %s, want skill_is_builtin", slug, qs, b)
 			}
+		}
+	}
+}
+
+func TestServer_DeleteGlobalSkill_Builtin(t *testing.T) {
+	shannonDir := t.TempDir()
+	if err := skills.EnsureBuiltinSkills(shannonDir); err != nil {
+		t.Fatal(err)
+	}
+	deps := &ServerDeps{
+		ShannonDir: shannonDir,
+		AgentsDir:  filepath.Join(shannonDir, "agents"),
+	}
+	srv := NewServer(0, nil, deps, "test")
+
+	for _, slug := range []string{"kocoro", "kocoro-generative-ui"} {
+		req := httptest.NewRequest(http.MethodDelete, "/skills/"+slug+"?confirm=true", nil)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("DELETE %s = %d, body=%s", slug, rr.Code, rr.Body.String())
+		}
+		if !strings.Contains(rr.Body.String(), "skill_is_builtin") {
+			t.Fatalf("DELETE %s body = %s, want skill_is_builtin", slug, rr.Body.String())
+		}
+		if _, err := os.Stat(filepath.Join(shannonDir, "skills", slug, "SKILL.md")); err != nil {
+			t.Fatalf("builtin %s was removed: %v", slug, err)
 		}
 	}
 }

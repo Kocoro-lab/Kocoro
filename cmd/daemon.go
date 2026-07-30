@@ -52,7 +52,31 @@ var daemonStartCmd = &cobra.Command{
 			return daemonStartDetached()
 		}
 
-		cfg, err := config.Load()
+		shanDir := config.ShannonDir()
+		agentsDir := filepath.Join(shanDir, "agents")
+		projectsDir := filepath.Join(shanDir, "projects")
+		pidPath := filepath.Join(shanDir, "daemon.pid")
+
+		force, _ := cmd.Flags().GetBool("force")
+		if force {
+			stopExistingDaemon(pidPath)
+		}
+
+		if daemon.IsDaemonServiceLoaded() {
+			log.Println("Warning: daemon is managed by launchd. Use 'shan daemon stop' to remove launchd management.")
+		}
+
+		pidFile, err := daemon.AcquirePIDFile(pidPath)
+		if err != nil {
+			return err
+		}
+		defer pidFile.Close()
+
+		// Every startup mutation, including config migrations and dangling-skill
+		// cleanup, must happen only after this process owns the daemon singleton.
+		// A second start attempt that later fails the PID lock must never rewrite
+		// files used by the live daemon.
+		cfg, configRevision, err := config.LoadWithRevision()
 		if err != nil {
 			return fmt.Errorf("config: %w", err)
 		}
@@ -69,11 +93,6 @@ var daemonStartCmd = &cobra.Command{
 				"(recommended: 540) to enable watchdog cancellation.",
 				cfg.Agent.IdleHardTimeoutSecs)
 		}
-
-		shanDir := config.ShannonDir()
-		agentsDir := filepath.Join(shanDir, "agents")
-		projectsDir := filepath.Join(shanDir, "projects")
-		pidPath := filepath.Join(shanDir, "daemon.pid")
 
 		if err := agents.EnsureBuiltins(agentsDir, Version); err != nil {
 			log.Printf("WARNING: failed to sync builtin agents: %v", err)
@@ -93,21 +112,6 @@ var daemonStartCmd = &cobra.Command{
 			log.Printf("daemon: pruned %d dangling skill reference(s) from agents: %s",
 				removed, strings.Join(agentNames, ", "))
 		}
-
-		force, _ := cmd.Flags().GetBool("force")
-		if force {
-			stopExistingDaemon(pidPath)
-		}
-
-		if daemon.IsDaemonServiceLoaded() {
-			log.Println("Warning: daemon is managed by launchd. Use 'shan daemon stop' to remove launchd management.")
-		}
-
-		pidFile, err := daemon.AcquirePIDFile(pidPath)
-		if err != nil {
-			return err
-		}
-		defer pidFile.Close()
 
 		// Clean up orphaned Chrome CDP from a previous hard kill. Must run AFTER
 		// AcquirePIDFile — holding the lock guarantees no other daemon is alive,
@@ -298,6 +302,7 @@ var daemonStartCmd = &cobra.Command{
 
 		deps := &daemon.ServerDeps{
 			Config:           cfg,
+			ConfigRevision:   configRevision,
 			GW:               gw,
 			Registry:         reg,
 			MCPManager:       mcpMgr,
@@ -644,7 +649,9 @@ var daemonStartCmd = &cobra.Command{
 				OnAPIKeyChanged: func(ctx context.Context) {
 					localServer.RebuildAuthSensitiveTools(ctx)
 				},
-				Logger: log.Default(),
+				ConfigReloadRequired: deps.ConfigReloadRequired,
+				RecordConfigRevision: deps.RecordConfigRevision,
+				Logger:               log.Default(),
 			})
 			authMgr.SetEventBus(localServer.EventBus())
 			wsCtl = daemon.NewWSController(ctx, wsClient)

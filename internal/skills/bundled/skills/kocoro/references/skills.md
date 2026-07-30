@@ -133,7 +133,9 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Method: DELETE
 - Path: /skills/{slug}?confirm=true
 - Response: `{"status": "deleted"}`
-- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Before removing the global files, the daemon removes both slug and legacy display-name references from every readable agent manifest. If any manifest is corrupt or unreadable, deletion fails and the global skill remains installed rather than reporting success with dangling references. Stored API keys are cleared from the OS keychain after deletion.
+- Response 403: `{"error": "skill_is_builtin"}` — auto-installed builtin skills cannot be deleted.
+- Response 422: the installed SKILL.md identity is malformed, so the daemon cannot safely identify and remove legacy display-name references.
+- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Before removing the global files, the daemon removes both slug and legacy display-name references from every readable agent manifest. If the skill identity or any manifest is corrupt or unreadable, deletion fails and the global skill remains installed rather than reporting success with dangling references. Stored API keys are cleared from the OS keychain after deletion.
 
 ### Set skill secrets (API keys / env vars)
 - Method: PUT

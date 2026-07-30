@@ -14,6 +14,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
 // newPullServer builds a minimal *Server with an initialized SessionCache and
@@ -22,7 +23,10 @@ func newPullServer(t *testing.T, agentsDir string) *Server {
 	t.Helper()
 	sc := NewSessionCache(filepath.Join(agentsDir, "_sessions"))
 	t.Cleanup(func() { sc.CloseAll() })
-	return &Server{deps: &ServerDeps{AgentsDir: agentsDir, ShannonDir: agentsDir, SessionCache: sc}}
+	return &Server{
+		deps:      &ServerDeps{AgentsDir: agentsDir, ShannonDir: filepath.Dir(agentsDir), SessionCache: sc},
+		slugLocks: skills.NewSlugLocks(),
+	}
 }
 
 func TestBuildSyncItems_IncludesAvatarInProfile(t *testing.T) {
@@ -192,6 +196,87 @@ func TestPullAndApply_FullyMaterializesMissingAgent(t *testing.T) {
 	// gone: soft-deleted -> not materialized
 	if _, err := os.Stat(filepath.Join(root, "gone")); !os.IsNotExist(err) {
 		t.Errorf("soft-deleted agent should not be materialized")
+	}
+}
+
+func TestPullAndApply_KeepsInstalledSyncedSkill(t *testing.T) {
+	shannonDir := t.TempDir()
+	agentsDir := filepath.Join(shannonDir, "agents")
+	skillDir := filepath.Join(shannonDir, "skills", "docker")
+	if err := os.MkdirAll(skillDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: Docker\ndescription: containers\n---\nbody\n"),
+		0600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	s := newPullServer(t, agentsDir)
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{{
+			AgentKey: "analyst",
+			Prompt:   "prompt",
+			Skills:   json.RawMessage(`[{"slug":"docker","name":"Docker"}]`),
+		}}, nil
+	}
+	if err := s.pullAndApplyAgents(pull); err != nil {
+		t.Fatal(err)
+	}
+	got, err := agents.ReadAttachedSkills(agentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "docker" {
+		t.Fatalf("synced skills = %v, want [docker]", got)
+	}
+}
+
+func TestPullAndApply_CannotReattachSkillAfterGlobalDelete(t *testing.T) {
+	shannonDir := t.TempDir()
+	agentsDir := filepath.Join(shannonDir, "agents")
+	skillDir := filepath.Join(shannonDir, "skills", "docker")
+	if err := os.MkdirAll(skillDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\nname: Docker\ndescription: containers\n---\nbody\n"),
+		0600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	s := newPullServer(t, agentsDir)
+	unlockDelete := s.slugLocks.Lock("docker")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.pullAndApplyAgents(func() ([]client.SyncAgentItem, error) {
+			return []client.SyncAgentItem{{
+				AgentKey: "analyst",
+				Prompt:   "prompt",
+				Skills:   json.RawMessage(`[{"slug":"docker","name":"Docker"}]`),
+			}}, nil
+		})
+	}()
+
+	select {
+	case err := <-done:
+		unlockDelete()
+		t.Fatalf("cloud pull bypassed the skill delete lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := os.RemoveAll(skillDir); err != nil {
+		unlockDelete()
+		t.Fatal(err)
+	}
+	unlockDelete()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(agentsDir, "analyst", "_attached.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("cloud pull reattached deleted skill: %v", err)
 	}
 }
 

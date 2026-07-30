@@ -112,12 +112,12 @@ func TestPruneDanglingSkillAttachments(t *testing.T) {
 	shannonDir := t.TempDir()
 	agentsDir := filepath.Join(shannonDir, "agents")
 	writeUsageTestSkill(t, shannonDir, "docker", "Docker", true)
-	writeUsageTestSkill(t, shannonDir, "temporarily-broken", "", false)
+	writeUsageTestSkill(t, shannonDir, "temporarily-broken", "Temporary Broken", false)
 
 	if err := SetAttachedSkills(agentsDir, "analyst", []string{
 		"Docker",
 		"missing-one",
-		"temporarily-broken",
+		"Temporary Broken",
 	}); err != nil {
 		t.Fatalf("SetAttachedSkills analyst: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestPruneDanglingSkillAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(analyst, []string{"Docker", "temporarily-broken"}) {
+	if !reflect.DeepEqual(analyst, []string{"Docker", "Temporary Broken"}) {
 		t.Errorf("analyst skills = %v", analyst)
 	}
 	operator, err := ReadAttachedSkills(agentsDir, "operator")
@@ -150,6 +150,26 @@ func TestPruneDanglingSkillAttachments(t *testing.T) {
 	}
 	if !reflect.DeepEqual(operator, []string{"docker"}) {
 		t.Errorf("operator skills = %v", operator)
+	}
+}
+
+func TestPruneDanglingSkillAttachmentsRefusesUnparseableIdentity(t *testing.T) {
+	shannonDir := t.TempDir()
+	agentsDir := filepath.Join(shannonDir, "agents")
+	writeUsageTestSkill(t, shannonDir, "broken", "", false)
+	if err := SetAttachedSkills(agentsDir, "analyst", []string{"Legacy Broken", "missing"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := PruneDanglingSkillAttachments(agentsDir, shannonDir); err == nil {
+		t.Fatal("expected unsafe alias resolution to stop pruning")
+	}
+	got, err := ReadAttachedSkills(agentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"Legacy Broken", "missing"}) {
+		t.Fatalf("manifest changed after conservative prune failure: %v", got)
 	}
 }
 
@@ -162,6 +182,8 @@ func writeUsageTestSkill(t *testing.T, shannonDir, slug, name string, valid bool
 	content := "not valid skill frontmatter\n"
 	if valid {
 		content = "---\nname: " + name + "\ndescription: test\n---\nbody\n"
+	} else if name != "" {
+		content = "---\nname: " + name + "\n---\nbody\n"
 	}
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0600); err != nil {
 		t.Fatal(err)

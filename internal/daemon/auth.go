@@ -53,14 +53,16 @@ type authSnapshot struct {
 // pass it), OnAPIKeyChanged (nil → skip tool rebuild), and WSController
 // (nil → skip WS lifecycle).
 type AuthManagerConfig struct {
-	Keychain        *keychain.Store
-	Cloud           *client.AuthClient
-	Gateway         *client.GatewayClient
-	WSClient        *Client
-	Cfg             *config.Config
-	ShannonDir      string
-	OnAPIKeyChanged func(context.Context)
-	Logger          *log.Logger
+	Keychain             *keychain.Store
+	Cloud                *client.AuthClient
+	Gateway              *client.GatewayClient
+	WSClient             *Client
+	Cfg                  *config.Config
+	ShannonDir           string
+	OnAPIKeyChanged      func(context.Context)
+	ConfigReloadRequired func() bool
+	RecordConfigRevision func(string)
+	Logger               *log.Logger
 }
 
 // AuthManager owns the daemon-side authentication state machine. All state
@@ -83,17 +85,19 @@ type AuthManager struct {
 	verifiedID     string
 	principalEpoch uint64
 
-	kc                 *keychain.Store
-	cloud              *client.AuthClient
-	gw                 *client.GatewayClient
-	wsClient           *Client
-	wsCtl              *WSController
-	bus                *EventBus
-	onPrincipalChanged func(previous, current string)
-	onAPIKeyChanged    func(context.Context)
-	logger             *log.Logger
-	shanDir            string
-	sf                 singleflight.Group
+	kc                   *keychain.Store
+	cloud                *client.AuthClient
+	gw                   *client.GatewayClient
+	wsClient             *Client
+	wsCtl                *WSController
+	bus                  *EventBus
+	onPrincipalChanged   func(previous, current string)
+	onAPIKeyChanged      func(context.Context)
+	configReloadRequired func() bool
+	recordConfigRevision func(string)
+	logger               *log.Logger
+	shanDir              string
+	sf                   singleflight.Group
 }
 
 // NewAuthManager builds an AuthManager. WSController and EventBus are
@@ -106,15 +110,17 @@ func NewAuthManager(cfg AuthManagerConfig) *AuthManager {
 		logger = log.Default()
 	}
 	return &AuthManager{
-		state:           AuthStateSignedOut,
-		updatedAt:       time.Now(),
-		kc:              cfg.Keychain,
-		cloud:           cfg.Cloud,
-		gw:              cfg.Gateway,
-		wsClient:        cfg.WSClient,
-		onAPIKeyChanged: cfg.OnAPIKeyChanged,
-		logger:          logger,
-		shanDir:         cfg.ShannonDir,
+		state:                AuthStateSignedOut,
+		updatedAt:            time.Now(),
+		kc:                   cfg.Keychain,
+		cloud:                cfg.Cloud,
+		gw:                   cfg.Gateway,
+		wsClient:             cfg.WSClient,
+		onAPIKeyChanged:      cfg.OnAPIKeyChanged,
+		configReloadRequired: cfg.ConfigReloadRequired,
+		recordConfigRevision: cfg.RecordConfigRevision,
+		logger:               logger,
+		shanDir:              cfg.ShannonDir,
 	}
 }
 
@@ -371,8 +377,14 @@ func (a *AuthManager) selfHealFromYAML(ctx context.Context) {
 		a.logger.Printf("auth: keychain self-heal from yaml api_key failed: %v", err)
 		return
 	}
-	if err := config.StripYAMLAPIKey(a.shanDir); err != nil {
+	configWasStale := a.configReloadRequired != nil && a.configReloadRequired()
+	revision, err := config.StripYAMLAPIKeyWithRevision(a.shanDir)
+	if err != nil {
 		a.logger.Printf("auth: keychain self-heal: strip yaml api_key: %v", err)
+		return
+	}
+	if !configWasStale && revision != "" && a.recordConfigRevision != nil {
+		a.recordConfigRevision(revision)
 	}
 }
 
