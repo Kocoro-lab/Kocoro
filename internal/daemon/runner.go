@@ -3149,13 +3149,21 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 	sessMgr.OnSessionClose(sess.ID, func() { _ = filePreview.Close() })
-	if artifactDir != "" {
+	if cloudSessionCWD != "" {
 		// Reclaim the per-session scratch dir when the session is closed
 		// (SessionCache eviction, daemon shutdown). Artifacts live across turns
-		// of the same session but don't accumulate across sessions. Covers
-		// both the cloud-source CWD scratch and the artifact scratch — for
-		// cloud runs they are the same directory.
-		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(artifactDir))
+		// of the same session but don't accumulate across sessions.
+		//
+		// Deliberately CLOUD-ONLY, not the general artifactDir: OnSessionClose
+		// fires on every session SWITCH, and interactive surfaces (Desktop,
+		// sync HTTP) revisit history — deleting the artifact scratch on
+		// switch-away turns every reported "Saved to:" path into a dangling
+		// reference within seconds (live 2026-07-30 repro: the screenshot was
+		// gone before the caller could open it). Cloud one-shot replies never
+		// re-read their artifacts, so eager reclaim stays correct there.
+		// Interactive-session scratch accumulates instead; age-based sweep at
+		// daemon startup is the follow-up for disk reclaim.
+		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(cloudSessionCWD))
 	}
 	// Tear down per-session suggestion state on explicit session close
 	// (session delete/switch, TUI quit, daemon shutdown). Forget drops the
