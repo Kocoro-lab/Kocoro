@@ -657,6 +657,7 @@ func openAIComputerDaemonCallForResponse(
 type openAIComputerDaemonLoopLLM struct {
 	responses []*client.CompletionResponse
 	requests  []client.CompletionRequest
+	errors    []error
 	err       error
 }
 
@@ -721,6 +722,13 @@ func (l *openAIComputerDaemonLoopLLM) Complete(
 	request client.CompletionRequest,
 ) (*client.CompletionResponse, error) {
 	l.requests = append(l.requests, request)
+	if len(l.errors) > 0 {
+		err := l.errors[0]
+		l.errors = l.errors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if l.err != nil {
 		return nil, l.err
 	}
@@ -1839,6 +1847,93 @@ func TestOpenAIComputerTaskReobservesAfterPrecommitPhysicalInterference(
 		nested[1].Text !=
 			`kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"none","gui_outcome":{"result":"user_interference","phase":"acting","failure_code":"physical_input_interference"}}` {
 		t.Fatalf("interference continuation content = %#v", blocks)
+	}
+}
+
+func TestOpenAIComputerTaskDoesNotTreatObservedPhysicalInputAsUserTakeover(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-observed-physical-input",
+		"turn-openai-observed-physical-input",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	interference := agent.BusinessError(
+		"the physical pointer moved before the click committed",
+	)
+	interference.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultUserInterference,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: "physical_input_interference",
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": interference,
+			"final_screenshot": {
+				Content: "fresh state observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "ZnJlc2gtc3RhdGU=",
+				}},
+			},
+		},
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	providerFailure := errors.New("provider continuation failed")
+	llm := &openAIComputerDaemonLoopLLM{
+		responses: []*client.CompletionResponse{
+			openAIComputerDaemonLoopResponse(
+				t,
+				profile,
+				openAIComputerDaemonContinuationToken,
+				string(openAIComputerDaemonCall(
+					`{"type":"click","button":"left","x":10,"y":20}`,
+				)),
+				"",
+			),
+		},
+		errors: []error{nil, providerFailure},
+	}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Click Calculator 7","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskUnverified ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		result.ComputerUseOutcome.FailureCode != "outcome_unverified" ||
+		!strings.Contains(result.Content, "reason: outcome_unverified") ||
+		strings.Contains(result.Content, "user_intervened") ||
+		strings.Contains(result.Content, "user_interference") {
+		t.Fatalf("observed physical input result=%+v err=%v", result, err)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot" {
+		t.Fatalf("observed physical input replayed input: %q", got)
 	}
 }
 

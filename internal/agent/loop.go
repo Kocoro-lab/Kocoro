@@ -2695,18 +2695,6 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// output budget at the same boundary.
 	const maxTruncationRecoveries = 3
 
-	// maxOpenAIComputerErrorBatches bounds provider-native computer recovery.
-	// A failed-but-continuable batch returns only a fresh screenshot to the
-	// provider (computer_call_output carries no error text), so a stuck UI
-	// yields blind retry loops that burn one paid provider call per batch.
-	// After this many failed batches in one Run the loop terminates with the
-	// last executor failure reason instead of continuing.
-	// This is an invariant rather than a power-user workload limit: there is no
-	// runtime override while the continuation wire hides the failure reason.
-	// Changing it requires updating this constant and the exact request-count
-	// regression test; agent.max_iterations remains the outer loop ceiling.
-	const maxOpenAIComputerErrorBatches = 3
-
 	// maxInconsistentFinishRetries bounds the daemon-side retry budget for the
 	// "stop_reason=tool_use but no tool_use block AND no visible text" upstream
 	// anomaly. Cloud also retries this shape once; if that retry already ran
@@ -2767,7 +2755,6 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		openAIComputerBaseRequest    *client.CompletionRequest
 		openAIContinuationRequest    *client.CompletionRequest
 		openAIContinuationScreenshot *client.ContentBlock
-		openAIComputerErrorBatches   int // total failed-but-continuable batches this Run; see maxOpenAIComputerErrorBatches
 		computerUseOwnsTurn          bool
 		computerUseNeedsApps         bool
 		computerUseAlternateOnly     bool
@@ -4349,20 +4336,6 @@ iterationLoop:
 				setRunStatus(runstatus.CodeFromError(validationErr), false)
 				return "", usage, validationErr
 			}
-			if execution.Result.IsError {
-				openAIComputerErrorBatches++
-				if openAIComputerErrorBatches >= maxOpenAIComputerErrorBatches {
-					err := fmt.Errorf(
-						"OpenAI computer recovery stopped after %d failed action batches; the desktop task did not reach a verified end state%s",
-						openAIComputerErrorBatches,
-						openAIComputerExecutionDetail(execution),
-					)
-					captureRunMessages()
-					setRunStatus(runstatus.CodeFromError(err), false)
-					return "", usage, err
-				}
-			}
-
 			if openAIComputerBaseRequest == nil {
 				base := cloneOpenAIComputerBaseRequest(req)
 				openAIComputerBaseRequest = &base

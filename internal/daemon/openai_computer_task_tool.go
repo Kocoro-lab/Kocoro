@@ -1427,8 +1427,6 @@ func (t *openAIComputerTaskToolV1) Run(
 				failureCode = "executor_timeout_after_commit"
 			case stats.LastGUIResult == agent.GUIActionResultCancelled:
 				failureCode = "cancelled"
-			case stats.LastGUIResult == agent.GUIActionResultUserInterference:
-				failureCode = "user_interference"
 			case stats.LastBatchHadFreshObservation:
 				failureCode = "outcome_unverified"
 			}
@@ -1487,8 +1485,7 @@ func (t *openAIComputerTaskToolV1) Run(
 				stats.TaskEffect,
 			), nil
 		}
-		if stats.LastGUIResult == agent.GUIActionResultCancelled ||
-			stats.LastGUIResult == agent.GUIActionResultUserInterference {
+		if stats.LastGUIResult == agent.GUIActionResultCancelled {
 			failureCode := stats.LastFailureCode
 			trace.record(openAIComputerTraceEventV1{
 				Phase:       "task",
