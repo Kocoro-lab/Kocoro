@@ -429,12 +429,14 @@ func GetMainScreenGeometry() (screenGeometry, error) {
 	// matching screencapture -m. NSScreen.mainScreen can instead follow the key
 	// window onto another monitor and silently break the declared tool canvas.
 	//
-	// Read capture pixels from CoreGraphics instead of deriving them from
-	// frame * backingScaleFactor. Virtual displays can report a logical
-	// 1024x768 frame with scale 1 while screencapture emits 1280x960; binding
-	// the declared tool space to CGDisplayPixelsWide/High keeps the screenshot
-	// bytes and coordinate contract exact on those runners too.
-	const script = `ObjC.import("AppKit"); ObjC.import("CoreGraphics"); var s=$.NSScreen.screens.objectAtIndex(0); var f=s.frame; var n=s.deviceDescription.objectForKey("NSScreenNumber"); var d=Number(n.unsignedIntValue); console.log(Number(f.size.width)+" "+Number(f.size.height)+" "+Number($.CGDisplayPixelsWide(d))+" "+Number($.CGDisplayPixelsHigh(d)))`
+	// Read dimensions from an actual CoreGraphics capture instead of deriving
+	// them from frame * backingScaleFactor or CGDisplayPixelsWide/High. Virtual
+	// displays can report 1024x768 through both metadata paths while
+	// screencapture emits 1280x960; Retina displays likewise report point-sized
+	// CGDisplayPixelsWide/High values while the captured image contains twice
+	// as many pixels. CGDisplayCreateImage binds the declared tool space to the
+	// same main-display pixels that screencapture will encode.
+	const script = `ObjC.import("AppKit"); ObjC.import("CoreGraphics"); var s=$.NSScreen.screens.objectAtIndex(0); var f=s.frame; var n=s.deviceDescription.objectForKey("NSScreenNumber"); var d=Number(n.unsignedIntValue); var i=$.CGDisplayCreateImage(d); console.log(Number(f.size.width)+" "+Number(f.size.height)+" "+Number($.CGImageGetWidth(i))+" "+Number($.CGImageGetHeight(i)))`
 	out, err := exec.Command("/usr/bin/osascript", "-l", "JavaScript", "-e", script).CombinedOutput()
 	if err == nil {
 		if geometry, parseErr := parseNSScreenGeometry(string(out)); parseErr == nil {
