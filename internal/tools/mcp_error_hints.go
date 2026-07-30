@@ -1,6 +1,33 @@
 package tools
 
-import "strings"
+import (
+	"path/filepath"
+	"strings"
+)
+
+// lostMCPArtifactHint returns a just-in-time hint for a file_read miss whose
+// original path carries the lost-MCP-artifact SIGNATURE: the playwright
+// artifact directory, or a filename following the browser-artifact naming
+// convention (page-* from playwright's own defaults, screenshot-/snapshot-*
+// from the daemon's injected names). 2026-07-29 incident: such a miss sent
+// the model into a 242-second `find /`. Deliberately NOT triggered by
+// ordinary relative misses (a missing README.md is not an artifact — pointing
+// the model at the daemon's scratch dirs for it would be misdirection).
+func lostMCPArtifactHint(origPath string) string {
+	trimmed := strings.TrimSpace(origPath)
+	if trimmed == "" {
+		return ""
+	}
+	if !strings.Contains(trimmed, ".playwright-mcp") {
+		base := filepath.Base(trimmed)
+		if !strings.HasPrefix(base, "page-") &&
+			!strings.HasPrefix(base, "screenshot-") &&
+			!strings.HasPrefix(base, "snapshot-") {
+			return ""
+		}
+	}
+	return "[hint] The path was not found here. MCP tool artifacts (screenshots, snapshots) are saved under the daemon's advertised workspace roots, not the session working directory — use the absolute path from the tool result's \"Saved to:\" line, or list ~/.shannon/tmp/attachments/ and ~/.shannon/tmp/sessions/. Do NOT scan the filesystem (e.g. `find /`) for it."
+}
 
 // normalizeMCPResult rewrites raw MCP-server tool results into content the
 // model can act on without having to infer intent from terse playwright-mcp

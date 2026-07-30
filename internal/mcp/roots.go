@@ -70,6 +70,21 @@ func (h *RootsHandler) ListRoots(_ context.Context, _ mcp.ListRootsRequest) (*mc
 	return &mcp.ListRootsResult{Roots: roots}, nil
 }
 
+// FirstExistingRoot returns the first candidate that exists as a directory —
+// the same root a `roots`-honoring server (playwright-mcp) treats as the
+// client workspace and renders result paths relative to. Empty string when
+// no candidate currently exists.
+func (h *RootsHandler) FirstExistingRoot() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, abs := range h.roots {
+		if info, err := os.Stat(abs); err == nil && info.IsDir() {
+			return abs
+		}
+	}
+	return ""
+}
+
 // Roots returns the normalized candidate list (pre-existence-filter) for
 // diagnostics and tests.
 func (h *RootsHandler) Roots() []string {

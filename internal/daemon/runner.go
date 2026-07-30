@@ -2533,6 +2533,30 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	ctx = cwdctx.WithSessionCWD(ctx, effectiveCWD)
 
+	// Artifact scratch dir: default landing zone for file-producing MCP
+	// artifacts (screenshots, snapshots) so machine-generated intermediates
+	// never pile up in user-visible folders like ~/Desktop — the Desktop
+	// default CWD is a READ context ("stuff in front of me"), not a dump
+	// site. Cloud runs already work out of the per-session scratch (their
+	// effective CWD); every other daemon-served run gets the same
+	// per-session dir without touching the effective CWD. Deliverables go
+	// wherever the model addresses them with an absolute path. TUI/one-shot
+	// runs never reach this path and keep artifacts in their working dir.
+	artifactDir := cloudSessionCWD
+	if artifactDir == "" {
+		// Path only — the directory is created lazily on the first artifact
+		// filename injection, so sessions that never produce files leave no
+		// empty dirs behind. Reclaim is the age-based sweep at daemon start.
+		if dir, err := sessionScratchDirPath(deps.ShannonDir, sess.ID); err != nil {
+			log.Printf("daemon: failed to resolve artifact scratch for %s: %v", sess.ID, err)
+		} else if dir != "" {
+			artifactDir = dir
+		}
+	}
+	if artifactDir != "" {
+		ctx = cwdctx.WithArtifactDir(ctx, artifactDir)
+	}
+
 	// Wrap the transport handler with a bus-emitting handler so every run
 	// publishes progress events regardless of transport. See
 	// docs/superpowers/specs/2026-04-23-event-bus-progress-coverage-design.md.
@@ -3132,6 +3156,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// Reclaim the per-session scratch dir when the session is closed
 		// (SessionCache eviction, daemon shutdown). Artifacts live across turns
 		// of the same session but don't accumulate across sessions.
+		//
+		// Deliberately CLOUD-ONLY, not the general artifactDir: OnSessionClose
+		// fires on every session SWITCH, and interactive surfaces (Desktop,
+		// sync HTTP) revisit history — deleting the artifact scratch on
+		// switch-away turns every reported "Saved to:" path into a dangling
+		// reference within seconds (live 2026-07-30 repro: the screenshot was
+		// gone before the caller could open it). Cloud one-shot replies never
+		// re-read their artifacts, so eager reclaim stays correct there.
+		// Interactive-session scratch accumulates instead; age-based sweep at
+		// daemon startup is the follow-up for disk reclaim.
 		sessMgr.OnSessionClose(sess.ID, cloudSessionTmpCleanup(cloudSessionCWD))
 	}
 	// Tear down per-session suggestion state on explicit session close
