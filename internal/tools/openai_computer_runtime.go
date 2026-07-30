@@ -48,10 +48,12 @@ type OpenAIComputerActionRuntimeV1 struct {
 	// process identities owned by internal automation services.
 	taskAppExcludedPIDs func() []int
 
-	executionLane      OpenAIComputerExecutionLaneV1
-	foregroundFallback bool
-	backgroundTarget   *OpenAIComputerTaskAppV1
-	backgroundRequired bool
+	executionLane            OpenAIComputerExecutionLaneV1
+	foregroundFallback       bool
+	foregroundFallbackReason string
+	foregroundRestoreUsed    bool
+	backgroundTarget         *OpenAIComputerTaskAppV1
+	backgroundRequired       bool
 }
 
 type OpenAIComputerExecutionLaneV1 string
@@ -330,22 +332,29 @@ func (r *OpenAIComputerActionRuntimeV1) LaunchAndFocusTaskAppsV1(
 			return fmt.Errorf("focus app %q: %w", apps[0].App, err)
 		}
 	}
+	targets := make([]ComputerUseInitialTargetV1, 0, len(apps))
+	for _, app := range apps {
+		targets = append(targets, ComputerUseInitialTargetV1{
+			PID:      app.PID,
+			AppName:  strings.TrimSpace(app.App),
+			BundleID: strings.TrimSpace(app.BundleID),
+		})
+	}
+	r.raw.setAllowedTaskTargetsV1(targets)
 	// The explicit task app list supersedes a Quick Panel foreground hint.
-	// Clear that one-shot bootstrap target so every post-action refresh follows
-	// the actual frontmost window, including an OpenAI-native app switch.
+	// Foreground multi-app execution still resolves later observations from the
+	// active app; background-bound execution installs its exact target below.
 	r.raw.initialTarget = nil
 	r.raw.invalidateState()
 	return nil
 }
 
-// PrepareTaskAppsV1 keeps ordinary tasks on the established foreground path.
-// Background execution is an explicit user constraint, never an opportunistic
-// optimization: probing it for foreground-allowed work adds a fragile
-// background-to-foreground transition before common keyboard actions.
-// A required background task binds one exact process with one visible
-// non-frontmost window. If the app is not running, the helper may launch it
-// with an explicit non-activating LaunchServices configuration; this path
-// never falls back to foreground activation.
+// PrepareTaskAppsV1 prefers one exact background target for single-app tasks.
+// Foreground-allowed work falls back to the established activation path only
+// when background binding is unavailable or when a later action has no exact
+// background primitive. preserve_frontmost uses the same binding but forbids
+// that fallback. Multi-app tasks retain the established foreground behavior
+// until target-bound background app switching has its own end-to-end proof.
 func (r *OpenAIComputerActionRuntimeV1) PrepareTaskAppsV1(
 	ctx context.Context,
 	apps []OpenAIComputerTaskAppV1,
@@ -356,80 +365,176 @@ func (r *OpenAIComputerActionRuntimeV1) PrepareTaskAppsV1(
 	}
 	r.executionLane = OpenAIComputerExecutionForegroundV1
 	r.foregroundFallback = false
+	r.foregroundFallbackReason = ""
+	r.foregroundRestoreUsed = false
 	r.backgroundTarget = nil
+	r.raw.setAllowedTaskTargetsV1(nil)
+	r.raw.lastTaskTarget = nil
 	r.raw.backgroundInputAuthority = nil
 	r.raw.foregroundFallbackRestorePending = false
 	r.backgroundRequired = options.RequireBackground
 
-	if !options.RequireBackground {
-		if err := r.LaunchAndFocusTaskAppsV1(ctx, apps); err != nil {
-			return "", err
-		}
-		return r.executionLane, nil
-	}
-
 	if len(apps) == 1 {
-		excludedPIDs := r.excludedTaskAppPIDsV1()
-		raw, err := r.raw.client.Call(
-			ctx,
-			"bind_background_task_app",
-			openAIComputerTaskAppParamsV1(apps[0], excludedPIDs),
-		)
-		if err == nil {
-			binding, decodeErr := decodeOpenAIComputerBackgroundBindingV1(raw)
-			if decodeErr != nil {
-				return "", fmt.Errorf(
-					"bind background app %q: %w",
-					apps[0].App,
-					decodeErr,
-				)
-			}
-			prepared := binding.target
-			if !strings.EqualFold(prepared.BundleID, apps[0].BundleID) ||
-				(apps[0].PID > 0 && prepared.PID != apps[0].PID) {
-				return "", fmt.Errorf(
-					"bind background app %q changed exact identity",
-					apps[0].App,
-				)
-			}
-			for _, excludedPID := range excludedPIDs {
-				if prepared.PID == excludedPID {
-					return "", fmt.Errorf(
-						"bind background app %q returned an excluded process",
-						apps[0].App,
-					)
-				}
-			}
-			apps[0] = prepared
-			r.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
-			target := prepared
-			r.backgroundTarget = &target
-			if prepared.LaunchDate != "" &&
-				binding.preservedFrontmostPID > 0 &&
-				binding.preservedFrontmostBundleID != "" &&
-				binding.preservedFrontmostLaunchDate != "" {
-				r.raw.backgroundInputAuthority =
-					&computerUseBackgroundInputAuthorityV1{
-						targetLaunchDate:             prepared.LaunchDate,
-						preservedFrontmostPID:        binding.preservedFrontmostPID,
-						preservedFrontmostBundleID:   binding.preservedFrontmostBundleID,
-						preservedFrontmostLaunchDate: binding.preservedFrontmostLaunchDate,
-					}
-			}
-			r.raw.initialTarget = nil
-			r.raw.invalidateState()
+		if err := r.bindBackgroundTaskAppV1(ctx, apps[0]); err == nil {
 			return r.executionLane, nil
+		} else if options.RequireBackground {
+			return "", fmt.Errorf(
+				"required background bind for %q failed: %w",
+				apps[0].App,
+				err,
+			)
 		}
-		return "", fmt.Errorf(
-			"required background bind for %q failed: %w",
-			apps[0].App,
-			err,
-		)
 	}
 
-	return "", fmt.Errorf(
-		"required background execution needs one exact app target",
+	if options.RequireBackground {
+		return "", fmt.Errorf(
+			"required background execution needs one exact app target",
+		)
+	}
+	if err := r.LaunchAndFocusTaskAppsV1(ctx, apps); err != nil {
+		return "", err
+	}
+	return r.executionLane, nil
+}
+
+func (r *OpenAIComputerActionRuntimeV1) bindBackgroundTaskAppV1(
+	ctx context.Context,
+	app OpenAIComputerTaskAppV1,
+) error {
+	binding, err := r.resolveBackgroundTaskAppV1(ctx, app)
+	if err != nil {
+		return err
+	}
+	prepared := binding.target
+
+	r.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	target := prepared
+	r.backgroundTarget = &target
+	r.raw.setAllowedTaskTargetsV1([]ComputerUseInitialTargetV1{{
+		PID:      prepared.PID,
+		AppName:  strings.TrimSpace(prepared.App),
+		BundleID: strings.TrimSpace(prepared.BundleID),
+	}})
+	r.installBackgroundInputAuthorityV1(binding)
+	r.raw.initialTarget = nil
+	r.raw.invalidateState()
+	return nil
+}
+
+func (r *OpenAIComputerActionRuntimeV1) resolveBackgroundTaskAppV1(
+	ctx context.Context,
+	app OpenAIComputerTaskAppV1,
+) (openAIComputerBackgroundBindingV1, error) {
+	excludedPIDs := r.excludedTaskAppPIDsV1()
+	raw, err := r.raw.client.Call(
+		ctx,
+		"bind_background_task_app",
+		openAIComputerTaskAppParamsV1(app, excludedPIDs),
 	)
+	if err != nil {
+		return openAIComputerBackgroundBindingV1{}, err
+	}
+	binding, err := decodeOpenAIComputerBackgroundBindingV1(raw)
+	if err != nil {
+		return openAIComputerBackgroundBindingV1{},
+			fmt.Errorf("bind background app %q: %w", app.App, err)
+	}
+	prepared := binding.target
+	if !strings.EqualFold(prepared.BundleID, app.BundleID) ||
+		(app.PID > 0 && prepared.PID != app.PID) {
+		return openAIComputerBackgroundBindingV1{},
+			fmt.Errorf("bind background app %q changed exact identity", app.App)
+	}
+	for _, excludedPID := range excludedPIDs {
+		if prepared.PID == excludedPID {
+			return openAIComputerBackgroundBindingV1{}, fmt.Errorf(
+				"bind background app %q returned an excluded process",
+				app.App,
+			)
+		}
+	}
+	return binding, nil
+}
+
+func (r *OpenAIComputerActionRuntimeV1) installBackgroundInputAuthorityV1(
+	binding openAIComputerBackgroundBindingV1,
+) {
+	r.raw.backgroundInputAuthority = nil
+	prepared := binding.target
+	if prepared.LaunchDate != "" &&
+		binding.preservedFrontmostPID > 0 &&
+		binding.preservedFrontmostBundleID != "" &&
+		binding.preservedFrontmostLaunchDate != "" {
+		r.raw.backgroundInputAuthority = &computerUseBackgroundInputAuthorityV1{
+			targetLaunchDate:             prepared.LaunchDate,
+			preservedFrontmostPID:        binding.preservedFrontmostPID,
+			preservedFrontmostBundleID:   binding.preservedFrontmostBundleID,
+			preservedFrontmostLaunchDate: binding.preservedFrontmostLaunchDate,
+		}
+	}
+}
+
+func (r *OpenAIComputerActionRuntimeV1) refreshBackgroundInputAuthorityV1(
+	ctx context.Context,
+) error {
+	if r == nil || r.raw == nil || r.raw.snapshot == nil {
+		return fmt.Errorf("background keyboard target snapshot is unavailable")
+	}
+	snapshot := r.raw.snapshot
+	if snapshot.pid <= 0 || strings.TrimSpace(snapshot.app) == "" ||
+		strings.TrimSpace(snapshot.bundleID) == "" {
+		return fmt.Errorf("background keyboard target identity is invalid")
+	}
+	binding, err := r.resolveBackgroundTaskAppV1(ctx, OpenAIComputerTaskAppV1{
+		App:      strings.TrimSpace(snapshot.app),
+		BundleID: strings.TrimSpace(snapshot.bundleID),
+		PID:      snapshot.pid,
+	})
+	if err != nil {
+		return err
+	}
+	r.installBackgroundInputAuthorityV1(binding)
+	if r.raw.backgroundInputAuthority == nil {
+		return fmt.Errorf("background keyboard target witness is unavailable")
+	}
+	return nil
+}
+
+// resumeBackgroundInputAfterForegroundFallbackV1 lets a background-started
+// single-app task return to its exact target after one foreground-only
+// primitive. It is intentionally limited to ordinary text and non-consequential
+// keys whose existing background executor has an exact focused-element witness.
+func (r *OpenAIComputerActionRuntimeV1) resumeBackgroundInputAfterForegroundFallbackV1(
+	ctx context.Context,
+	action OpenAIComputerActionV1,
+) {
+	if r == nil || r.raw == nil || !r.foregroundFallback ||
+		r.backgroundRequired || r.backgroundTarget == nil ||
+		r.executionLane != OpenAIComputerExecutionForegroundV1 {
+		return
+	}
+	switch action.Type {
+	case OpenAIComputerActionTypeTextV1:
+		if strings.IndexFunc(action.Text, unicode.IsControl) >= 0 {
+			return
+		}
+	case OpenAIComputerActionKeypressV1:
+		modifiers, keys, err := openAIComputerKeySequenceV1(action.Keys)
+		if err != nil ||
+			backgroundTargetedInputConsequentialKeyV1(keys, modifiers) {
+			return
+		}
+	default:
+		return
+	}
+	if err := r.refreshBackgroundInputAuthorityV1(ctx); err != nil {
+		return
+	}
+	r.executionLane = OpenAIComputerExecutionBackgroundSemanticV1
+	r.foregroundFallback = false
+	r.foregroundFallbackReason = ""
+	r.foregroundRestoreUsed = false
+	r.raw.foregroundFallbackRestorePending = false
 }
 
 func (r *OpenAIComputerActionRuntimeV1) applyExecutionLaneV1(
@@ -446,6 +551,22 @@ func (r *OpenAIComputerActionRuntimeV1) applyExecutionLaneV1(
 	args.ForegroundFallback = r.foregroundFallback
 }
 
+func (r *OpenAIComputerActionRuntimeV1) requestForegroundRestoreV1(
+	reason string,
+) bool {
+	if r == nil || r.backgroundRequired || r.foregroundRestoreUsed {
+		return false
+	}
+	r.executionLane = OpenAIComputerExecutionForegroundV1
+	r.foregroundFallback = true
+	r.foregroundFallbackReason = strings.TrimSpace(reason)
+	r.foregroundRestoreUsed = true
+	r.raw.backgroundInputAuthority = nil
+	r.raw.foregroundFallbackRestorePending = true
+	r.raw.initialTarget = nil
+	return true
+}
+
 func (r *OpenAIComputerActionRuntimeV1) transitionToForegroundV1() {
 	if r == nil || r.executionLane != OpenAIComputerExecutionBackgroundSemanticV1 {
 		return
@@ -453,12 +574,7 @@ func (r *OpenAIComputerActionRuntimeV1) transitionToForegroundV1() {
 	if r.backgroundRequired {
 		return
 	}
-	r.executionLane = OpenAIComputerExecutionForegroundV1
-	r.foregroundFallback = true
-	r.backgroundTarget = nil
-	r.raw.backgroundInputAuthority = nil
-	r.raw.foregroundFallbackRestorePending = true
-	r.raw.initialTarget = nil
+	r.requestForegroundRestoreV1("background_action_unsupported")
 }
 
 func (r *OpenAIComputerActionRuntimeV1) backgroundKeyboardFocusedRefV1(
@@ -505,7 +621,13 @@ func (r *OpenAIComputerActionRuntimeV1) plan(
 			fmt.Errorf("marshal internal OpenAI computer action")
 	}
 	return OpenAIComputerActionPlanV1{
-		Tool: r.public, Args: string(payload), Mutation: mutation,
+		Tool:               r.public,
+		Args:               string(payload),
+		Mutation:           mutation,
+		ExecutionLane:      OpenAIComputerExecutionLaneV1(args.ExecutionLane),
+		ForegroundFallback: args.ForegroundFallback,
+		FallbackReason:     r.foregroundFallbackReason,
+		FrontmostClass:     string(r.raw.frontmostDiversion),
 	}, nil
 }
 
@@ -576,8 +698,9 @@ func (r *OpenAIComputerActionRuntimeV1) AuthorizeOpenAIComputerTypeAfterKeypress
 }
 
 // PlanOpenAIComputerTaskInitialObservationV1 binds the first screenshot to the
-// first optional task app hint. Later observations deliberately pass nil and
-// follow the real frontmost app so one native task can still switch apps.
+// first optional task app hint. Later foreground multi-app observations may
+// follow the real frontmost app, while a background-bound single-app task keeps
+// its exact prepared identity.
 func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerTaskInitialObservationV1(
 	app *OpenAIComputerTaskAppV1,
 	description string,
@@ -601,8 +724,10 @@ func (r *OpenAIComputerActionRuntimeV1) planOpenAIComputerObservationV1(
 		return OpenAIComputerActionPlanV1{},
 			fmt.Errorf("OpenAI computer observation description is required")
 	}
-	if r.executionLane == OpenAIComputerExecutionBackgroundSemanticV1 &&
-		r.backgroundTarget != nil {
+	hasBoundTaskTarget := r.backgroundTarget != nil &&
+		(r.executionLane == OpenAIComputerExecutionBackgroundSemanticV1 ||
+			r.foregroundFallback)
+	if hasBoundTaskTarget {
 		r.raw.initialTarget = &ComputerUseInitialTargetV1{
 			PID:      r.backgroundTarget.PID,
 			AppName:  strings.TrimSpace(r.backgroundTarget.App),
@@ -626,11 +751,13 @@ func (r *OpenAIComputerActionRuntimeV1) planOpenAIComputerObservationV1(
 		// frontmost app so one goal-level task can switch applications.
 		r.raw.initialTarget = nil
 	}
-	// Every provider-requested observation follows the app/window that is
-	// actually frontmost now. This is also used for one lightweight,
-	// image-free refresh after a keypress when the same ordered batch has a
-	// later action: Command-Tab (and shortcuts that open another window) must
-	// not leave that later action bound to the previous app's snapshot.
+	// Foreground multi-app observations follow the app/window that is actually
+	// frontmost now. Background-bound single-app observations retain their exact
+	// prepared target instead. The foreground behavior is also used for one
+	// lightweight, image-free refresh after a keypress when the same ordered
+	// batch has a later action: Command-Tab (and shortcuts that open another
+	// window) must not leave that later action bound to the previous app's
+	// snapshot.
 	// Keep the one-shot verified click handoff while the observation follows
 	// the real frontmost window. getAppState restores it only when the newly
 	// observed PID, bundle, window, and frame still match; an app/window switch
@@ -642,7 +769,7 @@ func (r *OpenAIComputerActionRuntimeV1) planOpenAIComputerObservationV1(
 		Action:            "get_app_state",
 		Description:       description,
 		IncludeScreenshot: includeScreenshot,
-		FollowFrontmost:   true,
+		FollowFrontmost:   !hasBoundTaskTarget,
 	}
 	r.applyExecutionLaneV1(&args)
 	return r.plan(args, false)
@@ -691,7 +818,52 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 	args := computerUseArgs{StateID: stateID, Description: description}
 	anthropicHelpers := NewAnthropicComputerAdapter(r.raw, 1, 1)
 
-	if r.executionLane == OpenAIComputerExecutionBackgroundSemanticV1 {
+	r.resumeBackgroundInputAfterForegroundFallbackV1(ctx, action)
+	frontmostDiversion := r.raw.frontmostDiversion
+	coordinateImageAvailable := r.raw.coordinateArtifact != nil
+	semanticImageAvailable := r.raw.semanticImageArtifact != nil
+	frontmostSensitiveCandidate :=
+		action.Type == OpenAIComputerActionTypeTextV1 ||
+			action.Type == OpenAIComputerActionKeypressV1 ||
+			(action.Type == OpenAIComputerActionClickV1 &&
+				action.X != nil && action.Y != nil &&
+				(coordinateImageAvailable ||
+					action.Button == "left" && len(action.Keys) == 0 &&
+						semanticImageAvailable)) ||
+			(action.Type == OpenAIComputerActionDoubleClickV1 &&
+				action.X != nil && action.Y != nil &&
+				coordinateImageAvailable) ||
+			(action.Type == OpenAIComputerActionMoveV1 &&
+				action.X != nil && action.Y != nil &&
+				coordinateImageAvailable) ||
+			(action.Type == OpenAIComputerActionDragV1 &&
+				len(action.Path) >= 2 &&
+				coordinateImageAvailable) ||
+			(action.Type == OpenAIComputerActionScrollV1 &&
+				action.X != nil && action.Y != nil &&
+				action.ScrollX != nil && action.ScrollY != nil &&
+				(coordinateImageAvailable || semanticImageAvailable))
+	if frontmostDiversion == "" &&
+		r.executionLane == OpenAIComputerExecutionForegroundV1 &&
+		frontmostSensitiveCandidate {
+		// Kocoro may become frontmost after the provider's observation when
+		// the user clicks the Island or main SwiftUI/WebView surface. This
+		// best-effort read cannot grant broader authority: it only narrows the
+		// current action to an existing background semantic primitive, or
+		// causes the action to fail before commit below.
+		frontmostDiversion = r.raw.computerUseFrontmostDiversionNowV1(ctx)
+		if frontmostDiversion != "" {
+			r.raw.frontmostDiversion = frontmostDiversion
+		}
+	}
+	if r.executionLane == OpenAIComputerExecutionBackgroundSemanticV1 ||
+		frontmostDiversion != "" {
+		if frontmostDiversion != "" &&
+			(action.Type == OpenAIComputerActionTypeTextV1 ||
+				action.Type == OpenAIComputerActionKeypressV1) &&
+			r.raw.backgroundInputAuthority == nil {
+			_ = r.refreshBackgroundInputAuthorityV1(ctx)
+		}
 		if action.Type == OpenAIComputerActionClickV1 &&
 			action.Button == "left" &&
 			len(action.Keys) == 0 &&
@@ -712,7 +884,9 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 			}
 			if found {
 				args.Action, args.Ref = "press", ref
-				r.applyExecutionLaneV1(&args)
+				args.ExecutionLane =
+					string(OpenAIComputerExecutionBackgroundSemanticV1)
+				args.ForegroundFallback = false
 				return r.plan(args, true)
 			}
 		}
@@ -748,7 +922,9 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 			if found {
 				args.Action, args.Ref = "scroll", ref
 				args.DX, args.DY = dx, dy
-				r.applyExecutionLaneV1(&args)
+				args.ExecutionLane =
+					string(OpenAIComputerExecutionBackgroundSemanticV1)
+				args.ForegroundFallback = false
 				return r.plan(args, true)
 			}
 		}
@@ -812,6 +988,27 @@ func (r *OpenAIComputerActionRuntimeV1) PlanOpenAIComputerActionV1(
 						FailureCode: "background_keyboard_target_unavailable",
 						Detail: "the required background keyboard target is " +
 							"unavailable: " + focusErr.Error(),
+					}
+			}
+		}
+		if frontmostDiversion != "" {
+			if r.backgroundRequired {
+				return OpenAIComputerActionPlanV1{},
+					&OpenAIComputerActionPlanErrorV1{
+						FailureCode: "background_action_unsupported",
+						Detail: "the requested action has no exact background " +
+							"primitive and foreground activation is forbidden",
+					}
+			}
+			if !r.requestForegroundRestoreV1(
+				"frontmost_" + string(frontmostDiversion),
+			) {
+				return OpenAIComputerActionPlanV1{},
+					&OpenAIComputerActionPlanErrorV1{
+						FailureCode: "foreground_restore_already_used",
+						Detail: "the foreground changed again after the one " +
+							"target restore; re-observe " +
+							"and choose a background semantic action",
 					}
 			}
 		}

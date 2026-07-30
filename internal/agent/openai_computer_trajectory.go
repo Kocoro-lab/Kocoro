@@ -274,7 +274,8 @@ const (
 )
 
 func (category OpenAIComputerRecoveryCategoryV1) ContinuationAllowed() bool {
-	return category == OpenAIComputerRecoveryReobserveSameAppV1
+	return category == OpenAIComputerRecoveryReobserveSameAppV1 ||
+		category == OpenAIComputerRecoveryUnknownCommitV1
 }
 
 // ClassifyOpenAIComputerRecoveryV1 is the single local recovery classifier for
@@ -296,7 +297,10 @@ func ClassifyOpenAIComputerRecoveryV1(
 		return OpenAIComputerRecoveryUserIntervenedV1
 	}
 	if outcome.Result == GUIActionResultUserInterference {
-		return OpenAIComputerRecoveryUserIntervenedV1
+		// Physical input is a state change to observe, not a goal-level cancel.
+		// The daemon still requires one exact fresh screenshot before allowing
+		// the provider to decide whether anything remains to do.
+		return OpenAIComputerRecoveryReobserveSameAppV1
 	}
 	// A mutation helper can reject an action during its preflight authority
 	// check. That phase maps to observing, but the typed failed result still

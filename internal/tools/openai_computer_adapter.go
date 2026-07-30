@@ -61,9 +61,13 @@ type OpenAIComputerActionV1 struct {
 // Images are forbidden at this boundary; the batch adapter emits one final
 // exact screenshot after the ordered action list terminates.
 type OpenAIComputerActionPlanV1 struct {
-	Tool     agent.Tool
-	Args     string
-	Mutation bool
+	Tool               agent.Tool
+	Args               string
+	Mutation           bool
+	ExecutionLane      OpenAIComputerExecutionLaneV1
+	ForegroundFallback bool
+	FallbackReason     string
+	FrontmostClass     string
 }
 
 // OpenAIComputerCallV1 is the Cloud-normalized provider call. provider,

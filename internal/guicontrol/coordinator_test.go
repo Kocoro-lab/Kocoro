@@ -267,7 +267,7 @@ func TestPauseResumeTakeOverTransitionsAndCancellation(t *testing.T) {
 	}
 }
 
-func TestUserInterferencePausesAndRequiresVerifiedObservationBeforeMutation(t *testing.T) {
+func TestPhysicalUserInterferenceKeepsLeaseActiveButRequiresVerifiedObservation(t *testing.T) {
 	coordinator, _ := newCoordinatorFixture(t, nil)
 	lease, err := coordinator.BeginWorkflow(workflowRequest("turn-user-interference"))
 	if err != nil {
@@ -289,16 +289,10 @@ func TestUserInterferencePausesAndRequiresVerifiedObservationBeforeMutation(t *t
 		t.Fatalf("FinishAction user interference: %v", err)
 	}
 	snapshot := coordinator.Snapshot()
-	if snapshot.Active == nil || snapshot.Active.LeaseState != ComputerUseLeasePaused ||
-		snapshot.Active.ActionPhase != ComputerUsePhaseWaitingForUser ||
+	if snapshot.Active == nil || snapshot.Active.LeaseState != ComputerUseLeaseActive ||
+		snapshot.Active.ActionPhase != ComputerUsePhaseObserving ||
 		snapshot.Active.ActionResult == nil || *snapshot.Active.ActionResult != ComputerUseResultUserInterference {
-		t.Fatalf("user interference did not auto-pause: %+v", snapshot)
-	}
-
-	if _, err := coordinator.Control(ComputerUseControlRequest{
-		LeaseID: lease.LeaseID, Action: ComputerUseControlResume, IdempotencyKey: "resume-interference",
-	}); err != nil {
-		t.Fatalf("resume: %v", err)
+		t.Fatalf("physical interference did not enter active re-observation: %+v", snapshot)
 	}
 	beginMutation := func(toolUseID string) error {
 		_, err := coordinator.BeginAction(context.Background(), ActionRequest{

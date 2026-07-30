@@ -13,6 +13,7 @@ import (
 const ghosttyBundleID = "com.mitchellh.ghostty"
 
 type guiAXTarget struct {
+	PID      int
 	BundleID string
 	AppName  string
 }
@@ -59,6 +60,7 @@ func resolveGUIAXTarget(ctx context.Context, client axCallClient, appName string
 		}
 	}
 	var tree struct {
+		PID      int    `json:"pid"`
 		App      string `json:"app"`
 		AppName  string `json:"app_name"`
 		BundleID string `json:"bundle_id"`
@@ -70,7 +72,28 @@ func resolveGUIAXTarget(ctx context.Context, client axCallClient, appName string
 	if name == "" {
 		name = strings.TrimSpace(tree.App)
 	}
-	return guiAXTarget{BundleID: strings.TrimSpace(tree.BundleID), AppName: name}, nil
+	resolvedPID := tree.PID
+	if resolvedPID <= 0 {
+		resolvedPID = pid
+	}
+	return guiAXTarget{
+		PID:      resolvedPID,
+		BundleID: strings.TrimSpace(tree.BundleID),
+		AppName:  name,
+	}, nil
+}
+
+func (t *ComputerUseTool) computerUseFrontmostDiversionNowV1(
+	ctx context.Context,
+) computerUseFrontmostDiversionV1 {
+	if t == nil || t.client == nil {
+		return ""
+	}
+	target, err := resolveGUIAXTarget(ctx, t.client, "", 0)
+	if err != nil {
+		return ""
+	}
+	return t.frontmostDiversionV1(target.PID, target.BundleID)
 }
 
 func guiDescriptor(action string, effect agent.GUIActionEffect, path string) agent.GUIActionDescriptor {
@@ -206,10 +229,14 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 	pid := 0
 	usesInitialTarget := false
 	if t.snapshot != nil {
-		target = guiAXTarget{BundleID: t.snapshot.bundleID, AppName: t.snapshot.app}
+		target = guiAXTarget{
+			PID: t.snapshot.pid, BundleID: t.snapshot.bundleID,
+			AppName: t.snapshot.app,
+		}
 		pid = t.snapshot.pid
 	} else if t.coordinateFocus != nil {
 		target = guiAXTarget{
+			PID:      t.coordinateFocus.pid,
 			BundleID: t.coordinateFocus.bundleID,
 			AppName:  t.coordinateFocus.app,
 		}
@@ -236,6 +263,31 @@ func (t *ComputerUseTool) DescribeGUIAction(ctx context.Context, argsJSON string
 		} else {
 			if usesInitialTarget && resolved.BundleID != t.initialTarget.BundleID {
 				return agent.GUIActionDescriptor{}, fmt.Errorf("initial computer-use target identity changed")
+			}
+			if args.FollowFrontmost && args.App == "" &&
+				t.lastTaskTarget != nil &&
+				t.frontmostDiversionV1(
+					resolved.PID,
+					resolved.BundleID,
+				) != "" {
+				retained := *t.lastTaskTarget
+				resolved, err = resolveGUIAXTarget(
+					ctx,
+					t.client,
+					"",
+					retained.PID,
+				)
+				if err != nil {
+					return agent.GUIActionDescriptor{}, fmt.Errorf(
+						"resolve retained computer-use target: %w",
+						err,
+					)
+				}
+				if resolved.BundleID != retained.BundleID {
+					return agent.GUIActionDescriptor{}, fmt.Errorf(
+						"retained computer-use target identity changed",
+					)
+				}
 			}
 			target = resolved
 		}
