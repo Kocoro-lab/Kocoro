@@ -958,9 +958,20 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 // Only transport errors should trigger a reconnect attempt — retrying on logic
 // errors risks duplicating non-idempotent side effects.
 func IsTransportError(err error) bool {
+	// Innermost semantics win over wrapper type: mcp-go's client layer wraps
+	// EVERY transport SendRequest error in *transport.Error — including the
+	// bare ctx.Err() its stdio transport returns when a per-call deadline
+	// expires. A timed-out call is NOT a dead connection; retrying it would
+	// re-dispatch a non-idempotent tool call that already ran for the full
+	// timeout budget. The dead-process chains below (ErrTransportClosed,
+	// broken pipe, EOF) never carry a context error, so this exclusion
+	// cannot mask a real transport failure.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
 	// mcp-go wraps every transport-level send failure in *transport.Error
 	// and signals a dead stdio subprocess with transport.ErrTransportClosed.
-	// Classify by TYPE first — live 2026-07-30 repro: a kill -9'd
+	// Classify by TYPE, not message text — live 2026-07-30 repro: a kill -9'd
 	// workspace-mcp produced "transport error: transport closed", which the
 	// string list below does not match, so the dead-connection retry never
 	// fired and the model just saw a hard failure.

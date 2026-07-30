@@ -111,6 +111,28 @@ func TestIsTransportErrorMatchesMCPGoTransportError(t *testing.T) {
 	}
 }
 
+// The REAL error chain of a per-call timeout: mcp-go's stdio SendRequest
+// returns bare ctx.Err() on <-ctx.Done() (stdio.go), then client.go wraps
+// EVERY SendRequest error — including that DeadlineExceeded — in
+// transport.NewError. Classifying by *transport.Error alone would call this a
+// transport failure and re-dispatch a non-idempotent tool call that already
+// ran for the full timeout. Innermost semantics must win over wrapper type.
+func TestIsTransportErrorExcludesWrappedContextErrors(t *testing.T) {
+	realTimeoutChain := fmt.Errorf("tools/call failed: %w", transport.NewError(context.DeadlineExceeded))
+	if IsTransportError(realTimeoutChain) {
+		t.Fatal("mcp-go-wrapped DeadlineExceeded must not classify as a transport failure (would retry a timed-out non-idempotent call)")
+	}
+	realCancelChain := fmt.Errorf("tools/call failed: %w", transport.NewError(context.Canceled))
+	if IsTransportError(realCancelChain) {
+		t.Fatal("mcp-go-wrapped context.Canceled must not classify as a transport failure")
+	}
+	// The dead-process chain must still classify — it carries no context error.
+	deadProcess := fmt.Errorf("tools/call failed: %w", transport.NewError(transport.ErrTransportClosed))
+	if !IsTransportError(deadProcess) {
+		t.Fatal("wrapped ErrTransportClosed must still classify as a transport failure")
+	}
+}
+
 // The default constant pins the industry-consensus value (Codex and Hermes
 // both default MCP tool calls to 300s).
 func TestDefaultToolCallTimeoutValue(t *testing.T) {
