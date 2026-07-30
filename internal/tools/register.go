@@ -990,26 +990,23 @@ func RebuildRegistryForHealth(
 	playwrightPresent := false
 	if mcpMgr != nil {
 		for serverName, health := range healthStates {
-			// onDemandDegraded is the one narrow case where a Degraded server's
-			// cached tools stay exposed: Playwright in CDP mode with
-			// keep_alive=false, where Degraded is the expected idle state after a
-			// prior turn's on-demand Chrome teardown. Its tools recover on demand
-			// (mcp_tool.go ensureChromeDebugPort relaunches Chrome before the
-			// call) the moment the agent invokes a browser tool.
-			onDemandDegraded := false
 			switch health.State {
 			case mcp.StateHealthy, mcp.StateDisconnected:
 				// Healthy works directly; Disconnected is exposed with on-demand
 				// reconnect (handled below).
 			case mcp.StateDegraded:
-				// Any OTHER Degraded server (non-CDP playwright, keep_alive=true,
-				// or a future capability-probed server) stays hidden — exposing a
-				// server whose capability probe is failing would surface broken
-				// cached tools and, for playwright, strip the working fallback.
+				// The one narrow Degraded case whose cached tools stay exposed:
+				// Playwright in CDP mode with keep_alive=false, where Degraded
+				// is the expected idle state after a prior turn's on-demand
+				// Chrome teardown; its tools recover the moment the agent
+				// invokes a browser tool (mcp_tool.go ensureChromeDebugPort
+				// relaunches Chrome before the call). Any OTHER Degraded server
+				// (non-CDP playwright, keep_alive=true, or a future
+				// capability-probed server) stays hidden — exposing a server
+				// whose capability probe is failing would surface broken cached
+				// tools and, for playwright, strip the working fallback.
 				cfg, ok := mcpMgr.ConfigFor(serverName)
-				if ok && serverName == "playwright" && mcp.IsPlaywrightCDPMode(cfg) && !cfg.KeepAlive {
-					onDemandDegraded = true
-				} else {
+				if !(ok && serverName == "playwright" && mcp.IsPlaywrightCDPMode(cfg) && !cfg.KeepAlive) {
 					continue
 				}
 			default:
@@ -1022,10 +1019,18 @@ func RebuildRegistryForHealth(
 					continue
 				}
 				mt := NewMCPTool(t.ServerName, t.Tool, mcpMgr)
-				// Disconnected and the scoped on-demand Degraded get the supervisor
-				// for on-demand reconnect: Chrome only relaunches when the LLM
-				// actually invokes a browser tool, never from the turn-start probe.
-				if (health.State == mcp.StateDisconnected || onDemandDegraded) && supervisor != nil {
+				// EVERY rebuilt MCP tool carries the supervisor: a server
+				// healthy at build time can die mid-flight, and both the
+				// pre-dispatch health gate and the transport-failure retry in
+				// mcp_tool.go need supervisor access to recover. 2026-07-30
+				// live repro: a healthy-built google-workspace tool had no
+				// supervisor, so a kill -9'd subprocess surfaced as a hard
+				// failure instead of reconnecting. Holding the reference is
+				// inert for healthy servers — probes fire only on
+				// known-disconnected dispatch or transport failure, so the
+				// turn-start-Chrome concern (see onDemandDegraded above) is
+				// unaffected.
+				if supervisor != nil {
 					mt.SetSupervisor(supervisor)
 				}
 				reg.Register(mt)

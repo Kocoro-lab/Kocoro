@@ -235,6 +235,37 @@ func TestMCPTool_Run_NoRetryAfterCtxCancel(t *testing.T) {
 	}
 }
 
+// A server that is HEALTHY at registry-build time can still die mid-flight.
+// 2026-07-30 live repro: a kill -9'd workspace-mcp between the supervisor's
+// periodic probes left the healthy-built tool without a supervisor, so
+// neither the pre-dispatch gate nor the transport-failure retry could fire —
+// the model saw a hard failure instead of a reconnect. Every rebuilt MCP
+// tool must carry the supervisor; holding the reference is inert for healthy
+// servers (probes fire only on known-disconnected dispatch or transport
+// failure).
+func TestRebuildRegistryForHealth_HealthyToolsCarrySupervisor(t *testing.T) {
+	baseline := agent.NewToolRegistry()
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("gws", mcp.MCPServerConfig{Command: "dummy"})
+	mgr.SeedToolCache("gws", []mcp.RemoteTool{{ServerName: "gws", Tool: mcpgo.Tool{Name: "search_files"}}})
+	sup := mcp.NewSupervisor(mgr)
+
+	healthStates := map[string]mcp.ServerHealth{"gws": {State: mcp.StateHealthy}}
+	reg := RebuildRegistryForHealth(baseline, nil, nil, healthStates, mgr, sup)
+
+	tool, ok := reg.Get("search_files")
+	if !ok {
+		t.Fatal("expected healthy server's tool to be registered")
+	}
+	mt, ok := tool.(*MCPTool)
+	if !ok {
+		t.Fatalf("expected *MCPTool, got %T", tool)
+	}
+	if mt.supervisor == nil {
+		t.Fatal("healthy-built MCP tool must carry the supervisor — a live connection can die mid-flight")
+	}
+}
+
 // --- Test 2: No cache → disconnected server tools NOT injected ---
 
 func TestRebuildRegistryForHealth_DisconnectedNoCache(t *testing.T) {
