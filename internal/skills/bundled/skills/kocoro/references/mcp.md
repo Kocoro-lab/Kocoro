@@ -37,6 +37,16 @@ MCP servers are configured through the config API — there is no separate MCP e
 - Default: 60s, configurable globally via `mcp.default_connect_timeout_secs`
 - Notes: Caps the per-server startup time when `/config/reload` (or daemon startup) fires the background connect goroutine. The daemon ships built-in Intercom with 300s so the user has 5 minutes to complete the browser OAuth flow before the npx subprocess is force-killed. When the timeout fires, the daemon force-closes the client (which SIGTERMs the subprocess for stdio servers) and writes an `mcp_connect` audit entry; the server state stays `enabled` but never reaches `connected`.
 
+### Per-server tool call timeout
+- Field: `mcp_servers.<name>.tool_timeout_secs`
+- Default: 300s, configurable globally via `mcp.tool_timeout_secs`
+- Notes: Bounds a SINGLE tools/call attempt to this server so a wedged MCP subprocess (accepts the request, never replies) cannot hang the turn indefinitely. It bounds the attempt, not the whole call: after a transport failure the daemon reconnects and retries once, so a call is at most two attempts plus reconnect (a timeout is NOT retried — the tool may have run for the full budget). Cannot be disabled — only raised (0 falls back to the default). Raise it per-server for tools that legitimately run long (large exports, batch jobs); the symptom when it binds is a "no response within per-call timeout" tool error.
+
+### Workspace base for file-producing MCP servers
+- Field: `mcp_servers.<name>.workspace_base`
+- Default: unset (results stay untranslated)
+- Notes: Declares the absolute directory this server's tool results render RELATIVE file paths against. When set, the daemon annotates relative artifact links in results with a `Saved to: <absolute path>` line — only for files that verifiably exist under the base — so the agent never has to guess where an artifact landed. Set it when adding an MCP server that writes files locally and reports them by relative path. playwright is handled built-in (its base is the first advertised MCP root) and does not need this field.
+
 ### Disable an MCP server (without removing)
 - Method: PATCH
 - Path: /config

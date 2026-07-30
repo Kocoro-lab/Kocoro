@@ -28,6 +28,26 @@ func FromContext(ctx context.Context) string {
 	return v
 }
 
+type artifactDirKey struct{}
+
+// WithArtifactDir stores the session's artifact scratch directory — the
+// default landing zone for machine-generated intermediate files (MCP
+// screenshots, snapshots) — separately from the session CWD. The CWD stays
+// the model's READ context ("stuff in front of me"); the artifact dir keeps
+// intermediate WRITES out of user-visible folders like ~/Desktop.
+// Deliverables the user asked for are addressed with absolute paths and are
+// unaffected.
+func WithArtifactDir(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, artifactDirKey{}, dir)
+}
+
+// ArtifactDirFromContext returns the artifact scratch dir, or "" if unset
+// (TUI / one-shot CLI runs, where artifacts belong in the working directory).
+func ArtifactDirFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(artifactDirKey{}).(string)
+	return v
+}
+
 // expandHome expands a leading ~ to the user's home directory.
 func expandHome(path string) string {
 	if path == "~" {

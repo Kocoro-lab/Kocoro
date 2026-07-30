@@ -36,6 +36,18 @@ type MCPServerConfig struct {
 	// catalog so the user has time to complete the browser flow before the
 	// daemon kills the npx subprocess.
 	ConnectTimeoutSeconds int `yaml:"connect_timeout_secs,omitempty" mapstructure:"connect_timeout_secs" json:"connect_timeout_secs,omitempty"`
+	// ToolTimeoutSeconds bounds a single tools/call attempt to this server.
+	// Zero falls back to the manager default (SetToolCallTimeout, wired from
+	// `mcp.tool_timeout_secs`, default 300s). Raise it per-server for MCP
+	// tools that legitimately run long (large exports, batch jobs).
+	ToolTimeoutSeconds int `yaml:"tool_timeout_secs,omitempty" mapstructure:"tool_timeout_secs" json:"tool_timeout_secs,omitempty"`
+	// WorkspaceBase declares the directory this server's tool results render
+	// relative paths against (for file-producing MCP servers). When set, the
+	// daemon translates relative artifact links in results to absolute paths
+	// under this base — but only for files that actually exist there. Servers
+	// without it (and outside the built-in table) stay opaque: we never
+	// rewrite paths whose semantics we don't know.
+	WorkspaceBase string `yaml:"workspace_base,omitempty" mapstructure:"workspace_base" json:"workspace_base,omitempty"`
 	// Builtin marks an entry that originated from BuiltinMCPServers. Set by
 	// config.Load after merging the in-binary catalog onto user yaml; never
 	// persisted (yaml:"-" + mapstructure:"-"). The daemon API surfaces it
@@ -43,6 +55,20 @@ type MCPServerConfig struct {
 	// from user-added ones.
 	Builtin bool `yaml:"-" mapstructure:"-" json:"builtin,omitempty"`
 }
+
+// DefaultToolCallTimeout bounds a single tools/call attempt when neither the
+// server config (ToolTimeoutSeconds) nor the manager (SetToolCallTimeout,
+// wired from `mcp.tool_timeout_secs`) overrides it.
+//
+// Workload: interactive tool calls from the agent loop — search, browse,
+// file ops — that normally finish in seconds. Symptom when it binds: a
+// legitimately long MCP tool (large export, batch job) errors at 5 minutes;
+// raise `mcp.tool_timeout_secs` globally or the server's `tool_timeout_secs`.
+// Why it exists: a wedged-alive MCP subprocess accepts the request write and
+// never replies — without this bound the call blocks the turn indefinitely
+// (2026-07-29: google-workspace sat 6.5 min on a dead pipe). 300s matches
+// the Codex (DEFAULT_TOOL_TIMEOUT) and Hermes MCP defaults.
+const DefaultToolCallTimeout = 300 * time.Second
 
 // RemoteTool represents a tool discovered from an MCP server.
 type RemoteTool struct {
@@ -63,6 +89,10 @@ type ClientManager struct {
 	idleTimers   map[string]*time.Timer         // per-server idle disconnect timers
 	needsSetup   map[string]bool                // servers gated by missing readiness marker
 	rootsHandler *RootsHandler                  // advertised to servers honoring the MCP roots capability; nil disables advertisement
+	// toolCallTimeout bounds a single tools/call attempt when the server
+	// config has no ToolTimeoutSeconds override. Zero = DefaultToolCallTimeout.
+	// Wired from `mcp.tool_timeout_secs` via SetToolCallTimeout.
+	toolCallTimeout time.Duration
 }
 
 // NewClientManager creates a new MCP client manager.
@@ -111,6 +141,20 @@ func (m *ClientManager) SetRootsHandler(h *RootsHandler) {
 	m.mu.Lock()
 	m.rootsHandler = h
 	m.mu.Unlock()
+}
+
+// FirstAdvertisedRoot returns the first advertised workspace root that
+// currently exists — the directory a roots-honoring server (playwright-mcp)
+// renders result paths relative to. Empty when no handler is installed or
+// no root exists.
+func (m *ClientManager) FirstAdvertisedRoot() string {
+	m.mu.Lock()
+	h := m.rootsHandler
+	m.mu.Unlock()
+	if h == nil {
+		return ""
+	}
+	return h.FirstExistingRoot()
 }
 
 // ConnectAll connects to all configured MCP servers in parallel and returns discovered tools.
@@ -572,13 +616,29 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 		return "", true, fmt.Errorf("MCP server %q not connected", serverName)
 	}
 
-	result, err := c.CallTool(ctx, mcp.CallToolRequest{
-		Params: mcp.CallToolParams{
-			Name:      toolName,
-			Arguments: args,
-		},
-	})
-	if err != nil && isTransportError(err) {
+	// Per-attempt timeout: a wedged-alive MCP subprocess accepts the request
+	// write and never replies — without a bound the call blocks the turn
+	// until the process happens to die (2026-07-29: google-workspace held a
+	// tool call for 6.5 minutes). Each attempt (initial + post-reconnect
+	// retry) gets its own budget; an earlier caller deadline still wins.
+	callTimeout := m.resolveToolCallTimeout(cfg, hasCfg)
+	callToolOnce := func(callCtx context.Context) (*mcp.CallToolResult, error) {
+		attemptCtx, cancel := context.WithTimeout(callCtx, callTimeout)
+		defer cancel()
+		res, callErr := c.CallTool(attemptCtx, mcp.CallToolRequest{
+			Params: mcp.CallToolParams{
+				Name:      toolName,
+				Arguments: args,
+			},
+		})
+		if callErr != nil && attemptCtx.Err() == context.DeadlineExceeded && callCtx.Err() == nil {
+			callErr = fmt.Errorf("no response within per-call timeout %s (override: mcp server %q tool_timeout_secs, or mcp.tool_timeout_secs): %w", callTimeout, serverName, callErr)
+		}
+		return res, callErr
+	}
+
+	result, err := callToolOnce(ctx)
+	if err != nil && IsTransportError(err) {
 		m.mu.Lock()
 		skip := m.supervised
 		m.mu.Unlock()
@@ -613,12 +673,9 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 				m.mu.Lock()
 				c = m.clients[serverName]
 				m.mu.Unlock()
-				result, err = c.CallTool(ctx, mcp.CallToolRequest{
-					Params: mcp.CallToolParams{
-						Name:      toolName,
-						Arguments: args,
-					},
-				})
+				// callToolOnce reads the reassigned c and applies a fresh
+				// per-attempt timeout to the retry.
+				result, err = callToolOnce(ctx)
 			}
 		}
 		if err != nil {
@@ -766,6 +823,30 @@ func (m *ClientManager) SetSupervised(v bool) {
 	m.mu.Unlock()
 }
 
+// SetToolCallTimeout sets the default per-attempt tools/call timeout applied
+// when a server config carries no ToolTimeoutSeconds override. Wired from
+// `mcp.tool_timeout_secs`. Zero keeps DefaultToolCallTimeout.
+func (m *ClientManager) SetToolCallTimeout(d time.Duration) {
+	m.mu.Lock()
+	m.toolCallTimeout = d
+	m.mu.Unlock()
+}
+
+// resolveToolCallTimeout picks the per-attempt tools/call bound:
+// per-server ToolTimeoutSeconds > manager default > DefaultToolCallTimeout.
+func (m *ClientManager) resolveToolCallTimeout(cfg MCPServerConfig, hasCfg bool) time.Duration {
+	if hasCfg && cfg.ToolTimeoutSeconds > 0 {
+		return time.Duration(cfg.ToolTimeoutSeconds) * time.Second
+	}
+	m.mu.Lock()
+	d := m.toolCallTimeout
+	m.mu.Unlock()
+	if d > 0 {
+		return d
+	}
+	return DefaultToolCallTimeout
+}
+
 // SetNeedsSetup marks a server as needing setup (e.g. readiness marker absent).
 func (m *ClientManager) SetNeedsSetup(name string) {
 	m.mu.Lock()
@@ -872,11 +953,35 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 	return m.connect(ctx, serverName, cfg)
 }
 
-// isTransportError reports whether err indicates a transport/connection failure
+// IsTransportError reports whether err indicates a transport/connection failure
 // (process exited, broken pipe, EOF) rather than a tool-logic or protocol error.
 // Only transport errors should trigger a reconnect attempt — retrying on logic
 // errors risks duplicating non-idempotent side effects.
-func isTransportError(err error) bool {
+func IsTransportError(err error) bool {
+	// Innermost semantics win over wrapper type: mcp-go's client layer wraps
+	// EVERY transport SendRequest error in *transport.Error — including the
+	// bare ctx.Err() its stdio transport returns when a per-call deadline
+	// expires. A timed-out call is NOT a dead connection; retrying it would
+	// re-dispatch a non-idempotent tool call that already ran for the full
+	// timeout budget. The dead-process chains below (ErrTransportClosed,
+	// broken pipe, EOF) never carry a context error, so this exclusion
+	// cannot mask a real transport failure.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	// mcp-go wraps every transport-level send failure in *transport.Error
+	// and signals a dead stdio subprocess with transport.ErrTransportClosed.
+	// Classify by TYPE, not message text — live 2026-07-30 repro: a kill -9'd
+	// workspace-mcp produced "transport error: transport closed", which the
+	// string list below does not match, so the dead-connection retry never
+	// fired and the model just saw a hard failure.
+	var te *transport.Error
+	if errors.As(err, &te) {
+		return true
+	}
+	if errors.Is(err, transport.ErrTransportClosed) {
+		return true
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}

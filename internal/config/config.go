@@ -112,6 +112,13 @@ type MCPConfig struct {
 	// fans out connection goroutines. Per-server MCPServerConfig.ConnectTimeoutSeconds
 	// overrides this. 0 keeps the hardcoded 60s fallback.
 	DefaultConnectTimeoutSecs int `mapstructure:"default_connect_timeout_secs" yaml:"default_connect_timeout_secs,omitempty" json:"default_connect_timeout_secs,omitempty"`
+	// ToolTimeoutSecs bounds a single MCP tools/call attempt. Per-server
+	// MCPServerConfig.ToolTimeoutSeconds overrides this. 0 keeps the 300s
+	// default (mcp.DefaultToolCallTimeout — matches Codex/Hermes MCP
+	// defaults). Raise it if your MCP tools legitimately run longer than
+	// 5 minutes; the symptom when it binds is a "no response within
+	// per-call timeout" tool error.
+	ToolTimeoutSecs int `mapstructure:"tool_timeout_secs" yaml:"tool_timeout_secs,omitempty" json:"tool_timeout_secs,omitempty"`
 	// DefaultAgentDisabled lists MCP server names the DEFAULT agent must not use.
 	// Default-agent-only: named agents select servers via their per-agent
 	// mcp_servers config and are unaffected. Empty = default agent uses every
@@ -494,6 +501,10 @@ func Load() (*Config, error) {
 	// 60s matches the pre-async legacy hardcoded value; OAuth-bridged servers
 	// (Intercom) override to ~300s in the built-in catalog.
 	viper.SetDefault("mcp.default_connect_timeout_secs", 60)
+	viper.SetDefault("mcp.tool_timeout_secs", 300)
+	// Age window for reclaiming per-session artifact scratch dirs
+	// (~/.shannon/tmp/sessions/<id>/) at daemon startup. 0 disables the sweep.
+	viper.SetDefault("daemon.scratch_max_age_days", 14)
 	viper.SetDefault("skills.marketplace.clawhub_url", "https://clawhub.ai")
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	// skills.marketplace.max_attempts / .retry_base_backoff_secs: in-client
