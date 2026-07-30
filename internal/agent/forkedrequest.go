@@ -40,15 +40,15 @@ type ForkOptions struct {
 //
 // The Anthropic prompt-cache server-side cache key is composed of:
 //
-//	  (1) system prompt
-//	  (2) tools array (order + names + schemas)
-//	  (3) model (specific model string — SpecificModel or model_tier resolution)
-//	  (4) messages prefix (every Role + Content byte-equal)
-//	  (5) thinking config (Type + BudgetTokens)
+//	(1) system prompt
+//	(2) tools array (order + names + schemas)
+//	(3) model (specific model string — SpecificModel or model_tier resolution)
+//	(4) messages prefix (every Role + Content byte-equal)
+//	(5) thinking config (Type + BudgetTokens)
 //
-// Plus shannon-cloud adds:
+// Cloud additionally resolves:
 //
-//	  (6) cache_control block bytes (resolved by cloud from `cache_source`)
+//	(6) cache_control block bytes (resolved by cloud from `cache_source`)
 //
 // For a forked call to hit the parent's cache, items (1)-(6) must be
 // byte-identical to the parent's most recent request. This function

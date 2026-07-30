@@ -210,9 +210,7 @@ func buildStaticSystem(opts PromptOptions) string {
 			"necessarily the user's current-message language. Describe the user-facing goal in " +
 			"5–15 words, not the internal mechanism. Example for a Chinese conversation: " +
 			"'查找最大的 10 个文件', NOT 'Run find piped to du and sort'. When the field is present, " +
-			"this rule applies — that covers almost every tool you can call. The notable exception is " +
-			"`computer`, which is registered via NativeToolDef and drops Parameters before transmission, " +
-			"so a `description` argument would never reach the model — do not invent one for it. " +
+			"this rule applies — that covers almost every tool you can call. " +
 			"Code identifiers, file paths, and CLI commands inside the description may stay in their " +
 			"original form, but the surrounding prose follows the reply language.")
 
@@ -671,8 +669,8 @@ func macOSAutomationGuidance(toolNames []string) string {
 	}
 	var bullets strings.Builder
 	if has("computer_use") {
-		bullets.WriteString("- Prefer `computer_use` for native macOS UI. Start with action=get_app_state, then act with the returned state_id and ref.\n")
-		bullets.WriteString("- Re-observe after a mutation or stale-state error. Request include_screenshot only when pixels are needed; semantic state is the default.\n")
+		bullets.WriteString("- Use `computer_use` for native macOS UI. Start with an exact app name unless this run already identifies the user's original foreground app, then act with the returned state_id and ref.\n")
+		bullets.WriteString("- One state belongs to one existing app window. Re-observe after a mutation or stale-state error. screenshot and include_screenshot capture only that target window and should be requested only when pixels are needed.\n")
 		bullets.WriteString("- Use coordinate click/move only when the Accessibility tree has no usable ref.\n")
 	} else if has("accessibility") {
 		bullets.WriteString("- Prefer `accessibility` (AX API) over `computer` for UI interactions — faster, no screenshot needed.\n")

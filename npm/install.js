@@ -41,6 +41,27 @@ function fetch(url) {
   });
 }
 
+function parseExpectedChecksum(checksumData, filename) {
+  for (const rawLine of checksumData.toString().split(/\r?\n/)) {
+    const match = rawLine
+      .trim()
+      .match(/^([a-fA-F0-9]{64})[ \t]+\*?(.+)$/);
+    if (match && match[2] === filename) {
+      return match[1].toLowerCase();
+    }
+  }
+  throw new Error("No valid checksum found for " + filename);
+}
+
+function verifyChecksum(tarball, checksumData, filename) {
+  const expected = parseExpectedChecksum(checksumData, filename);
+  const actual = crypto.createHash("sha256").update(tarball).digest("hex");
+  if (actual !== expected) {
+    throw new Error("Checksum mismatch for " + filename);
+  }
+  return actual;
+}
+
 async function main() {
   const platform = getPlatform();
   const arch = getArch();
@@ -65,18 +86,12 @@ async function main() {
 
   // Verify checksum
   const checksumAsset = release.assets.find((a) => a.name === "checksums.txt");
-  if (checksumAsset) {
-    const checksumData = await fetch(checksumAsset.browser_download_url);
-    const line = checksumData.toString().split("\n").find((l) => l.includes(filename));
-    if (line) {
-      const expected = line.split(/\s+/)[0];
-      const actual = crypto.createHash("sha256").update(tarball).digest("hex");
-      if (actual !== expected) {
-        throw new Error("Checksum mismatch for " + filename);
-      }
-      console.log("shan: checksum verified");
-    }
+  if (!checksumAsset) {
+    throw new Error("Release is missing checksums.txt");
   }
+  const checksumData = await fetch(checksumAsset.browser_download_url);
+  verifyChecksum(tarball, checksumData, filename);
+  console.log("shan: checksum verified");
 
   // Extract with system tar
   fs.mkdirSync(BIN_DIR, { recursive: true });
@@ -97,7 +112,11 @@ async function main() {
   console.log("shan: v" + version + " installed successfully");
 }
 
-main().catch((err) => {
-  console.error("shan install failed: " + err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("shan install failed: " + err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { parseExpectedChecksum, verifyChecksum };

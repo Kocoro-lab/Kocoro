@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "action": "click",
+  "primary_action_committed": false,
+  "pointer_motion_committed": true,
+  "phase": "pointer_move",
+  "failure_code": "pointer_endpoint_not_verified",
+  "retry_safe": false,
+  "pointer_endpoint": {
+    "requested": {"x": 200.5, "y": 300.5},
+    "observed": {"x": 210.5, "y": 300.5},
+    "tolerance": 2,
+    "verified": false
+  }
+}

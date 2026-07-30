@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -122,6 +124,29 @@ func TestApprovalBroker_SendFails(t *testing.T) {
 	}
 }
 
+func TestApprovalBrokerGUIRequestCarriesContentFreePresentation(t *testing.T) {
+	secret := "ordinary text intended for an editor"
+	var captured ApprovalRequest
+	broker := NewApprovalBroker(func(req ApprovalRequest) error {
+		captured = req
+		return fmt.Errorf("stop after capture")
+	})
+	decision := broker.Request(context.Background(), ApprovalRequestMeta{}, "computer_use",
+		`{"action":"type","text":"`+secret+`","description":"Type `+secret+`"}`)
+	if decision != DecisionDeny {
+		t.Fatalf("decision = %q, want deny after transport failure", decision)
+	}
+	serialized := captured.Title + "\n" + captured.Args
+	if strings.Contains(serialized, secret) || strings.Contains(serialized, `"text"`) || strings.Contains(serialized, `"description"`) {
+		t.Fatalf("GUI approval presentation leaked content: %s", serialized)
+	}
+	if captured.Title != "computer_use: type" ||
+		!strings.Contains(captured.Args, `"action":"type"`) ||
+		!strings.Contains(captured.Args, `"redacted":true`) {
+		t.Fatalf("GUI approval presentation lost safe action metadata: %+v", captured)
+	}
+}
+
 func TestApprovalBroker_ResolveUnknown(t *testing.T) {
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 	// Should not panic
@@ -231,6 +256,12 @@ func TestApprovalBroker_FormerlyHighRiskNowAutoApprovable(t *testing.T) {
 	if !broker.IsToolAutoApproved("file_write") {
 		t.Error("file_write auto-approve regressed")
 	}
+	for _, tool := range []string{"computer", "accessibility", "applescript", "ghostty"} {
+		broker.SetToolAutoApprove(tool)
+		if broker.IsToolAutoApproved(tool) {
+			t.Errorf("%s must refuse persistent auto-approval", tool)
+		}
+	}
 }
 
 // TestApprovalBroker_FlagsNoLongerSetForFormerlyHighRisk pins the UI-facing
@@ -245,7 +276,7 @@ func TestApprovalBroker_FlagsNoLongerSetForFormerlyHighRisk(t *testing.T) {
 		return nil
 	})
 	// Previously-high-risk tool: flag MUST be absent now.
-	for _, tool := range []string{"publish_to_web", "generate_image", "edit_image"} {
+	for _, tool := range []string{"computer_use", "publish_to_web", "generate_image", "edit_image"} {
 		captured = ApprovalRequest{}
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		_ = broker.Request(ctx, ApprovalRequestMeta{}, tool, "{}")
@@ -268,6 +299,15 @@ func TestApprovalBroker_FlagsNoLongerSetForFormerlyHighRisk(t *testing.T) {
 				t.Errorf("%s: flag %q should NOT be set for safe tools, got %v",
 					tool, ApprovalFlagAlwaysAllowDisabled, captured.Flags)
 			}
+		}
+	}
+	for _, tool := range []string{"computer", "accessibility", "applescript", "ghostty"} {
+		captured = ApprovalRequest{}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_ = broker.Request(ctx, ApprovalRequestMeta{}, tool, "{}")
+		cancel()
+		if !slices.Contains(captured.Flags, ApprovalFlagAlwaysAllowDisabled) {
+			t.Errorf("%s: fresh-approval flag missing from %v", tool, captured.Flags)
 		}
 	}
 }

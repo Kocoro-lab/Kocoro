@@ -1,0 +1,7 @@
+{
+  "accepted": true,
+  "quiesced": false,
+  "lease_id": "cul_demo",
+  "revision": 42,
+  "lease_state": "stopping"
+}

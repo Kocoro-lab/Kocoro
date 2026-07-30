@@ -45,6 +45,24 @@ func (t *concurrentStub) RequiresApproval() bool                          { retu
 func (t *concurrentStub) IsReadOnlyCall(string) bool                      { return t.readOnly }
 func (t *concurrentStub) IsConcurrencySafeCall(string) bool               { return t.concurrencySafe }
 
+type invocationCapturingTool struct {
+	name        string
+	readOnly    bool
+	invocations chan ToolInvocation
+}
+
+func (t *invocationCapturingTool) Info() ToolInfo { return ToolInfo{Name: t.name} }
+func (t *invocationCapturingTool) Run(ctx context.Context, _ string) (ToolResult, error) {
+	invocation, ok := ToolInvocationFromContext(ctx)
+	if !ok {
+		return ToolResult{Content: "missing tool invocation", IsError: true}, nil
+	}
+	t.invocations <- invocation
+	return ToolResult{}, nil
+}
+func (t *invocationCapturingTool) RequiresApproval() bool     { return false }
+func (t *invocationCapturingTool) IsReadOnlyCall(string) bool { return t.readOnly }
+
 func ac(tool Tool, index int) approvedToolCall {
 	return approvedToolCall{
 		index:   index,
@@ -146,5 +164,61 @@ func TestPartition_FallbackToReadOnly(t *testing.T) {
 	batches := partitionToolCalls([]approvedToolCall{ac(r1, 0), ac(w, 1), ac(r2, 2)})
 	if len(batches) != 3 {
 		t.Fatalf("expected 3 sequential batches, got %d", len(batches))
+	}
+}
+
+func TestExecuteBatchesInjectsExactToolInvocationIntoSerialAndConcurrentRuns(t *testing.T) {
+	serial := &invocationCapturingTool{
+		name:        "serial_probe",
+		invocations: make(chan ToolInvocation, 1),
+	}
+	concurrentA := &invocationCapturingTool{
+		name:        "read_probe_a",
+		readOnly:    true,
+		invocations: make(chan ToolInvocation, 1),
+	}
+	concurrentB := &invocationCapturingTool{
+		name:        "read_probe_b",
+		readOnly:    true,
+		invocations: make(chan ToolInvocation, 1),
+	}
+
+	approved := []approvedToolCall{
+		{index: 0, fc: client.FunctionCall{ID: "toolu_serial", Name: serial.name}, tool: serial, argsStr: "{}"},
+		{index: 1, fc: client.FunctionCall{ID: "toolu_a", Name: concurrentA.name}, tool: concurrentA, argsStr: "{}"},
+		{index: 2, fc: client.FunctionCall{ID: "toolu_b", Name: concurrentB.name}, tool: concurrentB, argsStr: "{}"},
+	}
+	execResults := make([]toolExecResult, len(approved))
+	const userRequest = "Open TextEdit, type hello, then open Calculator"
+	executeBatches(
+		context.Background(),
+		partitionToolCalls(approved),
+		execResults,
+		nil,
+		nil,
+		userRequest,
+	)
+
+	for _, test := range []struct {
+		tool *invocationCapturingTool
+		want ToolInvocation
+	}{
+		{serial, ToolInvocation{
+			ToolName: "serial_probe", ToolUseID: "toolu_serial",
+			UserRequest: userRequest,
+		}},
+		{concurrentA, ToolInvocation{
+			ToolName: "read_probe_a", ToolUseID: "toolu_a",
+			UserRequest: userRequest,
+		}},
+		{concurrentB, ToolInvocation{
+			ToolName: "read_probe_b", ToolUseID: "toolu_b",
+			UserRequest: userRequest,
+		}},
+	} {
+		got := <-test.tool.invocations
+		if got != test.want {
+			t.Fatalf("%s invocation = %#v, want %#v", test.tool.name, got, test.want)
+		}
 	}
 }

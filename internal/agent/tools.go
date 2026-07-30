@@ -73,6 +73,21 @@ type ToolResult struct {
 	IsRetryable   bool          // true only for transient errors
 	Images        []ImageBlock
 	CloudResult   bool // true when result is a cloud deliverable (bypass LLM summarization)
+	// GUIOutcome is a daemon-internal, redacted execution acknowledgement. It
+	// is consumed by the computer-use control wrapper and is never serialized
+	// into provider-visible tool results.
+	GUIOutcome *GUIActionOutcome `json:"-"`
+	// ComputerUseOutcome is the goal-level counterpart to GUIOutcome. It keeps
+	// completed/not-completed/unverified and the accumulated action effect
+	// available to local orchestration without serializing it to providers.
+	ComputerUseOutcome *ComputerUseTaskOutcome `json:"-"`
+	// GUICaptureDiagnostics carries redacted exact-window capture geometry only
+	// inside the daemon. It is never serialized into provider-visible results.
+	GUICaptureDiagnostics *GUICaptureDiagnostics `json:"-"`
+	// GUIObservation records whether an attached desktop image also minted
+	// coordinate authority. A visual-only image is valid for verification but
+	// cannot safely seed a provider action batch.
+	GUIObservation *GUIObservationOutcome `json:"-"`
 	// Usage optionally reports per-call cost for this tool. Gateway tools
 	// whose server returns billing info (x_search → xAI tokens, web_search
 	// → SerpAPI query count) populate this so the audit logger can write a
@@ -105,6 +120,16 @@ type ToolResult struct {
 	//
 	// Field is intentionally untagged for JSON — it never crosses the wire.
 	InternalOnly bool `json:"-"`
+}
+
+type GUIObservationOutcome struct {
+	CoordinateActionable bool
+	SemanticActionable   bool
+	// ActionabilityFailureCode preserves the typed reason why a useful exact
+	// screenshot could not mint action authority. It is local-only and lets
+	// retry/trace policy distinguish transient capture drift from stable
+	// geometry without parsing provider-visible prose.
+	ActionabilityFailureCode string
 }
 
 // ToolUsage is ToolResult's per-call cost breakdown. Mirrors client.ToolUsage
@@ -247,11 +272,46 @@ type Tool interface {
 	RequiresApproval() bool
 }
 
+// ApprovalAdmissionChecker is a daemon-facing, fail-closed gate evaluated
+// before permission allow-lists, safe-call exemptions, approval caches, or the
+// approval UI. It lets a target-aware wrapper reject a prohibited invocation
+// without first displaying an approval request, and can require fresh attended
+// consent even when a broader permission setting would otherwise auto-allow.
+// Ordinary tools do not implement this interface and retain existing behavior.
+type ApprovalAdmissionChecker interface {
+	ApprovalAdmission(ctx context.Context, argsJSON string) ApprovalAdmissionDecision
+}
+
+// ApprovalAdmissionDenialReporter optionally replaces the generic permission
+// denial shown to the model with a structured, redacted reason. It is queried
+// only after ApprovalAdmission returned deny; it cannot turn a denial into an
+// allow or execute the tool.
+type ApprovalAdmissionDenialReporter interface {
+	ApprovalAdmissionDenialResult(ctx context.Context, argsJSON string) (ToolResult, bool)
+}
+
+type ApprovalAdmissionDecision string
+
+const (
+	ApprovalAdmissionInherit      ApprovalAdmissionDecision = "inherit"
+	ApprovalAdmissionDeny         ApprovalAdmissionDecision = "deny"
+	ApprovalAdmissionRequireFresh ApprovalAdmissionDecision = "require_fresh_approval"
+)
+
 // NativeToolProvider is an optional interface for tools that use a provider's
 // native tool schema (e.g., Anthropic's computer_20251124) instead of the
 // standard function-calling format.
 type NativeToolProvider interface {
 	NativeToolDef() *client.NativeToolDef
+}
+
+// NativeToolRequestPreparer performs provider-native, run-local preparation
+// immediately before the selected tool schemas are serialized for an LLM
+// request. It must be deterministic for one pending request and must not call
+// the provider. Ordinary tools and native tools without dynamic local state do
+// not implement it.
+type NativeToolRequestPreparer interface {
+	PrepareNativeToolRequest(context.Context) error
 }
 
 // SafeChecker is an optional interface tools can implement to indicate
@@ -388,45 +448,46 @@ func isBuiltinCancelable(name string) bool {
 // AutoApprovalDenyList returns a copy for cross-package consistency tests;
 // DisallowsAutoApproval is the runtime check.
 //
-// As of 2026-05-18 this list is intentionally empty: publish_to_web /
-// generate_image / edit_image used to be on it because of paid + permanent
-// CDN concerns. The product decision was to treat them as ordinary
-// approval-required tools — fresh prompt the first time, "always allow"
-// persists for future calls. The path-allowlist and basename-blocklist
-// guards in `internal/tools/publish_to_web.go` are still in place as
-// independent protection.
-//
-// The plumbing (DisallowsAutoApproval + all call sites) is preserved as a
-// hook for a future tool that genuinely cannot be persisted (account
-// deletion, payment authorization, etc.). See unattendedAutoApprovalDenyList
-// below for the parallel unattended-only gate.
-var autoApprovalDenyList = []string{}
+// computer_use is intentionally absent: it is the one guarded GUI surface
+// whose explicit tool-level grant represents the product's global Computer
+// Use permission. Legacy names remain covered so a model cannot bypass that
+// guarded surface by selecting an older wrapper.
+var autoApprovalDenyList = []string{
+	"computer",
+	"accessibility",
+	"applescript",
+	"ghostty",
+}
 
 // unattendedAutoApprovalDenyList is the set of tools that scheduled
 // (unattended) agent runs MUST NOT auto-approve.
 //
-// computer_use (added 2026-07-22) drives the user's live GUI session.
-// screenshot (added 2026-07-23) captures the user's desktop. Neither may run
-// unattended: a schedule firing at 3am must not observe or control arbitrary
-// windows on the strength of a prior Always Allow click or daemon.auto_approve.
+// GUI-control tools drive the user's live screen through AX, CGEvent, Apple
+// Events, or Ghostty automation, and screenshot captures the user's desktop.
+// The gate covers each WHOLE tool, including observation actions, because the
+// current approval seam is name-based rather than action-aware: a schedule
+// firing at 3am must not observe or control arbitrary windows on the strength
+// of a prior Always Allow click or daemon.auto_approve.
 //
-// The gate covers the WHOLE tool, observation actions included:
-// checkPermissionAndApproval also suppresses the SafeChecker exemption for
-// listed tools on unattended runs. Attended use is unaffected:
-// Desktop/Slack/TUI runs still honor always-allow, normal approval, and
-// approval-free computer_use observations.
+// computer_use remains here to prevent blanket daemon.auto_approve or a missing
+// approval UI from being interpreted as user consent. AgentLoop separately
+// honors only its explicit persisted global Computer Use grant, including for
+// unattended automation; the legacy GUI names can never use that grant.
 //
-// The legacy GUI tools (accessibility / computer / applescript) are
-// DELIBERATELY not listed yet: existing user schedules may depend on
-// unattended applescript/accessibility automation, and silently breaking
-// them in a patch release is worse than the incremental exposure — they
-// already required the user to author the schedule prompt. Revisit as a
-// product decision if computer_use supersedes them.
+// Attended use is unaffected: Desktop/Slack/TUI runs still honor always-allow,
+// normal approval, and approval-free computer_use observations.
 //
 // publish_to_web / generate_image / edit_image were considered for this list
 // on 2026-05-18 and deliberately left off — attended always-allow consent
 // extends to scheduled / watcher / heartbeat invocations for them.
-var unattendedAutoApprovalDenyList = []string{"computer_use", "screenshot"}
+var unattendedAutoApprovalDenyList = []string{
+	"computer_use",
+	"screenshot",
+	"computer",
+	"accessibility",
+	"applescript",
+	"ghostty",
+}
 
 // AutoApprovalDenyList returns a copy of the tools that disallow being
 // persisted into a user-facing always-allow list. Exposed for consistency
@@ -447,10 +508,9 @@ func AutoApprovalDenyList() []string {
 // "Always Allow" button in Desktop, hand-edited config.yaml entries) is
 // refused at multiple layers.
 //
-// Currently empty — see autoApprovalDenyList for the policy decision.
-// Scheduled-run gating is INTENTIONALLY separate, since attended consent
-// ("I'm clicking always-allow right now") is a different surface than
-// unattended consent ("this cron fires at 3am unsupervised").
+// computer_use is the intentional exception among GUI-control names: its
+// explicit global grant is the product permission. Legacy GUI wrappers remain
+// denied so they cannot bypass the strict surface.
 func DisallowsAutoApproval(toolName string) bool {
 	for _, denied := range autoApprovalDenyList {
 		if toolName == denied {
@@ -460,14 +520,15 @@ func DisallowsAutoApproval(toolName string) bool {
 	return false
 }
 
-// DisallowsUnattendedAutoApproval reports tools that MUST NOT be
-// auto-approved by scheduled or otherwise-unattended agent runs, even if
-// the user has them in an always-allow list. Compare with
-// DisallowsAutoApproval, which gates attended ("I'm watching") consent.
+// DisallowsUnattendedAutoApproval reports tools that MUST NOT be inferred as
+// safe by scheduled or otherwise-unattended agent runs. AgentLoop has one
+// explicit exception: a persisted computer_use grant is accepted as the
+// user's global automation permission. Legacy GUI names remain denied.
 //
 // Callers include schedule, heartbeat, remote/SSE auto-approve, and
-// synchronous HTTP handlers. The agent loop also consults this before honoring
-// persisted Always Allow when runner.go marks the source/transport unattended.
+// synchronous HTTP handlers. The agent loop consults this when runner.go marks
+// the source/transport unattended and fails closed unless that explicit
+// computer_use grant is present.
 func DisallowsUnattendedAutoApproval(toolName string) bool {
 	for _, denied := range unattendedAutoApprovalDenyList {
 		if toolName == denied {
@@ -721,12 +782,7 @@ func buildToolSchema(t Tool) client.Tool {
 	if native, ok := t.(NativeToolProvider); ok {
 		def := native.NativeToolDef()
 		if def != nil {
-			return client.Tool{
-				Type:            def.Type,
-				Name:            def.Name,
-				DisplayWidthPx:  def.DisplayWidthPx,
-				DisplayHeightPx: def.DisplayHeightPx,
-			}
+			return buildProviderNativeToolSchema(def)
 		}
 	}
 	info := t.Info()
@@ -745,6 +801,101 @@ func buildToolSchema(t Tool) client.Tool {
 			Parameters:  params,
 		},
 	}
+}
+
+func buildProviderNativeToolSchema(def *client.NativeToolDef) client.Tool {
+	if def.Type == client.OpenAINativeComputerToolType {
+		return client.Tool{Type: def.Type}
+	}
+	return client.Tool{
+		Type:            def.Type,
+		Name:            def.Name,
+		DisplayWidthPx:  def.DisplayWidthPx,
+		DisplayHeightPx: def.DisplayHeightPx,
+	}
+}
+
+// refreshProviderNativeToolSchemas rebuilds only provider-native entries in
+// an already-selected schema set. Provider-native definitions may depend on
+// the latest observation (for example, a screenshot can change the declared
+// computer display dimensions), while ordinary function schemas and their
+// defer_loading state are part of the run's stable tool-selection contract.
+//
+// Always return an isolated slice: CompletionRequest snapshots are retained
+// for retries and post-run forks, so mutating a previously dispatched Tools
+// backing array would rewrite historical request evidence in memory.
+func refreshProviderNativeToolSchemas(reg *ToolRegistry, schemas []client.Tool) []client.Tool {
+	refreshed := append([]client.Tool(nil), schemas...)
+	if reg == nil {
+		return refreshed
+	}
+	for index, schema := range refreshed {
+		// Membership and tagged-union selection were already decided by the
+		// deferred/tool-search path. Never promote a selected function entry
+		// into a native tool during this dynamic-field refresh.
+		if schema.Type == "function" {
+			continue
+		}
+		name := schemaToolName(schema)
+		tool, ok := reg.Get(name)
+		if !ok {
+			continue
+		}
+		native, ok := tool.(NativeToolProvider)
+		if !ok {
+			continue
+		}
+		def := native.NativeToolDef()
+		if def == nil {
+			continue
+		}
+		// Capture NativeToolDef exactly once so an asynchronously changing
+		// observation cannot mix dimensions from two different snapshots.
+		// Keep request-selection metadata stable while refreshing native fields.
+		rebuilt := buildProviderNativeToolSchema(def)
+		rebuilt.DeferLoading = schema.DeferLoading
+		refreshed[index] = rebuilt
+	}
+	return refreshed
+}
+
+// prepareProviderNativeTools prepares only native entries already selected for
+// this request. A same-name function/deferred entry must never trigger native
+// preparation because tool selection is part of the stable run contract.
+func prepareProviderNativeTools(
+	ctx context.Context,
+	reg *ToolRegistry,
+	schemas []client.Tool,
+) error {
+	if reg == nil {
+		return nil
+	}
+	prepared := make(map[string]struct{})
+	for _, schema := range schemas {
+		if schema.Type == "function" {
+			continue
+		}
+		name := schemaToolName(schema)
+		if name == "" {
+			continue
+		}
+		if _, done := prepared[name]; done {
+			continue
+		}
+		tool, ok := reg.Get(name)
+		if !ok {
+			continue
+		}
+		preparer, ok := tool.(NativeToolRequestPreparer)
+		if !ok {
+			continue
+		}
+		if err := preparer.PrepareNativeToolRequest(ctx); err != nil {
+			return fmt.Errorf("prepare provider-native tool %q: %w", name, err)
+		}
+		prepared[name] = struct{}{}
+	}
+	return nil
 }
 
 // SortedNames returns tool names in the same deterministic order as SortedSchemas.

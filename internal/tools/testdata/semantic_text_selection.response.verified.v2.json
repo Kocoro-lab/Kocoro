@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "status": "verified",
+  "commit_state": "committed",
+  "phase": "post_verification",
+  "failure_code": null,
+  "retry_safe": false,
+  "postcondition": "selected_range_matches",
+  "selected_range": {
+    "location": 5,
+    "length": 12
+  }
+}

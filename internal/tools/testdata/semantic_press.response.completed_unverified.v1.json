@@ -1,0 +1,8 @@
+{
+  "failure_code": "postcondition_not_observed",
+  "phase": "post_observation",
+  "postcondition": null,
+  "press_committed": true,
+  "retry_safe": false,
+  "status": "completed_unverified"
+}

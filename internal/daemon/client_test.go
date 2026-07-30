@@ -555,7 +555,7 @@ func TestClient_SendReply_CleansUpSeq(t *testing.T) {
 	}
 }
 
-// Locks down the cross-repo contract with shannon-cloud: approval_request must
+// Locks down the public Cloud contract: approval_request must
 // carry the inbound claim's WS envelope MessageID. Cloud reads it from the
 // envelope (not the payload) to look up channel/thread context for the
 // approval card. Empty MessageID triggers Cloud's fail-closed drop.
@@ -802,7 +802,7 @@ func TestClient_DeliveryAck_SentAfterReplySuccess(t *testing.T) {
 }
 
 // TestSendProactive_AllowsEmptyAgentName guards the cross-repo contract with
-// shannon-cloud: default-agent schedules need to broadcast and the daemon must
+// Cloud contract: default-agent schedules need to broadcast and the daemon must
 // pass empty AgentName through to Cloud, which (post-Cloud-update) routes to
 // default-bound channels via the COALESCE SQL match. The pre-fix daemon
 // silently dropped these messages at the `if agentName == ""` guard before

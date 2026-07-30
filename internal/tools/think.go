@@ -56,8 +56,8 @@ func (t *ThinkTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult,
 	// lives in the assistant message's tool_use.input.thought field — the
 	// model can reference its own past reasoning from there. Echoing into
 	// the tool_result was double-counting the thought against cache
-	// (assistant tool_use input + user tool_result content). Cuts ~50% of
-	// think-related cache writes per session.
+	// (assistant tool_use input + user tool_result content). This reduces
+	// redundant cache writes; exact product measurements are not published.
 	return agent.ToolResult{Content: "thought logged"}, nil
 }
 

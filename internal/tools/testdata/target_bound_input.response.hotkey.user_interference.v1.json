@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "action": "hotkey",
+  "input_committed": false,
+  "clipboard_touched": false,
+  "clipboard_restored": false,
+  "phase": "preflight",
+  "failure_code": "frontmost_process_mismatch",
+  "retry_safe": false,
+  "postcondition": null
+}

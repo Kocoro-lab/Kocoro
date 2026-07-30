@@ -3013,7 +3013,10 @@ func (h *tuiEventHandler) OnToolCall(name string, args string, toolUseID string)
 		return
 	}
 	if h.model.program != nil {
-		h.model.program.Send(toolCallMsg{name: name, args: truncate(args, 200)})
+		h.model.program.Send(toolCallMsg{
+			name: name,
+			args: truncate(agent.RedactGUIActivityArguments(name, args), 200),
+		})
 	}
 }
 
@@ -3021,8 +3024,8 @@ func (h *tuiEventHandler) OnToolResult(name string, args string, toolUseID strin
 	if h.model.program != nil {
 		h.model.program.Send(toolResultMsg{
 			name:    name,
-			args:    args,
-			content: result.Content,
+			args:    agent.RedactGUIActivityArguments(name, args),
+			content: agent.RedactGUIActivityResult(name, result.Content),
 			isError: result.IsError,
 			elapsed: elapsed,
 		})

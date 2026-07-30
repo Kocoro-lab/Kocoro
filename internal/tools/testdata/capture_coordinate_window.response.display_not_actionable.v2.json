@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "status": "failed",
+  "failure_code": "display_not_actionable",
+  "retry_safe": true,
+  "failure_diagnostics": null,
+  "display_diagnostics": {
+    "pid": 4242,
+    "bundle_id": "com.example.fixture",
+    "window_id": 7001,
+    "window_quartz_bounds": {"x": -100, "y": 200, "width": 1, "height": 1},
+    "actionable_display_count": 0,
+    "displays": [
+      {
+        "display_id": 1,
+        "quartz_bounds": {"x": 0, "y": 0, "width": 1280, "height": 800},
+        "is_active": true,
+        "is_online": true,
+        "is_asleep": false,
+        "is_mirror_follower": false,
+        "rotation_degrees": 0,
+        "fully_contains_window": false,
+        "failed_predicates": ["does_not_fully_contain_window"]
+      },
+      {
+        "display_id": 2,
+        "quartz_bounds": {"x": -1600, "y": 100, "width": 1600, "height": 900},
+        "is_active": false,
+        "is_online": true,
+        "is_asleep": false,
+        "is_mirror_follower": false,
+        "rotation_degrees": 0,
+        "fully_contains_window": true,
+        "failed_predicates": ["inactive"]
+      }
+    ]
+  },
+  "topology_ref": null,
+  "helper_boot_id": null,
+  "pid": null,
+  "bundle_id": null,
+  "window_id": null,
+  "window_quartz_bounds": null,
+  "display_id": null,
+  "backing_scale_factor": null,
+  "media_type": null,
+  "width_px": null,
+  "height_px": null,
+  "byte_length": null,
+  "sha256": null,
+  "image_base64": null,
+  "captured_at": null
+}

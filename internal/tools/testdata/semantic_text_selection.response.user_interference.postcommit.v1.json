@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "user_interference",
+  "selection_committed": true,
+  "phase": "user_interference",
+  "failure_code": "physical_input_interference",
+  "retry_safe": false,
+  "postcondition": null,
+  "selected_range": null
+}

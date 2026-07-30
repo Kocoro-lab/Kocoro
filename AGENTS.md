@@ -171,10 +171,10 @@ Payloads decoded by UI clients (bus events, per-request SSE events, HTTP respons
 
 ### Prompt Cache
 
-Cloud currently applies the short prompt-cache TTL to every request. Preserve
-`cache_source` as attribution (not a Kocoro-side TTL selector) and preserve
-canonical tool input normalization. Any future TTL-policy change belongs in
-shannon-cloud and must update `docs/cache-strategy.md` in the same rollout.
+Cloud owns the prompt-cache TTL policy. Preserve `cache_source` as attribution
+(not a Kocoro-side TTL selector) and preserve canonical tool input
+normalization. Any future TTL-policy change belongs in the Cloud service and
+must update `docs/cache-strategy.md` in the same rollout.
 
 Any in-place message content rewrite that can affect prompt bytes must emit cache-compaction/debug instrumentation so drift remains attributable.
 
@@ -213,6 +213,6 @@ Schedule tests use temp directories and do not write to the real LaunchAgents di
 
 ## Tools
 
-Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. Common openers and compact local utilities are Direct; process/GUI automation and uncommon mutations are Deferred and loaded through `tool_search` when needed. `computer_use` is the primary native-GUI tool: Accessibility-first observations return a per-run `state_id`; ref mutations reject stale state; screenshots are explicit; windowless apps are reopened generically; integer-shaped strings are tolerated; bounded delay waits need no shell fallback; pointer actions move the real cursor visibly; observations skip approval while mutations retain normal approval policy; whole calls serialize across concurrent routes on one GUI-operation lock shared with the legacy `accessibility` / `computer` / `applescript` tools; unattended runs (including auto-approve transports and IM/voice channels without an approval UI) can never invoke it — observation actions included — even via persisted or broker Always Allow. The standalone `screenshot` tool also requires approval and is denied on unattended runs. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
+Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. Common openers and compact local utilities are Direct; uncommon mutations are Deferred and loaded through `tool_search` when needed. On daemon runs, `computer_use` is the Direct, high-level native-GUI contract on the ordinary parent model. The parent keeps its configured model; only an invoked desktop task lazily resolves `openai.computer.v1` and starts a private OpenAI Responses trajectory that owns launch/focus, screenshots, visible coordinate pointer actions, typing, app switching, re-observation, continuation, and internal state/frame authority. NSWorkspace + CGWindow supplies exact target identity when AX is incomplete. The whole task serializes on the shared GUI-operation lock. Unattended runs can invoke it ONLY via an explicit persisted GLOBAL `computer_use` always-allow grant. The legacy `computer` / `accessibility` / `applescript` / `ghostty` wrappers cannot be persisted as Always Allow and remain denied for unattended execution; daemon parent runs remove the legacy GUI wrappers and reject shell `osascript` / `cliclick`. The standalone `screenshot` tool remains separate, approval-required, and denied unattended. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
 
 Every approval-required tool must expose a short human-readable description or equivalent purpose field for approval UI. Destructive or paid/public cloud tools require approval.

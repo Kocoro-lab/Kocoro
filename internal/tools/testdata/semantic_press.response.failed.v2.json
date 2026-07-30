@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "status": "failed",
+  "commit_state": "not_committed",
+  "phase": "preflight",
+  "failure_code": "process_identity_mismatch",
+  "postcondition": null,
+  "retry_safe": false
+}

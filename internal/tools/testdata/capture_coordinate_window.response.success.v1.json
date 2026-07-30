@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "captured",
+  "failure_code": null,
+  "retry_safe": false,
+  "failure_diagnostics": null,
+  "topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+  "helper_boot_id": "helper_boot_demo",
+  "pid": 4242,
+  "bundle_id": "com.example.fixture",
+  "window_id": 7001,
+  "window_quartz_bounds": {"x": -100, "y": 200, "width": 1, "height": 1},
+  "display_id": 2,
+  "backing_scale_factor": 1,
+  "media_type": "image/png",
+  "width_px": 1,
+  "height_px": 1,
+  "byte_length": 68,
+  "sha256": "431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460",
+  "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "captured_at": "2026-07-22T12:03:30Z"
+}

@@ -698,9 +698,9 @@ func TestAuthManager_Register_InjectsProviderAndDerivesUsername(t *testing.T) {
 	// Simulate the Desktop path: handler forwards FullName but no Provider,
 	// no Username. AuthManager must fill both before hitting Cloud.
 	if err := f.manager.Register(context.Background(), client.AuthRegisterRequest{
-		Email:    "zhaichen@alioyun.com",
-		Password: "pw1234567",
-		FullName: "Chen",
+		Email:    "fixtureuser@example.com",
+		Password: "test-password",
+		FullName: "Fixture User",
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -708,15 +708,15 @@ func TestAuthManager_Register_InjectsProviderAndDerivesUsername(t *testing.T) {
 	if seenBody["provider"] != "email" {
 		t.Fatalf("Cloud saw provider=%v, want \"email\" (this was the live 2026-05-20 bug)", seenBody["provider"])
 	}
-	if seenBody["full_name"] != "Chen" {
-		t.Fatalf("Cloud saw full_name=%v, want \"Chen\"", seenBody["full_name"])
+	if seenBody["full_name"] != "Fixture User" {
+		t.Fatalf("Cloud saw full_name=%v, want \"Fixture User\"", seenBody["full_name"])
 	}
 	username, _ := seenBody["username"].(string)
 	if username == "" {
 		t.Fatalf("Cloud saw empty username — daemon must auto-derive")
 	}
-	if !strings.HasPrefix(username, "zhaichen_") {
-		t.Fatalf("derived username=%q should start with email-prefix \"zhaichen_\"", username)
+	if !strings.HasPrefix(username, "fixtureuser_") {
+		t.Fatalf("derived username=%q should start with email-prefix \"fixtureuser_\"", username)
 	}
 	if len(username) < 3 || len(username) > 50 {
 		t.Fatalf("derived username=%q violates Cloud's 3-50 char rule (len=%d)", username, len(username))
@@ -730,7 +730,7 @@ func TestDeriveUsername_Sanitization(t *testing.T) {
 		minLen     int
 	}{
 		{"alice@example.com", "alice_", 9},
-		{"ZhaiChen@alioyun.com", "zhaichen_", 9},
+		{"FixtureUser@example.com", "fixtureuser_", 9},
 		{"name.with.dots@x.y", "name_with_dots_", 10},
 		{"weird+chars#@y.z", "weird_chars__", 10},
 		{"ab@x.y", "ab", 3}, // short prefix is padded then hex-suffixed

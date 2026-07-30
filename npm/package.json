@@ -7,7 +7,8 @@
     "kocoro": "bin/shan"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test install.test.js"
   },
   "os": [
     "darwin",
@@ -29,6 +30,6 @@
     "shannon",
     "llm"
   ],
-  "license": "Apache-2.0",
+  "license": "MIT",
   "author": "Kocoro-lab"
 }

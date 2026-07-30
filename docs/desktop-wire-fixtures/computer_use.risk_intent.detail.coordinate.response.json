@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "intent_id": "cri_AAECAwQFBgcICQoLDA0ODw",
+  "request_id": "req_http_coordinate",
+  "kind": "send",
+  "expires_at": "2026-07-23T10:00:30Z",
+  "target": {
+    "bundle_id": "com.tinyspeck.slackmacgap",
+    "app_name": "Slack",
+    "pid": 420,
+    "window_id": 1001,
+    "state_id": "s_0123456789abcdef",
+    "action_kind": "click",
+    "execution_path": "synthetic_coordinate",
+    "element_ref": "e12",
+    "role": "AXButton",
+    "fingerprint": "axf_1111111111111111111111111111111111111111111111111111111111111111",
+    "coordinate_authority": {
+      "element_path": "window[0]/AXButton[0]",
+      "frame_id": "frame_coordinate_broker_001",
+      "frame_expires_at": "2026-07-23T10:00:30Z",
+      "final_image_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "topology_ref": {
+        "topology_id": "topology_coordinate_001",
+        "generation": 7
+      },
+      "helper_boot_id": "helper_coordinate_001",
+      "display_id": 9,
+      "source_pixel": {
+        "x": 320,
+        "y": 240
+      },
+      "quartz_point": {
+        "x": 100.5,
+        "y": 200.5
+      }
+    },
+    "target_digest": "tdv1_0d1260a30debecb285696054ad568d13553d7c9e8963db85e1f98bd462ba6c34"
+  },
+  "send": {
+    "destination_kind": "conversation",
+    "destination_label": "#shipping-ops",
+    "payload_kind": "current_composer"
+  },
+  "delete": null,
+  "purchase": null
+}

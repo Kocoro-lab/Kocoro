@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "completed",
+  "action": "move",
+  "primary_action_committed": true,
+  "pointer_motion_committed": true,
+  "phase": "post_verification",
+  "failure_code": null,
+  "retry_safe": false,
+  "pointer_endpoint": {
+    "requested": {"x": 200.5, "y": 300.5},
+    "observed": {"x": 200.5, "y": 300.5},
+    "tolerance": 2,
+    "verified": true
+  }
+}

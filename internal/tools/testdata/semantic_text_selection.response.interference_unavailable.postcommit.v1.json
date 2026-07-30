@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "completed_unverified",
+  "selection_committed": true,
+  "phase": "post_verification",
+  "failure_code": "interference_detection_unavailable",
+  "retry_safe": false,
+  "postcondition": null,
+  "selected_range": null
+}

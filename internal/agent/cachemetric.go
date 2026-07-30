@@ -59,13 +59,14 @@ func (t *CacheTracker) Record(u client.Usage) {
 
 // CacheSummary is the aggregate metric emitted to audit.log.
 //
-// CER = cache_read / cache_creation. A healthy long session ramps from
-// ~0 (cold) to 30×+ (rolling reads dominating). TailCERLast3 isolates the
-// recent window so a long-tail healthy run with one cold write at the start
-// still reports a high tail.
+// CER = cache_read / cache_creation. It is a diagnostic ratio, not a public
+// product-performance target. Healthy ranges and release thresholds depend on
+// the workload and are maintained outside this public repository.
+// TailCERLast3 isolates the recent window so a cold write at the start does not
+// dominate the most recent signal.
 //
-// WarmStart=true means the first call read prior cache without paying any
-// creation cost — diagnostic of cross-session cache reuse.
+// WarmStart=true means the first call read prior cache without a cache-creation
+// entry — diagnostic of cross-session cache reuse.
 type CacheSummary struct {
 	Calls        int
 	InputTotal   int64 // uncached input tokens — fills the audit cache_summary's input_tokens field so TOTAL = input + cache_read + cache_creation reflects the real prompt size, including the portion Anthropic decided not to cache (large prompts often fall here)

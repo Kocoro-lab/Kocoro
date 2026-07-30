@@ -624,7 +624,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 // itself (and the per-session-stable contextWindow), never on the surrounding
 // history — otherwise the same message truncates to a different byte length
 // each turn, shifting the Anthropic prompt-cache prefix at this message and
-// forcing a full cache_creation re-bill (~$0.67/turn observed 2026-05-11).
+// forcing a full cache_creation re-bill.
 //
 // Pre-fix the budget was target − EstimateTokens(messages); appending a turn
 // pair grows EstimateTokens, shrinks the budget, and clips the SAME message

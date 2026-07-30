@@ -1,51 +1,26 @@
 #!/bin/bash
-# Skill discovery benchmark: measures use_skill trigger rate.
-# Usage: ./scripts/skill-discovery-bench.sh [before|after]
+# Public synthetic skill-discovery example. This is not a release QA matrix.
 set -euo pipefail
 
-LABEL=${1:-"before"}
-LOG=~/.shannon/logs/audit.log
-MARKER=$(wc -l < "$LOG")
+if [[ "${KOCORO_RUN_SYNTHETIC_BENCHMARK:-}" != "1" ]]; then
+  echo "Synthetic benchmark is disabled."
+  echo "Set KOCORO_RUN_SYNTHETIC_BENCHMARK=1 to acknowledge that it may use paid model quota."
+  exit 2
+fi
 
 PROMPTS=(
-  "帮我创建一个 agent"
-  "分析这个 PDF"
-  "写一个 MCP server"
-  "做一个 landing page"
-  "帮我写项目状态更新"
-  "我想让 AI 能查数据库"
-  "这个 Go 函数有 bug，帮我看看"
-  "帮我写个单元测试"
-  "给这个报告换套主题"
-  "把这套流程封装成可复用的模板"
+  "Synthetic example: explain which bundled skill would help inspect a PDF. Do not open files or use network services."
+  "Synthetic example: explain which bundled skill would help create a local MCP server. Do not modify files."
+  "Synthetic example: explain which bundled skill would help build a local landing page. Do not modify files."
 )
 
+RESULTS="${BENCHMARK_RESULTS_DIR:-/tmp/kocoro-synthetic-skill-discovery}"
+mkdir -p "$RESULTS"
+
 for i in "${!PROMPTS[@]}"; do
-  echo "[$((i+1))/10] ${PROMPTS[$i]}"
-  shan -y "${PROMPTS[$i]}" </dev/null > /dev/null 2>"$LOG.bench_stderr" &
-  BGPID=$!
-  for tick in $(seq 1 60); do
-    kill -0 $BGPID 2>/dev/null || break
-    sleep 1
-  done
-  kill $BGPID 2>/dev/null; wait $BGPID 2>/dev/null
-  cat "$LOG.bench_stderr" | grep "^\[skill-discovery\]" || true
-  sleep 2
+  task=$((i + 1))
+  echo "Synthetic task $task"
+  shan -y "${PROMPTS[$i]}" >"$RESULTS/task${task}.stdout" 2>"$RESULTS/task${task}.stderr"
 done
 
-NEW_ENTRIES=$(tail -n +$((MARKER+1)) "$LOG")
-SKILL_CALLS=$(echo "$NEW_ENTRIES" | grep -c '"use_skill"' || true)
-TOTAL_CALLS=$(echo "$NEW_ENTRIES" | wc -l | tr -d ' ')
-
-echo ""
-echo "=== Results ($LABEL) ==="
-echo "use_skill calls: $SKILL_CALLS / 10 prompts"
-echo "Total tool calls: $TOTAL_CALLS"
-echo "$NEW_ENTRIES" | grep '"use_skill"' | python3 -c "
-import sys, json
-for line in sys.stdin:
-    d = json.loads(line.strip())
-    s = d.get('input_summary','')
-    try:
-        inp = json.loads(s)
-        print(f'  -> {inp.get(\"skill_name\",\"?\")}')" 2>/dev/null || true
+echo "Synthetic example complete. No production pass threshold is defined here."

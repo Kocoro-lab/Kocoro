@@ -314,8 +314,8 @@ func normalizeForMatch(s string) string {
 }
 
 // intentScoreBreakdown records what terms contributed to a platform-intent
-// score. Emitted to stderr when SHANNON_SKILL_DEBUG=1 so thresholds and
-// dictionaries can be tuned against real traffic.
+// score. Emitted to stderr when SHANNON_SKILL_DEBUG=1 so maintainers can tune
+// thresholds and dictionaries against controlled evaluation fixtures.
 type intentScoreBreakdown struct {
 	Total   int
 	Anchors []string

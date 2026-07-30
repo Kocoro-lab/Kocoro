@@ -102,18 +102,20 @@ func (b *ApprovalBroker) SetOnAutoApprove(fn func(meta ApprovalRequestMeta, tool
 // only from non-channel-routed paths (e.g. the local SSE dev server, where
 // there is no Cloud claim and the approval flow stays in-process).
 func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, tool, args string) ApprovalDecision {
-	// A non-interactive channel has no human approval round-trip. Apply the
-	// unattended deny-list before the broker's in-memory Always Allow cache:
-	// otherwise an approval remembered from an earlier attended request could
-	// silently authorize computer_use on WeChat/voice/etc.
+	// An explicit persisted grant is mirrored into this cache and is the only
+	// way a deny-listed Computer Use request may run without an approval UI.
+	// Tools that disallow persistence cannot enter the cache.
+	if b.IsToolAutoApproved(tool) {
+		return DecisionAllow
+	}
+
+	// A non-interactive channel has no human approval round-trip. Without the
+	// explicit grant above, apply the unattended deny-list before the generic
+	// no-UI auto-approval fallback.
 	nonInteractive := IsNonInteractiveApprovalChannel(meta.Source)
 	if nonInteractive && agentpkg.DisallowsUnattendedAutoApproval(tool) {
 		log.Printf("approval: denying tool %q for non-interactive channel %q (disallows unattended auto-approval, no approval UI)", tool, meta.Source)
 		return DecisionDeny
-	}
-
-	if b.IsToolAutoApproved(tool) {
-		return DecisionAllow
 	}
 
 	// Non-interactive IM channels (WeChat/WeCom/Discord/Telegram/voice) have no
@@ -141,6 +143,7 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 	}
 
 	reqID := generateRequestID()
+	presentationTitle, presentationArgs := approvalPresentation(tool, args)
 	req := ApprovalRequest{
 		MessageID: meta.MessageID,
 		SessionID: meta.SessionID,
@@ -149,13 +152,12 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 		ThreadID:  meta.ThreadID,
 		RequestID: reqID,
 		Tool:      tool,
-		Title:     approvalTitle(tool, args),
-		Args:      args,
+		Title:     presentationTitle,
+		Args:      presentationArgs,
 		Agent:     meta.Agent,
 	}
-	// Policy hint for UI: tools in DisallowsAutoApproval cannot be persisted
-	// as always-allow. The list is empty as of 2026-05-18, but the hint stays
-	// available so clients can disable "Always Allow" for a future entry.
+	// Policy hint for UI: tools in DisallowsAutoApproval cannot be persisted.
+	// computer_use is intentionally persistable as the global product grant.
 	if agentpkg.DisallowsAutoApproval(tool) {
 		req.Flags = append(req.Flags, ApprovalFlagAlwaysAllowDisabled)
 	}
@@ -179,9 +181,9 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 func (b *ApprovalBroker) CancelAll() { b.cancelAll(DecisionDeny) }
 
 // SetToolAutoApprove marks a non-bash tool as auto-approved (in-memory only).
-// Tools in agentpkg.DisallowsAutoApproval are silently refused. The list is
-// empty today, but callers may still unconditionally invoke this after
-// DecisionAlwaysAllow; the broker remains the authoritative gate.
+// Tools in agentpkg.DisallowsAutoApproval are silently refused. Callers may
+// still unconditionally invoke this after DecisionAlwaysAllow; the broker
+// remains the authoritative gate.
 func (b *ApprovalBroker) SetToolAutoApprove(tool string) {
 	if agentpkg.DisallowsAutoApproval(tool) {
 		return
@@ -335,6 +337,24 @@ func approvalTitle(tool, args string) string {
 		}
 	}
 	return tool
+}
+
+// approvalPresentation keeps the attended decision boundary useful without
+// copying typed text, key content, scripts, AX values, or model descriptions
+// into the approval transport/event ring. The executor retains the original
+// args independently; only the user-facing card receives this projection.
+func approvalPresentation(tool, args string) (title string, presentedArgs string) {
+	presentedArgs = agentpkg.RedactGUIActivityArguments(tool, args)
+	if presentedArgs == args {
+		return approvalTitle(tool, args), args
+	}
+	var payload struct {
+		Action string `json:"action"`
+	}
+	if json.Unmarshal([]byte(presentedArgs), &payload) == nil && payload.Action != "" {
+		return tool + ": " + payload.Action, presentedArgs
+	}
+	return tool, presentedArgs
 }
 
 func generateRequestID() string {

@@ -8,10 +8,10 @@ func TestSymbolicForm(t *testing.T) {
 		home string
 		want string
 	}{
-		{"/Users/wayland/.claude", "/Users/wayland", "~/.claude"},
-		{"/Users/wayland/.claude.json", "/Users/wayland", "~/.claude.json"},
-		{"/Users/wayland/.shannon", "/Users/wayland", "~/.shannon"},
-		{"/opt/claude", "/Users/wayland", "/opt/claude"},
+		{"/Users/alice/.claude", "/Users/alice", "~/.claude"},
+		{"/Users/alice/.claude.json", "/Users/alice", "~/.claude.json"},
+		{"/Users/alice/.shannon", "/Users/alice", "~/.shannon"},
+		{"/opt/claude", "/Users/alice", "/opt/claude"},
 	}
 	for _, tc := range cases {
 		got := SymbolicForm(tc.abs, tc.home)
@@ -22,11 +22,11 @@ func TestSymbolicForm(t *testing.T) {
 }
 
 func TestDefaultSources(t *testing.T) {
-	got := DefaultSources("/Users/wayland")
-	if got.ClaudeHome != "/Users/wayland/.claude" {
+	got := DefaultSources("/Users/alice")
+	if got.ClaudeHome != "/Users/alice/.claude" {
 		t.Errorf("ClaudeHome = %q", got.ClaudeHome)
 	}
-	if got.ClaudeUserConfig != "/Users/wayland/.claude.json" {
+	if got.ClaudeUserConfig != "/Users/alice/.claude.json" {
 		t.Errorf("ClaudeUserConfig = %q", got.ClaudeUserConfig)
 	}
 }

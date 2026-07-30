@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "suite": "computer_use_synthetic_acceptance_example",
+  "synthetic_fixture": true,
+  "notice": "Public example only. All policies, measurements, budgets, names, and scenarios are synthetic and are not used for release qualification.",
+  "run_policy": {
+    "manual_only": true,
+    "paid_model_calls": false,
+    "one_pointer_operator": true,
+    "secondary_display_paused": false,
+    "default_timeout_seconds": 60,
+    "max_fix_cycles_per_checkpoint": 0,
+    "non_safety_reproduction_required": 1,
+    "out_of_scope_behavior": "example_only"
+  },
+  "performance_baseline": {
+    "captured_at": "2000-01-01T00:00:00Z",
+    "kind": "synthetic_example_not_measured",
+    "sample_size": 10,
+    "duration_p50_ms": 10000,
+    "duration_p95_ms": 20000,
+    "model_calls_p50": 2,
+    "model_calls_p95": 4,
+    "provider_batches_p50": 1,
+    "provider_batches_p95": 3,
+    "model_timeouts": 0
+  },
+  "evidence_policy": {
+    "summary_scope": "synthetic_example_scope",
+    "passed_mutation_requires_committed_action": true,
+    "observation_only_completion": "synthetic_inconclusive",
+    "provider_action_mismatch": "synthetic_classification",
+    "fix_boundary": "synthetic_example_only",
+    "failure_classes": [
+      "synthetic_precondition_failure",
+      "synthetic_action_failure"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "synthetic_calculator_example",
+      "enabled_by_default": false,
+      "prompt": "Open Calculator and evaluate 1+1.",
+      "preconditions": [
+        "A synthetic test environment is available."
+      ],
+      "expected_state": [
+        "The synthetic example reports 2."
+      ],
+      "risk": "synthetic_ordinary_mutation",
+      "tags": ["synthetic", "calculator"],
+      "performance_budget": {
+        "duration_ms": 10000,
+        "model_calls": 2,
+        "provider_batches": 1
+      }
+    },
+    {
+      "id": "synthetic_browser_example",
+      "enabled_by_default": false,
+      "prompt": "Open a browser and navigate to example.com.",
+      "preconditions": [
+        "Network access to example.com is available."
+      ],
+      "expected_state": [
+        "The synthetic example page is visible."
+      ],
+      "risk": "synthetic_ordinary_mutation",
+      "tags": ["synthetic", "browser"],
+      "performance_budget": {
+        "duration_ms": 20000,
+        "model_calls": 4,
+        "provider_batches": 3
+      }
+    },
+    {
+      "id": "synthetic_text_entry_example",
+      "enabled_by_default": false,
+      "prompt": "Enter sample text in a disposable editor document.",
+      "preconditions": [
+        "A disposable synthetic document is open."
+      ],
+      "expected_state": [
+        "The synthetic sample text is visible."
+      ],
+      "risk": "synthetic_ordinary_mutation",
+      "tags": ["synthetic", "text_entry"],
+      "performance_budget": {
+        "duration_ms": 15000,
+        "model_calls": 3,
+        "provider_batches": 2
+      }
+    }
+  ]
+}

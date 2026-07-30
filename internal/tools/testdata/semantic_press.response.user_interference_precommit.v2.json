@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "status": "user_interference",
+  "commit_state": "not_committed",
+  "phase": "user_interference",
+  "failure_code": "physical_input_interference",
+  "postcondition": null,
+  "retry_safe": false
+}

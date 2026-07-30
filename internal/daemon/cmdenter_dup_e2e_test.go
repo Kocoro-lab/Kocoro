@@ -40,8 +40,8 @@ func (b *blockingE2ETool) Info() agent.ToolInfo {
 
 func (b *blockingE2ETool) Run(ctx context.Context, args string) (agent.ToolResult, error) {
 	b.startedOnce.Do(func() { close(b.started) })
-	// Deliberately ignore ctx: in the production incident the bash tool ran
-	// to completion (8s) while the cancel was already pending — the loop
+	// Deliberately ignore ctx: the synthetic blocking tool runs to completion
+	// while the cancel is already pending — the loop
 	// appends its result and only THEN observes ctx.Err() at the top of the
 	// next iteration, which is the Bug-A flush window.
 	<-b.release

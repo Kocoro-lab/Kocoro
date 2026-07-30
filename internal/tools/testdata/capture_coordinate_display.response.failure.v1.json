@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "failure_code": "display_not_actionable",
+  "retry_safe": true,
+  "topology_ref": null,
+  "helper_boot_id": null,
+  "display_id": null,
+  "display_quartz_bounds": null,
+  "backing_scale_factor": null,
+  "media_type": null,
+  "width_px": null,
+  "height_px": null,
+  "byte_length": null,
+  "sha256": null,
+  "image_base64": null,
+  "captured_at": null
+}

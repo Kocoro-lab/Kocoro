@@ -426,6 +426,11 @@ type ContentBlock struct {
 	ToolUseID   string `json:"tool_use_id,omitempty"`
 	IsError     bool   `json:"is_error,omitempty"`
 	ToolContent any    `json:"-"` // string or []ContentBlock; serialized as "content" for tool_result
+	// AcknowledgedSafetyChecks is emitted only on the exact OpenAI Responses
+	// computer_call_output trajectory after attended confirmation. Keeping it
+	// off the generic wire path prevents ordinary/Anthropic tool results from
+	// acquiring provider-specific fields.
+	AcknowledgedSafetyChecks []OpenAIComputerSafetyCheck `json:"-"`
 	// thinking fields (Anthropic extended thinking content block).
 	// Type "thinking": Thinking carries the chain-of-thought text, Signature
 	// is the opaque base64 token Anthropic requires us to echo back on the
@@ -438,6 +443,20 @@ type ContentBlock struct {
 	Thinking  string `json:"thinking,omitempty"`
 	Signature string `json:"signature,omitempty"`
 	Data      string `json:"data,omitempty"`
+	// OpenAI Responses computer_call fields. They are intentionally off the
+	// generic JSON path so only Type=computer_call can emit them; ordinary and
+	// Anthropic content blocks keep their established wire shape.
+	Provider     string          `json:"-"`
+	APISurface   string          `json:"-"`
+	ToolContract string          `json:"-"`
+	ResponseID   string          `json:"-"`
+	CallID       string          `json:"-"`
+	Actions      json.RawMessage `json:"-"`
+	// PendingSafetyChecks is populated only for OpenAI computer_call blocks.
+	// A non-nil empty slice is significant: Cloud normalized the provider
+	// response and no acknowledgement is needed.
+	PendingSafetyChecks []OpenAIComputerSafetyCheck `json:"-"`
+	Status              string                      `json:"-"`
 	// CompressedTier records that an agent-loop compaction pass has visited
 	// this tool_result block. Once non-zero, further passes leave ToolContent
 	// alone so the wire bytes stay byte-stable across iterations — Anthropic's
@@ -460,6 +479,14 @@ type ContentBlock struct {
 // and guarantees tool_use.input is always a concrete JSON object (never null
 // or missing), which is required by Anthropic's schema validator. See issue #45.
 func (cb ContentBlock) MarshalJSON() ([]byte, error) {
+	if cb.Type == OpenAIComputerCallType {
+		call, err := cb.NormalizedOpenAIComputerCall()
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(call)
+	}
+
 	type plain ContentBlock // avoid infinite recursion
 	m := make(map[string]any)
 
@@ -475,6 +502,17 @@ func (cb ContentBlock) MarshalJSON() ([]byte, error) {
 	// Add ToolContent as "content" for tool_result blocks
 	if cb.Type == "tool_result" && cb.ToolContent != nil {
 		m["content"] = cb.ToolContent
+	}
+	if cb.Type == "tool_result" && cb.AcknowledgedSafetyChecks != nil {
+		if err := validateOpenAIComputerSafetyCheckList(
+			cb.AcknowledgedSafetyChecks,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"encode acknowledged OpenAI computer safety checks: %w",
+				err,
+			)
+		}
+		m["acknowledged_safety_checks"] = cb.AcknowledgedSafetyChecks
 	}
 
 	// For tool_use blocks, force-write a concrete input object. The base
@@ -559,6 +597,33 @@ func normalizeToolInput(raw json.RawMessage) json.RawMessage {
 
 // UnmarshalJSON handles the polymorphic "content" field for tool_result blocks.
 func (cb *ContentBlock) UnmarshalJSON(data []byte) error {
+	var discriminator struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &discriminator); err != nil {
+		return err
+	}
+	if discriminator.Type == OpenAIComputerCallType {
+		var call OpenAIComputerCall
+		if err := json.Unmarshal(data, &call); err != nil {
+			return err
+		}
+		*cb = ContentBlock{
+			Type:         call.Type,
+			Provider:     call.Provider,
+			APISurface:   call.APISurface,
+			ToolContract: call.ToolContract,
+			ResponseID:   call.ResponseID,
+			CallID:       call.CallID,
+			Actions:      append(json.RawMessage(nil), call.Actions...),
+			PendingSafetyChecks: CloneOpenAIComputerSafetyChecks(
+				call.PendingSafetyChecks,
+			),
+			Status: call.Status,
+		}
+		return nil
+	}
+
 	type plain ContentBlock
 	var p plain
 	if err := json.Unmarshal(data, &p); err != nil {
@@ -569,7 +634,8 @@ func (cb *ContentBlock) UnmarshalJSON(data []byte) error {
 	if cb.Type == "tool_result" {
 		// Parse the "content" field which can be a string or array of blocks
 		var raw struct {
-			Content json.RawMessage `json:"content"`
+			Content                  json.RawMessage `json:"content"`
+			AcknowledgedSafetyChecks json.RawMessage `json:"acknowledged_safety_checks"`
 		}
 		if err := json.Unmarshal(data, &raw); err == nil && len(raw.Content) > 0 {
 			var s string
@@ -582,8 +648,59 @@ func (cb *ContentBlock) UnmarshalJSON(data []byte) error {
 				}
 			}
 		}
+		if len(raw.AcknowledgedSafetyChecks) > 0 {
+			if bytes.Equal(
+				bytes.TrimSpace(raw.AcknowledgedSafetyChecks),
+				[]byte("null"),
+			) {
+				return fmt.Errorf(
+					"acknowledged OpenAI computer safety checks must be an array",
+				)
+			}
+			var checks []OpenAIComputerSafetyCheck
+			if err := json.Unmarshal(raw.AcknowledgedSafetyChecks, &checks); err != nil {
+				return fmt.Errorf(
+					"decode acknowledged OpenAI computer safety checks: %w",
+					err,
+				)
+			}
+			if checks == nil {
+				return fmt.Errorf(
+					"acknowledged OpenAI computer safety checks must be an array",
+				)
+			}
+			if err := validateOpenAIComputerSafetyCheckList(checks); err != nil {
+				return fmt.Errorf(
+					"decode acknowledged OpenAI computer safety checks: %w",
+					err,
+				)
+			}
+			cb.AcknowledgedSafetyChecks = CloneOpenAIComputerSafetyChecks(checks)
+		}
 	}
 	return nil
+}
+
+// NormalizedOpenAIComputerCall extracts and validates the exact Cloud
+// computer_call envelope represented by this block.
+func (cb ContentBlock) NormalizedOpenAIComputerCall() (OpenAIComputerCall, error) {
+	call := OpenAIComputerCall{
+		Type:         cb.Type,
+		Provider:     cb.Provider,
+		APISurface:   cb.APISurface,
+		ToolContract: cb.ToolContract,
+		ResponseID:   cb.ResponseID,
+		CallID:       cb.CallID,
+		Actions:      append(json.RawMessage(nil), cb.Actions...),
+		PendingSafetyChecks: CloneOpenAIComputerSafetyChecks(
+			cb.PendingSafetyChecks,
+		),
+		Status: cb.Status,
+	}
+	if err := call.Validate(); err != nil {
+		return OpenAIComputerCall{}, err
+	}
+	return call, nil
 }
 
 // NewToolUseBlock creates a tool_use content block. Input is normalized via
@@ -731,7 +848,15 @@ type FunctionDef struct {
 	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
-// NativeToolDef represents a provider-native tool definition (e.g., Anthropic computer use).
+const (
+	NativeComputerToolType       = "computer_20251124"
+	OpenAINativeComputerToolType = "computer"
+	NativeComputerToolName       = "computer"
+)
+
+// NativeToolDef represents one exact provider-native computer definition.
+// Anthropic requires dimensions and an explicit name; OpenAI Responses uses
+// only {"type":"computer"} on the wire. Unknown shapes remain rejected.
 type NativeToolDef struct {
 	Type            string `json:"type"`
 	Name            string `json:"name"`
@@ -739,6 +864,39 @@ type NativeToolDef struct {
 	DisplayHeightPx int    `json:"display_height_px,omitempty"`
 }
 
+// Validate fails closed on a provider-native definition that is not the exact
+// computer-use contract implemented by this client slice. Positive dimensions
+// are required because zero-valued omitempty fields would otherwise disappear
+// from the wire while still advertising a native computer tool.
+func (d NativeToolDef) Validate() error {
+	if d.Name != NativeComputerToolName {
+		return fmt.Errorf("native tool %q requires name %q", d.Type, NativeComputerToolName)
+	}
+	switch d.Type {
+	case NativeComputerToolType:
+		if d.DisplayWidthPx <= 0 || d.DisplayHeightPx <= 0 {
+			return fmt.Errorf("native tool %q requires positive display dimensions", d.Type)
+		}
+	case OpenAINativeComputerToolType:
+		if d.DisplayWidthPx != 0 || d.DisplayHeightPx != 0 {
+			return fmt.Errorf("native tool %q forbids display dimensions", d.Type)
+		}
+	default:
+		return fmt.Errorf("unsupported native tool type %q", d.Type)
+	}
+	return nil
+}
+
+// Tool is a strict tagged union at the outbound JSON boundary:
+//   - type=function serializes only Function (+ optional defer_loading)
+//   - type=computer_20251124 serializes the flattened Anthropic definition
+//     (+ optional defer_loading)
+//   - type=computer serializes only OpenAI Responses' native marker
+//
+// Function remains value-typed for source compatibility with the existing
+// tool registry. MarshalJSON is load-bearing: encoding/json's omitempty does
+// not omit a zero-valued struct, which previously leaked function:{name:""}
+// into provider-native tool definitions.
 type Tool struct {
 	Type            string      `json:"type"`
 	Function        FunctionDef `json:"function,omitempty"`
@@ -749,6 +907,79 @@ type Tool struct {
 	// Server expands the schema inline when tool_search returns a tool_reference
 	// block naming it. Only use on tools the model can discover via tool_search.
 	DeferLoading bool `json:"defer_loading,omitempty"`
+}
+
+// Validate enforces Tool's tagged-union invariants before any request reaches
+// the gateway. It intentionally validates outbound encoding only; response and
+// fixture decoding retain their additive compatibility.
+func (t Tool) Validate() error {
+	switch t.Type {
+	case "function":
+		if strings.TrimSpace(t.Function.Name) == "" {
+			return errors.New("function tool requires a non-empty function name")
+		}
+		if t.Name != "" || t.DisplayWidthPx != 0 || t.DisplayHeightPx != 0 {
+			return errors.New("function tool must not contain native tool fields")
+		}
+		return nil
+	case NativeComputerToolType:
+		if t.Function.Name != "" || t.Function.Description != "" || len(t.Function.Parameters) != 0 {
+			return errors.New("native tool must not contain a function definition")
+		}
+		return (NativeToolDef{
+			Type:            t.Type,
+			Name:            t.Name,
+			DisplayWidthPx:  t.DisplayWidthPx,
+			DisplayHeightPx: t.DisplayHeightPx,
+		}).Validate()
+	case OpenAINativeComputerToolType:
+		if t.Function.Name != "" || t.Function.Description != "" ||
+			len(t.Function.Parameters) != 0 ||
+			t.Name != "" || t.DisplayWidthPx != 0 || t.DisplayHeightPx != 0 {
+			return errors.New("OpenAI native computer tool must contain only type")
+		}
+		if t.DeferLoading {
+			return errors.New("native computer tool does not support defer_loading")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported tool type %q", t.Type)
+	}
+}
+
+func (t Tool) MarshalJSON() ([]byte, error) {
+	if err := t.Validate(); err != nil {
+		return nil, err
+	}
+	if t.Type == "function" {
+		return json.Marshal(struct {
+			Type         string      `json:"type"`
+			Function     FunctionDef `json:"function"`
+			DeferLoading bool        `json:"defer_loading,omitempty"`
+		}{
+			Type:         t.Type,
+			Function:     t.Function,
+			DeferLoading: t.DeferLoading,
+		})
+	}
+	if t.Type == OpenAINativeComputerToolType {
+		return json.Marshal(struct {
+			Type string `json:"type"`
+		}{Type: t.Type})
+	}
+	return json.Marshal(struct {
+		Type            string `json:"type"`
+		Name            string `json:"name"`
+		DisplayWidthPx  int    `json:"display_width_px"`
+		DisplayHeightPx int    `json:"display_height_px"`
+		DeferLoading    bool   `json:"defer_loading,omitempty"`
+	}{
+		Type:            t.Type,
+		Name:            t.Name,
+		DisplayWidthPx:  t.DisplayWidthPx,
+		DisplayHeightPx: t.DisplayHeightPx,
+		DeferLoading:    t.DeferLoading,
+	})
 }
 
 type CompletionRequest struct {
@@ -797,6 +1028,23 @@ type CompletionRequest struct {
 	// used today: "suggestion", "speculation". Future: "subagent-<name>". Used to
 	// correlate forked calls with their parent main turn in cache-debug.log.
 	ForkedKind string `json:"-"`
+
+	// PreviousResponseID continues an OpenAI Responses API trajectory. Kocoro
+	// sets it only after accepting a trusted, exact OpenAI native profile echo;
+	// Cloud maps the assistant computer_call + screenshot tool_result to the
+	// provider's computer_call_output shape.
+	PreviousResponseID string `json:"previous_response_id,omitempty"`
+
+	// ExecutionProfileID is the canonical Cloud-owned contract fingerprint
+	// returned by POST /v1/completions/resolve. Cloud recomputes and validates
+	// it for every completion; a stale profile fails closed rather than
+	// silently routing a provider-native tool to another adapter.
+	ExecutionProfileID string `json:"execution_profile_id,omitempty"`
+
+	// ResolvedExecutionProfile is the authenticated full profile retained only
+	// inside Kocoro. Complete / CompleteStream compare it with the full profile
+	// echoed by Cloud before returning any tool calls to the executor.
+	ResolvedExecutionProfile *ExecutionProfile `json:"-"`
 }
 
 // ThinkingConfig for Anthropic extended thinking.
@@ -807,9 +1055,43 @@ type ThinkingConfig struct {
 }
 
 type FunctionCall struct {
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
+	ID                  string                      `json:"id,omitempty"`
+	CallID              string                      `json:"call_id,omitempty"`
+	Name                string                      `json:"name"`
+	Arguments           json.RawMessage             `json:"arguments"`
+	Type                string                      `json:"type,omitempty"`
+	Provider            string                      `json:"provider,omitempty"`
+	APISurface          string                      `json:"api_surface,omitempty"`
+	ToolContract        string                      `json:"tool_contract,omitempty"`
+	ResponseID          string                      `json:"response_id,omitempty"`
+	PendingSafetyChecks []OpenAIComputerSafetyCheck `json:"pending_safety_checks,omitempty"`
+}
+
+func (fc FunctionCall) MarshalJSON() ([]byte, error) {
+	type wire FunctionCall
+	base, err := json.Marshal(wire(fc))
+	if err != nil {
+		return nil, err
+	}
+	if fc.Type != OpenAIComputerCallType {
+		return base, nil
+	}
+	if !validOpenAIComputerResponseID(fc.ResponseID) ||
+		fc.PendingSafetyChecks == nil {
+		return nil, fmt.Errorf("OpenAI computer function-call alias is incomplete")
+	}
+	if err := validateOpenAIComputerSafetyCheckList(
+		fc.PendingSafetyChecks,
+	); err != nil {
+		return nil, fmt.Errorf("OpenAI computer function-call alias: %w", err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(base, &object); err != nil {
+		return nil, err
+	}
+	object["response_id"] = fc.ResponseID
+	object["pending_safety_checks"] = fc.PendingSafetyChecks
+	return json.Marshal(object)
 }
 
 // ArgumentsString returns arguments as a JSON string regardless of
@@ -863,10 +1145,14 @@ type CompletionResponse struct {
 	// json package silently ignores this field when older Cloud doesn't emit
 	// it (omitempty + missing-key tolerance), so this is a no-op upgrade.
 	ContentBlocks []ContentBlock `json:"content_blocks,omitempty"`
-	Usage         Usage          `json:"usage"`
-	RequestID     string         `json:"request_id,omitempty"`
-	LatencyMs     int            `json:"latency_ms,omitempty"`
-	Cached        bool           `json:"cached"`
+	// ExecutionProfile is the full canonical profile actually used by Cloud.
+	// It is mandatory whenever the request carries execution_profile_id and is
+	// validated before any response tool call can reach the agent executor.
+	ExecutionProfile *ExecutionProfile `json:"execution_profile,omitempty"`
+	Usage            Usage             `json:"usage"`
+	RequestID        string            `json:"request_id,omitempty"`
+	LatencyMs        int               `json:"latency_ms,omitempty"`
+	Cached           bool              `json:"cached"`
 }
 
 // AllToolCalls returns all tool calls from the response. Preference order:
@@ -1029,6 +1315,9 @@ func (c *GatewayClient) APIKey() string {
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.
 func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
+	if err := validateProviderNativeExecution(req); err != nil {
+		return nil, err
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -1057,6 +1346,9 @@ func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*C
 	var result CompletionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if err := validateProviderNativeResponse(req, &result); err != nil {
+		return nil, err
 	}
 
 	logCacheResponse(reqID, req.SessionID, &result)
@@ -1147,6 +1439,9 @@ type StreamDelta struct {
 // that returns ErrStreamIdleTimeout if no chunk arrives within that interval.
 func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionRequest, onDelta func(StreamDelta)) (*CompletionResponse, error) {
 	req.Stream = true
+	if err := validateProviderNativeExecution(req); err != nil {
+		return nil, err
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -1173,10 +1468,19 @@ func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionReques
 		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 
+	var result *CompletionResponse
 	if c.streamIdleTimeout <= 0 {
-		return c.completeStreamLegacy(resp, onDelta, reqID, req.SessionID)
+		result, err = c.completeStreamLegacy(resp, onDelta, reqID, req.SessionID)
+	} else {
+		result, err = c.completeStreamWatchdog(ctx, resp, onDelta, reqID, req.SessionID)
 	}
-	return c.completeStreamWatchdog(ctx, resp, onDelta, reqID, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateProviderNativeResponse(req, result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // completeStreamLegacy reads the SSE body in a single blocking scanner loop.

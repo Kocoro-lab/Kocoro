@@ -15,10 +15,9 @@ const (
 // kindOf derives a session kind from its Source using an EXCLUSION rule rather
 // than a whitelist: `schedule` and the IM platforms are closed sets, so
 // everything else — including an empty source and "desktop"/"kocoro"/"tui"/
-// "cli" — is interactive. This is load-bearing: on real data ~93% of sessions
-// have an empty or "desktop" source, so a whitelist of "interactive" sources
-// would misclassify the bulk of sessions and break interactive cold-start +
-// heartbeat resolution. See
+// "cli" — is interactive. This is load-bearing because an empty or "desktop"
+// source is valid; a whitelist of "interactive" sources would misclassify
+// those sessions and break interactive cold-start + heartbeat resolution. See
 // docs/superpowers/specs/2026-06-01-named-agent-multi-session-design.md §6.3.
 func kindOf(source string) string {
 	norm := strings.ToLower(strings.TrimSpace(source))

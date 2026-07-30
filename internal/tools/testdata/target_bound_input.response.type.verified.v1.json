@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "status": "verified",
+  "action": "type",
+  "input_committed": true,
+  "clipboard_touched": true,
+  "clipboard_restored": true,
+  "phase": "post_verification",
+  "failure_code": null,
+  "retry_safe": false,
+  "postcondition": "target_value_matches_expected_edit"
+}

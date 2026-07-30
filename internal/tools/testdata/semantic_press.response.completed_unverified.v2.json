@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "status": "completed_unverified",
+  "commit_state": "committed",
+  "phase": "post_verification",
+  "failure_code": "postcondition_not_declared",
+  "postcondition": null,
+  "retry_safe": false
+}

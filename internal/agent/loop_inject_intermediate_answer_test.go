@@ -125,7 +125,7 @@ func TestAgentLoop_IntermediateAnswer_CarriesRespondedMessageID(t *testing.T) {
 		if n == 1 {
 			// Follow-up from a second user (its own cloud message id) lands while
 			// the model composes turn-1's end_turn answer for the primary message.
-			injectCh <- InjectedMessage{Text: "follow-up B", CloudMessageID: "msg-wayland"}
+			injectCh <- InjectedMessage{Text: "follow-up B", CloudMessageID: "msg-alice"}
 			_ = json.NewEncoder(w).Encode(nativeResponse("answer-one", "end_turn", nil, 10, 5))
 			return
 		}
@@ -161,13 +161,13 @@ func TestAgentLoop_IntermediateAnswer_CarriesRespondedMessageID(t *testing.T) {
 	if final != "answer-two-final" {
 		t.Fatalf("final = %q, want answer-two-final", final)
 	}
-	if got := loop.ReplyCloudMessageID(); got != "msg-wayland" {
-		t.Fatalf("ReplyCloudMessageID() = %q, want msg-wayland (the last message processed)", got)
+	if got := loop.ReplyCloudMessageID(); got != "msg-alice" {
+		t.Fatalf("ReplyCloudMessageID() = %q, want msg-alice (the last message processed)", got)
 	}
 	// msg-awek was independently replied (answer-one via OnIntermediateAnswer) and
 	// pruned; only the un-replied final target remains for the daemon to co-ack.
-	if got := loop.PendingAckIDs(); len(got) != 1 || got[0] != "msg-wayland" {
-		t.Fatalf("PendingAckIDs() = %v, want [msg-wayland]", got)
+	if got := loop.PendingAckIDs(); len(got) != 1 || got[0] != "msg-alice" {
+		t.Fatalf("PendingAckIDs() = %v, want [msg-alice]", got)
 	}
 }
 
@@ -189,7 +189,7 @@ func TestAgentLoop_FollowUpDuringToolUse_AdvancesReplyTarget_NoIntermediate(t *t
 		if callCount == 1 {
 			// Follow-up from a second inbound lands while the tool runs → drained
 			// at the top of the next iteration, not the end_turn race.
-			injectCh <- InjectedMessage{Text: "follow-up B", CloudMessageID: "msg-wayland"}
+			injectCh <- InjectedMessage{Text: "follow-up B", CloudMessageID: "msg-alice"}
 			_ = json.NewEncoder(w).Encode(nativeResponse("", "tool_use", toolCall("capture_snapshot", `{}`), 10, 5))
 			return
 		}
@@ -212,9 +212,9 @@ func TestAgentLoop_FollowUpDuringToolUse_AdvancesReplyTarget_NoIntermediate(t *t
 	}
 
 	// Reply target advanced to the absorbed follow-up: the run's final reply
-	// belongs to msg-wayland.
-	if got := loop.ReplyCloudMessageID(); got != "msg-wayland" {
-		t.Fatalf("ReplyCloudMessageID() = %q, want msg-wayland", got)
+	// belongs to msg-alice.
+	if got := loop.ReplyCloudMessageID(); got != "msg-alice" {
+		t.Fatalf("ReplyCloudMessageID() = %q, want msg-alice", got)
 	}
 	if final != "merged-answer" {
 		t.Fatalf("final = %q, want merged-answer", final)
@@ -229,7 +229,7 @@ func TestAgentLoop_FollowUpDuringToolUse_AdvancesReplyTarget_NoIntermediate(t *t
 	}
 	// No intermediate fired, so neither id was pruned: the daemon must co-ack BOTH
 	// the absorbed primary and the followup after the final reply is delivered.
-	if got := loop.PendingAckIDs(); len(got) != 2 || got[0] != "msg-awek" || got[1] != "msg-wayland" {
-		t.Fatalf("PendingAckIDs() = %v, want [msg-awek msg-wayland]", got)
+	if got := loop.PendingAckIDs(); len(got) != 2 || got[0] != "msg-awek" || got[1] != "msg-alice" {
+		t.Fatalf("PendingAckIDs() = %v, want [msg-awek msg-alice]", got)
 	}
 }

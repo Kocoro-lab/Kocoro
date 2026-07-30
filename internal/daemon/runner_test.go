@@ -399,7 +399,7 @@ func TestRouteTitle(t *testing.T) {
 	tests := []struct {
 		source, channel, sender, want string
 	}{
-		{"slack", "slack", "Wayland", "Slack · Wayland"},
+		{"slack", "slack", "Alice", "Slack · Alice"},
 		{"slack", "slack", "", "Slack"},
 		{"line", "line", "Tanaka", "LINE · Tanaka"},
 		{"wecom", "wecom", "", "WeCom"},
@@ -410,8 +410,8 @@ func TestRouteTitle(t *testing.T) {
 		{"desktop", "shanclaw", "", ""},
 		{"shanclaw", "shanclaw", "", ""},
 		{"kocoro", "shanclaw", "", ""},
-		{"", "slack", "Wayland", ""},
-		{"slack", "", "Wayland", "Slack · Wayland"},
+		{"", "slack", "Alice", ""},
+		{"slack", "", "Alice", "Slack · Alice"},
 		{"", "", "", ""},
 	}
 	for _, tt := range tests {
@@ -2027,7 +2027,7 @@ func TestRunAgent_PersistsSessionUsage(t *testing.T) {
 	// A "slack" source at turn 1 triggers the async smart-title goroutine
 	// (fireTitleAfterRun), which runs on context.Background() and re-writes the
 	// session file AFTER RunAgent returns. Without joining it, t.TempDir's
-	// RemoveAll races that late write ("unlinkat: directory not empty", ~10%).
+	// RemoveAll can race that late write ("unlinkat: directory not empty").
 	// The title write is the only post-return writer here (suggestion is
 	// source-gated off for slack), and it always lands under the fake gateway,
 	// so polling for the persisted title is a deterministic happens-after join.

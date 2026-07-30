@@ -249,6 +249,32 @@ const (
 	// and never emits project_id) falls back to hiding the feature instead of
 	// probing routes / sniffing the response shape.
 	CapProjectEntityV1 = "project_entity_v1"
+	// CapComputerUseTopologyV1 — daemon exposes the strict, read-only display
+	// topology contract at GET /local/computer-use/topology. This token does not
+	// advertise coordinate capture, input actions, or the future coordinator.
+	CapComputerUseTopologyV1 = "computer_use_topology_v1"
+	// CapComputerUseControlV1 — daemon exposes the Desktop-only, local-presence
+	// protected activity snapshot, heartbeat, and Pause/Resume/Take Over/Stop
+	// control plane. Desktop must gate the authoritative runtime with this token;
+	// a token-advertising daemon that returns an endpoint error fails closed.
+	CapComputerUseControlV1 = "computer_use_control_v1"
+	// CapComputerUsePreviewV1 advertises the local-presence protected,
+	// process-memory-only current-lease frame used by Desktop PiP.
+	CapComputerUsePreviewV1 = "computer_use_preview_v1"
+	// CapComputerUseAppPolicyV1 advertises the local-presence protected,
+	// Ask/Blocked-only per-app GUI mutation policy API. It deliberately does
+	// not advertise an Always Allow scope.
+	CapComputerUseAppPolicyV1 = "computer_use_app_policy_v1"
+	// CapComputerUsePhysicalInterferenceV1 advertises no-new-TCC user-priority
+	// detection only for synthetic coordinate pointer move/click, coordinate
+	// drag, and target-bound keyboard/type commit and verification windows. It
+	// does not cover semantic AX mutations or claim complete observation of every
+	// keyboard event.
+	CapComputerUsePhysicalInterferenceV1 = "computer_use_physical_interference_v1"
+	// CapComputerUseRiskConfirmationV1 advertises the local Desktop-only,
+	// no-store point-of-risk detail and one-shot allow/deny decision seam. It
+	// does not imply that any model-facing action is classified or wired yet.
+	CapComputerUseRiskConfirmationV1 = "computer_use_risk_confirmation_v1"
 )
 
 var Capabilities = []string{
@@ -283,6 +309,12 @@ var Capabilities = []string{
 	CapMessageIdempotencyReceiptV2,
 	CapQuestionV1,
 	CapProjectEntityV1,
+	CapComputerUseTopologyV1,
+	CapComputerUseControlV1,
+	CapComputerUsePreviewV1,
+	CapComputerUseAppPolicyV1,
+	CapComputerUsePhysicalInterferenceV1,
+	CapComputerUseRiskConfirmationV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

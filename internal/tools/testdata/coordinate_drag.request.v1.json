@@ -1,0 +1,27 @@
+{
+  "id": 901,
+  "method": "coordinate_drag",
+  "params": {
+    "schema_version": 1,
+    "topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+    "helper_boot_id": "helper_boot_demo",
+    "pid": 4242,
+    "bundle_id": "com.example.fixture",
+    "window_id": 7001,
+    "expected_window_quartz_bounds": {"x": 100, "y": 100, "width": 800, "height": 600},
+    "start_display_id": 1,
+    "end_display_id": 1,
+    "start_quartz_point": {"x": 200.5, "y": 300.5},
+    "end_quartz_point": {"x": 500.5, "y": 300.5},
+    "waypoints": [
+      {"display_id": 1, "quartz_point": {"x": 200.5, "y": 300.5}},
+      {"display_id": 1, "quartz_point": {"x": 350.5, "y": 450.5}},
+      {"display_id": 1, "quartz_point": {"x": 500.5, "y": 300.5}}
+    ],
+    "button": "left",
+    "modifiers": [],
+    "duration_ms": 240,
+    "end_target_policy": "same_window",
+    "commit_deadline_at": "2026-07-22T12:03:31Z"
+  }
+}

@@ -50,7 +50,7 @@ func TestDogfoodLive(t *testing.T) {
 	if cfg.APIKey == "" {
 		t.Fatal("no api_key resolved")
 	}
-	t.Logf("CFG api_key_len=%d key_prefix=%s", len(cfg.APIKey), cfg.APIKey[:8])
+	t.Logf("CFG api_key_fingerprint=%s", Fingerprint(cfg.APIKey))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

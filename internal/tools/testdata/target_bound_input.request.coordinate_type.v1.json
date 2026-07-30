@@ -1,0 +1,21 @@
+{
+  "id": 905,
+  "method": "target_bound_input",
+  "params": {
+    "schema_version": 1,
+    "pid": 42,
+    "bundle_id": "com.tinyspeck.slackmacgap",
+    "window_id": 7001,
+    "expected_window_ax_bounds": {"x": 100, "y": 200, "width": 800, "height": 600},
+    "action": "type",
+    "ref": null,
+    "path": null,
+    "expected_role": null,
+    "expected_fingerprint": null,
+    "text": "fixture input",
+    "key": null,
+    "keys": null,
+    "modifiers": null,
+    "commit_deadline_at": "2033-05-18T03:33:21Z"
+  }
+}

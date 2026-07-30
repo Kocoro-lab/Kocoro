@@ -8,7 +8,7 @@ import "strings"
 //
 // Source of truth:
 //   - Upstream provider model docs (for each vendor)
-//   - shannon-cloud/config/models.yaml (cloud-side enforcement)
+//   - Cloud's published model catalog (cloud-side enforcement)
 //
 // Used by AgentLoop when constructing CompletionRequest.MaxTokens: if the
 // user did not set agent.max_tokens explicitly (config default 0), we look
@@ -17,18 +17,18 @@ import "strings"
 // model and cloud both allow 64K.
 //
 // Re-verify on every model launch — providers occasionally raise caps
-// without bumping the family number. Keep in sync with
-// shannon-cloud/config/models.yaml#max_tokens.
+// without bumping the family number. Keep in sync with Cloud's published
+// model catalog.
 //
 // Unknown model → fallback defaultMaxOutputTokens (32K) — conservative
 // enough to cover Opus 4.1 era and any third-party / Ollama model.
 var modelMaxOutputTokens = map[string]int{
 	// --- 1M-context families (output cap is independent of context) ---
-	"claude-sonnet-4-6":     64_000,
-	"claude-opus-4-6":       64_000,
-	"claude-opus-4-7":       64_000,
-	// Mythos preview: stays on the 32K fallback until output-cap docs are
-	// published; flip to 64K when shannon-cloud config/models.yaml confirms.
+	"claude-sonnet-4-6": 64_000,
+	"claude-opus-4-6":   64_000,
+	"claude-opus-4-7":   64_000,
+	// Mythos preview: stays on the 32K fallback until the provider and Cloud
+	// publish a matching output cap.
 	"claude-mythos-preview": defaultMaxOutputTokens,
 
 	// --- 200K, dated forms ---

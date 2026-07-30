@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "entries": [
+    {"bundle_id": "com.apple.authorizationhost", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.apple.coreauthui", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.apple.keychainaccess", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.apple.loginwindow", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.apple.passwords", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.apple.securityagent", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.apple.systempreferences", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.apple.terminal", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.example.editor", "decision": "blocked", "source": "user"},
+    {"bundle_id": "com.github.wez.wezterm", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.googlecode.iterm2", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "com.mitchellh.ghostty", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "dev.warp.warp-stable", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "net.kovidgoyal.kitty", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "org.alacritty", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "run.shannon.shanclaw", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "run.shannon.shanclaw.ax-server", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "run.shannon.shanclaw.dev", "decision": "blocked", "source": "built_in"},
+    {"bundle_id": "run.shannon.shanclaw.dev.ax-server", "decision": "blocked", "source": "built_in"}
+  ]
+}

@@ -63,7 +63,7 @@ var BuiltinMCPServers = map[string]BuiltinEntry{
 			// 300s gives the user a 5-minute window to complete the OAuth
 			// flow in the browser before the daemon kills the npx subprocess.
 			// The default 60s is too short for cold-cache mcp-remote downloads
-			// followed by manual OAuth approval (commonly 30–180s).
+			// followed by manual OAuth approval, which can be slow.
 			ConnectTimeoutSeconds: 300,
 		},
 		IsAuthorized: intercomIsAuthorized,

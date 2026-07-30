@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "intent_id": "cri_AAECAwQFBgcICQoLDA0ODw",
+  "request_id": "req_http_send",
+  "kind": "send",
+  "expires_at": "2026-07-23T10:01:00Z",
+  "target": {
+    "bundle_id": "com.tinyspeck.slackmacgap",
+    "app_name": "Slack",
+    "pid": 420,
+    "window_id": 1001,
+    "state_id": "s_0123456789abcdef",
+    "action_kind": "press",
+    "execution_path": "accessibility",
+    "element_ref": "e12",
+    "role": "AXButton",
+    "fingerprint": "axf_1111111111111111111111111111111111111111111111111111111111111111",
+    "coordinate_authority": null,
+    "target_digest": "tdv1_9e609b3b4014950d9b55449a25bb47386e82ea2ca984f531cd3a318b47f2585f"
+  },
+  "send": {
+    "destination_kind": "conversation",
+    "destination_label": "#shipping-ops",
+    "payload_kind": "current_composer"
+  },
+  "delete": null,
+  "purchase": null
+}

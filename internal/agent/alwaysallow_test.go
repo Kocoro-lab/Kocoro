@@ -80,8 +80,13 @@ func TestCheckPermissionAndApproval_FormerlyHighRiskHonorsAlwaysAllow(t *testing
 // unattended handler (scheduler/heartbeat/watcher/auto_approve) enforces
 // DisallowsUnattendedAutoApproval. Before the fix, the loop.go bypass
 // returned "allow" before the handler was ever consulted.
+//
+// computer_use is the ONE documented exception and is pinned separately in
+// TestCheckPermissionAndApproval_UnattendedHonorsGlobalComputerUseGrant.
+// Everything else on the deny-list — standalone screenshot and the legacy GUI
+// names — still fails closed.
 func TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForDenyListed(t *testing.T) {
-	for _, name := range []string{"computer_use", "screenshot"} {
+	for _, name := range []string{"screenshot", "computer", "accessibility", "applescript", "ghostty"} {
 		t.Run(name, func(t *testing.T) {
 			loop, handler := newApprovalProbeLoop(t, nil)
 			loop.SetAlwaysAllowTools([]string{name})
@@ -100,6 +105,28 @@ func TestCheckPermissionAndApproval_UnattendedSkipsAlwaysAllowForDenyListed(t *t
 				t.Error("approval request never reached the handler's unattended deny-list gate")
 			}
 		})
+	}
+}
+
+// The global Computer Use grant is the product's single automation permission:
+// an explicit persisted computer_use always-allow DOES authorize an unattended
+// run. This is the deliberate exception to the test above — pinned separately
+// so that widening it back to "any persisted always-allow wins" (which would
+// re-open unattended desktop capture for screenshot) fails loudly.
+func TestCheckPermissionAndApproval_UnattendedHonorsGlobalComputerUseGrant(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	loop.SetAlwaysAllowTools([]string{"computer_use"})
+	loop.SetUnattendedRun(true)
+
+	tool := &mockApprovalTool{name: "computer_use"}
+	_, approved := loop.checkPermissionAndApproval(
+		context.Background(), "computer_use", `{"description":"Inspect the screen"}`, tool, NewApprovalCache())
+
+	if !approved {
+		t.Error("explicit global computer_use grant was not honored on an unattended run")
+	}
+	if handler.approvalRequested {
+		t.Error("granted computer_use should not have prompted the unattended handler")
 	}
 }
 
@@ -129,11 +156,11 @@ func TestCheckPermissionAndApproval_UnattendedDeniesSafeArgsForDenyListed(t *tes
 	}
 }
 
-// TestCheckPermissionAndApproval_UnattendedKeepsSafeArgsForNonDenyListed
-// scopes the gate above to the deny-list: tools NOT on it (legacy
-// accessibility reads in existing unattended schedules) keep their
-// SafeChecker exemption on unattended runs — the fix must not over-block.
-func TestCheckPermissionAndApproval_UnattendedKeepsSafeArgsForNonDenyListed(t *testing.T) {
+// TestCheckPermissionAndApproval_UnattendedDeniesLegacyGUISafeArgs prevents
+// legacy accessibility observations from bypassing the V1 GUI safety gate.
+// The current admission seam is tool-name based, so even observation-only
+// calls fail closed until action-aware unattended policy exists.
+func TestCheckPermissionAndApproval_UnattendedDeniesLegacyGUISafeArgs(t *testing.T) {
 	loop, handler := newApprovalProbeLoop(t, nil)
 	loop.SetUnattendedRun(true)
 
@@ -141,33 +168,53 @@ func TestCheckPermissionAndApproval_UnattendedKeepsSafeArgsForNonDenyListed(t *t
 		name:     "accessibility",
 		safeArgs: func(string) bool { return true }, // read_tree/find/annotate/get_value
 	}
-	decision, approved := loop.checkPermissionAndApproval(context.Background(), "accessibility", `{"action":"read_tree","description":"Read window tree"}`, tool, NewApprovalCache())
+	_, approved := loop.checkPermissionAndApproval(context.Background(), "accessibility", `{"action":"read_tree","description":"Read window tree"}`, tool, NewApprovalCache())
 
-	if decision != "allow" || !approved {
-		t.Errorf("unattended safe-args call for non-deny-listed tool should stay approval-free; got (%s, %v)", decision, approved)
+	if approved {
+		t.Error("unattended accessibility observation bypassed the GUI deny-list")
 	}
-	if handler.approvalRequested {
-		t.Error("OnApprovalNeeded called for non-deny-listed safe-args tool on unattended run")
+	if !handler.approvalRequested {
+		t.Error("legacy GUI observation never reached the unattended handler gate")
 	}
 }
 
-// TestCheckPermissionAndApproval_AttendedStillHonorsAlwaysAllowForComputerUse
-// guards the other side: attended runs keep the normal always-allow UX for
-// computer_use — the unattended gate must not silently merge the two
-// deny-lists.
-func TestCheckPermissionAndApproval_AttendedStillHonorsAlwaysAllowForComputerUse(t *testing.T) {
-	loop, handler := newApprovalProbeLoop(t, nil)
-	loop.SetAlwaysAllowTools([]string{"computer_use"})
-	// unattendedRun defaults to false (attended).
+// A persisted Computer Use grant is the one public authorization fact. It
+// bypasses routine mutation prompts for both attended and unattended runs;
+// app-policy and consequential-risk gates execute before this seam.
+func TestCheckPermissionAndApproval_ComputerUseAlwaysAllowCoversAttendedAndUnattended(t *testing.T) {
+	for _, unattended := range []bool{false, true} {
+		loop, handler := newApprovalProbeLoop(t, nil)
+		loop.SetAlwaysAllowTools([]string{"computer_use"})
+		loop.SetUnattendedRun(unattended)
 
-	tool := &mockApprovalTool{name: "computer_use"}
-	decision, approved := loop.checkPermissionAndApproval(context.Background(), "computer_use", `{"action":"click","x":1,"y":1,"description":"Click"}`, tool, NewApprovalCache())
+		tool := &mockApprovalTool{name: "computer_use"}
+		decision, approved := loop.checkPermissionAndApproval(context.Background(), "computer_use", `{"action":"click","x":1,"y":1,"description":"Click"}`, tool, NewApprovalCache())
 
-	if decision != "allow" || !approved {
-		t.Errorf("attended always-allow for computer_use should bypass approval; got (%s, %v)", decision, approved)
+		if decision != "allow" || !approved {
+			t.Errorf("unattended=%v: global computer_use grant should allow; got (%s, %v)", unattended, decision, approved)
+		}
+		if handler.approvalRequested {
+			t.Errorf("unattended=%v: globally allowed computer_use unexpectedly prompted", unattended)
+		}
 	}
-	if handler.approvalRequested {
-		t.Error("OnApprovalNeeded called despite attended always-allow bypass")
+}
+
+func TestCheckPermissionAndApproval_LegacyGUIApprovalIsNeverTurnCached(t *testing.T) {
+	loop, handler := newApprovalProbeLoop(t, nil)
+	handler.approveResult = true
+	tool := &mockApprovalTool{name: "computer"}
+	cache := NewApprovalCache()
+	args := `{"action":"click","x":1,"y":1,"description":"Click"}`
+
+	for call := 0; call < 2; call++ {
+		handler.approvalRequested = false
+		decision, approved := loop.checkPermissionAndApproval(
+			context.Background(), "computer", args, tool, cache,
+		)
+		if decision != "ask" || !approved || !handler.approvalRequested {
+			t.Fatalf("call %d reused or denied fresh GUI approval: (%s, %v), requested=%v",
+				call+1, decision, approved, handler.approvalRequested)
+		}
 	}
 }
 

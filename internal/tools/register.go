@@ -104,7 +104,16 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(&AppleScriptTool{})
 	axClient := SharedAXClient()
 	reg.Register(&AccessibilityTool{client: axClient})
-	reg.Register(&ComputerUseTool{client: axClient})
+	reg.Register(&ComputerUseTool{
+		client:                          axClient,
+		coordinateExecutor:              axClient.CoordinateMouseEventV1,
+		coordinateDragExecutor:          axClient.CoordinateDragV1,
+		coordinatePixelScrollExecutor:   axClient.CoordinatePixelScrollV1,
+		semanticTextSelectionExecutor:   axClient.SemanticTextSelectionV2,
+		semanticPressExecutor:           axClient.SemanticPressV2,
+		targetBoundInputExecutor:        axClient.TargetBoundInputV1,
+		backgroundTargetedInputExecutor: axClient.BackgroundTargetedInputV1,
+	})
 	reg.Register(&GhosttyTool{tabs: newTabRegistry()})
 
 	browser := &BrowserTool{}
@@ -122,6 +131,12 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 			reg.Register(tool)
 		}
 	}
+
+	// CLI, TUI, and daemon all share this registry. Guard every local GUI
+	// describer at the final Tool.Run seam; only the daemon coordinator can
+	// mint the opaque authority required for mutations. Observations retain
+	// their existing direct behavior.
+	guardRegisteredGUIExecution(reg)
 
 	cleanup := func() {
 		if !browser.IsDeprecated() {
@@ -172,29 +187,36 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 	// AX-backed GUI tools share the process-wide transport (ax_server accepts
 	// one client) but never their run-local observations or cached dimensions.
 	if raw, ok := cloned.Get("accessibility"); ok {
-		if existing, ok := raw.(*AccessibilityTool); ok {
+		if existing, ok := unwrapGUIExecutionGate(raw).(*AccessibilityTool); ok {
 			toolCopy := *existing
 			toolCopy.refs = nil
 			toolCopy.lastPID = 0
-			cloned.Register(&toolCopy)
+			toolCopy.lastBundleID = ""
+			toolCopy.lastAppName = ""
+			cloned.Register(wrapGUIExecutionGate(&toolCopy))
 		}
 	}
 	if raw, ok := cloned.Get("computer_use"); ok {
-		if existing, ok := raw.(*ComputerUseTool); ok {
+		if existing, ok := unwrapGUIExecutionGate(raw).(*ComputerUseTool); ok {
 			toolCopy := *existing
+			toolCopy.initialTarget = nil
 			toolCopy.snapshot = nil
 			toolCopy.refs = nil
-			toolCopy.screenW = 0
-			toolCopy.screenH = 0
-			cloned.Register(&toolCopy)
+			toolCopy.coordinateArtifact = nil
+			toolCopy.semanticImageArtifact = nil
+			toolCopy.coordinateFocus = nil
+			toolCopy.navigationCommit = nil
+			toolCopy.backgroundInputAuthority = nil
+			toolCopy.foregroundFallbackRestorePending = false
+			cloned.Register(wrapGUIExecutionGate(&toolCopy))
 		}
 	}
 	if raw, ok := cloned.Get("computer"); ok {
-		if existing, ok := raw.(*ComputerTool); ok {
+		if existing, ok := unwrapGUIExecutionGate(raw).(*ComputerTool); ok {
 			toolCopy := *existing
 			toolCopy.screenW = 0
 			toolCopy.screenH = 0
-			cloned.Register(&toolCopy)
+			cloned.Register(wrapGUIExecutionGate(&toolCopy))
 		}
 	}
 
@@ -208,6 +230,333 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 	}
 
 	return cloned
+}
+
+func rawComputerUseToolForRun(tool agent.Tool) *ComputerUseTool {
+	for tool != nil {
+		switch typed := tool.(type) {
+		case *ComputerUseTool:
+			return typed
+		case *AnthropicComputerAdapter:
+			return typed.raw
+		case *axOnlyComputerUseTool:
+			tool = typed.inner
+		case guiExecutionGuarded:
+			tool = typed.guiExecutionInner()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// BindComputerUseInitialTargetForRun binds the Desktop-captured foreground app
+// to one already-cloned registry. Provider adapters keep this metadata behind
+// their native wire contract.
+func BindComputerUseInitialTargetForRun(
+	reg *agent.ToolRegistry,
+	target ComputerUseInitialTargetV1,
+) error {
+	if reg == nil {
+		return fmt.Errorf("cannot bind computer-use target to a nil registry")
+	}
+	target.AppName = strings.TrimSpace(target.AppName)
+	target.BundleID = strings.TrimSpace(target.BundleID)
+	if target.PID <= 0 || !ValidAppNamePattern.MatchString(target.AppName) ||
+		!consequentialRiskBundleIDPatternV1.MatchString(target.BundleID) {
+		return fmt.Errorf("computer-use initial target is invalid")
+	}
+	for _, name := range []string{"computer_use", client.NativeComputerToolName} {
+		registered, ok := reg.Get(name)
+		if !ok {
+			continue
+		}
+		if raw := rawComputerUseToolForRun(registered); raw != nil {
+			copy := target
+			raw.initialTarget = &copy
+			return nil
+		}
+	}
+	return fmt.Errorf("run registry has no computer-use core")
+}
+
+// RequireExplicitComputerUseTargetForRun makes the first observation on a
+// run-local generic tool require an app name (or a Desktop-bound initial
+// target). It is used for schedules and other unattended sources so they never
+// inherit an unrelated app that happens to be frontmost at execution time.
+func RequireExplicitComputerUseTargetForRun(reg *agent.ToolRegistry) error {
+	if reg == nil {
+		return fmt.Errorf("cannot scope computer-use target on a nil registry")
+	}
+	registered, ok := reg.Get("computer_use")
+	if !ok {
+		return nil
+	}
+	raw := rawComputerUseToolForRun(registered)
+	if raw == nil {
+		return fmt.Errorf("run registry computer_use has no configurable core")
+	}
+	raw.targetScope = computerUseTargetScopeExplicitV1
+	return nil
+}
+
+// CloneWithGenericComputerUseForRun creates the provider-neutral function-tool
+// surface for a resolved generic route or a safe old-Cloud fallback. The legacy
+// `computer` function is deliberately absent so fallback can never silently
+// re-enter its fixed-canvas coordinate contract.
+//
+// supportsToolResultImages must come from a trusted resolved execution profile.
+// When false (or when no profile exists), the public computer_use identity is
+// retained but wrapped in an AX-only gate that rejects screenshot/coordinate
+// inputs and strips any unexpected image result fail-closed.
+func CloneWithGenericComputerUseForRun(
+	reg *agent.ToolRegistry,
+	cfg *config.Config,
+	supportsToolResultImages bool,
+) (*agent.ToolRegistry, error) {
+	cloned := CloneWithRuntimeConfig(reg, cfg)
+	if cloned == nil {
+		return nil, fmt.Errorf("cannot create generic computer_use clone from nil registry")
+	}
+	cloned.Remove(client.NativeComputerToolName)
+	disableLegacyGUIFallbacksForComputerUseRun(cloned)
+	public, ok := cloned.Get("computer_use")
+	if !ok {
+		// Narrow test/embedded registries may intentionally contain no GUI
+		// tools. Preserve that absence rather than inventing capability or
+		// failing an otherwise unrelated run.
+		return cloned, nil
+	}
+	if !supportsToolResultImages {
+		cloned.Register(&axOnlyComputerUseTool{inner: public})
+	}
+	return cloned, nil
+}
+
+func disableLegacyGUIFallbacksForComputerUseRun(reg *agent.ToolRegistry) {
+	if reg == nil {
+		return
+	}
+	reg.Remove("accessibility")
+	reg.Remove("applescript")
+	if raw, ok := reg.Get("bash"); ok {
+		if bash, ok := raw.(*BashTool); ok {
+			bash.LegacyGUIAutomationDisabled = true
+		}
+	}
+}
+
+// CloneWithResolvedComputerUseProfileForRun selects exactly one public
+// computer-use contract from a profile minted by the authenticated Cloud
+// resolve call. Callers cannot synthesize the trusted seal by decoding JSON.
+func CloneWithResolvedComputerUseProfileForRun(
+	reg *agent.ToolRegistry,
+	cfg *config.Config,
+	profile *client.ExecutionProfile,
+) (*agent.ToolRegistry, error) {
+	if profile == nil || !profile.IsTrustedResolution() {
+		return nil, fmt.Errorf("computer-use execution profile is not a trusted resolution")
+	}
+	switch profile.ExecutionMode() {
+	case client.ExecutionModeFunctionComputerUse:
+		cloned, err := CloneWithGenericComputerUseForRun(
+			reg,
+			cfg,
+			profile.SupportsToolResultImages(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return cloned, nil
+	case client.ExecutionModeNativeComputer:
+		if profile.Provider() == client.NativeComputerProviderAnthropic &&
+			profile.APISurface() == client.APISurfaceAnthropicMessages &&
+			profile.ToolContract() == client.ToolContractAnthropicComputer20251124 &&
+			profile.BetaContract() == client.AnthropicComputerBetaContract {
+			// The provider declaration remains stable. Exact target-window
+			// screenshots are captured lazily and letterboxed into this canvas.
+			capability := newAnthropicComputerRunCapabilityAfterVerification(1280, 800)
+			cloned, err := CloneWithAnthropicComputerForRun(reg, cfg, capability)
+			if err != nil {
+				return nil, err
+			}
+			disableLegacyGUIFallbacksForComputerUseRun(cloned)
+			// The adapter owns the same clone-local ComputerUseTool core; it must
+			// not also be advertised as a competing generic function schema.
+			cloned.Remove("computer_use")
+			return cloned, nil
+		}
+		if profile.Provider() == client.OpenAIComputerProvider &&
+			profile.APISurface() == client.APISurfaceOpenAIResponses &&
+			profile.ToolContract() == client.ToolContractOpenAIComputerV1 &&
+			profile.BetaContract() == "" &&
+			profile.SupportsImageInput() &&
+			profile.SupportsToolResultImages() &&
+			!profile.SupportsFunctionTools() &&
+			profile.SupportsBatchedActions() {
+			cloned, err := CloneWithOpenAIComputerForRun(reg, cfg)
+			if err != nil {
+				return nil, err
+			}
+			disableLegacyGUIFallbacksForComputerUseRun(cloned)
+			// computer_use remains registered only as the daemon-private action
+			// core. AgentLoop exposes solely {"type":"computer"} for this exact
+			// trusted profile.
+			return cloned, nil
+		}
+		{
+			return nil, fmt.Errorf(
+				"native computer profile %q has no Kocoro executor in this build",
+				profile.ToolContract(),
+			)
+		}
+	case client.ExecutionModeUnavailable:
+		return nil, fmt.Errorf("resolved model does not support computer use")
+	default:
+		return nil, fmt.Errorf(
+			"unsupported computer-use execution mode %q",
+			profile.ExecutionMode(),
+		)
+	}
+}
+
+// CloneWithOpenAIComputerForRun replaces the clone-local legacy computer tool
+// with the Responses native schema marker while retaining the guarded
+// computer_use core for daemon-private per-action planning and execution.
+func CloneWithOpenAIComputerForRun(
+	reg *agent.ToolRegistry,
+	cfg *config.Config,
+) (*agent.ToolRegistry, error) {
+	if reg == nil {
+		return nil, fmt.Errorf("cannot enable OpenAI computer adapter for a nil registry")
+	}
+	cloned := CloneWithRuntimeConfig(reg, cfg)
+	raw, ok := cloned.Get("computer_use")
+	if !ok {
+		return nil, fmt.Errorf("OpenAI computer adapter requires clone-local computer_use")
+	}
+	if _, err := NewOpenAIComputerActionRuntimeV1(raw); err != nil {
+		return nil, err
+	}
+	legacy, ok := cloned.Get(client.NativeComputerToolName)
+	if !ok {
+		return nil, fmt.Errorf("OpenAI computer adapter requires legacy %q entry",
+			client.NativeComputerToolName)
+	}
+	if _, ok := unwrapGUIExecutionGate(legacy).(*ComputerTool); !ok {
+		return nil, fmt.Errorf(
+			"OpenAI computer adapter may replace only legacy ComputerTool, got %T",
+			unwrapGUIExecutionGate(legacy),
+		)
+	}
+	marker := NewOpenAIComputerAdapterV1(nil)
+	definition := marker.NativeToolDef()
+	if definition == nil {
+		return nil, fmt.Errorf("OpenAI computer adapter produced no native definition")
+	}
+	if err := definition.Validate(); err != nil {
+		return nil, fmt.Errorf("OpenAI computer adapter native definition: %w", err)
+	}
+	cloned.Register(marker)
+	return cloned, nil
+}
+
+// AnthropicComputerRunCapability is an opaque, run-local authorization minted
+// only after a caller has verified the exact provider/model/profile contract.
+//
+// The zero value is deliberately invalid, its fields are not caller-settable,
+// and no public mint exists while production provider attestation is absent.
+// This keeps the adapter seam testable without turning a config bool into an
+// accidental production enable path.
+type AnthropicComputerRunCapability struct {
+	seal                   *anthropicComputerRunCapabilitySeal
+	initialDisplayWidthPX  int
+	initialDisplayHeightPX int
+}
+
+type anthropicComputerRunCapabilitySeal struct {
+	marker byte
+}
+
+var trustedAnthropicComputerRunCapabilitySeal = &anthropicComputerRunCapabilitySeal{marker: 1}
+
+// newAnthropicComputerRunCapabilityAfterVerification is intentionally private.
+// A future provider/profile verifier in this package may call it only after it
+// has attested the whole native contract. For now it is used solely by focused
+// seam tests, so CLI, TUI, and daemon production paths cannot mint capability.
+func newAnthropicComputerRunCapabilityAfterVerification(
+	initialDisplayWidthPX int,
+	initialDisplayHeightPX int,
+) AnthropicComputerRunCapability {
+	return AnthropicComputerRunCapability{
+		seal:                   trustedAnthropicComputerRunCapabilitySeal,
+		initialDisplayWidthPX:  initialDisplayWidthPX,
+		initialDisplayHeightPX: initialDisplayHeightPX,
+	}
+}
+
+// CloneWithAnthropicComputerForRun creates a normal run-local clone, then
+// atomically replaces only the clone's legacy public `computer` entry with the
+// provider-native adapter. The adapter always delegates to that same clone's
+// private `computer_use` core.
+//
+// The input registry is never mutated. Missing or unexpected tools, an
+// untrusted capability, or an invalid native definition return nil and an
+// error without exposing a partially replaced clone.
+func CloneWithAnthropicComputerForRun(
+	reg *agent.ToolRegistry,
+	cfg *config.Config,
+	capability AnthropicComputerRunCapability,
+) (*agent.ToolRegistry, error) {
+	if reg == nil {
+		return nil, fmt.Errorf("cannot enable Anthropic computer adapter for a nil registry")
+	}
+	if capability.seal != trustedAnthropicComputerRunCapabilitySeal {
+		return nil, fmt.Errorf("Anthropic computer adapter requires verified run capability")
+	}
+	if capability.initialDisplayWidthPX <= 0 || capability.initialDisplayHeightPX <= 0 {
+		return nil, fmt.Errorf("Anthropic computer adapter capability requires positive display dimensions")
+	}
+
+	cloned := CloneWithRuntimeConfig(reg, cfg)
+	rawRegistered, ok := cloned.Get("computer_use")
+	if !ok {
+		return nil, fmt.Errorf("Anthropic computer adapter requires clone-local computer_use")
+	}
+	raw, ok := unwrapGUIExecutionGate(rawRegistered).(*ComputerUseTool)
+	if !ok {
+		return nil, fmt.Errorf("Anthropic computer adapter requires ComputerUseTool, got %T",
+			unwrapGUIExecutionGate(rawRegistered))
+	}
+	legacyRegistered, ok := cloned.Get(client.NativeComputerToolName)
+	if !ok {
+		return nil, fmt.Errorf("Anthropic computer adapter requires legacy %q entry",
+			client.NativeComputerToolName)
+	}
+	if _, ok := unwrapGUIExecutionGate(legacyRegistered).(*ComputerTool); !ok {
+		return nil, fmt.Errorf("Anthropic computer adapter may replace only legacy ComputerTool, got %T",
+			unwrapGUIExecutionGate(legacyRegistered))
+	}
+
+	adapter := NewAnthropicComputerAdapter(
+		raw,
+		capability.initialDisplayWidthPX,
+		capability.initialDisplayHeightPX,
+	)
+	definition := adapter.NativeToolDef()
+	if definition == nil {
+		return nil, fmt.Errorf("Anthropic computer adapter produced no native definition")
+	}
+	if err := definition.Validate(); err != nil {
+		return nil, fmt.Errorf("Anthropic computer adapter native definition: %w", err)
+	}
+	guarded := wrapGUIExecutionGate(adapter)
+	if _, ok := guarded.(agent.NativeToolProvider); !ok {
+		return nil, fmt.Errorf("Anthropic computer adapter execution gate lost native provider trait")
+	}
+
+	cloned.Register(guarded)
+	return cloned, nil
 }
 
 // gatewayAllowedTools is the allowlist of server-side tools worth registering
@@ -473,6 +822,12 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 		}
 	}
 
+	// Re-assert the execution boundary after composing an arbitrary baseline
+	// with remote tools. Production baselines already arrive guarded, but this
+	// keeps registry rebuilds and future local GUI describers fail-closed even
+	// if their caller supplied a raw ToolRegistry.
+	guardRegisteredGUIExecution(reg)
+
 	// Apply tool filter AFTER all sources are registered
 	reg = ApplyToolFilter(reg, agentDef...)
 
@@ -590,7 +945,7 @@ func CompleteRegistrationAsync(ctx context.Context, gw *client.GatewayClient, cf
 // MCP connects: the returned startMCP closure runs them in the background
 // once the caller has stood up the supervisor and atomically swapped the
 // new deps into place. HTTP /config/reload and daemon startup are no
-// longer blocked by slow MCP handshakes (Intercom OAuth can be 30-180s).
+// longer blocked by slow MCP handshakes, including interactive OAuth.
 func RegisterAllWithBaselineAsync(gw *client.GatewayClient, cfg *config.Config, agentDef ...*agents.Agent) (
 	baseline *agent.ToolRegistry,
 	reg *agent.ToolRegistry,

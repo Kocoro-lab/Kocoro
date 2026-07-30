@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "coordinator_instance_id": "cui_demo",
+  "revision": 41,
+  "lease_id": "cul_demo",
+  "lease_state": "active",
+  "heartbeat_at": "2026-07-22T12:00:00Z",
+  "expires_at": "2026-07-22T12:00:30Z"
+}

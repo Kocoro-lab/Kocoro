@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "status": "user_interference",
+  "action": "hotkey",
+  "input_committed": true,
+  "clipboard_touched": false,
+  "clipboard_restored": false,
+  "phase": "user_interference",
+  "failure_code": "physical_input_interference",
+  "retry_safe": false,
+  "postcondition": null
+}

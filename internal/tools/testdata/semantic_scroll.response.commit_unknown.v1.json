@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "completed_unverified",
+  "commit_state": "unknown",
+  "phase": "action",
+  "failure_code": "ax_scroll_commit_unknown",
+  "retry_safe": false,
+  "postcondition": null,
+  "initial_value": 0.25,
+  "final_value": null,
+  "steps_completed": 1,
+  "expected_steps": 3
+}

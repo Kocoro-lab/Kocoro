@@ -1,0 +1,32 @@
+{
+  "id": 905,
+  "method": "background_targeted_input",
+  "params": {
+    "schema_version": 1,
+    "input": {
+      "schema_version": 1,
+      "pid": 42,
+      "bundle_id": "com.apple.Notes",
+      "window_id": 7001,
+      "expected_window_ax_bounds": {"x": 100, "y": 200, "width": 800, "height": 600},
+      "action": "type",
+      "ref": "e2",
+      "path": "window[0]/AXTextField[0]",
+      "expected_role": "AXTextField",
+      "expected_fingerprint": "axf_e2",
+      "text": "fixture input",
+      "key": null,
+      "keys": null,
+      "modifiers": null,
+      "commit_deadline_at": "2033-05-18T03:33:21Z"
+    },
+    "focused_ref": "e2",
+    "focused_path": "window[0]/AXTextField[0]",
+    "expected_focused_role": "AXTextField",
+    "expected_focused_fingerprint": "axf_e2",
+    "target_launch_date": "2026-07-28T06:00:00Z",
+    "preserved_frontmost_pid": 84,
+    "preserved_frontmost_bundle_id": "com.apple.TextEdit",
+    "preserved_frontmost_launch_date": "2026-07-28T05:00:00Z"
+  }
+}

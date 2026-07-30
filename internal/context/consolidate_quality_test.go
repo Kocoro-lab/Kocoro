@@ -41,8 +41,8 @@ func TestConsolidateMemory_LLMQuality(t *testing.T) {
 
 	// 13 detail files with duplicates, variations, and stale entries
 	entries := []struct {
-		date    string
-		facts   []string
+		date  string
+		facts []string
 	}{
 		{"2026-03-01", []string{
 			"Auth tokens expire after 1 hour",
@@ -90,7 +90,7 @@ func TestConsolidateMemory_LLMQuality(t *testing.T) {
 			"Auth tokens: 1h expiry",
 			"DB pool 20 max",
 			"User prefers dark mode for all UIs",
-			"Slack channel #ops-alerts for production incidents",
+			"Synthetic Slack channel #ops-alerts for service alerts",
 		}},
 		{"2026-03-09", []string{
 			"Auth token expiry: 1 hour",

@@ -273,14 +273,14 @@ func TestRedactSecrets_PEMMarker(t *testing.T) {
 // install failure, so we must scrub credentials before persisting.
 func TestRedactSecrets_URLEmbeddedCredentials(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		mustHave  string // substring that must remain (proves scheme+host kept)
-		mustHide  string // substring that must NOT appear (proves creds gone)
+		name     string
+		input    string
+		mustHave string // substring that must remain (proves scheme+host kept)
+		mustHide string // substring that must NOT appear (proves creds gone)
 	}{
 		{
 			name:     "https with token",
-			input:    "fatal: unable to access 'https://wayland:ghp_secrettoken123@github.com/foo/bar.git/': Forbidden",
+			input:    "fatal: unable to access 'https://alice:ghp_secrettoken123@github.com/foo/bar.git/': Forbidden",
 			mustHave: "https://[REDACTED]@github.com/foo/bar.git",
 			mustHide: "ghp_secrettoken123",
 		},
