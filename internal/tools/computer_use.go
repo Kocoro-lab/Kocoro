@@ -357,6 +357,9 @@ type ComputerUseTool struct {
 	client                           axCallClient
 	targetScope                      computerUseTargetScopeV1
 	initialTarget                    *ComputerUseInitialTargetV1
+	lastTaskTarget                   *ComputerUseInitialTargetV1
+	allowedTaskTargets               map[computerUseTaskTargetKeyV1]struct{}
+	frontmostDiversion               computerUseFrontmostDiversionV1
 	snapshot                         *computerUseSnapshot
 	refs                             map[string]refEntry
 	coordinateArtifact               *CoordinateWindowArtifactV1
@@ -377,6 +380,72 @@ type ComputerUseTool struct {
 	coordinateCaptureLimits          CaptureCoordinateWindowLimitsV1
 	coordinateNow                    func() time.Time
 	coordinateFrameID                func() (string, error)
+}
+
+type computerUseTaskTargetKeyV1 struct {
+	pid      int
+	bundleID string
+}
+
+type computerUseFrontmostDiversionV1 string
+
+const (
+	computerUseFrontmostControllerV1 computerUseFrontmostDiversionV1 = "controller"
+	computerUseFrontmostUnrelatedV1  computerUseFrontmostDiversionV1 = "unrelated"
+)
+
+func (t *ComputerUseTool) setAllowedTaskTargetsV1(
+	targets []ComputerUseInitialTargetV1,
+) {
+	if t == nil {
+		return
+	}
+	t.allowedTaskTargets = nil
+	if len(targets) == 0 {
+		return
+	}
+	allowed := make(map[computerUseTaskTargetKeyV1]struct{}, len(targets))
+	for _, target := range targets {
+		bundleID := strings.ToLower(strings.TrimSpace(target.BundleID))
+		if target.PID <= 0 || bundleID == "" {
+			continue
+		}
+		allowed[computerUseTaskTargetKeyV1{
+			pid:      target.PID,
+			bundleID: bundleID,
+		}] = struct{}{}
+	}
+	if len(allowed) > 0 {
+		t.allowedTaskTargets = allowed
+	}
+}
+
+func (t *ComputerUseTool) isAllowedTaskTargetV1(
+	pid int,
+	bundleID string,
+) bool {
+	if t == nil || pid <= 0 || len(t.allowedTaskTargets) == 0 {
+		return false
+	}
+	_, ok := t.allowedTaskTargets[computerUseTaskTargetKeyV1{
+		pid:      pid,
+		bundleID: strings.ToLower(strings.TrimSpace(bundleID)),
+	}]
+	return ok
+}
+
+func (t *ComputerUseTool) frontmostDiversionV1(
+	pid int,
+	bundleID string,
+) computerUseFrontmostDiversionV1 {
+	if guicontrol.IsComputerUseControllerSurfaceBundleID(bundleID) {
+		return computerUseFrontmostControllerV1
+	}
+	if len(t.allowedTaskTargets) > 0 &&
+		!t.isAllowedTaskTargetV1(pid, bundleID) {
+		return computerUseFrontmostUnrelatedV1
+	}
+	return ""
 }
 
 // A Mac has one frontmost app, pointer, keyboard focus, and AX server. Keep a
@@ -765,6 +834,7 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	// finalizer -> tree B succeeds as one exact-window transaction.
 	t.coordinateArtifact = nil
 	t.semanticImageArtifact = nil
+	t.frontmostDiversion = ""
 	pendingFocus := t.coordinateFocus
 	t.coordinateFocus = nil
 
@@ -804,6 +874,23 @@ func (t *ComputerUseTool) getAppState(ctx context.Context, args computerUseArgs)
 	tree, failure, ok := t.readTree(ctx, pid, filter, budget)
 	if !ok {
 		return failure, nil
+	}
+	if args.FollowFrontmost && pid == 0 && t.lastTaskTarget != nil {
+		diversion := t.frontmostDiversionV1(tree.PID, tree.BundleID)
+		if diversion != "" {
+			retained := *t.lastTaskTarget
+			tree, failure, ok = t.readTree(ctx, retained.PID, filter, budget)
+			if !ok {
+				return failure, nil
+			}
+			if tree.PID != retained.PID ||
+				strings.TrimSpace(tree.BundleID) != retained.BundleID {
+				return agent.BusinessError(
+					"computer_use retained task target identity changed while another app was frontmost; re-observe the intended app",
+				), nil
+			}
+			t.frontmostDiversion = diversion
+		}
 	}
 	if expectedPID > 0 && (tree.PID != expectedPID ||
 		strings.TrimSpace(tree.BundleID) != expectedBundleID) {
@@ -988,6 +1075,18 @@ func (t *ComputerUseTool) publishComputerUseObservation(
 		elements:               tree.Elements,
 		signatures:             signatures,
 		typed:                  tree.SchemaVersion == 1,
+	}
+	if tree.SchemaVersion == 1 && tree.PID > 0 &&
+		strings.TrimSpace(tree.App) != "" &&
+		strings.TrimSpace(tree.BundleID) != "" &&
+		!guicontrol.IsComputerUseControllerSurfaceBundleID(tree.BundleID) &&
+		(len(t.allowedTaskTargets) == 0 ||
+			t.isAllowedTaskTargetV1(tree.PID, tree.BundleID)) {
+		t.lastTaskTarget = &ComputerUseInitialTargetV1{
+			PID:      tree.PID,
+			AppName:  strings.TrimSpace(tree.App),
+			BundleID: strings.TrimSpace(tree.BundleID),
+		}
 	}
 	t.refs = make(map[string]refEntry, len(tree.RefPaths))
 	for ref, entry := range tree.RefPaths {
@@ -3530,6 +3629,7 @@ func (t *ComputerUseTool) invalidateObservationState() {
 	t.refs = nil
 	t.coordinateArtifact = nil
 	t.semanticImageArtifact = nil
+	t.frontmostDiversion = ""
 }
 
 func (t *ComputerUseTool) invalidateObservationStateAfterMutationV1(

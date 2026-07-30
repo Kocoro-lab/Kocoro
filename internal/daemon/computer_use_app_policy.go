@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
+	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 )
 
 const (
@@ -56,7 +57,7 @@ type persistedComputerUseAppPolicy struct {
 // happens to contain a terminal or settings view would make ordinary desktop
 // work unusable; V1 blocks only Kocoro itself, macOS security surfaces, and
 // dedicated shell applications.
-var builtInComputerUseBlockedBundleIDs = []string{
+var builtInComputerUseBlockedBundleIDs = append([]string{
 	"com.apple.authorizationhost",
 	"com.apple.coreauthui",
 	"com.apple.keychainaccess",
@@ -71,11 +72,7 @@ var builtInComputerUseBlockedBundleIDs = []string{
 	"dev.warp.warp-stable",
 	"net.kovidgoyal.kitty",
 	"org.alacritty",
-	"run.shannon.shanclaw",
-	"run.shannon.shanclaw.ax-server",
-	"run.shannon.shanclaw.dev",
-	"run.shannon.shanclaw.dev.ax-server",
-}
+}, guicontrol.ComputerUseControllerSurfaceBundleIDs()...)
 
 var builtInComputerUseBlockedSet = func() map[string]struct{} {
 	set := make(map[string]struct{}, len(builtInComputerUseBlockedBundleIDs))

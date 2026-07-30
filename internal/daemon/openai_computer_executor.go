@@ -313,8 +313,7 @@ func openAIComputerBatchContinuationAllowedV1(
 	executeErr error,
 ) bool {
 	if executeErr != nil ||
-		len(execution.Result.Images) != 1 ||
-		execution.ActionEffect == agent.ComputerUseCommitUnknown {
+		len(execution.Result.Images) != 1 {
 		return false
 	}
 	if !execution.Result.IsError {
@@ -472,19 +471,27 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 	started := time.Now()
 	var trace *openAIComputerTraceV1
 	batchIndex := 0
+	executionLane := ""
+	foregroundFallback := false
+	fallbackReason := ""
+	frontmostClass := ""
 	if e != nil {
 		trace = e.trace
 		batchIndex = e.batchIndex
 	}
 	defer func() {
 		trace.record(openAIComputerTraceWithCaptureDiagnosticsV1(openAIComputerTraceEventV1{
-			Phase:       "action",
-			Status:      openAIComputerTraceStatusV1(execution.Result, err),
-			BatchIndex:  batchIndex,
-			ActionIndex: scope.ActionIndex + 1,
-			ActionCount: scope.ActionCount,
-			ActionType:  action.Type,
-			CommitState: string(execution.CommitState),
+			Phase:              "action",
+			Status:             openAIComputerTraceStatusV1(execution.Result, err),
+			BatchIndex:         batchIndex,
+			ActionIndex:        scope.ActionIndex + 1,
+			ActionCount:        scope.ActionCount,
+			ActionType:         action.Type,
+			ExecutionLane:      executionLane,
+			ForegroundFallback: foregroundFallback,
+			FallbackReason:     fallbackReason,
+			FrontmostClass:     frontmostClass,
+			CommitState:        string(execution.CommitState),
 			FailureCode: openAIComputerTraceFailureCodeV1(
 				execution.Result,
 				err,
@@ -539,6 +546,10 @@ func (e *daemonOpenAIComputerExecutorV1) ExecuteAuthorizedOpenAIComputerActionV1
 				failureCode,
 			)
 	}
+	executionLane = string(plan.ExecutionLane)
+	foregroundFallback = plan.ForegroundFallback
+	fallbackReason = plan.FallbackReason
+	frontmostClass = plan.FrontmostClass
 	if plan.Mutation != openAIComputerActionMutatesInDaemonV1(action) {
 		return tools.OpenAIComputerActionExecutionV1{
 			CommitState: tools.OpenAIComputerNotCommittedV1,

@@ -806,10 +806,14 @@ func (c *Coordinator) FinishAction(finish ActionFinish) error {
 		state.ActionResult = cloneActionResult(action.cancellationResult)
 		state.FailureCode = nil
 	} else if finish.Result != nil && *finish.Result == ComputerUseResultUserInterference {
+		// Ambient user input is not an explicit Take Over. Keep the goal lease
+		// active, require one exact observation before another mutation, and
+		// let the provider re-plan from that fresh state. Explicit Pause and
+		// Take Over still arrive through action.cancellationResult above and
+		// retain their quiescent waiting-for-user semantics.
 		c.active.requiresObservation = true
-		c.active.lease.State = ComputerUseLeasePaused
-		state.LeaseState = ComputerUseLeasePaused
-		state.ActionPhase = ComputerUsePhaseWaitingForUser
+		state.LeaseState = ComputerUseLeaseActive
+		state.ActionPhase = ComputerUsePhaseObserving
 	} else if action.effect == ComputerUseActionObservation && action.toolName == "computer_use" &&
 		action.actionKind == "get_app_state" && finish.Result != nil &&
 		*finish.Result == ComputerUseResultVerified {
