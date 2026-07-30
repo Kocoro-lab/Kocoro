@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -298,6 +299,40 @@ func TestToolSearchTool_SelectMixedDirectAndDeferred(t *testing.T) {
 	}
 	if len(result.ContentBlocks) != 1 || result.ContentBlocks[0].ToolName != "mock_mcp_a" {
 		t.Fatalf("mixed selection blocks = %+v, want one deferred reference", result.ContentBlocks)
+	}
+}
+
+func TestToolSearchTool_ExactSelectReportsDirectTools(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "computer_use"})
+	reg.Register(&mockTool{name: "bash"})
+	ts := newToolSearchTool(reg, map[string]bool{})
+
+	result, err := ts.Run(context.Background(), `{"query":"select:computer_use"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:" {
+		t.Fatalf("direct computer_use must remain outside tool_search, got: %s", header)
+	}
+	if !strings.Contains(result.Content, `Tool "computer_use" is already directly available`) {
+		t.Fatalf("direct computer_use should receive the generic direct-call guidance, got %q", result.Content)
+	}
+	if len(result.ContentBlocks) != 0 {
+		t.Fatalf("direct tool must not emit a deferred tool_reference, got %+v", result.ContentBlocks)
+	}
+
+	result, err = ts.Run(context.Background(), `{"query":"select:bash"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header = strings.SplitN(result.Content, "\n", 2)[0]
+	if header != "LOADED:" {
+		t.Fatalf("ordinary active tool must remain outside tool_search, got: %s", header)
+	}
+	if !strings.Contains(result.Content, `Tool "bash" is already directly available`) {
+		t.Fatalf("direct bash should receive the generic direct-call guidance, got %q", result.Content)
 	}
 }
 
@@ -665,6 +700,48 @@ func TestBuildFullSchemasWithDefer_RespectsEffectiveExposure(t *testing.T) {
 	}
 	if !hasAnyNonDeferred(schemas) {
 		t.Error("expected at least one non-deferred schema (web_search/web_fetch)")
+	}
+}
+
+func TestBuildFullSchemasWithDefer_AnthropicNativeComputerCanBeDeferred(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mockNativeTool{name: "computer"})
+	reg.Register(&mockTool{name: "bash"})
+
+	schemas := buildFullSchemasWithDefer(reg, map[string]bool{
+		"computer": true,
+		"bash":     true,
+	})
+	if len(schemas) != 2 {
+		t.Fatalf("schemas len = %d, want 2", len(schemas))
+	}
+
+	var native, function *client.Tool
+	for index := range schemas {
+		schema := &schemas[index]
+		switch schema.Type {
+		case client.NativeComputerToolType:
+			native = schema
+		case "function":
+			function = schema
+		}
+	}
+	if native == nil || function == nil {
+		t.Fatalf("expected native and function schemas, got %+v", schemas)
+	}
+	if !native.DeferLoading {
+		t.Fatal("cold Anthropic native computer lost defer_loading")
+	}
+	if !function.DeferLoading {
+		t.Fatal("cold function tool lost existing defer_loading behavior")
+	}
+	raw, err := json.Marshal(native)
+	if err != nil {
+		t.Fatalf("marshal cold native computer: %v", err)
+	}
+	if !strings.Contains(string(raw), `"defer_loading":true`) ||
+		strings.Contains(string(raw), "function") {
+		t.Fatalf("deferred native computer wire shape is invalid: %s", raw)
 	}
 }
 

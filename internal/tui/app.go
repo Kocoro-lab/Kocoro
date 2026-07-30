@@ -549,11 +549,14 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		loop.SetAgentName(agentOverride.Name)
 		// TUI honors the same persisted always-allow set Desktop writes to.
 		// Read-only — TUI has no "Always Allow" write path yet.
-		merged := append([]string(nil), runtimeCfg.Permissions.AlwaysAllowTools...)
+		var perAgentAlwaysAllow []string
 		if agentOverride.Config != nil && agentOverride.Config.Permissions != nil {
-			merged = append(merged, agentOverride.Config.Permissions.AlwaysAllowTools...)
+			perAgentAlwaysAllow = agentOverride.Config.Permissions.AlwaysAllowTools
 		}
-		loop.SetAlwaysAllowTools(merged)
+		loop.SetAlwaysAllowTools(agents.MergeAlwaysAllowTools(
+			runtimeCfg.Permissions.AlwaysAllowTools,
+			perAgentAlwaysAllow,
+		))
 	} else {
 		loop.SetAgentName("")
 		loop.SetMemoryDir(filepath.Join(shannonDir, "memory"))
@@ -739,11 +742,14 @@ func (m *Model) rebuildAgentLoop() {
 		agentDir := filepath.Join(m.shannonDir, "agents", m.agentOverride.Name)
 		loop.SwitchAgent(m.agentOverride.Prompt, agentDir, nil, scopedMCPCtx, m.loadedSkills)
 		loop.SetAgentName(m.agentOverride.Name)
-		merged := append([]string(nil), m.cfg.Permissions.AlwaysAllowTools...)
+		var perAgentAlwaysAllow []string
 		if m.agentOverride.Config != nil && m.agentOverride.Config.Permissions != nil {
-			merged = append(merged, m.agentOverride.Config.Permissions.AlwaysAllowTools...)
+			perAgentAlwaysAllow = m.agentOverride.Config.Permissions.AlwaysAllowTools
 		}
-		loop.SetAlwaysAllowTools(merged)
+		loop.SetAlwaysAllowTools(agents.MergeAlwaysAllowTools(
+			m.cfg.Permissions.AlwaysAllowTools,
+			perAgentAlwaysAllow,
+		))
 	} else {
 		loop.SetAgentName("")
 		loop.SetMemoryDir(filepath.Join(m.shannonDir, "memory"))
@@ -3013,7 +3019,10 @@ func (h *tuiEventHandler) OnToolCall(name string, args string, toolUseID string)
 		return
 	}
 	if h.model.program != nil {
-		h.model.program.Send(toolCallMsg{name: name, args: truncate(args, 200)})
+		h.model.program.Send(toolCallMsg{
+			name: name,
+			args: truncate(agent.RedactGUIActivityArguments(name, args), 200),
+		})
 	}
 }
 
@@ -3021,8 +3030,8 @@ func (h *tuiEventHandler) OnToolResult(name string, args string, toolUseID strin
 	if h.model.program != nil {
 		h.model.program.Send(toolResultMsg{
 			name:    name,
-			args:    args,
-			content: result.Content,
+			args:    agent.RedactGUIActivityArguments(name, args),
+			content: agent.RedactGUIActivityResult(name, result.Content),
 			isError: result.IsError,
 			elapsed: elapsed,
 		})

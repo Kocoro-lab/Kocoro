@@ -41,14 +41,9 @@ func TestApprovalBroker_NonInteractiveChannelAutoApproves(t *testing.T) {
 	}
 }
 
-func TestApprovalBroker_NonInteractiveDenyListBeatsBrokerAlwaysAllow(t *testing.T) {
+func TestApprovalBroker_ComputerUseNeedsExplicitGrantForNonInteractiveUse(t *testing.T) {
 	sent := false
 	broker := NewApprovalBroker(func(req ApprovalRequest) error { sent = true; return nil })
-	broker.SetToolAutoApprove("computer_use")
-	if !broker.IsToolAutoApproved("computer_use") {
-		t.Fatal("test setup: attended broker Always Allow was not recorded")
-	}
-
 	decision := broker.Request(context.Background(),
 		ApprovalRequestMeta{Source: ChannelWeChat}, "computer_use", `{"action":"click","x":1,"y":1}`)
 	if decision != DecisionDeny {
@@ -56,6 +51,16 @@ func TestApprovalBroker_NonInteractiveDenyListBeatsBrokerAlwaysAllow(t *testing.
 	}
 	if sent {
 		t.Error("deny-listed non-interactive request must fail closed without an impossible approval round-trip")
+	}
+
+	broker.SetToolAutoApprove("computer_use")
+	if !broker.IsToolAutoApproved("computer_use") {
+		t.Fatal("explicit Computer Use grant was not retained by broker")
+	}
+	decision = broker.Request(context.Background(),
+		ApprovalRequestMeta{Source: ChannelWeChat}, "computer_use", `{"action":"click","x":1,"y":1}`)
+	if decision != DecisionAllow {
+		t.Fatalf("explicit Computer Use grant was not inherited by non-interactive run: %v", decision)
 	}
 }
 

@@ -35,17 +35,40 @@ import (
 //     default. Replaced the legacy command-string allowed_commands path so
 //     non-technical users get "click once, never asked again" semantics.
 //
-//  4. Non-bash + named agent: tool-level per-agent persistence.
+//  4. computer_use from any agent: GLOBAL persistence. The grant is a product
+//     permission across apps and agents, not a per-agent tool preference.
 //
-//  5. Non-bash + default agent: tool-level GLOBAL persistence (same global
+//  5. Other non-bash + named agent: tool-level per-agent persistence.
+//
+//  6. Other non-bash + default agent: tool-level GLOBAL persistence (same global
 //     list bash uses). Required because the SSE handler recreates the
 //     broker per request, so broker.SetToolAutoApprove alone evaporates.
 //     Tools in DisallowsAutoApproval are refused at this entry plus at
-//     PersistAgentAlwaysAllow, broker, and the runtime gate in loop.go. The
-//     list is empty as of 2026-05-18.
-func HandleAlwaysAllowDecision(deps *ServerDeps, broker *ApprovalBroker, agentName, tool, args string) {
+//     PersistAgentAlwaysAllow, broker, and the runtime gate in loop.go.
+//
+// localSurface reports whether the approval decision arrived on a
+// loopback-only surface the user is physically at (Desktop over local SSE), as
+// opposed to a Cloud-relayed channel or a paired remote device. Only a local
+// surface may mint the persistent global Computer Use grant: that grant also
+// authorizes UNATTENDED runs, so a tap in Slack or on a phone would otherwise
+// permanently license 3am schedules to drive this Mac. POST
+// /permissions/always-allow already enforces the same rule via
+// X-Kocoro-Local-Presence; this keeps the approval-click path consistent with it.
+func HandleAlwaysAllowDecision(
+	deps *ServerDeps, broker *ApprovalBroker, agentName, tool, args string, localSurface bool,
+) {
 	if tool == "bash" {
 		handleBashAlwaysAllow(deps, broker, agentName, args)
+		return
+	}
+	if tool == "computer_use" {
+		if !localSurface {
+			emitAlwaysAllowNotice(deps, "warn", NoticeCodeComputerUseGrantRequiresLocalPresence, tool,
+				"Computer Use was allowed for this call only. Turn on Always Allow Computer Use from the app on this Mac to grant it permanently.")
+			log.Printf("daemon: computer_use global grant refused on a non-local approval surface")
+			return
+		}
+		persistGlobalToolAlwaysAllow(deps, broker, tool)
 		return
 	}
 	// Non-bash. PersistAgentAlwaysAllow does its own DisallowsAutoApproval gate
@@ -104,7 +127,8 @@ func handleBashAlwaysAllow(deps *ServerDeps, broker *ApprovalBroker, agentName, 
 // and sets the broker's in-memory flag for immediate session effect.
 // Used by both bash (default agent) and non-bash + default agent paths so a
 // fresh-per-request SSE broker doesn't make "Always Allow" evaporate.
-// Callers must reject DisallowsAutoApproval tools before invoking this.
+// Callers must reject DisallowsAutoApproval tools before invoking this, except
+// for computer_use's explicit product-level grant path above.
 func persistGlobalToolAlwaysAllow(deps *ServerDeps, broker *ApprovalBroker, tool string) {
 	if err := config.AppendGlobalAlwaysAllowTool(deps.ShannonDir, tool); err != nil {
 		log.Printf("daemon: failed to persist global always-allow for %s: %v", tool, err)
@@ -190,6 +214,12 @@ const (
 	// an otherwise-allowed tool but the filesystem write failed. The click
 	// is still honored for the current session via the broker.
 	NoticeCodePersistFailed = "persist_failed"
+	// NoticeCodeComputerUseGrantRequiresLocalPresence is sent when "Always
+	// Allow" for computer_use is clicked on a Cloud-relayed channel or a
+	// paired remote device. The call itself is honored, but the persistent
+	// global grant — which also authorizes unattended runs — may only be
+	// minted from the Mac itself.
+	NoticeCodeComputerUseGrantRequiresLocalPresence = "computer_use_grant_requires_local_presence"
 )
 
 // AlwaysAllowNoticePayload is the structured shape of EventApprovalNotice

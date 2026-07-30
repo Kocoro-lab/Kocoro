@@ -1,0 +1,78 @@
+{
+  "app": "Fixture App",
+  "app_name": "Fixture App",
+  "bundle_id": "run.shannon.ax-fixture",
+  "elements": [
+    {
+      "actions": [
+        "AXPress"
+      ],
+      "children": [],
+      "desc": "Save document",
+      "description": "Save document",
+      "enabled": true,
+      "fingerprint": "axf_26044f5fe5bfdf5240ec9fde4df36d9760b3f71efb5b935622ec4038fc7604ad",
+      "focused": false,
+      "frame": {
+        "height": 28,
+        "width": 90,
+        "x": 620,
+        "y": 390
+      },
+      "identifier": "save-button",
+      "path": "window[0]/AXButton[0]",
+      "ref": "e1",
+      "role": "AXButton",
+      "selected": false,
+      "title": "Save",
+      "value_redacted": false
+    },
+    {
+      "actions": [
+        "AXConfirm"
+      ],
+      "children": [],
+      "enabled": true,
+      "fingerprint": "axf_49f9999997a5aa2c3c52399ad8e990ce311d5ada051d6c8d15323f9e897bc52e",
+      "focused": true,
+      "frame": {
+        "height": 28,
+        "width": 220,
+        "x": 620,
+        "y": 430
+      },
+      "identifier": "password-field",
+      "path": "window[0]/AXTextField[0]",
+      "ref": "e2",
+      "role": "AXTextField",
+      "selected": false,
+      "subrole": "AXSecureTextField",
+      "title": "Password",
+      "value_redacted": true
+    }
+  ],
+  "focused_ref": "e2",
+  "pid": 4242,
+  "ref_paths": {
+    "e1": {
+      "fingerprint": "axf_26044f5fe5bfdf5240ec9fde4df36d9760b3f71efb5b935622ec4038fc7604ad",
+      "path": "window[0]/AXButton[0]",
+      "role": "AXButton"
+    },
+    "e2": {
+      "fingerprint": "axf_49f9999997a5aa2c3c52399ad8e990ce311d5ada051d6c8d15323f9e897bc52e",
+      "path": "window[0]/AXTextField[0]",
+      "role": "AXTextField"
+    }
+  },
+  "schema_version": 1,
+  "window": "Fixture Window",
+  "window_frame": {
+    "height": 600,
+    "width": 800,
+    "x": 500,
+    "y": 250
+  },
+  "window_id": null,
+  "window_title": "Fixture Window"
+}

@@ -1,0 +1,20 @@
+{
+  "id": 703,
+  "method": "semantic_text_selection_v2",
+  "params": {
+    "schema_version": 2,
+    "pid": 42,
+    "bundle_id": "com.apple.Notes",
+    "window_id": 7001,
+    "ref": "e1",
+    "path": "window[0]/AXTextArea[0]",
+    "expected_role": "AXTextArea",
+    "expected_fingerprint": "axf_target",
+    "range": {
+      "location": 5,
+      "length": 12
+    },
+    "fallback_policy": "report_unsupported",
+    "commit_deadline_at": "2027-01-15T08:00:01.000Z"
+  }
+}

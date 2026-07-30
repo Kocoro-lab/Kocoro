@@ -1,0 +1,18 @@
+{
+  "id": 702,
+  "method": "semantic_press_v2",
+  "params": {
+    "schema_version": 2,
+    "pid": 42,
+    "bundle_id": "com.apple.Notes",
+    "window_id": 7001,
+    "ref": "e1",
+    "path": "window[0]/AXButton[0]",
+    "expected_role": "AXButton",
+    "expected_fingerprint": "axf_target",
+    "fallback_policy": "none",
+    "interference_policy": "global_physical",
+    "commit_deadline_at": "2099-01-02T03:04:06.000000000Z",
+    "risk_destination_assertion": null
+  }
+}

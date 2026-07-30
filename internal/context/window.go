@@ -16,10 +16,9 @@ const (
 	overheadPerMessage = 4
 
 	// compactThreshold is the fraction of context window that triggers compaction.
-	// 0.90 leaves the cliff at 180K on a 200K cap, vs 170K at the historical
-	// 0.85 setting; ~5% of sessions in the 170K–180K band skip the cliff entirely.
-	// The preflight emergency gate at 0.95 (internal/agent/loop.go) is the safety
-	// net for the remaining 10K headroom.
+	// The preflight emergency gate in internal/agent/loop.go provides the
+	// independent safety net. Product traffic distributions and observed
+	// compaction rates are maintained outside this public repository.
 	compactThreshold = 0.90
 
 	// stableUserBudgetFraction is the share of the compaction target that the
@@ -33,7 +32,7 @@ const (
 	// target − EstimateTokens(messages): the slice-derived budget shifted the
 	// byte boundary every turn as history grew, breaking the Anthropic
 	// prompt-cache prefix at the truncated message and re-billing the whole
-	// message as fresh cache_creation (~$0.67/follow-up turn — issue #124).
+	// message as fresh cache_creation (issue #124).
 	// A fixed fraction makes the cut a pure function of (contextWindow, the
 	// message, the oversized count), identical across turns. Scaling with
 	// contextWindow rather than a flat char cap keeps 200K-era sizing from

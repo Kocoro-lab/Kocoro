@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -86,24 +88,24 @@ func TestAskUserQuestionIsCancelableMidTurn(t *testing.T) {
 	}
 }
 
-// TestDisallowsAutoApproval pins the current policy: the deny-list mechanism
-// EXISTS (so a future genuinely-irreversible tool can be added) but is empty
-// for now. publish_to_web / generate_image / edit_image were previously on
-// this list; the 2026-05-18 product call moved them off so users who opt
-// into "always allow" no longer have to re-confirm every call. See the
-// trade-off block on autoApprovalDenyList for the data-exfiltration risk we
-// accepted.
+// TestDisallowsAutoApproval pins the attended policy. computer_use may be
+// explicitly persisted as the product's global Computer Use grant; legacy GUI
+// tools remain excluded so they cannot bypass the new guarded surface.
 func TestDisallowsAutoApproval(t *testing.T) {
-	// The list is currently empty — every tool can be persisted as always-allow.
-	if got := AutoApprovalDenyList(); len(got) != 0 {
-		t.Fatalf("autoApprovalDenyList expected empty, got %v", got)
+	want := []string{"computer", "accessibility", "applescript", "ghostty"}
+	got := AutoApprovalDenyList()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("autoApprovalDenyList expected %v, got %v", want, got)
 	}
-	// And no representative tool should be considered non-persistable, including
-	// the three that USED to be on the list. If a future change adds a new entry
-	// the test author should explicitly add it here so the policy shift is visible.
+	for _, name := range want {
+		if !DisallowsAutoApproval(name) {
+			t.Fatalf("GUI control tool %s must require fresh approval", name)
+		}
+	}
+	// Former entries remain persistable; this change is scoped to live GUI control.
 	for _, name := range []string{
 		"publish_to_web", "generate_image", "edit_image",
-		"bash", "file_write", "cloud_delegate", "think",
+		"computer_use", "bash", "file_write", "cloud_delegate", "think",
 	} {
 		if DisallowsAutoApproval(name) {
 			t.Fatalf("%s should not be in the per-call approval denylist", name)
@@ -111,23 +113,52 @@ func TestDisallowsAutoApproval(t *testing.T) {
 	}
 }
 
+func TestGUIActionOutcomeValidationRequiresCoherentFailureCodes(t *testing.T) {
+	validPointer := &GUIActionPointer{
+		DisplayID: 1, TopologyID: "topology-1", TopologyGeneration: 1, X: -10, Y: 20,
+	}
+	for _, tc := range []struct {
+		name    string
+		outcome GUIActionOutcome
+		valid   bool
+	}{
+		{name: "verified", outcome: GUIActionOutcome{Result: GUIActionResultVerified, Phase: GUIActionPhaseVerifying, Pointer: validPointer}, valid: true},
+		{name: "verified with failure", outcome: GUIActionOutcome{Result: GUIActionResultVerified, Phase: GUIActionPhaseVerifying, FailureCode: "unexpected"}},
+		{name: "unverified with reason", outcome: GUIActionOutcome{Result: GUIActionResultCompletedUnverified, Phase: GUIActionPhaseVerifying, FailureCode: "postcondition_not_observed"}, valid: true},
+		{name: "unverified same-observation continuation", outcome: GUIActionOutcome{Result: GUIActionResultCompletedUnverified, Phase: GUIActionPhaseVerifying, FailureCode: "postcondition_not_observed", SameObservationContinuationSafe: true}, valid: true},
+		{name: "failed cannot continue same observation", outcome: GUIActionOutcome{Result: GUIActionResultFailed, Phase: GUIActionPhaseActing, FailureCode: "action_failed", SameObservationContinuationSafe: true}},
+		{name: "unverified without reason", outcome: GUIActionOutcome{Result: GUIActionResultCompletedUnverified, Phase: GUIActionPhaseVerifying}},
+		{name: "failed with unsafe code", outcome: GUIActionOutcome{Result: GUIActionResultFailed, Phase: GUIActionPhaseActing, FailureCode: "secret: leaked"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.outcome.Validate()
+			if (err == nil) != tc.valid {
+				t.Fatalf("Validate() error=%v valid=%v", err, tc.valid)
+			}
+		})
+	}
+}
+
 // TestDisallowsUnattendedAutoApproval pins the unattended gate. The list
-// contains computer_use and standalone screenshot — an unattended
-// schedule/heartbeat/watcher run must never invoke either on the
-// strength of an attended always-allow click or a blanket auto_approve. See
-// unattendedAutoApprovalDenyList for the full rationale,
-// including why the legacy GUI tools are deliberately NOT listed.
+// contains computer_use, standalone screenshot, and every legacy GUI-control
+// name — an unattended schedule/heartbeat/watcher run must never observe or
+// control the screen on the strength of an attended always-allow click or a
+// blanket auto_approve, nor use a legacy name to bypass the computer_use gate.
+// See unattendedAutoApprovalDenyList for the full rationale.
 //
 // If you add an entry, also enumerate the tools you expect to remain off
 // the list so accidental over-broad deny-listing (which would break
 // scheduled runs of ordinary agents) gets caught.
 func TestDisallowsUnattendedAutoApproval(t *testing.T) {
 	got := UnattendedAutoApprovalDenyList()
-	if len(got) != 2 || got[0] != "computer_use" || got[1] != "screenshot" {
-		t.Fatalf("unattendedAutoApprovalDenyList expected [computer_use screenshot], got %v", got)
+	want := []string{"computer_use", "screenshot", "computer", "accessibility", "applescript", "ghostty"}
+	if len(got) != len(want) {
+		t.Fatalf("unattendedAutoApprovalDenyList expected %v, got %v", want, got)
 	}
-	if !DisallowsUnattendedAutoApproval("computer_use") {
-		t.Fatal("computer_use must be refused unattended auto-approval")
+	for index, name := range want {
+		if got[index] != name || !DisallowsUnattendedAutoApproval(name) {
+			t.Fatalf("GUI tool %q missing from unattended deny-list %v", name, got)
+		}
 	}
 	if !DisallowsUnattendedAutoApproval("screenshot") {
 		t.Fatal("screenshot must be refused unattended auto-approval")
@@ -179,7 +210,7 @@ func TestHighRiskListConsistency(t *testing.T) {
 		}
 	}
 
-	// Spot-check a few obvious safe tools — both gates must agree they're allowed.
+	// Spot-check ordinary safe tools — both gates must agree they're allowed.
 	for _, name := range []string{"file_write", "http", "bash", "file_read", "browser_navigate", "think"} {
 		if _, denied := rtSet[name]; denied {
 			t.Errorf("autoApprovalDenyList accidentally contains safe tool %q", name)
@@ -191,10 +222,21 @@ func TestHighRiskListConsistency(t *testing.T) {
 			t.Errorf("agents.IsToolAlwaysAllowable(%q) = false; want true", name)
 		}
 	}
+
+	// Computer Use is persistable only as the single global product
+	// permission. Runtime auto-approval may honor that global grant, while the
+	// per-agent persistence gate must reject a second scoped grant.
+	if DisallowsAutoApproval("computer_use") {
+		t.Error("global computer_use grant was disabled")
+	}
+	if agents.IsToolAlwaysAllowable("computer_use") {
+		t.Error("computer_use was admitted to per-agent always-allow")
+	}
 }
 
 type mockNativeTool struct {
 	name string
+	def  *client.NativeToolDef
 }
 
 func (m *mockNativeTool) Info() ToolInfo {
@@ -205,11 +247,131 @@ func (m *mockNativeTool) Run(ctx context.Context, args string) (ToolResult, erro
 }
 func (m *mockNativeTool) RequiresApproval() bool { return false }
 func (m *mockNativeTool) NativeToolDef() *client.NativeToolDef {
+	if m.def != nil {
+		return m.def
+	}
 	return &client.NativeToolDef{
 		Type:            "computer_20251124",
 		Name:            "computer",
 		DisplayWidthPx:  1280,
 		DisplayHeightPx: 800,
+	}
+}
+
+type preparingMockNativeTool struct {
+	*mockNativeTool
+	prepareCalls int
+}
+
+func (m *preparingMockNativeTool) PrepareNativeToolRequest(context.Context) error {
+	m.prepareCalls++
+	return nil
+}
+
+func TestPrepareProviderNativeToolsHonorsSelectedTaggedUnion(t *testing.T) {
+	native := &preparingMockNativeTool{mockNativeTool: &mockNativeTool{name: "computer"}}
+	reg := NewToolRegistry()
+	reg.Register(native)
+
+	selectedFunction := client.Tool{
+		Type: "function",
+		Function: client.FunctionDef{
+			Name:       "computer",
+			Parameters: map[string]any{"type": "object"},
+		},
+		DeferLoading: true,
+	}
+	if err := prepareProviderNativeTools(context.Background(), reg, []client.Tool{selectedFunction}); err != nil {
+		t.Fatalf("function selection preparation: %v", err)
+	}
+	if native.prepareCalls != 0 {
+		t.Fatalf("same-name function selection triggered %d native preparations", native.prepareCalls)
+	}
+
+	selectedNative := buildToolSchema(native)
+	if err := prepareProviderNativeTools(
+		context.Background(), reg, []client.Tool{selectedNative, selectedNative},
+	); err != nil {
+		t.Fatalf("native selection preparation: %v", err)
+	}
+	if native.prepareCalls != 1 {
+		t.Fatalf("duplicate selected native schemas triggered %d preparations, want 1", native.prepareCalls)
+	}
+}
+
+func TestRefreshProviderNativeToolSchemasOnlyRebuildsNativeEntries(t *testing.T) {
+	nativeDef := &client.NativeToolDef{
+		Type:            client.NativeComputerToolType,
+		Name:            client.NativeComputerToolName,
+		DisplayWidthPx:  1280,
+		DisplayHeightPx: 800,
+	}
+	reg := NewToolRegistry()
+	reg.Register(&mockNativeTool{name: "computer", def: nativeDef})
+	reg.Register(&mockTool{name: "file_read"})
+
+	functionSchema := buildToolSchema(&mockTool{name: "file_read"})
+	functionSchema.DeferLoading = true
+	before := []client.Tool{
+		buildToolSchema(&mockNativeTool{name: "computer", def: nativeDef}),
+		functionSchema,
+	}
+	before[0].DeferLoading = true
+
+	nativeDef.DisplayWidthPx = 1024
+	nativeDef.DisplayHeightPx = 768
+	got := refreshProviderNativeToolSchemas(reg, before)
+
+	if got[0].DisplayWidthPx != 1024 || got[0].DisplayHeightPx != 768 {
+		t.Fatalf("native dimensions = %dx%d, want 1024x768", got[0].DisplayWidthPx, got[0].DisplayHeightPx)
+	}
+	if !reflect.DeepEqual(got[1], before[1]) {
+		t.Fatalf("ordinary function schema changed:\n got: %+v\nwant: %+v", got[1], before[1])
+	}
+	if got[1].DeferLoading != true {
+		t.Fatal("ordinary function lost defer_loading while refreshing native schema")
+	}
+	if !got[0].DeferLoading {
+		t.Fatal("Anthropic native tool lost defer_loading while refreshing its schema")
+	}
+	if &got[0] == &before[0] {
+		t.Fatal("refresh must return an isolated slice so prior dispatched requests stay immutable")
+	}
+
+	selectedFunction := client.Tool{
+		Type: "function",
+		Function: client.FunctionDef{
+			Name:       "computer",
+			Parameters: map[string]any{"type": "object"},
+		},
+		DeferLoading: true,
+	}
+	functionSelected := refreshProviderNativeToolSchemas(reg, []client.Tool{selectedFunction})
+	if !reflect.DeepEqual(functionSelected[0], selectedFunction) {
+		t.Fatalf("native provider was mixed into a function/deferred selection:\n got: %+v\nwant: %+v", functionSelected[0], selectedFunction)
+	}
+}
+
+func TestBuildToolSchemaRejectsInvalidNativeDefinitionAtWireBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		def  client.NativeToolDef
+	}{
+		{name: "wrong type", def: client.NativeToolDef{Type: "computer_20241022", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: 800}},
+		{name: "wrong name", def: client.NativeToolDef{Type: "computer_20251124", Name: "desktop", DisplayWidthPx: 1280, DisplayHeightPx: 800}},
+		{name: "zero width", def: client.NativeToolDef{Type: "computer_20251124", Name: "computer", DisplayHeightPx: 800}},
+		{name: "negative height", def: client.NativeToolDef{Type: "computer_20251124", Name: "computer", DisplayWidthPx: 1280, DisplayHeightPx: -1}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			schema := buildToolSchema(&mockNativeTool{name: "computer", def: &tc.def})
+			if err := schema.Validate(); err == nil {
+				t.Fatalf("invalid native definition passed schema validation: %+v", schema)
+			}
+			if _, err := json.Marshal(schema); err == nil {
+				t.Fatalf("invalid native definition marshaled successfully: %+v", schema)
+			}
+		})
 	}
 }
 

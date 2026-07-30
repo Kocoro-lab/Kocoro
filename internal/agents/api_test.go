@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -312,6 +313,71 @@ func TestWriteAgentConfig_AutoApproveRoundTrip(t *testing.T) {
 	d2, _ := os.ReadFile(filepath.Join(dir, "agent-def456", "config.yaml"))
 	if strings.Contains(string(d2), "auto_approve") {
 		t.Errorf("nil AutoApprove should be omitted, got: %s", d2)
+	}
+}
+
+func TestWriteAgentConfigRejectsPerAgentComputerUsePermission(t *testing.T) {
+	dir := t.TempDir()
+	err := WriteAgentConfig(dir, "agent-computer-use", &AgentConfigAPI{
+		Permissions: &AgentPermissionsConfig{
+			AlwaysAllowTools: []string{"computer_use"},
+		},
+	})
+	if !errors.Is(err, ErrToolNotPersistable) {
+		t.Fatalf("err=%v, want ErrToolNotPersistable", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(
+		dir, "agent-computer-use", "config.yaml",
+	)); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected config was written: %v", statErr)
+	}
+}
+
+// Legacy GUI wrappers were legitimately persistable per-agent before they
+// joined highRiskTools, so real on-disk configs contain them. Config writes are
+// full-replace, so rejecting the stale entry would make the agent permanently
+// uneditable through the API. The write must succeed and self-heal instead.
+func TestWriteAgentConfigDropsStaleLegacyGUIPermissionInsteadOfFailing(t *testing.T) {
+	dir := t.TempDir()
+	err := WriteAgentConfig(dir, "legacy-gui", &AgentConfigAPI{
+		DisplayName: "Legacy GUI",
+		Permissions: &AgentPermissionsConfig{
+			AlwaysAllowTools: []string{"applescript", "file_read", "ghostty"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("WriteAgentConfig() = %v, want nil (stale entries must self-heal)", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "legacy-gui", "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config.yaml: %v", err)
+	}
+	var loaded AgentConfig
+	if err := yaml.Unmarshal(raw, &loaded); err != nil {
+		t.Fatalf("unmarshal config.yaml: %v", err)
+	}
+	if loaded.Permissions == nil {
+		t.Fatal("permissions block was dropped entirely; file_read must survive")
+	}
+	want := []string{"file_read"}
+	if !reflect.DeepEqual(loaded.Permissions.AlwaysAllowTools, want) {
+		t.Fatalf("always_allow_tools = %v, want %v", loaded.Permissions.AlwaysAllowTools, want)
+	}
+}
+
+// The caller's struct must never be mutated — API handlers reuse it after the
+// write (for example to render the response).
+func TestSanitizeAgentPermissionsConfigDoesNotMutateInput(t *testing.T) {
+	original := &AgentPermissionsConfig{
+		AlwaysAllowTools: []string{"applescript", "file_read"},
+	}
+	cleaned := SanitizeAgentPermissionsConfig(original)
+	if !reflect.DeepEqual(original.AlwaysAllowTools, []string{"applescript", "file_read"}) {
+		t.Fatalf("input was mutated: %v", original.AlwaysAllowTools)
+	}
+	if !reflect.DeepEqual(cleaned.AlwaysAllowTools, []string{"file_read"}) {
+		t.Fatalf("cleaned = %v, want [file_read]", cleaned.AlwaysAllowTools)
 	}
 }
 

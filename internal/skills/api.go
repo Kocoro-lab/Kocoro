@@ -139,7 +139,6 @@ var DownloadableSkills = []struct {
 	{"claude-api", "Build apps with the Claude API or Anthropic SDK"},
 	{"doc-coauthoring", "Structured workflow for co-authoring documentation"},
 	{"frontend-design", "Create production-grade frontend interfaces with high design quality"},
-	{"heatmap-analyze", "End-to-end Ptengine heatmap analysis with AI-powered CRO insights"},
 	{"internal-comms", "Write internal communications using company formats"},
 	{"mcp-builder", "Create MCP servers for LLM-to-service integration"},
 	{"skill-creator", "Create, modify, and measure skill performance"},

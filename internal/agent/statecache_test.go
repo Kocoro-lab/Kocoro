@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 )
@@ -55,3 +56,40 @@ func TestBuildStateAwareCacheKeyChangesAfterVersionBump(t *testing.T) {
 		t.Fatalf("expected cache key to change after version bump, got %q", before)
 	}
 }
+
+func TestStatefulGUIObservationsBypassFallbackReadCache(t *testing.T) {
+	for _, name := range []string{"computer_use", "accessibility"} {
+		t.Run(name, func(t *testing.T) {
+			tool := statefulReadCacheProbe{name: name}
+			traits := resolveFallbackReadStateTraits(tool, `{"action":"get_app_state"}`)
+			if traits.Cacheable || len(traits.Reads) != 0 {
+				t.Fatalf("stateful GUI observation entered fallback read cache: %+v", traits)
+			}
+			if !tool.IsReadOnlyCall(`{"action":"get_app_state"}`) {
+				t.Fatal("cache bypass must not remove read-only/safe classification")
+			}
+		})
+	}
+
+	ordinary := statefulReadCacheProbe{name: "ordinary_read"}
+	traits := resolveFallbackReadStateTraits(ordinary, `{}`)
+	if !traits.Cacheable || len(traits.Reads) != 1 {
+		t.Fatalf("ordinary read-only fallback unexpectedly disabled: %+v", traits)
+	}
+}
+
+type statefulReadCacheProbe struct {
+	name string
+}
+
+func (tool statefulReadCacheProbe) Info() ToolInfo {
+	return ToolInfo{Name: tool.name}
+}
+
+func (statefulReadCacheProbe) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{}, nil
+}
+
+func (statefulReadCacheProbe) RequiresApproval() bool { return false }
+
+func (statefulReadCacheProbe) IsReadOnlyCall(string) bool { return true }

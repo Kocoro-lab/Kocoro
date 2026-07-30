@@ -2,7 +2,14 @@ package tools
 
 import (
 	"context"
+	"image"
+	"image/png"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
 func TestComputer_Info(t *testing.T) {
@@ -11,20 +18,41 @@ func TestComputer_Info(t *testing.T) {
 	if info.Name != "computer" {
 		t.Errorf("expected name 'computer', got %q", info.Name)
 	}
-	// computer is a native Anthropic tool (NativeToolDef) — its
-	// Parameters/Description are dropped on the wire by buildToolSchema, so
-	// no `description` field is added (see description_field_test.go exemption).
-	if !containsString(info.Required, "action") {
-		t.Errorf("expected Required to contain 'action', got %v", info.Required)
+	if !containsString(info.Required, "action") || !containsString(info.Required, "description") {
+		t.Errorf("expected Required to contain action and description, got %v", info.Required)
 	}
 	props, ok := info.Parameters["properties"].(map[string]any)
 	if !ok {
 		t.Fatal("expected properties map in parameters")
 	}
-	for _, key := range []string{"action", "x", "y", "text", "keys", "button", "clicks"} {
+	for _, key := range []string{"action", "x", "y", "text", "keys", "button", "clicks", "description"} {
 		if _, exists := props[key]; !exists {
 			t.Errorf("expected property %q in schema", key)
 		}
+	}
+}
+
+func TestLegacyComputerAdvertisesFunctionSchemaNotProviderNative(t *testing.T) {
+	tool := &ComputerTool{client: &AXClient{}}
+	if _, ok := any(tool).(agent.NativeToolProvider); ok {
+		t.Fatal("legacy ComputerTool must not advertise Anthropic's provider-native computer contract")
+	}
+
+	registry := agent.NewToolRegistry()
+	registry.Register(tool)
+	schemas := registry.SortedSchemas()
+	if len(schemas) != 1 {
+		t.Fatalf("schema count = %d, want 1", len(schemas))
+	}
+	schema := schemas[0]
+	if schema.Type != "function" || schema.Function.Name != "computer" {
+		t.Fatalf("legacy computer schema = %+v, want ordinary function named computer", schema)
+	}
+	if schema.Name != "" || schema.DisplayWidthPx != 0 || schema.DisplayHeightPx != 0 {
+		t.Fatalf("legacy function schema leaked provider-native fields: %+v", schema)
+	}
+	if !containsString(schema.Function.Parameters["required"].([]string), "description") {
+		t.Fatalf("legacy function schema does not require approval description: %+v", schema)
 	}
 }
 
@@ -62,7 +90,7 @@ func TestComputer_MissingAction(t *testing.T) {
 
 func TestComputer_UnknownAction(t *testing.T) {
 	tool := &ComputerTool{client: &AXClient{}}
-	result, err := tool.Run(context.Background(), `{"action": "fly"}`)
+	result, err := tool.Run(context.Background(), `{"action": "fly", "description": "Try unknown action"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -76,7 +104,7 @@ func TestComputer_UnknownAction(t *testing.T) {
 
 func TestComputer_TypeMissingText(t *testing.T) {
 	tool := &ComputerTool{client: &AXClient{}}
-	result, err := tool.Run(context.Background(), `{"action": "type"}`)
+	result, err := tool.Run(context.Background(), `{"action": "type", "description": "Type text"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -88,9 +116,21 @@ func TestComputer_TypeMissingText(t *testing.T) {
 	}
 }
 
+func TestLegacyComputerTypeAcknowledgementDoesNotEchoTypedContent(t *testing.T) {
+	secret := "ordinary typed content"
+	raw := []byte(`{"result":"typed: ` + secret + `","context":{"app":"Notes","pid":42}}`)
+	got := legacyComputerTypeAcknowledgement(raw)
+	if contains(got, secret) || contains(got, "typed:") {
+		t.Fatalf("legacy type acknowledgement leaked content: %q", got)
+	}
+	if !contains(got, "Typed text (content redacted)") || !contains(got, "Notes") {
+		t.Fatalf("legacy type acknowledgement lost safe status/context: %q", got)
+	}
+}
+
 func TestComputer_HotkeyMissingKeys(t *testing.T) {
 	tool := &ComputerTool{client: &AXClient{}}
-	result, err := tool.Run(context.Background(), `{"action": "hotkey"}`)
+	result, err := tool.Run(context.Background(), `{"action": "hotkey", "description": "Press shortcut"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -190,8 +230,14 @@ func TestComputer_NormalizeArgs_NoOp(t *testing.T) {
 }
 
 func TestComputer_ScaleXY(t *testing.T) {
-	tool := &ComputerTool{client: &AXClient{}, screenW: 1440, screenH: 900}
-	x, y := tool.scaleXY(640, 400)
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 1440, screenH: 900,
+		toolW: 1280, toolH: 800,
+	}
+	x, y, err := tool.scaleXY(640, 400)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if x != 720 || y != 450 {
 		t.Errorf("expected (720, 450), got (%d, %d)", x, y)
 	}
@@ -199,9 +245,304 @@ func TestComputer_ScaleXY(t *testing.T) {
 
 func TestComputer_ScaleXY_DefaultFallback(t *testing.T) {
 	// When screen dims match API dims, no scaling
-	tool := &ComputerTool{client: &AXClient{}, screenW: 1280, screenH: 800}
-	x, y := tool.scaleXY(100, 200)
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 1280, screenH: 800,
+		toolW: 1280, toolH: 800,
+	}
+	x, y, err := tool.scaleXY(100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if x != 100 || y != 200 {
 		t.Errorf("expected (100, 200), got (%d, %d)", x, y)
+	}
+}
+
+func TestComputer_LegacyToolDimensionsAndMappingMatchFinalRetinaScreenshotAspect(t *testing.T) {
+	tool := &ComputerTool{
+		client: &AXClient{},
+		readScreenGeometry: func() (screenGeometry, error) {
+			return screenGeometry{
+				LogicalWidth: 2560, LogicalHeight: 1440,
+				CaptureWidth: 5120, CaptureHeight: 2880,
+			}, nil
+		},
+	}
+	if err := tool.ensureScreenDims(); err != nil {
+		t.Fatal(err)
+	}
+	if tool.toolW != 1280 || tool.toolH != 720 {
+		t.Fatalf("legacy tool dimensions = %dx%d, want exact final 1280x720", tool.toolW, tool.toolH)
+	}
+	x, y, err := tool.scaleXY(640, 360)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x != 1280 || y != 720 {
+		t.Fatalf("center maps to (%d,%d), want logical center (1280,720)", x, y)
+	}
+}
+
+func TestComputer_GeometryFailureDoesNotInstallFallbackDimensions(t *testing.T) {
+	tool := &ComputerTool{
+		client: &AXClient{},
+		readScreenGeometry: func() (screenGeometry, error) {
+			return screenGeometry{}, os.ErrNotExist
+		},
+	}
+
+	if err := tool.ensureScreenDims(); err == nil {
+		t.Fatal("geometry failure unexpectedly installed legacy dimensions")
+	}
+	if tool.screenW != 0 || tool.screenH != 0 || tool.toolW != 0 || tool.toolH != 0 {
+		t.Fatalf("geometry failure installed fallback dimensions screen=%dx%d tool=%dx%d",
+			tool.screenW, tool.screenH, tool.toolW, tool.toolH)
+	}
+}
+
+func TestComputer_GeometryFailureStopsScreenshotBeforeCapture(t *testing.T) {
+	captureCalled := false
+	tool := &ComputerTool{
+		readScreenGeometry: func() (screenGeometry, error) {
+			return screenGeometry{}, os.ErrNotExist
+		},
+		captureScreen: func(context.Context, int) (string, agent.ImageBlock, error) {
+			captureCalled = true
+			return "", agent.ImageBlock{}, os.ErrInvalid
+		},
+	}
+
+	result, err := tool.screenshot(context.Background())
+	if err != nil || !result.IsError || !contains(result.Content, "screen geometry unavailable") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if captureCalled {
+		t.Fatal("screenshot capture ran without trusted logical/tool dimensions")
+	}
+}
+
+func TestComputer_GeometryFailureStopsCoordinateMutationsBeforeAXWrite(t *testing.T) {
+	for _, action := range []string{"click", "move"} {
+		t.Run(action, func(t *testing.T) {
+			writer := &coordinateMouseTestWriter{writeErr: os.ErrInvalid}
+			tool := &ComputerTool{
+				client: coordinateMouseTestClient(writer),
+				readScreenGeometry: func() (screenGeometry, error) {
+					return screenGeometry{}, os.ErrNotExist
+				},
+			}
+			args := computerArgs{Action: action, X: 100, Y: 200}
+			var result agent.ToolResult
+			var err error
+			if action == "click" {
+				result, err = tool.click(context.Background(), args)
+			} else {
+				result, err = tool.move(context.Background(), args)
+			}
+			if err != nil || !result.IsError || !contains(result.Content, "screen geometry unavailable") {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if writer.writeCount() != 0 {
+				t.Fatalf("geometry failure wrote %d AX requests", writer.writeCount())
+			}
+		})
+	}
+}
+
+func TestComputer_ScreenshotFailsClosedWhenBytesDoNotMatchDeclaredSpace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mismatch.png")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 1280, 720))); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 1440, screenH: 900,
+		toolW: 1280, toolH: 800,
+		captureScreen: func(context.Context, int) (string, agent.ImageBlock, error) {
+			return path, agent.ImageBlock{MediaType: "image/png", Data: "opaque"}, nil
+		},
+	}
+	result, err := tool.screenshot(context.Background())
+	if err != nil || !result.IsError || !contains(result.Content, "do not match declared tool space") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestComputer_ScreenshotAdoptsSameAspectCaptureSpace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "virtual-display.png")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 1280, 960))); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	block, err := EncodeImage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 1024, screenH: 768,
+		toolW: 1024, toolH: 768,
+		captureScreen: func(context.Context, int) (string, agent.ImageBlock, error) {
+			return path, block, nil
+		},
+	}
+	result, err := tool.screenshot(context.Background())
+	if err != nil || result.IsError {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if tool.toolW != 1280 || tool.toolH != 960 {
+		t.Fatalf("adopted tool space = %dx%d, want 1280x960", tool.toolW, tool.toolH)
+	}
+	x, y, err := tool.scaleXY(640, 480)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x != 512 || y != 384 {
+		t.Fatalf("capture center maps to (%d,%d), want logical center (512,384)", x, y)
+	}
+}
+
+func TestCompatibleCapturedToolDimensionsAllowsResizeRoundingOnly(t *testing.T) {
+	if !compatibleCapturedToolDimensions(1280, 831, 1512, 982) {
+		t.Fatal("one-pixel Retina resize rounding was rejected")
+	}
+	if compatibleCapturedToolDimensions(1280, 720, 1440, 900) {
+		t.Fatal("different aspect ratio was admitted")
+	}
+	if compatibleCapturedToolDimensions(1281, 961, 1024, 768) {
+		t.Fatal("oversized capture was admitted")
+	}
+}
+
+func TestComputer_ScreenshotAlwaysRemovesLegacyCaptureTemporaryFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capture.png")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 16, 9))); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	block, err := EncodeImage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 16, screenH: 9,
+		toolW: 16, toolH: 9,
+		captureScreen: func(context.Context, int) (string, agent.ImageBlock, error) {
+			return path, block, nil
+		},
+	}
+	result, err := tool.screenshot(context.Background())
+	if err != nil || result.IsError {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("legacy capture temp file survived: %v", statErr)
+	}
+}
+
+func TestComputer_ScreenshotFailsWhenFinalProviderBytesDifferFromCapturePath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "declared.png")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 1280, 800))); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	providerPath := filepath.Join(t.TempDir(), "provider.png")
+	providerFile, err := os.Create(providerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(providerFile, image.NewRGBA(image.Rect(0, 0, 1280, 720))); err != nil {
+		t.Fatal(err)
+	}
+	if err := providerFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	providerBlock, err := EncodeImage(providerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 1280, screenH: 800,
+		toolW: 1280, toolH: 800,
+		captureScreen: func(context.Context, int) (string, agent.ImageBlock, error) {
+			return path, providerBlock, nil
+		},
+	}
+	result, err := tool.screenshot(context.Background())
+	if err != nil || !result.IsError ||
+		!contains(result.Content, "final legacy computer image dimensions 1280x720") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestComputer_ScreenshotPropagatesActionCancellationToCapture(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	captureStarted := make(chan struct{})
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 16, screenH: 9,
+		toolW: 16, toolH: 9,
+		captureScreen: func(captureCtx context.Context, _ int) (string, agent.ImageBlock, error) {
+			close(captureStarted)
+			<-captureCtx.Done()
+			return "", agent.ImageBlock{}, captureCtx.Err()
+		},
+	}
+	done := make(chan agent.ToolResult, 1)
+	go func() {
+		result, _ := tool.screenshot(ctx)
+		done <- result
+	}()
+	<-captureStarted
+	cancel()
+	select {
+	case result := <-done:
+		if !result.IsError || !contains(result.Content, "context canceled") {
+			t.Fatalf("result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("computer screenshot ignored action cancellation")
+	}
+}
+
+func TestComputer_PostActionDelayStopsBeforeCaptureOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	captureCalled := false
+	tool := &ComputerTool{
+		captureScreen: func(context.Context, int) (string, agent.ImageBlock, error) {
+			captureCalled = true
+			return "", agent.ImageBlock{}, nil
+		},
+	}
+	cancel()
+	started := time.Now()
+	result := tool.captureAfterAction(ctx, agent.ToolResult{Content: "mutated"})
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("cancelled post-action capture waited %s", elapsed)
+	}
+	if captureCalled || result.Content != "mutated" {
+		t.Fatalf("captureCalled=%v result=%+v", captureCalled, result)
 	}
 }

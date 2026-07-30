@@ -314,7 +314,7 @@ func AttachPolicy(ctx context.Context, socket string) (bool, error) {
 // the child becoming ready, the supervisor calls Shutdown on the stuck child
 // before re-Spawn. Without this the failed-startup process stays alive bound
 // to a stale socket while subsequent Spawn calls unlink+rebind it, leaving an
-// orphan process tree (production case 2026-05-22: five zombie tlm serve PIDs).
+// orphan process tree.
 type Spawner interface {
 	Spawn(ctx context.Context) error
 	WaitReady(ctx context.Context, ceiling time.Duration) error

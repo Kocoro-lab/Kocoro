@@ -74,10 +74,9 @@ func SanitizeHistory(messages []client.Message) []client.Message {
 //   - empty block list (`MessageContent{blocks: []}` or `nil`)
 //   - block list whose only members are `{type:"text", text:""}`
 //
-// Empty assistant content reaches Cloud's `_convert_messages_to_claude_format`
-// as `""` and is rewritten to `[{"type":"text","text":""}]`. Cloud's rolling
-// `cache_control` marker on `claude_messages[-2]` then lands on that empty
-// text block, triggering Anthropic's 400
+// Empty assistant content reaches Cloud message conversion as `""` and is
+// rewritten to `[{"type":"text","text":""}]`. A rolling `cache_control`
+// marker can then land on that empty text block, triggering Anthropic's 400
 // `cache_control cannot be set for empty text blocks`.
 // See docs/empty-assistant-content-400.md for the full data flow.
 //
@@ -186,9 +185,8 @@ func needsEmptyAssistantRepair(messages []client.Message) bool {
 		}
 		if !msg.Content.HasBlocks() {
 			// TrimSpace match — whitespace-only assistant content is also
-			// a 400 risk because Cloud's _mark_last_block runs rstrip()
-			// on string content before wrapping it as a cache_control
-			// text block (see shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py).
+			// a 400 risk because the Cloud adapter trims string content before
+			// wrapping it as a cache_control text block.
 			// Matches the wire-time gate in agent/loop.go.
 			if strings.TrimSpace(msg.Content.Text()) == "" {
 				return true

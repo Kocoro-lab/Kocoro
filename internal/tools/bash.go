@@ -14,6 +14,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
@@ -51,6 +52,11 @@ type BashTool struct {
 	// serial path. Wired from config.AgentConfig.BashConcurrencyEnabled
 	// by register.go (RegisterLocalTools + CloneWithRuntimeConfig).
 	ConcurrencyEnabled bool
+	// LegacyGUIAutomationDisabled is set on daemon run-local registries that
+	// expose computer_use. It blocks shell-level GUI input injectors so the
+	// model cannot bypass computer_use target binding, leases, verification,
+	// or IME-safe text insertion after a semantic/visual path fails.
+	LegacyGUIAutomationDisabled bool
 }
 
 type bashArgs struct {
@@ -76,6 +82,25 @@ var safeCommands = []string{
 // shellOperators are characters that chain or redirect commands.
 // Any command containing these is never auto-approved.
 var shellOperators = []string{"&&", "||", ";", "|", ">", "<", "`", "$(", "${", "&"}
+
+var legacyGUIAutomationDeniedCommands = []string{
+	"osascript",
+	"osascript *",
+	"*/osascript",
+	"*/osascript *",
+	"cliclick",
+	"cliclick *",
+	"*/cliclick",
+	"*/cliclick *",
+}
+
+func commandMatchesDeniedPatterns(command string, patterns []string) bool {
+	decision, reason := permissions.CheckCommand(
+		command,
+		&permissions.PermissionsConfig{DeniedCommands: patterns},
+	)
+	return decision == "deny" && strings.Contains(reason, "denied command pattern")
+}
 
 func isSafeCommand(cmd string, extraSafe []string) bool {
 	trimmed := strings.TrimSpace(cmd)
@@ -176,6 +201,11 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	}
 	if strings.TrimSpace(args.Description) == "" {
 		return agent.ValidationError("bash: missing required `description` parameter"), nil
+	}
+	if t.LegacyGUIAutomationDisabled &&
+		commandMatchesDeniedPatterns(args.Command, legacyGUIAutomationDeniedCommands) {
+		return agent.BusinessError(
+			"legacy GUI automation through bash is disabled; use computer_use"), nil
 	}
 
 	// Timeout precedence: per-call args > tool default (from config) > 120s fallback,

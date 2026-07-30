@@ -19,9 +19,8 @@ import (
 // deliberately gentle (keepRecent=8, maxResultChars=300) and can leave a
 // transcript over the small-tier cap when recent tool results are large.
 //
-// Without this guard, a 200K+ transcript fed to the summarizer 400s with
-// "prompt is too long", which is exactly the cascade that caused the
-// 2026-05-07 production incident.
+// Without this guard, an oversized transcript fed to the summarizer can fail
+// with "prompt is too long" and cascade into the parent request.
 const summarizeInputCapChars = 540_000
 
 // capTranscriptForSummarize returns s unchanged if it fits, or a head+tail

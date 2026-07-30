@@ -89,7 +89,7 @@ func (h *busEventHandler) OnToolCall(name, args, toolUseID string) {
 		"tool":        name,
 		"tool_use_id": toolUseID,
 		"status":      "running",
-		"args":        redactAndTruncate(args, 200),
+		"args":        redactAndTruncate(agent.RedactGUIActivityArguments(name, args), 200),
 		"session_id":  h.sessionID,
 		"ts":          nowISO(),
 	})
@@ -105,7 +105,7 @@ func (h *busEventHandler) OnToolResult(name, args, toolUseID string, result agen
 		"status":      "completed",
 		"elapsed":     elapsed.Seconds(),
 		"is_error":    result.IsError,
-		"preview":     redactAndTruncate(toolResultPreview(result), 200),
+		"preview":     redactAndTruncate(agent.RedactGUIActivityResult(name, toolResultPreview(result)), 200),
 		"session_id":  h.sessionID,
 		"ts":          nowISO(),
 	})

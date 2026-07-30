@@ -1,0 +1,9 @@
+{
+  "id": 802,
+  "method": "capture_coordinate_display",
+  "params": {
+    "schema_version": 1,
+    "topology_ref": {"topology_id": "topo_display_001", "generation": 9},
+    "display_id": 2
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "id": 902,
+  "method": "semantic_text_selection",
+  "params": {
+    "schema_version": 1,
+    "pid": 4242,
+    "bundle_id": "com.example.fixture",
+    "window_id": 7001,
+    "ref": "e12",
+    "path": "window[0]/AXTextArea[0]",
+    "expected_role": "AXTextArea",
+    "expected_fingerprint": "axf_fixture_text_area",
+    "range": {"location": 5, "length": 12},
+    "fallback_policy": "coordinate_drag",
+    "commit_deadline_at": "2026-07-22T12:03:31Z"
+  }
+}

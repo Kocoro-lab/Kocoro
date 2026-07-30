@@ -1321,7 +1321,7 @@ func (h *daemonEventHandler) OnApprovalNeeded(tool string, args string) bool {
 		// behavior cannot drift. Handles bash (tool-level for named agents,
 		// command-level for default agent), non-bash (tool-level), and
 		// always-ask high-risk gates.
-		daemon.HandleAlwaysAllowDecision(h.deps, h.broker, h.agent, tool, args)
+		daemon.HandleAlwaysAllowDecision(h.deps, h.broker, h.agent, tool, args, false)
 	}
 	return decision == daemon.DecisionAllow || decision == daemon.DecisionAlwaysAllow
 }

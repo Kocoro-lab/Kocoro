@@ -509,7 +509,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("skills.marketplace.registry_url", "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json")
 	// skills.marketplace.max_attempts / .retry_base_backoff_secs: in-client
 	// retry of transient upstream failures (503/5xx/429 + network) on catalog
-	// GETs. ClawHub returned ~22% 503s under a 50-request load test; with no
+	// GETs. ClawHub can return transient 503s under load; with no
 	// retry that surfaced as user-visible "marketplace unavailable". Symptom if
 	// too low: occasional spurious browse/install failures. Symptom if too high:
 	// slow failure when ClawHub is genuinely down (each attempt waits the 15s

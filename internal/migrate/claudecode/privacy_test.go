@@ -59,7 +59,7 @@ func TestPrivacy_NoOutboundCallsAtRuntime(t *testing.T) {
 		t.Fatalf("Scan: %v", err)
 	}
 	target := t.TempDir()
-	plan, err := BuildPlan(scan, src, target, "/Users/wayland", time.Now())
+	plan, err := BuildPlan(scan, src, target, "/Users/alice", time.Now())
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}

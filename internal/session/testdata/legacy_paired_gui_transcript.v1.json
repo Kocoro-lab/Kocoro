@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "id": "legacy-paired-gui",
+  "created_at": "2026-01-15T02:00:00Z",
+  "updated_at": "2026-01-15T02:05:00Z",
+  "title": "Legacy paired GUI transcript",
+  "cwd": "/Users/alice/Projects/example",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Open Slack and inspect the selected conversation."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_computer_legacy_001",
+          "name": "computer",
+          "input": {"action":"screenshot"}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_computer_legacy_001",
+          "content": "Screenshot captured from the historical desktop session. The original local artifact was stored under /Users/alice/Library/Application Support/Kocoro/screenshots/legacy-001.png and this deliberately long result exercises mechanical context compaction without requiring the retired executor."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_accessibility_legacy_002",
+          "name": "accessibility",
+          "input": {"action":"read_tree","app":"Slack","description":"Inspect interactive Slack controls","filter":"interactive"}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_accessibility_legacy_002",
+          "content": "Slack AX state observed; selected conversation was available. Diagnostic snapshot path: /Users/alice/Library/Application Support/Kocoro/ax/legacy-002.json."
+        }
+      ]
+    }
+  ],
+  "message_meta": [
+    {"source":"local","message_id":"msg-legacy-001"},
+    {"source":"local","message_id":"msg-legacy-002"},
+    {"source":"local","message_id":"msg-legacy-003"},
+    {"source":"local","message_id":"msg-legacy-004"},
+    {"source":"local","message_id":"msg-legacy-005"}
+  ]
+}

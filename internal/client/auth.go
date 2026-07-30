@@ -288,8 +288,8 @@ func (c *AuthClient) CreateAPIKey(ctx context.Context, accessToken, name string)
 	return &resp, nil
 }
 
-// meResponse decodes Cloud's /me schema. The authoritative shape
-// (shannon-cloud MeResponse) is FLAT with the canonical id under the
+// meResponse decodes Cloud's public /me schema. The authoritative shape is
+// flat with the canonical id under the
 // top-level `user_id` key (NOT `id`, and NOT nested under `user`) and the
 // plan under top-level `tier`:
 //

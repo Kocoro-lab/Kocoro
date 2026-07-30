@@ -19,14 +19,19 @@ private func searchTree(_ el: AXUIElement, path: String, query: String?, role: S
     let elRole = axString(el, "AXRole") ?? ""
     let title = axString(el, "AXTitle") ?? ""
     let desc = axString(el, "AXDescription") ?? ""
+    let ident = axString(el, "AXIdentifier")
+    let valueRedacted = isSensitiveAXValue(axValueSensitivityMetadata(
+        el,
+        role: elRole,
+        identifier: ident,
+        title: title,
+        description: desc))
     let value: String
-    if let v = axValue(el, "AXValue") {
+    if !valueRedacted, let v = axValue(el, "AXValue") {
         value = "\(v)"
     } else {
         value = ""
     }
-    let ident = axString(el, "AXIdentifier")
-
     // Match by identifier (exact)
     if let id = identifier, let actualIdent = ident, actualIdent == id {
         var r = FindResult(path: path, role: elRole, title: title)

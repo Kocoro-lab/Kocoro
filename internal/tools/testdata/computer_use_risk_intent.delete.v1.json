@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "intent_id": "cri_EBESExQVFhcYGRobHB0eHw",
+  "request_id": "req_delete_01HXYZ",
+  "kind": "delete",
+  "expires_at": "2026-07-23T00:02:00Z",
+  "target": {
+    "bundle_id": "com.apple.finder",
+    "app_name": "Finder",
+    "pid": 421,
+    "window_id": 1002,
+    "state_id": "s_1123456789abcdef",
+    "action_kind": "click",
+    "execution_path": "synthetic_coordinate",
+    "element_ref": "e7",
+    "role": "AXButton",
+    "fingerprint": "axf_2222222222222222222222222222222222222222222222222222222222222222",
+    "coordinate_authority": {
+      "element_path": "window[0]/AXButton[0]",
+      "frame_id": "frame_00112233445566778899aabbccddeeff",
+      "frame_expires_at": "2026-07-23T00:03:00Z",
+      "final_image_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "topology_ref": {
+        "topology_id": "topology_fixture_001",
+        "generation": 7
+      },
+      "helper_boot_id": "helper_fixture_001",
+      "display_id": 9,
+      "source_pixel": {
+        "x": 320,
+        "y": 240
+      },
+      "quartz_point": {
+        "x": 100.5,
+        "y": 200.5
+      }
+    },
+    "target_digest": "tdv1_e26ad59cfb5d02a4849cd57d196d7aea0a21388a614663a9a9f350b9e43ed10c"
+  },
+  "send": null,
+  "delete": {
+    "object_kind": "file",
+    "object_label": "Q3 draft.pdf",
+    "scope": "single_visible_object"
+  },
+  "purchase": null
+}

@@ -121,6 +121,45 @@ func TestBusEventHandlerOnToolCallRedactsAndTruncatesArgs(t *testing.T) {
 	}
 }
 
+func TestBusEventHandlerSuppressesGUIArgumentsAndResultContent(t *testing.T) {
+	h, bus := newTestHandler(t)
+	ch := bus.Subscribe()
+	defer bus.Unsubscribe(ch)
+
+	secret := "ordinary text typed into an editor"
+	h.OnToolCall("computer", `{"action":"type","text":"`+secret+`"}`, "toolu_gui")
+	h.OnToolResult("computer", `{"action":"type","text":"`+secret+`"}`, "toolu_gui",
+		agent.ToolResult{Content: "Typed: " + secret}, 5*time.Millisecond)
+
+	events := drain(t, ch, 2)
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2", len(events))
+	}
+	for _, event := range events {
+		if strings.Contains(string(event.Payload), secret) {
+			t.Fatalf("GUI activity event leaked typed content: %s", event.Payload)
+		}
+	}
+	var running struct {
+		Args string `json:"args"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &running); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(running.Args, `"action":"type"`) || !strings.Contains(running.Args, `"redacted":true`) {
+		t.Fatalf("running GUI activity lost safe metadata: %q", running.Args)
+	}
+	var completed struct {
+		Preview string `json:"preview"`
+	}
+	if err := json.Unmarshal(events[1].Payload, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if completed.Preview != agent.GUIActivityResultRedacted {
+		t.Fatalf("completed GUI preview = %q", completed.Preview)
+	}
+}
+
 func TestBusEventHandlerOnToolResultEmitsCompleted(t *testing.T) {
 	h, bus := newTestHandler(t)
 	ch := bus.Subscribe()

@@ -795,7 +795,7 @@ func TestStripRedirects(t *testing.T) {
 		want string
 	}{
 		{"no redirect", `ls -la`, `ls -la`},
-		{"2>/dev/null", `ptengine-cli config get 2>/dev/null`, `ptengine-cli config get`},
+		{"2>/dev/null", `terraform workspace list 2>/dev/null`, `terraform workspace list`},
 		{"2>&1", `cmd 2>&1`, `cmd`},
 		{">file", `cmd > out.log`, `cmd`},
 		{">>file", `cmd >> out.log`, `cmd`},
@@ -899,7 +899,7 @@ func TestIsAlwaysAskPrefix(t *testing.T) {
 		{"git push (no force)", `git push origin main`, false},
 		{"npm test", `npm test`, false},
 		{"normal compound", `cd /tmp && ls`, false},
-		{"normal ptengine", `ptengine-cli config get`, false},
+		{"normal generic CLI", `terraform workspace list`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -960,15 +960,15 @@ func TestCommandPrefixMatch(t *testing.T) {
 	}{
 		// Same family — should match
 		{
-			name:  "ptengine-cli config family",
-			entry: `ptengine-cli config get 2>/dev/null || echo "X"`,
-			cmd:   `ptengine-cli config show --json`,
+			name:  "terraform workspace family",
+			entry: `terraform workspace list 2>/dev/null || echo "X"`,
+			cmd:   `terraform workspace show`,
 			want:  true,
 		},
 		{
-			name:  "ptengine-cli heatmap family with redirects",
-			entry: `ptengine-cli heatmap query --url x.com 2>&1 | head -50`,
-			cmd:   `ptengine-cli heatmap filter-values --name url --output json`,
+			name:  "terraform import family with redirects",
+			entry: `terraform import module.example.one id-1 2>&1 | head -50`,
+			cmd:   `terraform import module.example.two id-2`,
 			want:  true,
 		},
 		{
@@ -994,9 +994,9 @@ func TestCommandPrefixMatch(t *testing.T) {
 			want:  false,
 		},
 		{
-			name:  "ptengine-cli config vs ptengine-cli heatmap",
-			entry: `ptengine-cli config get`,
-			cmd:   `ptengine-cli heatmap query`,
+			name:  "terraform workspace vs terraform import",
+			entry: `terraform workspace list`,
+			cmd:   `terraform import module.example id`,
 			want:  false,
 		},
 		{
@@ -1008,21 +1008,21 @@ func TestCommandPrefixMatch(t *testing.T) {
 		// Different exec — never match
 		{
 			name:  "completely different",
-			entry: `ptengine-cli config get`,
+			entry: `terraform workspace list`,
 			cmd:   `npm install`,
 			want:  false,
 		},
 		// Default-safe segments are skipped
 		{
 			name:  "cd prefix on entry",
-			entry: `cd /tmp && ptengine-cli config get`,
-			cmd:   `ptengine-cli config show`,
+			entry: `cd /tmp && terraform workspace list`,
+			cmd:   `terraform workspace show`,
 			want:  true,
 		},
 		{
 			name:  "cd prefix on cmd",
-			entry: `ptengine-cli config get`,
-			cmd:   `cd /tmp && ptengine-cli config show`,
+			entry: `terraform workspace list`,
+			cmd:   `cd /tmp && terraform workspace show`,
 			want:  true,
 		},
 		// Unknown executable — uses defaultPrefixDepth=3 (stricter)
@@ -1072,26 +1072,26 @@ func TestCommandPrefixMatch(t *testing.T) {
 	}
 }
 
-// TestCheckCommand_PrefixFallbackOnUserFixture: feeds a slice of real
-// allowed_commands (from user's ~/.shannon/config.yaml) and verifies that
+// TestCheckCommand_PrefixFallbackOnSyntheticFixture feeds an invented
+// allowed_commands slice and verifies that
 // (a) entries match themselves and same-family variants, (b) cross-family
 // commands still go to "ask".
-func TestCheckCommand_PrefixFallbackOnUserFixture(t *testing.T) {
+func TestCheckCommand_PrefixFallbackOnSyntheticFixture(t *testing.T) {
 	cfg := &PermissionsConfig{
 		AllowedCommands: []string{
-			`ptengine-cli config get 2>/dev/null || echo "CONFIG_ERROR"`,
-			`ptengine-cli heatmap query --query-type page_metrics --url "https://ptengine.jp" --start-date 2026-04-09 --end-date 2026-04-23 -o json-pretty 2>/dev/null`,
-			`agent-browser open https://meican.com && agent-browser wait --load networkidle && agent-browser screenshot --annotate`,
+			`terraform workspace list 2>/dev/null || echo "CONFIG_ERROR"`,
+			`terraform import module.example.one id-1 2>/dev/null`,
+			`agent-browser open https://example.com && agent-browser wait --load networkidle && agent-browser screenshot --annotate`,
 			`agent-browser click @e23 && agent-browser wait 2000 && agent-browser get url && agent-browser snapshot -i`,
 		},
 	}
 
 	allowExpect := []string{
 		// Same-family variants — should be allowed without re-prompt
-		`ptengine-cli config show --json 2>/dev/null`,
-		`ptengine-cli config list`,
-		`ptengine-cli heatmap filter-values --name url --output json`,
-		`ptengine-cli heatmap describe`,
+		`terraform workspace show 2>/dev/null`,
+		`terraform workspace select synthetic`,
+		`terraform import module.example.two id-2`,
+		`terraform import module.example.three id-3`,
 		`agent-browser open https://example.com`,
 		`agent-browser click @e99`,
 		`agent-browser snapshot -i`,

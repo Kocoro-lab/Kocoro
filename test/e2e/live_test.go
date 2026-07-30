@@ -230,9 +230,8 @@ func waitForDaemon(t *testing.T, timeout time.Duration) {
 // edit_image pipeline against the configured Shannon Cloud endpoint. It
 // bypasses the agent loop's per-call approval gate (which legitimately blocks
 // image tools under -y) and calls the production HTTP client directly,
-// validating the wire contract end-to-end. Costs ~$0.05 per run on
-// gpt-image-2; both Generate and Edit are bundled in one test to avoid double
-// billing.
+// validating the wire contract end-to-end. This is a paid live test; current
+// cost expectations are maintained in the private QA process.
 func TestLive_GenerateAndEditImage(t *testing.T) {
 	skipUnlessLive(t)
 

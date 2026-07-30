@@ -84,7 +84,14 @@ func partitionToolCalls(approved []approvedToolCall) [][]approvedToolCall {
 // so that subsequent write batches can pass read-before-edit checks.
 // If handler is non-nil, OnToolCall is fired for each call immediately
 // before execution begins (so "running" status reflects actual execution).
-func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResults []toolExecResult, readTracker *ReadTracker, handler EventHandler) {
+func executeBatches(
+	ctx context.Context,
+	batches [][]approvedToolCall,
+	execResults []toolExecResult,
+	readTracker *ReadTracker,
+	handler EventHandler,
+	userRequest string,
+) {
 	// Attach the handler's OnUsage as the per-run usage emitter so tools
 	// that bill per call (gateway tools reporting xAI/Grok or SerpAPI costs)
 	// can fold their usage into the session totals.
@@ -111,6 +118,11 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 				if toolCancel != nil {
 					defer toolCancel()
 				}
+				toolCtx = withToolInvocation(toolCtx, ToolInvocation{
+					ToolName:    ac.fc.Name,
+					ToolUseID:   ac.fc.ID,
+					UserRequest: userRequest,
+				})
 				startTime := time.Now()
 				result, runErr := ac.tool.Run(toolCtx, ac.argsStr)
 				execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}
@@ -143,6 +155,11 @@ func executeBatches(ctx context.Context, batches [][]approvedToolCall, execResul
 					if toolCancel != nil {
 						defer toolCancel()
 					}
+					toolCtx = withToolInvocation(toolCtx, ToolInvocation{
+						ToolName:    ac.fc.Name,
+						ToolUseID:   ac.fc.ID,
+						UserRequest: userRequest,
+					})
 					startTime := time.Now()
 					result, runErr := ac.tool.Run(toolCtx, ac.argsStr)
 					execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}

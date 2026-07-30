@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "status": "committed_unverified",
+  "pointer_move_commit_state": "committed",
+  "scroll_commit_state": "committed",
+  "phase": "post_verification",
+  "failure_code": "scroll_postcondition_not_declared",
+  "retry_safe": false,
+  "requested": {
+    "quartz_point": {"x": 350.5, "y": 450.5},
+    "unit": "pixel",
+    "provider_delta_x": 37,
+    "provider_delta_y": -618,
+    "provider_to_quartz_scale_x": 1,
+    "provider_to_quartz_scale_y": 1,
+    "cg_point_delta_axis1": 618,
+    "cg_point_delta_axis2": -37
+  },
+  "pointer_endpoint": {
+    "requested": {"x": 350.5, "y": 450.5},
+    "observed": {"x": 350.5, "y": 450.5},
+    "tolerance": 2,
+    "verified": true
+  }
+}

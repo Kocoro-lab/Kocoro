@@ -2,14 +2,19 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -178,11 +183,11 @@ func TestParseScreenDimensions_RetinaStripped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseScreenDimensions error: %v", err)
 	}
-	if w != 2880 {
-		t.Errorf("expected width 2880, got %d", w)
+	if w != 1440 {
+		t.Errorf("expected logical width 1440, got %d", w)
 	}
-	if h != 1800 {
-		t.Errorf("expected height 1800, got %d", h)
+	if h != 900 {
+		t.Errorf("expected logical height 900, got %d", h)
 	}
 }
 
@@ -196,6 +201,225 @@ func TestParseScreenDimensions_NoDisplay(t *testing.T) {
 	_, _, err := parseScreenDimensions(output)
 	if err == nil {
 		t.Error("expected error for output with no display info")
+	}
+}
+
+func TestParseScreenGeometry_PreservesLogicalAndCaptureDimensions(t *testing.T) {
+	output := `Graphics/Displays:
+      Displays:
+        Color LCD:
+          Resolution: 5120 x 2880 (Retina)
+          UI Looks like: 2560 x 1440
+          Main Display: Yes
+`
+	geometry, err := parseScreenGeometry(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if geometry.LogicalWidth != 2560 || geometry.LogicalHeight != 1440 ||
+		geometry.CaptureWidth != 5120 || geometry.CaptureHeight != 2880 {
+		t.Fatalf("geometry = %+v", geometry)
+	}
+}
+
+func TestParseScreenGeometry_SelectsMainDisplayInsteadOfFirstDisplay(t *testing.T) {
+	output := `Graphics/Displays:
+      Displays:
+        Side Display:
+          Resolution: 3840 x 2160
+          UI Looks like: 1920 x 1080
+          Main Display: No
+        Studio Display:
+          Resolution: 5120 x 2880 (Retina)
+          UI Looks like: 2560 x 1440
+          Main Display: Yes
+`
+	geometry, err := parseScreenGeometry(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if geometry != (screenGeometry{
+		LogicalWidth: 2560, LogicalHeight: 1440,
+		CaptureWidth: 5120, CaptureHeight: 2880,
+	}) {
+		t.Fatalf("main geometry = %+v", geometry)
+	}
+}
+
+func TestLegacyMainDisplayCaptureArgumentsSelectOnlyMainDisplay(t *testing.T) {
+	args := legacyMainDisplayCaptureArgs("/tmp/main.png")
+	if !slices.Contains(args, "-m") {
+		t.Fatalf("legacy capture args %v do not select only the main display", args)
+	}
+	if args[len(args)-1] != "/tmp/main.png" {
+		t.Fatalf("legacy capture output = %q", args[len(args)-1])
+	}
+}
+
+func TestCaptureMainDisplayRejectsAndCleansMultipleOutputs(t *testing.T) {
+	var scratchDir string
+	path, _, err := captureMainDisplayAndEncode(0, func(output string) error {
+		scratchDir = filepath.Dir(output)
+		for _, name := range []string{filepath.Base(output), "main 2.png"} {
+			file, createErr := os.Create(filepath.Join(scratchDir, name))
+			if createErr != nil {
+				return createErr
+			}
+			if encodeErr := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 4, 3))); encodeErr != nil {
+				file.Close()
+				return encodeErr
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				return closeErr
+			}
+		}
+		return nil
+	})
+	if err == nil || path != "" {
+		t.Fatalf("path=%q err=%v, want fail-closed multi-output capture", path, err)
+	}
+	if _, statErr := os.Stat(scratchDir); !os.IsNotExist(statErr) {
+		t.Fatalf("scratch capture directory survived: %v", statErr)
+	}
+}
+
+func TestCaptureMainDisplayReturnsOneImageAndCleansScratch(t *testing.T) {
+	var scratchDir string
+	path, block, err := captureMainDisplayAndEncode(0, func(output string) error {
+		scratchDir = filepath.Dir(output)
+		file, createErr := os.Create(output)
+		if createErr != nil {
+			return createErr
+		}
+		if encodeErr := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 16, 9))); encodeErr != nil {
+			file.Close()
+			return encodeErr
+		}
+		return file.Close()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	if block.MediaType != "image/png" || block.Data == "" {
+		t.Fatalf("block = %+v", block)
+	}
+	if width, height, dimErr := imageFileDimensions(path); dimErr != nil || width != 16 || height != 9 {
+		t.Fatalf("dimensions=%dx%d err=%v", width, height, dimErr)
+	}
+	if _, statErr := os.Stat(scratchDir); !os.IsNotExist(statErr) {
+		t.Fatalf("scratch capture directory survived: %v", statErr)
+	}
+}
+
+func TestBoundedLegacyMainDisplayCaptureKillsAndReapsOnTimeout(t *testing.T) {
+	started := time.Now()
+	err := runBoundedLegacyMainDisplayCapture("/bin/sleep", []string{"5"}, 50*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("timeout error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("timed-out capture returned after %s; child was not promptly killed and reaped", elapsed)
+	}
+}
+
+func TestBoundedLegacyMainDisplayCaptureStopsOnParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	started := time.Now()
+	err := runBoundedLegacyMainDisplayCaptureContext(
+		ctx, "/bin/sleep", []string{"5"}, 8*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("cancellation error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("cancelled capture returned after %s; child was not killed and reaped", elapsed)
+	}
+}
+
+func TestBoundedLegacyImageResizeStopsOnParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	started := time.Now()
+	err := runBoundedLegacyImageResizeCommand(
+		ctx, "/bin/sleep", []string{"5"}, 8*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "canceled") {
+		t.Fatalf("cancellation error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("cancelled resize returned after %s; child was not killed and reaped", elapsed)
+	}
+}
+
+func TestCaptureMainDisplayCleansScratchOnRunnerFailure(t *testing.T) {
+	var scratchDir string
+	path, _, err := captureMainDisplayAndEncode(0, func(output string) error {
+		scratchDir = filepath.Dir(output)
+		return fmt.Errorf("synthetic capture failure")
+	})
+	if err == nil || path != "" {
+		t.Fatalf("path=%q err=%v", path, err)
+	}
+	if _, statErr := os.Stat(scratchDir); !os.IsNotExist(statErr) {
+		t.Fatalf("failed capture scratch survived: %v", statErr)
+	}
+}
+
+func TestCaptureMainDisplayContextCancellationDuringResizeCleansEveryOutput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var scratchDir string
+	resizeStarted := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		path, _, err := captureMainDisplayAndEncodeContext(
+			ctx,
+			1280,
+			func(_ context.Context, output string) error {
+				scratchDir = filepath.Dir(output)
+				file, createErr := os.Create(output)
+				if createErr != nil {
+					return createErr
+				}
+				if encodeErr := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 16, 9))); encodeErr != nil {
+					file.Close()
+					return encodeErr
+				}
+				return file.Close()
+			},
+			func(resizeCtx context.Context, _ string, _ int) error {
+				close(resizeStarted)
+				<-resizeCtx.Done()
+				return resizeCtx.Err()
+			})
+		if path != "" {
+			done <- fmt.Errorf("cancelled resize returned path %q", path)
+			return
+		}
+		done <- err
+	}()
+	<-resizeStarted
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("resize cancellation error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not stop resize pipeline")
+	}
+	if _, statErr := os.Stat(scratchDir); !os.IsNotExist(statErr) {
+		t.Fatalf("cancelled resize scratch survived: %v", statErr)
+	}
+}
+
+func TestResizeDimensionsMatchesLongestEdgeWithoutAspectMismatch(t *testing.T) {
+	w, h := resizeDimensions(5120, 2880, 1280)
+	if w != 1280 || h != 720 {
+		t.Fatalf("resize = %dx%d, want 1280x720", w, h)
+	}
+	w, h = resizeDimensions(1000, 750, 1280)
+	if w != 1000 || h != 750 {
+		t.Fatalf("no-upscale resize = %dx%d", w, h)
 	}
 }
 

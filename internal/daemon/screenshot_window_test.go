@@ -32,7 +32,9 @@ func TestScreenshotWindow_MapsDeniedTo403(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", rec.Code)
 	}
-	var body struct{ Code string `json:"code"` }
+	var body struct {
+		Code string `json:"code"`
+	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -93,8 +95,11 @@ func TestFormatForegroundHint_IncludesAppAndPID(t *testing.T) {
 	if !strings.Contains(got, "WeChat") || !strings.Contains(got, "1234") {
 		t.Fatalf("hint note missing app/pid: %q", got)
 	}
-	if !strings.Contains(got, "accessibility") {
-		t.Fatalf("hint note should steer the agent to the accessibility tool: %q", got)
+	if !strings.Contains(got, "computer_use") {
+		t.Fatalf("hint note should steer the agent to computer_use: %q", got)
+	}
+	if strings.Contains(got, "accessibility tool") {
+		t.Fatalf("hint note references the removed accessibility tool: %q", got)
 	}
 }
 

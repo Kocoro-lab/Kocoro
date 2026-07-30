@@ -1266,6 +1266,93 @@ func (m *mockCountingTool) IsReadOnlyCall(string) bool {
 	return true
 }
 
+type mockComputerUseRecoveryTool struct {
+	runs int
+	args []string
+}
+
+func (m *mockComputerUseRecoveryTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "computer_use",
+		Description: "mock computer use recovery tool",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"controlled_apps": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"type": "string"},
+				},
+				"foreground_policy": map[string]any{
+					"type": "string",
+				},
+			},
+		},
+	}
+}
+
+func (m *mockComputerUseRecoveryTool) Run(
+	_ context.Context,
+	args string,
+) (ToolResult, error) {
+	m.runs++
+	m.args = append(m.args, args)
+	if m.runs == 1 {
+		return ToolResult{
+			Content: "computer_use_error: initial_target_required\n" +
+				"recovery: retry computer_use once with controlled_apps and foreground_policy",
+			IsError: true,
+			ComputerUseOutcome: &ComputerUseTaskOutcome{
+				Status:      ComputerUseTaskNotCompleted,
+				Effect:      ComputerUseCommitNone,
+				FailureCode: "initial_target_required",
+				Recovery:    ComputerUseRecoveryRetryWithApps,
+			},
+		}, nil
+	}
+	return ToolResult{
+		Content: "computer_use_result: completed",
+		ComputerUseOutcome: &ComputerUseTaskOutcome{
+			Status: ComputerUseTaskCompleted,
+			Effect: ComputerUseCommitKnown,
+		},
+	}, nil
+}
+
+func (m *mockComputerUseRecoveryTool) RequiresApproval() bool { return false }
+
+type mockNoEffectComputerUseTool struct {
+	runs int
+}
+
+func (m *mockNoEffectComputerUseTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "computer_use",
+		Description: "mock no-effect computer use tool",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}
+}
+
+func (m *mockNoEffectComputerUseTool) Run(
+	context.Context,
+	string,
+) (ToolResult, error) {
+	m.runs++
+	return ToolResult{
+		Content: "computer_use_error: executor_timeout_before_action\n" +
+			"recovery: another appropriate control path may be used",
+		IsError:       true,
+		ErrorCategory: ErrCategoryBusiness,
+		ComputerUseOutcome: &ComputerUseTaskOutcome{
+			Status:      ComputerUseTaskNotCompleted,
+			Effect:      ComputerUseCommitNone,
+			FailureCode: "executor_timeout_before_action",
+			Recovery:    ComputerUseRecoveryAlternateControl,
+		},
+	}, nil
+}
+
+func (m *mockNoEffectComputerUseTool) RequiresApproval() bool { return false }
+
 type bulkyMockMCPTool struct {
 	name string
 }
@@ -1624,6 +1711,347 @@ func TestAgentLoop_ToolSearchLoadsBrowserFamilyCoreAndReanchorsTask(t *testing.T
 	}
 	if !foundReanchor {
 		t.Fatal("expected third request to include a deferred-tool reanchor message")
+	}
+}
+
+func TestAgentLoop_TerminalComputerUseFailureBlocksBrowserFallbackInTurn(
+	t *testing.T,
+) {
+	computerUse := &mockSimpleTool{
+		name: "computer_use",
+		result: ToolResult{
+			Content: "[business error] computer_use_error: executor_failed\n" +
+				"message: private executor failed\n" +
+				"recovery: do not retry computer_use or attempt alternate desktop-control tools in this turn",
+			IsError:       true,
+			ErrorCategory: ErrCategoryBusiness,
+		},
+	}
+	browserNavigate := &mockCountingTool{
+		name:    "browser_navigate",
+		content: "must not run",
+	}
+
+	var thirdRequest client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"open the browser"}`), 10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("tool_search",
+					`{"query":"select:browser_navigate,browser_snapshot,browser_click"}`),
+				10, 5))
+		case 3:
+			thirdRequest = req
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The Computer Use task failed, so I stopped without switching control paths.",
+				"end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	reg.Register(browserNavigate)
+	for _, name := range FamilyRegistry["browser"].Core {
+		if name != "browser_navigate" {
+			reg.Register(&bulkyMockMCPTool{name: name})
+		}
+	}
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("result = %q", result)
+	}
+	if browserNavigate.runs != 0 {
+		t.Fatalf("browser fallback executed %d times", browserNavigate.runs)
+	}
+	encoded, err := json.Marshal(thirdRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript, "alternate_desktop_control_blocked") ||
+		strings.Contains(transcript, "LOADED:browser_navigate") {
+		t.Fatalf("fallback boundary was not machine-enforced: %s", transcript)
+	}
+}
+
+func TestAgentLoop_OneGoalComputerUseCallOwnsDesktopForTurn(t *testing.T) {
+	computerUse := &mockCountingTool{
+		name:    "computer_use",
+		content: "computer_use_result: unverified\naction_effect: committed",
+	}
+
+	var thirdRequest client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"complete the desktop goal"}`), 10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"retry the desktop goal"}`), 10, 5))
+		case 3:
+			thirdRequest = req
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The desktop result remains unverified, so I stopped.",
+				"end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+
+	result, _, err := loop.Run(
+		context.Background(),
+		"Complete one desktop task",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("result = %q", result)
+	}
+	if computerUse.runs != 1 {
+		t.Fatalf("computer_use executed %d times, want once", computerUse.runs)
+	}
+	encoded, err := json.Marshal(thirdRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript := string(encoded); !strings.Contains(
+		transcript,
+		"alternate_desktop_control_blocked",
+	) {
+		t.Fatalf("second goal-level call was not blocked: %s", transcript)
+	}
+}
+
+func TestAgentLoop_InitialTargetRequiredAllowsOneComputerUseRetryWithApps(
+	t *testing.T,
+) {
+	computerUse := &mockComputerUseRecoveryTool{}
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"Browser task completed.", "end_turn", nil, 10, 5,
+			))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Browser task completed." || computerUse.runs != 2 {
+		t.Fatalf("result=%q runs=%d args=%v", result, computerUse.runs, computerUse.args)
+	}
+}
+
+func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T) {
+	computerUse := &mockComputerUseRecoveryTool{}
+	browserNavigate := &mockCountingTool{
+		name:    "browser_navigate",
+		content: "must not run",
+	}
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","description":"open browser"}`),
+				10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("browser_navigate", `{"url":"https://example.com"}`),
+				10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"Stopped until the app target is supplied.",
+				"end_turn", nil, 10, 5,
+			))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	reg.Register(browserNavigate)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(result, "Stopped") ||
+		computerUse.runs != 1 || browserNavigate.runs != 0 {
+		t.Fatalf(
+			"result=%q computer runs=%d browser runs=%d",
+			result,
+			computerUse.runs,
+			browserNavigate.runs,
+		)
+	}
+}
+
+func TestAgentLoop_NoEffectComputerUseReleasesAlternateControlButNotSecondTask(
+	t *testing.T,
+) {
+	computerUse := &mockNoEffectComputerUseTool{}
+	browserNavigate := &mockCountingTool{
+		name:    "browser_navigate",
+		content: "browser completed",
+	}
+	var finalRequest client.CompletionRequest
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"open the site"}`), 10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use", `{"task":"retry the site"}`), 10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("browser_navigate", `{"url":"https://example.com"}`), 10, 5))
+		case 4:
+			finalRequest = req
+			json.NewEncoder(w).Encode(nativeResponse(
+				"Browser fallback completed.", "end_turn", nil, 10, 5,
+			))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	reg.Register(browserNavigate)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Open a site using the best available control path",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Browser fallback completed." ||
+		computerUse.runs != 1 || browserNavigate.runs != 1 {
+		t.Fatalf(
+			"result=%q computer runs=%d browser runs=%d",
+			result,
+			computerUse.runs,
+			browserNavigate.runs,
+		)
+	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript := string(encoded); !strings.Contains(
+		transcript,
+		"repeated_goal_task_blocked",
+	) {
+		t.Fatalf("second computer_use was not blocked: %s", transcript)
 	}
 }
 
@@ -3233,12 +3661,12 @@ func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 // with default scope). Empty on the default scope may be a scope artifact,
 // so ONE focused diversification (e.g. list_calendars after a blank
 // get_events) is permitted before concluding "not found". This is the
-// Task 3 vs Task 5 benchmark split the plan calls out.
+// synthetic single-lookup versus batch-enumeration distinction.
 func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 	wantSubstrings := []string{
 		"list-and-enumerate semantics", // names the new case
 		"scope artifact",               // distinguishes from real empty
-		"list_calendars",               // concrete example (Task 3 → Task 5)
+		"list_calendars",               // concrete synthetic example
 		"ONE",                          // permits exactly one diversification
 		"Google Calendar",              // explicit integration list (no broad "external APIs")
 		"Notion",
@@ -5585,6 +6013,166 @@ type capturingLLMClient struct {
 	idx       int
 }
 
+type mutableNativeImageTool struct {
+	mu            sync.Mutex
+	width         int
+	height        int
+	prepareWidth  int
+	prepareHeight int
+	prepareCalls  int
+	prepareErr    error
+}
+
+func (t *mutableNativeImageTool) Info() ToolInfo {
+	return ToolInfo{Name: client.NativeComputerToolName, Description: "dynamic native computer test tool"}
+}
+
+func (t *mutableNativeImageTool) RequiresApproval() bool { return false }
+
+func (t *mutableNativeImageTool) NativeToolDef() *client.NativeToolDef {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return &client.NativeToolDef{
+		Type:            client.NativeComputerToolType,
+		Name:            client.NativeComputerToolName,
+		DisplayWidthPx:  t.width,
+		DisplayHeightPx: t.height,
+	}
+}
+
+func (t *mutableNativeImageTool) PrepareNativeToolRequest(context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.prepareCalls++
+	if t.prepareWidth > 0 && t.prepareHeight > 0 {
+		t.width = t.prepareWidth
+		t.height = t.prepareHeight
+	}
+	return t.prepareErr
+}
+
+func (t *mutableNativeImageTool) Run(context.Context, string) (ToolResult, error) {
+	t.mu.Lock()
+	t.width = 1024
+	t.height = 768
+	t.mu.Unlock()
+	return ToolResult{
+		Content: "updated screenshot",
+		Images: []ImageBlock{{
+			MediaType: "image/png",
+			Data:      "iVBORfakebase64data",
+		}},
+	}, nil
+}
+
+func TestAgentLoopPreparesNativeToolBeforeFirstRequestSchema(t *testing.T) {
+	reg := NewToolRegistry()
+	native := &mutableNativeImageTool{
+		width: 1280, height: 800,
+		prepareWidth: 1024, prepareHeight: 768,
+	}
+	reg.Register(native)
+
+	cap := &capturingLLMClient{responses: []*client.CompletionResponse{{
+		OutputText: "done", FinishReason: "end_turn",
+	}}}
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetSpecificModel("claude-sonnet-4-6")
+
+	result, _, err := loop.Run(context.Background(), "inspect the screen", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" || len(cap.requests) != 1 {
+		t.Fatalf("result=%q requests=%d", result, len(cap.requests))
+	}
+	var prepared *client.Tool
+	for index := range cap.requests[0].Tools {
+		schema := &cap.requests[0].Tools[index]
+		if schema.Type == client.NativeComputerToolType &&
+			schema.Name == client.NativeComputerToolName {
+			prepared = schema
+		}
+	}
+	if prepared == nil || prepared.DisplayWidthPx != 1024 ||
+		prepared.DisplayHeightPx != 768 {
+		t.Fatalf("first prepared native schema = %+v", cap.requests[0].Tools)
+	}
+	native.mu.Lock()
+	prepareCalls := native.prepareCalls
+	native.mu.Unlock()
+	if prepareCalls != 1 {
+		t.Fatalf("native prepare calls = %d, want 1", prepareCalls)
+	}
+}
+
+func TestAgentLoopNativePreparationFailureMakesZeroLLMRequests(t *testing.T) {
+	reg := NewToolRegistry()
+	native := &mutableNativeImageTool{
+		width: 1280, height: 800,
+		prepareErr: errors.New("strict screenshot unavailable"),
+	}
+	reg.Register(native)
+	cap := &capturingLLMClient{}
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetSpecificModel("claude-sonnet-4-6")
+
+	if _, _, err := loop.Run(context.Background(), "inspect the screen", nil, nil); err == nil ||
+		!strings.Contains(err.Error(), "strict screenshot unavailable") {
+		t.Fatalf("preparation error = %v", err)
+	}
+	if len(cap.requests) != 0 {
+		t.Fatalf("preparation failure sent %d LLM requests", len(cap.requests))
+	}
+}
+
+func TestAgentLoopRefreshesNativeDimensionsAfterImageToolResult(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&mutableNativeImageTool{width: 1280, height: 800})
+
+	cap := &capturingLLMClient{responses: []*client.CompletionResponse{
+		{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID:        "toolu_dynamic_computer",
+				Name:      client.NativeComputerToolName,
+				Arguments: json.RawMessage(`{"action":"screenshot"}`),
+			}},
+		},
+		{OutputText: "done", FinishReason: "end_turn"},
+	}}
+	loop := NewAgentLoop(cap, reg, "medium", "", 5, 2000, 200, nil, nil, nil)
+	loop.SetSpecificModel("claude-sonnet-4-6")
+
+	result, _, err := loop.Run(context.Background(), "inspect the screen", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" {
+		t.Fatalf("result = %q, want done", result)
+	}
+	if len(cap.requests) != 2 {
+		t.Fatalf("LLM requests = %d, want 2", len(cap.requests))
+	}
+
+	dimensions := func(req client.CompletionRequest) (int, int, bool) {
+		for _, schema := range req.Tools {
+			if schema.Type == client.NativeComputerToolType && schema.Name == client.NativeComputerToolName {
+				return schema.DisplayWidthPx, schema.DisplayHeightPx, true
+			}
+		}
+		return 0, 0, false
+	}
+	firstWidth, firstHeight, firstFound := dimensions(cap.requests[0])
+	secondWidth, secondHeight, secondFound := dimensions(cap.requests[1])
+	if !firstFound || firstWidth != 1280 || firstHeight != 800 {
+		t.Fatalf("first native declaration = found:%t %dx%d, want 1280x800", firstFound, firstWidth, firstHeight)
+	}
+	if !secondFound || secondWidth != 1024 || secondHeight != 768 {
+		t.Fatalf("second native declaration = found:%t %dx%d, want 1024x768", secondFound, secondWidth, secondHeight)
+	}
+}
+
 func (c *capturingLLMClient) Complete(_ context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
 	c.requests = append(c.requests, req)
 	if c.idx >= len(c.responses) {
@@ -5952,7 +6540,7 @@ func TestAgentLoop_EmptyFinalResponse_BareEmpty_AuditBlocksNone(t *testing.T) {
 }
 
 // Whitespace-only fullText must trigger the empty-response guard. The
-// Cloud-side _mark_last_block in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py
+// Cloud-side assistant-content normalization
 // calls .strip() on string content before wrapping it as a cache_control'd
 // text block — feeding whitespace upstream re-creates the 400 trap. Both
 // sides must agree on "whitespace == empty" or the bug class re-opens.
@@ -6009,7 +6597,7 @@ func TestAgentLoop_WhitespaceOnlyTextBlock_RecoveryReturnsEmpty(t *testing.T) {
 // current iteration once with the same request; if the retry recovers (text
 // or tool_calls), the run continues normally.
 //
-// This is the daemon-side defense for the shape that shannon-cloud's retry
+// This is the daemon-side defense for the shape that Cloud's retry
 // guard is supposed to catch. Both repos defend it (defense-in-depth).
 //
 // The thinking block matters: the real 2026-05-22 audit row had

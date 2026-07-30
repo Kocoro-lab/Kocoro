@@ -100,7 +100,12 @@ func newSlashTestServerWithConfig(t *testing.T, gwURL string, applyConfig func(*
 	dir := t.TempDir()
 	sc := NewSessionCache(dir)
 	gw := client.NewGatewayClient(gwURL, "test-key")
+	interruptedResumeDisabled := false
 	cfg := &config.Config{APIKey: "test-key"}
+	// Slash routing fixtures do not exercise startup recovery. Disable that
+	// unrelated background scanner so it cannot create session-index files
+	// while TempDir teardown removes the fixture directory.
+	cfg.Agent.InterruptedResumeEnabled = &interruptedResumeDisabled
 	if applyConfig != nil {
 		applyConfig(cfg)
 	}
@@ -114,8 +119,21 @@ func newSlashTestServerWithConfig(t *testing.T, gwURL string, applyConfig func(*
 	c := NewClient("ws://localhost:1/x", "", func(msg MessagePayload) string { return "" }, nil)
 	srv := NewServer(0, c, deps, "test")
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go srv.Start(ctx)
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- srv.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-startDone:
+			if err != nil {
+				t.Errorf("daemon server shutdown: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("timed out waiting for daemon server shutdown")
+		}
+	})
 	// Wait for the port to be assigned.
 	for i := 0; i < 50; i++ {
 		if srv.Port() != 0 {

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "status": "user_interference",
+  "pointer_move_commit_state": "committed",
+  "scroll_commit_state": "not_committed",
+  "phase": "user_interference",
+  "failure_code": "physical_input_interference",
+  "retry_safe": false,
+  "requested": {
+    "quartz_point": {"x": 350.5, "y": 450.5},
+    "unit": "pixel",
+    "provider_delta_x": 37,
+    "provider_delta_y": -618,
+    "provider_to_quartz_scale_x": 1,
+    "provider_to_quartz_scale_y": 1,
+    "cg_point_delta_axis1": 618,
+    "cg_point_delta_axis2": -37
+  },
+  "pointer_endpoint": {
+    "requested": {"x": 350.5, "y": 450.5},
+    "observed": {"x": 360.5, "y": 450.5},
+    "tolerance": 2,
+    "verified": false
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "topology_id": "topo_mixed_001",
+  "helper_boot_id": "helper_boot_demo",
+  "generation": 7,
+  "captured_at": "2026-07-22T12:00:00Z",
+  "main_display_id": 1,
+  "displays": [
+    {
+      "display_id": 1,
+      "is_main": true,
+      "is_builtin": true,
+      "is_active": true,
+      "is_online": true,
+      "is_asleep": false,
+      "quartz_bounds": {"x": 0, "y": 0, "width": 1280, "height": 800},
+      "appkit_frame": {"x": 0, "y": 0, "width": 1280, "height": 800},
+      "appkit_visible_frame": {"x": 0, "y": 25, "width": 1280, "height": 750},
+      "backing_scale_factor": 2,
+      "pixel_width": 2560,
+      "pixel_height": 1600,
+      "rotation_degrees": 0,
+      "mirror_master_display_id": null
+    },
+    {
+      "display_id": 2,
+      "is_main": false,
+      "is_builtin": false,
+      "is_active": true,
+      "is_online": true,
+      "is_asleep": false,
+      "quartz_bounds": {"x": -1600, "y": 100, "width": 1600, "height": 900},
+      "appkit_frame": {"x": -1600, "y": -200, "width": 1600, "height": 900},
+      "appkit_visible_frame": {"x": -1600, "y": -200, "width": 1600, "height": 875},
+      "backing_scale_factor": 1,
+      "pixel_width": 1600,
+      "pixel_height": 900,
+      "rotation_degrees": 0,
+      "mirror_master_display_id": null
+    }
+  ]
+}

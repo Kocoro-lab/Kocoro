@@ -31,7 +31,8 @@ type captureWindowResult struct {
 }
 
 // formatForegroundHint renders a one-line system-context note steering the agent
-// to read the user's foreground app on-demand. Empty when there is nothing usable.
+// to read the user's foreground app through the one public Computer Use surface.
+// Empty when there is nothing usable.
 func formatForegroundHint(h *ForegroundHint) string {
 	if h == nil {
 		return ""
@@ -42,20 +43,18 @@ func formatForegroundHint(h *ForegroundHint) string {
 	if h.AppName != "" {
 		return fmt.Sprintf(
 			"[Active app when the user asked: %q (pid %d). When the user refers to "+
-				"the current app / what they're looking at / this screen, use the "+
-				"accessibility tool (app: %q) to read its real content, or the screenshot "+
-				"tool for purely visual content. Do not target Kocoro itself.]",
+				"the current app / what they're looking at / this screen, use "+
+				"computer_use with app %q. Do not target Kocoro itself.]",
 			h.AppName, h.PID, h.AppName,
 		)
 	}
 	// PID-only (the client had no resolvable app name, e.g. nil localizedName):
 	// resolvePID matches on localizedName/bundle, so "app: pid N" would ALWAYS fail
-	// to resolve. Steer by pid via the screenshot tool instead of handing the agent
-	// a name it cannot resolve.
+	// to resolve. Ask for a usable app name instead of inventing a target.
 	return fmt.Sprintf(
 		"[Active app when the user asked: pid %d. When the user refers to the current "+
-			"app / what they're looking at / this screen, use the screenshot tool to "+
-			"capture it for visual content. Do not target Kocoro itself.]",
+			"app / what they're looking at / this screen, ask the user to name the app "+
+			"before using computer_use. Do not target Kocoro itself.]",
 		h.PID,
 	)
 }

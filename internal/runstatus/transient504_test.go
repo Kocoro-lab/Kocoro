@@ -9,8 +9,7 @@ import (
 // TestClassifyAPIError_GatewayClass guards that a 504 from the Cloud edge is
 // classified as CodeServiceTemporaryError ("the AI service encountered a
 // temporary error. Please try again.") like its 502/503 siblings, not the
-// generic CodeUnexpected ("an unexpected error occurred"). Regression for the
-// production incident where a 504 surfaced to the user as an unexpected error.
+// generic CodeUnexpected ("an unexpected error occurred").
 func TestClassifyAPIError_GatewayClass(t *testing.T) {
 	cases := []struct {
 		status int

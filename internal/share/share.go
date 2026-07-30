@@ -12,34 +12,17 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
-// summaryTimeout caps the Haiku summary call. Sized to absorb P99 small-tier
-// latency on a near-cap (540K rune) transcript without falling back to the
-// session-title / first-user-message fallback — landing on the fallback
-// means a public share page shows a truncated first user message instead of
-// a real overview, which is a worse UX than waiting a few extra seconds.
-//
-// Latency profile we're sizing for (small-tier, MaxTokens=200):
-//   P50 ≈ 3–5s   typical 5K rune transcript
-//   P95 ≈ 15s    cap-sized transcript, warm route
-//   P99 ≈ 25–30s cap-sized + cold path / queue
-//
-// 45s leaves ~33% safety margin over P99. Async share has shareTaskTimeout
-// (180s) above it, so summary+slug+upload+list still has 135s of headroom
-// after a summary worst case. Sync path consumers (CLI, ?async=false) wait
-// the full 45s on cold paths — acceptable because the alternative is a
-// disappointing fallback summary on the rendered share page.
+// summaryTimeout bounds the small-tier summary call before falling back to the
+// session title or first user message. The measured latency distribution and
+// release threshold are maintained in the private QA process.
 const summaryTimeout = 45 * time.Second
 
 // summaryFallbackChars caps the fallback summary's length so a long first
 // user message doesn't dominate the page when Haiku fails.
 const summaryFallbackChars = 200
 
-// summaryCacheSource tags the share-page Haiku calls (both summary and slug)
-// as a share-feature internal helper so Cloud-side billing skips user-quota
-// accounting — parallel to how "prompt_suggestion" is exempted. Cloud added
-// the "session_share" entry to its billing exempt list on 2026-05-15, so
-// every share now runs free of user quota; the tag has been in place since
-// share shipped, so the change was a pure Cloud-side flip.
+// summaryCacheSource tags share-page summary and slug calls as an internal
+// helper. Cloud owns the billing treatment associated with this public label.
 const summaryCacheSource = "session_share"
 
 // RenderResult bundles the rendered HTML with light telemetry callers may

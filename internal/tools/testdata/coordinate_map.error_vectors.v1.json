@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "vectors": [
+    {
+      "name": "stale topology generation",
+      "frame_fixture": "coordinate_frame.display.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 8},
+      "current_state_id": "s_display_001",
+      "frame_id": "frame_display_001",
+      "now": "2026-07-22T12:03:30Z",
+      "x": 10,
+      "y": 60,
+      "expected_error": "stale_topology"
+    },
+    {
+      "name": "invalid actionable gap",
+      "frame_fixture": "coordinate_frame.gap.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+      "current_state_id": "s_invalid_gap_001",
+      "frame_id": "frame_invalid_gap_001",
+      "now": "2026-07-22T12:03:30Z",
+      "x": 1000,
+      "y": 450,
+      "expected_error": "invalid_frame"
+    },
+    {
+      "name": "overlapping transform regions",
+      "frame_fixture": "coordinate_frame.overlap.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+      "current_state_id": "s_overlap_001",
+      "frame_id": "frame_invalid_overlap_001",
+      "now": "2026-07-22T12:03:30Z",
+      "x": 60,
+      "y": 20,
+      "expected_error": "invalid_frame"
+    },
+    {
+      "name": "outside final image",
+      "frame_fixture": "coordinate_frame.display.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+      "current_state_id": "s_display_001",
+      "frame_id": "frame_display_001",
+      "now": "2026-07-22T12:03:30Z",
+      "x": 1280,
+      "y": 10,
+      "expected_error": "outside_final_image"
+    },
+    {
+      "name": "stale frame id",
+      "frame_fixture": "coordinate_frame.window.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+      "current_state_id": "s_window_001",
+      "frame_id": "frame_window_old",
+      "now": "2026-07-22T12:03:30Z",
+      "x": 10,
+      "y": 10,
+      "expected_error": "stale_frame"
+    },
+    {
+      "name": "stale state id",
+      "frame_fixture": "coordinate_frame.window.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+      "current_state_id": "s_window_new",
+      "frame_id": "frame_window_001",
+      "now": "2026-07-22T12:03:30Z",
+      "x": 10,
+      "y": 10,
+      "expected_error": "stale_state"
+    },
+    {
+      "name": "expired frame",
+      "frame_fixture": "coordinate_frame.window.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+      "current_state_id": "s_window_001",
+      "frame_id": "frame_window_001",
+      "now": "2026-07-22T12:04:00Z",
+      "x": 10,
+      "y": 10,
+      "expected_error": "frame_expired"
+    },
+    {
+      "name": "frame not yet valid",
+      "frame_fixture": "coordinate_frame.window.v1.json",
+      "current_topology_ref": {"topology_id": "topo_mixed_001", "generation": 7},
+      "current_state_id": "s_window_001",
+      "frame_id": "frame_window_001",
+      "now": "2026-07-22T12:02:59Z",
+      "x": 10,
+      "y": 10,
+      "expected_error": "frame_not_yet_valid"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -9,13 +10,13 @@ import (
 const minGhosttyVersion = "1.3.0"
 
 // ghosttyAvailable checks if Ghostty.app is installed and >= 1.3.0.
-func ghosttyAvailable() bool {
-	out, err := exec.Command("mdfind", "kMDItemCFBundleIdentifier == 'com.mitchellh.ghostty'").CombinedOutput()
+func ghosttyAvailable(ctx context.Context) bool {
+	out, err := exec.CommandContext(ctx, "mdfind", "kMDItemCFBundleIdentifier == 'com.mitchellh.ghostty'").CombinedOutput()
 	if err != nil || strings.TrimSpace(string(out)) == "" {
 		return false
 	}
 	appPath := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
-	ver, err := exec.Command("defaults", "read", appPath+"/Contents/Info.plist", "CFBundleShortVersionString").CombinedOutput()
+	ver, err := exec.CommandContext(ctx, "defaults", "read", appPath+"/Contents/Info.plist", "CFBundleShortVersionString").CombinedOutput()
 	if err != nil {
 		return false
 	}
@@ -24,6 +25,10 @@ func ghosttyAvailable() bool {
 
 // execGhosttyScript runs an AppleScript targeting the Ghostty application.
 func execGhosttyScript(script string) (string, error) {
+	return execGhosttyScriptContext(context.Background(), script)
+}
+
+func execGhosttyScriptContext(ctx context.Context, script string) (string, error) {
 	var cmdArgs []string
 	for _, line := range strings.Split(script, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -31,7 +36,7 @@ func execGhosttyScript(script string) (string, error) {
 			cmdArgs = append(cmdArgs, "-e", trimmed)
 		}
 	}
-	out, err := exec.Command("osascript", cmdArgs...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "osascript", cmdArgs...).CombinedOutput()
 	result := strings.TrimSpace(string(out))
 	if err != nil {
 		return "", fmt.Errorf("osascript error: %w\n%s", err, result)
@@ -45,7 +50,7 @@ func execGhosttyScript(script string) (string, error) {
 // The `color` parameter is reserved for future per-tab color customization
 // (Ghostty exposes color attributes on surface configurations); see ghostty.go's
 // caller which already plumbs the value through.
-func ghosttyNewTab(command, title, color string) (windowIdx, tabIdx int, err error) {
+func ghosttyNewTab(ctx context.Context, command, title, color string) (windowIdx, tabIdx int, err error) {
 	_ = color // reserved (see godoc above)
 	cmdPart := "/bin/zsh"
 	if command != "" {
@@ -61,16 +66,16 @@ func ghosttyNewTab(command, title, color string) (windowIdx, tabIdx int, err err
 	set newTab to new tab in win with configuration cfg
 	set t to focused terminal of selected tab of win
 end tell`
-	_, err = execGhosttyScript(script)
+	_, err = execGhosttyScriptContext(ctx, script)
 	if err != nil {
 		return 0, 0, fmt.Errorf("new_tab: %w", err)
 	}
 
 	if title != "" {
-		setTabTitle(title)
+		setTabTitleContext(ctx, title)
 	}
 	if command != "" {
-		sendCommand(command)
+		sendCommandContext(ctx, command)
 	}
 
 	// Get tab index for registry
@@ -80,7 +85,7 @@ end tell`
 	end tell
 	return tabIdx as text
 end tell`
-	result, err := execGhosttyScript(idxScript)
+	result, err := execGhosttyScriptContext(ctx, idxScript)
 	if err != nil {
 		return 1, 1, nil
 	}
@@ -91,7 +96,7 @@ end tell`
 // ghosttyNewSplit opens a new split in the given direction (right or down).
 // The `color` parameter is reserved for future per-split color customization
 // (matches ghosttyNewTab's signature; see its godoc).
-func ghosttyNewSplit(direction, command, title, color string) (windowIdx, tabIdx int, err error) {
+func ghosttyNewSplit(ctx context.Context, direction, command, title, color string) (windowIdx, tabIdx int, err error) {
 	_ = color // reserved (see godoc above)
 	script := fmt.Sprintf(`tell application "Ghostty"
 	activate
@@ -100,16 +105,16 @@ func ghosttyNewSplit(direction, command, title, color string) (windowIdx, tabIdx
 	set cfg to new surface configuration
 	set t2 to split t1 direction %s with configuration cfg
 end tell`, direction)
-	_, err = execGhosttyScript(script)
+	_, err = execGhosttyScriptContext(ctx, script)
 	if err != nil {
 		return 0, 0, fmt.Errorf("new_split: %w", err)
 	}
 
 	if title != "" {
-		setTabTitle(title)
+		setTabTitleContext(ctx, title)
 	}
 	if command != "" {
-		sendCommand(command)
+		sendCommandContext(ctx, command)
 	}
 
 	return 1, 1, nil
@@ -121,7 +126,7 @@ end tell`, direction)
 // because Ghostty exposes only one window scope per send. The parameter is
 // retained so callers continue to thread a window identifier through, ready
 // for multi-window support without an API break.
-func ghosttySendInput(windowIdx, tabIdx int, text string) error {
+func ghosttySendInput(ctx context.Context, windowIdx, tabIdx int, text string) error {
 	_ = windowIdx // see godoc — currently scripted as `window 1`
 	escaped := strings.ReplaceAll(text, `\`, `\\`)
 	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
@@ -131,23 +136,31 @@ func ghosttySendInput(windowIdx, tabIdx int, text string) error {
 	set t to focused terminal of targetTab
 	input text "%s" to t
 end tell`, tabIdx, escaped)
-	_, err := execGhosttyScript(script)
+	_, err := execGhosttyScriptContext(ctx, script)
 	return err
 }
 
 // setTabTitle sets the title of the current tab in the front window.
 func setTabTitle(title string) {
+	setTabTitleContext(context.Background(), title)
+}
+
+func setTabTitleContext(ctx context.Context, title string) {
 	escaped := strings.ReplaceAll(title, `"`, `\"`)
 	script := fmt.Sprintf(`tell application "Ghostty"
 	tell selected tab of front window
 		set title to "%s"
 	end tell
 end tell`, escaped)
-	execGhosttyScript(script)
+	execGhosttyScriptContext(ctx, script)
 }
 
 // sendCommand sends a command string + enter to the focused terminal.
 func sendCommand(command string) {
+	sendCommandContext(context.Background(), command)
+}
+
+func sendCommandContext(ctx context.Context, command string) {
 	escaped := strings.ReplaceAll(command, `\`, `\\`)
 	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 	script := fmt.Sprintf(`tell application "Ghostty"
@@ -155,7 +168,7 @@ func sendCommand(command string) {
 	input text "%s" to t
 	send key "enter" to t
 end tell`, escaped)
-	execGhosttyScript(script)
+	execGhosttyScriptContext(ctx, script)
 }
 
 // SetGhosttyTabAppearance sets tab title for the current terminal.
@@ -201,7 +214,7 @@ func GhosttyWorkspaceScript(shanBinary string, agentNames []string) string {
 }
 
 // GhosttyAvailable is the exported wrapper for cmd package.
-func GhosttyAvailable() bool { return ghosttyAvailable() }
+func GhosttyAvailable() bool { return ghosttyAvailable(context.Background()) }
 
 // ExecGhosttyScript is the exported wrapper for cmd package.
 func ExecGhosttyScript(script string) error {

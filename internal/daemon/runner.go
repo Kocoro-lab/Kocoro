@@ -28,6 +28,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
@@ -134,8 +135,8 @@ type RunAgentRequest struct {
 
 // ForegroundHint identifies the app that was frontmost when the user summoned
 // the Desktop quick panel (captured before Kocoro stole focus). Folded into the
-// run's StickyContext so the agent's accessibility/screenshot tools target this
-// app instead of Kocoro when the user refers to "the current app".
+// run's StickyContext and run-local computer_use target so the tool observes
+// this app instead of Kocoro when the user refers to "the current app".
 type ForegroundHint struct {
 	PID      int    `json:"pid,omitempty"`
 	AppName  string `json:"app_name,omitempty"`
@@ -742,11 +743,9 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 // WeChat, Telegram) keep "plain" because Cloud owns their final render.
 //
 // WeChat deliberately stays "plain" (NOT here) even though it sends native
-// images/files: Cloud's iLink outbound extracts RAW CDN URLs from the plain
-// text (shannon-cloud wechat_streamer.go / cdn_images.go). Do NOT add it here —
-// a markdown link `[name](url)` would leave a "[name]()" shell after Cloud
-// strips the URL, because its cleanup only removes `![]()` image shells and
-// `<>` autolinks, never `[]()` links.
+// images/files: Cloud's iLink outbound extracts raw CDN URLs from plain text.
+// Do NOT add it here because markdown link shells are not part of that public
+// rendering contract.
 var markdownCloudSources = map[string]struct{}{
 	ChannelFeishu: {},
 	ChannelLark:   {},
@@ -1172,7 +1171,7 @@ func IsMessagingPlatform(source string) bool {
 
 // channelHasInteractiveApproval reports whether a channel can render an
 // Allow/Deny approval prompt AND route the user's decision back to the daemon.
-// Kept in sync with shannon-cloud's RouteApproval supported set
+// Kept in sync with Cloud's advertised approval-capable channel set
 // (slack/line/feishu/lark/teams); everything else cannot prompt.
 func channelHasInteractiveApproval(source string) bool {
 	switch strings.ToLower(strings.TrimSpace(source)) {
@@ -1184,8 +1183,8 @@ func channelHasInteractiveApproval(source string) bool {
 
 // IsNonInteractiveApprovalChannel reports whether a run originates from an IM
 // channel that has NO way to prompt the user for tool approval (no Allow/Deny
-// UI): WeChat, WeCom, Discord, Telegram, voice, etc. The cloud cannot route an
-// approval card to these (RouteApproval returns "approval not supported"), so an
+// UI): WeChat, WeCom, Discord, Telegram, voice, etc. Cloud cannot route an
+// approval card to these, so an
 // emitted approval request would block until the 5-minute timeout and then be
 // denied — surfacing to the user as a truncated "(Response may be incomplete)".
 // The approval broker auto-approves these locally instead.
@@ -1241,7 +1240,7 @@ func routeTitle(source, channel, sender string) string {
 		return ""
 	}
 
-	// Use sender name when available (e.g. "Slack · Wayland")
+	// Use sender name when available (e.g. "Slack · Alice")
 	if sender != "" {
 		return label + " · " + sender
 	}
@@ -1489,6 +1488,20 @@ type ServerDeps struct {
 	// Wired by NewServer after construction. nil-safe: when unset (e.g. CLI
 	// fixtures that construct ServerDeps directly), the post-Run hook is a no-op.
 	Suggestions *agent.SuggestionState
+	// ComputerUseCoordinator is the process-wide GUI control authority used by
+	// daemon tool wrappers. Production leaves this nil and resolves
+	// guicontrol.ProcessCoordinator; tests may inject an isolated coordinator.
+	ComputerUseCoordinator *guicontrol.Coordinator
+	// ComputerUsePreview is the process-memory last-frame seam shared with the
+	// trusted local Desktop. It is nil-safe for CLI and isolated tests.
+	ComputerUsePreview *ComputerUsePreviewStore
+	// ComputerUseAppPolicy is the process-wide Ask/Blocked policy store shared
+	// by daemon admission and the Desktop local-presence API. Tests may inject
+	// an isolated in-memory-directory-backed store before the first run.
+	ComputerUseAppPolicy *ComputerUseAppPolicyStore
+	// ConsequentialRiskBroker is process-memory-only and shared by the daemon
+	// tool workflow and authenticated local Desktop decision endpoints.
+	ConsequentialRiskBroker *ConsequentialRiskBroker
 
 	// ApprovalTracker records which sessions are currently blocked on a
 	// user approval prompt. Approval handlers (SSE + WS) Mark/Clear here so
@@ -1513,6 +1526,15 @@ func (d *ServerDeps) Snapshot() (*config.Config, *agent.ToolRegistry, *mcp.Super
 	cfg, reg, sup := d.Config, d.Registry, d.Supervisor
 	d.mu.RUnlock()
 	return cfg, reg, sup
+}
+
+func (d *ServerDeps) computerUseAppPolicyStore() *ComputerUseAppPolicyStore {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ComputerUseAppPolicy == nil {
+		d.ComputerUseAppPolicy = NewComputerUseAppPolicyStore(d.ShannonDir)
+	}
+	return d.ComputerUseAppPolicy
 }
 
 // ShutdownCleanup captures and calls the current Cleanup function under lock,
@@ -1716,9 +1738,9 @@ func resumeNamedAgentColdStart(sessMgr *session.Manager) (bool, error) {
 	// Resume the latest INTERACTIVE session only — never a schedule/IM session
 	// that happens to be newer in this agent's directory. isInteractiveSource
 	// encodes the exclusion rule (see sessionkind.go); empty-source / "desktop"
-	// sessions (the bulk of real data, including pre-upgrade named-agent
-	// sessions written with no route_key) classify as interactive and resolve
-	// correctly here without any data migration.
+	// sessions (including legacy named-agent sessions written with no route_key)
+	// classify as interactive and resolve correctly here without any data
+	// migration.
 	latest, err := sessMgr.ResumeLatestMatching(isInteractiveSource)
 	if err != nil {
 		return false, err
@@ -1791,6 +1813,81 @@ func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelCo
 	}
 }
 
+type runModelIntent struct {
+	ModelTier     string
+	SpecificModel string
+}
+
+// effectiveRunModelIntent mirrors the existing loop precedence so route
+// resolution and the eventual CompletionRequest cannot disagree:
+// global config -> named-agent overlay -> request tier override.
+func effectiveRunModelIntent(
+	runCfg *config.Config,
+	agentOverride *agents.Agent,
+	req RunAgentRequest,
+) runModelIntent {
+	var intent runModelIntent
+	if runCfg != nil {
+		intent.ModelTier = runCfg.ModelTier
+		intent.SpecificModel = runCfg.Agent.Model
+	}
+	if agentOverride != nil &&
+		agentOverride.Config != nil &&
+		agentOverride.Config.Agent != nil {
+		model := agentOverride.Config.Agent
+		if model.ModelTier != nil && *model.ModelTier != "" {
+			intent.ModelTier = *model.ModelTier
+		}
+		if model.Model != nil {
+			intent.SpecificModel = *model.Model
+		}
+	}
+	if req.ModelOverride != "" {
+		intent.ModelTier = req.ModelOverride
+	}
+	return intent
+}
+
+// resolveOpenAIComputerProfileForTask is called only after the parent model
+// delegates an actual desktop goal. Ordinary turns never touch the Computer
+// Use resolver or inherit its model.
+func resolveOpenAIComputerProfileForTask(
+	ctx context.Context,
+	gateway *client.GatewayClient,
+	modelTier string,
+) (*client.ExecutionProfile, error) {
+	if gateway == nil {
+		return nil, fmt.Errorf("Cloud gateway is unavailable")
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	profile, err := gateway.ResolveExecutionProfile(
+		resolveCtx,
+		client.ResolveExecutionProfileRequest{
+			SchemaVersion:        client.ExecutionProfileSchemaVersion,
+			ModelTier:            modelTier,
+			Capability:           client.ExecutionProfileCapabilityComputer,
+			RequiredToolContract: client.ToolContractOpenAIComputerV1,
+			AllowModelFallback:   true,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve OpenAI computer profile: %w", err)
+	}
+	if profile.Provider() != client.OpenAIComputerProvider ||
+		profile.APISurface() != client.APISurfaceOpenAIResponses ||
+		profile.ToolContract() != client.ToolContractOpenAIComputerV1 ||
+		profile.ExecutionMode() != client.ExecutionModeNativeComputer ||
+		!profile.IsTrustedResolution() ||
+		!profile.SupportsImageInput() ||
+		!profile.SupportsToolResultImages() ||
+		profile.SupportsFunctionTools() ||
+		!profile.SupportsBatchedActions() {
+		return nil, fmt.Errorf("Cloud returned an unsupported OpenAI computer profile")
+	}
+	return profile, nil
+}
+
 // historySnapshotForRequest returns the conversation history that the agent
 // loop should see. When req.OmitHistory is true (set by the scheduler for
 // stateless schedules), the LLM gets an empty history even though the session
@@ -1801,6 +1898,36 @@ func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []cli
 		return nil
 	}
 	return sess.HistoryForLoop()
+}
+
+func configureDaemonComputerUseDispatcher(
+	reg *agent.ToolRegistry,
+	dispatcherReady bool,
+) bool {
+	if reg == nil || !reg.Has("computer_use") {
+		return false
+	}
+	// The unwrapped core is never model-visible on daemon runs. If private
+	// dispatcher construction failed, omit only this core and preserve every
+	// legacy fallback that the filtered registry still exposes.
+	reg.Remove("computer_use")
+	if !dispatcherReady {
+		return false
+	}
+	// There is exactly one model-visible desktop surface. Remove the low-level
+	// legacy GUI fallbacks only after both the filtered public dispatcher and
+	// its private executor are known to be available. A named agent that
+	// excludes computer_use keeps its explicitly selected legacy tools and
+	// normal bash behavior.
+	reg.Remove(client.NativeComputerToolName)
+	reg.Remove("accessibility")
+	reg.Remove("applescript")
+	if raw, ok := reg.Get("bash"); ok {
+		if bash, ok := raw.(*tools.BashTool); ok {
+			bash.LegacyGUIAutomationDisabled = true
+		}
+	}
+	return true
 }
 
 const interruptedTurnContinuation = "[system] The previous turn was interrupted after a durable checkpoint. Continue the existing request from the saved tool results and partial work. Do not repeat completed tool calls."
@@ -2688,7 +2815,38 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 
-	// Clone and apply per-agent tool filter
+	// Prepare only the local executor. The OpenAI profile is resolved lazily if
+	// and when the parent delegates a desktop goal, so ordinary Sonnet turns
+	// never pay provider-native preparation latency.
+	modelIntent := effectiveRunModelIntent(runCfg, agentOverride, req)
+	var computerReg *agent.ToolRegistry
+	var openAIComputerPrivate *daemonOpenAIComputerPrivateRuntimeV1
+	if baseReg.Has("computer_use") {
+		computerReg, err = tools.CloneWithOpenAIComputerForRun(baseReg, runCfg)
+		if err != nil {
+			log.Printf(
+				"daemon: local OpenAI computer executor unavailable; computer_use will be omitted: %v",
+				err,
+			)
+			computerReg = nil
+		}
+	}
+	if computerReg != nil {
+		if hint := req.ForegroundHint; hint != nil && hint.PID > 0 &&
+			strings.TrimSpace(hint.AppName) != "" && strings.TrimSpace(hint.BundleID) != "" {
+			if err := tools.BindComputerUseInitialTargetForRun(computerReg, tools.ComputerUseInitialTargetV1{
+				PID: hint.PID, AppName: hint.AppName, BundleID: hint.BundleID,
+			}); err != nil {
+				return nil, fmt.Errorf("bind foreground computer-use target: %w", err)
+			}
+		}
+		openAIComputerPrivate, err =
+			detachDaemonOpenAIComputerPrivateRuntimeCoreV1(computerReg)
+		if err != nil {
+			return nil, fmt.Errorf("detach OpenAI computer runtime: %w", err)
+		}
+	}
+
 	reg := tools.CloneWithRuntimeConfig(baseReg, runCfg)
 	if agentOverride != nil {
 		reg = tools.ApplyToolFilter(reg, agentOverride)
@@ -2702,6 +2860,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// (config.mcp.default_agent_disabled). No-op when empty.
 		reg = tools.ApplyMCPServerScope(reg, runCfg)
 	}
+	computerUseDispatcherEnabled := configureDaemonComputerUseDispatcher(
+		reg,
+		openAIComputerPrivate != nil && computerReg != nil &&
+			computerReg.Has(client.NativeComputerToolName),
+	)
 
 	// Attach SecretsStore to the session-scoped bash tool so use_skill
 	// activations can expose skill secrets as child-process env vars.
@@ -2769,6 +2932,62 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	tools.RegisterMemoryTool(reg, memSvc, &daemonFallback{sessionMgr: sessMgr})
 
+	guiCoordinator := deps.ComputerUseCoordinator
+	if guiCoordinator == nil {
+		guiCoordinator = guicontrol.ProcessCoordinator()
+	}
+	guiWorkflow := newDaemonGUIWorkflow(guiCoordinator, daemonGUIWorkflowRequest{
+		SessionID:   sess.ID,
+		TurnID:      "turn/" + guicontrol.NewCoordinatorInstanceID(),
+		SourceKind:  req.Source,
+		SourceLabel: daemonGUISourceLabel(req.Source),
+	})
+	guiWorkflow.appPolicy = deps.computerUseAppPolicyStore()
+	guiWorkflow.riskBroker = deps.ConsequentialRiskBroker
+	var openAIComputerRuntime *tools.OpenAIComputerActionRuntimeV1
+	childComputerTools := agent.NewToolRegistry()
+	if openAIComputerPrivate != nil {
+		openAIComputerRuntime = openAIComputerPrivate.runtime
+		if marker, ok := computerReg.Get(client.NativeComputerToolName); ok {
+			childComputerTools.Register(marker)
+		} else {
+			return nil, fmt.Errorf("OpenAI computer child marker is unavailable")
+		}
+	}
+	wrapDaemonGUITools(reg, guiWorkflow)
+	if computerUseDispatcherEnabled {
+		resolveProfile := func(
+			taskCtx context.Context,
+		) (*client.ExecutionProfile, error) {
+			return resolveOpenAIComputerProfileForTask(
+				taskCtx,
+				deps.GW,
+				modelIntent.ModelTier,
+			)
+		}
+		reg.Register(&openAIComputerTaskToolV1{
+			gateway:         deps.GW,
+			resolveProfile:  resolveProfile,
+			childTools:      childComputerTools,
+			workflow:        guiWorkflow,
+			runtime:         openAIComputerRuntime,
+			preview:         deps.ComputerUsePreview,
+			appPolicy:       guiWorkflow.appPolicy,
+			handler:         handler,
+			modelTier:       "large",
+			shannonDir:      deps.ShannonDir,
+			maxIter:         runCfg.Agent.MaxIterations,
+			maxTokens:       runCfg.Agent.MaxTokens,
+			resultTrunc:     runCfg.Tools.ResultTruncation,
+			argsTrunc:       runCfg.Tools.ArgsTruncation,
+			postBatchSettle: waitOpenAIComputerPostBatchSettleV1,
+			permissions:     &runCfg.Permissions,
+			auditor:         deps.Auditor,
+			hookRunner:      deps.HookRunner,
+		})
+	}
+	defer guiWorkflow.EndTurn()
+
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
@@ -2787,12 +3006,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
 		runCfg.Agent.Model, sess.LastSeenModel(),
 		agent.ContextWindowFloorForProvider(runCfg.Provider, runCfg.Agent.ContextWindow)))
-	// Streaming on: bypasses Shannon Cloud's MAX_NON_STREAMING=16384 cap in
-	// llm-service/llm_provider/anthropic_provider.py, raising effective max
-	// output to the model's full limit (e.g. Sonnet 4.6 = 64K). Without this,
+	// Streaming on: uses Cloud's full streamed-output contract instead of its
+	// smaller legacy non-streaming response cap. Without this,
 	// the trailing tool_use truncation handled above triggers on routine large
 	// file_write calls; with streaming, it becomes a rare edge case (still
-	// possible past 64K, but the model has 4x the budget before clipping).
+	// possible at the provider's output limit).
 	// Streaming fallback to Complete() is built into the agent loop, so a
 	// gateway that rejects streaming degrades gracefully. WS/SSE/bus handlers
 	// all implement OnStreamDelta — the WS+bus paths are no-ops (clients see
@@ -2825,13 +3043,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// global (~/.shannon/config.yaml permissions.always_allow_tools) and
 		// per-agent (agents/<name>/config.yaml permissions.always_allow_tools)
 		// — global lets the user authorize a tool once and have it apply to
-		// every agent; per-agent narrows trust to a single agent.
-		// SetAlwaysAllowTools dedups internally so simple append is fine.
-		merged := append([]string(nil), runCfg.Permissions.AlwaysAllowTools...)
+		// every agent; permitted per-agent entries narrow trust to one agent.
+		// MergeAlwaysAllowTools filters stale per-agent high-risk grants, and
+		// SetAlwaysAllowTools deduplicates the merged result.
+		var perAgentAlwaysAllow []string
 		if agentOverride.Config != nil && agentOverride.Config.Permissions != nil {
-			merged = append(merged, agentOverride.Config.Permissions.AlwaysAllowTools...)
+			perAgentAlwaysAllow = agentOverride.Config.Permissions.AlwaysAllowTools
 		}
-		loop.SetAlwaysAllowTools(merged)
+		loop.SetAlwaysAllowTools(agents.MergeAlwaysAllowTools(
+			runCfg.Permissions.AlwaysAllowTools,
+			perAgentAlwaysAllow,
+		))
 	} else {
 		loop.SetMemoryDir(filepath.Join(deps.ShannonDir, "memory"))
 		if loadedSkills != nil {
@@ -3246,6 +3468,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	} else {
 		result, usage, runErr = loop.Run(ctx, prompt, resolvedContent, history)
 	}
+	// Release GUI authority at the actual agent-turn boundary, before session
+	// persistence, title generation, suggestions, or delivery work. The defer
+	// above remains as a panic/early-return safety net and is idempotent.
+	guiWorkflow.EndTurn()
 	status := loop.LastRunStatus()
 	idempotencyOutcomeKnown = true
 	idempotencyRunErr = runErr

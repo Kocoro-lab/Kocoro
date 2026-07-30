@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "user_interference",
+  "action": "click",
+  "primary_action_committed": true,
+  "pointer_motion_committed": true,
+  "phase": "user_interference",
+  "failure_code": "physical_input_interference",
+  "retry_safe": false,
+  "pointer_endpoint": {
+    "requested": {"x": 200.5, "y": 300.5},
+    "observed": {"x": 204.5, "y": 300.5},
+    "tolerance": 2,
+    "verified": false
+  }
+}

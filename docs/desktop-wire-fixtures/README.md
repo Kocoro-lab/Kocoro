@@ -30,15 +30,21 @@ version they target. Sync is one-way — consumer repos never author fixture
 changes locally; propose them here first. Fixture contents must describe only
 what crosses the wire: no consumer-side type names, file paths, or internals.
 
+`execution-profiles-v1/` is the one inverse-direction exception: Shannon Cloud
+mints that contract and is its canonical home. This repository vendors the same
+named bytes and the same SHA-256 manifest. Both repositories validate their local copy in CI; neither
+test suite depends on a sibling checkout or an absolute path.
+
 ## Surfaces
 
-Three transport surfaces, named by file prefix:
+Four live transport families, named by file prefix:
 
 | Prefix | Surface | Framing (not in fixture) |
 |---|---|---|
 | `bus_event.*` | `GET /events` broadcast SSE stream | `id: <n>\nevent: <type>\ndata: <payload>\n\n` — fixture is the `data` payload |
 | `sse_event.*` | `POST /message` per-request SSE stream | `event: <name>\ndata: <payload>\n\n` — fixture is the `data` payload. NOTE: per-request event names differ from bus types (`approval` not `approval_request`, `tool` not `tool_status`) |
 | `http_get.*` | Plain HTTP GET response body | none — fixture is the whole body |
+| `computer_use.*` | Local Desktop computer-use control plane | Request/response bodies for the authenticated activity, control, and heartbeat routes. |
 
 ## File List
 
@@ -83,12 +89,42 @@ retry. `decline` carries no answers.
 | `bus_event.cloud_progress.json` | `bus_handler.go OnCloudProgress` | counts-only today; a future `items` array extension will be additive + capability-gated |
 | `bus_event.suggestion_ready.json` | `runner.go fireSuggestionAfterRun` | post-turn suggested next user prompt |
 | `bus_event.deliverable.json` | `bus_handler.go makeDeliverableEventHandler` | daemon-validated local regular-file metadata emitted by `present_deliverable`; Desktop dedupes live/replay/history records by `id` |
+| `bus_event.computer_use.activity.json` | `guicontrol.Coordinator` through the `Server` event sink | Dotted event type `computer_use.activity`; schema v1 redacted activity payload. `coordinator_instance_id` is immutable for one daemon coordinator process, while `revision` is coordinator-owned and independent from the SSE event ID. Pointer geometry is bound to `topology_id` + `topology_generation`. Nullable result/path/pointer/failure fields never carry action content. |
+| `bus_event.computer_use.activity.scroll.json` | same | Verified Accessibility scroll activity. It pins `action_kind: scroll`, `execution_path: accessibility`, and an explicit null pointer so Desktop never invents a click/move pulse for a semantic AX scroll. |
+
+### Computer-use control plane
+
+| File | Producer | Notes |
+|---|---|---|
+| `computer_use.activity_snapshot.active.json` | `GET /local/computer-use/activity` via `EncodeComputerUseActivitySnapshot` | Reconnect snapshot with one active lease. `schema_version`, `coordinator_instance_id`, and `revision` appear only in the envelope; `active` reuses the event's state fields without duplicating them. |
+| `computer_use.activity_snapshot.waiting_confirmation.json` | same | Waiting-for-user snapshot with only the content-free consequential-risk marker. Labels, destination, target digest, and tool arguments are forbidden. |
+| `computer_use.activity_snapshot.idle.json` | `GET /local/computer-use/activity` via `EncodeComputerUseActivitySnapshot` | Explicit idle state: the coordinator instance and its last revision remain visible while `active` is JSON null. |
+| `computer_use.control.stop.request.json` | `POST /local/computer-use/control` via `DecodeComputerUseControlRequest` | Stop command identity only: lease + idempotency key. Stop intentionally has no stale-revision precondition. |
+| `computer_use.control.stop.response.json` | `POST /local/computer-use/control` via `EncodeComputerUseControlResponse` | Fixture represents cancellation of an in-flight action: accepted stop advances the revision and reports `lease_state: stopping` until the executor acknowledges quiescence. A stop with no in-flight action reports `terminal` immediately. |
+| `computer_use.heartbeat.request.json` | `POST /local/computer-use/heartbeat` via `DecodeComputerUseHeartbeatRequest` | Strict schema-v1 controller heartbeat bound to one active lease. |
+| `computer_use.heartbeat.response.json` | `POST /local/computer-use/heartbeat` via `EncodeComputerUseHeartbeatResponse` | Atomic coordinator identity/revision plus refreshed heartbeat and expiry timestamps. |
+| `computer_use.app_policy.update.request.json` | `PUT /local/computer-use/app-policy` | Strict canonical bundle id plus the only mutable V1 decisions: `ask` or `blocked`. `always_allow` is not part of this contract. |
+| `computer_use.app_policy.revoke.request.json` | `DELETE /local/computer-use/app-policy` | Removes one user entry so that the app returns to default Ask; built-in entries are immutable. |
+| `computer_use.app_policy.update.response.json` | `PUT /local/computer-use/app-policy` | Full redacted snapshot returned after an update. Entries contain bundle id, decision, and source only; no titles or AX values. |
+| `computer_use.risk_intent.detail.response.json` | `GET /local/computer-use/risk-intents/{intent_id}` | Authoritative, no-store, local-presence-only point-of-risk detail. The committed fixture contains synthetic labels/digest solely to pin the local wire; runtime details are process memory only and never enter activity events or persistence. |
+| `computer_use.risk_intent.detail.coordinate.response.json` | same | Synthetic-coordinate variant. `coordinate_authority` binds the single left click to one AX path, immutable frame/image digest, topology/helper/display, source pixel, and mapped Quartz point; the intent/grant may never outlive `frame_expires_at`. Accessibility targets carry explicit JSON null instead. |
+| `computer_use.risk_intent.allow.request.json` | `POST /local/computer-use/risk-intents/{intent_id}/decision` | One-shot allow; body must echo the exact path `intent_id`. |
+| `computer_use.risk_intent.allow.response.json` | same | Content-free confirmation receipt and grant expiry. The execution grant itself remains process-local and is bound to request id + target digest + the exact canonical consequential detail. |
+| `computer_use.risk_intent.deny.request.json` | same | One-shot deny; body must echo the exact path `intent_id`. |
+| `computer_use.risk_intent.deny.response.json` | same | Content-free denial receipt; `grant_expires_at` is explicit JSON null. |
+
+All local routes require `X-Kocoro-Local-Presence`; localhost CORS admission
+is not authentication. Risk confirmation additionally requires the actual TCP
+peer to be loopback. Control, heartbeat, app-policy, and risk-decision bodies
+reject unknown, duplicate, missing, and trailing JSON members through strict
+codecs.
 
 ### HTTP responses
 
 | File | Producer | Notes |
 |---|---|---|
 | `http_get.status.response.json` | `server.go handleStatus` | pins the FULL `capabilities` token list — adding a token without updating this fixture fails the daemon test, which is the point (minting discipline made mechanical). `memory.reason` is explicit-null, not omitted. `uptime` is dynamic (normalized in tests) |
+| `http_get.computer_use_topology.response.json` | `computer_use_topology.go handleComputerUseTopology` (`GET /local/computer-use/topology`) | daemon-owned transport fixture copied semantically from the helper's canonical `display_topology.mixed_horizontal.v1.json`. The HTTP body is the strict topology object itself, with no wrapper. Desktop vendors this fixture from the daemon repo; the endpoint exposes topology only, never coordinate-capture image bytes. |
 | `http_get.agents.response.json` | `server.go handleAgents` | list items use `override` |
 | `http_get.agent_detail.response.json` | `server.go handleGetAgent` (`AgentAPI`) | detail uses `overridden` — historical field-name divergence, pinned here so neither side "fixes" it unilaterally. `memory`/`config`/`commands`/`skills` are explicit-null when absent |
 | `http_get.sessions.scope_all.response.json` | `server.go handleSessions` (`GET /sessions?scope=all`) | cross-agent merged list, sorted `pinned DESC, updated_at DESC`. Each row carries `agent` (empty = default scope, slug otherwise) and normalized `cwd` (empty = unlinked) — always emitted. Wrapper carries the complete pre-page `projects` catalog plus `total` and `has_more`. `id`/`created_at`/`updated_at` are dynamic (normalized in tests). Paginated via `limit` (default 100) / `offset` (default 0) — page/offset applied AFTER optional `project_cwd` filtering and merge+sort; single-scope `GET /sessions` and `GET /sessions?agent=<slug>` return the same wrapper+row shape with `agent` set to the queried scope |
