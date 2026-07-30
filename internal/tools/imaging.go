@@ -428,19 +428,18 @@ func GetMainScreenGeometry() (screenGeometry, error) {
 	// NSScreen.screens[0] is the primary display (the one with the menu bar),
 	// matching screencapture -m. NSScreen.mainScreen can instead follow the key
 	// window onto another monitor and silently break the declared tool canvas.
-	//
-	// Read dimensions from an actual CoreGraphics capture instead of deriving
-	// them from frame * backingScaleFactor or CGDisplayPixelsWide/High. Virtual
-	// displays can report 1024x768 through both metadata paths while
-	// screencapture emits 1280x960; Retina displays likewise report point-sized
-	// CGDisplayPixelsWide/High values while the captured image contains twice
-	// as many pixels. CGDisplayCreateImage binds the declared tool space to the
-	// same main-display pixels that screencapture will encode.
-	const script = `ObjC.import("AppKit"); ObjC.import("CoreGraphics"); var s=$.NSScreen.screens.objectAtIndex(0); var f=s.frame; var n=s.deviceDescription.objectForKey("NSScreenNumber"); var d=Number(n.unsignedIntValue); var i=$.CGDisplayCreateImage(d); console.log(Number(f.size.width)+" "+Number(f.size.height)+" "+Number($.CGImageGetWidth(i))+" "+Number($.CGImageGetHeight(i)))`
+	const script = `ObjC.import("AppKit"); var s=$.NSScreen.screens.objectAtIndex(0); var f=s.frame; var k=Number(s.backingScaleFactor); console.log(Number(f.size.width)+" "+Number(f.size.height)+" "+k)`
 	out, err := exec.Command("/usr/bin/osascript", "-l", "JavaScript", "-e", script).CombinedOutput()
 	if err == nil {
-		if geometry, parseErr := parseNSScreenGeometry(string(out)); parseErr == nil {
-			return geometry, nil
+		var w, h int
+		var scale float64
+		if _, parseErr := fmt.Sscanf(strings.TrimSpace(string(out)), "%d %d %f", &w, &h, &scale); parseErr == nil &&
+			w > 0 && h > 0 && scale > 0 && !math.IsNaN(scale) && !math.IsInf(scale, 0) {
+			return screenGeometry{
+				LogicalWidth: w, LogicalHeight: h,
+				CaptureWidth:  int(math.Round(float64(w) * scale)),
+				CaptureHeight: int(math.Round(float64(h) * scale)),
+			}, nil
 		}
 	}
 
@@ -450,30 +449,6 @@ func GetMainScreenGeometry() (screenGeometry, error) {
 		return screenGeometry{}, fmt.Errorf("screen dimensions: %v", err)
 	}
 	return parseScreenGeometry(string(out))
-}
-
-func parseNSScreenGeometry(output string) (screenGeometry, error) {
-	var logicalWidth, logicalHeight, captureWidth, captureHeight int
-	if _, err := fmt.Sscanf(
-		strings.TrimSpace(output),
-		"%d %d %d %d",
-		&logicalWidth,
-		&logicalHeight,
-		&captureWidth,
-		&captureHeight,
-	); err != nil {
-		return screenGeometry{}, fmt.Errorf("parse NSScreen geometry: %w", err)
-	}
-	if logicalWidth <= 0 || logicalHeight <= 0 ||
-		captureWidth <= 0 || captureHeight <= 0 {
-		return screenGeometry{}, fmt.Errorf("parse NSScreen geometry: invalid dimensions")
-	}
-	return screenGeometry{
-		LogicalWidth:  logicalWidth,
-		LogicalHeight: logicalHeight,
-		CaptureWidth:  captureWidth,
-		CaptureHeight: captureHeight,
-	}, nil
 }
 
 // GetScreenDimensions returns the main display's logical point dimensions.

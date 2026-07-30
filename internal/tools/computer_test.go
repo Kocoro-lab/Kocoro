@@ -374,6 +374,57 @@ func TestComputer_ScreenshotFailsClosedWhenBytesDoNotMatchDeclaredSpace(t *testi
 	}
 }
 
+func TestComputer_ScreenshotAdoptsSameAspectCaptureSpace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "virtual-display.png")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(file, image.NewRGBA(image.Rect(0, 0, 1280, 960))); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	block, err := EncodeImage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := &ComputerTool{
+		client: &AXClient{}, screenW: 1024, screenH: 768,
+		toolW: 1024, toolH: 768,
+		captureScreen: func(context.Context, int) (string, agent.ImageBlock, error) {
+			return path, block, nil
+		},
+	}
+	result, err := tool.screenshot(context.Background())
+	if err != nil || result.IsError {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if tool.toolW != 1280 || tool.toolH != 960 {
+		t.Fatalf("adopted tool space = %dx%d, want 1280x960", tool.toolW, tool.toolH)
+	}
+	x, y, err := tool.scaleXY(640, 480)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x != 512 || y != 384 {
+		t.Fatalf("capture center maps to (%d,%d), want logical center (512,384)", x, y)
+	}
+}
+
+func TestCompatibleCapturedToolDimensionsAllowsResizeRoundingOnly(t *testing.T) {
+	if !compatibleCapturedToolDimensions(1280, 831, 1512, 982) {
+		t.Fatal("one-pixel Retina resize rounding was rejected")
+	}
+	if compatibleCapturedToolDimensions(1280, 720, 1440, 900) {
+		t.Fatal("different aspect ratio was admitted")
+	}
+	if compatibleCapturedToolDimensions(1281, 961, 1024, 768) {
+		t.Fatal("oversized capture was admitted")
+	}
+}
+
 func TestComputer_ScreenshotAlwaysRemovesLegacyCaptureTemporaryFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "capture.png")
 	file, err := os.Create(path)

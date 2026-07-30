@@ -94,21 +94,57 @@ func (t *ComputerTool) captureExactToolImage(ctx context.Context) (string, agent
 	if err != nil {
 		return path, agent.ImageBlock{}, fmt.Errorf("read legacy computer screenshot dimensions: %w", err)
 	}
+	adoptCapturedDimensions := false
 	if width != t.toolW || height != t.toolH {
-		return path, agent.ImageBlock{}, fmt.Errorf(
-			"legacy computer screenshot dimensions %dx%d do not match declared tool space %dx%d",
-			width, height, t.toolW, t.toolH)
+		if !compatibleCapturedToolDimensions(
+			width, height, t.screenW, t.screenH,
+		) {
+			return path, agent.ImageBlock{}, fmt.Errorf(
+				"legacy computer screenshot dimensions %dx%d do not match declared tool space %dx%d",
+				width, height, t.toolW, t.toolH)
+		}
+		adoptCapturedDimensions = true
 	}
 	finalWidth, finalHeight, err := imageBlockDimensions(block)
 	if err != nil {
 		return path, agent.ImageBlock{}, fmt.Errorf("read final legacy computer image dimensions: %w", err)
 	}
-	if finalWidth != t.toolW || finalHeight != t.toolH {
+	expectedWidth, expectedHeight := t.toolW, t.toolH
+	if adoptCapturedDimensions {
+		expectedWidth, expectedHeight = width, height
+	}
+	if finalWidth != expectedWidth || finalHeight != expectedHeight {
 		return path, agent.ImageBlock{}, fmt.Errorf(
 			"final legacy computer image dimensions %dx%d do not match declared tool space %dx%d",
-			finalWidth, finalHeight, t.toolW, t.toolH)
+			finalWidth, finalHeight, expectedWidth, expectedHeight)
+	}
+	if adoptCapturedDimensions {
+		t.toolW, t.toolH = width, height
 	}
 	return path, block, nil
+}
+
+// compatibleCapturedToolDimensions admits display-scale differences only.
+// macOS virtual displays can report 1024x768 through every geometry API while
+// screencapture emits 1280x960. The actual image is the tool's coordinate
+// space, but it may replace the metadata-derived size only when it preserves
+// the logical display aspect (within one pixel of resize rounding) and the
+// existing capture bound. Crops, wrong-display images, and oversized output
+// still fail closed.
+func compatibleCapturedToolDimensions(
+	width, height, logicalWidth, logicalHeight int,
+) bool {
+	if width <= 0 || height <= 0 ||
+		logicalWidth <= 0 || logicalHeight <= 0 ||
+		width > DefaultAPIWidth || height > DefaultAPIWidth {
+		return false
+	}
+	delta := int64(width)*int64(logicalHeight) -
+		int64(height)*int64(logicalWidth)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= int64(max(logicalWidth, logicalHeight))
 }
 
 type computerArgs struct {

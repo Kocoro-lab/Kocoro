@@ -246,30 +246,6 @@ func TestParseScreenGeometry_SelectsMainDisplayInsteadOfFirstDisplay(t *testing.
 	}
 }
 
-func TestParseNSScreenGeometryUsesExactCoreGraphicsPixels(t *testing.T) {
-	geometry, err := parseNSScreenGeometry("1024 768 1280 960\n")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if geometry != (screenGeometry{
-		LogicalWidth: 1024, LogicalHeight: 768,
-		CaptureWidth: 1280, CaptureHeight: 960,
-	}) {
-		t.Fatalf("geometry = %+v", geometry)
-	}
-}
-
-func TestParseNSScreenGeometryRejectsInvalidDimensions(t *testing.T) {
-	for _, input := range []string{
-		"1024 768 0 960",
-		"1024 768",
-	} {
-		if _, err := parseNSScreenGeometry(input); err == nil {
-			t.Fatalf("parseNSScreenGeometry(%q) succeeded", input)
-		}
-	}
-}
-
 func TestLegacyMainDisplayCaptureArgumentsSelectOnlyMainDisplay(t *testing.T) {
 	args := legacyMainDisplayCaptureArgs("/tmp/main.png")
 	if !slices.Contains(args, "-m") {
