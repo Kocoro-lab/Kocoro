@@ -944,7 +944,7 @@ func CompleteRegistrationAsync(ctx context.Context, gw *client.GatewayClient, cf
 // MCP connects: the returned startMCP closure runs them in the background
 // once the caller has stood up the supervisor and atomically swapped the
 // new deps into place. HTTP /config/reload and daemon startup are no
-// longer blocked by slow MCP handshakes (Intercom OAuth can be 30-180s).
+// longer blocked by slow MCP handshakes, including interactive OAuth.
 func RegisterAllWithBaselineAsync(gw *client.GatewayClient, cfg *config.Config, agentDef ...*agents.Agent) (
 	baseline *agent.ToolRegistry,
 	reg *agent.ToolRegistry,

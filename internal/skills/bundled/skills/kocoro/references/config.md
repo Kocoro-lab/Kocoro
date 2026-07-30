@@ -117,12 +117,10 @@ agent:
     min_turns: 2
 ```
 
-**Cost note:** Each suggestion call's cost depends on whether `agent.thinking`
-is enabled. With thinking off + a warm prompt cache, suggestion ≈ 5-20% of one
-main-turn cost (input mostly cache_read, output capped at ~30 tokens). With
-thinking on, the fork inherits the same `thinking.budget_tokens` (cannot be
-trimmed without invalidating the cache key), so cost rises to ≈ 50-90% of
-one main-turn. Disabled by default — opt in explicitly via this config or
+**Cost note:** Each suggestion is a potentially billed helper call. Cost varies
+with the configured model, cache state, and whether `agent.thinking` is enabled.
+Exact product measurements and cost baselines are maintained outside this
+public repository. Disabled by default — opt in explicitly via this config or
 the Desktop toggle.
 
 ## memory.* (Phase 2.3 — Kocoro Cloud memory feature)

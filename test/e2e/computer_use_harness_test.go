@@ -10,9 +10,11 @@ import (
 )
 
 type computerUseAcceptanceManifestV1 struct {
-	SchemaVersion int    `json:"schema_version"`
-	Suite         string `json:"suite"`
-	RunPolicy     struct {
+	SchemaVersion    int    `json:"schema_version"`
+	Suite            string `json:"suite"`
+	SyntheticFixture bool   `json:"synthetic_fixture"`
+	Notice           string `json:"notice"`
+	RunPolicy        struct {
 		ManualOnly            bool   `json:"manual_only"`
 		PaidModelCalls        bool   `json:"paid_model_calls"`
 		OnePointerOperator    bool   `json:"one_pointer_operator"`
@@ -58,7 +60,7 @@ type computerUseAcceptanceManifestV1 struct {
 	} `json:"scenarios"`
 }
 
-func TestOffline_ComputerUseAcceptanceManifestIsFrozenAndSafe(t *testing.T) {
+func TestOffline_ComputerUseAcceptanceManifestIsSyntheticAndWellFormed(t *testing.T) {
 	path := filepath.Join(
 		repoRoot(),
 		"test",
@@ -75,64 +77,59 @@ func TestOffline_ComputerUseAcceptanceManifestIsFrozenAndSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	if manifest.SchemaVersion != 1 ||
-		manifest.Suite != "computer_use_core_acceptance" {
+		manifest.Suite != "computer_use_synthetic_acceptance_example" ||
+		!manifest.SyntheticFixture ||
+		!strings.Contains(strings.ToLower(manifest.Notice), "synthetic") {
 		t.Fatalf("unexpected manifest identity: %+v", manifest)
 	}
 	if !manifest.RunPolicy.ManualOnly ||
-		!manifest.RunPolicy.PaidModelCalls ||
-		!manifest.RunPolicy.OnePointerOperator ||
-		!manifest.RunPolicy.SecondaryDisplayPause ||
-		manifest.RunPolicy.DefaultTimeoutSeconds != 120 ||
-		manifest.RunPolicy.MaxFixCycles != 1 ||
-		manifest.RunPolicy.ReproductionRequired != 2 ||
-		manifest.RunPolicy.OutOfScopeBehavior != "record_only" {
-		t.Fatalf("unsafe or drifting run policy: %+v", manifest.RunPolicy)
+		manifest.RunPolicy.PaidModelCalls ||
+		manifest.RunPolicy.DefaultTimeoutSeconds <= 0 ||
+		manifest.RunPolicy.OutOfScopeBehavior != "example_only" {
+		t.Fatalf("public fixture must remain inert and synthetic: %+v", manifest.RunPolicy)
 	}
-	if manifest.PerformanceBaseline.CapturedAt == "" ||
-		manifest.PerformanceBaseline.Kind != "mixed_completed_trace_warning_only" ||
-		manifest.PerformanceBaseline.SampleSize != 15 ||
-		manifest.PerformanceBaseline.DurationP50MS != 29825 ||
-		manifest.PerformanceBaseline.DurationP95MS != 66485 ||
-		manifest.PerformanceBaseline.ModelCallsP50 != 6 ||
-		manifest.PerformanceBaseline.ModelCallsP95 != 15 ||
-		manifest.PerformanceBaseline.ProviderBatchesP50 != 5 ||
-		manifest.PerformanceBaseline.ProviderBatchesP95 != 14 ||
-		manifest.PerformanceBaseline.ModelTimeouts != 1 {
+	if manifest.PerformanceBaseline.CapturedAt != "2000-01-01T00:00:00Z" ||
+		manifest.PerformanceBaseline.Kind != "synthetic_example_not_measured" ||
+		manifest.PerformanceBaseline.SampleSize <= 0 ||
+		manifest.PerformanceBaseline.DurationP50MS <= 0 ||
+		manifest.PerformanceBaseline.DurationP95MS <=
+			manifest.PerformanceBaseline.DurationP50MS ||
+		manifest.PerformanceBaseline.ModelCallsP50 <= 0 ||
+		manifest.PerformanceBaseline.ModelCallsP95 <
+			manifest.PerformanceBaseline.ModelCallsP50 ||
+		manifest.PerformanceBaseline.ProviderBatchesP50 <= 0 ||
+		manifest.PerformanceBaseline.ProviderBatchesP95 <
+			manifest.PerformanceBaseline.ProviderBatchesP50 ||
+		manifest.PerformanceBaseline.ModelTimeouts != 0 {
 		t.Fatalf(
-			"missing or drifting computer-use baseline: %+v",
+			"public performance values must remain explicitly synthetic: %+v",
 			manifest.PerformanceBaseline,
 		)
 	}
-	if manifest.EvidencePolicy.SummaryScope != "latest_task_boundary" ||
+	if !strings.HasPrefix(manifest.EvidencePolicy.SummaryScope, "synthetic_") ||
 		!manifest.EvidencePolicy.PassedMutationRequiresCommittedAction ||
-		manifest.EvidencePolicy.ObservationOnlyCompletion != "inconclusive" ||
-		manifest.EvidencePolicy.ProviderActionMismatch !=
-			"classify_before_runtime_change" ||
-		manifest.EvidencePolicy.FixBoundary != "one_bounded_cycle" {
-		t.Fatalf("unsafe or drifting evidence policy: %+v", manifest.EvidencePolicy)
+		!strings.HasPrefix(
+			manifest.EvidencePolicy.ObservationOnlyCompletion,
+			"synthetic_",
+		) ||
+		!strings.HasPrefix(
+			manifest.EvidencePolicy.ProviderActionMismatch,
+			"synthetic_",
+		) ||
+		!strings.HasPrefix(manifest.EvidencePolicy.FixBoundary, "synthetic_") {
+		t.Fatalf("public evidence policy must remain synthetic: %+v", manifest.EvidencePolicy)
 	}
-	failureClasses := make(
-		map[string]struct{},
-		len(manifest.EvidencePolicy.FailureClasses),
-	)
 	for _, class := range manifest.EvidencePolicy.FailureClasses {
-		failureClasses[class] = struct{}{}
-	}
-	for _, required := range []string{
-		"public_capability_regression",
-		"unsupported_provider_action",
-		"invalid_precondition_or_stale_state",
-	} {
-		if _, found := failureClasses[required]; !found {
-			t.Fatalf("evidence policy is missing failure class %q", required)
+		if !strings.HasPrefix(class, "synthetic_") {
+			t.Fatalf("non-synthetic failure class %q", class)
 		}
 	}
-	if len(manifest.Scenarios) < 7 {
-		t.Fatalf("scenario count = %d", len(manifest.Scenarios))
+	if len(manifest.Scenarios) == 0 {
+		t.Fatal("synthetic scenario examples are missing")
 	}
 	seen := make(map[string]struct{}, len(manifest.Scenarios))
 	for _, scenario := range manifest.Scenarios {
-		if strings.TrimSpace(scenario.ID) == "" ||
+		if !strings.HasPrefix(scenario.ID, "synthetic_") ||
 			strings.TrimSpace(scenario.Prompt) == "" ||
 			len(scenario.Preconditions) == 0 ||
 			len(scenario.ExpectedState) == 0 ||
@@ -142,68 +139,15 @@ func TestOffline_ComputerUseAcceptanceManifestIsFrozenAndSafe(t *testing.T) {
 			scenario.PerformanceBudget.ProviderBatches <= 0 {
 			t.Fatalf("incomplete scenario: %+v", scenario)
 		}
+		if scenario.EnabledByDefault {
+			t.Fatalf("public synthetic scenario %q must be disabled", scenario.ID)
+		}
 		if _, duplicate := seen[scenario.ID]; duplicate {
 			t.Fatalf("duplicate scenario id %q", scenario.ID)
 		}
 		seen[scenario.ID] = struct{}{}
-		if scenario.Risk == "consequential_send" && scenario.EnabledByDefault {
-			t.Fatalf("consequential scenario %q is enabled by default", scenario.ID)
-		}
-	}
-	for _, required := range []string{
-		"calculator_cold_launch",
-		"calculator_warm_window",
-		"chrome_cold_url_navigation",
-		"chrome_multi_window_url_navigation",
-		"managed_browser_instance_coexistence",
-		"textedit_calculator_cross_app",
-		"slack_draft_without_send",
-		"slack_send_with_confirmation",
-		"pointer_interference",
-		"textedit_background_scroll_preview",
-		"background_required_drag_rejection",
-		"pause_resume_during_background_input",
-		"take_over_during_foreground_action",
-		"stop_during_wait",
-	} {
-		if _, found := seen[required]; !found {
-			t.Fatalf("required scenario %q is missing", required)
-		}
-	}
-	for _, scenario := range manifest.Scenarios {
-		expected := strings.Join(scenario.ExpectedState, "\n")
-		switch scenario.ID {
-		case "calculator_background_semantic":
-			if !strings.Contains(
-				expected,
-				"four committed click actions",
-			) {
-				t.Fatalf("%s lacks action evidence", scenario.ID)
-			}
-		case "textedit_background_targeted_keyboard":
-			if !strings.Contains(
-				expected,
-				"committed type action",
-			) {
-				t.Fatalf("%s lacks action evidence", scenario.ID)
-			}
-		case "textedit_background_scroll_preview":
-			if !strings.Contains(
-				expected,
-				"committed scroll action",
-			) || !strings.Contains(
-				expected,
-				"unsupported_provider_action",
-			) {
-				t.Fatalf("%s lacks action-variance evidence", scenario.ID)
-			}
-		case "background_required_drag_rejection":
-			if !strings.Contains(
-				expected,
-				"not_committed drag action",
-			) {
-				t.Fatalf("%s lacks pre-commit rejection evidence", scenario.ID)
-			}
+		if !strings.HasPrefix(scenario.Risk, "synthetic_") {
+			t.Fatalf("non-synthetic scenario risk %q", scenario.Risk)
 		}
 	}
 }

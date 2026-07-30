@@ -568,8 +568,8 @@ func TestOpenAIComputerTaskInitialObservationPinsFirstAppHint(t *testing.T) {
 	fake.queue(
 		"read_tree",
 		`{"schema_version":1,"app":"Google Chrome","app_name":"Google Chrome",`+
-			`"bundle_id":"com.google.Chrome","pid":77,"window":"waylandz.com",`+
-			`"window_title":"waylandz.com","window_id":7001,`+
+			`"bundle_id":"com.google.Chrome","pid":77,"window":"example.com",`+
+			`"window_title":"example.com","window_id":7001,`+
 			`"window_frame":{"x":0,"y":0,"width":1200,"height":800},`+
 			`"elements":[],"ref_paths":{}}`,
 	)
@@ -1021,7 +1021,7 @@ func TestOpenAIComputerActionRuntimeBindsRefreshedPostKeypressWindowForType(
 		context.Background(),
 		OpenAIComputerActionV1{
 			Type: OpenAIComputerActionTypeTextV1,
-			Text: "waylandz.com",
+			Text: "example.com",
 		},
 	)
 	if err != nil {

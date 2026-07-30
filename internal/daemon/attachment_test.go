@@ -652,8 +652,8 @@ func TestDownloadRemoteFiles_DocumentB64(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString(pdfBytes)
 	blocks, cleanup := downloadRemoteFiles(dir, []RemoteFile{
 		{
-			Name:           "spec.pdf",
-			MimeType:       "application/pdf",
+			Name:        "spec.pdf",
+			MimeType:    "application/pdf",
 			DocumentB64: encoded,
 		},
 	})
@@ -796,7 +796,7 @@ func TestDownloadRemoteFiles_BackwardCompat_URLPath(t *testing.T) {
 
 // TestRemoteFile_UnmarshalProtocol checks that the JSON tags match plan §4.3
 // exactly. The protocol field names (extracted_text, document_b64,
-// extraction_note) are part of the contract with shannon-cloud — drifting
+// extraction_note) are part of the public Cloud contract — drifting
 // from them silently breaks WS interop.
 func TestRemoteFile_UnmarshalProtocol(t *testing.T) {
 	raw := `{
@@ -892,4 +892,3 @@ func TestDownloadRemoteFiles_DocumentB64_EmptyMIME(t *testing.T) {
 		t.Errorf("URL fallback bytes not downloaded; got byte_size=%d", blocks[0].ByteSize)
 	}
 }
-

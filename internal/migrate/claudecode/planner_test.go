@@ -14,7 +14,7 @@ func TestPlan_BuildsActionsAndConflicts(t *testing.T) {
 	scan, _ := Scan(src)
 	target := t.TempDir()
 
-	p, err := BuildPlan(scan, src, target, "/Users/wayland", time.Now())
+	p, err := BuildPlan(scan, src, target, "/Users/alice", time.Now())
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestPlan_DetectsSkillConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, _ := BuildPlan(scan, src, target, "/Users/wayland", time.Now())
+	p, _ := BuildPlan(scan, src, target, "/Users/alice", time.Now())
 	gotConflict := false
 	for _, c := range p.Conflicts {
 		if c.Category == "skills" && c.Name == preexisting {
@@ -121,7 +121,7 @@ func TestPlan_DetectsMCPConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, err := BuildPlan(scan, src, target, "/Users/wayland", time.Now())
+	p, err := BuildPlan(scan, src, target, "/Users/alice", time.Now())
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
@@ -151,8 +151,8 @@ func TestPlan_HashStable(t *testing.T) {
 	target := t.TempDir()
 
 	now := time.Now()
-	p1, _ := BuildPlan(scan, src, target, "/Users/wayland", now)
-	p2, _ := BuildPlan(scan, src, target, "/Users/wayland", now)
+	p1, _ := BuildPlan(scan, src, target, "/Users/alice", now)
+	p2, _ := BuildPlan(scan, src, target, "/Users/alice", now)
 	if p1.Hash != p2.Hash {
 		t.Errorf("hash not stable across builds: %q vs %q", p1.Hash, p2.Hash)
 	}
@@ -166,7 +166,7 @@ func TestPlan_MCPSourceFingerprintRecorded(t *testing.T) {
 	scan, _ := Scan(src)
 	target := t.TempDir()
 
-	p, _ := BuildPlan(scan, src, target, "/Users/wayland", time.Now())
+	p, _ := BuildPlan(scan, src, target, "/Users/alice", time.Now())
 	fp, ok := p.SourceHashes[src.ClaudeUserConfig]
 	if !ok {
 		t.Fatal("MCP source file fingerprint not recorded — TOCTOU re-check would miss claude.json edits")

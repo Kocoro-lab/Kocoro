@@ -736,11 +736,9 @@ func (req *RunAgentRequest) EnsureRouteKey() {
 // WeChat, Telegram) keep "plain" because Cloud owns their final render.
 //
 // WeChat deliberately stays "plain" (NOT here) even though it sends native
-// images/files: Cloud's iLink outbound extracts RAW CDN URLs from the plain
-// text (shannon-cloud wechat_streamer.go / cdn_images.go). Do NOT add it here —
-// a markdown link `[name](url)` would leave a "[name]()" shell after Cloud
-// strips the URL, because its cleanup only removes `![]()` image shells and
-// `<>` autolinks, never `[]()` links.
+// images/files: Cloud's iLink outbound extracts raw CDN URLs from plain text.
+// Do NOT add it here because markdown link shells are not part of that public
+// rendering contract.
 var markdownCloudSources = map[string]struct{}{
 	ChannelFeishu: {},
 	ChannelLark:   {},
@@ -1166,7 +1164,7 @@ func IsMessagingPlatform(source string) bool {
 
 // channelHasInteractiveApproval reports whether a channel can render an
 // Allow/Deny approval prompt AND route the user's decision back to the daemon.
-// Kept in sync with shannon-cloud's RouteApproval supported set
+// Kept in sync with Cloud's advertised approval-capable channel set
 // (slack/line/feishu/lark/teams); everything else cannot prompt.
 func channelHasInteractiveApproval(source string) bool {
 	switch strings.ToLower(strings.TrimSpace(source)) {
@@ -1178,8 +1176,8 @@ func channelHasInteractiveApproval(source string) bool {
 
 // IsNonInteractiveApprovalChannel reports whether a run originates from an IM
 // channel that has NO way to prompt the user for tool approval (no Allow/Deny
-// UI): WeChat, WeCom, Discord, Telegram, voice, etc. The cloud cannot route an
-// approval card to these (RouteApproval returns "approval not supported"), so an
+// UI): WeChat, WeCom, Discord, Telegram, voice, etc. Cloud cannot route an
+// approval card to these, so an
 // emitted approval request would block until the 5-minute timeout and then be
 // denied — surfacing to the user as a truncated "(Response may be incomplete)".
 // The approval broker auto-approves these locally instead.
@@ -1235,7 +1233,7 @@ func routeTitle(source, channel, sender string) string {
 		return ""
 	}
 
-	// Use sender name when available (e.g. "Slack · Wayland")
+	// Use sender name when available (e.g. "Slack · Alice")
 	if sender != "" {
 		return label + " · " + sender
 	}
@@ -1732,9 +1730,9 @@ func resumeNamedAgentColdStart(sessMgr *session.Manager) (bool, error) {
 	// Resume the latest INTERACTIVE session only — never a schedule/IM session
 	// that happens to be newer in this agent's directory. isInteractiveSource
 	// encodes the exclusion rule (see sessionkind.go); empty-source / "desktop"
-	// sessions (the bulk of real data, including pre-upgrade named-agent
-	// sessions written with no route_key) classify as interactive and resolve
-	// correctly here without any data migration.
+	// sessions (including legacy named-agent sessions written with no route_key)
+	// classify as interactive and resolve correctly here without any data
+	// migration.
 	latest, err := sessMgr.ResumeLatestMatching(isInteractiveSource)
 	if err != nil {
 		return false, err
@@ -2960,12 +2958,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetContextWindow(agent.SeedContextWindowFromModels(
 		runCfg.Agent.Model, sess.LastSeenModel(),
 		agent.ContextWindowFloorForProvider(runCfg.Provider, runCfg.Agent.ContextWindow)))
-	// Streaming on: bypasses Shannon Cloud's MAX_NON_STREAMING=16384 cap in
-	// llm-service/llm_provider/anthropic_provider.py, raising effective max
-	// output to the model's full limit (e.g. Sonnet 4.6 = 64K). Without this,
+	// Streaming on: uses Cloud's full streamed-output contract instead of its
+	// smaller legacy non-streaming response cap. Without this,
 	// the trailing tool_use truncation handled above triggers on routine large
 	// file_write calls; with streaming, it becomes a rare edge case (still
-	// possible past 64K, but the model has 4x the budget before clipping).
+	// possible at the provider's output limit).
 	// Streaming fallback to Complete() is built into the agent loop, so a
 	// gateway that rejects streaming degrades gracefully. WS/SSE/bus handlers
 	// all implement OnStreamDelta — the WS+bus paths are no-ops (clients see

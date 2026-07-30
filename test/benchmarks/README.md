@@ -1,48 +1,31 @@
-# Loop detector benchmarks
+# Synthetic loop benchmark example
 
-14-task end-to-end benchmark used to validate agent-loop reliability work
-(loop detector gate, force-stop synthesis, empty-result heuristic).
+This directory contains a deliberately small, synthetic example of how to
+exercise and inspect the agent loop. It is not Kocoro's release QA matrix and
+does not publish product-performance baselines, acceptance thresholds, customer
+workflows, or expected production trajectories.
 
-## Scripts
+The sample prompts use only this checkout and are read-only. They do not access
+Calendar, email, cloud storage, chat, or other personal accounts. All task
+names, counts, prompts, timeouts, and results produced by the sample are
+synthetic and must not be interpreted as product claims.
 
-- `driver.sh` — 8 coding scenarios (grep, batch edit, audit analysis, codebase
-  comparison, bulk test generation, tracing, tool selection, TODO scan).
-  Modifying tasks (2, 5) run in throwaway worktrees under `/tmp/maxiter_tests/`.
-- `driver_tob.sh` — 6 toB daily-task scenarios (calendar, inbox, drive, notion).
-  Read-only / draft-free — no side effects on the user's accounts.
-- `analyze.py` — post-run parser: reads a session JSON + audit log and emits
-  per-task metrics (LLM calls, tool distribution, consecutive streaks, failures,
-  max-iter synthesis detection, cost).
+## Files
+
+- `synthetic_driver.sh` — two harmless local source-reading examples.
+- `analyze.py` — generic parser for a locally produced session and audit log.
 
 ## Running
 
-Requires the `shan` binary on `$PATH` and a configured Shannon Cloud endpoint.
-Tasks that call Calendar / Gmail / Drive / Notion need MCP servers configured.
+Running the driver invokes the locally configured model and may consume paid
+quota. It is therefore disabled unless explicitly acknowledged:
 
 ```bash
-# From anywhere — scripts resolve repo root via BASH_SOURCE
-./test/benchmarks/driver.sh         # coding scenarios
-./test/benchmarks/driver_tob.sh     # toB scenarios
-
-# Override where results land
-BENCHMARK_RESULTS_DIR=/path/to/out ./test/benchmarks/driver.sh
-
-# Analyze one task
-./test/benchmarks/analyze.py <session_id> <task_num> <task_name>
+KOCORO_RUN_SYNTHETIC_BENCHMARK=1 \
+  bash test/benchmarks/synthetic_driver.sh
 ```
 
-Per-task artifacts (stdout, session_id, driver.log) land under
-`$BENCHMARK_RESULTS_DIR` (defaults to `/tmp/maxiter_tests/results` and
-`/tmp/maxiter_tests/results_tob`).
-
-## Expected behavior after Phase 1 gate
-
-The loop detector previously force-stopped Task 5 (coding, ~14 bash calls) and
-Task 6 (toB, ~10 MCP calls) despite both being legitimate batch operations with
-unique arguments. After the `batchTolerant` uniqueness gate lands:
-
-- Task 5: completes all 19 tool calls without force-stop.
-- Task 6: completes all 16 database queries; row counts returned.
-- Tasks that don't hit the detector (1, 3, 4, 7, 8 / 1, 2, 3, 4, 5) must remain
-  within ±1 tool call of their pre-fix trajectory — uniqueness gate must not
-  accidentally relax generic `think` / `http` / `file_*` spin detection.
+Override the disposable output location with
+`BENCHMARK_RESULTS_DIR=/tmp/your-directory`. Real release scenarios,
+measurements, budgets, and pass/fail thresholds are maintained outside this
+public repository.

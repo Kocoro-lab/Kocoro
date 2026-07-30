@@ -1053,8 +1053,8 @@ var killChromedpChromeForDirFn = killChromedpChromeForDir
 // only when Chrome survives SIGKILL.
 //
 // Used by Cleanup paths because cancelling chromedp's allocCtx alone doesn't
-// reliably reap the Chrome process tree — production case showed orphan
-// chromedp Chrome alive 3h+ after a nominal Cleanup.
+// reliably reap the Chrome process tree and can leave an orphan after a
+// nominal Cleanup.
 //
 // The dataDir is removed from disk on every successful path (dead, TERM-dead,
 // KILL-dead). When Chrome survives SIGKILL the dir is preserved so a follow-up

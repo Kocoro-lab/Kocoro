@@ -255,7 +255,7 @@ func TestComputerUseVerifiedLocationTypeAuthorizesOneReturn(
 		context.Background(),
 		OpenAIComputerActionV1{
 			Type: OpenAIComputerActionTypeTextV1,
-			Text: "waylandz.com",
+			Text: "example.com",
 		},
 	)
 	if err != nil {
@@ -361,7 +361,7 @@ func TestComputerUseLocationReturnSurvivesTypedFieldFingerprintChange(
 		context.Background(),
 		OpenAIComputerActionV1{
 			Type: OpenAIComputerActionTypeTextV1,
-			Text: "waylandz.com",
+			Text: "example.com",
 		},
 	)
 	if err != nil {

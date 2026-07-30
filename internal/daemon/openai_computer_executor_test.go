@@ -1023,7 +1023,7 @@ func TestDaemonOpenAIComputerExecutorRefreshesAndAuthorizesTypeAfterKeypress(
 		context.Background(),
 		openAIComputerDaemonCall(
 			`{"type":"keypress","keys":["META","L"]},`+
-				`{"type":"type","text":"waylandz.com"}`,
+				`{"type":"type","text":"example.com"}`,
 		),
 	)
 	if err != nil {
@@ -3411,7 +3411,7 @@ func TestOpenAIComputerTaskToolBoundsPrivateExecutorDuration(t *testing.T) {
 	started := time.Now()
 	result, err := taskTool.Run(
 		context.Background(),
-		`{"task":"Open waylandz.com in Chrome","controlled_apps":["Google Chrome"],`+
+		`{"task":"Open example.com in Chrome","controlled_apps":["Google Chrome"],`+
 			`"foreground_policy":"foreground_allowed",`+
 			`"description":"Open the browser page"}`,
 	)

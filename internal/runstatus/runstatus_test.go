@@ -85,8 +85,8 @@ func TestIsFriendlyMessage(t *testing.T) {
 }
 
 // TestCodeFromError_429Disambiguation covers the four shapes the
-// gateway returns on 429 (per shannon-cloud middleware/quota.go,
-// ratelimit.go, openai/handler.go). Substring-matching on "429"
+// gateway returns on 429 (per the public Cloud error contract).
+// Substring-matching on "429"
 // previously collapsed all four into CodeRateLimited, causing a real
 // UX bug for quota-exceeded and credits-exhausted users.
 func TestCodeFromError_429Disambiguation(t *testing.T) {

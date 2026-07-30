@@ -51,7 +51,7 @@ All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format 
 
 Two new read surfaces plus reliability work. The daemon gains **session-grouped content search** (`GET /search`, behind the desktop ⌘K palette) and a **byte-bounded mobile timeline projection** (`GET /sessions/{id}?view=remote_timeline`). **`file_edit`** stops failing on cosmetic drift (smart quotes, trailing whitespace, CRLF, indentation) via a punctuation/line fuzzy fallback that never widens an exact edit. The **ClawHub** marketplace default view stops surfacing intermittent "registry unreachable" 503s and can hide already-installed skills. Named-agent **default cwd** becomes device-local (never synced), and the **skills `allowed-tools`** contract is completed to be fully fail-closed.
 
-> **Cross-repo contract:** four new **additive** capability tokens — `search_v1`, `remote_session_timeline_v1`, `clawhub_exclude_installed`, `agent_default_cwd_v1` — surfaced on the WS handshake (`X-Kocoro-Capabilities`) and `GET /status`. New clients that support these features gate them OFF when the token is absent (title-only search, no mobile timeline view, no "hide installed" toggle, read-only cwd); old clients simply ignore the unknown tokens. Either way a partially-deployed daemon/client pair degrades cleanly rather than half-render. No breaking wire change. The memory bundle version gate is unchanged (`[0.4.0, 0.8.0)`) — no coordinated tensorlogic-memory release required. **Desktop must gate each feature on its token, verified end-to-end, before relying on it.**
+> **Cross-repo contract:** four new **additive** capability tokens — `search_v1`, `remote_session_timeline_v1`, `clawhub_exclude_installed`, `agent_default_cwd_v1` — surfaced on the WS handshake (`X-Kocoro-Capabilities`) and `GET /status`. New clients that support these features gate them OFF when the token is absent (title-only search, no mobile timeline view, no "hide installed" toggle, read-only cwd); old clients simply ignore the unknown tokens. Either way a partially-deployed daemon/client pair degrades cleanly rather than half-render. No breaking wire change. The memory bundle version gate is unchanged (`[0.4.0, 0.8.0)`) — no coordinated memory bundle producer release required. **Desktop must gate each feature on its token, verified end-to-end, before relying on it.**
 
 ### Added
 
@@ -78,7 +78,7 @@ Two new read surfaces plus reliability work. The daemon gains **session-grouped 
 
 Fix-and-fix release, all additive with no wire-contract change. **WeChat (iLink)** becomes a first-class cloud channel across the daemon's source handling. The **koe** voice front-brain stops over-delegating stable-knowledge questions and stops voicing a cut run's progress tail as if it were the result. The **memory** surfaces now carry per-group evidence strength through to the answer model, with an opt-in debug dump for attributing dropped facts. Named agents can finally toggle auto-approve from the config API.
 
-> **Cross-repo contract:** no capability-token or wire change. The memory bundle version gate stays `[0.4.0, 0.8.0)` and continues to accept the sidecar's `0.7.0` bundle format unchanged — no coordinated tensorlogic-memory release required.
+> **Cross-repo contract:** no capability-token or wire change. The memory bundle version gate stays `[0.4.0, 0.8.0)` and continues to accept the sidecar's `0.7.0` bundle format unchanged — no coordinated memory bundle producer release required.
 
 ### Added
 
@@ -149,7 +149,7 @@ Feature release across four surfaces. **`shan koe`** lands as the voice front-br
 ### Changed
 
 - **Bounded browser-observation context growth** ([#263](https://github.com/Kocoro-lab/Kocoro/pull/263), `internal/agent/`) — browser/GUI sessions accumulated page/DOM snapshots in history and re-sent all of them every loop iteration, so request context grew without bound on long sessions. Three bounds: an **observation sliding window** (full fidelity for the last N observations, `agent.observation_window` default 3, `0` = disabled; older ones become one-line self-describing stubs); a **per-capture cap** (`tools.browser_result_truncation` default 24000 chars, `0` = fall back to `tools.result_truncation`); and **screenshot retention** (only the most recent browser screenshot kept, `agent.max_recent_browser_images` default 1; non-browser images stay under `agent.max_recent_images`, now configurable). All keys merge at global/project/local levels.
-- **Retry + short-TTL cache for the skills marketplace** ([#260](https://github.com/Kocoro-lab/Kocoro/pull/260), `internal/skills/marketplace_retry.go`, `marketplace_cache.go`) — the ClawHub live catalog (`clawhub.ai`) intermittently returns 503 under load (a 50-request load test saw ~22% failures), and the client had no HTTP retry, so a single upstream blip surfaced as a "marketplace unavailable" error. Every catalog GET (and the zip install download) now goes through `doGETWithRetry`: retries `429/5xx` + network errors with exponential backoff + ±20% jitter (honors a numeric `Retry-After`, capped at 30s), tuned by `skills.marketplace.max_attempts` / `.retry_base_backoff_secs`; 4xx is never retried and the final response is preserved so each caller's `status %d` error is intact. ClawHub reads additionally have a bounded short-TTL per-URL response cache (`skills.marketplace.clawhub_cache_ttl_secs` default 60s, serve-stale-on-error) so burst/repeat browsing doesn't re-hit clawhub.ai.
+- **Retry + short-TTL cache for the skills marketplace** ([#260](https://github.com/Kocoro-lab/Kocoro/pull/260), `internal/skills/marketplace_retry.go`, `marketplace_cache.go`) — the ClawHub live catalog (`clawhub.ai`) can return transient 503 responses under load, and the client had no HTTP retry, so a single upstream blip surfaced as a "marketplace unavailable" error. Every catalog GET (and the zip install download) now goes through `doGETWithRetry`: retries `429/5xx` + network errors with exponential backoff + jitter (honors a numeric `Retry-After`), tuned by `skills.marketplace.max_attempts` / `.retry_base_backoff_secs`; 4xx is never retried and the final response is preserved so each caller's `status %d` error is intact. ClawHub reads additionally have a bounded short-TTL per-URL response cache (`skills.marketplace.clawhub_cache_ttl_secs`, serve-stale-on-error) so burst/repeat browsing doesn't re-hit clawhub.ai. Exact production measurements are not published in this repository.
 
 ### Fixed
 
@@ -430,7 +430,6 @@ Two daemon threads plus open-source hygiene. First, **IM timeline output** (PR #
 
 - `references/*` (bundled `kocoro` skill): document the `im_timeline_v1` capability token (PR #205).
 - **Open-source hygiene** (PR #207) — scrubbed external developer-tool parity/attribution callouts from comments and docs, replaced with neutral technical descriptions (no logic change; the config-migration endpoint paths and bundled third-party skills are intentionally retained). Generalized attachment-cap references to neutral phrasing while keeping the actual caps and their rationale. Trimmed project-guide redundancy and condensed oversized subsystem entries in `CLAUDE.md`.
-- `README.md`: added a demo GIF hero (`assets/kocoro-demo.gif`) and an OSS-scope note (`5a68fab`).
 
 ### Tests
 
@@ -671,7 +670,7 @@ Ships the full local episodic memory pipeline. The TLM sidecar is now managed by
 ### Cross-repo consumers
 
 - **Kocoro Desktop 0.1.5**: helper bundle rebuilt against this tag. Episodic Memory toggle in Settings → Advanced → Beta controls `memory.provider` + `sync.enabled` together via `PATCH /config`.
-- **Shannon Cloud**: `UpsertTenantTrainState` (PR #128) ensures the first accepted session sync immediately schedules training. `cloud_memory_enabled` feature flag must be set per tenant for the manifest endpoint to serve bundles.
+- **Shannon Cloud**: the Cloud training scheduler ensures the first accepted session sync immediately schedules training. The tenant memory feature must be enabled for the manifest endpoint to serve bundles.
 - **TLM memory sidecar**: sidecar binary (`tlm`) must be at `v0.6.0`; bundle format version `0.6.x` required. Earlier bundle versions are rejected at the version gate (`versionInRange`).
 
 ---
@@ -736,7 +735,7 @@ Bundles two cross-repo tracks and one major new tool. The WS handshake + `delive
 
 ### Cross-repo consumers
 
-- **Shannon Cloud**: capability handshake is the prerequisite for Phase 4 unacked-tracking + replay-on-reconnect. Cloud-side gates on `"delivery_ack" in conn.capabilities`; old daemons → no tracking → legacy fire-and-forget. The 429 body schemas Cloud emits (per `middleware/quota.go`, `middleware/ratelimit.go`, `openai/handler.go`) are now parsed properly on the daemon side.
+- **Shannon Cloud**: capability handshake is the prerequisite for Phase 4 unacked-tracking + replay-on-reconnect. Cloud-side gates on `"delivery_ack" in conn.capabilities`; old daemons → no tracking → legacy fire-and-forget. The public 429 response variants are now parsed properly on the daemon side.
 - **Kocoro Desktop**: helper bundle should rebuild against this tag's SHA to pick up the daemon changes. Templated quota / credits messages currently render as the static fallback in the TUI — full templating needs `RunStatus` to carry `*runstatus.Detail`, deferred to a follow-up.
 - **npm `@kocoro/shanclaw`**: release CI publishes against this tag.
 
@@ -758,13 +757,13 @@ Bundles PR #114 (tool-layer cost optimization), PR #113 (webhook agent isolation
 - **`file_edit` `replace_all` parameter** — opt-in to rewrite every occurrence (useful for renames); `old_string` uniqueness still enforced by default.
 - **`bash` caller-controlled output cap** — default 30K-char head+tail truncation; `max_output_chars` overrides (raise or lower).
 - **`file_read` streaming + oversized-error guard** — bounded reads stream via `bufio.Scanner`; reads estimated above ~25K tokens return an error directing the caller to use `offset+limit` instead of falling back to spill.
-- **`think` ack-only result** — thought is captured in the tool call; result returns a short ack so the prose does not echo back into context. ~50% reduction in think-related cache writes.
+- **`think` ack-only result** — thought is captured in the tool call; result returns a short ack so the prose does not echo back into context and reduces cache writes. Exact production measurements are not published here.
 
 ### Fixed
 - **`CancelBySessionID` data race** — `routeEntry.sessionID` is now `atomic.Pointer[string]`; the cancel scan reads lock-free instead of taking `sc.mu` and reading a field protected by `entry.mu`. Reviewer-flagged on PR #113.
 - **`Manager.Delete` callback wiring** (`internal/session/manager.go`) — fires registered `OnSessionClose` callbacks, holds the manager lock across `store.Delete` so concurrent `Save` cannot recreate the file mid-delete, and leaves in-memory state intact when the disk delete fails.
 - **`ReadTrackerCache.Forget` lifecycle** — daemon registers `Forget(sessionID)` as an `OnSessionClose` hook so per-session tracker entries no longer leak for the daemon's lifetime.
-- **`applyAggregateCap` byte/rune unit mismatch** — char counting now uses `utf8.RuneCountInString`, matching per-result spill and `applyToolResultBudget`. CJK/emoji content no longer fires the cap ~3x early.
+- **`applyAggregateCap` byte/rune unit mismatch** — char counting now uses `utf8.RuneCountInString`, matching per-result spill and `applyToolResultBudget`. CJK/emoji content no longer fires the cap prematurely.
 - **Final-save and hard-error save paths persist budget state** — both terminal `runner.go` save paths copy `ToolResultReplacements` + `ToolResultSeen` from the loop, so fast turns and crashed turns retain dedup/replacement bookkeeping on resume (was previously only saved by mid-turn checkpoints).
 - **`file_read` offset-without-limit slicing** — when `offset > 0` and `limit <= 0`, the unlimited-read branch now slices `lines[start:]` before printing; line numbers are correct rather than shifted by `offset`.
 - **WS envelope `MessageID` on `approval_request`** — `cmd/daemon.go` passes the inbound claim's MessageID into `ApprovalBroker.Request` and `Client.SendApprovalRequest` stamps it onto the envelope. Empty MessageID triggered Cloud's fail-closed drop; users never saw the approval card and the tool call hung until timeout.
@@ -825,7 +824,6 @@ Bundles PR #114 (tool-layer cost optimization), PR #113 (webhook agent isolation
 - **Kocoro identity + language anti-drift policy** — persona rebrand to Kocoro; language policy added to prevent identity drift across long sessions.
 - Skill secrets API endpoints: `PUT/DELETE /skills/{name}/secrets` and `GET /skills` returns `required_secrets` + `configured_secrets` (values never exposed).
 - `metadata.clawdis` accepted as third ClawHub spec alias alongside `openclaw` and `clawdbot`.
-- heatmap-analyze skill: API-key acquisition walkthrough; EN+JA official copy with reply-language rule.
 
 ### Fixed
 - **Agent reliability triad**: loop-detector args-uniqueness gate prevents batch-tolerant tool thrash; force-stop now synthesizes a structured partial report; empty-result rule narrowed to distinguish retry vs diversify (user-named scope wins, `http` excluded).
@@ -842,7 +840,6 @@ Bundles PR #114 (tool-layer cost optimization), PR #113 (webhook agent isolation
 - **Daily session sync** — opt-in upload of `~/.shannon/sessions/` to Shannon Cloud with flock + atomic marker, per-session ACK, persistent failed-entry bookkeeping, oversized + load-error permanent rejection.
 - **Three-layer skill discovery** — skill descriptions embedded in scaffolded first user message (4000-char budget, rune-safe), semantic prefetch on iteration 0 (`model_tier: small`, 5s timeout, gated by `agent.skill_discovery`), fallback catalog in `use_skill` tool description.
 - **Skill secrets management** — per-skill API keys stored in the macOS Keychain via `zalando/go-keyring` (pure Go, no CGo; password passed via stdin not argv). Plaintext index at `~/.shannon/secrets-index.json` tracks configured key names; values are env-var-injected into `bash` only for skills activated via `use_skill` within the current run.
-- **heatmap-analyze bundled skill** — Ptengine heatmap analysis with `install.sh`.
 - **kocoro setup skill** — platform-configuration assistant teaching the agent to manage ShanClaw via the daemon HTTP API.
 - **Cache-source TTL routing** — `cache_source` tags every LLM call; 1h cache for channel/TUI, 5m for one-shot/subagent; `SHANNON_FORCE_TTL` override.
 

@@ -116,7 +116,7 @@ func TestCompressImage_DecodesByMagicNotExtension(t *testing.T) {
 
 // TestCompressImage_IsDeterministic locks in the prompt-cache stability
 // prerequisite: same input must produce byte-identical output, otherwise
-// prompt-cache hash drift causes silent $0.10+/turn regressions.
+// prompt-cache hash drift causes silent cache-cost regressions.
 func TestCompressImage_IsDeterministic(t *testing.T) {
 	raw := makeNoisePNG(t, 1800, 1800)
 	d1, mt1, err := compressImage(raw, "image/png")
@@ -233,14 +233,13 @@ func TestCompressImage_RejectsPixelBomb(t *testing.T) {
 
 // TestCompressImage_OversizeDimSmallBytes_GetsResized covers Anthropic's
 // many-image 2000px constraint: when a single request contains >20 images,
-// per-side limit drops from 8000 to 2000 px. A wide Retina screenshot (e.g.
-// 2588×690 PNG of UI chrome) zlib-compresses well below TargetRawImageBytes
+// per-side limit drops from 8000 to 2000 px. A synthetic wide screenshot
+// fixture zlib-compresses well below TargetRawImageBytes
 // (3.75 MB), so the legacy byte-only fast path passes it through unchanged
 // and Anthropic returns 400. The dimension fast-path guard must trigger
 // re-encode whenever max(W,H) > CompressionMaxDimension regardless of size.
 func TestCompressImage_OversizeDimSmallBytes_GetsResized(t *testing.T) {
-	// Uniform Gray PNG at 2588×690 — same dimensions as the production
-	// screenshot that triggered the original 400. PNG compresses uniform
+	// Uniform Gray PNG at a synthetic wide dimension. PNG compresses uniform
 	// gray to a few KB, well under TargetRawImageBytes.
 	img := image.NewGray(image.Rect(0, 0, 2588, 690))
 	var buf bytes.Buffer

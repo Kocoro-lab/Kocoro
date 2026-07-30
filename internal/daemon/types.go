@@ -52,8 +52,8 @@ const (
 // ID) — Cloud reads it from DaemonMessage.MessageID to look up channel/thread
 // context for the approval card. Marked `json:"-"` so it does not leak into
 // the payload body; Client.SendApprovalRequest is responsible for copying it
-// onto the envelope at send time. When MessageID is empty, Cloud will
-// fail-closed (see shannon-cloud `handleApprovalRequest`).
+// onto the envelope at send time. The public Cloud contract fails closed when
+// MessageID is empty.
 type ApprovalRequest struct {
 	MessageID string `json:"-"`
 	// SessionID lets Desktop click-through from an inbox card into the
@@ -257,7 +257,7 @@ type MessagePayload struct {
 	// channels.members for Slack, etc. Empty when the surface has no roster
 	// (1:1 chats, webview, tui). The daemon renders this into the sticky
 	// context line "Conversation participants:" so the agent knows the full
-	// set of names it is allowed to @-mention. Mirrors shannon-cloud's same
+	// set of names it is allowed to @-mention. Mirrors Shannon Cloud's same
 	// field; keep the json tag byte-identical.
 	Participants []string `json:"participants,omitempty"`
 
@@ -330,7 +330,7 @@ type ReplyPayload struct {
 	// on platforms that require a user identifier (Teams, Slack, ...). When the
 	// agent embeds "@name" in Text but the channel roster has duplicate display
 	// names, Mentions would pin which person each "@name" refers to (by
-	// Email/UPN). Mirrors shannon-cloud ReplyPayload.Mentions byte-for-byte.
+	// Email/UPN). Mirrors Shannon Cloud ReplyPayload.Mentions byte-for-byte.
 	//
 	// RESERVED — daemon does not currently populate this field. The agent emits
 	// `@<display name>` as free text and SendReply (client.go) constructs the
@@ -345,7 +345,7 @@ type ReplyPayload struct {
 // Mention is a disambiguation anchor for outbound @mentions on platforms that
 // require a user identifier (Teams, Slack, ...). Name is the display name the
 // agent wrote inline; Email is the optional UPN/email the agent has seen in
-// the conversation, used to resolve duplicates. Mirrors shannon-cloud
+// the conversation, used to resolve duplicates. Mirrors Shannon Cloud
 // Mention byte-for-byte.
 type Mention struct {
 	Name  string `json:"name"`

@@ -181,7 +181,7 @@ func (m *ClientManager) RegisterConfigs(servers map[string]MCPServerConfig) {
 
 // StartConnectAll launches per-server connection goroutines and returns
 // immediately — the daemon HTTP path is no longer blocked by slow MCP
-// handshakes (e.g. Intercom's npx + OAuth chain commonly runs 30–180s).
+// handshakes (for example, a subprocess plus an interactive OAuth chain).
 //
 // Per-server timeout resolves in this order:
 //  1. cfg.ConnectTimeoutSeconds (if > 0)

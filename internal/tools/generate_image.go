@@ -62,12 +62,8 @@ func (t *GenerateImageTool) Info() agent.ToolInfo {
 			"    (renders inline as SVG/HTML, no public URL).\n" +
 			"  - Editing or annotating an existing image (this tool is text-to-image only;\n" +
 			"    no input image is supported).\n\n" +
-			"Latency vs. quality:\n" +
-			"  - quality=low      ~30–50s\n" +
-			"  - quality=medium   ~60–90s\n" +
-			"  - quality=auto     ~80–150s (default)\n" +
-			"  - quality=high     ~120–180s\n" +
-			"Pick the lowest quality that satisfies the request.\n\n" +
+			"Higher quality generally takes longer. Pick the lowest quality that " +
+			"satisfies the request; exact latency varies by workload.\n\n" +
 			"Cost: each call consumes Shannon Cloud image-generation credits. Use n=1 unless " +
 			"the user explicitly asks for multiple variants." +
 			agent.DescriptionGuidance,

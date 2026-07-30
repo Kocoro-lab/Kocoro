@@ -7,9 +7,9 @@ import (
 
 // defaultClawHubCacheTTL is how long a ClawHub catalog response (browse page,
 // search, detail, file list, file body) is reused before re-hitting clawhub.ai.
-// Short by design: it absorbs request bursts and repeat browsing (the 50-request
-// load test that exposed clawhub.ai's ~22% 503s) without letting the catalog go
-// noticeably stale. Tunable via skills.marketplace.clawhub_cache_ttl_secs.
+// Short by design: it absorbs request bursts and repeat browsing without
+// letting the catalog go noticeably stale. Tunable via
+// skills.marketplace.clawhub_cache_ttl_secs.
 const defaultClawHubCacheTTL = 60 * time.Second
 
 // clawhubCacheMaxEntries caps the per-URL ClawHub response cache. Each entry is

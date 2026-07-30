@@ -13,9 +13,9 @@ import (
 // fireTitleAfterRun must be a safe no-op when gated out (nil deps, nil mgr,
 // or a turn count outside the trigger set) — it must not panic or spawn work.
 func TestFireTitleAfterRun_GatingIsNoOp(t *testing.T) {
-	fireTitleAfterRun(nil, nil, "", "", "", "", nil, 2)                         // nil deps
-	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Wayland", "", nil, 1) // nil mgr + nil GW
-	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Wayland", "", nil, 2) // turn not in {1,3}
+	fireTitleAfterRun(nil, nil, "", "", "", "", nil, 2)                       // nil deps
+	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Alice", "", nil, 1) // nil mgr + nil GW
+	fireTitleAfterRun(&ServerDeps{}, nil, "s1", "slack", "Alice", "", nil, 2) // turn not in {1,3}
 }
 
 // TestFireTitleAfterRun_SkipsAutonomousSource locks the watcher/heartbeat/mcp
@@ -103,7 +103,7 @@ func TestFireTitleAfterRun_EmitsSessionTitleUpdated(t *testing.T) {
 	}
 
 	// turns=1 is a TitleTriggerTurns value, so the async upgrade fires.
-	fireTitleAfterRun(deps, mgr, id, "slack", "Wayland", "", msgs, 1)
+	fireTitleAfterRun(deps, mgr, id, "slack", "Alice", "", msgs, 1)
 
 	// Wait on the EMITTED EVENT, not the persisted title. The goroutine emits
 	// only AFTER UpgradeTitle returns, but the title lands earlier — inside
@@ -112,7 +112,7 @@ func TestFireTitleAfterRun_EmitsSessionTitleUpdated(t *testing.T) {
 	// zero events (this flaked in CI on slower scheduling). Re-scan the bus each
 	// iteration so a duplicate emit is caught too; bounded so a hung goroutine
 	// fails the test rather than hanging the suite.
-	const want = "Slack · Wayland · Fix The Bug"
+	const want = "Slack · Alice · Fix The Bug"
 	var titleEvents []json.RawMessage
 	deadline := time.Now().Add(2 * time.Second)
 	for {

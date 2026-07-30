@@ -187,9 +187,9 @@ func TestSidecar_ShutdownIdempotent_AfterWait(t *testing.T) {
 // the cmd field, double-Waiting the same exec.Cmd, or deadlocking. Run with
 // -race to catch field-access races.
 //
-// This models the production failure mode: Desktop repair flow stops the
-// daemon (Service.Stop → Shutdown) while the supervisor goroutine is
-// blocked in Sidecar.Wait().
+// This synthetic scenario models Desktop repair stopping the daemon
+// (Service.Stop → Shutdown) while the supervisor goroutine is blocked in
+// Sidecar.Wait().
 func TestSidecar_ConcurrentWaitAndShutdown(t *testing.T) {
 	sock := shortSocketPath(t, "race")
 	root, err := os.MkdirTemp("", "tlmroot")

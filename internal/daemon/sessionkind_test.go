@@ -24,8 +24,8 @@ func TestKindOf_ExclusionRule(t *testing.T) {
 		{"telegram", SessionKindIM},
 		{"Slack", SessionKindIM}, // case-insensitive
 
-		// interactive — the catch-all (open set). The first two are ~93% of
-		// real sessions; a whitelist would misclassify them.
+		// interactive — the catch-all (open set). The first two are important
+		// valid cases; a whitelist would misclassify them.
 		{"", SessionKindInteractive},
 		{"desktop", SessionKindInteractive},
 		{"kocoro", SessionKindInteractive},

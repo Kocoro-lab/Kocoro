@@ -105,7 +105,7 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 	}
 
 	// Legacy Content string: preserved as the fallback path for non-supporting
-	// backends (Ollama, pre-3.1 shannon-cloud gateway). Contains the LOADED:
+	// backends (Ollama and older gateways). Contains the LOADED:
 	// header + full schema JSON so the model can still discover tools when
 	// the tool_reference protocol is unavailable.
 	var sb strings.Builder

@@ -163,10 +163,10 @@ Payloads decoded by UI clients (bus events, per-request SSE events, HTTP respons
 
 ### Prompt Cache
 
-Cloud currently applies the short prompt-cache TTL to every request. Preserve
-`cache_source` as attribution (not a Kocoro-side TTL selector) and preserve
-canonical tool input normalization. Any future TTL-policy change belongs in
-shannon-cloud and must update `docs/cache-strategy.md` in the same rollout.
+Cloud owns the prompt-cache TTL policy. Preserve `cache_source` as attribution
+(not a Kocoro-side TTL selector) and preserve canonical tool input
+normalization. Any future TTL-policy change belongs in the Cloud service and
+must update `docs/cache-strategy.md` in the same rollout.
 
 Any in-place message content rewrite that can affect prompt bytes must emit cache-compaction/debug instrumentation so drift remains attributable.
 

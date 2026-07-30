@@ -35,8 +35,9 @@ type PermissionsConfig struct {
 //
 //	N=2 for "git" → `git status` and `git push` are different families,
 //	                but `git status -uall` and `git status --short` share `git status`.
-//	N=2 for "ptengine-cli" → `ptengine-cli config` covers config get/show/list/...,
-//	                         `ptengine-cli heatmap` covers heatmap query/filter-values/...
+//	N=2 for "terraform" → `terraform workspace` covers workspace
+//	                     list/show/select/... while `terraform import` is a
+//	                     separate family.
 var prefixDepthTable = map[string]int{
 	"git":            2,
 	"kubectl":        2,
@@ -51,7 +52,6 @@ var prefixDepthTable = map[string]int{
 	"aws":            2,
 	"gcloud":         2,
 	"terraform":      2,
-	"ptengine-cli":   2,
 	"agent-browser":  2,
 }
 

@@ -10,8 +10,8 @@ import (
 )
 
 // maxTitleRunes caps the final title. Workload: a session-list row in Desktop /
-// TUI. Symptom if it binds: a trailing "...". Mirrors Cloud's 60-rune cap
-// (shannon-cloud .../activities/session_title.go); not user-tunable.
+// TUI. Symptom if it binds: a trailing "...". Mirrors Cloud's public
+// 60-rune title contract; not user-tunable.
 const maxTitleRunes = 60
 
 // maxTitleInputRunes tail-caps the transcript sent to the title model —
@@ -203,7 +203,7 @@ func SourceLabel(source string) string {
 
 // DecorateTitle rebuilds the channel+sender prefix routeTitle produces (see
 // internal/daemon/runner.go) so an upgraded title keeps the same shape as the
-// instant placeholder: "Slack · Wayland · <title>" with a sender, "Slack ·
+// instant placeholder: "Slack · Alice · <title>" with a sender, "Slack ·
 // #general · <title>" with only a channel, "Slack · <title>" with neither, and
 // the bare title for interactive sources. The sender-then-channel fallback and
 // the " · " separator must match routeTitle's exactly.

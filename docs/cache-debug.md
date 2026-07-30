@@ -1,8 +1,8 @@
 # Cache Debug — Operator Guide
 
 Diagnostic instrumentation for the Anthropic prompt-cache prefix path. Pairs
-with `docs/cache-strategy.md` (which covers the design); this file covers
-**how to capture, read, and act on debug data when CER drops**.
+with the public contract in `docs/cache-strategy.md`. Production baselines,
+release thresholds, and the private QA matrix are intentionally omitted.
 
 ## Quickstart
 
@@ -39,7 +39,7 @@ The log is a JSON-lines stream of three entry kinds, joined chronologically:
 |---|---|
 | `req_id` | 6-byte hex correlation key for the matching `resp` line |
 | `session_id` | Session this call belongs to (rolling cache_control marker key) |
-| `cache_source` | `oneshot_cli` / `tui` / `slack` / etc. — attribution label; Cloud currently uses the short TTL for all values |
+| `cache_source` | `oneshot_cli` / `tui` / `slack` / etc. — attribution label only |
 | `force_ttl` | Present only when `SHANNON_FORCE_TTL` is set; values: `off` / `5m` / `1h` |
 | `tag` | `complete` or `stream` — which client method invoked the call |
 | `model` | `<specific>/<tier>` |
@@ -65,7 +65,8 @@ truncated. Tier 0 (default) is omitted to keep logs lean.
 | `cc` / `cc_5m` / `cc_1h` | Cache creation, split by TTL bucket |
 | `cr` | Cache read tokens — the win signal |
 
-CER (cache efficiency ratio) = `cr / cc`. Healthy long sessions hit 15× +.
+CER (cache efficiency ratio) = `cr / cc`. Interpret it only against the
+private workload-specific baseline; this repository defines no pass threshold.
 
 ### `dir: "compact"` — in-place message rewrite
 
@@ -121,13 +122,13 @@ The standard analysis pipeline:
 | `system_h` flips when nothing structural changed | No `compact` event lines up with it | Ordering instability in tool_use input or system prompt — check `normalizeToolInput` |
 | `cc=0 cr=0` simultaneously | Tool-use-only turn (no LLM bill) | Normal — model returned tool calls without further generation |
 
-## Performance impact
+## Diagnostic overhead
 
-| Mode | Per-call cost | Disk |
+| Mode | Relative work | Disk behavior |
 |---|---|---|
 | Debug off (default) | 0 | 0 |
-| `SHANNON_CACHE_DEBUG=1` | One sha256 over each marshalled tool + message; one append | ~2 KB/call → ~1 MB / 500 calls before rotation |
-| `SHANNON_CACHE_DEBUG_RAW=1` | + 3 file writes per call | Hundreds of KB/call (full request) → bounded by `SHANNON_CACHE_DEBUG_RAW_MAX` |
+| `SHANNON_CACHE_DEBUG=1` | Hash each marshalled tool and message; append one record | Bounded by log rotation |
+| `SHANNON_CACHE_DEBUG_RAW=1` | Write the full request sections | Bounded by `SHANNON_CACHE_DEBUG_RAW_MAX` |
 
 Lightweight mode is cheap enough to leave on for an entire session under
 investigation. Raw dump mode is for active reproduction work — disable
@@ -149,6 +150,5 @@ hashes, lengths, role, type, and TTL/source metadata.
 - `internal/agent/loop.go` — `compressOldToolResults`, `filterOldImages`
   (compact event call sites)
 - `internal/agent/timebasedcompact.go` — `timeBasedCompact` (call site)
-- `scripts/cache_bench.sh` — fixture-based regression bench
-- `docs/cache-strategy.md` — authoritative cache design (4-breakpoint
-  allocation, current Cloud TTL policy, source attribution, byte stability)
+- `scripts/cache_bench.sh` — synthetic diagnostics example, not release QA
+- `docs/cache-strategy.md` — public Kocoro-side cache contract

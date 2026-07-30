@@ -342,7 +342,7 @@ func TestChromedpOrphanPattern_MatchesBothPrefixes(t *testing.T) {
 		{"chrome --foo --user-data-dir=/tmp/kocoro-chromedp-x --bar", true},
 
 		// Negative: real Chrome profiles that aren't ours
-		{"--user-data-dir=/Users/wayland/Library/Application Support/Google/Chrome", false},
+		{"--user-data-dir=/Users/alice/Library/Application Support/Google/Chrome", false},
 		{"--user-data-dir=/tmp/some-other-thing", false},
 
 		// Negative: substring-trap — cmdline that contains 'user-data-dir' as a

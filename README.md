@@ -2,13 +2,7 @@
 
 **An AI cowork agent that lives on your Mac.**
 
-<p align="center">
-  <a href="https://kocoro.ai/en/start/">
-    <img src="assets/kocoro-demo.gif" alt="Kocoro demo — AI agents working hands-on across your Mac" width="720">
-  </a>
-  <br>
-  <sub><a href="https://kocoro.ai/en/start/">▶ Watch the full demo (with audio) →</a></sub>
-</p>
+See the [Kocoro product site](https://kocoro.ai/en/start/) for the current product demo.
 
 Kocoro runs AI agents locally with full computer access — files, apps, browser, terminal, screen — and connects to your team's Slack / LINE / Feishu / Telegram channels via Shannon Cloud. Named agents with their own memory and tools, MCP-native, daemon-driven. The `shan` CLI is the runtime; **Kocoro Desktop** is the recommended way to use it.
 
@@ -22,8 +16,6 @@ Kocoro runs AI agents locally with full computer access — files, apps, browser
 > **Coming from Claude Code?** Kocoro Desktop can import your existing agents, skills, and instructions from `~/.claude/` in one click — preview-then-apply via the daemon's `/migrate/claude-code/*` endpoints.
 
 Built on **[Shannon](https://github.com/Kocoro-lab/Shannon)** — the open-source multi-agent framework that powers both the Shannon Cloud SaaS and the self-hosted Shannon Gateway.
-
-[**Interactive architecture diagram →**](https://www.waylandz.com/diagrams/shanclaw-architecture.html)
 
 ## Contents
 
@@ -98,7 +90,7 @@ shan --setup
 
 ```bash
 shan                                         # interactive TUI
-shan "who is wayland zhang"                  # one-shot
+shan "who was Ada Lovelace"                # one-shot
 shan --agent ops-bot "check prod health"     # named agent
 shan --setup                                 # configure endpoint + API key
 ```
@@ -186,7 +178,7 @@ Add one when you find a task shape you keep coming back to; [`examples/cookbook/
 
 ```bash
 shan                              # interactive TUI
-shan "who is wayland zhang"       # one-shot (prompts for tool approval)
+shan "who was Ada Lovelace"     # one-shot (prompts for tool approval)
 shan -y "query"                   # auto-approve all tools
 shan --agent ops-bot "query"      # use a named agent
 shan --setup                      # configure endpoint + API key
@@ -319,8 +311,8 @@ Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calenda
 | `publish_to_web` | Yes ⚠️ | Upload to a **public** S3 URL on Shannon Cloud (50 MiB cap). Path blocklist (`.env`, `.ssh`, `credentials`, `*.pem`, …) and extension allowlist (html/md/txt/pdf/png/jpg/svg/csv/json/mp4/…). Extend allowlist via `cloud.publish_allowed_extensions`. Uploads are tagged `kind=other` server-side (Desktop UI's "All / Image / HTML / PDF / Other" filter sits alongside a separate "Session" bucket for daemon-side session shares). Files retractable via `retract_published_file`, but **anyone with the URL can read content until then** plus up to 5 minutes after via CDN edge cache. |
 | `list_my_published_files` | No | List the user's still-active published files. Paginated (`limit` default 20, max 100). Optional `kind` filter (`session_share` / `report` / `landing_page` / `image` / `other`) — omit to list every category. |
 | `retract_published_file` | Yes ⚠️ | Retract a published file by `id` (UUID from list, **not** the URL). Owner-only; cross-user calls return a friendly 404 (cloud conflates not-found/already-retracted/not-yours to prevent existence leaks). NOT on the high-risk auto-approval denylist — user can opt in to `always_allow_tools`. CDN edges may serve content for up to 5 min after success. |
-| `generate_image` | Yes ⚠️ | Generate via `POST /api/v1/images/generations` (`gpt-image-2`); returns a **public permanent** CDN URL. Args: `prompt`, `size`, `quality` (latency 30s→180s), `n` (1–10), `background`. Each call consumes paid quota. For charts use `kocoro-generative-ui` instead. |
-| `edit_image` | Yes ⚠️ | Edit via `POST /api/v1/images/edits`. Args: `prompt` + `image_urls` (1–4, must start with `https://static.kocoro.ai/` — external URLs rejected; pipe through `generate_image` / `publish_to_web` first). No mask field — describe the region in prose. Latency 40s–350s. |
+| `generate_image` | Yes ⚠️ | Generate via `POST /api/v1/images/generations` (`gpt-image-2`); returns a **public permanent** CDN URL. Args: `prompt`, `size`, `quality`, `n` (1–10), `background`. Latency varies and each call consumes paid quota. For charts use `kocoro-generative-ui` instead. |
+| `edit_image` | Yes ⚠️ | Edit via `POST /api/v1/images/edits`. Args: `prompt` + `image_urls` (1–4, must start with `https://static.kocoro.ai/` — external URLs rejected; pipe through `generate_image` / `publish_to_web` first). No mask field — describe the region in prose. Latency varies and each call consumes paid quota. |
 
 ### Tool Approval Flow
 
@@ -355,7 +347,7 @@ Bash command resolution order:
 2. **Denied commands** — `permissions.denied_commands` in config
 3. **Compound split** — `&&`, `||`, `;`, `|`, bare `&`, and `(...)` subshells split and checked per sub-command. Bare `&` is preserved so background launches still trigger always-ask.
 4. **Always-ask high-risk gate** — runs BEFORE the allowlist. (a) fixed-prefix list (`python -c`, `bash -c`, `pip install`, `npx`, `rm -rf`, etc.); (b) dangerous-flag token scan for `git push` (`--force`, `-f`, `--force-with-lease`, `--mirror`, `--delete`, `--prune`, etc.). "Always Allow" on a high-risk command is honored once but NOT persisted.
-5. **Allowed commands** — literal/glob match against the full command, then a token-prefix family fallback (depth N=2 for known CLIs like git/kubectl/docker/npm, N=3 for unknowns). So `ptengine-cli config get` covers `ptengine-cli config show --json` but not `ptengine-cli heatmap query`. The always-ask gate above prevents family expansion from silently widening scope to destructive variants.
+5. **Allowed commands** — literal/glob match against the full command, then a token-prefix family fallback (depth N=2 for known CLIs like git/kubectl/docker/npm, N=3 for unknowns). So `terraform workspace list` covers `terraform workspace show` but not `terraform import`. The always-ask gate above prevents family expansion from silently widening scope to destructive variants.
 6. **Default safe** — built-in safe list (ls, git status, go test, make).
 7. **User approval** — interactive prompt or `-y`.
 
@@ -660,7 +652,11 @@ agent:
 
 Or toggle from Desktop: Settings → Suggestions → Enable next-prompt suggestion.
 
-**Cost** depends on `agent.thinking`. Without thinking, each suggestion is ~5–20% of one main-turn (input mostly cache_read, output capped ~30 tokens). With thinking, the fork inherits the same `thinking.budget_tokens` (cannot be trimmed without invalidating Anthropic's cache key), so cost rises to ~50–90% of one main-turn. Disabled by default. Skipped when the prompt cache is cold (`cache_cold_threshold_tokens`).
+**Cost** varies with the configured model, cache state, and
+`agent.thinking`. Each suggestion is a potentially billed helper call; exact
+product measurements and cost baselines are intentionally not published here.
+Disabled by default. Skipped when the prompt cache is cold
+(`cache_cold_threshold_tokens`).
 
 ## Memory (Kocoro Cloud feature)
 

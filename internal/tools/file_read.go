@@ -40,8 +40,8 @@ const pdfPageMaxDim = 1024
 // fileReadMaxTokens is the hard cap on text file_read output. Files (or
 // offset+limit slices) whose estimated token count exceeds this return an
 // error pointing the agent at offset/limit instead of letting the loop's
-// 50K spill fallback drop a 2K preview into context. ~100B error vs ~2K
-// spill preview ≈ 95% per-call savings on oversized reads.
+// 50K spill fallback drop a partial preview into context. Product token and
+// cost measurements are maintained outside this public repository.
 const fileReadMaxTokens = 25000
 
 const fileReadNoLimitMaxBytes = 256 * 1024

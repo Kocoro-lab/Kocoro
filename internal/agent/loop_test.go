@@ -3660,12 +3660,12 @@ func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 // with default scope). Empty on the default scope may be a scope artifact,
 // so ONE focused diversification (e.g. list_calendars after a blank
 // get_events) is permitted before concluding "not found". This is the
-// Task 3 vs Task 5 benchmark split the plan calls out.
+// synthetic single-lookup versus batch-enumeration distinction.
 func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 	wantSubstrings := []string{
 		"list-and-enumerate semantics", // names the new case
 		"scope artifact",               // distinguishes from real empty
-		"list_calendars",               // concrete example (Task 3 → Task 5)
+		"list_calendars",               // concrete synthetic example
 		"ONE",                          // permits exactly one diversification
 		"Google Calendar",              // explicit integration list (no broad "external APIs")
 		"Notion",
@@ -6294,7 +6294,7 @@ func TestAgentLoop_EmptyFinalResponse_BareEmpty_AuditBlocksNone(t *testing.T) {
 }
 
 // Whitespace-only fullText must trigger the empty-response guard. The
-// Cloud-side _mark_last_block in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py
+// Cloud-side assistant-content normalization
 // calls .strip() on string content before wrapping it as a cache_control'd
 // text block — feeding whitespace upstream re-creates the 400 trap. Both
 // sides must agree on "whitespace == empty" or the bug class re-opens.
@@ -6351,7 +6351,7 @@ func TestAgentLoop_WhitespaceOnlyTextBlock_RecoveryReturnsEmpty(t *testing.T) {
 // current iteration once with the same request; if the retry recovers (text
 // or tool_calls), the run continues normally.
 //
-// This is the daemon-side defense for the shape that shannon-cloud's retry
+// This is the daemon-side defense for the shape that Cloud's retry
 // guard is supposed to catch. Both repos defend it (defense-in-depth).
 //
 // The thinking block matters: the real 2026-05-22 audit row had

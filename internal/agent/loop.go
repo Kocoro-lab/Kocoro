@@ -285,8 +285,8 @@ func recoverVisibleTextFromBlocks(resp *client.CompletionResponse) string {
 	var sb strings.Builder
 	for _, b := range resp.ContentBlocks {
 		// TrimSpace check: a whitespace-only text block is wire-form
-		// "visible" but semantically empty, and Cloud's _mark_last_block
-		// rstrip+stamp pipeline can still convert it into the 400-trigger
+		// "visible" but semantically empty, and Cloud normalization can still
+		// convert it into the 400-trigger
 		// shape `{"type":"text","text":"","cache_control":...}`. Treat it
 		// as empty here so the empty-response guard in the caller fires.
 		if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
@@ -2672,8 +2672,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 
 	// maxInconsistentFinishRetries bounds the daemon-side retry budget for the
 	// "stop_reason=tool_use but no tool_use block AND no visible text" upstream
-	// anomaly. Matches shannon-cloud's `_retry_attempt` ceiling of 1 — if
-	// cloud's retry already ran and still produced the inconsistent shape, one
+	// anomaly. Cloud also retries this shape once; if that retry already ran
+	// and still produced the inconsistent shape, one
 	// more daemon attempt is the most we should try before surfacing
 	// ErrEmptyFinalResponse. Worst-case token spend bounded at 2x for this
 	// branch (and the cloud retry runs INSIDE one daemon call, so the
@@ -2690,7 +2690,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// batch-tolerant set: bash + READ-verb MCP tool names + read-only local
 	// fan-out tools (file_read / glob / grep / directory_list). On these
 	// tools, the NoProgress detector applies a uniqueness gate so
-	// legitimate batch enumerations (Task 5 / Task 6 benchmarks, "read all N
+	// legitimate batch enumerations (for example, "read all N
 	// screenshots") are not force-stopped by name-count alone. The local
 	// read-only tools were added after #135 audit-log review showed the
 	// "read 13 desktop screenshots" workflow tripping the count-12 NoProgress
@@ -3136,8 +3136,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// history strips the scaffold (captureRunMessages restores rawUserMessage),
 	// so daemon runs (which new-build AgentLoop each turn) will re-inject the
 	// listing every turn. The listing sits after <!-- cache_break --> so it is
-	// NOT covered by cache breakpoint 3 and counts as uncached input tokens
-	// (~200 tokens ≈ $0.0006/turn). Acceptable trade-off vs. moving it into
+	// NOT covered by cache breakpoint 3 and counts as uncached input tokens.
+	// This is an acceptable trade-off vs. moving it into
 	// the cached prefix which would break byte stability on skill set changes.
 	// Delta tracking: only announce skills not yet sent in prior Run() calls
 	// (relevant for TUI multi-turn sessions where sentSkillNames persists).
@@ -4511,11 +4511,10 @@ iterationLoop:
 			// text blocks" on the next request. See
 			// docs/empty-assistant-content-400.md.
 			// TrimSpace check throughout: whitespace-only fullText is wire-
-			// form "non-empty" but Cloud's _mark_last_block rstrip+stamp
-			// can still produce the empty-text+cache_control 400 trigger.
+			// form "non-empty" but Cloud's adapter can still trim it into the
+			// empty-text+cache_control 400 trigger.
 			// Treat it as empty here so we never persist whitespace-only
-			// assistants. Matches the Cloud-side _has_visible_text gate
-			// in shannon-cloud/python/llm-service/llm_provider/anthropic_provider.py.
+			// assistants. Matches the Cloud-side visible-text gate.
 			if strings.TrimSpace(fullText) == "" {
 				fullText = recoverVisibleTextFromBlocks(resp)
 			}

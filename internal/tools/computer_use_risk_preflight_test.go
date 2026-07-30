@@ -201,8 +201,8 @@ func TestConsequentialRiskPreflightAllowsOnlyExactSemanticSend(t *testing.T) {
 		{name: "compound identifier style", label: "sendButton", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightRequiredV1},
 		{name: "post reply", label: "Post reply", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightRequiredV1},
 		{name: "post comment", label: "Post comment", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightRequiredV1},
-		{name: "read blog post", label: "Read post", window: "Wayland Zhang - Blog", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
-		{name: "blog post noun", label: "Blog post", window: "Wayland Zhang - Blog", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
+		{name: "read blog post", label: "Read post", window: "Sample Author - Blog", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
+		{name: "blog post noun", label: "Blog post", window: "Sample Author - Blog", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
 		{name: "near miss", label: "Sender settings", window: "general - Slack", action: "press", wantStatus: ConsequentialRiskPreflightNoneV1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
