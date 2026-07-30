@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
@@ -141,6 +142,22 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		}
 	}
 
+	// Known-dead dispatch gate: when the supervisor has already marked this
+	// server disconnected (subprocess died or wedged while idle), reconcile
+	// via ProbeNow BEFORE dispatching instead of discovering the corpse
+	// mid-call. Without this, the call lands on the stale client and blocks
+	// until the per-call timeout — 2026-07-29 incident: google-workspace was
+	// marked disconnected at 11:53, a 14:11 tool call sat ~6.5 minutes on
+	// the dead pipe before erroring, while the eventual reconnect took 12s.
+	// ProbeNow re-probes transport and, only if still disconnected, attempts
+	// an on-demand reconnect (bounded: 10s probe + 15s reconnect).
+	if t.supervisor != nil {
+		if h := t.supervisor.HealthFor(t.serverName); h.State == mcp.StateDisconnected {
+			log.Printf("[mcp-tool] %s/%s: server known-disconnected, probing before dispatch", t.serverName, t.tool.Name)
+			t.supervisor.ProbeNow(t.serverName)
+		}
+	}
+
 	// Relative output filenames for known file-producing MCP tools: if the
 	// caller passed a bare name ("snapshot.md"), rewrite it to an absolute
 	// path under the session CWD so both the MCP server and our subsequent
@@ -148,22 +165,32 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	rewrittenOutPath := maybeRewriteFileProducingArg(ctx, t.serverName, t.tool.Name, args)
 
 	content, isError, err := t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
-	if err != nil && t.supervisor != nil {
-		// Connection dead — attempt on-demand reconnect and retry once.
-		h := t.supervisor.HealthFor(t.serverName)
-		if h.State == mcp.StateDisconnected {
-			log.Printf("[mcp-tool] %s/%s: connection dead, triggering on-demand reconnect", t.serverName, t.tool.Name)
-			// Re-ensure Chrome CDP is available before reconnecting — Chrome may
-			// have died along with the MCP connection.
-			if t.serverName == "playwright" {
-				if cfg, ok := t.manager.ConfigFor(t.serverName); ok && isPlaywrightCDPMode(cfg) {
-					_ = ensureChromeDebugPort(playwrightCDPPort(cfg))
-				}
+	if err != nil && t.supervisor != nil && ctx.Err() == nil && mcp.IsTransportError(err) {
+		// Retry gate — TRANSPORT failures only. A retry re-executes the
+		// tool, so it is only safe when the request provably never reached a
+		// live server: dead pipe, EOF, killed process. Deliberately excluded:
+		//   - per-call timeouts: not evidence the server didn't act — a
+		//     write tool (send email, create event) may time out AFTER its
+		//     side effect landed, and a retry would duplicate it;
+		//   - JSON-RPC/protocol errors (mcp-go returns them as err): a
+		//     second identical dispatch fails identically;
+		//   - cancelled ctx: retry after user interrupt is wasted work.
+		// MarkTransportSuspect invalidates the supervisor's <60s health-cache
+		// freshness so ProbeNow performs a REAL probe (and, if the transport
+		// is confirmed dead, an on-demand reconnect) instead of blessing a
+		// retry with cached pre-failure state.
+		log.Printf("[mcp-tool] %s/%s: transport failure (%v), probing for on-demand reconnect", t.serverName, t.tool.Name, err)
+		t.supervisor.MarkTransportSuspect(t.serverName)
+		// Re-ensure Chrome CDP is available before reconnecting — Chrome may
+		// have died along with the MCP connection.
+		if t.serverName == "playwright" {
+			if cfg, ok := t.manager.ConfigFor(t.serverName); ok && isPlaywrightCDPMode(cfg) {
+				_ = ensureChromeDebugPort(playwrightCDPPort(cfg))
 			}
-			reconHealth := t.supervisor.ProbeNow(t.serverName)
-			if reconHealth.State == mcp.StateHealthy {
-				content, isError, err = t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
-			}
+		}
+		reconHealth := t.supervisor.ProbeNow(t.serverName)
+		if reconHealth.State == mcp.StateHealthy {
+			content, isError, err = t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
 		}
 	}
 	if err != nil {
@@ -176,6 +203,12 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	}
 	if !isError && rewrittenOutPath != "" {
 		content = annotateAbsPath(content, rewrittenOutPath)
+	}
+	if !isError {
+		// Translate server-relative artifact links (e.g. playwright's
+		// first-root-relative screenshot paths) to absolute paths the model
+		// can act on. No-op for servers with unknown path semantics.
+		content = maybeAnnotateResultPaths(t.serverName, content, t.manager)
 	}
 	return agent.ToolResult{Content: content, IsError: isError}, nil
 }
@@ -196,14 +229,62 @@ func (t *MCPTool) ServerName() string { return t.serverName }
 // missing, or arg has an unexpected type). This is a best-effort helper —
 // a failed rewrite is never fatal; the call continues with original args.
 func maybeRewriteFileProducingArg(ctx context.Context, serverName, toolName string, args map[string]any) string {
-	argNames, ok := fileProducingMCPArgs[serverName+"/"+toolName]
+	key := serverName + "/" + toolName
+	argNames, ok := fileProducingMCPArgs[key]
 	if !ok {
 		return ""
 	}
-	cwd := cwdctx.FromContext(ctx)
-	if cwd == "" || !filepath.IsAbs(cwd) {
+	// Target directory precedence: artifact scratch dir (daemon-served runs;
+	// keeps machine-generated intermediates out of user-visible folders like
+	// ~/Desktop) > session CWD (TUI / one-shot CLI, where artifacts belong in
+	// the working directory). Absolute model-supplied paths always win below.
+	targetDir := cwdctx.ArtifactDirFromContext(ctx)
+	if targetDir == "" || !filepath.IsAbs(targetDir) {
+		targetDir = cwdctx.FromContext(ctx)
+	}
+	if targetDir == "" || !filepath.IsAbs(targetDir) {
 		return ""
 	}
+	// Scratch-internal dirs stay owner-only to match the 0o700 scratch root;
+	// non-scratch targets (session CWD fallback) keep conventional 0o755.
+	dirPerm := os.FileMode(0o755)
+	if artifact := cwdctx.ArtifactDirFromContext(ctx); artifact != "" && targetDir == artifact {
+		dirPerm = 0o700
+	}
+	// Missing output filename: the server would pick its own default
+	// location and report a path relative to its own workspace — the
+	// ambiguity behind the 2026-07-29 whole-disk search. Inject an absolute
+	// name in the artifact dir instead. Guards: only when an artifact dir is
+	// present (CWD-only runs keep the legacy no-injection behavior — the
+	// server default + result translation cover them), only for tools with a
+	// default (see defaultOutputName), and only when EVERY output arg is
+	// absent — if the caller supplied any of them, injecting a sibling would
+	// silently redirect output the model already addressed.
+	anyPresent := false
+	for _, name := range argNames {
+		if _, present := args[name]; present {
+			anyPresent = true
+			break
+		}
+	}
+	if !anyPresent {
+		if cwdctx.ArtifactDirFromContext(ctx) == "" {
+			return ""
+		}
+		def := defaultOutputName(key, args)
+		if def == "" {
+			return ""
+		}
+		abs := filepath.Join(targetDir, def)
+		// The scratch dir is created lazily here (0o700 to match its
+		// intended root perms); playwright-mcp does not mkdir for us.
+		_ = os.MkdirAll(filepath.Dir(abs), dirPerm)
+		// argNames is priority-ordered; the first name is the canonical
+		// output arg for the tool.
+		args[argNames[0]] = abs
+		return abs
+	}
+
 	for _, name := range argNames {
 		raw, present := args[name]
 		if !present {
@@ -238,31 +319,62 @@ func maybeRewriteFileProducingArg(ctx context.Context, serverName, toolName stri
 				expanded = filepath.Join(home, strings.TrimPrefix(trimmed, "~/"))
 			}
 			expanded = filepath.Clean(expanded)
+			// Best-effort parent creation: playwright-mcp does not create
+			// missing directories and fails with ENOENT.
+			_ = os.MkdirAll(filepath.Dir(expanded), 0o755)
 			args[name] = expanded
 			return expanded
 		}
 		if filepath.IsAbs(trimmed) {
 			continue
 		}
-		// Reject anything that tries to climb out of the session CWD. Keeping
-		// the rewrite inside the session sandbox avoids accidentally aiming
-		// the MCP server at (say) ~/.ssh. Also reject values that resolve to
-		// the session CWD itself (".", "./", trailing ".."): the MCP server
-		// needs a real filename, and passing the directory path would produce
+		// Reject anything that tries to climb out of the target dir. Keeping
+		// the rewrite inside the sandbox avoids accidentally aiming the MCP
+		// server at (say) ~/.ssh. Also reject values that resolve to the
+		// target dir itself (".", "./", trailing ".."): the MCP server needs
+		// a real filename, and passing the directory path would produce
 		// malformed artifacts. On reject we fall through (empty return); the
 		// original relative value still goes to the server, which will use its
 		// own CWD — behavior unchanged from pre-fix for that edge case.
-		abs := filepath.Clean(filepath.Join(cwd, trimmed))
-		if abs == cwd {
+		abs := filepath.Clean(filepath.Join(targetDir, trimmed))
+		if abs == targetDir {
 			continue
 		}
-		if !strings.HasPrefix(abs+string(filepath.Separator), cwd+string(filepath.Separator)) {
+		if !strings.HasPrefix(abs+string(filepath.Separator), targetDir+string(filepath.Separator)) {
 			continue
 		}
+		// Parent creation fixes the 2026-07-29 ENOENT on nested names like
+		// ".playwright-mcp/snapshot.md" — the server does not mkdir for us.
+		_ = os.MkdirAll(filepath.Dir(abs), dirPerm)
 		args[name] = abs
 		return abs
 	}
 	return ""
+}
+
+// defaultOutputName returns the filename injected when the model omits the
+// output arg of a file-producing MCP tool, or "" for tools without a
+// default. The millisecond timestamp keeps repeated captures from
+// overwriting each other.
+//
+// Only tools that ALWAYS write a file belong here — for them the filename
+// controls location only. browser_snapshot is deliberately absent: its
+// filename is a MODE switch (playwright: "Save snapshot to markdown file
+// instead of returning it in the response"), and an omitted filename means
+// the inline accessibility snapshot the model reads pages through. Injecting
+// a default there would add a file round-trip to every page read.
+func defaultOutputName(key string, args map[string]any) string {
+	var stem, ext string
+	switch key {
+	case "playwright/browser_take_screenshot":
+		stem, ext = "screenshot", ".png"
+		if t, _ := args["type"].(string); strings.EqualFold(t, "jpeg") {
+			ext = ".jpeg"
+		}
+	default:
+		return ""
+	}
+	return stem + "-" + time.Now().Format("20060102-150405.000") + ext
 }
 
 // annotateAbsPath ensures a "Saved to: <abs>" line is present in an MCP tool

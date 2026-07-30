@@ -823,6 +823,25 @@ func (s *Server) Start(ctx context.Context) error {
 	// skills.marketplace.clawhub_warm_on_startup (default true).
 	go s.warmClawHubOnce(ctx)
 
+	// Reclaim stale per-session artifact scratch dirs. Interactive sessions
+	// keep their scratch across session switches (artifacts must outlive
+	// OnSessionClose — see the cloud-only cleanup rationale in runner.go), so
+	// age at startup is the reclaim mechanism. viper.GetInt returns 0 when
+	// config.Load hasn't run (hermetic unit tests) and sweepSessionScratch
+	// treats maxAge<=0 as a no-op; `daemon.scratch_max_age_days` (default 14)
+	// tunes the window, 0 disables.
+	go func() {
+		days := viper.GetInt("daemon.scratch_max_age_days")
+		if days <= 0 {
+			return
+		}
+		if removed, err := sweepSessionScratch(s.deps.ShannonDir, time.Duration(days)*24*time.Hour); err != nil {
+			log.Printf("daemon: session scratch sweep failed: %v", err)
+		} else if removed > 0 {
+			log.Printf("daemon: session scratch sweep removed %d stale dirs (older than %dd)", removed, days)
+		}
+	}()
+
 	// One-time agent pull on startup: applies the cloud mirror to local disk
 	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
 	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
