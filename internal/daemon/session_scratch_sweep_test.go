@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"context"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -88,5 +90,94 @@ func TestSessionScratchDirPathDoesNotCreate(t *testing.T) {
 	// Traversal-shaped session IDs are rejected, mirroring the mkdir variant.
 	if _, err := sessionScratchDirPath(shannonDir, "../escape"); err == nil {
 		t.Fatal("expected traversal rejection")
+	}
+}
+
+// The commit-invariant behind the age-based sweep: a NON-cloud run must NOT
+// register scratch cleanup on OnSessionClose. That hook fires on every
+// session SWITCH, and interactive surfaces revisit history — live 2026-07-30
+// repro: a screenshot whose "Saved to:" path the model had just reported was
+// deleted seconds later when the user switched sessions. This drives the real
+// RunAgent registration seam: BypassRouting runs use an ephemeral session
+// manager whose deferred Close() fires every registered OnSessionClose
+// callback before RunAgent returns, so a pre-placed artifact still existing
+// afterwards proves no cleanup was registered.
+func TestRunAgent_NonCloudArtifactScratchSurvivesSessionClose(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "done"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+
+	// Client-minted session id (the Desktop NewSession+SessionID path) so the
+	// scratch path is known BEFORE the run; place an artifact there as if a
+	// prior turn's filename injection had created it.
+	const sessionID = "11111111-2222-3333-4444-555555555555"
+	scratch, err := sessionScratchDirPath(deps.ShannonDir, sessionID)
+	if err != nil || scratch == "" {
+		t.Fatalf("sessionScratchDirPath: %q, %v", scratch, err)
+	}
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(scratch, "screenshot-survives.png")
+	if err := os.WriteFile(artifact, []byte("png"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "hi",
+		Source:        "desktop", // interactive non-cloud source
+		NewSession:    true,
+		SessionID:     sessionID,
+		BypassRouting: true,
+	}, nullEventHandler{}); err != nil {
+		t.Fatalf("RunAgent: %v", err)
+	}
+
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("non-cloud artifact scratch was reclaimed on session close: %v", err)
+	}
+}
+
+// Control for the survival test above (and the cloud half of the invariant):
+// a cloud-source run registers cloudSessionTmpCleanup, so the same pre-placed
+// artifact must be GONE after RunAgent returns. If OnSessionClose callbacks
+// stopped firing on the ephemeral-manager path, this test fails instead of
+// the survival test silently passing for the wrong reason.
+func TestRunAgent_CloudArtifactScratchReclaimedOnSessionClose(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "done"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+
+	const sessionID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+	scratch, err := sessionScratchDirPath(deps.ShannonDir, sessionID)
+	if err != nil || scratch == "" {
+		t.Fatalf("sessionScratchDirPath: %q, %v", scratch, err)
+	}
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(scratch, "screenshot-reclaimed.png")
+	if err := os.WriteFile(artifact, []byte("png"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "hi",
+		Source:        "slack", // cloud source → scratch is the effective CWD, cleanup registered
+		NewSession:    true,
+		SessionID:     sessionID,
+		BypassRouting: true,
+	}, nullEventHandler{}); err != nil {
+		t.Fatalf("RunAgent: %v", err)
+	}
+
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("cloud session scratch must be reclaimed on session close, stat err = %v", err)
 	}
 }
