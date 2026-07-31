@@ -3050,13 +3050,18 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	// Gate on the run's SOURCE, not auto_approve. auto_approve only governs
 	// whether tool EXECUTIONS are auto-approved; it says nothing about whether a
 	// human can answer a multiple-choice question. An attended Desktop/web run
-	// with auto_approve on must still be able to ask. Only unattended sources
+	// with auto_approve on must still be able to ask. Unattended sources
 	// (schedule/cron, heartbeat/watcher/mcp, non-interactive channels) get no
 	// asker, so a background run can never block on an interactive question; the
 	// QuestionBroker's auto-resolution timeout backstops an attended run whose
 	// user walks away.
+	//
+	// CanPresentQuestionUI additionally excludes messaging platforms that DO have
+	// interactive approval (Slack/Feishu/Lark/Teams/LINE): approvals reach them
+	// through Cloud, questions do not, so an asker there blocks the run for the
+	// whole auto-resolution window and then reports a decline the user never made.
 	askCtx := r.Context()
-	if !isUnattendedSource(req.Source) {
+	if CanPresentQuestionUI(req.Source) {
 		askCtx = agent.WithQuestionAsker(askCtx, &brokerQuestionAsker{
 			broker: qBroker,
 			metaFn: func() ApprovalRequestMeta {
