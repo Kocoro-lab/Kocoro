@@ -1198,6 +1198,28 @@ func IsNonInteractiveApprovalChannel(source string) bool {
 	return IsMessagingPlatform(source) && !channelHasInteractiveApproval(source)
 }
 
+// CanPresentQuestionUI reports whether a run's originating client can render an
+// ask_user_question selection card AND send the answer back.
+//
+// This is deliberately NOT isUnattendedSource. Approval capability is not a
+// proxy for question capability: Slack/Feishu/Lark/Teams/LINE can receive an
+// Allow/Deny card because Cloud routes approvals, but there is NO Cloud
+// transport for question.request — it is Desktop-local (see the daemon's wire
+// contract notes and issue #301). Gating questions on the approval predicate
+// therefore hands an IM run an asker it can never satisfy: the tool blocks for
+// the full auto-resolution window (up to 4 minutes of silence for the IM user)
+// and then resolves as a decline the user never made.
+//
+// Messaging platforms are excluded wholesale — including koe, which is
+// messaging-routed — leaving the attended local surfaces (Desktop/web/CLI)
+// that actually consume the `question` frame.
+func CanPresentQuestionUI(source string) bool {
+	if isUnattendedSource(source) {
+		return false
+	}
+	return !IsMessagingPlatform(source)
+}
+
 // cacheSourceFromDaemonSource normalizes daemon-level origins for Cloud-side
 // attribution. It does not select a TTL: Cloud currently applies the short
 // prompt-cache TTL to every source. See docs/cache-strategy.md.
