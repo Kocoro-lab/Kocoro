@@ -19,8 +19,8 @@ Kocoro is the Go CLI/runtime for Shannon AI agents. The main production path is 
 - cmd: CLI entry points for one-shot, daemon, scheduling, update, and MCP serve.
 - internal/daemon: primary production path; HTTP API server, WebSocket client, routing, approvals + structured user questions (`pending.go` `pendingCore[D]` shared by `ApprovalBroker` and `QuestionBroker`), events, launchd, attachments, session CWD, memory fallback, suggestions, email/password auth (`auth.go` / `auth_handlers.go` / `ws_controller.go`), Desktop RPC reverse-channel (`desktop_rpc/` subpackage — Unix sock listener + length-prefixed JSON codec + DesktopRPCBroker for Calendar RPC v1).
 - internal/agent: core loop; tool batching, compaction, spill/budget state, deferred loading, state cache, read tracking, approvals, phase/watchdog, thinking handling, prompt suggestions, forked requests.
-- internal/koe: macOS native speech-to-speech voice front brain; one first-person Kocoro identity; Realtime tool authority; bounded continuation; call-scoped task ledger with one `do_task` per response by default and explicit, disjoint scopes for parallel calls; asynchronous result mailbox; and reversible raw-audio native-floor barge-in. Keep `stop_speaking` (current output), `cancel` (delegated work), and terminal `end_call` (voice session) as separate authorities. ASR transcripts remain asynchronous evidence/logging, not ordinary-turn, barge-in-admission, or default dismissal control.
-- internal/tools: local, gateway, cloud, schedule, publish/upload, image, memory, MCP, and document tools.
+- internal/koe: macOS native speech-to-speech voice front brain; one first-person Kocoro identity; Realtime tool authority; bounded continuation; call-scoped task ledger with one `do_task` per response by default and explicit, disjoint scopes for parallel calls; asynchronous result mailbox; and reversible raw-audio native-floor barge-in. Keep `stop_speaking` (current output), `cancel` (delegated work), and terminal `end_call` (voice session) as separate authorities. ASR transcripts remain asynchronous evidence/logging, not ordinary-turn, barge-in-admission, or default dismissal control. Per-file map and behavior contracts live in `internal/koe/CLAUDE.md`.
+- internal/tools: local, gateway, cloud, schedule, publish/upload, image, memory, MCP, and document tools. Full inventory — registration gating, per-tool caps, approval flags — lives in `internal/tools/CLAUDE.md`.
 - internal/keychain: credential store wrapper for daemon api_key — macOS Keychain / Windows Credential Manager via go-keyring (backend_keyring.go), Linux file store at ~/.shannon/credentials.json 0600 (backend_linux.go + backend_file.go); `keychain.Supported()` = darwin||windows||linux, other platforms return ErrUnsupportedPlatform. Constructor `NewOSStoreAt(dir, logger)`; callers pass config.ShannonDir().
 - internal/client: gateway/SSE/Ollama clients plus AuthClient (`/api/v1/auth/*` REST wrapper).
 - internal/session: session persistence, lifecycle, titles, and SQLite FTS index.
@@ -192,11 +192,6 @@ Keep random XML tool execution delimiters and strip fabricated tool calls. For a
 
 ```bash
 go test ./...
-go test ./internal/agent/ -v
-go test ./internal/daemon/ -v
-go test ./internal/agents/ -v
-go test ./internal/schedule/ -v
-go test ./test/ -v
 go test ./test/e2e/ -v
 SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v
 go build ./...
@@ -218,3 +213,5 @@ Schedule tests use temp directories and do not write to the real LaunchAgents di
 Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. Common openers and compact local utilities are Direct; uncommon mutations are Deferred and loaded through `tool_search` when needed. On daemon runs, `computer_use` is the Direct, high-level native-GUI contract on the ordinary parent model. The parent keeps its configured model; only an invoked desktop task lazily resolves `openai.computer.v1` and starts a private OpenAI Responses trajectory. One exact task app binds background-first: semantic press/scroll and ordinary target-bound input stay in the background lane, while `foreground_allowed` may activate the app only for an action without an exact background primitive. Multi-app tasks retain foreground switching. The private trajectory owns screenshots, foreground coordinate pointer actions, typing, re-observation, continuation, and internal state/frame authority. NSWorkspace + CGWindow supplies exact target identity when AX is incomplete. Ambient physical interference requires a fresh exact observation before another mutation; explicit Pause/Take Over/Stop keeps user-owned quiescence. The whole task serializes on the shared GUI-operation lock. Unattended runs can invoke it ONLY via an explicit persisted GLOBAL `computer_use` always-allow grant. The legacy `computer` / `accessibility` / `applescript` / `ghostty` wrappers cannot be persisted as Always Allow and remain denied for unattended execution; daemon parent runs remove the legacy GUI wrappers and reject shell `osascript` / `cliclick`. The standalone `screenshot` tool remains separate, approval-required, and denied unattended. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
 
 Every approval-required tool must expose a short human-readable description or equivalent purpose field for approval UI. Destructive or paid/public cloud tools require approval.
+
+Per-tool detail (registration conditions, size/timeout caps, approval flags, argument contracts) lives in `internal/tools/CLAUDE.md`, which loads when working under that directory.

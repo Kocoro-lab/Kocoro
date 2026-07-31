@@ -1,0 +1,30 @@
+# internal/koe — Voice Front-Brain (`shan koe`)
+
+cgo since `audio.go`. Test deps on macOS: `brew install opus opusfile pkg-config`, and set
+`PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find the Homebrew files.
+
+CLI surface lives in `cmd/koe.go`: `--mic-device`/`--speaker-device` pass CoreAudio device UIDs (from
+`koe.mic_device`/`speaker_device`) that the VPIO backend binds, empty = system default; `--barge-in`
+(from `koe.barge_in`) enables reversible native-S2S floor control by setting `KOE_VPIO_BARGE_IN=1` +
+`KOE_NATIVE_FLOOR=1` + `KOE_INTERRUPT_RESPONSE=0` via `applyBargeInEnv` (vpio-only, no-op on gate);
+`koe.persona_source` (`"global"` distill default | `"custom"` → `koe.custom_persona` verbatim) selects
+the spoken persona (daemon `buildKoePersona`).
+
+## File Map
+
+```
+link.go              #   DaemonClient: DoTask/Cancel/ListAgents + MintViaDaemon + SendRealtimeUsage (HTTP to daemon, NEVER imports internal/daemon)
+agentresolve.go      #   agent name-resolution ladder (exact → bidirectional-substring → semantic-noop → not-found)
+tools.go             #   7 OpenAI-Realtime voice tools (do_task/cancel/get_status/control_app/switch_agent/stop_speaking/end_call) + Dispatcher + CallState. do_task defaults to exactly one call per response; multiple calls in one response require an explicit user request for parallel execution and each call must carry one disjoint work scope. Ledger-mode cancel targets one task_id, or all_running=true for one atomic stop-everything call (per-task partial failures stay explicit and a failed task stays running). stop_speaking silences only the current output and keeps the call active; end_call is the whole-conversation dismiss/hang-up terminal. Both say nothing and send no function_call_output on the regular response path. Standalone/CLI and Desktop wire onEndCall to their goodbye-earcon + teardown paths. The ASR transcript dismiss backstop is opt-in (KOE_ASR_DISMISS_BACKSTOP=1, default off — ASR stays evidence-only by default) and converges with the model's end_call on realtime.go's handler-local terminal. MapDoTaskOutcome maps a partial do_task run (soft idle/deadline timeout, iteration_limit, force-stop — but NOT user_cancelled, which stays silent) to a canned per-language `incomplete` line and seeds no digest, so a cut run's progress tail is never voiced as the result; the daemon logs `koe voice projection kind=authored|mechanical partial=… failure_code=…` per turn for clean-success provenance.
+ledger.go            #   call-scoped task lineages: stable task IDs/routes, parallel work, targeted follow-up/cancel, revision state
+toolloop.go          #   semantic-free per-turn response/tool provenance, four-action continuation budget, newer-turn preemption, replay fuse
+result_mailbox.go    #   owner-leased asynchronous result queue; batches ready task revisions and retries unacknowledged delivery
+floor.go             #   reversible native-S2S interruption state machine: pause exact PCM, then choose resume_playback, stop_speaking, accept_turn, or end_call from raw audio without ASR admission; an accepted interruption also truncates the paused assistant item server-side (conversation.item.truncate to the audio actually heard) so the model never treats unspoken text as said
+audio.go             #   malgo duplex (CoreAudio) + Opus codec + half-duplex gate (cgo deps: brew install opus opusfile pkg-config; PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig)
+webrtc.go            #   pion mint + SDP + Opus tracks + oai-events data channel + Connect orchestrator (ConnectOptions)
+realtime.go          #   GA session config (create_response:true auto-respond) + oai-events dispatch + reachy say-and-ask do_task (result is the single function_call_output) + voice_state/usage hooks. requestEndCall owns a handler-local terminal (terminalMu + ending CAS) shared by the model's end_call and the opt-in ASR dismiss backstop: the first request synchronously aborts floor/output, blocks queued or new response creation, cancels a late response.created without reopening playback, then invokes onEndCall for outer teardown. stop_speaking discards only the current output/result announcement and schedules no continuation. Local-commit fallback (manual input_audio_buffer.commit after local speech end) is opt-in via KOE_LOCAL_COMMIT_FALLBACK=1, default off since 2026-07-09 — far-field fragment gate-opens (Reachy) turned commit_empty rejections into spoken "could not hear you" loops; even when enabled, a commit_empty rejection is classified as a fragment and dropped silently (commitEmptySeq short-circuits the ack wait), never ask-to-repeat
+dismissintent.go     #   isDismissPhrase/normalizeDismissPhrase: closed-vocabulary zh/en/ja classifier used only by the opt-in KOE_ASR_DISMISS_BACKSTOP=1 path; ASR stays evidence-only by default and model-judged end_call remains authoritative. When enabled, accepted phrases converge on realtime.go's requestEndCall terminal rather than firing teardown independently. Ambiguous task-stop words remain model-owned so cancel, stop_speaking, and end_call keep separate scopes. KOE_DISMISS_DETECT=0 kills matching, KOE_DISMISS_PHRASES extends it, and KOE_DISMISS_CONTAIN=0 disables strong-token containment. Tagless pure Go
+control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state/mic_status); optional Bearer auth via KOE_CONTROL_TOKEN env, never argv
+micwatchdog.go       #   MicSilenceState: pure silent-input watchdog core (clamshell/covered mic → mic_status "silent"/"ok" to Desktop; driver ticker in cmd/koe.go; KOE_MIC_SILENCE_FLOOR/_MS tunable; no restart/rebind by design)
+earcon.go            #   "ready" + "dismiss" earcons (go:embed assets/{ready,dismiss}.pcm, 48k mono): shared playEarcon() SetSpeaking-gated so it can't self-trigger VAD. PlayReadyEarcon() at emitReadyLocked (KOE_READY_EARCON=0 disables); PlayDismissEarcon() a soft descending goodbye cue in the Desktop endCall path so every hang-up (Esc / menu Stop / end_call tool) signs off (KOE_DISMISS_EARCON=0 disables)
+```

@@ -4,18 +4,6 @@
 
 Go CLI tool (`shan`) — the runtime for Shannon AI agents. Production stack is **daemon + Kocoro Desktop + Shannon Cloud**: the daemon connects to Cloud via WebSocket, receives channel messages (Slack, LINE, Feishu, Telegram, webhook), runs the agent loop locally with full tool access, and streams results back. Also supports interactive TUI, one-shot CLI, MCP server, and local scheduled tasks.
 
-## Tech Stack
-
-- **Go 1.25.7** — `go.mod` is source of truth
-- **Cobra** — CLI (`cmd/`)
-- **gorilla/websocket** — daemon WS client (primary production path)
-- **Bubbletea + Bubbles** — TUI (`internal/tui/`)
-- **adhocore/gronx** — cron validation
-- **modernc.org/sqlite** — pure-Go SQLite, FTS5 session index
-- **chromedp** — browser automation (isolated profile)
-- **mcp-go** — MCP client/server
-- **adrg/frontmatter** — YAML frontmatter for SKILL.md
-
 ## Project Structure
 
 ```
@@ -121,21 +109,8 @@ internal/
   tui/                   # Bubbletea TUI + /compact + /doctor
   update/                # GitHub release auto-update
   sync/                  # Daily session JSON upload to Cloud
-  koe/                   # ── VOICE FRONT-BRAIN (shan koe) ── cgo since audio.go
-    link.go              #   DaemonClient: DoTask/Cancel/ListAgents + MintViaDaemon + SendRealtimeUsage (HTTP to daemon, NEVER imports internal/daemon)
-    agentresolve.go      #   agent name-resolution ladder (exact → bidirectional-substring → semantic-noop → not-found)
-    tools.go             #   7 OpenAI-Realtime voice tools (do_task/cancel/get_status/control_app/switch_agent/stop_speaking/end_call) + Dispatcher + CallState. do_task defaults to exactly one call per response; multiple calls in one response require an explicit user request for parallel execution and each call must carry one disjoint work scope. Ledger-mode cancel targets one task_id, or all_running=true for one atomic stop-everything call (per-task partial failures stay explicit and a failed task stays running). stop_speaking silences only the current output and keeps the call active; end_call is the whole-conversation dismiss/hang-up terminal. Both say nothing and send no function_call_output on the regular response path. Standalone/CLI and Desktop wire onEndCall to their goodbye-earcon + teardown paths. The ASR transcript dismiss backstop is opt-in (KOE_ASR_DISMISS_BACKSTOP=1, default off — ASR stays evidence-only by default) and converges with the model's end_call on realtime.go's handler-local terminal. MapDoTaskOutcome maps a partial do_task run (soft idle/deadline timeout, iteration_limit, force-stop — but NOT user_cancelled, which stays silent) to a canned per-language `incomplete` line and seeds no digest, so a cut run's progress tail is never voiced as the result; the daemon logs `koe voice projection kind=authored|mechanical partial=… failure_code=…` per turn for clean-success provenance.
-    ledger.go            #   call-scoped task lineages: stable task IDs/routes, parallel work, targeted follow-up/cancel, revision state
-    toolloop.go          #   semantic-free per-turn response/tool provenance, four-action continuation budget, newer-turn preemption, replay fuse
-    result_mailbox.go    #   owner-leased asynchronous result queue; batches ready task revisions and retries unacknowledged delivery
-    floor.go             #   reversible native-S2S interruption state machine: pause exact PCM, then choose resume_playback, stop_speaking, accept_turn, or end_call from raw audio without ASR admission; an accepted interruption also truncates the paused assistant item server-side (conversation.item.truncate to the audio actually heard) so the model never treats unspoken text as said
-    audio.go             #   malgo duplex (CoreAudio) + Opus codec + half-duplex gate (cgo deps: brew install opus opusfile pkg-config; PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig)
-    webrtc.go            #   pion mint + SDP + Opus tracks + oai-events data channel + Connect orchestrator (ConnectOptions)
-    realtime.go          #   GA session config (create_response:true auto-respond) + oai-events dispatch + reachy say-and-ask do_task (result is the single function_call_output) + voice_state/usage hooks. requestEndCall owns a handler-local terminal (terminalMu + ending CAS) shared by the model's end_call and the opt-in ASR dismiss backstop: the first request synchronously aborts floor/output, blocks queued or new response creation, cancels a late response.created without reopening playback, then invokes onEndCall for outer teardown. stop_speaking discards only the current output/result announcement and schedules no continuation. Local-commit fallback (manual input_audio_buffer.commit after local speech end) is opt-in via KOE_LOCAL_COMMIT_FALLBACK=1, default off since 2026-07-09 — far-field fragment gate-opens (Reachy) turned commit_empty rejections into spoken "could not hear you" loops; even when enabled, a commit_empty rejection is classified as a fragment and dropped silently (commitEmptySeq short-circuits the ack wait), never ask-to-repeat
-    dismissintent.go     #   isDismissPhrase/normalizeDismissPhrase: closed-vocabulary zh/en/ja classifier used only by the opt-in KOE_ASR_DISMISS_BACKSTOP=1 path; ASR stays evidence-only by default and model-judged end_call remains authoritative. When enabled, accepted phrases converge on realtime.go's requestEndCall terminal rather than firing teardown independently. Ambiguous task-stop words remain model-owned so cancel, stop_speaking, and end_call keep separate scopes. KOE_DISMISS_DETECT=0 kills matching, KOE_DISMISS_PHRASES extends it, and KOE_DISMISS_CONTAIN=0 disables strong-token containment. Tagless pure Go
-    control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state/mic_status); optional Bearer auth via KOE_CONTROL_TOKEN env, never argv
-    micwatchdog.go       #   MicSilenceState: pure silent-input watchdog core (clamshell/covered mic → mic_status "silent"/"ok" to Desktop; driver ticker in cmd/koe.go; KOE_MIC_SILENCE_FLOOR/_MS tunable; no restart/rebind by design)
-    earcon.go            #   "ready" + "dismiss" earcons (go:embed assets/{ready,dismiss}.pcm, 48k mono): shared playEarcon() SetSpeaking-gated so it can't self-trigger VAD. PlayReadyEarcon() at emitReadyLocked (KOE_READY_EARCON=0 disables); PlayDismissEarcon() a soft descending goodbye cue in the Desktop endCall path so every hang-up (Esc / menu Stop / end_call tool) signs off (KOE_DISMISS_EARCON=0 disables)
+  koe/                   # ── VOICE FRONT-BRAIN (shan koe) ── cgo since audio.go; file map + behavior contracts in internal/koe/CLAUDE.md
+```
 
 ## Key Conventions
 
@@ -361,11 +336,6 @@ XML `<tool_exec>` delimiters use random hex call_id. Model-authored preambles ar
 
 ```bash
 go test ./...                              # all
-go test ./internal/daemon/ -v              # daemon: WS, router, E2E routing, launchd
-go test ./internal/agent/ -v               # loop, partitioning, spill, deferred
-go test ./internal/agents/ -v              # agent loader
-go test ./internal/schedule/ -v            # schedule CRUD
-go test ./test/ -v                         # E2E: vision pipeline, persist learnings
 go test ./test/e2e/ -v                     # E2E offline (CI)
 SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v  # E2E live (run before each release)
 go build ./...
@@ -385,25 +355,6 @@ Schedule tests use temp dirs — never write to real `~/Library/LaunchAgents/`. 
 
 ## Local Tools
 
-Always registered (`internal/tools/register.go RegisterLocalTools`):
-
-- **File**: file_read (auto-compresses images >3.75 MB raw, see `imaging_compress.go`), file_write, file_edit, glob, grep, directory_list
-- **Archive**: archive_inspect (read-only), archive_extract (approval). Zip/tar/tar.gz via stdlib. Atomic staging+rename; rejects encrypted/absolute/symlink/device/setuid; zipbomb caps (50 MB/entry, 200 MB total, 500 entries). See `archive.go`.
-- **Documents**: pdf_to_text, docx_to_text, xlsx_to_text, pptx_to_text. Prefer poppler/pandoc/xlsx2csv; fall back to unzip+XML strip (no fallback for PDF — surfaces `brew install poppler` hint + suggests upload for native Anthropic document block). Fixed-argv, 60s timeout, 100K-rune output cap. See `doc_extract.go`.
-- **Shell/system**: bash, system_info, process, http, think
-- **macOS GUI**: computer_use (primary native-GUI workflow), accessibility (legacy low-level AX), applescript, screenshot, computer, clipboard, notify, browser, wait_for, ghostty. On daemon runs, the ordinary parent sees one high-level `computer_use` task function and keeps its configured model (Sonnet 5 by default). Only an actual call lazily resolves `openai.computer.v1` and starts a private OpenAI Responses trajectory. A single exact task app binds background-first; semantic press/scroll and ordinary target-bound input stay in that lane, while `foreground_allowed` may activate the target only when an action lacks an exact background primitive. Multi-app tasks retain foreground switching. Screenshots, pointer actions, typing, re-observation, continuation, `state_id`, refs, and coordinate frames stay internal. NSWorkspace + CGWindow provides a coordinate-capable target when AX is incomplete, while foreground OpenAI pointer actions use the visible CGEvent path. Ambient physical interference requires one exact fresh observation before another mutation; explicit Pause/Take Over/Stop retains user-owned quiescence. The whole call uses the shared GUI-operation lock. The standalone `screenshot` tool remains separate and approval-gated. Unattended `computer_use` still requires the explicit persisted global grant.
-- **Schedule**: schedule_create / _list / _update / _remove / _show
-- **Memory**: memory_append (flock-protected MEMORY.md append)
-- **User interaction**: ask_user_question — closed-choice escalation (1-4 questions, 2-4 options each; model receives full option labels, not bare tokens). `RequiresApproval()==false` — its own request/resolve interaction, NOT an approval. Reaches the daemon `QuestionBroker` through an `agent.QuestionAsker` injected on the tool-call context (`internal/tools` can't import `internal/daemon`); no asker on ctx (unattended / non-interactive channel / sync HTTP / TUI) → clean "can't ask here, use best judgment" result. Its explicit Direct exposure keeps it in the first-turn schema set; the volatile `Structured question UI: available` capability line gates calls on surfaces with a live asker. See Wire Contract Discipline + `internal/daemon/question.go` / `question_broker.go` / `pending.go`. Over-asking is suppressed by the "## Asking the user" prompt gate (`internal/prompt/builder.go`), not the tool description.
-- **Skills**: use_skill
-
-Conditional:
-
-- `session_search` — when session manager available
-- `cloud_delegate` — `cloud.enabled: true`
-- `publish_to_web` — `cloud.enabled` + `cfg.APIKey`. Always approval. Path-segment + basename blocklist (`.env`/`.pem`/…); extension allowlist (`cloud.publish_allowed_extensions`). All uploads tagged `kind=other` server-side; the kind enum (`session_share`/`report`/`landing_page`/`image`/`other` — see `internal/uploads/client.go`) is NOT exposed to the model.
-- `list_my_published_files` — same gating. Read-only, no approval. `limit` (≤100), `offset`, optional `kind` filter (same enum). Returns paged `UploadEntry` rows keyed by id; rendering surfaces a `kind=…` badge per row so the LLM can answer "which of these are session shares".
-- `retract_published_file` — same gating. Destructive, requires approval. Args: `id` (UUID from list) + `description`. 404 conflates not-found/already-retracted/not-yours to avoid existence leak.
-- `generate_image` / `edit_image` — same gating. Always approval (paid quota + permanent CDN). Edit requires `image_urls` 1-4 entries starting with `https://static.kocoro.ai/`.
-- `tool_search` — registered Direct whenever the effective registry contains cold Deferred tools; keyword retrieval uses the internal deterministic BM25 index in `agent/toolsearch_index.go`
-- **`calendar_*` family (8 tools)** — registered only when daemon is a Kocoro Desktop subprocess (`tools.RegisterCalendarTools` no-ops when the `DesktopRPCBroker` is nil; TUI/one-shot/MCP/scheduled paths fall back to `applescript` + Calendar.app). Tools: `calendar_check_permission`, `calendar_request_permission` (approval, 5-min TCC-dialog timeout), `calendar_list_sources`, `calendar_list_events`, `calendar_get_event`, `calendar_create_event` / `_update_event` / `_delete_event` (approval). Backed by `docs/desktop-calendar-rpc.md` v0.5.1 (Unix socket reverse RPC to Desktop's EventKit). `attendees` is metadata-only — `invitations_sent` always `false` in v1. `update_event` rejects `scope=all`; use delete + create.
+Full tool inventory — registration gating, per-tool caps, and approval flags — lives in
+`internal/tools/CLAUDE.md` (loads when working under that directory). Repo-wide approval and
+unattended deny-list policy stays above under **Daemon Approval Protocol**.
