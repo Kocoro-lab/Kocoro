@@ -69,6 +69,81 @@ func TestComputerUseGUIActionDescriptorResolvesInitialObservationTarget(t *testi
 	}
 }
 
+func TestComputerUseFrontmostDiversionProbeAvoidsAXTreeWalk(t *testing.T) {
+	fake := newFakeAXCaller()
+	fake.queue(
+		"read_window_target",
+		`{"schema_version":1,"app":"Kocoro Desktop","app_name":"Kocoro Desktop",`+
+			`"bundle_id":"run.shannon.shanclaw.dev","pid":909,"window_id":9909,`+
+			`"window_frame":{"x":0,"y":0,"width":800,"height":600},`+
+			`"elements":[],"ref_paths":{}}`,
+	)
+	tool := &ComputerUseTool{client: fake}
+
+	if got := tool.computerUseFrontmostDiversionNowV1(
+		context.Background(),
+	); got != computerUseFrontmostControllerV1 {
+		t.Fatalf("frontmost diversion = %q", got)
+	}
+	if len(fake.calls) != 1 || fake.calls[0].method != "read_window_target" {
+		t.Fatalf("frontmost diversion used a heavy AX path: %+v", fake.calls)
+	}
+}
+
+func TestComputerUseFrontmostDiversionProbeFailsOpenWithoutAXTreeFallback(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.errors["read_window_target"] = []error{
+		errors.New("frontmost window unavailable"),
+	}
+	tool := &ComputerUseTool{client: fake}
+
+	if got := tool.computerUseFrontmostDiversionNowV1(
+		context.Background(),
+	); got != "" {
+		t.Fatalf("failed frontmost probe classified diversion = %q", got)
+	}
+	if len(fake.calls) != 1 || fake.calls[0].method != "read_window_target" {
+		t.Fatalf("failed probe fell back to a heavy AX path: %+v", fake.calls)
+	}
+}
+
+func TestComputerUseInitialTargetDescriptorDoesNotApplyFrontmostRetention(
+	t *testing.T,
+) {
+	fake := newFakeAXCaller()
+	fake.queue("read_tree", treeFixture("Notes"))
+	tool := &ComputerUseTool{
+		client: fake,
+		initialTarget: &ComputerUseInitialTargetV1{
+			PID: 42, AppName: "Notes", BundleID: "com.apple.Notes",
+		},
+		lastTaskTarget: &ComputerUseInitialTargetV1{
+			PID: 77, AppName: "Slack",
+			BundleID: "com.tinyspeck.slackmacgap",
+		},
+	}
+	tool.setAllowedTaskTargetsV1([]ComputerUseInitialTargetV1{{
+		PID: 77, AppName: "Slack", BundleID: "com.tinyspeck.slackmacgap",
+	}})
+
+	descriptor, err := tool.DescribeGUIAction(
+		context.Background(),
+		`{"action":"get_app_state","follow_frontmost":true,"description":"observe"}`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.TargetBundleID != "com.apple.Notes" ||
+		descriptor.TargetAppName != "Notes" {
+		t.Fatalf("initial descriptor was replaced by retention: %+v", descriptor)
+	}
+	if len(fake.calls) != 1 || fake.calls[0].method != "read_tree" {
+		t.Fatalf("initial descriptor unexpectedly re-resolved: %+v", fake.calls)
+	}
+}
+
 func TestComputerUseUnavailableMutationsCannotBeDescribedForExecutionAuthority(t *testing.T) {
 	for _, action := range []string{"focus_app", "launch_app", "set_value"} {
 		t.Run(action, func(t *testing.T) {

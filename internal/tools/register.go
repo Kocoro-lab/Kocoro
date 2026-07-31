@@ -200,6 +200,9 @@ func CloneWithRuntimeConfig(reg *agent.ToolRegistry, cfg *config.Config) *agent.
 		if existing, ok := unwrapGUIExecutionGate(raw).(*ComputerUseTool); ok {
 			toolCopy := *existing
 			toolCopy.initialTarget = nil
+			toolCopy.lastTaskTarget = nil
+			toolCopy.allowedTaskTargets = nil
+			toolCopy.frontmostDiversion = ""
 			toolCopy.snapshot = nil
 			toolCopy.refs = nil
 			toolCopy.coordinateArtifact = nil

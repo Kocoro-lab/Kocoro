@@ -75,8 +75,9 @@ func TestOpenAIComputerBatchContinuationPolicyUsesStableRecoveryCategory(
 			want: true,
 		},
 		{
-			name: "physical user input stops",
+			name: "precommit physical user input reobserves from fresh image",
 			execution: agent.OpenAIComputerBatchExecution{
+				ActionEffect: agent.ComputerUseCommitNone,
 				Result: agent.ToolResult{
 					IsError: true,
 					Images:  []agent.ImageBlock{image},
@@ -87,6 +88,7 @@ func TestOpenAIComputerBatchContinuationPolicyUsesStableRecoveryCategory(
 					},
 				},
 			},
+			want: true,
 		},
 		{
 			name: "precommit lane failure can replan from fresh image",
@@ -104,12 +106,28 @@ func TestOpenAIComputerBatchContinuationPolicyUsesStableRecoveryCategory(
 			want: true,
 		},
 		{
-			name: "unknown commit stops",
+			name: "unknown commit with fresh image returns to specialist",
 			execution: agent.OpenAIComputerBatchExecution{
 				ActionEffect: agent.ComputerUseCommitUnknown,
 				Result: agent.ToolResult{
 					IsError: true,
 					Images:  []agent.ImageBlock{image},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "explicit cancellation after commit refuses continuation",
+			execution: agent.OpenAIComputerBatchExecution{
+				ActionEffect: agent.ComputerUseCommitUnknown,
+				Result: agent.ToolResult{
+					IsError: true,
+					Images:  []agent.ImageBlock{image},
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result:      agent.GUIActionResultCancelled,
+						Phase:       agent.GUIActionPhaseInputCommitted,
+						FailureCode: "control_cancelled",
+					},
 				},
 			},
 		},
@@ -639,6 +657,7 @@ func openAIComputerDaemonCallForResponse(
 type openAIComputerDaemonLoopLLM struct {
 	responses []*client.CompletionResponse
 	requests  []client.CompletionRequest
+	errors    []error
 	err       error
 }
 
@@ -703,6 +722,13 @@ func (l *openAIComputerDaemonLoopLLM) Complete(
 	request client.CompletionRequest,
 ) (*client.CompletionResponse, error) {
 	l.requests = append(l.requests, request)
+	if len(l.errors) > 0 {
+		err := l.errors[0]
+		l.errors = l.errors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if l.err != nil {
 		return nil, l.err
 	}
@@ -1705,6 +1731,306 @@ func TestOpenAIComputerTaskReplansAfterPreflightNotCommittedActionWithEarlierCom
 	}
 }
 
+func TestOpenAIComputerTaskReobservesAfterPrecommitPhysicalInterference(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-physical-interference",
+		"turn-openai-physical-interference",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	interference := agent.BusinessError(
+		"the user moved the physical pointer before the click committed",
+	)
+	interference.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultUserInterference,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: "physical_input_interference",
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "ZnJlc2gtc3RhdGU=",
+				}},
+			},
+		},
+		resultQueues: map[string][]agent.ToolResult{
+			"click": {
+				interference,
+				{
+					Content: "clicked after fresh observation",
+					GUIOutcome: &agent.GUIActionOutcome{
+						Result: agent.GUIActionResultVerified,
+						Phase:  agent.GUIActionPhaseVerifying,
+					},
+				},
+			},
+		},
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	secondResponseID := "shct_pOIBMOn2gmZdU7TJZm93xdhEM1SNRTRle-n9A0mz76i"
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(openAIComputerDaemonCall(
+				`{"type":"click","button":"left","x":10,"y":20}`,
+			)),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			secondResponseID,
+			string(openAIComputerDaemonCallForResponse(
+				secondResponseID,
+				"call_daemon_interference_replan",
+				`{"type":"click","button":"left","x":10,"y":20}`,
+			)),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_interference_done",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Calculation completed after re-observing.\"}"}`,
+			`{"status":"completed","summary":"Calculation completed after re-observing."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     5,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Click Calculator 7","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil || result.IsError ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitKnown {
+		t.Fatalf("task result=%+v err=%v", result, err)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot,click,final_screenshot" {
+		t.Fatalf("physical interference run order = %q", got)
+	}
+	if len(llm.requests) != 3 {
+		t.Fatalf("provider requests = %d, want 3", len(llm.requests))
+	}
+	blocks := llm.requests[1].Messages[len(llm.requests[1].Messages)-1].Content.Blocks()
+	nested, ok := blocks[0].ToolContent.([]client.ContentBlock)
+	if !ok || len(nested) != 2 ||
+		nested[1].Text !=
+			`kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"none","gui_outcome":{"result":"user_interference","phase":"acting","failure_code":"physical_input_interference"}}` {
+		t.Fatalf("interference continuation content = %#v", blocks)
+	}
+}
+
+func TestOpenAIComputerTaskDoesNotTreatObservedPhysicalInputAsUserTakeover(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-observed-physical-input",
+		"turn-openai-observed-physical-input",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	interference := agent.BusinessError(
+		"the physical pointer moved before the click committed",
+	)
+	interference.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultUserInterference,
+		Phase:       agent.GUIActionPhaseActing,
+		FailureCode: "physical_input_interference",
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": interference,
+			"final_screenshot": {
+				Content: "fresh state observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "ZnJlc2gtc3RhdGU=",
+				}},
+			},
+		},
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	providerFailure := errors.New("provider continuation failed")
+	llm := &openAIComputerDaemonLoopLLM{
+		responses: []*client.CompletionResponse{
+			openAIComputerDaemonLoopResponse(
+				t,
+				profile,
+				openAIComputerDaemonContinuationToken,
+				string(openAIComputerDaemonCall(
+					`{"type":"click","button":"left","x":10,"y":20}`,
+				)),
+				"",
+			),
+		},
+		errors: []error{nil, providerFailure},
+	}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Click Calculator 7","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskUnverified ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		result.ComputerUseOutcome.FailureCode != "outcome_unverified" ||
+		!strings.Contains(result.Content, "reason: outcome_unverified") ||
+		strings.Contains(result.Content, "user_intervened") ||
+		strings.Contains(result.Content, "user_interference") {
+		t.Fatalf("observed physical input result=%+v err=%v", result, err)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot" {
+		t.Fatalf("observed physical input replayed input: %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskLetsFreshObservationResolvePostcommitInterference(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-postcommit-interference",
+		"turn-openai-postcommit-interference",
+	)
+	workflow.invocationFromContext = agent.ToolInvocationFromContext
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	interference := agent.BusinessError(
+		"the user moved the physical pointer after the click was posted",
+	)
+	interference.GUIOutcome = &agent.GUIActionOutcome{
+		Result:      agent.GUIActionResultUserInterference,
+		Phase:       agent.GUIActionPhaseInputCommitted,
+		FailureCode: "physical_input_interference",
+	}
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": interference,
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "dmlzaWJsZS1yZXN1bHQ=",
+				}},
+			},
+		},
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			openAIComputerDaemonContinuationToken,
+			string(openAIComputerDaemonCall(
+				`{"type":"click","button":"left","x":10,"y":20}`,
+			)),
+			"",
+		),
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_postcommit_interference_done",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"The requested calculator result is visible after re-observing.\"}"}`,
+			`{"status":"completed","summary":"The requested calculator result is visible after re-observing."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Click Calculator 7","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil || result.IsError ||
+		result.Content !=
+			"The requested calculator result is visible after re-observing." {
+		t.Fatalf("task result=%+v err=%v", result, err)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitUnknown {
+		t.Fatalf("postcommit observation outcome = %+v", result.ComputerUseOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot" {
+		t.Fatalf("postcommit interference replayed input: %q", got)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("provider requests = %d, want action + observation decision",
+			len(llm.requests))
+	}
+}
+
 func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *testing.T) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
 	workflow := testGUIWorkflow(
@@ -1851,6 +2177,7 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		hasStopBeforeExtraActionInstructions := false
 		hasSafeNavigationRecoveryInstructions := false
 		hasSelfContainedInspectionResultInstructions := false
+		hasControlledAppSwitchInstructions := false
 		for _, message := range request.Messages {
 			if strings.Contains(
 				message.Content.Text(),
@@ -1927,6 +2254,15 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 			) {
 				hasSafeNavigationRecoveryInstructions = true
 			}
+			if strings.Contains(
+				message.Content.Text(),
+				"switch between already prepared controlled apps with Command-Tab",
+			) && strings.Contains(
+				message.Content.Text(),
+				"never use Spotlight search plus Return to launch a controlled app",
+			) {
+				hasControlledAppSwitchInstructions = true
+			}
 		}
 		if !hasExecutorInstructions {
 			t.Fatalf("child request %d lacks private executor instructions", index)
@@ -1948,6 +2284,9 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		}
 		if !hasSafeNavigationRecoveryInstructions {
 			t.Fatalf("child request %d lacks safe browser navigation recovery instructions", index)
+		}
+		if !hasControlledAppSwitchInstructions {
+			t.Fatalf("child request %d lacks controlled-app switch instructions", index)
 		}
 	}
 	if blocks := llm.requests[0].Messages[len(llm.requests[0].Messages)-1].Content.Blocks(); len(blocks) != 2 || blocks[1].Type != "image" {
@@ -2487,7 +2826,9 @@ func TestOpenAIComputerTaskToolRecoversInitialDisplayBeforeProviderAction(
 			return
 		}
 		initialRuns++
-		if initialRuns == 1 {
+		// A display unplug can leave AppKit and WindowServer disagreeing for
+		// more than one poll while macOS migrates the task window.
+		if initialRuns == 3 {
 			probe.mu.Lock()
 			probe.results["final_screenshot"] = actionable
 			probe.mu.Unlock()
@@ -2547,15 +2888,16 @@ func TestOpenAIComputerTaskToolRecoversInitialDisplayBeforeProviderAction(
 		t.Fatalf("task result = %+v", result)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=
-		"final_screenshot,final_screenshot,click,final_screenshot" {
+		"final_screenshot,final_screenshot,final_screenshot,"+
+			"final_screenshot,click,final_screenshot" {
 		t.Fatalf("desktop runs = %q", got)
 	}
-	if !reflect.DeepEqual(waits, []int{1}) {
+	if !reflect.DeepEqual(waits, []int{1, 2, 3}) {
 		t.Fatalf("display observation waits = %v", waits)
 	}
 }
 
-func TestOpenAIComputerTaskToolStopsAfterSecondInitialDisplayFailure(
+func TestOpenAIComputerTaskToolStopsAfterBoundedInitialDisplayRecovery(
 	t *testing.T,
 ) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
@@ -2626,7 +2968,8 @@ func TestOpenAIComputerTaskToolStopsAfterSecondInitialDisplayFailure(
 		t.Fatalf("terminal display outcome = %+v", result.ComputerUseOutcome)
 	}
 	if got := strings.Join(probe.runNames(), ","); got !=
-		"final_screenshot,final_screenshot" {
+		"final_screenshot,final_screenshot,final_screenshot,"+
+			"final_screenshot,final_screenshot" {
 		t.Fatalf("terminal display runs = %q", got)
 	}
 }
@@ -2761,6 +3104,60 @@ func TestOpenAIComputerInitialDisplayRecoveryContinuesAfterActionableSecondObser
 	}
 	if attempts != 2 || !result.GUIObservation.CoordinateActionable {
 		t.Fatalf("actionable recovery result=%+v attempts=%d", result, attempts)
+	}
+}
+
+func TestOpenAIComputerInitialDisplayRecoveryAllowsHotPlugWindowSettle(
+	t *testing.T,
+) {
+	displayFailure := agent.ToolResult{
+		IsRetryable: true,
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "ZGlzcGxheS1mYWlsdXJl",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			ActionabilityFailureCode: "display_not_actionable",
+		},
+	}
+	actionable := agent.ToolResult{
+		Images: []agent.ImageBlock{{
+			MediaType: "image/png",
+			Data:      "YWN0aW9uYWJsZQ==",
+		}},
+		GUIObservation: &agent.GUIObservationOutcome{
+			CoordinateActionable: true,
+			SemanticActionable:   true,
+		},
+	}
+	attempts := 0
+	var waits []int
+	result, err := runOpenAIComputerInitialObservationV1(
+		context.Background(),
+		maxOpenAIComputerInitialObservationsV1,
+		true,
+		false,
+		func(_ context.Context, attempt int) error {
+			waits = append(waits, attempt)
+			return nil
+		},
+		func(context.Context, int) (agent.ToolResult, error) {
+			attempts++
+			if attempts < 4 {
+				return displayFailure, nil
+			}
+			return actionable, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("initial hot-plug observation: %v", err)
+	}
+	if attempts != 4 || !result.GUIObservation.CoordinateActionable {
+		t.Fatalf("hot-plug recovery result=%+v attempts=%d", result, attempts)
+	}
+	if !reflect.DeepEqual(waits, []int{1, 2, 3}) {
+		t.Fatalf("hot-plug observation waits = %v", waits)
 	}
 }
 

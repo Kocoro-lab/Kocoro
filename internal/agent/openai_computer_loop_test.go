@@ -1078,7 +1078,7 @@ func TestAgentLoopOpenAIComputerRejectsMismatchedFunctionCallAliasBeforeExecutio
 	}
 }
 
-func TestAgentLoopOpenAIComputerUnknownCommitStopsBeforeProviderContinuation(t *testing.T) {
+func TestAgentLoopOpenAIComputerUnknownCommitReturnsFreshStateToProvider(t *testing.T) {
 	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
 	llm := &openAIComputerLoopLLM{responses: []*client.CompletionResponse{
 		openAIComputerLoopResponse(
@@ -1087,11 +1087,17 @@ func TestAgentLoopOpenAIComputerUnknownCommitStopsBeforeProviderContinuation(t *
 			openAIContinuationTokenPrimary,
 			normalizedOpenAIComputerCallForTrajectory,
 		),
+		openAIComputerLoopFinalResponse(
+			t,
+			profile,
+			"resp_unknown_commit_observed",
+			"visible state checked",
+		),
 	}}
 	executor := &openAIComputerLoopBatchExecutor{
 		executions: []OpenAIComputerBatchExecution{{
 			CallID:              "call_001",
-			ContinuationAllowed: false,
+			ContinuationAllowed: true,
 			ActionEffect:        ComputerUseCommitUnknown,
 			Result: ToolResult{
 				Content: "commit status is unknown; do not retry automatically",
@@ -1120,22 +1126,28 @@ func TestAgentLoopOpenAIComputerUnknownCommitStopsBeforeProviderContinuation(t *
 	loop.SetExecutionProfile(profile)
 	loop.SetOpenAIComputerBatchExecutor(executor)
 
-	_, _, err := loop.Run(context.Background(), "click once", nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "no verified state for continuation") {
-		t.Fatalf("unknown commit recovery error = %v", err)
+	reply, _, err := loop.Run(context.Background(), "click once", nil, nil)
+	if err != nil || reply != "visible state checked" {
+		t.Fatalf("unknown commit recovery reply=%q error=%v", reply, err)
 	}
 	requests := llm.capturedRequests()
-	if got := len(requests); got != 1 {
-		t.Fatalf("unknown commit issued %d completion requests, want 1", got)
+	if got := len(requests); got != 2 {
+		t.Fatalf("unknown commit issued %d completion requests, want 2", got)
 	}
 	if got := len(executor.capturedCalls()); got != 1 {
 		t.Fatalf("unknown commit executed %d batches, want 1", got)
 	}
-
+	blocks := requests[1].Messages[len(requests[1].Messages)-1].Content.Blocks()
+	if len(blocks) != 1 || !blocks[0].IsError {
+		t.Fatalf("unknown commit continuation result = %#v", blocks)
+	}
 }
 
-func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
+func TestAgentLoopOpenAIComputerContinuesAcrossRecoverableFailures(
+	t *testing.T,
+) {
 	profile := resolveTrustedOpenAIComputerProfile(t, "gpt-5.6-sol")
+	const fourthResponseID = "shct_Y0HkuID7glWNemH9kzQ3zFBGmA4Sby5a2q8IhVNpMZw"
 	llm := &openAIComputerLoopLLM{responses: []*client.CompletionResponse{
 		openAIComputerLoopResponse(
 			t,
@@ -1155,12 +1167,28 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 			openAIContinuationTokenOther,
 			normalizedOpenAIComputerCallForTrajectory,
 		),
+		openAIComputerLoopResponse(
+			t,
+			profile,
+			fourthResponseID,
+			normalizedOpenAIComputerCallForTrajectory,
+		),
+		openAIComputerLoopFinalResponse(
+			t,
+			profile,
+			"resp_recovered_after_ambient_input",
+			"visible state verified after recovery",
+		),
 	}}
-	failedBatch := func(detail string) OpenAIComputerBatchExecution {
+	failedBatch := func(
+		result GUIActionResult,
+		failureCode string,
+		detail string,
+	) OpenAIComputerBatchExecution {
 		return OpenAIComputerBatchExecution{
 			CallID:              "call_001",
 			ContinuationAllowed: true,
-			ActionEffect:        ComputerUseCommitKnown,
+			ActionEffect:        ComputerUseCommitNone,
 			Result: ToolResult{
 				Content: detail,
 				IsError: true,
@@ -1169,18 +1197,47 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 					Data:      "ZmluYWw=",
 				}},
 				GUIOutcome: &GUIActionOutcome{
-					Result:      GUIActionResultCompletedUnverified,
-					Phase:       GUIActionPhaseInputCommitted,
-					FailureCode: "scroll_not_committed",
+					Result:      result,
+					Phase:       GUIActionPhaseActing,
+					FailureCode: failureCode,
 				},
 			},
 		}
 	}
+	successfulBatch := OpenAIComputerBatchExecution{
+		CallID:              "call_001",
+		ContinuationAllowed: true,
+		ActionEffect:        ComputerUseCommitKnown,
+		Result: ToolResult{
+			Content: "one calculator action committed",
+			Images: []ImageBlock{{
+				MediaType: "image/png",
+				Data:      "ZmluYWw=",
+			}},
+			GUIOutcome: &GUIActionOutcome{
+				Result: GUIActionResultVerified,
+				Phase:  GUIActionPhaseVerifying,
+			},
+		},
+	}
 	executor := &openAIComputerLoopBatchExecutor{
 		executions: []OpenAIComputerBatchExecution{
-			failedBatch("OpenAI computer action 1 of 2 did not complete: click target vanished"),
-			failedBatch("OpenAI computer action 1 of 2 did not complete: click target vanished"),
-			failedBatch("OpenAI computer action 2 of 2 did not complete: typed text was not accepted"),
+			failedBatch(
+				GUIActionResultFailed,
+				"stale_state",
+				"the calculator state changed before the click",
+			),
+			successfulBatch,
+			failedBatch(
+				GUIActionResultFailed,
+				"keyboard_target_unavailable",
+				"the calculator keyboard target was unavailable",
+			),
+			failedBatch(
+				GUIActionResultUserInterference,
+				"physical_input_interference",
+				"the physical pointer moved before the click committed",
+			),
 		},
 	}
 	loop := NewAgentLoop(
@@ -1200,39 +1257,42 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 	loop.SetExecutionProfile(profile)
 	loop.SetOpenAIComputerBatchExecutor(executor)
 
-	_, _, err := loop.Run(context.Background(), "click once", nil, nil)
-	if err == nil {
-		t.Fatal("repeated failed batches did not terminate the run")
+	reply, _, err := loop.Run(
+		context.Background(),
+		"finish the calculator task",
+		nil,
+		nil,
+	)
+	if err != nil || reply != "visible state verified after recovery" {
+		t.Fatalf("recovery reply=%q error=%v", reply, err)
 	}
-	for _, want := range []string{
-		"stopped after 3 failed action batches",
-		"typed text was not accepted",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("terminal error %q missing %q", err.Error(), want)
-		}
-	}
-	if got := len(executor.capturedCalls()); got != 3 {
-		t.Fatalf("failed batches executed = %d, want exactly 3", got)
+	if got := len(executor.capturedCalls()); got != 4 {
+		t.Fatalf("executed batches = %d, want 4", got)
 	}
 	requests := llm.capturedRequests()
-	if got := len(requests); got != 3 {
+	if got := len(requests); got != 5 {
 		t.Fatalf(
-			"completion requests = %d, want 3 (no provider call after the recovery cap)",
+			"completion requests = %d, want 5",
 			got,
 		)
 	}
-	for index, request := range requests[1:] {
+	expectedFailures := map[int]string{
+		1: `kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"none","gui_outcome":{"result":"failed","phase":"acting","failure_code":"stale_state"}}`,
+		3: `kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"none","gui_outcome":{"result":"failed","phase":"acting","failure_code":"keyboard_target_unavailable"}}`,
+		4: `kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"none","gui_outcome":{"result":"user_interference","phase":"acting","failure_code":"physical_input_interference"}}`,
+	}
+	for requestIndex, expectedFeedback := range expectedFailures {
+		request := requests[requestIndex]
 		messages := request.Messages
 		if len(messages) == 0 {
-			t.Fatalf("continuation request %d has no messages", index+2)
+			t.Fatalf("continuation request %d has no messages", requestIndex+1)
 		}
 		blocks := messages[len(messages)-1].Content.Blocks()
 		if len(blocks) != 1 || blocks[0].Type != "tool_result" ||
 			!blocks[0].IsError {
 			t.Fatalf(
 				"continuation request %d result block = %#v",
-				index+2,
+				requestIndex+1,
 				blocks,
 			)
 		}
@@ -1240,13 +1300,24 @@ func TestAgentLoopOpenAIComputerStopsAfterRepeatedFailedBatches(t *testing.T) {
 		if !ok || len(nested) != 2 ||
 			nested[0].Type != "image" ||
 			nested[1].Type != "text" ||
-			nested[1].Text != `kocoro.computer_action_outcome.v1:{"schema_version":1,"effect":"committed","gui_outcome":{"result":"completed_unverified","phase":"input_committed","failure_code":"scroll_not_committed"}}` {
+			nested[1].Text != expectedFeedback {
 			t.Fatalf(
 				"continuation request %d tool content = %#v",
-				index+2,
+				requestIndex+1,
 				blocks[0].ToolContent,
 			)
 		}
+	}
+	successMessages := requests[2].Messages
+	successBlocks := successMessages[len(successMessages)-1].Content.Blocks()
+	if len(successBlocks) != 1 ||
+		successBlocks[0].Type != "tool_result" ||
+		successBlocks[0].IsError {
+		t.Fatalf("successful continuation result = %#v", successBlocks)
+	}
+	successContent, ok := successBlocks[0].ToolContent.([]client.ContentBlock)
+	if !ok || len(successContent) != 1 || successContent[0].Type != "image" {
+		t.Fatalf("successful continuation content = %#v", successBlocks[0].ToolContent)
 	}
 }
 

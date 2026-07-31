@@ -274,7 +274,8 @@ const (
 )
 
 func (category OpenAIComputerRecoveryCategoryV1) ContinuationAllowed() bool {
-	return category == OpenAIComputerRecoveryReobserveSameAppV1
+	return category == OpenAIComputerRecoveryReobserveSameAppV1 ||
+		category == OpenAIComputerRecoveryUnknownCommitV1
 }
 
 // ClassifyOpenAIComputerRecoveryV1 is the single local recovery classifier for
@@ -285,18 +286,21 @@ func (category OpenAIComputerRecoveryCategoryV1) ContinuationAllowed() bool {
 func ClassifyOpenAIComputerRecoveryV1(
 	execution OpenAIComputerBatchExecution,
 ) OpenAIComputerRecoveryCategoryV1 {
+	outcome := execution.Result.GUIOutcome
+	if outcome != nil && outcome.Result == GUIActionResultCancelled {
+		return OpenAIComputerRecoveryUserIntervenedV1
+	}
 	if execution.ActionEffect == ComputerUseCommitUnknown {
 		return OpenAIComputerRecoveryUnknownCommitV1
 	}
-	outcome := execution.Result.GUIOutcome
 	if outcome == nil {
 		return OpenAIComputerRecoveryCaptureUnavailableV1
 	}
-	if outcome.Result == GUIActionResultCancelled {
-		return OpenAIComputerRecoveryUserIntervenedV1
-	}
 	if outcome.Result == GUIActionResultUserInterference {
-		return OpenAIComputerRecoveryUserIntervenedV1
+		// Physical input is a state change to observe, not a goal-level cancel.
+		// The daemon still requires one exact fresh screenshot before allowing
+		// the provider to decide whether anything remains to do.
+		return OpenAIComputerRecoveryReobserveSameAppV1
 	}
 	// A mutation helper can reject an action during its preflight authority
 	// check. That phase maps to observing, but the typed failed result still

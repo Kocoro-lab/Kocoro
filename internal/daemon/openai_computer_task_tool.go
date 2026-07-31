@@ -671,10 +671,10 @@ func runOpenAIComputerObservationV1(
 	)
 }
 
-// runOpenAIComputerInitialObservationV1 preserves the existing one-retry cap
-// for an initial display actionability transition. The helper/wire
-// IsRetryable acknowledgement remains the admission owner: the daemon never
-// retries a display_not_actionable result that the helper marked terminal.
+// runOpenAIComputerInitialObservationV1 uses the same bounded observation-only
+// recovery as later screenshots. This gives macOS a short window to migrate a
+// task window after display hot-plug without replaying any user input. The
+// helper/wire IsRetryable acknowledgement remains the admission owner.
 func runOpenAIComputerInitialObservationV1(
 	ctx context.Context,
 	maxAttempts int,
@@ -684,8 +684,7 @@ func runOpenAIComputerInitialObservationV1(
 	attempt openAIComputerObservationAttemptV1,
 	record openAIComputerObservationRecorderV1,
 ) (agent.ToolResult, error) {
-	displayRecoveryActive := false
-	return runOpenAIComputerObservationWithRetryDecisionV1(
+	return runOpenAIComputerObservationV1(
 		ctx,
 		maxAttempts,
 		requireCoordinateActionable,
@@ -693,24 +692,6 @@ func runOpenAIComputerInitialObservationV1(
 		retryWait,
 		attempt,
 		record,
-		func(
-			attemptIndex int,
-			result agent.ToolResult,
-			err error,
-		) bool {
-			if openAIComputerTraceFailureCodeV1(result, err) !=
-				"display_not_actionable" {
-				return retryOpenAIComputerObservationV1(result, err)
-			}
-			if displayRecoveryActive || attemptIndex != 1 {
-				return false
-			}
-			if !retryOpenAIComputerObservationV1(result, err) {
-				return false
-			}
-			displayRecoveryActive = true
-			return true
-		},
 	)
 }
 
@@ -771,8 +752,9 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 		Name: "computer_use",
 		Description: "Operate native macOS desktop apps to complete one full user goal. " +
 			"Give the complete task once; the computer executor prepares exact app targets, " +
-			"uses the foreground for ordinary tasks, and uses only supported no-activation " +
-			"background actions when preserve_frontmost is explicitly required. It " +
+			"prefers supported no-activation background actions for one controlled app, " +
+			"and activates it only when foreground_allowed work requires a foreground action. " +
+			"preserve_frontmost forbids that activation and fallback. It " +
 			"observes the current UI, performs the needed actions, and verifies the result internally. " +
 			"Do not split clicks, typing, screenshots, or app switches into separate calls. " +
 			"For reading or summarization, this call returns the requested content itself; " +
@@ -798,7 +780,7 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 						openAIComputerForegroundAllowedV1,
 						openAIComputerPreserveFrontmostV1,
 					},
-					"description": "Use preserve_frontmost only when the user explicitly requires the single controlled app to remain in the background. This forbids foreground activation and fallback; unsupported actions fail without changing focus. Use foreground_allowed otherwise.",
+					"description": "Use preserve_frontmost only when the user explicitly requires the single controlled app to remain in the background. This forbids foreground activation and fallback; unsupported actions fail without changing focus. Use foreground_allowed otherwise: a single controlled app is attempted in the background first and may activate only when an action cannot be completed there; multi-app tasks retain foreground switching.",
 				},
 				"description": agent.DescriptionFieldSpec,
 			},
@@ -1047,9 +1029,10 @@ func (t *openAIComputerTaskToolV1) Run(
 		), nil
 	}
 	preparationEvent := openAIComputerTraceEventV1{
-		Phase:      "app_launch_focus",
-		Status:     "completed",
-		DurationMS: time.Since(preparationStarted).Milliseconds(),
+		Phase:         "app_launch_focus",
+		Status:        "completed",
+		ExecutionLane: string(executionLane),
+		DurationMS:    time.Since(preparationStarted).Milliseconds(),
 	}
 	if len(apps) > 0 {
 		preparationEvent.AppBundleID = apps[0].BundleID
@@ -1306,6 +1289,7 @@ func (t *openAIComputerTaskToolV1) Run(
 			"Never move or drag merely to park the cursor, rearrange windows, clean up the screen, or prepare the final response. " +
 			"For inspection or summarization, read from screenshots and use scroll only when more content must be revealed; do not drag-select text unless the user explicitly requested selection or dragging. " +
 			"Do not add routine fixed waits: Kocoro applies one short bounded settle before the post-batch screenshot; use wait only while the latest UI visibly shows loading or an in-progress transition. " +
+			"For multi-app tasks, switch between already prepared controlled apps with Command-Tab, one switch per batch, then inspect the latest screenshot before typing or clicking; never use Spotlight search plus Return to launch a controlled app. " +
 			"Continue across app switches, " +
 			"and stop as soon as the requested end state is verified. " +
 			"Keyboard actions are bound to the latest verified target app, window, and focus; re-observe whenever that target is uncertain. " +
@@ -1381,7 +1365,8 @@ func (t *openAIComputerTaskToolV1) Run(
 		}
 	}
 	trace.record(providerEvent)
-	if stats.TaskEffect == agent.ComputerUseCommitUnknown {
+	if stats.TaskEffect == agent.ComputerUseCommitUnknown &&
+		(err != nil || !stats.LastBatchHadFreshObservation) {
 		failureCode := stats.LastFailureCode
 		if failureCode == "" {
 			failureCode = "commit_unknown"
@@ -1442,8 +1427,6 @@ func (t *openAIComputerTaskToolV1) Run(
 				failureCode = "executor_timeout_after_commit"
 			case stats.LastGUIResult == agent.GUIActionResultCancelled:
 				failureCode = "cancelled"
-			case stats.LastGUIResult == agent.GUIActionResultUserInterference:
-				failureCode = "user_interference"
 			case stats.LastBatchHadFreshObservation:
 				failureCode = "outcome_unverified"
 			}
@@ -1502,8 +1485,7 @@ func (t *openAIComputerTaskToolV1) Run(
 				stats.TaskEffect,
 			), nil
 		}
-		if stats.LastGUIResult == agent.GUIActionResultCancelled ||
-			stats.LastGUIResult == agent.GUIActionResultUserInterference {
+		if stats.LastGUIResult == agent.GUIActionResultCancelled {
 			failureCode := stats.LastFailureCode
 			trace.record(openAIComputerTraceEventV1{
 				Phase:       "task",

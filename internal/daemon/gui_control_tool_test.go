@@ -875,7 +875,7 @@ func TestDaemonGUIWorkflowPublishesTypedOutcomeAndAuthoritativePointer(t *testin
 	workflow.EndTurn()
 }
 
-func TestDaemonGUIWorkflowSemanticSelectionUserInterferenceAutoPauses(t *testing.T) {
+func TestDaemonGUIWorkflowSemanticSelectionUserInterferenceReobservesWithoutPause(t *testing.T) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{
 		RequireControllerHeartbeat: true,
 		LeaseTTL:                   5 * time.Second,
@@ -898,17 +898,11 @@ func TestDaemonGUIWorkflowSemanticSelectionUserInterferenceAutoPauses(t *testing
 		t.Fatalf("selection interference result=%+v", result)
 	}
 	active := coordinator.Snapshot().Active
-	if active == nil || active.LeaseState != guicontrol.ComputerUseLeasePaused ||
-		active.ActionPhase != guicontrol.ComputerUsePhaseWaitingForUser ||
+	if active == nil || active.LeaseState != guicontrol.ComputerUseLeaseActive ||
+		active.ActionPhase != guicontrol.ComputerUsePhaseObserving ||
 		active.ActionResult == nil || *active.ActionResult != guicontrol.ComputerUseResultUserInterference ||
 		active.FailureCode == nil || *active.FailureCode != "physical_input_interference" {
-		t.Fatalf("selection interference did not auto-pause through daemon FinishAction: %+v", active)
-	}
-	if _, err := coordinator.Control(guicontrol.ComputerUseControlRequest{
-		LeaseID: active.LeaseID, Action: guicontrol.ComputerUseControlResume,
-		IdempotencyKey: "resume-selection-interference",
-	}); err != nil {
-		t.Fatalf("resume: %v", err)
+		t.Fatalf("selection interference did not enter active re-observation through daemon FinishAction: %+v", active)
 	}
 	nextMutation := &guiProbeTool{
 		name: "computer_use",
@@ -924,6 +918,27 @@ func TestDaemonGUIWorkflowSemanticSelectionUserInterferenceAutoPauses(t *testing
 	}
 	if nextMutation.calls != 0 {
 		t.Fatalf("post-interference mutation reached executor %d times", nextMutation.calls)
+	}
+
+	reobserve := &guiProbeTool{
+		name: "computer_use",
+		descriptor: agent.GUIActionDescriptor{
+			Participates: true, ActionKind: "get_app_state", Effect: agent.GUIActionObservation,
+			TargetBundleID: "com.apple.Notes", TargetAppName: "Notes",
+			ExecutionPath: "accessibility",
+		},
+		outcome: &agent.GUIActionOutcome{
+			Result: agent.GUIActionResultVerified, Phase: agent.GUIActionPhaseObserving,
+		},
+	}
+	observed, err := workflow.runTool(context.Background(), reobserve, `{}`)
+	if err != nil || observed.IsError || reobserve.calls != 1 {
+		t.Fatalf("post-interference re-observation=%+v calls=%d err=%v", observed, reobserve.calls, err)
+	}
+
+	replanned, err := workflow.runTool(context.Background(), nextMutation, `{}`)
+	if err != nil || replanned.IsError || nextMutation.calls != 1 {
+		t.Fatalf("replanned mutation=%+v calls=%d err=%v", replanned, nextMutation.calls, err)
 	}
 	workflow.EndTurn()
 }
