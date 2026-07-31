@@ -27,8 +27,9 @@ var modelMaxOutputTokens = map[string]int{
 	"claude-sonnet-4-6": 64_000,
 	"claude-opus-4-6":   64_000,
 	"claude-opus-4-7":   64_000,
-	// Mythos preview: stays on the 32K fallback until the provider and Cloud
-	// publish a matching output cap.
+	"claude-sonnet-5":   128_000,
+	// Mythos preview: stays on the 32K fallback until output-cap docs are
+	// published; flip to 64K when shannon-cloud config/models.yaml confirms.
 	"claude-mythos-preview": defaultMaxOutputTokens,
 
 	// --- 200K, dated forms ---
@@ -47,6 +48,9 @@ var modelMaxOutputTokens = map[string]int{
 
 	// --- GPT-5 / GPT-4.1 (Responses API: max_output_tokens cap) ---
 	"gpt-5.1":               128_000,
+	"gpt-5.6-terra":         128_000,
+	"gpt-5.6-luna":          128_000,
+	"gpt-5.6-sol":           128_000,
 	"gpt-5.1-chat-latest":   128_000,
 	"gpt-5-pro-2025-10-06":  128_000,
 	"gpt-5-mini-2025-08-07": 128_000,

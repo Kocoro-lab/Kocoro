@@ -135,6 +135,11 @@ codecs.
 
 `POST /message` optionally accepts `idempotency_key` together with a
 client-minted `session_id` (`message_idempotency_v1`).
+For `source=koe`, `koe_fast_profile_v1` additionally accepts the semantic
+`execution_mode: "fast"|"full"` field. Missing and unknown values are `full`.
+The client never sends provider/model/profile ids; the daemon resolves `fast`
+through Cloud and falls back to the unchanged full Agent configuration on any
+missing, invalid, or failed resolution.
 `message_idempotency_receipt_v2` additionally persists validated deliverable
 receipts and returns stable failed/in-progress error codes. The first request
 durably records acceptance before running tools. A completed retry returns the

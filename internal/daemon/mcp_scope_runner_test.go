@@ -2,10 +2,12 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -21,6 +23,17 @@ func offeredToolName(tl client.Tool) string {
 		return tl.Name
 	}
 	return tl.Function.Name
+}
+
+func firstStreamingGatewayRequest(t *testing.T, reqs []client.CompletionRequest) client.CompletionRequest {
+	t.Helper()
+	for _, req := range reqs {
+		if req.Stream {
+			return req
+		}
+	}
+	t.Fatalf("no streaming main-agent request captured: %+v", reqs)
+	return client.CompletionRequest{}
 }
 
 // TestRunAgent_NamedAgentMCPScope_ExcludesUnselectedServer is the daemon-path
@@ -45,11 +58,6 @@ func TestRunAgent_NamedAgentMCPScope_ExcludesUnselectedServer(t *testing.T) {
 	deps.Registry.Register(tools.NewMCPTool("serverA", mcpproto.Tool{Name: "a_tool"}, nil))
 	deps.Registry.Register(tools.NewMCPTool("serverB", mcpproto.Tool{Name: "b_tool"}, nil))
 	deps.Config.MCPServers = map[string]mcp.MCPServerConfig{"serverA": {}, "serverB": {}}
-	// Use the native tool-reference path so selected MCP schemas remain on the
-	// wire with defer_loading=true and the test can distinguish Deferred from
-	// excluded.
-	deps.Config.Agent.Model = "claude-sonnet-4-5-20250929"
-
 	// A named agent scoping MCP to serverA only (inherit:false + serverA).
 	agentDir := filepath.Join(deps.AgentsDir, "mcptest")
 	if err := os.MkdirAll(agentDir, 0o755); err != nil {
@@ -77,19 +85,26 @@ func TestRunAgent_NamedAgentMCPScope_ExcludesUnselectedServer(t *testing.T) {
 	if len(reqs) == 0 {
 		t.Fatal("no gateway requests captured")
 	}
+	mainReq := firstStreamingGatewayRequest(t, reqs)
 	offered := map[string]client.Tool{}
-	for _, r := range reqs {
-		for _, tl := range r.Tools {
-			offered[offeredToolName(tl)] = tl
-		}
+	for _, tl := range mainReq.Tools {
+		offered[offeredToolName(tl)] = tl
 	}
-	if _, ok := offered["a_tool"]; !ok {
-		t.Errorf("serverA tool a_tool not offered; offered=%v", offered)
-	} else if !offered["a_tool"].DeferLoading {
-		t.Error("serverA MCP tool a_tool must be offered as Deferred")
+	if _, ok := offered["a_tool"]; ok {
+		t.Error("cold serverA MCP tool must stay out of the initial tools wire")
 	}
 	if _, ok := offered["b_tool"]; ok {
 		t.Errorf("serverB tool b_tool offered — scope not enforced")
+	}
+	if _, ok := offered["tool_search"]; !ok {
+		t.Fatalf("tool_search missing from scoped Deferred request; offered=%v", offered)
+	}
+	messageWire, _ := json.Marshal(mainReq.Messages)
+	if !strings.Contains(string(messageWire), "a_tool") {
+		t.Error("serverA tool is not discoverable through the Deferred summary")
+	}
+	if strings.Contains(string(messageWire), "b_tool") {
+		t.Error("serverB tool leaked into the scoped Deferred summary")
 	}
 }
 
@@ -141,9 +156,10 @@ func TestIsUnattendedRun_IncludesTransportWithoutApprovalRoundTrip(t *testing.T)
 }
 
 // Every inbound surface converges on RunAgent's one per-run registry clone.
-// Pin the actual offered-tool seam so future source-specific routing cannot
-// accidentally make GUI execution Desktop-only.
-func TestRunAgent_AllInboundSourcesOfferComputerUse(t *testing.T) {
+// Pin the actual discovery seam so future source-specific routing cannot
+// accidentally make GUI execution Desktop-only. Computer schemas are run-
+// scoped and must not be advertised before tool_search binds a profile.
+func TestRunAgent_AllInboundSourcesDiscoverComputerUse(t *testing.T) {
 	reg, _, cleanup := tools.RegisterLocalTools(&config.Config{}, nil)
 	defer cleanup()
 
@@ -170,10 +186,6 @@ func TestRunAgent_AllInboundSourcesOfferComputerUse(t *testing.T) {
 
 			deps := runAgentContractTestDeps(t, ts.URL)
 			defer deps.SessionCache.CloseAll()
-			// Tool-reference-capable model keeps deferred schemas on the wire
-			// with defer_loading=true, so this test can inspect the exact offered
-			// registry rather than only the tool_search discovery summary.
-			deps.Config.Agent.Model = "claude-sonnet-4-5-20250929"
 			deps.Registry = reg
 			deps.BaselineReg = reg
 
@@ -185,16 +197,26 @@ func TestRunAgent_AllInboundSourcesOfferComputerUse(t *testing.T) {
 				t.Fatalf("RunAgent(%s): %v", source, err)
 			}
 
-			offered := false
-			for _, request := range gw.requests() {
-				for _, tool := range request.Tools {
-					if offeredToolName(tool) == "computer_use" {
-						offered = true
-					}
+			requests := gw.requests()
+			if len(requests) == 0 {
+				t.Fatal("no gateway requests captured")
+			}
+			mainReq := firstStreamingGatewayRequest(t, requests)
+			hasToolSearch := false
+			for _, tool := range mainReq.Tools {
+				switch offeredToolName(tool) {
+				case "computer_use", "computer":
+					t.Fatalf("cold computer schema leaked for source %q", source)
+				case "tool_search":
+					hasToolSearch = true
 				}
 			}
-			if !offered {
-				t.Fatalf("computer_use was not offered for source %q", source)
+			if !hasToolSearch {
+				t.Fatalf("tool_search was not offered for source %q", source)
+			}
+			messageWire, _ := json.Marshal(mainReq.Messages)
+			if !strings.Contains(string(messageWire), "computer_use") {
+				t.Fatalf("computer_use was not discoverable for source %q", source)
 			}
 		})
 	}

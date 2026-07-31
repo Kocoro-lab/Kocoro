@@ -1353,6 +1353,222 @@ func (m *mockNoEffectComputerUseTool) Run(
 
 func (m *mockNoEffectComputerUseTool) RequiresApproval() bool { return false }
 
+func TestAgentLoop_VerifiedClaimAfterToolDoesNotNudge(t *testing.T) {
+	tool := &mockCountingTool{
+		name:    "computer",
+		content: "synthetic screenshot result",
+	}
+	claim := "The screen shows a verified synthetic result. " +
+		strings.Repeat("This detail comes from the completed screenshot tool. ", 3)
+	first := nativeResponse(
+		"",
+		"tool_use",
+		toolCall("computer", `{"action":"screenshot"}`),
+		20,
+		5,
+	)
+	final := nativeResponse(claim, "end_turn", nil, 25, 10)
+	llm := &budgetCaptureLLMClient{
+		responses: []*client.CompletionResponse{&first, &final},
+	}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(
+		llm,
+		registry,
+		"medium",
+		"",
+		25,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+
+	result, _, err := loop.Run(context.Background(), "inspect once", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != claim {
+		t.Fatalf("result = %q, want verified claim", result)
+	}
+	if tool.runs != 1 {
+		t.Fatalf("computer executions = %d, want 1", tool.runs)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("LLM requests = %d, want 2", len(llm.requests))
+	}
+}
+
+func TestAgentLoop_UnverifiedClaimNudgesUntilToolEvidence(t *testing.T) {
+	tool := &mockCountingTool{
+		name:    "computer",
+		content: "synthetic screenshot result",
+	}
+	unverified := "The screen shows an unverified synthetic result. " +
+		strings.Repeat("No screenshot has run yet. ", 4)
+	verified := "The screen shows the now-verified synthetic result. " +
+		strings.Repeat("This detail comes from the screenshot tool. ", 3)
+	first := nativeResponse(unverified, "end_turn", nil, 20, 10)
+	second := nativeResponse(
+		"",
+		"tool_use",
+		toolCall("computer", `{"action":"screenshot"}`),
+		25,
+		5,
+	)
+	third := nativeResponse(verified, "end_turn", nil, 30, 10)
+	llm := &budgetCaptureLLMClient{
+		responses: []*client.CompletionResponse{&first, &second, &third},
+	}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(
+		llm,
+		registry,
+		"medium",
+		"",
+		25,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+
+	result, _, err := loop.Run(context.Background(), "inspect the screen", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != verified {
+		t.Fatalf("result = %q, want verified claim", result)
+	}
+	if tool.runs != 1 {
+		t.Fatalf("computer executions = %d, want 1", tool.runs)
+	}
+	if len(llm.requests) != 3 {
+		t.Fatalf("LLM requests = %d, want 3", len(llm.requests))
+	}
+}
+
+func TestAgentLoop_EmptyPostToolRecoveryForcesNoTools(t *testing.T) {
+	runs := 0
+	tool := &simpleTool{
+		name: "write_once",
+		run: func(context.Context, string) (ToolResult, error) {
+			runs++
+			return ToolResult{Content: "write completed"}, nil
+		},
+	}
+	first := nativeResponse(
+		"",
+		"tool_use",
+		toolCall("write_once", `{"value":"x"}`),
+		20,
+		5,
+	)
+	empty := nativeResponse("", "end_turn", nil, 25, 0)
+	final := nativeResponse("done", "end_turn", nil, 25, 2)
+	llm := &budgetCaptureLLMClient{
+		responses: []*client.CompletionResponse{&first, &empty, &final},
+	}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(
+		llm,
+		registry,
+		"medium",
+		"",
+		25,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+	loop.SetBypassPermissions(true)
+
+	result, _, err := loop.Run(context.Background(), "write once", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" {
+		t.Fatalf("result = %q, want done", result)
+	}
+	if runs != 1 {
+		t.Fatalf("write executions = %d, want 1", runs)
+	}
+	if len(llm.requests) != 3 {
+		t.Fatalf("LLM requests = %d, want 3", len(llm.requests))
+	}
+	if got := llm.requests[2].ToolChoice; got != "none" {
+		t.Fatalf("recovery tool_choice = %#v, want none", got)
+	}
+}
+
+func TestAgentLoop_EmptyPostToolRecoveryRejectsToolCall(t *testing.T) {
+	runs := 0
+	tool := &simpleTool{
+		name: "write_once",
+		run: func(context.Context, string) (ToolResult, error) {
+			runs++
+			return ToolResult{Content: "write completed"}, nil
+		},
+	}
+	first := nativeResponse(
+		"",
+		"tool_use",
+		toolCall("write_once", `{"value":"x"}`),
+		20,
+		5,
+	)
+	empty := nativeResponse("", "end_turn", nil, 25, 0)
+	violating := nativeResponse(
+		"",
+		"tool_use",
+		toolCall("write_once", `{"value":"x"}`),
+		25,
+		5,
+	)
+	llm := &budgetCaptureLLMClient{
+		responses: []*client.CompletionResponse{
+			&first,
+			&empty,
+			&violating,
+		},
+	}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(
+		llm,
+		registry,
+		"medium",
+		"",
+		25,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+	loop.SetBypassPermissions(true)
+
+	_, _, err := loop.Run(context.Background(), "write once", nil, nil)
+	if !errors.Is(err, ErrEmptyFinalResponse) {
+		t.Fatalf("error = %v, want ErrEmptyFinalResponse", err)
+	}
+	if runs != 1 {
+		t.Fatalf("write executions = %d, want 1", runs)
+	}
+	if len(llm.requests) != 3 {
+		t.Fatalf("LLM requests = %d, want 3", len(llm.requests))
+	}
+	if got := llm.requests[2].ToolChoice; got != "none" {
+		t.Fatalf("recovery tool_choice = %#v, want none", got)
+	}
+}
+
 type bulkyMockMCPTool struct {
 	name string
 }
@@ -6317,6 +6533,62 @@ func TestAgentLoop_EmptyFinalResponse_ReturnsErrorAndDoesNotPersistEmpty(t *test
 	for i, m := range loop.RunMessages() {
 		if m.Role == "assistant" && !m.Content.HasBlocks() && m.Content.Text() == "" {
 			t.Errorf("empty assistant was persisted at idx %d — would trigger cache_control 400 on resume", i)
+		}
+	}
+}
+
+func TestAgentLoop_EmptyFinalAfterToolRetriesOnceWithoutRepeatingTool(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"",
+				"tool_use",
+				toolCall("write_probe", `{"value":"x"}`),
+				10,
+				5,
+			))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 10, 0))
+		default:
+			json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 10, 2))
+		}
+	}))
+	defer server.Close()
+
+	tool := &executionEvidenceTool{}
+	reg := NewToolRegistry()
+	reg.Register(tool)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg,
+		"medium",
+		"",
+		5,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+
+	result, _, err := loop.Run(context.Background(), "write once", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" || callCount != 3 {
+		t.Fatalf("result/calls = %q/%d, want done/3", result, callCount)
+	}
+	if got := tool.runs.Load(); got != 1 {
+		t.Fatalf("tool executions = %d, want 1", got)
+	}
+	for index, message := range loop.RunMessages() {
+		if message.Role == "assistant" &&
+			!message.Content.HasBlocks() &&
+			strings.TrimSpace(message.Content.Text()) == "" {
+			t.Fatalf("empty assistant persisted at %d", index)
 		}
 	}
 }

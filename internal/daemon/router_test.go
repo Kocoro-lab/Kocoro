@@ -319,6 +319,39 @@ func TestSessionCache_SetRouteCancel_NilWhilePendingNoPanic(t *testing.T) {
 	}
 }
 
+// Every cancel/cancelPending access is serialized by sc.mu. This test races a
+// runner-style teardown against CancelRoute; the pre-fix UnlockRoute writes
+// both fields under entry.mu only and reliably trips the race detector.
+func TestSessionCache_RouteCancelTeardownNoRace(t *testing.T) {
+	sc := NewSessionCache(t.TempDir())
+	defer sc.CloseAll()
+	const routeKey = "agent:cancel-race"
+	sessionsDir := t.TempDir()
+
+	for i := 0; i < 500; i++ {
+		sc.LockRouteWithManager(routeKey, sessionsDir)
+		done := make(chan struct{})
+		sc.SetRouteRunState(routeKey, done, nil, "")
+		_, cancel := context.WithCancel(context.Background())
+		sc.SetRouteCancel(routeKey, cancel)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			sc.CancelRoute(routeKey)
+		}()
+
+		close(start)
+		sc.ClearRouteRunState(routeKey)
+		close(done)
+		sc.UnlockRoute(routeKey)
+		wg.Wait()
+	}
+}
+
 func TestSessionCache_InjectMessage_NoActiveRoute(t *testing.T) {
 	sc := NewSessionCache(t.TempDir())
 	defer sc.CloseAll()

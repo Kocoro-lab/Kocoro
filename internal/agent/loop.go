@@ -23,6 +23,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/instructions"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
@@ -271,6 +272,11 @@ var ErrMaxIterReached = errors.New("agent loop reached iteration limit")
 // See docs/empty-assistant-content-400.md. Callers (runner.go) treat this
 // like other hard run failures and append the standard friendly error.
 var ErrEmptyFinalResponse = errors.New("agent: LLM returned empty final response")
+
+// ErrComputerActivationToolsetChanged prevents an interrupted native-computer
+// trajectory from silently dropping its exact ep1 contract when the callable
+// registry no longer matches the durable activation checkpoint.
+var ErrComputerActivationToolsetChanged = errors.New("agent: checkpointed computer activation toolset changed")
 
 // recoverVisibleTextFromBlocks scans resp.ContentBlocks for non-empty text
 // blocks and returns their concatenation. Used as a last-resort fallback in
@@ -882,17 +888,27 @@ type AgentLoop struct {
 	// emit). Injected into the per-tool-call context (WithIMStatusContext) so
 	// schedule_create can snapshot a proactive-delivery target onto a new
 	// Schedule. Set once with firstTurnIMContext; never cleared.
-	runIMStatusContext json.RawMessage
-	runMessages        []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
-	runMsgInjected     []bool           // parallel to runMessages: true = system-injected guardrail/nudge
-	runMsgTimestamps   []time.Time      // parallel to runMessages: when each message was created
-	lastRunStatus      RunStatus
-	toolRefSupported   bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource        string // attribution tag sent to gateway on every Complete call
-	skillDiscovery     bool   // call small-tier model on first turn to identify relevant skills (default true)
-	memoryPreflight    MemoryPreflightFunc
-	sentSkillNames     map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
-	readTracker        *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	runIMStatusContext    json.RawMessage
+	runMessages           []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
+	runMsgInjected        []bool           // parallel to runMessages: true = system-injected guardrail/nudge
+	runMsgTimestamps      []time.Time      // parallel to runMessages: when each message was created
+	lastRunStatus         RunStatus
+	toolRefSupported      bool   // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource           string // attribution tag sent to gateway on every Complete call
+	executionProfileID    string
+	executionHarnessModel string
+	parallelToolCalls     bool
+	responseCachePolicy   executionprofile.ResponseCachePolicy
+	computerProfile       executionprofile.Profile
+	computerToolName      string
+	computerToolsetHash   string
+	executionEvidence     executionprofile.Evidence
+	sideEffectReplayKeys  map[string]struct{}
+	executionEvidenceMu   sync.Mutex
+	skillDiscovery        bool // call small-tier model on first turn to identify relevant skills (default true)
+	memoryPreflight       MemoryPreflightFunc
+	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
 	// historical tool_result blocks. It is session-scoped and persisted by
 	// daemon/TUI callers so resumed sessions replay identical bytes.
@@ -1073,6 +1089,24 @@ func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
 	a.lastCheckpointAt = time.Now()
 }
 
+// checkpointNow bypasses debounce for a newly activated ep1 computer profile.
+// The next completion is not allowed to carry that profile until the transcript
+// and activation overlay share one durable checkpoint.
+func (a *AgentLoop) checkpointNow(ctx context.Context) error {
+	if a.checkpointFn == nil || a.tracker == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := a.checkpointFn(ctx); err != nil {
+		return err
+	}
+	a.tracker.TakeDirty()
+	a.lastCheckpointAt = time.Now()
+	return nil
+}
+
 // SetIdleTimeouts configures the per-run watchdog. Zero disables that
 // threshold individually. Typical defaults (soft=90s, hard=0) keep the
 // watchdog in visibility-only mode.
@@ -1093,25 +1127,22 @@ func (a *AgentLoop) SetModelTier(tier string) {
 	a.modelTier = tier
 }
 
-// ModelTier returns the currently-configured model tier. Test-only accessor;
-// production callers read modelTier directly through messagesForLLM / Run.
+// ModelTier returns the currently-configured model tier. ExecutionConfig uses
+// it to persist the resolved pre-profile baseline across interrupted recovery.
 func (a *AgentLoop) ModelTier() string {
 	return a.modelTier
 }
 
-// EffortTier returns the currently-configured unified effort tier. Test-only
-// read-back for the global / per-agent / voice wiring; production callers read
-// effortTier directly through the request-construction sites in Run.
+// EffortTier returns the currently-configured unified effort tier.
 func (a *AgentLoop) EffortTier() string {
 	return a.effortTier
 }
 
-// SpecificModel returns the currently-configured specific model id. Test-only
-// accessor used to prove that SetSpecificModel won the precedence race against
-// SetModelTier; production callers read specificModel directly via
-// messagesForLLM / Run. Without this accessor a regression that drops the
-// SetSpecificModel call in applyAgentModelOverlayToLoop would silently slip
-// past the precedence-chain regression test.
+// SpecificModel returns the currently-configured specific model id. It also
+// proves that SetSpecificModel won the precedence race against SetModelTier;
+// without this accessor a regression that drops the SetSpecificModel call in
+// applyAgentModelOverlayToLoop would silently slip past the precedence-chain
+// regression test.
 func (a *AgentLoop) SpecificModel() string {
 	return a.specificModel
 }
@@ -1132,6 +1163,381 @@ func (a *AgentLoop) SetMCPContext(ctx string) {
 // this value is attribution rather than a Kocoro-side policy switch.
 func (a *AgentLoop) SetCacheSource(src string) {
 	a.cacheSource = src
+}
+
+// SetKoeExecutionProfile pins a Cloud-resolved Koe profile for this AgentLoop.
+// The caller supplies a validated immutable profile; full mode intentionally
+// leaves model/reasoning configuration untouched.
+func (a *AgentLoop) SetKoeExecutionProfile(profile executionprofile.Profile) {
+	a.executionProfileID = ""
+	a.executionHarnessModel = ""
+	a.parallelToolCalls = false
+	a.responseCachePolicy = ""
+	if !profile.IsFast() {
+		return
+	}
+	a.executionProfileID = profile.ProfileID
+	a.executionHarnessModel = profile.Model
+	a.parallelToolCalls = profile.ParallelToolCalls
+	a.responseCachePolicy = profile.ResponseCachePolicy
+}
+
+func (a *AgentLoop) requestModelTier() string {
+	// The reserved Fast profile owns its route completely. A Full-mode ep1
+	// computer overlay pins only provider/model/tool semantics, so the caller's
+	// tier remains part of the request and of Cloud attribution.
+	if a.executionProfileID != "" {
+		return ""
+	}
+	return a.modelTier
+}
+
+func (a *AgentLoop) requestSpecificModel() string {
+	if a.executionProfileID != "" {
+		return ""
+	}
+	if a.executionProfile != nil {
+		return a.executionProfile.Model()
+	}
+	if a.computerProfile.ProfileID != "" {
+		if a.computerProfile.Provider != "" {
+			return a.computerProfile.Provider + ":" + a.computerProfile.Model
+		}
+		return a.computerProfile.Model
+	}
+	return a.specificModel
+}
+
+func (a *AgentLoop) requestReasoningEffort() string {
+	if a.executionProfileID != "" {
+		return ""
+	}
+	return a.reasoningEffort
+}
+
+func (a *AgentLoop) requestEffortTier() string {
+	if a.executionProfileID != "" {
+		return ""
+	}
+	return a.effortTier
+}
+
+func (a *AgentLoop) requestThinking() *client.ThinkingConfig {
+	if a.executionProfileID != "" {
+		return nil
+	}
+	return a.thinking
+}
+
+func (a *AgentLoop) requestExecutionProfileID() string {
+	if a.executionProfile != nil {
+		return executionProfileID(a.executionProfile)
+	}
+	if a.computerProfile.ProfileID != "" {
+		return a.computerProfile.ProfileID
+	}
+	return a.executionProfileID
+}
+
+func (a *AgentLoop) requestParallelToolCalls() bool {
+	if a.computerProfile.ProfileID != "" {
+		return false
+	}
+	return a.parallelToolCalls
+}
+
+func (a *AgentLoop) requestResponseCachePolicy() executionprofile.ResponseCachePolicy {
+	if a.computerProfile.ProfileID != "" {
+		return ""
+	}
+	return a.responseCachePolicy
+}
+
+func (a *AgentLoop) clearRunComputerProfile() {
+	a.computerProfile = executionprofile.Profile{}
+	a.computerToolName = ""
+	a.computerToolsetHash = ""
+}
+
+// RestoreComputerActivation restores a checkpointed computer overlay for
+// ResumeInterrupted. A normal Run clears it at entry; only the recovery path
+// may reuse the exact ep1 contract and toolset fingerprint.
+func (a *AgentLoop) RestoreComputerActivation(activation *executionprofile.ComputerActivation) error {
+	a.clearRunComputerProfile()
+	if activation == nil {
+		return nil
+	}
+	if err := activation.Profile.ValidateComputer(activation.Profile.ToolContract); err != nil {
+		return fmt.Errorf("invalid checkpointed computer profile: %w", err)
+	}
+	expectedName, err := computerToolNameForContract(activation.Profile.ToolContract)
+	if err != nil {
+		return err
+	}
+	if activation.ToolName != expectedName {
+		return fmt.Errorf("checkpointed computer tool %q does not match contract %q", activation.ToolName, activation.Profile.ToolContract)
+	}
+	if strings.TrimSpace(activation.ToolsetFingerprint) == "" {
+		return fmt.Errorf("checkpointed computer toolset fingerprint is required")
+	}
+	a.computerProfile = activation.Profile
+	a.computerToolName = activation.ToolName
+	a.computerToolsetHash = activation.ToolsetFingerprint
+	return nil
+}
+
+func (a *AgentLoop) ComputerActivation() *executionprofile.ComputerActivation {
+	if a.computerProfile.ProfileID == "" {
+		return nil
+	}
+	return &executionprofile.ComputerActivation{
+		Profile:            a.computerProfile,
+		ToolName:           a.computerToolName,
+		ToolsetFingerprint: a.computerToolsetHash,
+	}
+}
+
+func computerToolNameForContract(contract string) (string, error) {
+	switch contract {
+	case executionprofile.AnthropicComputerToolContract:
+		return "computer", nil
+	case executionprofile.GenericComputerUseToolContract:
+		return "computer_use", nil
+	default:
+		return "", fmt.Errorf("unsupported computer tool contract %q", contract)
+	}
+}
+
+func exactResponseModel(resp *client.CompletionResponse, configuredModel string) string {
+	if resp != nil {
+		model := strings.TrimSpace(resp.Model)
+		provider := strings.ToLower(strings.TrimSpace(resp.Provider))
+		if model != "" {
+			if provider != "" {
+				prefix := provider + ":"
+				if strings.HasPrefix(strings.ToLower(model), prefix) {
+					return prefix + strings.TrimSpace(model[len(prefix):])
+				}
+				// Colons are legal inside model IDs (for example Ollama's
+				// qwen3:4b). Provider qualification is therefore based on the
+				// actual response provider, not on "model contains a colon".
+				return prefix + model
+			}
+			return model
+		}
+	}
+	return strings.TrimSpace(configuredModel)
+}
+
+func validateComputerProfileExactRoute(profile executionprofile.Profile, specificModel string) error {
+	specificModel = strings.TrimSpace(specificModel)
+	if specificModel == "" {
+		return fmt.Errorf("exact specific model is required")
+	}
+	requestedProvider := ""
+	requestedModel := specificModel
+	if strings.Contains(specificModel, ":") {
+		parts := strings.SplitN(specificModel, ":", 2)
+		requestedProvider = strings.ToLower(strings.TrimSpace(parts[0]))
+		requestedModel = strings.TrimSpace(parts[1])
+		if requestedProvider == "" || requestedModel == "" {
+			return fmt.Errorf("specific model %q is not canonical", specificModel)
+		}
+	}
+	if profile.Model != requestedModel {
+		return fmt.Errorf("resolved model %q does not match exact model %q", profile.Model, requestedModel)
+	}
+	if requestedProvider != "" && profile.Provider != requestedProvider {
+		return fmt.Errorf("resolved provider %q does not match exact provider %q", profile.Provider, requestedProvider)
+	}
+	return nil
+}
+
+func (a *AgentLoop) resolveRunComputerTool(
+	ctx context.Context,
+	resp *client.CompletionResponse,
+) (string, error) {
+	// Koe Fast already has an immutable kfp1 route whose contract admits
+	// ordinary function tools. Never replace it with a second profile.
+	if a.executionProfileID != "" {
+		if !a.tools.Has("computer_use") {
+			return "", fmt.Errorf("generic computer_use tool is unavailable")
+		}
+		return "computer_use", nil
+	}
+	if a.computerProfile.ProfileID != "" {
+		return computerToolNameForContract(a.computerProfile.ToolContract)
+	}
+
+	resolver, ok := a.client.(client.ComputerExecutionProfileResolver)
+	if !ok {
+		// Local backends never cross the Cloud profile boundary and cannot send
+		// a provider-native schema. Keep their established generic tool path.
+		if !a.tools.Has("computer_use") {
+			return "", fmt.Errorf("generic computer_use tool is unavailable")
+		}
+		return "computer_use", nil
+	}
+
+	specificModel := exactResponseModel(resp, a.specificModel)
+	if specificModel == "" {
+		return "", fmt.Errorf("computer profile requires the exact model that selected the tool")
+	}
+	provider := ""
+	if resp != nil {
+		provider = strings.ToLower(strings.TrimSpace(resp.Provider))
+	}
+	contracts := []string{executionprofile.GenericComputerUseToolContract}
+	if provider == "anthropic" {
+		// Preserve the native Sonnet loop when Cloud proves the exact adapter
+		// contract. Generic computer_use is the same-model fallback only.
+		contracts = []string{
+			executionprofile.AnthropicComputerToolContract,
+			executionprofile.GenericComputerUseToolContract,
+		}
+	}
+
+	var resolutionErrors []string
+	for _, contract := range contracts {
+		profile, err := resolver.ResolveComputerExecutionProfile(ctx, client.ComputerExecutionProfileRequest{
+			ModelTier:            a.modelTier,
+			SpecificModel:        specificModel,
+			RequiredToolContract: contract,
+		})
+		if err != nil {
+			resolutionErrors = append(resolutionErrors, fmt.Sprintf("%s: %v", contract, err))
+			continue
+		}
+		profile.RequestedMode = executionprofile.ModeFull
+		profile.EffectiveMode = executionprofile.ModeFull
+		if err := profile.ValidateComputer(contract); err != nil {
+			resolutionErrors = append(resolutionErrors, fmt.Sprintf("%s: invalid profile: %v", contract, err))
+			continue
+		}
+		if err := validateComputerProfileExactRoute(profile, specificModel); err != nil {
+			resolutionErrors = append(resolutionErrors, fmt.Sprintf("%s: route mismatch: %v", contract, err))
+			continue
+		}
+		name, err := computerToolNameForContract(profile.ToolContract)
+		if err != nil {
+			resolutionErrors = append(resolutionErrors, fmt.Sprintf("%s: %v", contract, err))
+			continue
+		}
+		if !a.tools.Has(name) {
+			resolutionErrors = append(resolutionErrors, fmt.Sprintf("%s: tool %q is unavailable", contract, name))
+			continue
+		}
+		a.computerProfile = profile
+		a.computerToolName = name
+		a.computerToolsetHash = toolSchemaFingerprint(a.tools)
+		return name, nil
+	}
+	return "", fmt.Errorf("computer execution profile unavailable for %q: %s", specificModel, strings.Join(resolutionErrors, "; "))
+}
+
+func (a *AgentLoop) activateProfileBoundSelections(
+	ctx context.Context,
+	resp *client.CompletionResponse,
+	names []string,
+) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	activated := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	var activationErr error
+	for _, name := range names {
+		tool, ok := a.tools.Get(name)
+		if !ok || EffectiveToolProfileRequirement(tool) == ToolProfileNone {
+			if name != "" && !seen[name] {
+				seen[name] = true
+				activated = append(activated, name)
+			}
+			continue
+		}
+		if EffectiveToolProfileRequirement(tool) != ToolProfileComputer {
+			activationErr = fmt.Errorf("unsupported execution profile requirement for tool %q", name)
+			continue
+		}
+		actual, err := a.resolveRunComputerTool(ctx, resp)
+		if err != nil {
+			activationErr = err
+			continue
+		}
+		if !seen[actual] {
+			seen[actual] = true
+			activated = append(activated, actual)
+		}
+	}
+	return activated, activationErr
+}
+
+func (a *AgentLoop) SetExecutionEvidence(evidence executionprofile.Evidence) {
+	a.executionEvidenceMu.Lock()
+	defer a.executionEvidenceMu.Unlock()
+	a.executionEvidence.ToolOutcomes = append([]executionprofile.ToolOutcomeEvidence(nil), evidence.ToolOutcomes...)
+	a.executionEvidence.Deliverables = append([]executionprofile.DeliverableEvidence(nil), evidence.Deliverables...)
+	a.sideEffectReplayKeys = make(map[string]struct{})
+	for _, outcome := range evidence.ToolOutcomes {
+		if !outcome.Validated || !outcome.SideEffect ||
+			outcome.Outcome != "succeeded" ||
+			!isSHA256Digest(outcome.ArgumentsDigest) {
+			continue
+		}
+		a.sideEffectReplayKeys[sideEffectReplayKey(
+			outcome.ToolName,
+			outcome.ArgumentsDigest,
+		)] = struct{}{}
+	}
+}
+
+func (a *AgentLoop) ExecutionEvidence() executionprofile.Evidence {
+	a.executionEvidenceMu.Lock()
+	defer a.executionEvidenceMu.Unlock()
+	return executionprofile.Evidence{
+		ToolOutcomes: append([]executionprofile.ToolOutcomeEvidence(nil), a.executionEvidence.ToolOutcomes...),
+		Deliverables: append([]executionprofile.DeliverableEvidence(nil), a.executionEvidence.Deliverables...),
+	}
+}
+
+func (a *AgentLoop) recordToolOutcomeEvidence(e executionprofile.ToolOutcomeEvidence) {
+	a.executionEvidenceMu.Lock()
+	a.executionEvidence.ToolOutcomes = append(a.executionEvidence.ToolOutcomes, e)
+	a.executionEvidenceMu.Unlock()
+}
+
+func (a *AgentLoop) hasPriorSideEffect(
+	toolName string,
+	argumentsDigest string,
+) bool {
+	a.executionEvidenceMu.Lock()
+	defer a.executionEvidenceMu.Unlock()
+	_, ok := a.sideEffectReplayKeys[sideEffectReplayKey(
+		toolName,
+		argumentsDigest,
+	)]
+	return ok
+}
+
+func sideEffectReplayKey(toolName, argumentsDigest string) string {
+	return strings.TrimSpace(toolName) + "\x00" + argumentsDigest
+}
+
+func toolArgumentsDigest(arguments json.RawMessage) string {
+	digest := sha256.Sum256([]byte(normalizeJSON(arguments)))
+	return hex.EncodeToString(digest[:])
+}
+
+func isSHA256Digest(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // SetMemoryPreflight installs an optional fail-silent private-memory preflight.
@@ -1175,7 +1581,14 @@ func (a *AgentLoop) effectiveMaxTokens() int {
 	if a.maxTokens > 0 {
 		return a.maxTokens
 	}
-	return MaxTokensForModel(a.specificModel)
+	model := a.executionHarnessModel
+	if a.computerProfile.Model != "" {
+		model = a.computerProfile.Model
+	}
+	if model == "" {
+		model = a.specificModel
+	}
+	return MaxTokensForModel(model)
 }
 
 // LastRunStatus returns the status from the most recent Run call.
@@ -2162,6 +2575,9 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	a.runMsgInjected = nil   // reset for this run
 	a.runMsgTimestamps = nil // reset for this run
 	a.lastRunStatus = RunStatus{}
+	if !initialUserInjected {
+		a.clearRunComputerProfile()
+	}
 
 	// Phase tracker: initialized per Run. AssertClean fires the fail-closed
 	// invariant if any EnterTransient restore was forgotten (panics in
@@ -2213,11 +2629,28 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		a.workingSet = NewWorkingSet()
 	}
 	toolsetChanged := a.workingSet.SyncToolset(a.tools)
+	if a.computerProfile.ProfileID != "" &&
+		a.computerToolsetHash != a.workingSet.Fingerprint() {
+		return "", nil, fmt.Errorf(
+			"%w: profile=%s checkpoint=%s current=%s",
+			ErrComputerActivationToolsetChanged,
+			a.computerProfile.ProfileID,
+			a.computerToolsetHash,
+			a.workingSet.Fingerprint(),
+		)
+	}
 
 	// Resolve exposure independently for every tool, then pre-seed schemas that
 	// this session already loaded. Any remaining Deferred tool activates
 	// tool_search; schema size is diagnostic only and never reclassifies tools.
 	deferred := deferredToolNames(a.tools)
+	profileBoundTools := profileBoundToolNames(a.tools)
+	for name := range profileBoundTools {
+		// A profile requirement is stronger than an accidental Direct exposure:
+		// these schemas must stay cold until this run resolves an exact contract.
+		deferred[name] = true
+		a.workingSet.Remove(name)
+	}
 	// A resolved execution profile is a request-level contract, not an
 	// optional cold tool. Keep its selected computer schema in every profiled
 	// completion so Cloud can verify profile/model/tool consistency before
@@ -2230,7 +2663,14 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			delete(deferred, "computer_use")
 		}
 	}
-	loadedDeferred := preseedDeferredSchemas(a.workingSet, deferred)
+	loadedDeferred := preseedDeferredSchemas(a.workingSet, deferred, profileBoundTools)
+	if a.computerProfile.ProfileID != "" {
+		if name, err := computerToolNameForContract(a.computerProfile.ToolContract); err == nil {
+			if schemas := a.tools.FullSchemas([]string{name}); len(schemas) == 1 {
+				loadedDeferred[name] = schemas[0]
+			}
+		}
+	}
 	coldDeferred := remainingDeferredNames(deferred, loadedDeferred)
 	deferredMode := len(coldDeferred) > 0
 	if toolsetChanged {
@@ -2324,63 +2764,20 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	var toolNames []string
 	var toolSchemas []client.Tool
 	var baseSchemas []client.Tool
-
-	// Model identity: prefer specificModel, fall back to modelTier.
-	// Computed early so the deferred-mode branch can gate on capability.
-	modelID := a.specificModel
+	modelID := a.executionHarnessModel
+	if modelID == "" {
+		modelID = a.specificModel
+	}
 	if modelID == "" {
 		modelID = a.modelTier
 	}
-	a.toolRefSupported = modelSupportsToolRef(modelID)
 
-	if deferredMode && a.toolRefSupported {
-		// New path: send full tools[] with defer_loading flags; Anthropic strips
-		// deferred entries from the prefix hash so tools_h stays stable, while
-		// tool_search returns tool_reference blocks that the server expands inline.
-		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
-		effTools = a.tools.Clone()
-		effTools.Register(tsSearch)
-
-		baseSchemas = buildFullSchemasWithDefer(effTools, coldDeferred)
-		toolSchemas = baseSchemas
-		toolNames = liveToolNames(toolSchemas)
-
-		// Surface deferred summaries in the system prompt regardless of path.
-		// Anthropic already sees the full descriptions in tools[] (defer_loading
-		// strips from the cache-key prefix, not from the model's view), but the
-		// prompt's Deferred Tools section is a discovery hint — keeps parity
-		// with the legacy branch and avoids subtle model behavior drift.
-		for _, s := range deferredToolSummariesForNames(a.tools, coldDeferred) {
-			deferredSummaries = append(deferredSummaries, prompt.DeferredToolSummary{
-				Name:        s.Name,
-				Description: s.Description,
-			})
-		}
-
-		// Invariant check: Anthropic 400s if every tool is deferred.
-		// tool_search is registered without the defer flag so this should hold;
-		// downgrade defensively rather than risk a 400. The downgrade is
-		// unreachable in practice — log loudly if it ever fires so the registry
-		// misconfiguration is visible instead of silent.
-		if !hasAnyNonDeferred(toolSchemas) {
-			log.Printf("[cache-warn] hasAnyNonDeferred invariant violated: "+
-				"all %d tools have defer_loading=true; downgrading to legacy path. "+
-				"Check that tool_search registration preserves DeferLoading=false.",
-				len(toolSchemas))
-			a.toolRefSupported = false
-		}
-	}
-	if deferredMode && !a.toolRefSupported {
-		// Legacy path (Haiku, non-Anthropic, downgrade-on-invariant-violation):
-		// build local-only, let rebuildSchemas patch in cold schemas on demand,
-		// and surface deferred summaries in the system prompt.
-		//
-		// Reset deferredSummaries: when the upstream `toolRefSupported` branch
-		// downgraded (set a.toolRefSupported=false after already populating
-		// summaries), both branches would otherwise append the same entries and
-		// the system prompt's Deferred Tools section would list each tool twice.
-		deferredSummaries = nil
-
+	// One deterministic Deferred wire is used for every selector and provider:
+	// cold schemas stay out of tools[] until a completed tool_search turn loads
+	// them. In particular, a tier alias must not be safer than an explicit
+	// Sonnet model merely because ShanClaw can guess one provider capability.
+	a.toolRefSupported = false
+	if deferredMode {
 		tsSearch := newToolSearchTool(a.tools, coldDeferred, a.workingSet)
 		effTools = a.tools.Clone()
 		effTools.Register(tsSearch)
@@ -2755,34 +3152,42 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		openAIComputerBaseRequest    *client.CompletionRequest
 		openAIContinuationRequest    *client.CompletionRequest
 		openAIContinuationScreenshot *client.ContentBlock
-		computerUseOwnsTurn          bool
-		computerUseNeedsApps         bool
-		computerUseAlternateOnly     bool
-		computerUseAppsRecoveryUsed  bool
-		afterCheckpoint              bool
-		checkpointDone               bool
-		nudges                       = newNudgeWindow(maxNudges, nudgeWindowIters)
-		hallucinationNudges          int
-		lastPromptTokens             int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
-		lastOutputTokens             int    // actual output tokens from last LLM response
-		compactionSummary            string // cached summary from compaction
-		compactionApplied            bool   // true once messages have been shaped
-		reactiveCompacted            bool   // true once reactive compaction fired (never resets)
-		summaryFailures              int    // consecutive summary failures; backs off after 3
+		ordinaryOpenAIContinuation   struct {
+			responseID         string
+			model              string
+			executionProfileID string
+		}
+		emptyPostToolRetries        int // one recovery turn when tools ran but the model returned no visible final
+		emptyPostToolRecovery       bool
+		computerUseOwnsTurn         bool
+		computerUseNeedsApps        bool
+		computerUseAlternateOnly    bool
+		computerUseAppsRecoveryUsed bool
+		afterCheckpoint             bool
+		checkpointDone              bool
+		nudges                      = newNudgeWindow(maxNudges, nudgeWindowIters)
+		hallucinationNudges         int
+		lastPromptTokens            int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
+		lastOutputTokens            int    // actual output tokens from last LLM response
+		compactionSummary           string // cached summary from compaction
+		compactionApplied           bool   // true once messages have been shaped
+		reactiveCompacted           bool   // true once reactive compaction fired (never resets)
+		summaryFailures             int    // consecutive summary failures; backs off after 3
 		// lastSummaryFailureIter records the iteration of the most recent summary
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
 		// short-circuits the distance check until a real failure streak writes it.
-		lastSummaryFailureIter  int
-		toolSearchFired         bool
-		preambleEmitted         bool
-		silentNarratableBatches int
-		latestUserText          = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
-		cloudNudgeFired         bool
-		cloudDelegateClaimed    bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
-		cloudResultContent      string // non-empty when a cloud deliverable should bypass LLM summarization
-		lastDiscoveryInput      string // dedup: skip discovery when user text hasn't changed between iterations
-		contextBloatStatusSent  bool
+		lastSummaryFailureIter           int
+		toolSearchFired                  bool
+		computerProfileCheckpointPending bool
+		preambleEmitted                  bool
+		silentNarratableBatches          int
+		latestUserText                   = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
+		cloudNudgeFired                  bool
+		cloudDelegateClaimed             bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
+		cloudResultContent               string // non-empty when a cloud deliverable should bypass LLM summarization
+		lastDiscoveryInput               string // dedup: skip discovery when user text hasn't changed between iterations
+		contextBloatStatusSent           bool
 
 		// Cross-iteration dedup: cache successful results from previous iteration
 		// to prevent re-execution of identical tool calls across consecutive iterations.
@@ -2888,6 +3293,29 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		})
 	}
 
+	consumeOrdinaryOpenAIContinuation := func(req *client.CompletionRequest) {
+		responseID := ordinaryOpenAIContinuation.responseID
+		model := ordinaryOpenAIContinuation.model
+		executionProfileID := ordinaryOpenAIContinuation.executionProfileID
+		ordinaryOpenAIContinuation.responseID = ""
+		ordinaryOpenAIContinuation.model = ""
+		ordinaryOpenAIContinuation.executionProfileID = ""
+		if req == nil || responseID == "" {
+			return
+		}
+		// Native computer has its own sealed continuation request. A profile
+		// change between the function call and its result also invalidates the
+		// provider-owned ordinary cursor, so fail closed instead of crossing
+		// execution routes.
+		if openAIContinuationRequest != nil ||
+			req.ExecutionProfileID != executionProfileID ||
+			validateTrustedOpenAIComputerProfile(a.executionProfile) == nil {
+			return
+		}
+		req.PreviousResponseID = responseID
+		req.SpecificModel = model
+	}
+
 	// runForceStopTurn issues the final non-tool LLM turn after the loop
 	// detector decided to stop. It preserves the live agent config so this
 	// turn behaves like every other turn (MaxTokens, Thinking, SpecificModel,
@@ -2927,7 +3355,14 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			a.tracker.MarkDirty()
 		}
 		captureRunMessages()
-		a.maybeCheckpoint(ctx)
+		if computerProfileCheckpointPending {
+			if err := a.checkpointNow(ctx); err != nil {
+				return "", fmt.Errorf("persist computer profile activation before force stop: %w", err)
+			}
+			computerProfileCheckpointPending = false
+		} else {
+			a.maybeCheckpoint(ctx)
+		}
 		if a.tracker != nil {
 			a.tracker.Enter(PhaseForceStop)
 		}
@@ -3007,16 +3442,30 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		}
 
 		req := client.CompletionRequest{
-			Messages:        a.messagesForLLM(messages),
-			ModelTier:       a.modelTier,
-			SpecificModel:   a.specificModel,
-			Temperature:     a.temperature,
-			MaxTokens:       a.effectiveMaxTokens(),
-			Thinking:        a.thinking,
-			ReasoningEffort: a.reasoningEffort,
-			EffortTier:      a.effortTier,
-			SessionID:       a.sessionID,
-			CacheSource:     a.cacheSource,
+			Messages:                 a.messagesForLLM(messages),
+			ModelTier:                a.requestModelTier(),
+			SpecificModel:            a.requestSpecificModel(),
+			Temperature:              a.temperature,
+			MaxTokens:                a.effectiveMaxTokens(),
+			Thinking:                 a.requestThinking(),
+			ReasoningEffort:          a.requestReasoningEffort(),
+			EffortTier:               a.requestEffortTier(),
+			SessionID:                a.sessionID,
+			CacheSource:              a.cacheSource,
+			ExecutionProfileID:       a.requestExecutionProfileID(),
+			ResolvedExecutionProfile: a.executionProfile,
+			ParallelToolCalls:        a.requestParallelToolCalls(),
+			ResponseCachePolicy:      a.requestResponseCachePolicy(),
+		}
+		consumeOrdinaryOpenAIContinuation(&req)
+		if a.executionProfile != nil || a.computerProfile.ProfileID != "" {
+			// General ep1 profiles validate the exact computer schema on
+			// every completion, including force-stop synthesis turns.
+			req.Tools = toolSchemas
+			// The schema must remain present for ep1 validation, but this is a
+			// synthesis-only turn. Explicitly prohibit another tool call so a
+			// repeated computer action cannot be silently discarded below.
+			req.ToolChoice = "none"
 		}
 		finalResp, err := a.completeWithRetry(ctx, req)
 		if err != nil {
@@ -3052,6 +3501,9 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		setRunStatus(runstatus.CodeIterationLimit, true)
 		if a.handler != nil {
 			a.handler.OnText(text)
+		}
+		if !finalResp.HasToolCalls() {
+			a.clearLastSentOrdinaryContinuation(req.PreviousResponseID)
 		}
 		return text, nil
 	}
@@ -3724,22 +4176,31 @@ iterationLoop:
 		}
 		req := client.CompletionRequest{
 			Messages:                 requestMessages,
-			ModelTier:                a.modelTier,
-			SpecificModel:            a.specificModel,
+			ModelTier:                a.requestModelTier(),
+			SpecificModel:            a.requestSpecificModel(),
 			Temperature:              a.temperature,
 			MaxTokens:                a.effectiveMaxTokens(),
 			Tools:                    toolSchemas,
-			Thinking:                 a.thinking,
-			ReasoningEffort:          a.reasoningEffort,
-			EffortTier:               a.effortTier,
+			Thinking:                 a.requestThinking(),
+			ReasoningEffort:          a.requestReasoningEffort(),
+			EffortTier:               a.requestEffortTier(),
 			SessionID:                a.sessionID,
 			CacheSource:              a.cacheSource,
-			ExecutionProfileID:       executionProfileID(a.executionProfile),
+			ExecutionProfileID:       a.requestExecutionProfileID(),
 			ResolvedExecutionProfile: a.executionProfile,
+			ParallelToolCalls:        a.requestParallelToolCalls(),
+			ResponseCachePolicy:      a.requestResponseCachePolicy(),
 		}
 		if a.forceInitialToolUse && openAIComputerBaseRequest == nil {
 			req.ToolChoice = "any"
 		}
+		// Ordinary Responses continuations are deliberately one-shot and
+		// run-local. Keep the full local transcript on the request; Cloud
+		// uses previous_response_id to send only the incremental tool result
+		// upstream. The helper also pins the actual response model so a tier
+		// request that reached OpenAI through fallback cannot jump back to a
+		// different provider while carrying an OpenAI-owned cursor.
+		consumeOrdinaryOpenAIContinuation(&req)
 		reuseExactRequestOnRetry := false
 		isOpenAIComputerContinuation := openAIContinuationRequest != nil
 		// A Responses continuation carries previous_response_id plus exactly
@@ -3752,6 +4213,14 @@ iterationLoop:
 			req = *openAIContinuationRequest
 			openAIContinuationRequest = nil
 			reuseExactRequestOnRetry = true
+		}
+		emptyRecoveryRequest := emptyPostToolRecovery
+		if emptyRecoveryRequest {
+			// A post-tool empty response is ambiguous: the model may have lost
+			// only its visible text, while the side effects already happened.
+			// The one recovery request is synthesis-only so it cannot repeat
+			// completed actions under a fresh tool-call ID.
+			req.ToolChoice = "none"
 		}
 
 		recordMainLLMUsage := func(resp *client.CompletionResponse, updateLastIter bool) client.Usage {
@@ -3812,7 +4281,7 @@ iterationLoop:
 				// On retries, skip streaming to avoid duplicate partial deltas.
 				if attempt == 0 && a.enableStreaming && a.handler != nil {
 					streamingText.Reset()
-					streamTools := newStreamToolStarter(ctx, a, effTools, a.handler)
+					streamTools := newStreamToolStarter(ctx, a, effTools, req.Tools, a.handler)
 					resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
 						// A delta means the model received the request (incl. the
 						// drained system-event scaffold) and is responding — so the
@@ -4078,6 +4547,8 @@ iterationLoop:
 					reanchorActiveTask(MetaBoundaryPostCompaction)
 
 					// Rebuild request with compacted messages.
+					ordinaryPreviousResponseID := req.PreviousResponseID
+					ordinarySpecificModel := req.SpecificModel
 					if prepareErr := prepareProviderNativeTools(ctx, effTools, toolSchemas); prepareErr != nil {
 						captureRunMessages()
 						setRunStatus(runstatus.CodeFromError(prepareErr), false)
@@ -4086,21 +4557,33 @@ iterationLoop:
 					toolSchemas = refreshProviderNativeToolSchemas(effTools, toolSchemas)
 					req = client.CompletionRequest{
 						Messages:                 a.messagesForLLM(messages),
-						ModelTier:                a.modelTier,
-						SpecificModel:            a.specificModel,
+						ModelTier:                a.requestModelTier(),
+						SpecificModel:            a.requestSpecificModel(),
 						Temperature:              a.temperature,
 						MaxTokens:                a.effectiveMaxTokens(),
 						Tools:                    toolSchemas,
-						Thinking:                 a.thinking,
-						ReasoningEffort:          a.reasoningEffort,
-						EffortTier:               a.effortTier,
+						Thinking:                 a.requestThinking(),
+						ReasoningEffort:          a.requestReasoningEffort(),
+						EffortTier:               a.requestEffortTier(),
 						SessionID:                a.sessionID,
 						CacheSource:              a.cacheSource,
-						ExecutionProfileID:       executionProfileID(a.executionProfile),
+						ExecutionProfileID:       a.requestExecutionProfileID(),
 						ResolvedExecutionProfile: a.executionProfile,
+						ParallelToolCalls:        a.requestParallelToolCalls(),
+						ResponseCachePolicy:      a.requestResponseCachePolicy(),
 					}
 					if a.forceInitialToolUse && openAIComputerBaseRequest == nil {
 						req.ToolChoice = "any"
+					}
+					if emptyRecoveryRequest {
+						req.ToolChoice = "none"
+					}
+					if validOrdinaryOpenAIResponseID(ordinaryPreviousResponseID) &&
+						strings.TrimSpace(ordinarySpecificModel) != "" {
+						// This is the same logical tool-result request after
+						// local compaction, not a new trajectory step.
+						req.PreviousResponseID = ordinaryPreviousResponseID
+						req.SpecificModel = ordinarySpecificModel
 					}
 					// Checkpoint the compacted state before retrying. Gated on
 					// the dirty flag we just set — a no-op compaction path
@@ -4201,6 +4684,22 @@ iterationLoop:
 				continue
 			}
 			break
+		}
+
+		if emptyRecoveryRequest {
+			emptyPostToolRecovery = false
+			if resp.HasToolCalls() {
+				// Fail closed even if a provider violates tool_choice=none.
+				// Executing this response could duplicate an already-completed
+				// side effect under a new tool-call ID.
+				recordMainLLMUsage(resp, false)
+				captureRunMessages()
+				setRunStatus(runstatus.CodeEmptyResponse, false)
+				return "", usage, fmt.Errorf(
+					"%w: synthesis-only recovery returned tool calls",
+					ErrEmptyFinalResponse,
+				)
+			}
 		}
 
 		normalizedUsage := recordMainLLMUsage(resp, true)
@@ -4381,6 +4880,13 @@ iterationLoop:
 			continue
 		}
 
+		if responseID, model := ordinaryOpenAIResponsesContinuation(resp); responseID != "" &&
+			a.executionProfileID == "" {
+			ordinaryOpenAIContinuation.responseID = responseID
+			ordinaryOpenAIContinuation.model = model
+			ordinaryOpenAIContinuation.executionProfileID = req.ExecutionProfileID
+		}
+
 		// Handle text-only responses (no tool calls).
 		// Text-only means "done" unless truncated, after a checkpoint, or
 		// hallucination is detected (Layer 3).
@@ -4472,8 +4978,10 @@ iterationLoop:
 			// Its task wrapper parses a strict terminal outcome, so the generic
 			// "claim without verification in this response" nudge would discard
 			// valid long summaries and force an unnecessary provider round trip.
+			// Ordinary completed tools are evidence too: only nudge when this run
+			// has no native trajectory and no ordinary tool result at all.
 			if openAIComputerBaseRequest == nil &&
-				totalToolCalls > 0 &&
+				totalToolCalls == 0 &&
 				hallucinationNudges < 2 &&
 				looksLikeUnverifiedClaim(resp.OutputText) {
 				hallucinationNudges++
@@ -4536,6 +5044,26 @@ iterationLoop:
 				fullText = recoverVisibleTextFromBlocks(resp)
 			}
 			if strings.TrimSpace(fullText) == "" {
+				if totalToolCalls > 0 && emptyPostToolRetries == 0 {
+					emptyPostToolRetries++
+					emptyPostToolRecovery = true
+					messages = append(messages, client.Message{
+						Role: "user",
+						Content: client.NewTextContent(
+							"Your last turn returned no visible response after tool execution. " +
+								"Continue from the existing tool results, do not repeat completed actions, " +
+								"and finish the user's task.",
+						),
+					})
+					markInjected()
+					if rs, ok := a.handler.(RunStatusHandler); ok {
+						rs.OnRunStatus(
+							"empty_response_retry",
+							"upstream returned no visible response after tools; retrying once",
+						)
+					}
+					continue
+				}
 				captureRunMessages()
 				setRunStatus(runstatus.CodeEmptyResponse, false)
 				// Audit row so post-incident triage can attribute "user saw
@@ -4610,6 +5138,7 @@ iterationLoop:
 				}
 				continue
 			}
+			a.clearLastSentOrdinaryContinuation(req.PreviousResponseID)
 			return fullText, usage, nil
 		}
 
@@ -4687,6 +5216,9 @@ iterationLoop:
 			argsStr     string
 			decision    string
 			wasApproved bool
+			validated   bool
+			sideEffect  bool
+			argsDigest  string
 			resolved    bool // true if already resolved (denied/unknown/hook-denied)
 			cacheKey    string
 			stateTraits CallStateTraits
@@ -4766,6 +5298,7 @@ iterationLoop:
 
 			// Denied-call blocking: auto-reject if this exact call was denied earlier
 			if deniedCalls[dedupKey] {
+				callMeta[idx].decision = "deny"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "tool call blocked: previously denied this turn. Use a different approach.", IsError: true},
@@ -4811,6 +5344,26 @@ iterationLoop:
 				continue
 			}
 
+			// A registered Deferred tool is not callable merely because the
+			// registry can look it up. It must have been advertised in this run
+			// (or safely pre-seeded) before validation, approval, hooks, or I/O.
+			if deferred[fc.Name] {
+				if _, loaded := loadedDeferred[fc.Name]; !loaded {
+					callMeta[idx].resolved = true
+					execResults[idx] = toolExecResult{
+						result: ToolResult{
+							Content: "deferred tool is not loaded in this run; call tool_search first, then retry the tool on the next model turn",
+							IsError: true,
+						},
+						name: fc.Name,
+					}
+					if a.handler != nil {
+						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
+					}
+					continue
+				}
+			}
+
 			// Skill admission happens before validation, permission prompts, and
 			// hooks. A tool excluded by the active skill must be observationally
 			// equivalent to an unavailable capability: it must not ask the user
@@ -4823,6 +5376,7 @@ iterationLoop:
 					stickyInjectPending = true
 				}
 				a.logAudit(fc.Name, argsStr, denyMsg, "deny", false, 0, nil)
+				callMeta[idx].decision = "deny"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: denyMsg, IsError: true, ErrorCategory: ErrCategoryPermission},
@@ -4934,6 +5488,44 @@ iterationLoop:
 				}
 				continue
 			}
+			callMeta[idx].validated = true
+			if readOnly, ok := tool.(ReadOnlyChecker); !ok || !readOnly.IsReadOnlyCall(argsStr) {
+				callMeta[idx].sideEffect = true
+				callMeta[idx].argsDigest = toolArgumentsDigest(fc.Arguments)
+				if a.hasPriorSideEffect(
+					fc.Name,
+					callMeta[idx].argsDigest,
+				) {
+					callMeta[idx].decision = "replay_blocked"
+					callMeta[idx].resolved = true
+					execResults[idx] = toolExecResult{
+						result: ToolResult{
+							Content: "side effect replay blocked: an identical validated action already succeeded in prior execution evidence",
+							IsError: true,
+						},
+						name: fc.Name,
+					}
+					a.logAudit(
+						fc.Name,
+						argsStr,
+						execResults[idx].result.Content,
+						callMeta[idx].decision,
+						false,
+						0,
+						nil,
+					)
+					if a.handler != nil {
+						a.handler.OnToolResult(
+							fc.Name,
+							argsStr,
+							fc.ID,
+							execResults[idx].result,
+							0,
+						)
+					}
+					continue
+				}
+			}
 
 			stateTraits := resolveCallStateTraits(fc.Name, argsStr)
 			if !stateTraits.Cacheable && len(stateTraits.Reads) == 0 && len(stateTraits.Writes) == 0 && !stateTraits.UnknownWrite {
@@ -5007,6 +5599,8 @@ iterationLoop:
 				}
 				if hookDecision == "deny" {
 					a.logAudit(fc.Name, argsStr, "tool call denied by hook: "+hookReason, "deny", false, 0, nil)
+					callMeta[idx].decision = "deny"
+					callMeta[idx].wasApproved = false
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{Content: "tool call denied by hook: " + hookReason, IsError: true},
@@ -5080,21 +5674,38 @@ iterationLoop:
 					er := execResults[ac.index]
 					if !er.result.IsError {
 						names := parseLoadedHeader(er.result.Content)
+						if len(names) > 0 {
+							profileBefore := a.computerProfile.ProfileID
+							activated, activationErr := a.activateProfileBoundSelections(ctx, resp, names)
+							if profileBefore == "" && a.computerProfile.ProfileID != "" {
+								computerProfileCheckpointPending = true
+							}
+							rewritten := buildLoadedToolSearchResult(effTools, activated)
+							if activationErr != nil {
+								rewritten.Content += "\nProfile-bound computer tools were not loaded: " + activationErr.Error()
+								rewritten.IsError = len(activated) == 0
+								execResults[ac.index].result = rewritten
+								setRunStatus(runstatus.CodeFromError(activationErr), false)
+								return "", usage, fmt.Errorf(
+									"activate profile-bound tool selection: %w",
+									activationErr,
+								)
+							}
+							execResults[ac.index].result = rewritten
+							names = activated
+						}
 						for _, name := range names {
 							if _, exists := loadedDeferred[name]; !exists {
 								schemas := effTools.FullSchemas([]string{name})
 								if len(schemas) > 0 {
 									loadedDeferred[name] = schemas[0]
-									a.workingSet.Add(name, schemas[0])
+									if !profileBoundTools[name] {
+										a.workingSet.Add(name, schemas[0])
+									}
 								}
 							}
 						}
-						// Only rebuild on the legacy path. The tool-ref path already
-						// sent the full schema array with DeferLoading flags up front;
-						// rebuildSchemas would strip those flags.
-						if !a.toolRefSupported {
-							toolSchemas = rebuildSchemas(effTools, baseSchemas, loadedDeferred)
-						}
+						toolSchemas = rebuildSchemas(effTools, baseSchemas, loadedDeferred)
 						if len(names) > 0 {
 							toolSearchFired = true
 						}
@@ -5172,6 +5783,29 @@ iterationLoop:
 				computerUseNeedsApps = false
 				computerUseAlternateOnly = true
 			}
+
+			outcome := "succeeded"
+			if result.IsError || er.err != nil {
+				outcome = "failed"
+			}
+			if callMeta[idx].decision == "deny" ||
+				(callMeta[idx].decision == "ask" && !callMeta[idx].wasApproved) {
+				outcome = "denied"
+			} else if !callMeta[idx].validated {
+				outcome = "rejected"
+			}
+			digest := sha256.Sum256([]byte(result.Content))
+			a.recordToolOutcomeEvidence(executionprofile.ToolOutcomeEvidence{
+				ToolCallID:         fc.ID,
+				ToolName:           fc.Name,
+				Validated:          callMeta[idx].validated,
+				Outcome:            outcome,
+				PermissionDecision: callMeta[idx].decision,
+				PermissionApproved: callMeta[idx].wasApproved,
+				SideEffect:         callMeta[idx].sideEffect && !callMeta[idx].resolved,
+				ArgumentsDigest:    callMeta[idx].argsDigest,
+				ResultDigest:       hex.EncodeToString(digest[:]),
+			})
 
 			// Track successful file reads for read-before-edit enforcement
 			if fc.Name == "file_read" && !result.IsError {
@@ -5493,7 +6127,15 @@ iterationLoop:
 		// tracker, snapshot the conversation now so a mid-turn crash does
 		// not lose this batch's work. No-op otherwise.
 		captureRunMessages()
-		a.maybeCheckpoint(ctx)
+		if computerProfileCheckpointPending {
+			if err := a.checkpointNow(ctx); err != nil {
+				setRunStatus(runstatus.CodeFromError(err), false)
+				return "", usage, fmt.Errorf("persist computer profile activation: %w", err)
+			}
+			computerProfileCheckpointPending = false
+		} else {
+			a.maybeCheckpoint(ctx)
+		}
 	}
 
 	// Graceful degradation: give the model one final non-tool turn to
@@ -6375,6 +7017,54 @@ func hasNativeToolIDs(toolCalls []client.FunctionCall) bool {
 	return true
 }
 
+// ordinaryOpenAIResponsesContinuation returns the provider-owned cursor and
+// exact model for an ordinary OpenAI Responses function-tool result. The
+// cursor is intentionally stricter than a prefix check so malformed or
+// provider-mismatched request IDs can never influence the next route.
+func ordinaryOpenAIResponsesContinuation(resp *client.CompletionResponse) (string, string) {
+	if resp == nil ||
+		strings.ToLower(strings.TrimSpace(resp.Provider)) != "openai" ||
+		responseHasOpenAIComputerCall(resp) ||
+		!resp.HasToolCalls() {
+		return "", ""
+	}
+	for _, call := range resp.AllToolCalls() {
+		if call.Type == client.OpenAIComputerCallType {
+			return "", ""
+		}
+	}
+	responseID := resp.RequestID
+	if !validOrdinaryOpenAIResponseID(responseID) {
+		return "", ""
+	}
+	model := strings.TrimSpace(resp.Model)
+	if model == "" {
+		return "", ""
+	}
+	return responseID, model
+}
+
+func validOrdinaryOpenAIResponseID(value string) bool {
+	const prefix = "resp_"
+	if !strings.HasPrefix(value, prefix) ||
+		len(value) == len(prefix) ||
+		len(value) > 256 ||
+		value != strings.TrimSpace(value) {
+		return false
+	}
+	for _, char := range value[len(prefix):] {
+		switch {
+		case char >= 'a' && char <= 'z':
+		case char >= 'A' && char <= 'Z':
+		case char >= '0' && char <= '9':
+		case char == '_', char == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // nudgeWindow tracks recent nudge events by iteration index and reports
 // whether the count within the trailing `window` iterations meets `max`.
 // Replaces the previous flat `nudgeCount` counter that never reset, which
@@ -7044,6 +7734,22 @@ func (a *AgentLoop) captureSentRequest(req client.CompletionRequest) {
 	}
 	a.lastSentRequest = snapshot
 	a.lastSentValid = true
+}
+
+// clearLastSentOrdinaryContinuation removes a consumed ordinary Responses
+// cursor only from the post-Run fork snapshot. The actual dispatched request
+// remains untouched for retries and evidence, while suggestion/speculation
+// forks cannot accidentally branch again from the pre-tool-result response.
+// Native computer tokens use a different sealed prefix and are never changed.
+func (a *AgentLoop) clearLastSentOrdinaryContinuation(previousResponseID string) {
+	if !validOrdinaryOpenAIResponseID(previousResponseID) {
+		return
+	}
+	a.lastSentMu.Lock()
+	defer a.lastSentMu.Unlock()
+	if a.lastSentRequest.PreviousResponseID == previousResponseID {
+		a.lastSentRequest.PreviousResponseID = ""
+	}
 }
 
 // LastSentRequest returns a DEEP-COPIED snapshot of the most recently sent

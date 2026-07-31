@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 )
 
@@ -59,18 +61,20 @@ type IdempotentRequest struct {
 // in Messages; this metadata only reconstructs the execution lane and delivery
 // context. It intentionally does not duplicate the user prompt or credentials.
 type InterruptedTurn struct {
-	Agent           string          `json:"agent,omitempty"`
-	Source          string          `json:"source,omitempty"`
-	Sender          string          `json:"sender,omitempty"`
-	Channel         string          `json:"channel,omitempty"`
-	ThreadID        string          `json:"thread_id,omitempty"`
-	RouteKey        string          `json:"route_key,omitempty"`
-	CWD             string          `json:"cwd,omitempty"`
-	CloudMessageID  string          `json:"cloud_message_id,omitempty"`
-	IMStatusContext json.RawMessage `json:"im_status_context,omitempty"`
-	Participants    []string        `json:"participants,omitempty"`
-	ResumeAttempts  int             `json:"resume_attempts,omitempty"`
-	UpdatedAt       time.Time       `json:"updated_at"`
+	Agent           string                 `json:"agent,omitempty"`
+	Source          string                 `json:"source,omitempty"`
+	Sender          string                 `json:"sender,omitempty"`
+	Channel         string                 `json:"channel,omitempty"`
+	ThreadID        string                 `json:"thread_id,omitempty"`
+	RouteKey        string                 `json:"route_key,omitempty"`
+	CWD             string                 `json:"cwd,omitempty"`
+	CloudMessageID  string                 `json:"cloud_message_id,omitempty"`
+	IMStatusContext json.RawMessage        `json:"im_status_context,omitempty"`
+	Participants    []string               `json:"participants,omitempty"`
+	ResumeAttempts  int                    `json:"resume_attempts,omitempty"`
+	ExecutionRun    executionprofile.Run   `json:"execution_run,omitempty"`
+	ExecutionConfig *agent.ExecutionConfig `json:"execution_config,omitempty"`
+	UpdatedAt       time.Time              `json:"updated_at"`
 }
 
 type Session struct {
@@ -109,6 +113,10 @@ type Session struct {
 	// recovery continue the saved transcript without replaying completed tools
 	// or waiting for the user to resend the original request.
 	InterruptedTurn *InterruptedTurn `json:"interrupted_turn,omitempty"`
+	// ExecutionRuns is the durable provider-neutral run ledger. It carries only
+	// resolved profile metadata plus validated tool/deliverable evidence; no
+	// provider-native response ids or hidden reasoning are persisted.
+	ExecutionRuns []executionprofile.Run `json:"execution_runs,omitempty"`
 	// Pinned sticks the session to the top of the list regardless of
 	// recency. Set/cleared via PATCH /sessions/{id} {"pinned": bool}.
 	Pinned bool `json:"pinned,omitempty"`

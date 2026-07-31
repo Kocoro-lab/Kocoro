@@ -7,6 +7,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 const (
@@ -65,10 +66,11 @@ func microCompactResult(ctx context.Context, c ctxwin.Completer, toolName, conte
 		Messages: []client.Message{
 			{Role: "user", Content: client.NewTextContent(prompt)},
 		},
-		ModelTier:   "small",
-		Temperature: 0.0,
-		MaxTokens:   200,
-		CacheSource: "helper",
+		ModelTier:           "small",
+		Temperature:         0.0,
+		MaxTokens:           200,
+		CacheSource:         "helper",
+		ResponseCachePolicy: executionprofile.ResponseCacheOff,
 	})
 	if err != nil || resp.OutputText == "" {
 		return "", false, client.Usage{}

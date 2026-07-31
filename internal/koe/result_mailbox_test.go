@@ -350,6 +350,79 @@ func TestResultDeliveryWaitsForActiveCallAndUserFloor(t *testing.T) {
 	}
 }
 
+func TestImmediateDoTaskResultWaitsForAcknowledgementPlaybackTail(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "120")
+
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply": "The fast task is complete.", "spoken_summary": "The fast task is complete.",
+		})
+	}))
+	defer mock.Close()
+
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	mailbox := NewResultMailbox()
+	state := NewCallState("burst-fast-result", "")
+	mailbox.BeginBurst(state.BurstID())
+	disp := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	captured := &captureSender{}
+	var h *eventHandler
+	h = newEventHandlerWithMailbox(disp, state, audio, func(v any) error {
+		if err := captured.send(v); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			h.handleEvent(context.Background(), responseCreatedForRequest("result-response", v))
+		}
+		return nil
+	}, mailbox, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	// The Realtime model is still speaking the short pre-tool acknowledgement when
+	// the daemon returns immediately.
+	h.handleEvent(ctx, []byte(`{"type":"response.created","response":{"id":"ack-response"}}`))
+	h.handleEvent(ctx, []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleFunctionCallForResponse(ctx, "ack-response", "fast-call", "do_task", []byte(`{"task":"finish immediately"}`), false)
+	waitUntil(t, func() bool { return mailbox.pending() == 1 }, "immediate do_task result did not reach mailbox")
+
+	if got := captured.countType("response.create"); got != 0 {
+		t.Fatalf("result response started during acknowledgement generation: creates=%d", got)
+	}
+	if got := captured.countType("response.cancel"); got != 0 {
+		t.Fatalf("immediate result cancelled acknowledgement generation: cancels=%d", got)
+	}
+
+	// response.done precedes actual WebRTC playout drain. The result must remain
+	// queued both before output_audio_buffer.stopped and during the local speaker
+	// tail that follows it.
+	h.handleEvent(ctx, []byte(`{"type":"response.done","response":{"id":"ack-response","status":"completed"}}`))
+	time.Sleep(40 * time.Millisecond)
+	if got := captured.countType("response.create"); got != 0 {
+		t.Fatalf("result response started before acknowledgement playback stopped: creates=%d", got)
+	}
+	h.handleEvent(ctx, []byte(`{"type":"output_audio_buffer.stopped"}`))
+	time.Sleep(40 * time.Millisecond)
+	if got := captured.countType("response.create"); got != 0 {
+		t.Fatalf("result response started inside acknowledgement playback tail: creates=%d", got)
+	}
+	if got := captured.countType("response.cancel"); got != 0 {
+		t.Fatalf("immediate result interrupted acknowledgement playback: cancels=%d", got)
+	}
+
+	waitUntil(t, func() bool { return captured.countType("response.create") == 1 }, "result was not announced after acknowledgement playback drained")
+}
+
 func TestResultDeliveryIgnoresUnrelatedResponseLifecycle(t *testing.T) {
 	m := NewResultMailbox()
 	h := newEventHandlerWithMailbox(nil, nil, nil, func(any) error { return nil }, m, nil)

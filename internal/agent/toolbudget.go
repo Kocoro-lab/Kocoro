@@ -156,6 +156,8 @@ func toolSchemaFingerprint(reg *ToolRegistry) string {
 		_, _ = h.Write([]byte{0})
 		_, _ = h.Write([]byte(EffectiveToolExposure(t)))
 		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(EffectiveToolProfileRequirement(t)))
+		_, _ = h.Write([]byte{0})
 		_, _ = h.Write(data)
 		_, _ = h.Write([]byte{'\n'})
 	}

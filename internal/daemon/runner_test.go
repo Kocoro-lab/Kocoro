@@ -21,6 +21,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -127,6 +128,50 @@ func TestConfigureDaemonComputerUseDispatcherPreservesLegacyToolsUntilReady(t *t
 			t.Fatal("dispatcher did not disable legacy GUI bash commands")
 		}
 	})
+}
+
+func TestKoeExecutionTelemetryIsContentFree(t *testing.T) {
+	run := executionprofile.Run{
+		LogicalTaskID: "burst:t01",
+		RunID:         "ker1_child",
+		ParentRunID:   "ker1_parent",
+		Profile: executionprofile.Profile{
+			RequestedMode:    executionprofile.ModeFast,
+			EffectiveMode:    executionprofile.ModeFast,
+			ProfileName:      executionprofile.FastProfileName,
+			ProfileVersion:   executionprofile.FastProfileVersion,
+			ProfileID:        "secret-profile-id",
+			ResolutionReason: "cloud_profile_resolved",
+		},
+		Evidence: executionprofile.Evidence{ToolOutcomes: []executionprofile.ToolOutcomeEvidence{{
+			ToolCallID:   "secret-arguments",
+			ToolName:     "secret-output",
+			ResultDigest: "secret-digest",
+		}}},
+	}
+	raw, err := json.Marshal(newKoeExecutionTelemetry("resolved", run))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{
+		`"requested_mode":"fast"`,
+		`"effective_mode":"fast"`,
+		`"effective_profile":"koe-fast-v1"`,
+		`"resolution_reason":"cloud_profile_resolved"`,
+		`"logical_task_id":"burst:t01"`,
+		`"run_id":"ker1_child"`,
+		`"parent_run_id":"ker1_parent"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("telemetry %s missing %s", text, want)
+		}
+	}
+	for _, forbidden := range []string{"secret-profile-id", "secret-arguments", "secret-output", "secret-digest"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("content-free telemetry leaked %q: %s", forbidden, text)
+		}
+	}
 }
 
 func TestIsMessagingPlatform(t *testing.T) {
@@ -1688,41 +1733,134 @@ func TestApplyAgentModelOverlayToLoop_EmptyEffortInherits(t *testing.T) {
 	}
 }
 
-// TestApplyKoeEffortTier verifies the voice fast-effort toggle: on koe sources,
-// fast mode (unset/true) forces low over the text-mode effort, an explicit
-// false leaves it untouched, and non-koe sources are always left untouched.
-func TestApplyKoeEffortTier(t *testing.T) {
-	tru := true
+func TestResolveKoeExecutionRunFailsClosedWithoutChangingAgentConfig(t *testing.T) {
 	fls := false
+	tests := []struct {
+		name      string
+		source    string
+		mode      executionprofile.Mode
+		inherited executionprofile.Mode
+		koe       config.KoeConfig
+		reason    string
+	}{
+		{"requested full", "koe", executionprofile.ModeFull, "", config.KoeConfig{}, "requested_full"},
+		{"setting disabled", "koe", executionprofile.ModeFast, "", config.KoeConfig{FastEffort: &fls}, "fast_setting_disabled"},
+		{"resolver missing", "koe", executionprofile.ModeFast, "", config.KoeConfig{}, "cloud_profile_missing"},
+		{"wire lineage hint is not authority", "koe", executionprofile.ModeFast, executionprofile.ModeFull, config.KoeConfig{}, "cloud_profile_missing"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			run := resolveKoeExecutionRun(context.Background(), nil, RunAgentRequest{
+				Source: tc.source, ExecutionMode: tc.mode, InheritedMode: tc.inherited, ExecutionRunID: "ker1_test",
+			}, tc.koe)
+			if run.Profile.EffectiveMode != executionprofile.ModeFull || run.Profile.ResolutionReason != tc.reason {
+				t.Fatalf("run = %+v", run)
+			}
+			if run.Profile.Model != "" || run.Profile.ReasoningEffort != "" || run.Profile.ProfileID != "" {
+				t.Fatalf("full fallback must carry no agent config overrides: %+v", run.Profile)
+			}
+		})
+	}
+}
 
-	// Unset fast_effort → default ON → force low, overriding whatever text-mode
-	// effort the global/per-agent chain left on the loop.
-	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
-	loop.SetEffortTier("max")
-	applyKoeEffortTier(loop, "koe", config.KoeConfig{})
-	if got := loop.EffortTier(); got != "low" {
-		t.Errorf("koe with unset fast_effort = %q, want low (default ON)", got)
+func TestApplyKoeModeAdmissionUsesSelectedMode(t *testing.T) {
+	stringPtr := func(value string) *string { return &value }
+	tests := []struct {
+		name         string
+		req          RunAgentRequest
+		wantMode     executionprofile.Mode
+		wantReason   executionprofile.FullReason
+		wantDecision string
+	}{
+		{
+			name: "new selected full remains full without reason",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr("full"),
+				FullReason:             executionprofile.FullReasonNone,
+				InheritedMode:          executionprofile.ModeFull,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantDecision: executionprofile.AdmissionModeSelectedFull,
+		},
+		{
+			name: "structured reason cannot override selected fast",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr("fast"),
+				FullReason:             executionprofile.FullReasonProductionIncident,
+			},
+			wantMode:     executionprofile.ModeFast,
+			wantDecision: executionprofile.AdmissionModeSelectedFast,
+		},
+		{
+			name: "selected full retains recognized diagnostic reason",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr("full"),
+				FullReason:             executionprofile.FullReasonProductionIncident,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantReason:   executionprofile.FullReasonProductionIncident,
+			wantDecision: executionprofile.AdmissionModeSelectedFull,
+		},
+		{
+			name: "new missing mode fails closed",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr(""),
+				FullReason:             executionprofile.FullReasonNone,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantDecision: executionprofile.AdmissionModeMissingOrInvalid,
+		},
+		{
+			name: "new invalid mode fails closed",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr("turbo"),
+				FullReason:             executionprofile.FullReasonNone,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantDecision: executionprofile.AdmissionModeMissingOrInvalid,
+		},
+		{
+			name: "full without raw selector field remains full",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFull,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantDecision: executionprofile.AdmissionModeSelectedFull,
+		},
+		{
+			name: "unrecognized diagnostic reason does not downgrade full",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFull,
+				FullReason: "unexpected_reason",
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantDecision: executionprofile.AdmissionModeSelectedFull,
+		},
 	}
 
-	// Explicit true → same as unset: force low.
-	loop.SetEffortTier("max")
-	applyKoeEffortTier(loop, "koe", config.KoeConfig{FastEffort: &tru})
-	if got := loop.EffortTier(); got != "low" {
-		t.Errorf("koe with fast_effort=true = %q, want low", got)
-	}
-
-	// Explicit false → do NOT override; the text-mode effort is preserved.
-	loop.SetEffortTier("xhigh")
-	applyKoeEffortTier(loop, "koe", config.KoeConfig{FastEffort: &fls})
-	if got := loop.EffortTier(); got != "xhigh" {
-		t.Errorf("koe with fast_effort=false = %q, want xhigh (inherited)", got)
-	}
-
-	// Non-koe source: no-op even with fast_effort=true, text-mode effort preserved.
-	loop.SetEffortTier("high")
-	applyKoeEffortTier(loop, "desktop", config.KoeConfig{FastEffort: &tru})
-	if got := loop.EffortTier(); got != "high" {
-		t.Errorf("non-koe source should not touch effort: got %q, want high", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := tc.req
+			applyKoeModeAdmission(&req)
+			if req.ExecutionMode != tc.wantMode ||
+				req.ModeAdmission.AdmittedFullReason != tc.wantReason ||
+				req.ModeAdmission.DecisionReason != tc.wantDecision ||
+				req.InheritedMode != "" {
+				t.Fatalf("request admission = %+v mode=%q, want mode=%q reason=%q decision=%q",
+					req.ModeAdmission, req.ExecutionMode, tc.wantMode, tc.wantReason, tc.wantDecision)
+			}
+			first := req.ModeAdmission
+			applyKoeModeAdmission(&req)
+			if req.ModeAdmission != first || req.ExecutionMode != tc.wantMode {
+				t.Fatalf("mode admission is not idempotent: first=%+v second=%+v mode=%q",
+					first, req.ModeAdmission, req.ExecutionMode)
+			}
+		})
 	}
 }
 

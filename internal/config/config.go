@@ -88,15 +88,13 @@ type KoeConfig struct {
 	// PersonaSource == "custom". Injected as-is (already voice-friendly), wrapped
 	// by Koe's base persona; empty falls back to the base persona only.
 	CustomPersona string `mapstructure:"custom_persona" yaml:"custom_persona,omitempty" json:"custom_persona,omitempty"`
-	// FastEffort forces the Kocoro agent TASK triggered by voice (Path A
-	// /v1/completions) to run at the fastest effort tier ("low") for low
-	// latency, NOT the realtime voice model itself (which has no effort knob).
+	// FastEffort enables semantic fast-task requests from Koe. It does not
+	// change the realtime voice model and does not override the normal Agent's
+	// model or effort. The daemon resolves fast through Cloud's trusted profile;
+	// full/missing/invalid/resolver failure preserves normal Agent config.
 	// A *bool so the three states round-trip Desktop's RFC-7386 PATCH:
-	//   nil (unset) / &true  → force low (default ON — voice is snappy)
-	//   &false               → do NOT override; the voice-triggered task
-	//                          inherits the agent's normal global/per-agent
-	//                          effort (for users who don't mind waiting).
-	// Independent of the agent's text-mode effort.
+	//   nil (unset) / &true  → allow a do_task classified as fast (default ON)
+	//   &false               → every voice-triggered task runs full.
 	FastEffort *bool `mapstructure:"fast_effort" yaml:"fast_effort,omitempty" json:"fast_effort,omitempty"`
 }
 

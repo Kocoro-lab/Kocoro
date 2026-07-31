@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -108,7 +110,17 @@ func TestResolveOpenAIComputerProfileRejectsEveryNonOpenAINativeProfile(t *testi
 	}
 }
 
-func TestRunAgentKeepsSonnetParentAndExposesOnlyHighLevelComputerTask(t *testing.T) {
+func TestOpenAIComputerTaskToolIsDeferredWithoutParentProfileRequirement(t *testing.T) {
+	tool := &openAIComputerTaskToolV1{}
+	if got := agent.EffectiveToolExposure(tool); got != agent.ToolExposureDeferred {
+		t.Fatalf("dispatcher exposure = %q, want %q", got, agent.ToolExposureDeferred)
+	}
+	if got := agent.EffectiveToolProfileRequirement(tool); got != agent.ToolProfileNone {
+		t.Fatalf("dispatcher profile requirement = %q, want none", got)
+	}
+}
+
+func TestRunAgentKeepsSonnetParentAndDefersHighLevelComputerTask(t *testing.T) {
 	streamResponse := []byte(
 		"data: {\"type\":\"content_delta\",\"text\":\"ok\"}\n\n" +
 			"data: {\"type\":\"done\",\"output_text\":\"ok\",\"provider\":\"anthropic\"," +
@@ -199,7 +211,7 @@ func TestRunAgentKeepsSonnetParentAndExposesOnlyHighLevelComputerTask(t *testing
 	if request.ExecutionProfileID != "" || request.ResolvedExecutionProfile != nil {
 		t.Fatalf("parent leaked child profile: %+v", request)
 	}
-	var computer *client.Tool
+	hasToolSearch := false
 	for index := range request.Tools {
 		schema := &request.Tools[index]
 		if schema.Type == client.NativeComputerToolType ||
@@ -209,20 +221,20 @@ func TestRunAgentKeepsSonnetParentAndExposesOnlyHighLevelComputerTask(t *testing
 			t.Fatalf("parent exposed legacy/native GUI tool: %+v", *schema)
 		}
 		if schema.Type == "function" && schema.Function.Name == "computer_use" {
-			computer = schema
+			t.Fatalf("parent exposed cold high-level computer schema: %+v", *schema)
+		}
+		if schema.Type == "function" && schema.Function.Name == "tool_search" {
+			hasToolSearch = true
 		}
 	}
-	if computer == nil {
-		t.Fatal("parent omitted high-level computer_use")
+	if !hasToolSearch {
+		t.Fatal("parent omitted tool_search")
 	}
-	properties, _ := computer.Function.Parameters["properties"].(map[string]any)
-	if _, ok := properties["task"]; !ok {
-		t.Fatalf("computer_use schema = %+v", computer.Function.Parameters)
+	messageWire, err := json.Marshal(request.Messages)
+	if err != nil {
+		t.Fatalf("marshal parent messages: %v", err)
 	}
-	if _, leaked := properties["action"]; leaked {
-		t.Fatalf("low-level action leaked into parent schema: %+v", properties)
-	}
-	if _, leaked := properties["state_id"]; leaked {
-		t.Fatalf("state_id leaked into parent schema: %+v", properties)
+	if !strings.Contains(string(messageWire), "computer_use") {
+		t.Fatalf("high-level computer_use is not discoverable: %s", messageWire)
 	}
 }

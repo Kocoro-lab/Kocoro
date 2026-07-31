@@ -28,6 +28,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
@@ -100,7 +101,39 @@ type RunAgentRequest struct {
 	OmitHistory     bool                  `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
 	StickyContext   string                `json:"-"`                           // 额外的 sticky context，注入系统提示（对用户不可见）
 	ForegroundHint  *ForegroundHint       `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
-	Files           []RemoteFile          `json:"-"`                           // remote file attachments from Cloud (WS only)
+	// Koe sends both the locally admitted mode and the raw selector evidence.
+	// The daemon independently recomputes ModeAdmission before routing.
+	ExecutionMode          executionprofile.Mode       `json:"execution_mode,omitempty"`
+	RequestedExecutionMode *string                     `json:"requested_execution_mode,omitempty"`
+	FullReason             executionprofile.FullReason `json:"full_reason,omitempty"`
+	// InheritedMode remains decode-compatible with the Koe wire but is never
+	// trusted as lineage authority. Admission clears it; only validation
+	// against the active/persisted execution ledger may restore the internal
+	// provider-neutral Full floor.
+	InheritedMode executionprofile.Mode `json:"inherited_execution_mode,omitempty"`
+	Files         []RemoteFile          `json:"-"` // remote file attachments from Cloud (WS only)
+
+	// Execution lineage is minted by Koe/daemon and is provider-neutral. The
+	// resolved Profile is internal-only: HTTP callers can request fast/full but
+	// can never inject a model, provider, or opaque profile id.
+	LogicalTaskID  string                         `json:"logical_task_id,omitempty"`
+	ExecutionRunID string                         `json:"execution_run_id,omitempty"`
+	ParentRunID    string                         `json:"parent_run_id,omitempty"`
+	ExecutionRun   executionprofile.Run           `json:"-"`
+	ModeAdmission  executionprofile.ModeAdmission `json:"-"`
+	// ExecutionConfig is the resolved pre-profile Agent baseline carried only
+	// by interrupted recovery. HTTP clients cannot inject it.
+	ExecutionConfig *agent.ExecutionConfig `json:"-"`
+	// WaitForRouteBoundary is set only by the HTTP Koe follow-up gate for a
+	// child execution generation. It queues behind the active route without
+	// canceling that parent run.
+	WaitForRouteBoundary bool `json:"-"`
+	// AuthoritativeActiveParent is an in-process snapshot captured from the
+	// route table before an injection attempt. HTTP clients cannot supply it.
+	AuthoritativeActiveParent     executionprofile.Run `json:"-"`
+	routeBoundaryGeneration       uint64
+	routeBoundaryCancelGeneration uint64
+	routeBoundaryDone             <-chan struct{}
 
 	// Participants is the live conversation roster (display names) Cloud
 	// forwards from the inbound MessagePayload. Carried through to
@@ -762,30 +795,153 @@ func applyKoeResponseLanguage(loop *agent.AgentLoop, source, text string) {
 	loop.SetResponseLanguage(inferKoeResponseLanguage(text))
 }
 
-// koeFastEffortTier is the effort tier voice-triggered tasks are forced to when
-// koe.fast_effort is on — the fastest tier, for low-latency voice.
-const koeFastEffortTier = "low"
+func koeFastEnabled(koe config.KoeConfig) bool {
+	return koe.FastEffort == nil || *koe.FastEffort
+}
 
-// applyKoeEffortTier optionally forces the loop's effort tier to fast for
-// voice-triggered tasks. It runs AFTER the global + per-agent effort has been
-// applied, so when fast mode is ON it overrides them. The realtime voice model
-// itself has no effort knob — this tunes the Kocoro agent task the voice
-// front-brain triggers via do_task.
-//
-// koe.fast_effort is a *bool with three states:
-//   - nil (unset) / true → force koeFastEffortTier (default ON: voice is snappy)
-//   - false              → do NOT override; the task keeps the agent's normal
-//     global/per-agent effort (for users who prefer quality
-//     over latency on voice).
-func applyKoeEffortTier(loop *agent.AgentLoop, source string, koe config.KoeConfig) {
-	if loop == nil || !isKoeSource(source) {
+func applyKoeModeAdmission(req *RunAgentRequest) {
+	if req == nil || !isKoeSource(req.Source) {
 		return
 	}
-	// Default ON: only an explicit false opts out of fast voice.
-	if koe.FastEffort != nil && !*koe.FastEffort {
+	// This field is advisory on the wire. Clearing it on every admission pass
+	// makes both HTTP and direct RunAgent seams fail closed against a forged
+	// Full floor. authorizeKoeExecutionLineage may restore it later, but only
+	// after validating the authoritative session ledger under the route lock.
+	req.InheritedMode = ""
+	// handleMessage admits before route/fork decisions and RunAgent admits at
+	// its direct-call boundary. Preserve that first authoritative result when
+	// the same in-process request crosses both seams; ModeAdmission is json:"-"
+	// and therefore cannot be supplied by an HTTP caller.
+	if req.ModeAdmission.DecisionReason != "" {
+		req.ExecutionMode = req.ModeAdmission.AdmittedMode
+		req.FullReason = req.ModeAdmission.RequestedFullReason
 		return
 	}
-	loop.SetEffortTier(koeFastEffortTier)
+	requestedMode := string(req.ExecutionMode)
+	if req.RequestedExecutionMode != nil {
+		requestedMode = *req.RequestedExecutionMode
+	}
+
+	req.ModeAdmission = executionprofile.DecideModeAdmission(
+		requestedMode,
+		string(req.FullReason),
+	)
+	req.ExecutionMode = req.ModeAdmission.AdmittedMode
+	req.FullReason = req.ModeAdmission.RequestedFullReason
+}
+
+func newExecutionRunID() string {
+	var raw [12]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		return "ker1_" + hex.EncodeToString(raw[:])
+	}
+	return fmt.Sprintf("ker1_%d", time.Now().UnixNano())
+}
+
+// resolveKoeExecutionRun is the sole setting x mode x Cloud-support policy.
+// A full result carries no model overrides, so the normal global/per-agent
+// configuration remains byte-for-byte authoritative.
+func resolveKoeExecutionRun(ctx context.Context, deps *ServerDeps, req RunAgentRequest, koe config.KoeConfig) executionprofile.Run {
+	if !isKoeSource(req.Source) {
+		return executionprofile.Run{}
+	}
+	if req.ResumeInterrupted {
+		return cloneExecutionRun(req.ExecutionRun)
+	}
+	requested := executionprofile.NormalizeMode(string(req.ExecutionMode))
+	var cloudProfile *executionprofile.Profile
+	var cloudErr error
+	if requested == executionprofile.ModeFast && koeFastEnabled(koe) && deps != nil && deps.GW != nil {
+		resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		resolved, err := deps.GW.ResolveKoeExecutionProfile(resolveCtx)
+		cancel()
+		if err != nil {
+			cloudErr = err
+		} else {
+			cloudProfile = &resolved
+		}
+	}
+	profile := executionprofile.Resolve(executionprofile.ResolutionInput{
+		RequestedMode: requested,
+		FastEnabled:   koeFastEnabled(koe),
+		CloudProfile:  cloudProfile,
+		CloudError:    cloudErr,
+	})
+	runID := strings.TrimSpace(req.ExecutionRunID)
+	if runID == "" {
+		runID = newExecutionRunID()
+	}
+	return executionprofile.Run{
+		LogicalTaskID: strings.TrimSpace(req.LogicalTaskID),
+		RunID:         runID,
+		ParentRunID:   strings.TrimSpace(req.ParentRunID),
+		Profile:       profile,
+	}
+}
+
+type koeExecutionTelemetry struct {
+	Stage            string                `json:"stage"`
+	RequestedMode    executionprofile.Mode `json:"requested_mode"`
+	EffectiveMode    executionprofile.Mode `json:"effective_mode"`
+	EffectiveProfile string                `json:"effective_profile"`
+	ProfileVersion   int                   `json:"profile_version,omitempty"`
+	ResolutionReason string                `json:"resolution_reason"`
+	LogicalTaskID    string                `json:"logical_task_id,omitempty"`
+	RunID            string                `json:"run_id"`
+	ParentRunID      string                `json:"parent_run_id,omitempty"`
+}
+
+type koeModeAdmissionTelemetry struct {
+	RequestedMode       executionprofile.Mode       `json:"requested_mode"`
+	RequestedFullReason executionprofile.FullReason `json:"requested_full_reason"`
+	AdmittedMode        executionprofile.Mode       `json:"admitted_mode"`
+	AdmittedFullReason  executionprofile.FullReason `json:"admitted_full_reason,omitempty"`
+	DecisionReason      string                      `json:"decision_reason"`
+}
+
+func logKoeModeAdmission(admission executionprofile.ModeAdmission) {
+	payload, err := json.Marshal(koeModeAdmissionTelemetry{
+		RequestedMode:       admission.RequestedMode,
+		RequestedFullReason: admission.RequestedFullReason,
+		AdmittedMode:        admission.AdmittedMode,
+		AdmittedFullReason:  admission.AdmittedFullReason,
+		DecisionReason:      admission.DecisionReason,
+	})
+	if err == nil {
+		log.Printf("daemon: koe_mode_admission %s", payload)
+	}
+}
+
+func newKoeExecutionTelemetry(stage string, run executionprofile.Run) koeExecutionTelemetry {
+	effectiveProfile := run.Profile.ProfileName
+	if effectiveProfile == "" {
+		effectiveProfile = string(run.Profile.EffectiveMode)
+	}
+	return koeExecutionTelemetry{
+		Stage:            stage,
+		RequestedMode:    run.Profile.RequestedMode,
+		EffectiveMode:    run.Profile.EffectiveMode,
+		EffectiveProfile: effectiveProfile,
+		ProfileVersion:   run.Profile.ProfileVersion,
+		ResolutionReason: run.Profile.ResolutionReason,
+		LogicalTaskID:    run.LogicalTaskID,
+		RunID:            run.RunID,
+		ParentRunID:      run.ParentRunID,
+	}
+}
+
+// logKoeExecutionRun emits provider-neutral, content-free execution telemetry.
+// Keep this projection deliberately narrower than executionprofile.Run: task
+// text, tool arguments/results, evidence digests, opaque profile IDs, and
+// credentials must never enter this event.
+func logKoeExecutionRun(stage string, run executionprofile.Run) {
+	if run.RunID == "" {
+		return
+	}
+	payload, err := json.Marshal(newKoeExecutionTelemetry(stage, run))
+	if err == nil {
+		log.Printf("daemon: koe_execution %s", payload)
+	}
 }
 
 func inferKoeResponseLanguage(text string) string {
@@ -1324,6 +1480,7 @@ type RunAgentResult struct {
 	// result gives crash-recovery clients evidence of the side effect itself,
 	// rather than asking them to infer success from an often-empty chat reply.
 	Deliverables []session.DeliverableReceipt `json:"deliverables,omitempty"`
+	ExecutionRun *executionprofile.Run        `json:"execution_run,omitempty"`
 
 	// MessageStartIndex / MessageEndIndex pin the slice of sess.Messages this
 	// invocation wrote. MessageStartIndex is len(sess.Messages) AFTER the
@@ -1342,6 +1499,14 @@ type RunAgentResult struct {
 	// both success and hard-error paths.
 	MessageStartIndex int `json:"message_start_index,omitempty"`
 	MessageEndIndex   int `json:"message_end_index,omitempty"`
+}
+
+func executionRunResult(run executionprofile.Run) *executionprofile.Run {
+	if run.RunID == "" {
+		return nil
+	}
+	copy := cloneExecutionRun(run)
+	return &copy
 }
 
 func completedIdempotentResult(sess *session.Session, key, agentName string) (*RunAgentResult, error, bool) {
@@ -1992,8 +2157,58 @@ func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string
 		IMStatusContext: append(json.RawMessage(nil), req.IMStatusContext...),
 		Participants:    append([]string(nil), req.Participants...),
 		ResumeAttempts:  req.InterruptedResumeAttempt,
+		ExecutionRun:    cloneExecutionRun(req.ExecutionRun),
+		ExecutionConfig: agent.CloneExecutionConfig(req.ExecutionConfig),
 		UpdatedAt:       updatedAt,
 	}
+}
+
+func cloneExecutionRun(run executionprofile.Run) executionprofile.Run {
+	if run.ComputerActivation != nil {
+		activation := *run.ComputerActivation
+		run.ComputerActivation = &activation
+	}
+	run.Evidence.ToolOutcomes = append([]executionprofile.ToolOutcomeEvidence(nil), run.Evidence.ToolOutcomes...)
+	run.Evidence.Deliverables = append([]executionprofile.DeliverableEvidence(nil), run.Evidence.Deliverables...)
+	return run
+}
+
+func syncExecutionEvidence(run *executionprofile.Run, loop *agent.AgentLoop, receipts []session.DeliverableReceipt) {
+	if run == nil || loop == nil || run.RunID == "" {
+		return
+	}
+	evidence := loop.ExecutionEvidence()
+	evidence.Deliverables = make([]executionprofile.DeliverableEvidence, 0, len(receipts))
+	for _, receipt := range receipts {
+		evidence.Deliverables = append(evidence.Deliverables, executionprofile.DeliverableEvidence{
+			ID: receipt.ID, Filename: receipt.Filename, MIME: receipt.MIME, ByteSize: receipt.ByteSize,
+		})
+	}
+	run.ComputerActivation = loop.ComputerActivation()
+	run.Evidence = evidence
+}
+
+func upsertExecutionRun(sess *session.Session, run executionprofile.Run) error {
+	if sess == nil || run.RunID == "" {
+		return nil
+	}
+	for i := range sess.ExecutionRuns {
+		current := &sess.ExecutionRuns[i]
+		if current.RunID != run.RunID {
+			continue
+		}
+		if current.LogicalTaskID != run.LogicalTaskID ||
+			current.ParentRunID != run.ParentRunID ||
+			current.Profile != run.Profile {
+			return fmt.Errorf("execution run %q immutable fields changed", run.RunID)
+		}
+		cloned := cloneExecutionRun(run)
+		current.ComputerActivation = cloned.ComputerActivation
+		current.Evidence = cloned.Evidence
+		return nil
+	}
+	sess.ExecutionRuns = append(sess.ExecutionRuns, cloneExecutionRun(run))
+	return nil
 }
 
 // claimInterruptedResume validates and persists a startup recovery claim while
@@ -2056,6 +2271,43 @@ func claimInterruptedResume(
 		return errInterruptedRecoveryExhausted
 	}
 
+	// Discovery is advisory. Always replace its config copy with the checkpoint
+	// loaded under the route lock; a concurrent checkpoint may have changed it
+	// after discovery. Nil remains compatible with legacy checkpoints.
+	req.ExecutionConfig = agent.CloneExecutionConfig(state.ExecutionConfig)
+
+	if isKoeSource(req.Source) {
+		authoritativeReq := *req
+		authoritativeReq.ExecutionRun = cloneExecutionRun(state.ExecutionRun)
+		if err := validatePersistedKoeResumeRequest(authoritativeReq); err != nil {
+			return abandonInvalidKoeResume(sessMgr, sess, err)
+		}
+		if err := validatePersistedKoeRunAgainstLedger(state.ExecutionRun, sess.ExecutionRuns); err != nil {
+			return abandonInvalidKoeResume(
+				sessMgr,
+				sess,
+				fmt.Errorf("validate authoritative checkpointed Koe execution run: %w", err),
+			)
+		}
+		if !sameExecutionRunImmutableFields(req.ExecutionRun, state.ExecutionRun) {
+			return abandonInvalidKoeResume(
+				sessMgr,
+				sess,
+				fmt.Errorf(
+					"validate checkpointed Koe execution run candidate: %w: discovery candidate immutable fields differ from the authoritative checkpoint",
+					executionprofile.ErrInvalidPersistedRun,
+				),
+			)
+		}
+		// The session loaded under the route lock is authoritative. Refresh all
+		// mutable evidence/activation fields from it before constructing the loop.
+		req.ExecutionRun = cloneExecutionRun(state.ExecutionRun)
+		req.ExecutionMode = state.ExecutionRun.Profile.RequestedMode
+		req.LogicalTaskID = state.ExecutionRun.LogicalTaskID
+		req.ExecutionRunID = state.ExecutionRun.RunID
+		req.ParentRunID = state.ExecutionRun.ParentRunID
+	}
+
 	req.InterruptedResumeAttempt = state.ResumeAttempts + 1
 	req.InterruptedResumeCheckpointUpdatedAt = checkpointAt
 	state.Agent = agentName
@@ -2066,6 +2318,40 @@ func claimInterruptedResume(
 		return fmt.Errorf("persist interrupted resume attempt: %w", err)
 	}
 	return nil
+}
+
+// lockAgentExecutionConfig freezes the resolved Agent baseline after global,
+// per-agent, and request overlays, but before a transient execution profile is
+// applied. On recovery, an authoritative persisted snapshot first replaces the
+// currently discovered baseline. A legacy nil snapshot keeps current config and
+// is upgraded to a concrete snapshot at the next checkpoint.
+func lockAgentExecutionConfig(loop *agent.AgentLoop, req *RunAgentRequest) {
+	if loop == nil || req == nil {
+		return
+	}
+	if req.ModelOverride != "" {
+		loop.SetModelTier(req.ModelOverride)
+	}
+	if req.ResumeInterrupted && req.ExecutionConfig != nil {
+		loop.ApplyExecutionConfig(*req.ExecutionConfig)
+	}
+	snapshot := loop.ExecutionConfig()
+	req.ExecutionConfig = agent.CloneExecutionConfig(&snapshot)
+}
+
+// refreshExecutionConfigRuntimeState advances only provider-neutral values
+// learned while this exact execution generation is running. Model context
+// auto-detection happens after the initial config lock; persisting the learned
+// window prevents an interrupted restart from reverting compaction to the
+// pre-response estimate. Model, effort, and profile authority remain frozen in
+// the original snapshot.
+func refreshExecutionConfigRuntimeState(loop *agent.AgentLoop, req *RunAgentRequest) {
+	if loop == nil || req == nil || req.ExecutionConfig == nil {
+		return
+	}
+	contextWindow, explicit := loop.ContextWindow()
+	req.ExecutionConfig.ContextWindow = contextWindow
+	req.ExecutionConfig.ContextWindowExplicit = explicit
 }
 
 // RunAgent executes a single agent turn using the shared dependencies.
@@ -2082,6 +2368,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if cfg == nil || deps.GW == nil || deps.SessionCache == nil {
 		return nil, fmt.Errorf("daemon not fully configured")
 	}
+	applyKoeModeAdmission(&req)
+	if !isKoeSource(req.Source) {
+		req.ExecutionMode = executionprofile.NormalizeMode(string(req.ExecutionMode))
+	} else {
+		logKoeModeAdmission(req.ModeAdmission)
+	}
+	req.ExecutionRun = resolveKoeExecutionRun(ctx, deps, req, cfg.Koe)
 	// HTTP callers validate before reaching the runner, but RunAgent is also a
 	// package seam used directly by tests and internal callers. Keep the
 	// idempotency contract fail-closed here as well so a caller cannot execute
@@ -2256,6 +2549,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	var route *routeEntry
 	var routeDone chan struct{}
 	var routeInjectCh chan agent.InjectedMessage
+	var routeRunGeneration uint64
 
 	// drainedMailboxIDs holds the mailbox rows drained into this run's prompt
 	// (set in the routed branch below). consumeDrainedMailbox durably flags them
@@ -2295,12 +2589,40 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	// Empty route key = no cache entry for routing, always start a fresh local session.
 	if req.RouteKey != "" {
-		route = deps.SessionCache.LockRouteWithManager(req.RouteKey, sessionsDir)
+		if req.WaitForRouteBoundary {
+			var err error
+			route, err = deps.SessionCache.LockRouteWithManagerAtSafeBoundary(
+				ctx,
+				req.RouteKey,
+				sessionsDir,
+				req.routeBoundaryGeneration,
+				req.routeBoundaryCancelGeneration,
+				req.routeBoundaryDone,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("wait for parent route boundary: %w", err)
+			}
+		} else {
+			route = deps.SessionCache.LockRouteWithManager(req.RouteKey, sessionsDir)
+		}
+		if route == nil {
+			return nil, errors.New("route session manager unavailable")
+		}
+		if route.manager == nil {
+			deps.SessionCache.UnlockRoute(req.RouteKey)
+			return nil, errors.New("route session manager unavailable")
+		}
 		sessMgr = route.manager
 		reqCtx, cancel := context.WithCancel(ctx)
 		routeDone = make(chan struct{})
 		routeInjectCh = make(chan agent.InjectedMessage, 10)
-		deps.SessionCache.SetRouteRunState(req.RouteKey, routeDone, nil, "")
+		routeRunGeneration = deps.SessionCache.SetRouteActiveRunState(
+			req.RouteKey,
+			routeDone,
+			nil,
+			"",
+			req.ExecutionRun,
+		)
 		ctx = reqCtx
 		// Register cancel under sc.mu so CancelRoute sees it immediately.
 		// Also fires cancel right away if CancelRoute already set cancelPending.
@@ -2327,7 +2649,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 			deps.SessionCache.ClearRouteRunState(req.RouteKey)
 			closeRouteDone(routeDone)
-			route.cancel = nil
 			// Atomic store — SetRouteSessionID would re-acquire entry.mu
 			// (held by the surrounding LockRouteWithManager) and deadlock.
 			if current := sessMgr.Current(); current != nil {
@@ -2514,8 +2835,31 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if route != nil && sess != nil {
 		route.storeSessionID(sess.ID)
 	}
+	if isKoeSource(req.Source) && !req.ResumeInterrupted {
+		if sess == nil {
+			return nil, errors.New("authorize Koe execution lineage: session unavailable")
+		}
+		if err := authorizeKoeExecutionLineage(&req, sess.ExecutionRuns); err != nil {
+			return nil, fmt.Errorf("authorize Koe execution lineage: %w", err)
+		}
+		if req.ExecutionRun.ParentRunID != "" {
+			if err := inheritParentExecutionEvidence(&req.ExecutionRun, sess.ExecutionRuns); err != nil {
+				return nil, fmt.Errorf("inherit Koe parent execution evidence: %w", err)
+			}
+		}
+	}
 	if err := claimInterruptedResume(sessMgr, sess, &req, agentName); err != nil {
 		return nil, err
+	}
+	if isKoeSource(req.Source) {
+		if req.RouteKey != "" && !deps.SessionCache.UpdateRouteActiveExecutionRun(
+			req.RouteKey,
+			routeRunGeneration,
+			req.ExecutionRun,
+		) {
+			return nil, errors.New("publish authoritative Koe execution lineage")
+		}
+		logKoeExecutionRun("resolved", req.ExecutionRun)
 	}
 	if result, err, found := completedIdempotentResult(sess, req.IdempotencyKey, agentName); found {
 		// A duplicate SSE request still needs the stable binding event before
@@ -3163,16 +3507,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 	}
 	applyKoeResponseLanguage(loop, req.Source, req.Text)
-	// Voice-triggered tasks get their own effort tier (default low), overriding
-	// the global + per-agent effort just applied. Must run after the per-agent
-	// overlay so voice wins.
-	applyKoeEffortTier(loop, req.Source, runCfg.Koe)
+	lockAgentExecutionConfig(loop, &req)
+	// Only a Cloud-resolved fast profile overrides model/reasoning. Full mode is
+	// a no-op here and therefore preserves the locked Agent baseline.
+	loop.SetKoeExecutionProfile(req.ExecutionRun.Profile)
+	loop.SetExecutionEvidence(req.ExecutionRun.Evidence)
+	if err := loop.RestoreComputerActivation(req.ExecutionRun.ComputerActivation); err != nil {
+		return nil, fmt.Errorf("restore checkpointed computer activation: %w", err)
+	}
 	// Apply idle-timeout config AFTER per-agent overrides have been folded
 	// into runCfg, otherwise agent-level opt-in/override silently does nothing.
 	loop.SetIdleTimeouts(runCfg.Agent.IdleSoftTimeoutSecs, runCfg.Agent.IdleHardTimeoutSecs)
-	if req.ModelOverride != "" {
-		loop.SetModelTier(req.ModelOverride)
-	}
 	// Inject session metadata as sticky context so it survives compaction.
 	// imBindings is a best-effort Cloud probe: failures degrade silently so
 	// the rest of the sticky block still ships (the LLM correctly infers
@@ -3486,6 +3831,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
 	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		applyTurnState(sess, loop, turnUsage, turnBase)
+		syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())
+		refreshExecutionConfigRuntimeState(loop, &req)
+		if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
+			return err
+		}
 		sess.InProgress = true
 		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
 		if err := sessMgr.Save(); err != nil {
@@ -3557,6 +3907,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// the first checkpoint fires.
 			sess.ToolResultReplacements = loop.ToolResultReplacements()
 			sess.ToolResultSeen = loop.ToolResultSeen()
+			syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())
+			if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
+				return nil, err
+			}
 			if req.ResumeInterrupted {
 				// A recovery attempt that fails before making forward progress
 				// remains eligible for a later daemon restart until the
@@ -3613,6 +3967,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			PendingAckMessageIDs: loop.PendingAckIDs(),
 			MessageStartIndex:    turnBase.msgCount,
 			MessageEndIndex:      len(sess.Messages),
+			ExecutionRun:         executionRunResult(req.ExecutionRun),
 		}, fmt.Errorf("agent error for %s: %w", agentName, runErr)
 	}
 	if errors.Is(runErr, agent.ErrMaxIterReached) {
@@ -3706,6 +4061,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// checkpoint fires would otherwise lose new dedup/replacement entries.
 		sess.ToolResultReplacements = loop.ToolResultReplacements()
 		sess.ToolResultSeen = loop.ToolResultSeen()
+		syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())
+		if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
+			return nil, err
+		}
 		sess.InProgress = false // turn completed — clear mid-turn crash marker
 		sess.InterruptedTurn = nil
 		if req.IdempotencyKey != "" {
@@ -3886,6 +4245,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		Partial:              status.Partial,
 		FailureCode:          status.FailureCode,
 		Deliverables:         deliverableReceipts.snapshot(),
+		ExecutionRun:         executionRunResult(req.ExecutionRun),
 		MessageStartIndex:    turnBase.msgCount,
 		MessageEndIndex:      len(sess.Messages),
 	}, nil

@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 // TestWriteFileAtomic_ConcurrentReadsNeverTorn locks the atomic-write fix: a
@@ -138,6 +140,192 @@ func TestStore_SaveLoad(t *testing.T) {
 	}
 	if len(loaded.Messages) != 2 {
 		t.Errorf("expected 2 messages, got %d", len(loaded.Messages))
+	}
+}
+
+func TestStore_RoundTripsProviderNeutralExecutionRuns(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	sess := &Session{
+		ID: "test-execution-run",
+		ExecutionRuns: []executionprofile.Run{{
+			LogicalTaskID: "burst:t01",
+			RunID:         "ker1_child",
+			ParentRunID:   "ker1_parent",
+			Profile: executionprofile.Profile{
+				RequestedMode:       executionprofile.ModeFast,
+				EffectiveMode:       executionprofile.ModeFast,
+				SchemaVersion:       executionprofile.FastSchemaVersion,
+				ProfileName:         executionprofile.FastProfileName,
+				ProfileVersion:      executionprofile.FastProfileVersion,
+				ProfileID:           "kfp1_store-test",
+				Provider:            "openai",
+				Model:               "gpt-5.6-luna",
+				APISurface:          "openai_responses",
+				ToolContract:        executionprofile.FastToolContract,
+				ReasoningEffort:     "medium",
+				ServiceTier:         "fast",
+				ParallelToolCalls:   true,
+				ResponseCachePolicy: executionprofile.ResponseCacheOff,
+				ResolutionReason:    "cloud_profile_resolved",
+			},
+			Evidence: executionprofile.Evidence{
+				ToolOutcomes: []executionprofile.ToolOutcomeEvidence{{
+					ToolCallID: "write-1", ToolName: "file_write", Validated: true,
+					Outcome: "succeeded", PermissionDecision: "ask",
+					PermissionApproved: true, SideEffect: true,
+					ArgumentsDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					ResultDigest:    "sha256-digest",
+				}},
+				Deliverables: []executionprofile.DeliverableEvidence{{
+					ID: "deliverable-1", Filename: "report.pdf", MIME: "application/pdf", ByteSize: 42,
+				}},
+			},
+		}, {
+			LogicalTaskID: "burst:t02",
+			RunID:         "ker1_computer",
+			Profile:       executionprofile.FullProfile(executionprofile.ModeFull, "requested_full"),
+			ComputerActivation: &executionprofile.ComputerActivation{
+				Profile: executionprofile.Profile{
+					RequestedMode:      executionprofile.ModeFull,
+					EffectiveMode:      executionprofile.ModeFull,
+					SchemaVersion:      executionprofile.ComputerSchemaVersion,
+					ContractRevision:   executionprofile.ComputerContractRevision,
+					ProfileID:          "ep1_store-computer",
+					Provider:           "anthropic",
+					Model:              "claude-sonnet-5",
+					APISurface:         executionprofile.AnthropicMessagesAPISurface,
+					ExecutionMode:      executionprofile.ComputerExecutionModeNative,
+					ToolContract:       executionprofile.AnthropicComputerToolContract,
+					BetaContract:       executionprofile.AnthropicComputerBetaContract,
+					SupportsImageInput: true,
+					SupportsToolImages: true,
+					SupportsFunctions:  true,
+					ResolutionReason:   "cloud_computer_profile_resolved",
+				},
+				ToolName:           "computer",
+				ToolsetFingerprint: "sha256:toolset-v1",
+			},
+		}},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded.ExecutionRuns) != 2 {
+		t.Fatalf("ExecutionRuns = %+v", loaded.ExecutionRuns)
+	}
+	run := loaded.ExecutionRuns[0]
+	if run.RunID != "ker1_child" || run.ParentRunID != "ker1_parent" ||
+		run.Profile.ProfileID != "kfp1_store-test" ||
+		run.Profile.ServiceTier != "fast" ||
+		len(run.Evidence.ToolOutcomes) != 1 || !run.Evidence.ToolOutcomes[0].SideEffect ||
+		run.Evidence.ToolOutcomes[0].ArgumentsDigest != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ||
+		len(run.Evidence.Deliverables) != 1 || run.Evidence.Deliverables[0].Filename != "report.pdf" {
+		t.Fatalf("execution run round trip drifted: %+v", run)
+	}
+	computerRun := loaded.ExecutionRuns[1]
+	if computerRun.RunID != "ker1_computer" ||
+		computerRun.ComputerActivation == nil ||
+		computerRun.ComputerActivation.Profile.ProfileID != "ep1_store-computer" ||
+		computerRun.ComputerActivation.ToolName != "computer" ||
+		computerRun.ComputerActivation.ToolsetFingerprint != "sha256:toolset-v1" {
+		t.Fatalf("computer activation round trip drifted: %+v", computerRun)
+	}
+	raw, err := json.Marshal(sess.ExecutionRuns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"arguments":`, `"output":`, `"response_id":`, `"reasoning":`} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("provider-neutral execution ledger leaked %s: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestStore_RoundTripsInterruptedExecutionConfig(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	defer store.Close()
+
+	checkpointAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Nanosecond)
+	want := &agent.ExecutionConfig{
+		SpecificModel:         "claude-sonnet-5",
+		ModelTier:             "large",
+		Thinking:              &client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096},
+		ReasoningEffort:       "high",
+		EffortTier:            "xhigh",
+		ResponseLanguage:      "中文",
+		Temperature:           0.27,
+		MaxTokens:             7777,
+		ContextWindow:         200_000,
+		ContextWindowExplicit: true,
+		MaxIterations:         13,
+	}
+	sess := &Session{
+		ID:         "test-interrupted-execution-config",
+		InProgress: true,
+		InterruptedTurn: &InterruptedTurn{
+			Source:          "koe",
+			ExecutionConfig: agent.CloneExecutionConfig(want),
+			UpdatedAt:       checkpointAt,
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	loaded, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := loaded.InterruptedTurn.ExecutionConfig
+	if got == nil ||
+		got.SpecificModel != want.SpecificModel ||
+		got.ModelTier != want.ModelTier ||
+		got.Thinking == nil ||
+		*got.Thinking != *want.Thinking ||
+		got.ReasoningEffort != want.ReasoningEffort ||
+		got.EffortTier != want.EffortTier ||
+		got.ResponseLanguage != want.ResponseLanguage ||
+		got.Temperature != want.Temperature ||
+		got.MaxTokens != want.MaxTokens ||
+		got.ContextWindow != want.ContextWindow ||
+		got.ContextWindowExplicit != want.ContextWindowExplicit ||
+		got.MaxIterations != want.MaxIterations {
+		t.Fatalf("execution config round trip drifted: got=%+v want=%+v", got, want)
+	}
+
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		`"tools"`,
+		`"prompt"`,
+		`"secret"`,
+		`"provider"`,
+		`"response_id"`,
+	} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("execution config leaked %s: %s", forbidden, raw)
+		}
+	}
+
+	var legacy Session
+	if err := json.Unmarshal([]byte(`{
+		"id":"legacy-interrupted-config",
+		"in_progress":true,
+		"interrupted_turn":{"source":"desktop","updated_at":"2026-07-29T00:00:00Z"}
+	}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.InterruptedTurn == nil || legacy.InterruptedTurn.ExecutionConfig != nil {
+		t.Fatalf("legacy checkpoint config = %+v, want nil compatibility", legacy.InterruptedTurn)
 	}
 }
 

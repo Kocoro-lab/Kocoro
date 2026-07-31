@@ -6,9 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -83,6 +86,218 @@ func TestDiscoverInterruptedTurns_DefaultAndNamedAgent(t *testing.T) {
 	}
 	if _, exists := byID["complete-session-001"]; exists {
 		t.Fatal("completed session was incorrectly scheduled for recovery")
+	}
+}
+
+func interruptedExecutionConfigA() *agent.ExecutionConfig {
+	return &agent.ExecutionConfig{
+		SpecificModel:         "claude-sonnet-5",
+		ModelTier:             "large",
+		Thinking:              &client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096},
+		ReasoningEffort:       "high",
+		EffortTier:            "xhigh",
+		ResponseLanguage:      "中文",
+		Temperature:           0.27,
+		MaxTokens:             7777,
+		ContextWindow:         200_000,
+		ContextWindowExplicit: true,
+		MaxIterations:         13,
+	}
+}
+
+func applyInterruptedExecutionConfigB(loop *agent.AgentLoop) {
+	loop.SetSpecificModel("current-config-b")
+	loop.SetModelTier("small")
+	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
+	loop.SetReasoningEffort("low")
+	loop.SetEffortTier("low")
+	loop.SetResponseLanguage("English")
+	loop.SetTemperature(0.9)
+	loop.SetMaxTokens(999)
+	loop.SetContextWindow(32_000)
+	loop.SetMaxIterations(2)
+}
+
+func TestInterruptedExecutionConfigCloneIsDeep(t *testing.T) {
+	original := session.InterruptedTurn{ExecutionConfig: interruptedExecutionConfigA()}
+	cloned := cloneInterruptedTurn(original)
+	cloned.ExecutionConfig.Thinking.BudgetTokens = 1
+	cloned.ExecutionConfig.SpecificModel = "mutated"
+	if original.ExecutionConfig.Thinking.BudgetTokens != 4096 ||
+		original.ExecutionConfig.SpecificModel != "claude-sonnet-5" {
+		t.Fatalf("clone retained checkpoint config ownership: original=%+v clone=%+v", original, cloned)
+	}
+
+	req := buildInterruptedResumeRequest(interruptedTurnCandidate{
+		SessionID: "execution-config-clone-001",
+		State:     original,
+		UpdatedAt: time.Now(),
+	}, 3, 4*time.Hour)
+	original.ExecutionConfig.Thinking.BudgetTokens = 2
+	if req.ExecutionConfig == nil || req.ExecutionConfig.Thinking.BudgetTokens != 4096 {
+		t.Fatalf("resume request retained candidate config ownership: %+v", req.ExecutionConfig)
+	}
+}
+
+func TestInterruptedResumeUsesAuthoritativeCheckpointConfigAOverCurrentB(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const id = "recovery-config-authority-001"
+	configA := interruptedExecutionConfigA()
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{
+		Source:          "desktop",
+		ExecutionConfig: configA,
+	})
+
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	// Simulate a stale discovery copy. The session loaded under the route lock
+	// still contains A and must replace this candidate's B-like mutation.
+	candidates[0].State.ExecutionConfig.SpecificModel = "stale-candidate-b"
+	candidates[0].State.ExecutionConfig.Thinking.BudgetTokens = 1
+	req := buildInterruptedResumeRequest(candidates[0], 3, 4*time.Hour)
+
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claimInterruptedResume(mgr, sess, &req, ""); err != nil {
+		t.Fatalf("claimInterruptedResume: %v", err)
+	}
+	if !reflect.DeepEqual(req.ExecutionConfig, configA) {
+		t.Fatalf("claim kept discovery config instead of authoritative checkpoint: got=%+v want=%+v",
+			req.ExecutionConfig, configA)
+	}
+
+	// Current global/agent/request discovery has changed to B. The locked A
+	// snapshot still wins before loop construction proceeds to a model call.
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 4, 1000, 100, nil, nil, nil)
+	applyInterruptedExecutionConfigB(loop)
+	req.ModelOverride = "request-overlay-b"
+	lockAgentExecutionConfig(loop, &req)
+	if got := loop.ExecutionConfig(); !reflect.DeepEqual(got, *configA) {
+		t.Fatalf("resume config = %+v, want checkpoint A %+v", got, *configA)
+	}
+	if !reflect.DeepEqual(req.ExecutionConfig, configA) {
+		t.Fatalf("re-locked request config = %+v, want checkpoint A %+v", req.ExecutionConfig, configA)
+	}
+}
+
+func TestLockAgentExecutionConfigIncludesRequestOverlayAndLegacyNil(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 4, 1000, 100, nil, nil, nil)
+	req := RunAgentRequest{ModelOverride: "small"}
+	lockAgentExecutionConfig(loop, &req)
+	if req.ExecutionConfig == nil || req.ExecutionConfig.ModelTier != "small" {
+		t.Fatalf("request overlay missing from snapshot: %+v", req.ExecutionConfig)
+	}
+
+	legacyLoop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "large", "", 7, 1000, 100, nil, nil, nil)
+	legacyReq := RunAgentRequest{ResumeInterrupted: true}
+	lockAgentExecutionConfig(legacyLoop, &legacyReq)
+	if legacyReq.ExecutionConfig == nil ||
+		legacyReq.ExecutionConfig.ModelTier != "large" ||
+		legacyReq.ExecutionConfig.MaxIterations != 7 {
+		t.Fatalf("legacy nil snapshot was not upgraded from current config: %+v", legacyReq.ExecutionConfig)
+	}
+}
+
+func TestRefreshExecutionConfigRuntimeStateUpdatesOnlyContextWindow(t *testing.T) {
+	req := RunAgentRequest{ExecutionConfig: interruptedExecutionConfigA()}
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "small", "", 2, 1000, 100, nil, nil, nil)
+	loop.SetSpecificModel("gpt-5.6-terra")
+	loop.SetReasoningEffort("none")
+	loop.SetContextWindow(1_050_000)
+
+	refreshExecutionConfigRuntimeState(loop, &req)
+
+	want := interruptedExecutionConfigA()
+	want.ContextWindow = 1_050_000
+	want.ContextWindowExplicit = false
+	if !reflect.DeepEqual(req.ExecutionConfig, want) {
+		t.Fatalf("runtime refresh changed frozen authority: got=%+v want=%+v", req.ExecutionConfig, want)
+	}
+}
+
+func TestKoeInterruptedContinuationRestoresCheckpointResponseLanguage(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "small", "", 2, 1000, 100, nil, nil, nil)
+	loop.SetResponseLanguage("English")
+	req := RunAgentRequest{
+		Source:            "koe",
+		Text:              interruptedTurnContinuation,
+		ResumeInterrupted: true,
+		ExecutionConfig:   interruptedExecutionConfigA(),
+	}
+
+	applyKoeResponseLanguage(loop, req.Source, req.Text)
+	if got := loop.ResponseLanguage(); got != "English" {
+		t.Fatalf("continuation pre-lock language = %q, want English inference", got)
+	}
+	lockAgentExecutionConfig(loop, &req)
+	if got := loop.ResponseLanguage(); got != "中文" {
+		t.Fatalf("checkpoint language = %q, want 中文", got)
+	}
+}
+
+func TestInterruptedResumeGatewayRequestUsesCheckpointConfigAAfterCurrentConfigB(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "continued with checkpoint config"}
+	server := httptest.NewServer(gw.handler())
+	defer server.Close()
+
+	deps := runAgentContractTestDeps(t, server.URL)
+	defer deps.SessionCache.CloseAll()
+	deps.Config.ModelTier = "small"
+	deps.Config.Agent.Model = "current-config-b"
+	deps.Config.Agent.Thinking = true
+	deps.Config.Agent.ThinkingMode = "adaptive"
+	deps.Config.Agent.ReasoningEffort = "low"
+	deps.Config.Agent.EffortTier = "low"
+	deps.Config.Agent.Temperature = 0.9
+	deps.Config.Agent.MaxTokens = 999
+	deps.Config.Agent.ContextWindow = 32_000
+	deps.Config.Agent.MaxIterations = 2
+
+	const id = "recovery-config-gateway-001"
+	writeInterruptedSession(
+		t,
+		filepath.Join(deps.ShannonDir, "sessions"),
+		id,
+		&session.InterruptedTurn{
+			Source:          "heartbeat",
+			ExecutionConfig: interruptedExecutionConfigA(),
+		},
+	)
+	(&Server{deps: deps}).resumeInterruptedTurns(context.Background())
+
+	requests := gw.requests()
+	if len(requests) == 0 {
+		t.Fatal("recovery did not call the gateway")
+	}
+	got := requests[len(requests)-1]
+	want := interruptedExecutionConfigA()
+	if got.SpecificModel != want.SpecificModel ||
+		got.ModelTier != want.ModelTier ||
+		got.Thinking == nil ||
+		*got.Thinking != *want.Thinking ||
+		got.ReasoningEffort != want.ReasoningEffort ||
+		got.EffortTier != want.EffortTier ||
+		got.Temperature != want.Temperature ||
+		got.MaxTokens != want.MaxTokens {
+		t.Fatalf("gateway request used current config B instead of checkpoint A: got=%+v want=%+v", got, want)
+	}
+	var messageText strings.Builder
+	for _, message := range got.Messages {
+		messageText.WriteString(message.Content.Text())
+		messageText.WriteByte('\n')
+	}
+	if !strings.Contains(messageText.String(), "Always respond in 中文") {
+		t.Fatalf("gateway request lost checkpoint response language: %s", messageText.String())
 	}
 }
 

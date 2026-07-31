@@ -789,6 +789,10 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 	}
 }
 
+func (*openAIComputerTaskToolV1) ToolExposure() agent.ToolExposure {
+	return agent.ToolExposureDeferred
+}
+
 func (t *openAIComputerTaskToolV1) RequiresApproval() bool { return true }
 
 func (t *openAIComputerTaskToolV1) Run(

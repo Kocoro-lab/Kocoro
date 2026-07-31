@@ -1289,6 +1289,17 @@ func TestWrapDaemonGUIToolsPreservesSchemasAndSafetyTraits(t *testing.T) {
 			t.Fatalf("%s exposure = %q, want deferred", name, got)
 		}
 	}
+	for _, name := range []string{"computer", "computer_use"} {
+		wrapped, _ := reg.Get(name)
+		if got := agent.EffectiveToolProfileRequirement(wrapped); got != agent.ToolProfileComputer {
+			t.Fatalf(
+				"%s profile requirement = %q, want %q",
+				name,
+				got,
+				agent.ToolProfileComputer,
+			)
+		}
+	}
 }
 
 func TestWrapDaemonGUIToolsPreservesEveryNativeToolTraitAndRunDelegation(t *testing.T) {
