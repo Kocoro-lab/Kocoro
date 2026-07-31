@@ -127,14 +127,14 @@ func TestToolSearchLive_CloudToolReference(t *testing.T) {
 	runToolSearchLiveTrace(t, recorder, model, true, nil)
 }
 
-func TestToolSearchLive_KoeFastTerraLegacy(t *testing.T) {
-	if os.Getenv("KOE_FAST_TERRA_LIVE") != "1" {
-		t.Skip("set KOE_FAST_TERRA_LIVE=1 to run the real Koe Terra ToolSearch trace")
+func TestToolSearchLive_KoeFastProfile(t *testing.T) {
+	if os.Getenv("KOE_FAST_PROFILE_LIVE") != "1" {
+		t.Skip("set KOE_FAST_PROFILE_LIVE=1 to run the real Koe Fast ToolSearch trace")
 	}
 
 	endpoint := strings.TrimSpace(os.Getenv("TOOLSEARCH_CLOUD_ENDPOINT"))
 	if endpoint == "" {
-		t.Fatal("Koe Terra live gate is enabled but TOOLSEARCH_CLOUD_ENDPOINT is empty")
+		t.Fatal("Koe Fast live gate is enabled but TOOLSEARCH_CLOUD_ENDPOINT is empty")
 	}
 	gateway := client.NewGatewayClient(
 		endpoint,

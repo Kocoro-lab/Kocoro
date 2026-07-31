@@ -15,6 +15,7 @@ func TestExecutionConfigSnapshotAndApplyAreDeepCopies(t *testing.T) {
 	loop.SetThinking(&client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096})
 	loop.SetReasoningEffort("high")
 	loop.SetEffortTier("xhigh")
+	loop.SetServiceTier("fast")
 	loop.SetResponseLanguage("日本語")
 	loop.SetTemperature(0.27)
 	loop.SetMaxTokens(7777)
@@ -26,6 +27,7 @@ func TestExecutionConfigSnapshotAndApplyAreDeepCopies(t *testing.T) {
 		Thinking:              &client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096},
 		ReasoningEffort:       "high",
 		EffortTier:            "xhigh",
+		ServiceTier:           "fast",
 		ResponseLanguage:      "日本語",
 		Temperature:           0.27,
 		MaxTokens:             7777,
@@ -63,6 +65,7 @@ func TestExecutionConfigApplyPreservesZeroAndNil(t *testing.T) {
 	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
 	loop.SetReasoningEffort("high")
 	loop.SetEffortTier("xhigh")
+	loop.SetServiceTier("fast")
 	loop.SetResponseLanguage("中文")
 	loop.SetTemperature(0.8)
 	loop.SetMaxTokens(32_000)
@@ -83,6 +86,7 @@ func TestExecutionConfigExcludesFastProfileAuthority(t *testing.T) {
 	loop.SetThinking(&client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096})
 	loop.SetReasoningEffort("high")
 	loop.SetEffortTier("xhigh")
+	loop.SetServiceTier("fast")
 
 	baseline := loop.ExecutionConfig()
 	loop.SetKoeExecutionProfile(fastProfileForAgentTest())

@@ -773,6 +773,7 @@ type AgentLoop struct {
 	thinking               *client.ThinkingConfig
 	reasoningEffort        string
 	effortTier             string
+	serviceTier            string
 	responseLanguage       string
 	temperature            float64
 	specificModel          string
@@ -1138,6 +1139,14 @@ func (a *AgentLoop) EffortTier() string {
 	return a.effortTier
 }
 
+// ServiceTier returns the configured process-global OpenAI processing lane.
+func (a *AgentLoop) ServiceTier() string {
+	if a == nil {
+		return ""
+	}
+	return a.serviceTier
+}
+
 // SpecificModel returns the currently-configured specific model id. It also
 // proves that SetSpecificModel won the precedence race against SetModelTier;
 // without this accessor a regression that drops the SetSpecificModel call in
@@ -1220,6 +1229,15 @@ func (a *AgentLoop) requestEffortTier() string {
 		return ""
 	}
 	return a.effortTier
+}
+
+func (a *AgentLoop) requestServiceTier() string {
+	// Sealed Koe/computer profiles own their processing lane. Never let the
+	// global developer selector leak into those independently resolved routes.
+	if a.executionProfileID != "" || a.executionProfile != nil || a.computerProfile.ProfileID != "" {
+		return ""
+	}
+	return a.serviceTier
 }
 
 func (a *AgentLoop) requestThinking() *client.ThinkingConfig {
@@ -1698,6 +1716,12 @@ func (a *AgentLoop) SetReasoningEffort(effort string) {
 // the runner call sites (mirrors SetReasoningEffort).
 func (a *AgentLoop) SetEffortTier(tier string) {
 	a.effortTier = tier
+}
+
+// SetServiceTier sets the process-global OpenAI processing lane. The request
+// builder suppresses it whenever a sealed execution profile is active.
+func (a *AgentLoop) SetServiceTier(tier string) {
+	a.serviceTier = tier
 }
 
 // SetResponseLanguage locks the reply language; "" mirrors the user's
@@ -3450,6 +3474,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			Thinking:                 a.requestThinking(),
 			ReasoningEffort:          a.requestReasoningEffort(),
 			EffortTier:               a.requestEffortTier(),
+			ServiceTier:              a.requestServiceTier(),
 			SessionID:                a.sessionID,
 			CacheSource:              a.cacheSource,
 			ExecutionProfileID:       a.requestExecutionProfileID(),
@@ -4184,6 +4209,7 @@ iterationLoop:
 			Thinking:                 a.requestThinking(),
 			ReasoningEffort:          a.requestReasoningEffort(),
 			EffortTier:               a.requestEffortTier(),
+			ServiceTier:              a.requestServiceTier(),
 			SessionID:                a.sessionID,
 			CacheSource:              a.cacheSource,
 			ExecutionProfileID:       a.requestExecutionProfileID(),
@@ -4565,6 +4591,7 @@ iterationLoop:
 						Thinking:                 a.requestThinking(),
 						ReasoningEffort:          a.requestReasoningEffort(),
 						EffortTier:               a.requestEffortTier(),
+						ServiceTier:              a.requestServiceTier(),
 						SessionID:                a.sessionID,
 						CacheSource:              a.cacheSource,
 						ExecutionProfileID:       a.requestExecutionProfileID(),

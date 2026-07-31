@@ -4055,6 +4055,7 @@ func TestForceStop_PreservesRequestConfig(t *testing.T) {
 	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
 	loop.SetReasoningEffort("medium")
 	loop.SetEffortTier("xhigh")
+	loop.SetServiceTier("fast")
 
 	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
 	if err != nil {
@@ -4096,6 +4097,9 @@ func TestForceStop_PreservesRequestConfig(t *testing.T) {
 	}
 	if final.EffortTier != "xhigh" {
 		t.Errorf("force-stop dropped EffortTier: got %q", final.EffortTier)
+	}
+	if final.ServiceTier != "fast" {
+		t.Errorf("force-stop dropped ServiceTier: got %q", final.ServiceTier)
 	}
 	if final.ModelTier != "medium" {
 		t.Errorf("force-stop dropped ModelTier: got %q", final.ModelTier)

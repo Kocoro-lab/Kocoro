@@ -85,6 +85,32 @@ func TestValidateConfig_AgentModelTierKeyword(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_AgentServiceTier(t *testing.T) {
+	tests := []struct {
+		value   string
+		wantErr bool
+	}{
+		{"", false},
+		{"default", false},
+		{"fast", false},
+		{"priority", true},
+		{"FAST", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Agent.ServiceTier = tt.value
+			err := validateConfig(cfg)
+			if tt.wantErr && (err == nil || !strings.Contains(err.Error(), "service_tier")) {
+				t.Fatalf("validateConfig() error = %v, want service_tier error", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateConfig() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestAppendAllowedCommand(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -501,6 +527,28 @@ func TestMergeRuntimeOverlayFile_BashConcurrencyEnabled(t *testing.T) {
 	}
 	if src, ok := cfg.Sources["agent.bash_concurrency_enabled"]; !ok || src.Level != "project" {
 		t.Errorf("expected source to record project overlay, got %+v ok=%v", src, ok)
+	}
+}
+
+func TestMergeRuntimeOverlayFile_ServiceTierStaysProcessGlobal(t *testing.T) {
+	dir := t.TempDir()
+	overlayPath := filepath.Join(dir, ".shannon", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(overlayPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(overlayPath, []byte("agent:\n  service_tier: fast\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cfg := &Config{Sources: map[string]ConfigSource{}}
+	cfg.Agent.ServiceTier = "default"
+	mergeRuntimeOverlayFile(cfg, overlayPath, "project")
+
+	if cfg.Agent.ServiceTier != "default" {
+		t.Fatalf("project overlay changed process-global service tier to %q", cfg.Agent.ServiceTier)
+	}
+	if _, ok := cfg.Sources["agent.service_tier"]; ok {
+		t.Fatal("project overlay claimed source authority for agent.service_tier")
 	}
 }
 

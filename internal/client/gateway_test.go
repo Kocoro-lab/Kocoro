@@ -18,8 +18,9 @@ import (
 
 func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	got := struct {
-		Messages []Message `json:"messages"`
-		Tools    []Tool    `json:"tools"`
+		Messages    []Message `json:"messages"`
+		Tools       []Tool    `json:"tools"`
+		ServiceTier string    `json:"service_tier"`
 	}{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +55,8 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	defer cancel()
 
 	resp, err := gw.Complete(ctx, CompletionRequest{
-		Messages: []Message{{Role: "user", Content: NewTextContent("ping")}},
+		Messages:    []Message{{Role: "user", Content: NewTextContent("ping")}},
+		ServiceTier: "fast",
 		Tools: []Tool{{
 			Type: "function",
 			Function: FunctionDef{
@@ -77,6 +79,9 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	}
 	if len(got.Tools) != 1 || got.Tools[0].Type != "function" {
 		t.Errorf("expected tool payload to include tools")
+	}
+	if got.ServiceTier != "fast" {
+		t.Errorf("service_tier = %q, want fast", got.ServiceTier)
 	}
 }
 

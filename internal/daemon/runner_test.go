@@ -1671,6 +1671,7 @@ func TestApplyAgentModelOverlayToLoop_ModelTier(t *testing.T) {
 // routing even when a specific model was requested.
 func TestApplyAgentModelOverlayToLoop_SpecificModelBeatsTier(t *testing.T) {
 	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetServiceTier("fast")
 	tier := "large"
 	pinned := "vendor-model-2026"
 	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{
@@ -1686,6 +1687,9 @@ func TestApplyAgentModelOverlayToLoop_SpecificModelBeatsTier(t *testing.T) {
 	// ModelTier == "large" and the test would silently pass.
 	if got := loop.SpecificModel(); got != pinned {
 		t.Errorf("SpecificModel = %q, want %q (overlay should pin specific model)", got, pinned)
+	}
+	if got := loop.ServiceTier(); got != "" {
+		t.Errorf("ServiceTier = %q, want empty (named exact model must not inherit global Fast)", got)
 	}
 }
 

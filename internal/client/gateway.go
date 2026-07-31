@@ -1002,10 +1002,12 @@ type CompletionRequest struct {
 	// EffortTier is the unified cross-provider reasoning-effort intent
 	// ("low"/"high"/"xhigh"/"max"). Cloud translates it to each provider's
 	// native value (Anthropic output_config.effort direct; OpenAI reasoning_effort
-	// low→low/high→medium/xhigh→high/max→high). Cloud prefers effort_tier when
-	// present, else falls back to ReasoningEffort (old behavior). Empty = unset.
-	EffortTier string `json:"effort_tier,omitempty"`
-	ToolChoice any    `json:"tool_choice,omitempty"` // nil=auto, "any", or {"type":"tool","name":"..."}
+	// maps low→low/high→medium; GPT-5.6 keeps xhigh/max while older models
+	// compress both to high). Cloud prefers effort_tier when present, else falls
+	// back to ReasoningEffort (old behavior). Empty = unset.
+	EffortTier  string `json:"effort_tier,omitempty"`
+	ServiceTier string `json:"service_tier,omitempty"` // OpenAI processing lane: default/fast
+	ToolChoice  any    `json:"tool_choice,omitempty"`  // nil=auto, "any", or {"type":"tool","name":"..."}
 
 	// ExecutionProfileID is an opaque Cloud-minted identifier. kfp1 profiles
 	// pin Koe Fast; ep1 profiles pin a provider-native computer route. ShanClaw

@@ -2003,6 +2003,9 @@ func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelCo
 		loop.SetResponseLanguage(*ac.Language)
 	}
 	if ac.Model != nil {
+		// Processing tier is deliberately global-only. A named agent's exact
+		// model choice must not inherit the hidden global OpenAI Fast switch.
+		loop.SetServiceTier("")
 		loop.SetSpecificModel(*ac.Model)
 	}
 	if ac.MaxIterations != nil {
@@ -3492,6 +3495,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if runCfg.Agent.EffortTier != "" {
 		loop.SetEffortTier(runCfg.Agent.EffortTier)
 	}
+	loop.SetServiceTier(runCfg.Agent.ServiceTier)
 	// Response language: unconditional global baseline ("" = mirror); the
 	// per-agent overlay below may override (including "" to force mirror).
 	loop.SetResponseLanguage(runCfg.Agent.Language)

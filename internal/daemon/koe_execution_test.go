@@ -677,6 +677,7 @@ func TestKoeFastCheckpointKeepsPreProfileAgentBaseline(t *testing.T) {
 	loop.SetThinking(&client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096})
 	loop.SetReasoningEffort("high")
 	loop.SetEffortTier("xhigh")
+	loop.SetServiceTier("default")
 	loop.SetResponseLanguage("中文")
 	loop.SetTemperature(0.27)
 	loop.SetMaxTokens(7777)
@@ -699,6 +700,7 @@ func TestKoeFastCheckpointKeepsPreProfileAgentBaseline(t *testing.T) {
 		snapshot.ExecutionConfig.ModelTier != "large" ||
 		snapshot.ExecutionConfig.ReasoningEffort != "high" ||
 		snapshot.ExecutionConfig.EffortTier != "xhigh" ||
+		snapshot.ExecutionConfig.ServiceTier != "default" ||
 		snapshot.ExecutionConfig.ResponseLanguage != "中文" {
 		t.Fatalf("Fast checkpoint baseline drifted: %+v", snapshot.ExecutionConfig)
 	}

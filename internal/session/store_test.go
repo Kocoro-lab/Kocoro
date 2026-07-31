@@ -260,6 +260,7 @@ func TestStore_RoundTripsInterruptedExecutionConfig(t *testing.T) {
 		Thinking:              &client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096},
 		ReasoningEffort:       "high",
 		EffortTier:            "xhigh",
+		ServiceTier:           "fast",
 		ResponseLanguage:      "中文",
 		Temperature:           0.27,
 		MaxTokens:             7777,
@@ -291,6 +292,7 @@ func TestStore_RoundTripsInterruptedExecutionConfig(t *testing.T) {
 		*got.Thinking != *want.Thinking ||
 		got.ReasoningEffort != want.ReasoningEffort ||
 		got.EffortTier != want.EffortTier ||
+		got.ServiceTier != want.ServiceTier ||
 		got.ResponseLanguage != want.ResponseLanguage ||
 		got.Temperature != want.Temperature ||
 		got.MaxTokens != want.MaxTokens ||

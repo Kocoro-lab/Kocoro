@@ -39,6 +39,7 @@ func TestAgentLoopExecutionProfileWireAndFullConfigPreservation(t *testing.T) {
 		loop.SetSpecificModel("gpt-5.6-terra")
 		loop.SetReasoningEffort("low")
 		loop.SetEffortTier("medium")
+		loop.SetServiceTier("fast")
 		loop.SetThinking(&client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096})
 		loop.SetKoeExecutionProfile(executionprofile.FullProfile(executionprofile.ModeFull, "requested_full"))
 		if _, _, err := loop.Run(context.Background(), "work", nil, nil); err != nil {
@@ -46,7 +47,8 @@ func TestAgentLoopExecutionProfileWireAndFullConfigPreservation(t *testing.T) {
 		}
 		req := llm.requests[0]
 		if req.ModelTier != "large" || req.SpecificModel != "gpt-5.6-terra" ||
-			req.ReasoningEffort != "low" || req.EffortTier != "medium" {
+			req.ReasoningEffort != "low" || req.EffortTier != "medium" ||
+			req.ServiceTier != "fast" {
 			t.Fatalf("full request changed agent config: %+v", req)
 		}
 		if req.Thinking == nil || req.Thinking.Type != "enabled" || req.Thinking.BudgetTokens != 4096 {
@@ -71,9 +73,12 @@ func TestAgentLoopExecutionProfileWireAndFullConfigPreservation(t *testing.T) {
 		loop.SetSpecificModel("claude-sonnet-5")
 		loop.SetReasoningEffort("high")
 		loop.SetEffortTier("xhigh")
+		loop.SetServiceTier("default")
 		loop.SetThinking(&client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096})
 		loop.SetKoeExecutionProfile(fastProfileForAgentTest())
-		if loop.SpecificModel() != "claude-sonnet-5" || loop.EffortTier() != "xhigh" {
+		if loop.SpecificModel() != "claude-sonnet-5" ||
+			loop.EffortTier() != "xhigh" ||
+			loop.ServiceTier() != "default" {
 			t.Fatal("SetKoeExecutionProfile mutated user Agent configuration")
 		}
 		if _, _, err := loop.Run(context.Background(), "work", nil, nil); err != nil {
@@ -81,7 +86,8 @@ func TestAgentLoopExecutionProfileWireAndFullConfigPreservation(t *testing.T) {
 		}
 		req := llm.requests[0]
 		if req.ModelTier != "" || req.SpecificModel != "" ||
-			req.ReasoningEffort != "" || req.EffortTier != "" {
+			req.ReasoningEffort != "" || req.EffortTier != "" ||
+			req.ServiceTier != "" {
 			t.Fatalf("fast request carried caller model/effort selectors: %+v", req)
 		}
 		if req.Thinking != nil {
