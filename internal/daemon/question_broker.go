@@ -62,11 +62,19 @@ func (b *QuestionBroker) SetOnCleanup(fn func(requestID string)) { b.onCleanup =
 func (b *QuestionBroker) Request(ctx context.Context, meta ApprovalRequestMeta, req *QuestionRequest) questionResolution {
 	cancel := questionResolution{Action: QuestionActionCancel}
 
-	// Non-interactive IM/voice channels have no selection UI and a question
-	// cannot be auto-answered — unlike approvals there is no safe "yes". Decline
-	// so the agent falls back to its own best judgment instead of blocking.
-	if IsNonInteractiveApprovalChannel(meta.Source) {
-		log.Printf("question: declining for non-interactive channel %q (no selection UI)", meta.Source)
+	// Sources with no selection UI decline here rather than block: a question
+	// cannot be auto-answered — unlike approvals there is no safe "yes" — so the
+	// agent falls back to its own best judgment instead of stalling the turn.
+	//
+	// This mirrors the asker-injection gate in handleMessageSSE ON PURPOSE. It
+	// used to test IsNonInteractiveApprovalChannel, which let Slack/Feishu/Lark/
+	// Teams/LINE through because they can show an Allow/Deny card — but there is
+	// no Cloud transport for questions, so those runs blocked for the whole
+	// resolution window and then reported a decline the user never made. This
+	// layer exists to backstop a call site getting the gate wrong, so it must use
+	// the question predicate, not the approval one.
+	if !CanPresentQuestionUI(meta.Source) {
+		log.Printf("question: declining for source %q (no selection UI)", meta.Source)
 		return questionResolution{Action: QuestionActionDecline}
 	}
 

@@ -1198,6 +1198,47 @@ func IsNonInteractiveApprovalChannel(source string) bool {
 	return IsMessagingPlatform(source) && !channelHasInteractiveApproval(source)
 }
 
+// questionUISources are the run sources whose originating client can BOTH
+// render an ask_user_question selection card and send the answer back — the
+// per-request SSE `question` frame and the `question.request` bus event are
+// consumed by Kocoro Desktop, and `POST /question` is its answer path.
+//
+// This is deliberately NOT isUnattendedSource. Approval capability is not a
+// proxy for question capability: Slack/Feishu/Lark/Teams/LINE receive an
+// Allow/Deny card because Cloud routes approvals, but there is NO Cloud
+// transport for question.request (issue #301). Gating questions on the approval
+// predicate hands those runs an asker they can never satisfy — the tool blocks
+// for the whole resolution window (the 4-minute auto_resolution_ms clamp, or
+// ApprovalTimeout at 5 minutes when the model omits it) and then resolves as a
+// decline the user never made, with nothing shown on their side at all.
+//
+// An allow-list (not a deny-list) is deliberate, mirroring
+// promptSuggestionSources: any source added later — a new channel, a new
+// background trigger — defaults to prose questions, not to a wedged run. A
+// deny-list would fail OPEN, and would also couple this gate to
+// IsMessagingPlatform, where REMOVING a channel would silently grant it an
+// asker. Add a source here only once it has a confirmed question consumer.
+//
+// The empty string is included because handleMessage backfills it to "kocoro"
+// only after this gate is consulted on some paths.
+var questionUISources = map[string]struct{}{
+	"":         {},
+	"desktop":  {},
+	"kocoro":   {},
+	"shanclaw": {},
+	"web":      {},
+}
+
+// CanPresentQuestionUI reports whether a run's originating client can present
+// an ask_user_question selection card. See questionUISources.
+func CanPresentQuestionUI(source string) bool {
+	if isUnattendedSource(source) {
+		return false
+	}
+	_, ok := questionUISources[strings.ToLower(strings.TrimSpace(source))]
+	return ok
+}
+
 // cacheSourceFromDaemonSource normalizes daemon-level origins for Cloud-side
 // attribution. It does not select a TTL: Cloud currently applies the short
 // prompt-cache TTL to every source. See docs/cache-strategy.md.
