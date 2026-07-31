@@ -1198,26 +1198,45 @@ func IsNonInteractiveApprovalChannel(source string) bool {
 	return IsMessagingPlatform(source) && !channelHasInteractiveApproval(source)
 }
 
-// CanPresentQuestionUI reports whether a run's originating client can render an
-// ask_user_question selection card AND send the answer back.
+// questionUISources are the run sources whose originating client can BOTH
+// render an ask_user_question selection card and send the answer back — the
+// per-request SSE `question` frame and the `question.request` bus event are
+// consumed by Kocoro Desktop, and `POST /question` is its answer path.
 //
 // This is deliberately NOT isUnattendedSource. Approval capability is not a
-// proxy for question capability: Slack/Feishu/Lark/Teams/LINE can receive an
+// proxy for question capability: Slack/Feishu/Lark/Teams/LINE receive an
 // Allow/Deny card because Cloud routes approvals, but there is NO Cloud
-// transport for question.request — it is Desktop-local (see the daemon's wire
-// contract notes and issue #301). Gating questions on the approval predicate
-// therefore hands an IM run an asker it can never satisfy: the tool blocks for
-// the full auto-resolution window (up to 4 minutes of silence for the IM user)
-// and then resolves as a decline the user never made.
+// transport for question.request (issue #301). Gating questions on the approval
+// predicate hands those runs an asker they can never satisfy — the tool blocks
+// for the whole resolution window (the 4-minute auto_resolution_ms clamp, or
+// ApprovalTimeout at 5 minutes when the model omits it) and then resolves as a
+// decline the user never made, with nothing shown on their side at all.
 //
-// Messaging platforms are excluded wholesale — including koe, which is
-// messaging-routed — leaving the attended local surfaces (Desktop/web/CLI)
-// that actually consume the `question` frame.
+// An allow-list (not a deny-list) is deliberate, mirroring
+// promptSuggestionSources: any source added later — a new channel, a new
+// background trigger — defaults to prose questions, not to a wedged run. A
+// deny-list would fail OPEN, and would also couple this gate to
+// IsMessagingPlatform, where REMOVING a channel would silently grant it an
+// asker. Add a source here only once it has a confirmed question consumer.
+//
+// The empty string is included because handleMessage backfills it to "kocoro"
+// only after this gate is consulted on some paths.
+var questionUISources = map[string]struct{}{
+	"":         {},
+	"desktop":  {},
+	"kocoro":   {},
+	"shanclaw": {},
+	"web":      {},
+}
+
+// CanPresentQuestionUI reports whether a run's originating client can present
+// an ask_user_question selection card. See questionUISources.
 func CanPresentQuestionUI(source string) bool {
 	if isUnattendedSource(source) {
 		return false
 	}
-	return !IsMessagingPlatform(source)
+	_, ok := questionUISources[strings.ToLower(strings.TrimSpace(source))]
+	return ok
 }
 
 // cacheSourceFromDaemonSource normalizes daemon-level origins for Cloud-side
