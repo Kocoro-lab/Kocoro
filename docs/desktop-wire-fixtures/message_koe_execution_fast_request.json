@@ -1,0 +1,10 @@
+{
+  "text": "check today's calendar and add a reminder",
+  "source": "koe",
+  "channel": "koe",
+  "session_id": "koe-session-001",
+  "execution_mode": "fast",
+  "requested_execution_mode": "fast",
+  "logical_task_id": "burst-4f2a:t01",
+  "execution_run_id": "burst-4f2a:t01.r01"
+}

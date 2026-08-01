@@ -153,6 +153,9 @@ auto-runs again under the same key.
 | `local_screenshot_window_success.json` | `screenshot_window.go handleScreenshotWindow` (200 branch) | `{"image_base64":…,"width":…,"height":…}`; anchors key names consumed by Desktop's `CaptureWindowResult` |
 | `message_foreground_hint_request.json` | Desktop → `POST /message` | `RunAgentRequest` with `foreground_hint` populated; `source: "kocoro"` is the quick-panel source string; `foreground_hint` is folded into `StickyContext` by the runner, never forwarded to Cloud |
 | `message_idempotency_request.json` | Desktop → `POST /message` | Crash-safe primary request with a client-minted `session_id` + stable `idempotency_key`; decoded and validated by the daemon and emitted by Desktop's production request builder |
+| `message_koe_execution_fast_request.json` | Koe → `POST /message` | `source=koe` fast request: semantic `execution_mode` + `requested_execution_mode` claim plus client-minted lineage ids (`logical_task_id`, `execution_run_id`). No provider/model/profile fields — the daemon re-decides admission and resolves the profile itself |
+| `message_koe_execution_full_request.json` | Koe → `POST /message` | Full-mode follow-up: adds `full_reason` (closed vocabulary), `parent_run_id` lineage, and the untrusted `inherited_execution_mode` claim (admission clears it; only ledger validation restores the Full floor) |
+| `sse_event.done.with_execution_run.json` | `handleMessageSSE` `event: done` | `RunAgentResult` carrying the validated `execution_run` (lineage ids + the resolved kfp1 profile incl. `resolution_reason`); Koe records it into the call ledger for follow-up/cancel routing |
 
 ## Comparison Rule: Semantic Equality, Not Byte Equality
 

@@ -31,6 +31,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -1452,4 +1453,128 @@ func TestWireFixture_MessageIdempotencyRequest(t *testing.T) {
 		t.Fatalf("re-encode failed: %v", err)
 	}
 	assertSemanticEqual(t, fixture, parseJSONMap(t, reEncoded))
+}
+
+// TestWireFixture_MessageKoeExecutionFastRequest pins the source=koe fast
+// request: the semantic execution_mode/requested_execution_mode claim plus
+// client-minted lineage ids. The wire deliberately carries NO provider, model,
+// or profile fields — the daemon re-decides admission and resolves the profile.
+func TestWireFixture_MessageKoeExecutionFastRequest(t *testing.T) {
+	fixture := loadWireFixture(t, "message_koe_execution_fast_request.json")
+
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatalf("re-marshal fixture: %v", err)
+	}
+	var req RunAgentRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("request decode failed: %v", err)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("request validation failed: %v", err)
+	}
+	if req.Source != "koe" || req.ExecutionMode != executionprofile.ModeFast {
+		t.Fatalf("source=%q mode=%q, want koe/fast", req.Source, req.ExecutionMode)
+	}
+	if req.RequestedExecutionMode == nil || *req.RequestedExecutionMode != "fast" {
+		t.Fatalf("requested_execution_mode = %v, want fast", req.RequestedExecutionMode)
+	}
+	if req.LogicalTaskID != "burst-4f2a:t01" || req.ExecutionRunID != "burst-4f2a:t01.r01" {
+		t.Fatalf("lineage ids = %q / %q", req.LogicalTaskID, req.ExecutionRunID)
+	}
+	// json:"-" injection surfaces must stay zero even if a hostile client
+	// added them; the fixture omits them, so this pins the decode default.
+	if !req.ExecutionRun.IsZero() {
+		t.Fatalf("execution_run decoded from wire: %+v", req.ExecutionRun)
+	}
+
+	// Producer side: the koe-visible execution fields survive re-encoding
+	// through the production struct with the same tags and values.
+	produced := parseJSONMap(t, []byte(mustJSON(req)))
+	for _, key := range []string{"execution_mode", "requested_execution_mode", "logical_task_id", "execution_run_id"} {
+		if produced[key] != fixture[key] {
+			t.Fatalf("field %q drifted: fixture=%v produced=%v", key, fixture[key], produced[key])
+		}
+	}
+}
+
+// TestWireFixture_MessageKoeExecutionFullRequest pins the full-mode follow-up:
+// full_reason (closed vocabulary), parent lineage, and the untrusted
+// inherited_execution_mode claim (admission clears it — only validation
+// against the execution ledger may restore the Full floor).
+func TestWireFixture_MessageKoeExecutionFullRequest(t *testing.T) {
+	fixture := loadWireFixture(t, "message_koe_execution_full_request.json")
+
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatalf("re-marshal fixture: %v", err)
+	}
+	var req RunAgentRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("request decode failed: %v", err)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("request validation failed: %v", err)
+	}
+	if req.ExecutionMode != executionprofile.ModeFull ||
+		req.FullReason != executionprofile.FullReasonSecurityPermissions {
+		t.Fatalf("mode=%q full_reason=%q", req.ExecutionMode, req.FullReason)
+	}
+	if req.InheritedMode != executionprofile.ModeFull {
+		t.Fatalf("inherited_execution_mode = %q, want full", req.InheritedMode)
+	}
+	if req.ParentRunID != "burst-4f2a:t02.r01" {
+		t.Fatalf("parent_run_id = %q", req.ParentRunID)
+	}
+
+	produced := parseJSONMap(t, []byte(mustJSON(req)))
+	for _, key := range []string{"execution_mode", "full_reason", "inherited_execution_mode", "logical_task_id", "execution_run_id", "parent_run_id"} {
+		if produced[key] != fixture[key] {
+			t.Fatalf("field %q drifted: fixture=%v produced=%v", key, fixture[key], produced[key])
+		}
+	}
+}
+
+// TestWireFixture_DoneWithExecutionRun pins the `event: done` payload carrying
+// the validated execution run (lineage ids + the resolved kfp1 profile).
+// handleMessageSSE marshals *RunAgentResult directly, so serializing the
+// producer type IS the production path; Koe's ledger is the consumer.
+func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
+	fixture := loadWireFixture(t, "sse_event.done.with_execution_run.json")
+
+	result := &RunAgentResult{
+		Reply:     fixture["reply"].(string),
+		SessionID: fixture["session_id"].(string),
+		Agent:     fixture["agent"].(string),
+		Usage: RunAgentUsage{
+			InputTokens: 8120, OutputTokens: 240, TotalTokens: 8360, CostUSD: 0.021,
+		},
+		ExecutionRun: &executionprofile.Run{
+			LogicalTaskID: "burst-4f2a:t01",
+			RunID:         "burst-4f2a:t01.r01",
+			Profile:       fastProfileForDaemonTest(),
+		},
+	}
+	if err := result.ExecutionRun.ValidatePersisted(); err != nil {
+		t.Fatalf("fixture run must satisfy the persisted contract: %v", err)
+	}
+	raw := []byte(mustJSON(result))
+	produced := parseJSONMap(t, raw)
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer shape: Koe decodes execution_run into executionprofile.Run for
+	// ledger recording; pin the key fields it routes on.
+	var done struct {
+		Reply        string                `json:"reply"`
+		ExecutionRun *executionprofile.Run `json:"execution_run"`
+	}
+	if err := json.Unmarshal(raw, &done); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if done.ExecutionRun == nil ||
+		done.ExecutionRun.RunID != "burst-4f2a:t01.r01" ||
+		!done.ExecutionRun.Profile.IsFast() ||
+		done.ExecutionRun.Profile.ResolutionReason != "cloud_profile_resolved" {
+		t.Fatalf("consumer decode lost execution_run fields: %+v", done.ExecutionRun)
+	}
 }
