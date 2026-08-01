@@ -15,7 +15,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
-// This test crosses the real Shan AgentLoop, an isolated shannon-cloud
+// This test crosses the real Shan AgentLoop, an isolated Shannon Cloud
 // deployment, the selected Anthropic adapter, and macOS screen capture. It is
 // intentionally gated because it sends a real desktop screenshot to the
 // configured provider and incurs provider cost.

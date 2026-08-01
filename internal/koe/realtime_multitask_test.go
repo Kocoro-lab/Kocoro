@@ -109,3 +109,148 @@ func waitDoTaskPost(t *testing.T, posts <-chan DoTaskRequest) DoTaskRequest {
 		return DoTaskRequest{}
 	}
 }
+
+// A daemon result whose execution run the ledger REFUSES (conflicting run
+// identity) has no successor goroutine to clean up after it. The rejection
+// must still clear the busy state — a bare return pinned the call at
+// "thinking" with the user mic un-restored for the rest of the call — while
+// never delivering the conflicting result to the mailbox.
+func TestRejectedExecutionRunClearsPendingStateWithoutDelivery(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req DoTaskRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply":          "done",
+			"spoken_summary": "done",
+			"execution_run": map[string]any{
+				// Different run_id from the request's and a dangling parent:
+				// RecordExecutionRun's append branch rejects it.
+				"run_id":        "ker1_conflicting",
+				"parent_run_id": "ker1_nonexistent",
+				"profile": map[string]any{
+					"requested_mode":    "full",
+					"effective_mode":    "full",
+					"resolution_reason": "test",
+				},
+			},
+		})
+	}))
+	defer mock.Close()
+
+	state := NewCallState("burst-rej", "")
+	dispatcher := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
+	var mu sync.Mutex
+	var states []string
+	h := newEventHandlerWithMailbox(dispatcher, state, nil, func(any) error { return nil }, mailbox, nil)
+	h.onVoiceState = func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		states = append(states, s)
+	}
+
+	h.handleFunctionCall(context.Background(), "call-rej", "do_task", []byte(`{"task":"check something","relationship":"new"}`))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		last := ""
+		if len(states) > 0 {
+			last = states[len(states)-1]
+		}
+		mu.Unlock()
+		if !h.asyncTaskPending.Load() && last == "listening" {
+			if mailbox.pending() != 0 {
+				t.Fatalf("rejected execution run was delivered to the mailbox: pending=%d", mailbox.pending())
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("rejected execution run left call wedged: pending=%t states=%v mailbox=%d",
+		h.asyncTaskPending.Load(), states, mailbox.pending())
+}
+
+// A rejected run's cleanup must be lane-aware: while an INDEPENDENT task is
+// still in flight, the rejection must not flip the call to "listening" or
+// clear the pending flag — the surviving task's own completion owns that
+// transition, and its result must still land.
+func TestRejectedExecutionRunKeepsBusyStateWhileAnotherTaskRuns(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	rejectedReturned := make(chan struct{})
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req DoTaskRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Text == "long running job" {
+			<-release
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"reply": "long job done", "spoken_summary": "long job done",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply":          "conflicting done",
+			"spoken_summary": "conflicting done",
+			"execution_run": map[string]any{
+				"run_id":        "ker1_conflicting2",
+				"parent_run_id": "ker1_nonexistent2",
+				"profile": map[string]any{
+					"requested_mode":    "full",
+					"effective_mode":    "full",
+					"resolution_reason": "test",
+				},
+			},
+		})
+		close(rejectedReturned)
+	}))
+	defer func() {
+		releaseAll()
+		mock.Close()
+	}()
+
+	state := NewCallState("burst-par", "")
+	dispatcher := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
+	var mu sync.Mutex
+	var states []string
+	h := newEventHandlerWithMailbox(dispatcher, state, nil, func(any) error { return nil }, mailbox, nil)
+	h.onVoiceState = func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		states = append(states, s)
+	}
+
+	h.handleFunctionCall(context.Background(), "call-long", "do_task", []byte(`{"task":"long running job","relationship":"new"}`))
+	h.handleFunctionCall(context.Background(), "call-conflict", "do_task", []byte(`{"task":"conflicting job","relationship":"new"}`))
+
+	select {
+	case <-rejectedReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rejected task's daemon call never returned")
+	}
+	// Give the rejection goroutine time to run its (wrong, if buggy) cleanup.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !h.asyncTaskPending.Load() {
+			t.Fatal("rejection cleared asyncTaskPending while another task was still running")
+		}
+		mu.Lock()
+		for _, s := range states {
+			if s == "listening" {
+				mu.Unlock()
+				t.Fatalf("rejection emitted listening while another task was still running: %v", states)
+			}
+		}
+		mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	releaseAll()
+	waitUntil(t, func() bool { return mailbox.pending() == 1 }, "surviving task's result must land in the mailbox")
+}

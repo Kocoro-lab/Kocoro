@@ -2117,6 +2117,26 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 					if eventLogEnabled() {
 						log.Printf("koe[task]: rejected conflicting execution run task_id=%q run_id=%q", task.ID, out.ExecutionRun.RunID)
 					}
+					// The answer is undeliverable under this lineage (the ledger
+					// refused the run identity), but the goroutine is still
+					// terminal and — unlike the stale-generation branch below —
+					// has NO successor in flight to clean up after it. A bare
+					// return here pinned the call at "thinking" with the user
+					// mic un-restored for the rest of the call. Only voice
+					// delivery is dropped; the report persists in the daemon
+					// session, same as any unvoiced result.
+					//
+					// This task is terminal even though its result cannot land —
+					// mark it failed so it stops counting as running, then gate
+					// the busy-state clear on OTHER lanes: while an independent
+					// task is still in flight, leave the state alone — that
+					// task's own completion owns the transition to listening.
+					h.state.MarkFailed(task.ID, "conflicting execution run")
+					if !h.taskInFlight() {
+						h.asyncTaskPending.Store(false)
+						h.maybeRestoreUserMic()
+						h.emitVoiceState("listening")
+					}
 					return
 				}
 				landed, supersedes, currentGeneration := h.state.LandResultForRun(task.ID, landingRunID, r)

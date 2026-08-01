@@ -246,6 +246,19 @@ func (s *CallState) LandResult(taskID string, result SayResult) (VoiceTask, bool
 	return landed, supersedes
 }
 
+// MarkFailed terminates a running task whose daemon run finished but whose
+// result is undeliverable (e.g. the ledger refused a conflicting execution-run
+// identity). Without a terminal transition the task counts as running forever
+// and taskInFlight()-gated cleanup never fires.
+func (s *CallState) MarkFailed(taskID, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if task, ok := s.tasks[taskID]; ok && task.State == TaskRunning {
+		task.State = TaskFailed
+		task.FailReason = reason
+	}
+}
+
 func (s *CallState) MarkCancelled(taskID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
