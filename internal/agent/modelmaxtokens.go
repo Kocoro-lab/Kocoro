@@ -29,7 +29,7 @@ var modelMaxOutputTokens = map[string]int{
 	"claude-opus-4-7":   64_000,
 	"claude-sonnet-5":   128_000,
 	// Mythos preview: stays on the 32K fallback until output-cap docs are
-	// published; flip to 64K when shannon-cloud config/models.yaml confirms.
+	// published; flip to 64K once the Cloud model catalog confirms.
 	"claude-mythos-preview": defaultMaxOutputTokens,
 
 	// --- 200K, dated forms ---

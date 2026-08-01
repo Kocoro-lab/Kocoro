@@ -7246,3 +7246,30 @@ func TestAgentLoop_SourceAccessor(t *testing.T) {
 		t.Errorf("after SetSource(\"\") want empty, got %q", got)
 	}
 }
+
+// The zero-tool hallucination nudge must not fire on ordinary conversational
+// answers: observational phrasing describes user-provided material there, and
+// the nudge would force a finished chat turn into pointless tool use.
+func TestLooksLikeUnverifiedActionClaimZeroToolGate(t *testing.T) {
+	conversational := []string{
+		"I can see why you would prefer the second approach here — it keeps the routing table flat and avoids the double lookup we discussed earlier in the thread.",
+		"I notice you mentioned latency concerns; the output shows a p99 spike in the trace you pasted, which usually points at GC pressure rather than lock contention.",
+	}
+	for _, text := range conversational {
+		if looksLikeUnverifiedActionClaim(text) {
+			t.Errorf("conversational answer misclassified as unverified action claim: %q", text)
+		}
+	}
+
+	fabricated := []string{
+		"I've successfully created the configuration file with all the settings you requested, and everything is in place for the deployment to proceed smoothly.",
+		"The command completed without any issues and the migration ran to the end; all thirty-seven rows were updated in the production table as requested.",
+		// A live GUI surface cannot be observed without a screenshot tool.
+		"The screen shows the settings dialog is open with the network tab selected, and the proxy fields are already filled in with the values from your config.",
+	}
+	for _, text := range fabricated {
+		if !looksLikeUnverifiedActionClaim(text) {
+			t.Errorf("performed-action claim not flagged in zero-tool run: %q", text)
+		}
+	}
+}

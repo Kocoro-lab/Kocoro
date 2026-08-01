@@ -1417,11 +1417,19 @@ func (a *AgentLoop) resolveRunComputerTool(
 
 	var resolutionErrors []string
 	for _, contract := range contracts {
-		profile, err := resolver.ResolveComputerExecutionProfile(ctx, client.ComputerExecutionProfileRequest{
+		// This resolve runs inside the tool-execution phase, which the idle
+		// watchdog does not count — an unbounded call against a hung resolve
+		// endpoint would silently stall the run for the full HTTP client
+		// timeout (up to 10 min across both contracts). Bound each attempt
+		// like the Koe fast resolve in the daemon runner; on timeout the
+		// loop falls through to the next contract / generic fallback.
+		resolveCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		profile, err := resolver.ResolveComputerExecutionProfile(resolveCtx, client.ComputerExecutionProfileRequest{
 			ModelTier:            a.modelTier,
 			SpecificModel:        specificModel,
 			RequiredToolContract: contract,
 		})
+		cancel()
 		if err != nil {
 			resolutionErrors = append(resolutionErrors, fmt.Sprintf("%s: %v", contract, err))
 			continue
@@ -1447,7 +1455,7 @@ func (a *AgentLoop) resolveRunComputerTool(
 		}
 		a.computerProfile = profile
 		a.computerToolName = name
-		a.computerToolsetHash = toolSchemaFingerprint(a.tools)
+		a.computerToolsetHash = computerActivationFingerprint(a.tools, name)
 		return name, nil
 	}
 	return "", fmt.Errorf("computer execution profile unavailable for %q: %s", specificModel, strings.Join(resolutionErrors, "; "))
@@ -2653,14 +2661,18 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		a.workingSet = NewWorkingSet()
 	}
 	toolsetChanged := a.workingSet.SyncToolset(a.tools)
+	// Compare only the activation's own tool contract, not the whole registry
+	// fingerprint: recovery runs while MCP servers are still connecting, so
+	// unrelated registry churn must not abandon a valid checkpoint. See
+	// computerActivationFingerprint.
 	if a.computerProfile.ProfileID != "" &&
-		a.computerToolsetHash != a.workingSet.Fingerprint() {
+		a.computerToolsetHash != computerActivationFingerprint(a.tools, a.computerToolName) {
 		return "", nil, fmt.Errorf(
 			"%w: profile=%s checkpoint=%s current=%s",
 			ErrComputerActivationToolsetChanged,
 			a.computerProfile.ProfileID,
 			a.computerToolsetHash,
-			a.workingSet.Fingerprint(),
+			computerActivationFingerprint(a.tools, a.computerToolName),
 		)
 	}
 
@@ -4572,7 +4584,16 @@ iterationLoop:
 
 					reanchorActiveTask(MetaBoundaryPostCompaction)
 
-					// Rebuild request with compacted messages.
+					// Rebuild request with compacted messages. The ordinary
+					// Responses cursor is deliberately NOT carried over: with
+					// previous_response_id set, the provider reconstructs
+					// context from its own stored response chain, which local
+					// compaction did not shrink — the retry would hit the
+					// identical overflow and reactiveCompacted blocks a second
+					// attempt. Dropping the cursor sends the full compacted
+					// transcript instead. The exact model that owns the tool
+					// trajectory IS kept (below): only the provider-side
+					// cursor is stale, not the route.
 					ordinaryPreviousResponseID := req.PreviousResponseID
 					ordinarySpecificModel := req.SpecificModel
 					if prepareErr := prepareProviderNativeTools(ctx, effTools, toolSchemas); prepareErr != nil {
@@ -4607,9 +4628,10 @@ iterationLoop:
 					}
 					if validOrdinaryOpenAIResponseID(ordinaryPreviousResponseID) &&
 						strings.TrimSpace(ordinarySpecificModel) != "" {
-						// This is the same logical tool-result request after
-						// local compaction, not a new trajectory step.
-						req.PreviousResponseID = ordinaryPreviousResponseID
+						// Same logical tool-result request, same model: keep
+						// the exact pin so the trajectory does not hop to a
+						// different tier route mid-tool-call. Only the cursor
+						// is dropped.
 						req.SpecificModel = ordinarySpecificModel
 					}
 					// Checkpoint the compacted state before retrying. Gated on
@@ -5006,11 +5028,14 @@ iterationLoop:
 			// "claim without verification in this response" nudge would discard
 			// valid long summaries and force an unnecessary provider round trip.
 			// Ordinary completed tools are evidence too: only nudge when this run
-			// has no native trajectory and no ordinary tool result at all.
+			// has no native trajectory and no ordinary tool result at all — and
+			// then only for performed-action claims. A zero-tool run is usually
+			// plain conversation; observational phrasing ("I can see", "the
+			// output shows") legitimately describes user-provided material there.
 			if openAIComputerBaseRequest == nil &&
 				totalToolCalls == 0 &&
 				hallucinationNudges < 2 &&
-				looksLikeUnverifiedClaim(resp.OutputText) {
+				looksLikeUnverifiedActionClaim(resp.OutputText) {
 				hallucinationNudges++
 				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
 				stampMessage()
@@ -7597,28 +7622,37 @@ func compressToolResultText(text string, maxChars int) string {
 	return result.String()
 }
 
-// unverifiedClaimPatterns matches text that claims to see, read, or complete something.
-var unverifiedClaimPatterns = regexp.MustCompile(`(?i)(?:I (?:can see|see that|notice|observe|found that)|I(?:'ve| have) (?:successfully|completed|finished|done|created|updated|deleted|modified|set|changed)|(?:the (?:screen|window|page|app|file|output|result) (?:shows|displays|contains|has|reads))|(?:the (?:command|task|operation|script|request))\b.{0,60}?(?:completed|finished|succeeded|ran|executed|worked)\b)`)
-
 // deniedSuccessPattern catches responses claiming a task completed even when no minimum
 // length is met — any confident success claim after a denial is a red flag.
 var deniedSuccessPattern = regexp.MustCompile(`(?i)(?:^Done\b|completed successfully|ran successfully|executed successfully|finished successfully|(?:the (?:command|task|operation|script|request))\b.{0,60}?(?:completed|finished|succeeded|ran|executed|worked)\b)`)
 
 // claimsSuccessAfterDenial returns true if the response claims a task completed.
-// Unlike looksLikeUnverifiedClaim, this has no minimum-length exemption — it is only
-// called when at least one tool was denied this turn, making any success claim suspect.
+// Unlike looksLikeUnverifiedActionClaim, this has no minimum-length exemption — it is
+// only called when at least one tool was denied this turn, making any success claim
+// suspect.
 func claimsSuccessAfterDenial(text string) bool {
 	return deniedSuccessPattern.MatchString(text)
 }
 
-// looksLikeUnverifiedClaim returns true if the text contains phrases that claim
-// observation or completion — the kind of claims that should be backed by a tool call.
-// Short responses (<100 chars) are exempt (likely simple answers).
-func looksLikeUnverifiedClaim(text string) bool {
+// zeroToolActionClaimPattern matches text asserting something only a tool
+// could have established — fabricated by construction in a run with zero tool
+// calls: first-person performed actions, completed operations, and live GUI
+// surfaces (screen/window/page/app), which cannot be observed without a
+// screenshot. Conversational observation ("I can see", "I notice") and
+// user-pastable material ("the output shows", "the file contains") are
+// deliberately excluded: with no tool calls those usually describe
+// user-provided material in ordinary conversation, and nudging turns a
+// finished chat answer into pointless forced tool use.
+var zeroToolActionClaimPattern = regexp.MustCompile(`(?i)I(?:'ve| have) (?:successfully|completed|finished|done|created|updated|deleted|modified|set|changed)|(?:the (?:screen|window|page|app) (?:shows|displays|contains|has|reads))|(?:the (?:command|task|operation|script|request))\b.{0,60}?(?:completed|finished|succeeded|ran|executed|worked)\b`)
+
+// looksLikeUnverifiedActionClaim gates the zero-tool hallucination nudge: short
+// responses (<100 chars) are exempt (likely simple answers), and only
+// first-person completed-action claims qualify.
+func looksLikeUnverifiedActionClaim(text string) bool {
 	if len(text) < 100 {
 		return false
 	}
-	return unverifiedClaimPatterns.MatchString(text)
+	return zeroToolActionClaimPattern.MatchString(text)
 }
 
 // fabricatedToolCallPattern matches text that mimics tool call output format.

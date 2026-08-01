@@ -416,3 +416,83 @@ func TestAgentLoopOrdinaryOpenAIResponsesDoesNotOverrideNativeComputer(t *testin
 		)
 	}
 }
+
+// compactionCursorLLMClient mints an ordinary Responses cursor on the first
+// call, overflows exactly once on the request that carries it, and succeeds on
+// everything else (including the small-tier compaction calls).
+type compactionCursorLLMClient struct {
+	requests []client.CompletionRequest
+	errored  bool
+}
+
+func (m *compactionCursorLLMClient) Complete(ctx context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	m.requests = append(m.requests, req)
+	if len(m.requests) == 1 {
+		return ordinaryOpenAIToolResponse("openai", "gpt-5.6-sol", "resp_tool_turn_1"), nil
+	}
+	if req.PreviousResponseID != "" && !m.errored {
+		m.errored = true
+		return nil, &client.APIError{StatusCode: 400, Body: `{"error":{"type":"invalid_request_error","message":"prompt is too long"}}`}
+	}
+	return &client.CompletionResponse{
+		Provider:     "openai",
+		Model:        "gpt-5.6-sol",
+		OutputText:   "BLUE",
+		FinishReason: "stop",
+		RequestID:    "resp_final_turn",
+	}, nil
+}
+
+func (m *compactionCursorLLMClient) CompleteStream(ctx context.Context, req client.CompletionRequest, onDelta func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return m.Complete(ctx, req)
+}
+
+// A context-length overflow on an ordinary continuation request must NOT carry
+// previous_response_id into the post-compaction retry: with the cursor set the
+// provider rebuilds context from its own stored chain, which local compaction
+// did not shrink, so the retry re-overflows and reactiveCompacted blocks a
+// second attempt — the turn dies where the cursorless path recovers.
+func TestReactiveCompactionDropsOrdinaryOpenAIContinuationCursor(t *testing.T) {
+	llm := &compactionCursorLLMClient{}
+	loop := newOrdinaryOpenAIContinuationLoop(t, llm)
+
+	result, _, err := loop.Run(context.Background(), "look up cobalt", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "BLUE" {
+		t.Fatalf("result = %q, want BLUE", result)
+	}
+
+	erroredIdx := -1
+	for i, req := range llm.requests {
+		if req.PreviousResponseID == "resp_tool_turn_1" {
+			erroredIdx = i
+			break
+		}
+	}
+	if erroredIdx == -1 {
+		t.Fatal("no request carried the ordinary continuation cursor")
+	}
+	if erroredIdx+1 >= len(llm.requests) {
+		t.Fatal("no retry request after the context-length overflow")
+	}
+	for _, req := range llm.requests[erroredIdx+1:] {
+		if req.PreviousResponseID != "" {
+			t.Fatalf(
+				"post-compaction request still pinned previous_response_id=%q — provider-side context is not compacted",
+				req.PreviousResponseID,
+			)
+		}
+	}
+	// The exact model that owns the tool trajectory must survive the rebuild:
+	// dropping the cursor must not hop the trajectory onto tier routing. The
+	// requests between the overflow and the retry are the compaction's own
+	// small-tier calls; the main retry is the final request.
+	if retry := llm.requests[len(llm.requests)-1]; retry.SpecificModel != "gpt-5.6-sol" {
+		t.Fatalf(
+			"post-compaction retry specific_model = %q, want gpt-5.6-sol (trajectory model pin lost)",
+			retry.SpecificModel,
+		)
+	}
+}

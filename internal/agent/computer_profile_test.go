@@ -884,3 +884,42 @@ func eventIndex(events []string, want string) int {
 	}
 	return -1
 }
+
+// Recovery runs at daemon start while MCP servers are still connecting, so
+// registry churn OUTSIDE the activation's own tool must not fail the resume —
+// the old whole-registry fingerprint burned a recovery attempt on every
+// restart. Only the computer tool's own contract is pinned.
+func TestResumeInterruptedToleratesUnrelatedRegistryChurn(t *testing.T) {
+	reg, _, _ := newComputerProfileRegistry()
+	llm := &computerProfileSequenceLLM{
+		responses: []*client.CompletionResponse{{
+			OutputText:   "resumed fine",
+			FinishReason: "end_turn",
+		}},
+	}
+	loop := NewAgentLoop(llm, reg, "medium", "", 4, 1000, 100, nil, nil, nil)
+	activation := &executionprofile.ComputerActivation{
+		Profile:            nativeComputerProfileForAgentTest(),
+		ToolName:           "computer",
+		ToolsetFingerprint: computerActivationFingerprint(reg, "computer"),
+	}
+	if err := loop.RestoreComputerActivation(activation); err != nil {
+		t.Fatalf("RestoreComputerActivation: %v", err)
+	}
+
+	// A late-connecting MCP server registers a tool the checkpoint never saw.
+	reg.Register(&mockSimpleTool{name: "late_mcp_tool", result: ToolResult{Content: "x"}})
+
+	_, _, err := loop.ResumeInterrupted(
+		context.Background(),
+		"Continue the interrupted task.",
+		[]client.Message{{Role: "user", Content: client.NewTextContent("Inspect the screen.")}},
+	)
+	if errors.Is(err, ErrComputerActivationToolsetChanged) {
+		t.Fatalf("unrelated registry churn abandoned a valid checkpoint: %v", err)
+	}
+	requests, _ := llm.snapshot()
+	if len(requests) == 0 {
+		t.Fatal("resume never reached the LLM")
+	}
+}
