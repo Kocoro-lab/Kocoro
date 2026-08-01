@@ -121,6 +121,20 @@ type Run struct {
 	Evidence           Evidence            `json:"evidence,omitempty"`
 }
 
+// IsZero reports whether the run carries no execution state at all — the shape
+// a checkpoint written before execution runs existed decodes to. Restore paths
+// use it to distinguish "legacy checkpoint, no ledger" (resumable under the
+// normal configuration) from a corrupt run, which ValidatePersisted rejects.
+func (r Run) IsZero() bool {
+	return r.RunID == "" &&
+		r.LogicalTaskID == "" &&
+		r.ParentRunID == "" &&
+		r.Profile == (Profile{}) &&
+		r.ComputerActivation == nil &&
+		len(r.Evidence.ToolOutcomes) == 0 &&
+		len(r.Evidence.Deliverables) == 0
+}
+
 func FullProfile(requested Mode, reason string) Profile {
 	return Profile{
 		RequestedMode:    NormalizeMode(string(requested)),

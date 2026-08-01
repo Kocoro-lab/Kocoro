@@ -2279,7 +2279,39 @@ func claimInterruptedResume(
 	// after discovery. Nil remains compatible with legacy checkpoints.
 	req.ExecutionConfig = agent.CloneExecutionConfig(state.ExecutionConfig)
 
-	if isKoeSource(req.Source) {
+	if isKoeSource(req.Source) && state.ExecutionRun.IsZero() {
+		// Legacy checkpoint written before execution runs were persisted:
+		// there is no ledger entry to validate against, and abandoning would
+		// discard the user's interrupted turn on the first post-upgrade
+		// daemon start. Mint a fresh Full run under the route lock instead —
+		// mirrors the nil ExecutionConfig allowance above. A zero run would
+		// also work for THIS resume, but syncExecutionEvidence and
+		// upsertExecutionRun both no-op on an empty RunID, so a second crash
+		// during the resumed run would checkpoint no replay evidence and
+		// re-execute side effects on the next resume. Minting gives the
+		// legacy turn the same exactly-once machinery as a native run.
+		// Partially-populated runs do NOT take this path; they still fail
+		// closed below.
+		minted := executionprofile.Run{
+			RunID: newExecutionRunID(),
+			Profile: executionprofile.FullProfile(
+				executionprofile.ModeFull,
+				"legacy_checkpoint_resume",
+			),
+		}
+		if err := upsertExecutionRun(sess, minted); err != nil {
+			return abandonInvalidKoeResume(
+				sessMgr,
+				sess,
+				fmt.Errorf("persist minted legacy-resume execution run: %w", err),
+			)
+		}
+		state.ExecutionRun = cloneExecutionRun(minted)
+		req.ExecutionRun = cloneExecutionRun(minted)
+		req.ExecutionMode = minted.Profile.RequestedMode
+		req.ExecutionRunID = minted.RunID
+		req.ParentRunID = ""
+	} else if isKoeSource(req.Source) {
 		authoritativeReq := *req
 		authoritativeReq.ExecutionRun = cloneExecutionRun(state.ExecutionRun)
 		if err := validatePersistedKoeResumeRequest(authoritativeReq); err != nil {

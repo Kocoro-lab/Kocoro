@@ -13,6 +13,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
@@ -602,5 +603,97 @@ func TestCompletedForegroundTurnCancelsPendingRecovery(t *testing.T) {
 	}
 	if persisted.InProgress || persisted.InterruptedTurn != nil {
 		t.Fatalf("superseded recovery rewrote completed session: %#v", persisted)
+	}
+}
+
+// A checkpoint written by a pre-execution-run daemon decodes ExecutionRun as
+// the zero value. That is "legacy, no ledger" — the turn must resume under the
+// normal configuration, not be abandoned on the first post-upgrade start. The
+// claim mints a fresh Full run (not a zero one): syncExecutionEvidence and
+// upsertExecutionRun both no-op on an empty RunID, so a zero run would leave a
+// second crash with no replay evidence.
+func TestClaimInterruptedResumeAllowsLegacyKoeCheckpointWithoutExecutionRun(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const id = "recovery-legacy-koe-001"
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{Source: "koe"})
+
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	req := buildInterruptedResumeRequest(candidates[0], 3, 4*time.Hour)
+
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claimInterruptedResume(mgr, sess, &req, ""); err != nil {
+		t.Fatalf("legacy koe checkpoint abandoned instead of resumed: %v", err)
+	}
+	if sess.InterruptedTurn == nil || !sess.InProgress {
+		t.Fatalf("legacy koe claim cleared checkpoint state: InProgress=%v turn=%v",
+			sess.InProgress, sess.InterruptedTurn)
+	}
+	minted := req.ExecutionRun
+	if !strings.HasPrefix(minted.RunID, "ker1_") ||
+		minted.Profile.EffectiveMode != executionprofile.ModeFull ||
+		req.ExecutionRunID != minted.RunID || req.ParentRunID != "" {
+		t.Fatalf("legacy koe resume did not mint a Full run: %+v", minted)
+	}
+	if err := minted.ValidatePersisted(); err != nil {
+		t.Fatalf("minted legacy-resume run is not persistable: %v", err)
+	}
+	// The minted run must be in the ledger AND the checkpoint, so a second
+	// crash validates cleanly and carries replay evidence on the next resume.
+	if sess.InterruptedTurn.ExecutionRun.RunID != minted.RunID {
+		t.Fatalf("checkpoint state does not carry the minted run: %+v", sess.InterruptedTurn.ExecutionRun)
+	}
+	if err := validatePersistedKoeRunAgainstLedger(
+		sess.InterruptedTurn.ExecutionRun,
+		sess.ExecutionRuns,
+	); err != nil {
+		t.Fatalf("minted run does not validate against the ledger for a second resume: %v", err)
+	}
+}
+
+// A partially-populated run is corruption, not legacy — it must still abandon.
+func TestClaimInterruptedResumeStillRejectsCorruptKoeExecutionRun(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const id = "recovery-corrupt-koe-001"
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{
+		Source: "koe",
+		// RunID present but the profile is zero: fails ValidatePersisted and
+		// must not be mistaken for a legacy checkpoint.
+		ExecutionRun: executionprofile.Run{RunID: "ker1_corrupt"},
+	})
+
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(candidates))
+	}
+	req := buildInterruptedResumeRequest(candidates[0], 3, 4*time.Hour)
+
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claimInterruptedResume(mgr, sess, &req, ""); err == nil {
+		t.Fatal("corrupt koe execution run was accepted")
+	}
+	if sess.InProgress || sess.InterruptedTurn != nil {
+		t.Fatalf("corrupt koe claim did not abandon: InProgress=%v turn=%v",
+			sess.InProgress, sess.InterruptedTurn)
 	}
 }

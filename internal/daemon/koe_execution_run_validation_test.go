@@ -127,18 +127,29 @@ func TestRunAgentResumeRejectsValidKFP1PlusValidEP1WithoutCloudCall(t *testing.T
 	assertKoeCheckpointAbandonedForValidationTest(t, deps, sessionID)
 }
 
-func TestRunAgentResumeRejectsOldKoeCheckpointWithoutResolver(t *testing.T) {
-	var calls atomic.Int32
+// A checkpoint written by a pre-execution-run daemon decodes ExecutionRun as
+// the zero value. That is "legacy, no ledger" — not corruption — and it must
+// resume as an ordinary run under the normal configuration instead of being
+// abandoned on the first post-upgrade daemon start. The resolve endpoint stays
+// untouched (ResumeInterrupted never resolves a replacement profile); the run
+// proceeds straight to the completion call.
+func TestRunAgentResumeAcceptsLegacyKoeCheckpointWithoutExecutionRun(t *testing.T) {
+	var resolverCalls atomic.Int32
+	var llmCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		http.Error(w, "unexpected cloud call", http.StatusInternalServerError)
+		if r.URL.Path == "/v1/completions/resolve" {
+			resolverCalls.Add(1)
+		} else {
+			llmCalls.Add(1)
+		}
+		http.Error(w, "cloud unavailable", http.StatusInternalServerError)
 	}))
 	defer server.Close()
 
 	deps := runAgentContractTestDeps(t, server.URL)
 	defer deps.SessionCache.CloseAll()
 
-	const sessionID = "resume-old-koe-checkpoint-001"
+	const sessionID = "resume-legacy-koe-checkpoint-001"
 	req := persistedKoeResumeRequestForValidationTest(
 		t,
 		deps,
@@ -146,14 +157,15 @@ func TestRunAgentResumeRejectsOldKoeCheckpointWithoutResolver(t *testing.T) {
 		executionprofile.Run{},
 	)
 	_, err := RunAgent(context.Background(), deps, req, nullEventHandler{})
-	if !errors.Is(err, executionprofile.ErrInvalidPersistedRun) ||
-		!strings.Contains(err.Error(), "run_id") {
-		t.Fatalf("RunAgent error = %v, want old checkpoint rejection", err)
+	if errors.Is(err, executionprofile.ErrInvalidPersistedRun) {
+		t.Fatalf("legacy koe checkpoint rejected as invalid: %v", err)
 	}
-	if got := calls.Load(); got != 0 {
-		t.Fatalf("Cloud calls = %d, want 0", got)
+	if got := resolverCalls.Load(); got != 0 {
+		t.Fatalf("resolver calls = %d, want 0 (resume never resolves a profile)", got)
 	}
-	assertKoeCheckpointAbandonedForValidationTest(t, deps, sessionID)
+	if got := llmCalls.Load(); got == 0 {
+		t.Fatal("legacy resume never reached the completion call — turn was dropped pre-flight")
+	}
 }
 
 func TestValidatePersistedKoeRunAgainstLedgerChecksImmutableFields(t *testing.T) {
