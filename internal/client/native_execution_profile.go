@@ -121,6 +121,28 @@ func (p *ExecutionProfile) UnmarshalJSON(data []byte) error {
 // Token() returns decoded object keys, so escaped-equivalent spellings such as
 // "provider" and "pro\u0076ider" compare equal. Recursing through every object
 // keeps this guard valid if a later profile revision adds nested structures.
+// decodeBoundedResolveResponse reads a /v1/completions/resolve response body
+// with the same hardening as ResolveExecutionProfile: the 64 KiB ceiling,
+// duplicate-member rejection, and unknown-field rejection. One endpoint, one
+// codec — a misconfigured or hostile resolve endpoint must not be able to
+// force an unbounded allocation or smuggle ambiguous duplicate members past
+// any of the resolver entry points.
+func decodeBoundedResolveResponse(body io.Reader, target any) error {
+	raw, err := io.ReadAll(io.LimitReader(body, maxExecutionProfileResolveResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("read resolve response: %w", err)
+	}
+	if len(raw) > maxExecutionProfileResolveResponseBytes {
+		return fmt.Errorf("resolve response exceeds %d byte limit", maxExecutionProfileResolveResponseBytes)
+	}
+	if err := rejectDuplicateJSONMembers(raw); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
+}
+
 func rejectDuplicateJSONMembers(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()

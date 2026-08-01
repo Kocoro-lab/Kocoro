@@ -1359,7 +1359,7 @@ func (c *GatewayClient) ResolveKoeExecutionProfile(ctx context.Context) (executi
 		return executionprofile.Profile{}, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 	var profile executionprofile.Profile
-	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+	if err := decodeBoundedResolveResponse(resp.Body, &profile); err != nil {
 		return executionprofile.Profile{}, fmt.Errorf("decode execution profile: %w", err)
 	}
 	profile.RequestedMode = executionprofile.ModeFast
@@ -1412,7 +1412,7 @@ func (c *GatewayClient) ResolveComputerExecutionProfile(
 		return executionprofile.Profile{}, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 	var profile executionprofile.Profile
-	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+	if err := decodeBoundedResolveResponse(resp.Body, &profile); err != nil {
 		return executionprofile.Profile{}, fmt.Errorf("decode computer execution profile: %w", err)
 	}
 	profile.RequestedMode = executionprofile.ModeFull
