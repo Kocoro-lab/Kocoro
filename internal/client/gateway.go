@@ -989,9 +989,14 @@ type CompletionRequest struct {
 	Messages      []Message `json:"messages"`
 	ModelTier     string    `json:"model_tier,omitempty"`
 	SpecificModel string    `json:"specific_model,omitempty"`
-	// Temperature is always present. Zero is the configured ShanClaw default
-	// and a meaningful deterministic Full-mode override, not "unset".
-	Temperature float64 `json:"temperature"`
+	// Temperature keeps omitempty deliberately: `agent.temperature` defaults
+	// to 0, and the pre-existing wire contract is "0 = unset → provider
+	// default sampling". Dropping omitempty would silently flip EVERY
+	// channel (Desktop, IM, TUI, schedules) from provider-default sampling
+	// to explicit greedy temperature:0 — a global product behavior change
+	// that must not ride along with an execution-profile feature. A future
+	// deliberate "explicit zero" needs a pointer field, not a tag change.
+	Temperature float64 `json:"temperature,omitempty"`
 	MaxTokens   int     `json:"max_tokens,omitempty"`
 	Tools       []Tool  `json:"tools,omitempty"`
 	Stream      bool    `json:"stream,omitempty"`

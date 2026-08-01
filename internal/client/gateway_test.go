@@ -501,7 +501,7 @@ func TestCompletionRequestMarshalFunctionToolExact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal completion request: %v", err)
 	}
-	want := `{"messages":[{"role":"user","content":"ping"}],"temperature":0,"tools":[{"type":"function","function":{"name":"bash","description":"Run a command","parameters":{"properties":{},"type":"object"}}}]}`
+	want := `{"messages":[{"role":"user","content":"ping"}],"tools":[{"type":"function","function":{"name":"bash","description":"Run a command","parameters":{"properties":{},"type":"object"}}}]}`
 	if string(raw) != want {
 		t.Fatalf("CompletionRequest JSON = %s, want %s", raw, want)
 	}
@@ -521,7 +521,7 @@ func TestCompletionRequestMarshalNativeToolExact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal completion request: %v", err)
 	}
-	want := `{"messages":[{"role":"user","content":"ping"}],"temperature":0,"tools":[{"type":"computer_20251124","name":"computer","display_width_px":1280,"display_height_px":800}]}`
+	want := `{"messages":[{"role":"user","content":"ping"}],"tools":[{"type":"computer_20251124","name":"computer","display_width_px":1280,"display_height_px":800}]}`
 	if string(raw) != want {
 		t.Fatalf("CompletionRequest JSON = %s, want %s", raw, want)
 	}
@@ -536,7 +536,7 @@ func TestCompletionRequestMarshalOpenAIComputerToolExact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal OpenAI computer completion request: %v", err)
 	}
-	want := `{"messages":[{"role":"user","content":"ping"}],"temperature":0,"tools":[{"type":"computer"}]}`
+	want := `{"messages":[{"role":"user","content":"ping"}],"tools":[{"type":"computer"}]}`
 	if string(raw) != want {
 		t.Fatalf("CompletionRequest JSON = %s, want %s", raw, want)
 	}
@@ -617,8 +617,12 @@ func TestCompletionRequestExecutionProfileMarshaling(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(raw)
+	// Zero temperature must stay OFF the wire (omitempty): 0 means "unset →
+	// provider default", not an explicit greedy override.
+	if strings.Contains(text, `"temperature"`) {
+		t.Fatalf("payload %s carries a temperature for the zero value", text)
+	}
 	for _, field := range []string{
-		`"temperature":0`,
 		`"execution_profile_id":"kfp1_server-minted"`,
 		`"parallel_tool_calls":true`,
 		`"response_cache_policy":"off"`,
