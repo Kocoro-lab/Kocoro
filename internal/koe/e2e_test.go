@@ -46,6 +46,12 @@ func e2eModelName() string {
 // carry words the mock can match back, proving ASR understanding end-to-end.
 const e2eSpoken = "Add a reminder to call mom at six."
 
+// A clearly bounded, read-only, current lookup exercises the fast semantic
+// lane. The reminder above remains intentionally available to the say-and-ask
+// result-delivery test; a routine side effect alone is not a reason to leave
+// the default fast lane.
+const e2eFastSpoken = "Check the current time in Tokyo."
+
 // e2ePersona instructs the front brain to delegate real work — passed to the
 // production sessionConfig so "auto" tool_choice reliably picks do_task here.
 const e2ePersona = "You are a voice assistant. For any request that is real work, call do_task with the user's words."
@@ -56,30 +62,47 @@ func TestKoeVoiceE2E(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	spoken := strings.TrimSpace(os.Getenv("KOE_E2E_SPOKEN"))
+	if spoken == "" {
+		spoken = e2eFastSpoken
+	}
+	wantMode := strings.TrimSpace(os.Getenv("KOE_E2E_EXPECT_MODE"))
+	if wantMode == "" {
+		wantMode = "fast"
+	}
+	expectTerm := strings.ToLower(strings.TrimSpace(os.Getenv("KOE_E2E_EXPECT_TERM")))
+	if expectTerm == "" {
+		expectTerm = "tokyo"
+	}
 
 	// 1) Synthesize the "user's voice" as a 48k mono S16 WAV — quiet (-o file,
 	// no playback), then verify the format afconvert produced (readWavS16 trusts
 	// it blindly).
-	pcm := synthSpokenWAV(t, e2eSpoken)
+	pcm := synthSpokenWAV(t, spoken)
 	t.Logf("[wav] %d samples (%.2fs @ 48k mono)", len(pcm), float64(len(pcm))/48000)
 
 	// 2) Mock daemon back-brain: capture the do_task POST /message, reply done.
-	gotTask := make(chan string, 1)
+	type delegatedTask struct {
+		Text          string
+		ExecutionMode string
+	}
+	gotTask := make(chan delegatedTask, 1)
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/message" {
 			body, _ := io.ReadAll(r.Body)
 			var req struct {
-				Text   string `json:"text"`
-				Source string `json:"source"`
+				Text          string `json:"text"`
+				Source        string `json:"source"`
+				ExecutionMode string `json:"execution_mode"`
 			}
 			_ = json.Unmarshal(body, &req)
-			t.Logf("[mock daemon] POST /message source=%q text=%q", req.Source, req.Text)
+			t.Logf("[mock daemon] POST /message source=%q execution_mode=%q text=%q", req.Source, req.ExecutionMode, req.Text)
 			select {
-			case gotTask <- req.Text:
+			case gotTask <- delegatedTask{Text: req.Text, ExecutionMode: req.ExecutionMode}:
 			default:
 			}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"reply": "Done, I added the reminder."})
+		_ = json.NewEncoder(w).Encode(map[string]any{"reply": "Done, I checked the current time."})
 	}))
 	defer mock.Close()
 
@@ -146,6 +169,9 @@ func TestKoeVoiceE2E(t *testing.T) {
 		if ev.Type == "session.updated" {
 			cfgOnce.Do(func() { close(configured) })
 		}
+		if ev.Type == "response.function_call_arguments.done" {
+			t.Logf("[event %s] %s", ev.Type, string(m.Data))
+		}
 		if strings.Contains(ev.Type, "error") { // surface any rejection on failure
 			t.Logf("[event %s] %s", ev.Type, string(m.Data))
 		}
@@ -179,11 +205,14 @@ func TestKoeVoiceE2E(t *testing.T) {
 	// 6) Wait for the back-brain to receive the delegated task.
 	select {
 	case task := <-gotTask:
-		low := strings.ToLower(task)
-		if !strings.Contains(low, "remind") && !strings.Contains(low, "mom") && !strings.Contains(low, "call") {
-			t.Errorf("do_task arrived but task text %q doesn't reflect the spoken words %q", task, e2eSpoken)
+		low := strings.ToLower(task.Text)
+		if !strings.Contains(low, expectTerm) {
+			t.Errorf("do_task arrived but task text %q is missing expected term %q from %q", task.Text, expectTerm, spoken)
 		}
-		t.Logf("VERDICT: PASS — koe side end-to-end. do_task reached the back-brain: %q", task)
+		if task.ExecutionMode != wantMode {
+			t.Errorf("execution_mode = %q, want %q", task.ExecutionMode, wantMode)
+		}
+		t.Logf("VERDICT: PASS — koe side end-to-end. do_task reached the back-brain with mode=%q: %q", task.ExecutionMode, task.Text)
 	case <-ctx.Done():
 		mu.Lock()
 		log := eventLog
@@ -208,7 +237,9 @@ func feedWAV(ctx context.Context, audio *AudioIO, pcm []int16) {
 		audio.frames <- append([]int16(nil), pcm[off:off+audioFrameSize]...)
 	}
 	silence := make([]int16, audioFrameSize)
-	for range 60 { // ~1.2s
+	// sessionConfig uses a 1.5s semantic-VAD silence window. Stay safely above
+	// it so longer synthesized utterances do not end with speech_started only.
+	for range 110 { // ~2.2s
 		select {
 		case <-ctx.Done():
 			return

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 func TestDoTaskCompleted(t *testing.T) {
@@ -28,6 +30,11 @@ func TestDoTaskCompleted(t *testing.T) {
 		if got.ForegroundHint == nil || got.ForegroundHint.AppName != "Mail" || got.ForegroundHint.BundleID != "com.apple.mail" {
 			t.Errorf("foreground hint = %+v", got.ForegroundHint)
 		}
+		if got.ExecutionMode != executionprofile.ModeFull ||
+			got.RequestedExecutionMode == nil || *got.RequestedExecutionMode != "fast" ||
+			got.FullReason != executionprofile.FullReasonProductionIncident {
+			t.Errorf("mode admission wire = %+v", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"reply":          "NVDA is up two percent today.\n\nFull table omitted here.",
@@ -39,11 +46,15 @@ func TestDoTaskCompleted(t *testing.T) {
 	defer srv.Close()
 
 	c := NewDaemonClient(srv.URL)
+	requestedMode := "fast"
 	out, err := c.DoTask(context.Background(), DoTaskRequest{
-		Text:           "check NVDA",
-		Agent:          "finance",
-		ThreadID:       "burst-1",
-		ForegroundHint: &ForegroundHint{AppName: "Mail", BundleID: "com.apple.mail"},
+		Text:                   "check NVDA",
+		Agent:                  "finance",
+		ThreadID:               "burst-1",
+		ForegroundHint:         &ForegroundHint{AppName: "Mail", BundleID: "com.apple.mail"},
+		ExecutionMode:          executionprofile.ModeFull,
+		RequestedExecutionMode: &requestedMode,
+		FullReason:             executionprofile.FullReasonProductionIncident,
 	})
 	if err != nil {
 		t.Fatalf("DoTask: %v", err)

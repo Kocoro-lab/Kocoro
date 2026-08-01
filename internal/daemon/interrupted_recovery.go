@@ -13,6 +13,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
@@ -77,9 +78,7 @@ func discoverInterruptedTurns(shannonDir string) ([]interruptedTurnCandidate, er
 				UpdatedAt: sess.UpdatedAt,
 			}
 			if sess.InterruptedTurn != nil {
-				state = *sess.InterruptedTurn
-				state.IMStatusContext = append(json.RawMessage(nil), sess.InterruptedTurn.IMStatusContext...)
-				state.Participants = append([]string(nil), sess.InterruptedTurn.Participants...)
+				state = cloneInterruptedTurn(*sess.InterruptedTurn)
 			}
 			// The directory is authoritative. A stale or malformed persisted
 			// agent value must never redirect recovery into another store.
@@ -201,6 +200,8 @@ func isStaleInterruptedTurn(candidate interruptedTurnCandidate, maxAge time.Dura
 func cloneInterruptedTurn(state session.InterruptedTurn) session.InterruptedTurn {
 	state.IMStatusContext = append(json.RawMessage(nil), state.IMStatusContext...)
 	state.Participants = append([]string(nil), state.Participants...)
+	state.ExecutionRun = cloneExecutionRun(state.ExecutionRun)
+	state.ExecutionConfig = agent.CloneExecutionConfig(state.ExecutionConfig)
 	return state
 }
 
@@ -228,6 +229,12 @@ func buildInterruptedResumeRequest(candidate interruptedTurnCandidate, maxAttemp
 		CloudMessageID:                       state.CloudMessageID,
 		IMStatusContext:                      append(json.RawMessage(nil), state.IMStatusContext...),
 		Participants:                         append([]string(nil), state.Participants...),
+		ExecutionMode:                        state.ExecutionRun.Profile.RequestedMode,
+		LogicalTaskID:                        state.ExecutionRun.LogicalTaskID,
+		ExecutionRunID:                       state.ExecutionRun.RunID,
+		ParentRunID:                          state.ExecutionRun.ParentRunID,
+		ExecutionRun:                         cloneExecutionRun(state.ExecutionRun),
+		ExecutionConfig:                      agent.CloneExecutionConfig(state.ExecutionConfig),
 		ResumeInterrupted:                    true,
 		InterruptedResumePriorAttempts:       state.ResumeAttempts,
 		InterruptedResumeMaxAttempts:         maxAttempts,
@@ -288,6 +295,10 @@ func (s *Server) resumeInterruptedCandidate(ctx context.Context, candidate inter
 		case errors.Is(runErr, errInterruptedRecoveryExhausted):
 			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
 				fmt.Sprintf("automatic recovery exhausted after %d attempts", state.ResumeAttempts))
+			return
+		case errors.Is(runErr, executionprofile.ErrInvalidPersistedRun):
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
+				"checkpoint execution profile is invalid; no model call was made")
 			return
 		}
 		log.Printf("daemon: interrupted turn resume failed session=%s agent=%s: %v",

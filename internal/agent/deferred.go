@@ -32,7 +32,7 @@ func newToolSearchTool(reg *ToolRegistry, deferred map[string]bool, workingSet .
 func (t *toolSearchTool) Info() ToolInfo {
 	return ToolInfo{
 		Name:        "tool_search",
-		Description: "Load deferred tool schemas so you can call them in this same request. After calling tool_search, immediately continue the task using the loaded tools — do not stop or ask the user to proceed. Use \"select:name1,name2\" for exact lookup or a keyword to search by name/description.",
+		Description: "Load deferred tool schemas for the next model turn. After calling tool_search, immediately continue the task using the loaded tools — do not stop or ask the user to proceed. Use \"select:name1,name2\" for exact lookup or a keyword to search by name/description.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -111,8 +111,24 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 	}
 	matched = expandDeferredFamilyCore(t.registry, t.deferred, matched)
 
-	// Build structured tool_reference blocks for the new protocol path.
-	// Zero matches → zero blocks (loop.go falls back to the Content string).
+	result := buildLoadedToolSearchResult(t.registry, matched)
+
+	if len(matched) == 0 && len(alreadyDirect) == 0 {
+		result.Content += "\nNo matching deferred tools found."
+	}
+	for _, name := range alreadyDirect {
+		result.Content += fmt.Sprintf(
+			"\nTool %q is already directly available; call it directly without tool_search.",
+			name,
+		)
+	}
+
+	return result, nil
+}
+
+// buildLoadedToolSearchResult is also used by AgentLoop after a profile-bound
+// selection is rewritten to the exact native or generic computer schema.
+func buildLoadedToolSearchResult(reg *ToolRegistry, matched []string) ToolResult {
 	var blocks []client.ContentBlock
 	for _, name := range matched {
 		blocks = append(blocks, client.ContentBlock{
@@ -121,36 +137,18 @@ func (t *toolSearchTool) Run(_ context.Context, argsJSON string) (ToolResult, er
 		})
 	}
 
-	// Legacy Content string: preserved as the fallback path for non-supporting
-	// backends (Ollama, pre-3.1 shannon-cloud gateway). Contains the LOADED:
-	// header + full schema JSON so the model can still discover tools when
-	// the tool_reference protocol is unavailable.
 	var sb strings.Builder
 	sb.WriteString("LOADED:")
 	sb.WriteString(strings.Join(matched, ","))
-
-	if len(matched) == 0 && len(alreadyDirect) == 0 {
-		sb.WriteString("\nNo matching deferred tools found.")
-	}
-	for _, name := range alreadyDirect {
-		sb.WriteString(fmt.Sprintf(
-			"\nTool %q is already directly available; call it directly without tool_search.",
-			name,
-		))
-	}
 	if len(matched) > 0 {
 		sb.WriteString("\nSchemas loaded. Call these tools now to continue the user's task — do not stop or describe what was loaded.")
-		schemas := t.registry.FullSchemas(matched)
-		for i, s := range schemas {
-			schemaJSON, _ := json.MarshalIndent(s, "", "  ")
+		schemas := reg.FullSchemas(matched)
+		for i, schema := range schemas {
+			schemaJSON, _ := json.MarshalIndent(schema, "", "  ")
 			sb.WriteString(fmt.Sprintf("\n\n## %s\n%s", matched[i], string(schemaJSON)))
 		}
 	}
-
-	return ToolResult{
-		Content:       sb.String(),
-		ContentBlocks: blocks,
-	}, nil
+	return ToolResult{Content: sb.String(), ContentBlocks: blocks}
 }
 
 func (t *toolSearchTool) matchKeyword(query string) []string {
@@ -328,13 +326,21 @@ func deferredToolNames(reg *ToolRegistry) map[string]bool {
 
 // preseedDeferredSchemas filters the session working set down to schemas that
 // are still deferred in the current effective registry.
-func preseedDeferredSchemas(ws *WorkingSet, deferred map[string]bool) map[string]client.Tool {
+func preseedDeferredSchemas(
+	ws *WorkingSet,
+	deferred map[string]bool,
+	runScoped ...map[string]bool,
+) map[string]client.Tool {
 	loaded := make(map[string]client.Tool)
 	if ws == nil || len(deferred) == 0 {
 		return loaded
 	}
+	var excluded map[string]bool
+	if len(runScoped) > 0 {
+		excluded = runScoped[0]
+	}
 	for name, schema := range ws.Schemas() {
-		if deferred[name] {
+		if deferred[name] && !excluded[name] {
 			loaded[name] = schema
 		}
 	}

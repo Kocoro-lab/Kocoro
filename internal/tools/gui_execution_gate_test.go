@@ -84,6 +84,23 @@ func TestGUIExecutionGatePreservesEveryNativeToolTrait(t *testing.T) {
 	}
 }
 
+func TestGUIExecutionGatePreservesToolProfileRequirement(t *testing.T) {
+	for _, tool := range []agent.Tool{
+		&ComputerUseTool{},
+		&ComputerTool{},
+	} {
+		guarded := wrapGUIExecutionGate(tool)
+		if got := agent.EffectiveToolProfileRequirement(guarded); got != agent.ToolProfileComputer {
+			t.Fatalf(
+				"guarded %s profile requirement = %q, want %q",
+				tool.Info().Name,
+				got,
+				agent.ToolProfileComputer,
+			)
+		}
+	}
+}
+
 func registeredGUIExecutionProbe(t *testing.T, probe *guiExecutionGateProbe) agent.Tool {
 	t.Helper()
 	registry := agent.NewToolRegistry()

@@ -28,6 +28,9 @@ type streamToolStarter struct {
 	tools   *ToolRegistry
 	handler EventHandler
 	runs    map[string]*speculativeToolRun
+	// advertised is the exact name set carried in the current completion
+	// request. Registry membership alone is insufficient for Deferred tools.
+	advertised map[string]bool
 	// barrier is set once any streamed call is not speculation-eligible
 	// (write-capable, approval-gated, unknown, …). Later calls in the same
 	// response must not start early: the normal executor runs calls in
@@ -37,13 +40,26 @@ type streamToolStarter struct {
 	barrier bool
 }
 
-func newStreamToolStarter(ctx context.Context, loop *AgentLoop, tools *ToolRegistry, handler EventHandler) *streamToolStarter {
+func newStreamToolStarter(
+	ctx context.Context,
+	loop *AgentLoop,
+	tools *ToolRegistry,
+	advertisedSchemas []client.Tool,
+	handler EventHandler,
+) *streamToolStarter {
+	advertised := make(map[string]bool, len(advertisedSchemas))
+	for _, schema := range advertisedSchemas {
+		if name := schemaToolName(schema); name != "" {
+			advertised[name] = true
+		}
+	}
 	return &streamToolStarter{
-		ctx:     ctx,
-		loop:    loop,
-		tools:   tools,
-		handler: handler,
-		runs:    make(map[string]*speculativeToolRun),
+		ctx:        ctx,
+		loop:       loop,
+		tools:      tools,
+		handler:    handler,
+		runs:       make(map[string]*speculativeToolRun),
+		advertised: advertised,
 	}
 }
 
@@ -53,6 +69,9 @@ func streamedToolCallKey(fc client.FunctionCall) string {
 
 func (s *streamToolStarter) eligible(fc client.FunctionCall, activeSkillFilter map[string]bool) (Tool, string, bool) {
 	if s == nil || s.loop == nil || s.tools == nil || fc.Name == "" || fc.Name == "tool_search" {
+		return nil, "", false
+	}
+	if !s.advertised[fc.Name] {
 		return nil, "", false
 	}
 	tool, ok := s.tools.Get(fc.Name)

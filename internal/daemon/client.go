@@ -239,6 +239,15 @@ const (
 	// daemon omits it and never emits the events, so the ask-user tool stays a
 	// no-op there rather than surfacing an undecodable event family.
 	CapQuestionV1 = "question_v1"
+	// CapKoeFastProfileV1 means source=koe POST /message accepts the semantic
+	// execution_mode contract, resolves fast through Cloud's trusted profile,
+	// pins it across checkpoints, and forks fast->full follow-ups before generic
+	// injection. Missing/invalid/failed resolution preserves full Agent config.
+	CapKoeFastProfileV1 = "koe_fast_profile_v1"
+	// CapAgentServiceTierV1 means global agent.service_tier is validated,
+	// checkpointed, and forwarded on ordinary completion requests while sealed
+	// Koe/computer profiles and named exact-model overrides remain isolated.
+	CapAgentServiceTierV1 = "agent_service_tier_v1"
 	// CapProjectEntityV1 — daemon supports the persisted Project ENTITY (distinct
 	// from CapSessionProjectsV1, which is the CWD/folder-derived grouping): the
 	// /projects CRUD surface (incl. per-project instructions/memory + theme
@@ -315,6 +324,8 @@ var Capabilities = []string{
 	CapComputerUseAppPolicyV1,
 	CapComputerUsePhysicalInterferenceV1,
 	CapComputerUseRiskConfirmationV1,
+	CapKoeFastProfileV1,
+	CapAgentServiceTierV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

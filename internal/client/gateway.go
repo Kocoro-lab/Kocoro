@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 // cacheDebugLogPath returns the absolute path of the cache-debug log file,
@@ -394,6 +396,7 @@ func logCacheResponse(reqID, sessionID string, resp *CompletionResponse) {
 // APIError represents an HTTP error from the LLM API with a status code.
 type APIError struct {
 	StatusCode int
+	Code       string
 	Body       string
 }
 
@@ -986,10 +989,17 @@ type CompletionRequest struct {
 	Messages      []Message `json:"messages"`
 	ModelTier     string    `json:"model_tier,omitempty"`
 	SpecificModel string    `json:"specific_model,omitempty"`
-	Temperature   float64   `json:"temperature,omitempty"`
-	MaxTokens     int       `json:"max_tokens,omitempty"`
-	Tools         []Tool    `json:"tools,omitempty"`
-	Stream        bool      `json:"stream,omitempty"`
+	// Temperature keeps omitempty deliberately: `agent.temperature` defaults
+	// to 0, and the pre-existing wire contract is "0 = unset → provider
+	// default sampling". Dropping omitempty would silently flip EVERY
+	// channel (Desktop, IM, TUI, schedules) from provider-default sampling
+	// to explicit greedy temperature:0 — a global product behavior change
+	// that must not ride along with an execution-profile feature. A future
+	// deliberate "explicit zero" needs a pointer field, not a tag change.
+	Temperature float64 `json:"temperature,omitempty"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
+	Tools       []Tool  `json:"tools,omitempty"`
+	Stream      bool    `json:"stream,omitempty"`
 
 	// Provider-specific parameters (passed through to gateway)
 	Thinking        *ThinkingConfig `json:"thinking,omitempty"`
@@ -997,10 +1007,23 @@ type CompletionRequest struct {
 	// EffortTier is the unified cross-provider reasoning-effort intent
 	// ("low"/"high"/"xhigh"/"max"). Cloud translates it to each provider's
 	// native value (Anthropic output_config.effort direct; OpenAI reasoning_effort
-	// low→low/high→medium/xhigh→high/max→high). Cloud prefers effort_tier when
-	// present, else falls back to ReasoningEffort (old behavior). Empty = unset.
-	EffortTier string `json:"effort_tier,omitempty"`
-	ToolChoice any    `json:"tool_choice,omitempty"` // nil=auto, "any", or {"type":"tool","name":"..."}
+	// maps low→low/high→medium; GPT-5.6 keeps xhigh/max while older models
+	// compress both to high). Cloud prefers effort_tier when present, else falls
+	// back to ReasoningEffort (old behavior). Empty = unset.
+	EffortTier  string `json:"effort_tier,omitempty"`
+	ServiceTier string `json:"service_tier,omitempty"` // OpenAI processing lane: default/fast
+	ToolChoice  any    `json:"tool_choice,omitempty"`  // nil=auto, "any", or {"type":"tool","name":"..."}
+
+	// ExecutionProfileID is an opaque Cloud-minted identifier. kfp1 profiles
+	// pin Koe Fast; ep1 profiles pin a provider-native computer route. ShanClaw
+	// never constructs or interprets either identifier.
+	ExecutionProfileID string `json:"execution_profile_id,omitempty"`
+	// ParallelToolCalls is explicit for resolved profiles that require native
+	// multi-call support. false/omitted keeps the provider's normal behavior.
+	ParallelToolCalls bool `json:"parallel_tool_calls,omitempty"`
+	// ResponseCachePolicy controls Cloud's whole-response cache. It is distinct
+	// from SkipCacheWrite, which only controls Anthropic prompt-cache markers.
+	ResponseCachePolicy executionprofile.ResponseCachePolicy `json:"response_cache_policy,omitempty"`
 
 	// SessionID is sent to the gateway so the Anthropic provider can preserve
 	// the previous turn's rolling cache_control marker across turns (long-session
@@ -1034,12 +1057,6 @@ type CompletionRequest struct {
 	// Cloud maps the assistant computer_call + screenshot tool_result to the
 	// provider's computer_call_output shape.
 	PreviousResponseID string `json:"previous_response_id,omitempty"`
-
-	// ExecutionProfileID is the canonical Cloud-owned contract fingerprint
-	// returned by POST /v1/completions/resolve. Cloud recomputes and validates
-	// it for every completion; a stale profile fails closed rather than
-	// silently routing a provider-native tool to another adapter.
-	ExecutionProfileID string `json:"execution_profile_id,omitempty"`
 
 	// ResolvedExecutionProfile is the authenticated full profile retained only
 	// inside Kocoro. Complete / CompleteStream compare it with the full profile
@@ -1311,12 +1328,151 @@ func (c *GatewayClient) APIKey() string {
 	return c.getAPIKey()
 }
 
+// ResolveKoeExecutionProfileRequest is deliberately closed: an untrusted Koe
+// caller selects only a semantic capability, never a provider or model id.
+type ResolveKoeExecutionProfileRequest struct {
+	Capability         string `json:"capability"`
+	SchemaVersion      int    `json:"schema_version"`
+	AllowModelFallback bool   `json:"allow_model_fallback"`
+}
+
+// ResolveKoeExecutionProfile asks Cloud for the exact trusted koe-fast profile.
+// The returned opaque id is the only profile authority used on completions.
+func (c *GatewayClient) ResolveKoeExecutionProfile(ctx context.Context) (executionprofile.Profile, error) {
+	body, err := json.Marshal(ResolveKoeExecutionProfileRequest{
+		Capability:         executionprofile.FastCapability,
+		SchemaVersion:      executionprofile.FastSchemaVersion,
+		AllowModelFallback: false,
+	})
+	if err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("marshal execution profile request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/completions/resolve", bytes.NewReader(body))
+	if err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("create execution profile request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("execution profile request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return executionprofile.Profile{}, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+	}
+	var profile executionprofile.Profile
+	if err := decodeBoundedResolveResponse(resp.Body, &profile); err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("decode execution profile: %w", err)
+	}
+	profile.RequestedMode = executionprofile.ModeFast
+	profile.EffectiveMode = executionprofile.ModeFast
+	if err := profile.ValidateFast(); err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("invalid execution profile: %w", err)
+	}
+	profile.ResolutionReason = "cloud_profile_resolved"
+	return profile, nil
+}
+
+// ResolveComputerExecutionProfile binds a just-selected computer capability to
+// the exact provider/model route that produced the selection. The caller may
+// choose only a Shan-supported tool contract; Cloud remains authoritative for
+// every returned route and for the opaque ep1 id.
+func (c *GatewayClient) ResolveComputerExecutionProfile(
+	ctx context.Context,
+	request ComputerExecutionProfileRequest,
+) (executionprofile.Profile, error) {
+	request.SchemaVersion = executionprofile.ComputerSchemaVersion
+	request.Capability = executionprofile.ComputerCapability
+	request.AllowModelFallback = false
+	if strings.TrimSpace(request.SpecificModel) == "" {
+		return executionprofile.Profile{}, fmt.Errorf("computer execution profile requires an exact specific model")
+	}
+	switch request.RequiredToolContract {
+	case executionprofile.AnthropicComputerToolContract, executionprofile.GenericComputerUseToolContract:
+	default:
+		return executionprofile.Profile{}, fmt.Errorf("unsupported computer tool contract %q", request.RequiredToolContract)
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("marshal computer execution profile request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/completions/resolve", bytes.NewReader(body))
+	if err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("create computer execution profile request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("computer execution profile request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return executionprofile.Profile{}, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+	}
+	var profile executionprofile.Profile
+	if err := decodeBoundedResolveResponse(resp.Body, &profile); err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("decode computer execution profile: %w", err)
+	}
+	profile.RequestedMode = executionprofile.ModeFull
+	profile.EffectiveMode = executionprofile.ModeFull
+	if err := profile.ValidateComputer(request.RequiredToolContract); err != nil {
+		return executionprofile.Profile{}, fmt.Errorf("invalid computer execution profile: %w", err)
+	}
+	requestedProvider := ""
+	requestedModel := strings.TrimSpace(request.SpecificModel)
+	if strings.Contains(requestedModel, ":") {
+		parts := strings.SplitN(requestedModel, ":", 2)
+		requestedProvider = strings.ToLower(strings.TrimSpace(parts[0]))
+		requestedModel = strings.TrimSpace(parts[1])
+		if requestedProvider == "" || requestedModel == "" {
+			return executionprofile.Profile{}, fmt.Errorf(
+				"invalid exact computer model %q",
+				request.SpecificModel,
+			)
+		}
+	}
+	if profile.Model != requestedModel ||
+		(requestedProvider != "" && profile.Provider != requestedProvider) {
+		return executionprofile.Profile{}, fmt.Errorf(
+			"invalid computer execution profile: resolved route %s:%s does not match exact route %s",
+			profile.Provider,
+			profile.Model,
+			request.SpecificModel,
+		)
+	}
+	profile.ResolutionReason = "cloud_computer_profile_resolved"
+	return profile, nil
+}
+
+// usesKoeFastExecutionProfile distinguishes the older kfp1 Fast contract from
+// the sealed ep1 native-computer contract. kfp1 is validated when it is
+// resolved and again by Cloud on every completion; it does not carry the
+// client.ExecutionProfile echo required by provider-native execution.
+func usesKoeFastExecutionProfile(req CompletionRequest) bool {
+	if req.ResolvedExecutionProfile != nil ||
+		!strings.HasPrefix(strings.TrimSpace(req.ExecutionProfileID), "kfp1_") {
+		return false
+	}
+	_, hasNativeTool := requestNativeToolType(req)
+	return !hasNativeTool
+}
+
 // Complete sends a completion request to the gateway's /v1/completions endpoint.
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.
 func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
-	if err := validateProviderNativeExecution(req); err != nil {
-		return nil, err
+	koeFastProfile := usesKoeFastExecutionProfile(req)
+	if !koeFastProfile {
+		if err := validateProviderNativeExecution(req); err != nil {
+			return nil, err
+		}
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -1343,12 +1499,22 @@ func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*C
 		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if apiErr := parseJSONAPIError(raw); apiErr != nil {
+		return nil, apiErr
+	}
+
 	var result CompletionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
-	if err := validateProviderNativeResponse(req, &result); err != nil {
-		return nil, err
+	if !koeFastProfile {
+		if err := validateProviderNativeResponse(req, &result); err != nil {
+			return nil, err
+		}
 	}
 
 	logCacheResponse(reqID, req.SessionID, &result)
@@ -1439,8 +1605,11 @@ type StreamDelta struct {
 // that returns ErrStreamIdleTimeout if no chunk arrives within that interval.
 func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionRequest, onDelta func(StreamDelta)) (*CompletionResponse, error) {
 	req.Stream = true
-	if err := validateProviderNativeExecution(req); err != nil {
-		return nil, err
+	koeFastProfile := usesKoeFastExecutionProfile(req)
+	if !koeFastProfile {
+		if err := validateProviderNativeExecution(req); err != nil {
+			return nil, err
+		}
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -1477,8 +1646,10 @@ func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionReques
 	if err != nil {
 		return nil, err
 	}
-	if err := validateProviderNativeResponse(req, result); err != nil {
-		return nil, err
+	if !koeFastProfile {
+		if err := validateProviderNativeResponse(req, result); err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }
@@ -1492,7 +1663,14 @@ func (c *GatewayClient) completeStreamLegacy(resp *http.Response, onDelta func(S
 
 	var result *CompletionResponse
 	for scanner.Scan() {
-		stop, parsed := processSSEData(scanner.Text(), onDelta)
+		line := scanner.Text()
+		if apiErr := parseSSEAPIError(line); apiErr != nil {
+			return nil, apiErr
+		}
+		stop, parsed, err := processSSEDataWithError(line, onDelta)
+		if err != nil {
+			return nil, err
+		}
 		if parsed != nil {
 			result = parsed
 		}
@@ -1581,7 +1759,13 @@ func (c *GatewayClient) completeStreamWatchdog(ctx context.Context, resp *http.R
 				logCacheResponse(reqID, sessionID, result)
 				return result, nil
 			}
-			stop, parsed := processSSEData(msg.line, onDelta)
+			if apiErr := parseSSEAPIError(msg.line); apiErr != nil {
+				return nil, apiErr
+			}
+			stop, parsed, err := processSSEDataWithError(msg.line, onDelta)
+			if err != nil {
+				return nil, err
+			}
 			if parsed != nil {
 				result = parsed
 			}
@@ -1625,29 +1809,99 @@ func (c *GatewayClient) completeStreamWatchdog(ctx context.Context, resp *http.R
 	}
 }
 
+func parseSSEAPIError(line string) *APIError {
+	if !strings.HasPrefix(line, "data: ") {
+		return nil
+	}
+	payload := line[6:]
+	var event struct {
+		Type  string `json:"type"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Status  int    `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(payload), &event); err != nil || event.Type != "error" {
+		return nil
+	}
+	status := event.Error.Status
+	if status == 0 {
+		status = http.StatusInternalServerError
+	}
+	body := event.Error.Message
+	if body == "" {
+		if raw, err := json.Marshal(event.Error); err == nil {
+			body = string(raw)
+		}
+	}
+	return &APIError{
+		StatusCode: status,
+		Code:       event.Error.Code,
+		Body:       body,
+	}
+}
+
+func parseJSONAPIError(payload []byte) *APIError {
+	var event struct {
+		Error *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Status  int    `json:"status"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &event); err != nil || event.Error == nil {
+		return nil
+	}
+	status := event.Error.Status
+	if status == 0 {
+		status = http.StatusInternalServerError
+	}
+	body := event.Error.Message
+	if body == "" {
+		if raw, err := json.Marshal(event.Error); err == nil {
+			body = string(raw)
+		}
+	}
+	return &APIError{
+		StatusCode: status,
+		Code:       event.Error.Code,
+		Body:       body,
+	}
+}
+
 // processSSEData parses one SSE data line from the gateway's streaming output.
 // Returns stop=true when the line is a "[DONE]" sentinel (caller should exit
 // the read loop). Returns a non-nil *CompletionResponse when the line carries
 // a parsed "done" event payload. Unrecognized lines are silently skipped to
 // match the pre-watchdog behavior.
 func processSSEData(line string, onDelta func(StreamDelta)) (stop bool, result *CompletionResponse) {
+	stop, result, _ = processSSEDataWithError(line, onDelta)
+	return stop, result
+}
+
+// processSSEDataWithError is the CompleteStream parsing path. Keep
+// processSSEData as the compatibility wrapper used by fixture/unit callers,
+// while allowing the live stream readers to distinguish a malformed "done"
+// payload from a stream that never sent a done event.
+func processSSEDataWithError(line string, onDelta func(StreamDelta)) (stop bool, result *CompletionResponse, err error) {
 	if line == "" || strings.HasPrefix(line, ":") {
-		return false, nil
+		return false, nil, nil
 	}
 	if !strings.HasPrefix(line, "data: ") {
-		return false, nil
+		return false, nil, nil
 	}
 	payload := line[6:]
 	if payload == "[DONE]" {
-		return true, nil
+		return true, nil, nil
 	}
 	var event map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
-		return false, nil
+		return false, nil, nil
 	}
 	typeBytes, ok := event["type"]
 	if !ok {
-		return false, nil
+		return false, nil, nil
 	}
 	var eventType string
 	_ = json.Unmarshal(typeBytes, &eventType)
@@ -1666,11 +1920,12 @@ func processSSEData(line string, onDelta func(StreamDelta)) (stop bool, result *
 		}
 	case "done":
 		var final CompletionResponse
-		if err := json.Unmarshal([]byte(payload), &final); err == nil {
-			return false, &final
+		if err := json.Unmarshal([]byte(payload), &final); err != nil {
+			return false, nil, fmt.Errorf("decode stream done response: %w", err)
 		}
+		return false, &final, nil
 	}
-	return false, nil
+	return false, nil, nil
 }
 
 func completeStreamToolCall(event map[string]json.RawMessage) *FunctionCall {

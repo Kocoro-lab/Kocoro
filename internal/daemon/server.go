@@ -33,6 +33,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/cloudflow"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
@@ -2759,6 +2760,10 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if req.Source == "" {
 		req.Source = "kocoro"
 	}
+	applyKoeModeAdmission(&req)
+	if !isKoeSource(req.Source) {
+		req.ExecutionMode = executionprofile.NormalizeMode(string(req.ExecutionMode))
+	}
 	// Normalize "default" → "" early so downstream guards are consistent.
 	if req.Agent == "default" {
 		req.Agent = ""
@@ -2811,7 +2816,9 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// resolveContentBlocks. The Desktop client always carries a RouteKey on
 	// every send (including new sessions), so gate on an actual active run —
 	// not RouteKey alone — to avoid misrouting fresh requests through inject.
-	if req.RouteKey != "" {
+	forkActiveKoeRun := false
+	req, forkActiveKoeRun = prepareActiveKoeChild(s.deps.SessionCache, req.RouteKey, req)
+	if req.RouteKey != "" && !forkActiveKoeRun {
 		if s.deps.SessionCache.HasActiveRun(req.RouteKey) {
 			// A primary idempotent request is never a steering inject. The first
 			// run already owns this stable session/key; injecting the same prompt
@@ -6382,6 +6389,10 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.effort_tier %q is not valid; use one of %s", tier, strings.Join(agents.EffortTierAllowedValues(), ", ")))
 			return
 		}
+		if tier, ok := agentPatch["service_tier"].(string); ok && !config.IsValidAgentServiceTier(tier) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.service_tier %q is not valid; use one of %s", tier, strings.Join(config.AgentServiceTierAllowedValues(), ", ")))
+			return
+		}
 	}
 
 	if err := s.patchGlobalConfig(patch); err != nil {
@@ -6475,10 +6486,9 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 			"agent":            cfg.Koe.Agent,
 			"language":         cfg.Koe.Language,
 			"audio_processing": cfg.Koe.AudioProcessing,
-			// Fast-effort toggle for voice-triggered tasks. nil (unset) means the
-			// runtime default (ON → force fast/low), so Desktop renders an unset
-			// value as ON. Only an explicit false opts out (voice keeps the
-			// agent's normal effort).
+			// Automatic fast-task toggle. nil means the runtime default (ON), so
+			// Desktop renders it enabled. Only explicit false disables semantic
+			// fast requests; full always preserves normal Agent configuration.
 			"fast_effort": cfg.Koe.FastEffort,
 		}
 	}

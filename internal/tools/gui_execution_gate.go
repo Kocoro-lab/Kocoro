@@ -31,6 +31,12 @@ func (g *guiExecutionGate) ToolExposure() agent.ToolExposure {
 	}
 	return agent.ToolExposureDefault
 }
+func (g *guiExecutionGate) ToolProfileRequirement() agent.ToolProfileRequirement {
+	if provider, ok := g.inner.(agent.ToolProfileRequirementProvider); ok {
+		return provider.ToolProfileRequirement()
+	}
+	return agent.ToolProfileNone
+}
 func (g *guiExecutionGate) DescribeGUIAction(ctx context.Context, args string) (agent.GUIActionDescriptor, error) {
 	return g.describer.DescribeGUIAction(ctx, args)
 }

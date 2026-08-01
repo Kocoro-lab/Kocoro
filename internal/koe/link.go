@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 // DaemonClient is a localhost HTTP client for the daemon back-brain.
@@ -176,6 +178,15 @@ type DoTaskRequest struct {
 	ThreadID       string          `json:"thread_id,omitempty"`
 	CWD            string          `json:"cwd,omitempty"`
 	ForegroundHint *ForegroundHint `json:"foreground_hint,omitempty"`
+	// ExecutionMode is the locally admitted mode used by the voice ledger.
+	// The daemon independently recomputes it from the raw selector fields.
+	ExecutionMode          executionprofile.Mode       `json:"execution_mode"`
+	RequestedExecutionMode *string                     `json:"requested_execution_mode"`
+	FullReason             executionprofile.FullReason `json:"full_reason"`
+	InheritedMode          executionprofile.Mode       `json:"inherited_execution_mode,omitempty"`
+	LogicalTaskID          string                      `json:"logical_task_id,omitempty"`
+	ExecutionRunID         string                      `json:"execution_run_id,omitempty"`
+	ParentRunID            string                      `json:"parent_run_id,omitempty"`
 }
 
 // ForegroundHint mirrors daemon.RunAgentRequest.foreground_hint without importing
@@ -209,6 +220,7 @@ type DoTaskOutcome struct {
 	FailureCode   string        // Completed (soft)
 	Route         string        // Injected / Rejected
 	Reason        string        // Rejected (queue_full|active_run_not_ready|cwd_conflict)
+	ExecutionRun  *executionprofile.Run
 }
 
 // Deliverable is the voice-safe subset of a daemon-validated deliverable. Local
@@ -249,17 +261,18 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 	}
 
 	var parsed struct {
-		Reply         string        `json:"reply"`
-		SpokenSummary string        `json:"spoken_summary"`
-		SessionID     string        `json:"session_id"`
-		Agent         string        `json:"agent"`
-		Partial       bool          `json:"partial"`
-		FailureCode   string        `json:"failure_code"`
-		Deliverables  []Deliverable `json:"deliverables"`
-		Status        string        `json:"status"`
-		Route         string        `json:"route"`
-		Reason        string        `json:"reason"`
-		Error         string        `json:"error"`
+		Reply         string                `json:"reply"`
+		SpokenSummary string                `json:"spoken_summary"`
+		SessionID     string                `json:"session_id"`
+		Agent         string                `json:"agent"`
+		Partial       bool                  `json:"partial"`
+		FailureCode   string                `json:"failure_code"`
+		Deliverables  []Deliverable         `json:"deliverables"`
+		Status        string                `json:"status"`
+		Route         string                `json:"route"`
+		Reason        string                `json:"reason"`
+		Error         string                `json:"error"`
+		ExecutionRun  *executionprofile.Run `json:"execution_run"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return DoTaskOutcome{}, fmt.Errorf("decode POST /message response (status %d): %w; body=%s", resp.StatusCode, err, string(raw))
@@ -274,6 +287,7 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 			Kind: OutcomeCompleted, Reply: parsed.Reply, SpokenSummary: parsed.SpokenSummary, SessionID: parsed.SessionID,
 			Agent: parsed.Agent, Partial: parsed.Partial, FailureCode: parsed.FailureCode,
 			Deliverables: append([]Deliverable(nil), parsed.Deliverables...),
+			ExecutionRun: parsed.ExecutionRun,
 		}, nil
 	case "injected", "retracted_before_delivery":
 		return DoTaskOutcome{Kind: OutcomeInjected, Route: parsed.Route}, nil

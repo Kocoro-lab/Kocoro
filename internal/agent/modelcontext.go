@@ -19,6 +19,7 @@ var modelContextWindow = map[string]int{
 	"claude-opus-4-6":       1_000_000,
 	"claude-opus-4-7":       1_000_000,
 	"claude-mythos-preview": 1_000_000,
+	"claude-sonnet-5":       1_000_000,
 
 	// --- Anthropic (200K, dated forms) ---
 	"claude-sonnet-4-5-20250929": 200_000,
@@ -40,6 +41,9 @@ var modelContextWindow = map[string]int{
 
 	// --- OpenAI ---
 	"gpt-5.1":               400_000,
+	"gpt-5.6-terra":         1_050_000,
+	"gpt-5.6-luna":          1_050_000,
+	"gpt-5.6-sol":           1_050_000,
 	"gpt-5.1-chat-latest":   400_000,
 	"gpt-5-pro-2025-10-06":  400_000,
 	"gpt-5-mini-2025-08-07": 400_000,

@@ -12,6 +12,7 @@ func TestMaxTokensForModel(t *testing.T) {
 		{"sonnet 4.6 dateless", "claude-sonnet-4-6", 64_000},
 		{"opus 4.6 dateless", "claude-opus-4-6", 64_000},
 		{"opus 4.7 dateless", "claude-opus-4-7", 64_000},
+		{"sonnet 5 dateless", "claude-sonnet-5", 128_000},
 
 		// Known 200K dated forms
 		{"sonnet 4.5 dated", "claude-sonnet-4-5-20250929", 64_000},
@@ -31,6 +32,9 @@ func TestMaxTokensForModel(t *testing.T) {
 
 		// GPT-5 / GPT-4.1
 		{"gpt-5.1", "gpt-5.1", 128_000},
+		{"gpt-5.6 terra", "gpt-5.6-terra", 128_000},
+		{"gpt-5.6 luna", "gpt-5.6-luna", 128_000},
+		{"gpt-5.6 sol", "gpt-5.6-sol", 128_000},
 		{"gpt-5 mini", "gpt-5-mini-2025-08-07", 128_000},
 		{"gpt-4.1", "gpt-4.1-2025-04-14", 32_000},
 

@@ -685,12 +685,9 @@ func TestTryLockRouteWithManager_Held(t *testing.T) {
 //
 // Post-fix, both writes happen under sc.mu and the detector is silent.
 //
-// Test scope: this test ONLY exercises TryLockRouteWithManager vs
-// CancelRoute. It deliberately does NOT call UnlockRoute or SetRouteCancel
-// concurrently with CancelRoute — those have a pre-existing
-// cancelPending-via-entry.mu-only race that's out of scope for this fix.
-// Each iteration uses a fresh SessionCache so the concurrent zone is
-// isolated to TryLock and CancelRoute on a single key.
+// Test scope: this test exercises TryLockRouteWithManager vs CancelRoute.
+// The separate RouteCancelTeardownNoRace test covers concurrent UnlockRoute;
+// cleanup here runs after the two racing operations finish.
 //
 // Run with -race; without -race the test always passes.
 func TestTryLockRouteWithManager_StartupWindowCancelSurvives(t *testing.T) {
@@ -710,10 +707,8 @@ func TestTryLockRouteWithManager_StartupWindowCancelSurvives(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 
-		// Goroutine A: TryLock and exit immediately — this is the ONLY
-		// path under test. We don't call UnlockRoute / SetRouteCancel here
-		// to keep the concurrent zone narrow. The lock leak is fine for
-		// this iteration: each iteration uses a fresh SessionCache.
+		// Goroutine A: TryLock and exit immediately. Cleanup happens after the
+		// concurrent zone so this test remains focused on acquisition.
 		go func() {
 			defer wg.Done()
 			_, _ = sc.TryLockRouteWithManager(key, dir)
@@ -728,9 +723,7 @@ func TestTryLockRouteWithManager_StartupWindowCancelSurvives(t *testing.T) {
 		}()
 
 		wg.Wait()
-		// Don't UnlockRoute here — that would race with CancelRoute on
-		// cancelPending via UnlockRoute's pre-existing entry.mu-only write,
-		// reporting a different (out-of-scope) race.
+		sc.UnlockRoute(key)
 	}
 }
 

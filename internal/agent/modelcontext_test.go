@@ -4,16 +4,17 @@ import "testing"
 
 func TestLookupModelContextWindow(t *testing.T) {
 	cases := []struct {
-		name     string
-		model    string
-		wantCW   int
-		wantOK   bool
+		name   string
+		model  string
+		wantCW int
+		wantOK bool
 	}{
 		{"empty", "", 0, false},
 		{"unknown", "claude-future-99", 0, false},
 		{"sonnet 4.6 dateless 1M", "claude-sonnet-4-6", 1_000_000, true},
 		{"opus 4.6 dateless 1M", "claude-opus-4-6", 1_000_000, true},
 		{"opus 4.7 dateless 1M", "claude-opus-4-7", 1_000_000, true},
+		{"sonnet 5 dateless 1M", "claude-sonnet-5", 1_000_000, true},
 		{"sonnet 4.5 dated 200K", "claude-sonnet-4-5-20250929", 200_000, true},
 		{"haiku 4.5 dated 200K", "claude-haiku-4-5-20251001", 200_000, true},
 		{"sonnet 4 deprecated 200K", "claude-sonnet-4-20250514", 200_000, true},
@@ -43,6 +44,9 @@ func TestLookupModelContextWindow(t *testing.T) {
 		// guards future additions.)
 		{"longest-prefix-first guards future overlap", "claude-sonnet-4-6-20270101", 1_000_000, true},
 		{"gpt-5.1 400K", "gpt-5.1", 400_000, true},
+		{"gpt-5.6 terra 1.05M", "gpt-5.6-terra", 1_050_000, true},
+		{"gpt-5.6 luna 1.05M", "gpt-5.6-luna", 1_050_000, true},
+		{"gpt-5.6 sol 1.05M", "gpt-5.6-sol", 1_050_000, true},
 		{"gpt-4.1 dated 128K", "gpt-4.1-2025-04-14", 128_000, true},
 		{"gemini 2.5 pro 1M+", "gemini-2.5-pro", 1_048_576, true},
 		{"grok 2M", "grok-4-1-fast-reasoning", 2_000_000, true},
@@ -139,11 +143,11 @@ func TestMaybeAutoAdjustContextWindow(t *testing.T) {
 // first response triggers maybeAutoAdjustContextWindow.
 func TestSeedContextWindowFromModels(t *testing.T) {
 	cases := []struct {
-		name             string
-		configuredModel  string
-		lastSeenModel    string
-		fallback         int
-		want             int
+		name            string
+		configuredModel string
+		lastSeenModel   string
+		fallback        int
+		want            int
 	}{
 		{
 			name:            "configured 1M wins",

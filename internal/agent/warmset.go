@@ -35,6 +35,18 @@ func (ws *WorkingSet) Add(name string, schema client.Tool) {
 	ws.schemas[name] = schema
 }
 
+// Remove forgets one warmed schema without invalidating the remaining
+// session-scoped cache. Run-scoped, profile-bound tools use this during setup
+// so a prior run can never advertise them without resolving a fresh profile.
+func (ws *WorkingSet) Remove(name string) {
+	if ws == nil || name == "" {
+		return
+	}
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	delete(ws.schemas, name)
+}
+
 // Contains reports whether the working set contains the named schema.
 func (ws *WorkingSet) Contains(name string) bool {
 	if ws == nil || name == "" {

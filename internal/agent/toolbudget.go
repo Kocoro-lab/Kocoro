@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"math"
 	"sort"
 	"strings"
@@ -136,28 +137,56 @@ func toolSchemaFingerprint(reg *ToolRegistry) string {
 		if !ok {
 			continue
 		}
-		data, err := json.Marshal(buildToolSchema(t))
-		if err != nil {
-			continue
-		}
-		source := SourceLocal
-		if sourcer, ok := t.(ToolSourcer); ok {
-			source = sourcer.ToolSource()
-		}
-		namespace := ""
-		if provider, ok := t.(ToolSearchNamespaceProvider); ok {
-			namespace = provider.ToolSearchNamespace()
-		}
-		_, _ = h.Write([]byte(name))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(source))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(namespace))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(EffectiveToolExposure(t)))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write(data)
-		_, _ = h.Write([]byte{'\n'})
+		writeToolFingerprintRecord(h, name, t)
 	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeToolFingerprintRecord(h hash.Hash, name string, t Tool) {
+	data, err := json.Marshal(buildToolSchema(t))
+	if err != nil {
+		return
+	}
+	source := SourceLocal
+	if sourcer, ok := t.(ToolSourcer); ok {
+		source = sourcer.ToolSource()
+	}
+	namespace := ""
+	if provider, ok := t.(ToolSearchNamespaceProvider); ok {
+		namespace = provider.ToolSearchNamespace()
+	}
+	_, _ = h.Write([]byte(name))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(source))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(namespace))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(EffectiveToolExposure(t)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(EffectiveToolProfileRequirement(t)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(data)
+	_, _ = h.Write([]byte{'\n'})
+}
+
+// computerActivationFingerprint hashes ONLY the activation's computer tool
+// (schema, source, exposure, profile requirement) — not the whole registry.
+// The full-registry fingerprint is wrong for recovery: interrupted-turn resume
+// runs at daemon start while MCP servers are still connecting asynchronously,
+// so the registry routinely differs from checkpoint time in ways irrelevant to
+// the sealed computer trajectory, and every daemon restart burned a recovery
+// attempt before abandoning the turn. Registry drift OUTSIDE this tool
+// surfaces at dispatch (tool-not-found), where the model can adapt — only the
+// computer tool's own contract must be byte-identical to continue.
+func computerActivationFingerprint(reg *ToolRegistry, toolName string) string {
+	if reg == nil || toolName == "" {
+		return ""
+	}
+	t, ok := reg.Get(toolName)
+	if !ok {
+		return ""
+	}
+	h := sha256.New()
+	writeToolFingerprintRecord(h, toolName, t)
 	return hex.EncodeToString(h.Sum(nil))
 }

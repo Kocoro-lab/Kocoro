@@ -15,6 +15,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agenttypes"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
@@ -34,6 +35,8 @@ type DrainedInflightEntry struct {
 
 var ErrSessionChanged = errors.New("session changed since pre-check")
 var ErrRouteActive = errors.New("route has an active run")
+var ErrRouteBoundaryCanceled = errors.New("route boundary parent was canceled")
+var ErrRouteBoundarySuperseded = errors.New("route boundary parent generation was superseded")
 
 type routeEntry struct {
 	mu            sync.Mutex
@@ -51,12 +54,15 @@ type routeEntry struct {
 	// blocking on entry.mu held by an active run. Writers in the runner
 	// already hold entry.mu (per the resume invariant); the atomic only
 	// adds memory-order visibility for the lock-free reader.
-	sessionID  atomic.Pointer[string]
-	lastAccess time.Time
-	injectCh   chan agent.InjectedMessage // buffered channel for mid-run follow-up injection
-	activeCWD  string
-	evicting   bool
-	manager    *session.Manager
+	sessionID          atomic.Pointer[string]
+	lastAccess         time.Time
+	injectCh           chan agent.InjectedMessage // buffered channel for mid-run follow-up injection
+	activeCWD          string
+	activeExecutionRun executionprofile.Run
+	runGeneration      uint64
+	cancelGeneration   uint64
+	evicting           bool
+	manager            *session.Manager
 	// mailbox is the persisted per-route message queue (Phase 1+).
 	// Lazily created on first EnsureMailbox; nil for routes that have
 	// never queued. Coexists with injectCh — injectCh is the legacy
@@ -92,6 +98,10 @@ func cloneSessionSnapshot(sess *session.Session) *session.Session {
 	clone.Messages = append([]client.Message(nil), sess.Messages...)
 	clone.MessageMeta = append([]session.MessageMeta(nil), sess.MessageMeta...)
 	clone.RemoteTasks = append([]string(nil), sess.RemoteTasks...)
+	clone.ExecutionRuns = make([]executionprofile.Run, len(sess.ExecutionRuns))
+	for i := range sess.ExecutionRuns {
+		clone.ExecutionRuns[i] = cloneExecutionRun(sess.ExecutionRuns[i])
+	}
 	return &clone
 }
 
@@ -312,6 +322,7 @@ func (sc *SessionCache) TryLockRouteWithManager(key, sessionsDir string) (*route
 	// this sc.mu.Unlock will set cancelPending=true and SetRouteCancel will
 	// catch it.
 	entry.cancelPending = false
+	entry.pendingReason = agenttypes.ReasonUnknown
 	entry.lastAccess = time.Now()
 	sc.mu.Unlock()
 	return entry, false
@@ -338,6 +349,7 @@ func (sc *SessionCache) LockRouteWithManager(key, sessionsDir string) *routeEntr
 	// arriving after this point (during the startup window before SetRouteCancel
 	// is called) will set cancelPending again and be picked up correctly.
 	entry.cancelPending = false
+	entry.pendingReason = agenttypes.ReasonUnknown
 	sc.mu.Unlock()
 
 	if cancel != nil && done != nil {
@@ -346,8 +358,93 @@ func (sc *SessionCache) LockRouteWithManager(key, sessionsDir string) *routeEntr
 	}
 
 	entry.mu.Lock()
+	sc.mu.Lock()
+	// Eviction can nil the manager while this caller waits behind an active
+	// route. Revalidate only after acquiring entry.mu, when eviction can no
+	// longer change it underneath the new owner.
+	if entry.manager == nil && sessionsDir != "" {
+		entry.manager = sc.newManager(sessionsDir)
+	}
 	entry.lastAccess = time.Now()
+	sc.mu.Unlock()
 	return entry
+}
+
+// LockRouteWithManagerAtSafeBoundary queues behind the active route without
+// canceling it. Koe uses this for an execution-mode child generation: the
+// parent must reach its normal terminal/checkpoint boundary before the child
+// gets a fresh AgentLoop on the same session lineage. The generation and
+// cancellation fences are captured atomically when the child decision is made;
+// a canceled or superseded parent can therefore never release a stale child.
+func (sc *SessionCache) LockRouteWithManagerAtSafeBoundary(
+	ctx context.Context,
+	key, sessionsDir string,
+	expectedGeneration, expectedCancelGeneration uint64,
+	parentDone <-chan struct{},
+) (*routeEntry, error) {
+	if key == "" {
+		return nil, nil
+	}
+	if expectedGeneration == 0 {
+		return nil, ErrRouteBoundarySuperseded
+	}
+
+	// Wait on the exact parent's completion channel, rather than a mutable
+	// route-level field. This keeps the waiter cancel-aware even after cleanup
+	// clears entry.done for the next generation.
+	if parentDone != nil {
+		select {
+		case <-parentDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	// parentDone closes immediately before the parent releases entry.mu. Use a
+	// cancel-aware TryLock loop for that short handoff instead of an
+	// uninterruptible Mutex.Lock. If another route owner wins, its publication
+	// changes runGeneration and this waiter fails closed rather than waiting
+	// behind the wrong generation.
+	retry := time.NewTicker(time.Millisecond)
+	defer retry.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		sc.mu.Lock()
+		entry := sc.routes[key]
+		if entry == nil || entry.runGeneration != expectedGeneration {
+			sc.mu.Unlock()
+			return nil, ErrRouteBoundarySuperseded
+		}
+		if entry.cancelGeneration != expectedCancelGeneration {
+			sc.mu.Unlock()
+			return nil, ErrRouteBoundaryCanceled
+		}
+		if entry.mu.TryLock() {
+			if entry.done != nil {
+				sc.mu.Unlock()
+				entry.mu.Unlock()
+				return nil, ErrRouteBoundarySuperseded
+			}
+			// A deferred eviction can clear the route manager between the initial
+			// child decision and this acquisition. Recreate it while entry.mu is
+			// held; returning a nil manager would panic immediately in RunAgent.
+			if entry.manager == nil && sessionsDir != "" {
+				entry.manager = sc.newManager(sessionsDir)
+			}
+			entry.lastAccess = time.Now()
+			sc.mu.Unlock()
+			return entry, nil
+		}
+		sc.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-retry.C:
+		}
+	}
 }
 
 // UnlockRoute releases the per-route mutex acquired by LockRoute.
@@ -356,21 +453,25 @@ func (sc *SessionCache) LockRouteWithManager(key, sessionsDir string) *routeEntr
 func (sc *SessionCache) UnlockRoute(key string) {
 	sc.mu.Lock()
 	entry, ok := sc.routes[key]
-	sc.mu.Unlock()
 	if !ok || entry == nil {
+		sc.mu.Unlock()
 		return
 	}
 
-	// Check evicting flag under the already-held lock.
+	// The caller already owns entry.mu. Keep all cancel/cancelPending access
+	// under sc.mu as well so CancelRoute cannot race teardown.
 	var mgr *session.Manager
 	entry.cancel = nil
+	entry.cancelCause = nil
 	entry.cancelPending = false
+	entry.pendingReason = agenttypes.ReasonUnknown
 	entry.lastAccess = time.Now()
 	if entry.evicting {
 		mgr = entry.manager
 		entry.manager = nil
 		entry.evicting = false
 	}
+	sc.mu.Unlock()
 
 	// Single unlock point — releases the lock from LockRouteWithManager.
 	// Entry stays in the map as a reusable shell (never deleted).
@@ -398,6 +499,7 @@ func (sc *SessionCache) SetRouteCancel(key string, cancel context.CancelFunc) {
 		entry.cancel = cancel
 		pending = entry.cancelPending
 		entry.cancelPending = false
+		entry.pendingReason = agenttypes.ReasonUnknown
 	}
 	sc.mu.Unlock()
 	if pending && cancel != nil {
@@ -691,6 +793,92 @@ func (sc *SessionCache) SetRouteRunState(key string, done chan struct{}, injectC
 	sc.mu.Unlock()
 }
 
+// SetRouteActiveRunState atomically publishes the route's externally visible
+// run state and execution lineage. A Koe follow-up must never observe done
+// without the matching execution run (or vice versa), because that partial
+// snapshot could inject a Full child into its Fast parent.
+func (sc *SessionCache) SetRouteActiveRunState(
+	key string,
+	done chan struct{},
+	injectCh chan agent.InjectedMessage,
+	activeCWD string,
+	run executionprofile.Run,
+) uint64 {
+	if key == "" {
+		return 0
+	}
+	normalizedCWD := normalizeCWDForCompare(activeCWD)
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if entry := sc.routes[key]; entry != nil {
+		entry.runGeneration++
+		if entry.runGeneration == 0 {
+			// Reserve zero as "no captured generation".
+			entry.runGeneration++
+		}
+		entry.done = done
+		entry.injectCh = injectCh
+		entry.activeCWD = normalizedCWD
+		entry.activeExecutionRun = cloneExecutionRun(run)
+		return entry.runGeneration
+	}
+	return 0
+}
+
+// UpdateRouteActiveExecutionRun replaces only the execution snapshot for the
+// exact route generation published by SetRouteActiveRunState. RunAgent uses it
+// after validating persisted Koe lineage under the route lock and before
+// opening the injection channel. The generation fence prevents a stale caller
+// from overwriting a replacement run.
+func (sc *SessionCache) UpdateRouteActiveExecutionRun(
+	key string,
+	expectedGeneration uint64,
+	run executionprofile.Run,
+) bool {
+	if key == "" || expectedGeneration == 0 {
+		return false
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	entry := sc.routes[key]
+	if entry == nil ||
+		entry.done == nil ||
+		entry.runGeneration != expectedGeneration ||
+		entry.injectCh != nil {
+		return false
+	}
+	entry.activeExecutionRun = cloneExecutionRun(run)
+	return true
+}
+
+type activeRouteExecutionSnapshot struct {
+	Run              executionprofile.Run
+	RunGeneration    uint64
+	CancelGeneration uint64
+	Done             <-chan struct{}
+}
+
+// ActiveRouteExecutionSnapshot returns one immutable child-decision snapshot.
+// Active state, execution lineage, generation, cancellation fence, and done
+// channel all come from the same sc.mu critical section.
+func (sc *SessionCache) ActiveRouteExecutionSnapshot(key string) (activeRouteExecutionSnapshot, bool) {
+	if key == "" {
+		return activeRouteExecutionSnapshot{}, false
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	entry := sc.routes[key]
+	if entry == nil || entry.done == nil || entry.cancelPending || entry.activeExecutionRun.RunID == "" {
+		return activeRouteExecutionSnapshot{}, false
+	}
+	return activeRouteExecutionSnapshot{
+		Run:              cloneExecutionRun(entry.activeExecutionRun),
+		RunGeneration:    entry.runGeneration,
+		CancelGeneration: entry.cancelGeneration,
+		Done:             entry.done,
+	}, true
+}
+
 // ClearRouteRunState removes the externally visible in-flight run state for a route.
 func (sc *SessionCache) ClearRouteRunState(key string) {
 	if key == "" {
@@ -702,6 +890,7 @@ func (sc *SessionCache) ClearRouteRunState(key string) {
 		entry.done = nil
 		entry.injectCh = nil
 		entry.activeCWD = ""
+		entry.activeExecutionRun = executionprofile.Run{}
 	}
 	// Tombstones and the committed ledger deliberately SURVIVE run end: a
 	// retract that lost the race against teardown must still drop its target
@@ -948,6 +1137,21 @@ func (sc *SessionCache) WasInjectCommitted(key, clientMessageID string) bool {
 	return ok && time.Since(at) <= injectLedgerTTL
 }
 
+// markRouteCancelLocked records a cancellation fence for both the active run
+// and any safe-boundary child already queued behind it. Caller must hold sc.mu.
+func markRouteCancelLocked(entry *routeEntry, reason agenttypes.CancelReason) {
+	if entry == nil {
+		return
+	}
+	entry.cancelPending = true
+	entry.pendingReason = reason
+	entry.cancelGeneration++
+	if entry.cancelGeneration == 0 {
+		// Reserve zero as the initial "never canceled" generation.
+		entry.cancelGeneration++
+	}
+}
+
 // CancelRoute cancels the in-flight run for a route without waiting.
 // Used by the hard cancel API endpoint.
 //
@@ -993,8 +1197,7 @@ func (sc *SessionCache) CancelRouteWithReason(key string, reason agenttypes.Canc
 		// immediately POSTs the replacement message; the inject gate must see
 		// that this route is winding down and start a fresh RunAgent instead
 		// of writing the replacement into the dying loop's injectCh.
-		entry.cancelPending = true
-		entry.pendingReason = reason
+		markRouteCancelLocked(entry, reason)
 	}
 	sc.mu.Unlock()
 	if cancelCause != nil {
@@ -1032,14 +1235,16 @@ func (sc *SessionCache) CancelRouteForRestore(key string, reason agenttypes.Canc
 		return nil, nil
 	}
 
-	// Capture cancel handle + done channel under sc.mu so a concurrent
-	// ClearRouteRunState can't yank them out from under us.
+	// Capture cancel handle + done channel and publish the cancellation fence
+	// in one sc.mu critical section so a queued child cannot miss the restore
+	// cancellation.
 	sc.mu.Lock()
 	cancelCause := entry.cancelCause
 	cancel := entry.cancel
 	doneCh := entry.done
 	mgr := entry.manager
 	sessID := entry.loadSessionID()
+	markRouteCancelLocked(entry, reason)
 	sc.mu.Unlock()
 
 	switch {
@@ -1048,11 +1253,8 @@ func (sc *SessionCache) CancelRouteForRestore(key string, reason agenttypes.Canc
 	case cancel != nil:
 		cancel()
 	default:
-		// No active cancel handle yet — mark pending and return.
-		sc.mu.Lock()
-		entry.cancelPending = true
-		entry.pendingReason = reason
-		sc.mu.Unlock()
+		// No active cancel handle yet — the pending fence published above will
+		// be consumed by SetRouteCancel during startup.
 		return nil, nil
 	}
 
@@ -1107,10 +1309,9 @@ func (sc *SessionCache) CancelBySessionID(sessionID string) {
 		// loadSessionID is lock-free; entry.cancel/cancelPending are
 		// protected by sc.mu (per SetRouteCancel's documented invariant).
 		if entry != nil && entry.loadSessionID() == sessionID {
+			markRouteCancelLocked(entry, agenttypes.ReasonUserCancel)
 			if entry.cancel != nil {
 				cancels = append(cancels, entry.cancel)
-			} else {
-				entry.cancelPending = true
 			}
 		}
 	}
@@ -1200,27 +1401,52 @@ func (sc *SessionCache) evictRoute(key string) {
 	// that merely go idle without being evicted.
 	delete(sc.retractedInjects, key)
 	delete(sc.committedInjects, key)
+	var (
+		cancel   context.CancelFunc
+		deferred bool
+	)
+	if entry != nil && (entry.cancel != nil || entry.done != nil) {
+		// Active routes cannot be locked here: their runner owns entry.mu until
+		// teardown. Mark deferred cleanup and a cancellation fence atomically,
+		// then invoke cancel after releasing sc.mu.
+		entry.evicting = true
+		markRouteCancelLocked(entry, agenttypes.ReasonUserCancel)
+		cancel = entry.cancel
+		deferred = true
+	}
 	sc.mu.Unlock()
 	se.Forget(key) // nil-safe; releases the route's S0 queue (best-effort)
 	if entry == nil {
 		return
 	}
+	if deferred {
+		if cancel != nil {
+			cancel()
+		}
+		return // UnlockRoute will close and clear the evicted manager.
+	}
 
 	entry.mu.Lock()
+	// Revalidate under sc.mu after acquiring entry.mu: a run may have started
+	// between the first idle snapshot and this lock acquisition.
+	sc.mu.Lock()
 	mgr := entry.manager
 	active := entry.cancel != nil || entry.done != nil
 	if active {
-		// Route has an in-flight run — mark for deferred cleanup.
 		entry.evicting = true
-		if entry.cancel != nil {
-			entry.cancel()
-		}
+		markRouteCancelLocked(entry, agenttypes.ReasonUserCancel)
+		cancel = entry.cancel
+		sc.mu.Unlock()
 		entry.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 		return // UnlockRoute will finalize when the run completes
 	}
 	// Nil out manager but keep entry in map — LockRouteWithManager will
 	// create a fresh manager on next use (it checks entry.manager == nil).
 	entry.manager = nil
+	sc.mu.Unlock()
 	entry.mu.Unlock()
 
 	if mgr != nil {

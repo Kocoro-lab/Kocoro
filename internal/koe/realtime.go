@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 // eventHandler dispatches decoded oai-events and composes do_task. sendFn frames a
@@ -992,7 +994,11 @@ func (h *eventHandler) waitResultVoiceGap(ctx context.Context) bool {
 		if h.canAnnounce != nil && !h.canAnnounce() {
 			return false
 		}
-		if !h.respBusy.Load() && !h.outputBufferActive.Load() && !h.userSpeaking.Load() {
+		// Do not start a fast task result inside the local speaker tail. The
+		// Realtime response slot and WebRTC output buffer can both be idle while
+		// CoreAudio is still finishing the acknowledgement; isSpeakingOrResponding
+		// includes that local speaking gate.
+		if !h.isSpeakingOrResponding() && !h.userSpeaking.Load() {
 			return true
 		}
 		select {
@@ -1574,11 +1580,16 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 	if !strings.EqualFold(noiseReduction, "off") {
 		input["noise_reduction"] = map[string]any{"type": noiseReduction}
 	}
+	sessionInstructions := strings.TrimSpace(persona)
+	if sessionInstructions != "" {
+		sessionInstructions += "\n\n"
+	}
+	sessionInstructions += executionModeSchemaInstructions
 	return map[string]any{
 		"type": "session.update",
 		"session": map[string]any{
 			"type":              "realtime",
-			"instructions":      persona,
+			"instructions":      sessionInstructions,
 			"output_modalities": []string{"audio"},
 			"audio": map[string]any{
 				"input":  input,
@@ -2096,7 +2107,46 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 			h.state.ClearInFlightForRoute(req.Agent, req.ThreadID)
 			r := MapDoTaskOutcome(out, derr, lang)
 			if task != nil {
-				landed, supersedes := h.state.LandResult(task.ID, r)
+				landingRunID, accepted := acceptDaemonExecutionRun(
+					h.state,
+					task.ID,
+					req.ExecutionRunID,
+					out.ExecutionRun,
+				)
+				if !accepted {
+					if eventLogEnabled() {
+						log.Printf("koe[task]: rejected conflicting execution run task_id=%q run_id=%q", task.ID, out.ExecutionRun.RunID)
+					}
+					// The answer is undeliverable under this lineage (the ledger
+					// refused the run identity), but the goroutine is still
+					// terminal and — unlike the stale-generation branch below —
+					// has NO successor in flight to clean up after it. A bare
+					// return here pinned the call at "thinking" with the user
+					// mic un-restored for the rest of the call. Only voice
+					// delivery is dropped; the report persists in the daemon
+					// session, same as any unvoiced result.
+					//
+					// This task is terminal even though its result cannot land —
+					// mark it failed so it stops counting as running, then gate
+					// the busy-state clear on OTHER lanes: while an independent
+					// task is still in flight, leave the state alone — that
+					// task's own completion owns the transition to listening.
+					h.state.MarkFailed(task.ID, "conflicting execution run")
+					if !h.taskInFlight() {
+						h.asyncTaskPending.Store(false)
+						h.maybeRestoreUserMic()
+						h.emitVoiceState("listening")
+					}
+					return
+				}
+				landed, supersedes, currentGeneration := h.state.LandResultForRun(task.ID, landingRunID, r)
+				if !currentGeneration {
+					if eventLogEnabled() {
+						log.Printf("koe[task]: suppress stale execution result task_id=%q run_id=%q current_run_id=%q",
+							task.ID, landingRunID, landed.CurrentExecutionRun().RunID)
+					}
+					return
+				}
 				r.TaskID = landed.ID
 				r.Task = landed.Label
 				r.Revision = landed.Revision
@@ -2275,4 +2325,18 @@ func (h *eventHandler) waitRespIdle(ctx context.Context) bool {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+}
+
+func acceptDaemonExecutionRun(
+	state *CallState,
+	taskID, requestedRunID string,
+	resolved *executionprofile.Run,
+) (string, bool) {
+	if resolved == nil {
+		return requestedRunID, true
+	}
+	if state == nil || !state.RecordExecutionRun(taskID, *resolved) {
+		return "", false
+	}
+	return resolved.RunID, true
 }

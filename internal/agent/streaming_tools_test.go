@@ -14,6 +14,7 @@ import (
 type streamingProbeTool struct {
 	name     string
 	readOnly bool
+	exposure ToolExposure
 	started  chan struct{}
 	release  chan struct{}
 	runs     atomic.Int32
@@ -27,6 +28,9 @@ func (t *streamingProbeTool) Info() ToolInfo {
 	}
 }
 func (t *streamingProbeTool) RequiresApproval() bool { return false }
+func (t *streamingProbeTool) ToolExposure() ToolExposure {
+	return t.exposure
+}
 func (t *streamingProbeTool) IsReadOnlyCall(string) bool {
 	return t.readOnly
 }
@@ -176,5 +180,48 @@ func TestStreamingToolStartup_WriteCapableCallWaitsForFinalResponse(t *testing.T
 	}
 	if got := tool.runs.Load(); got != 1 {
 		t.Fatalf("tool runs = %d, want 1", got)
+	}
+}
+
+func TestStreamingToolStartup_ColdDeferredReadDoesNotStartSpeculatively(t *testing.T) {
+	tool := &streamingProbeTool{
+		name:     "cold_probe_read",
+		readOnly: true,
+		exposure: ToolExposureDeferred,
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	call := client.FunctionCall{
+		ID:        "tool-cold",
+		Name:      tool.name,
+		Arguments: json.RawMessage(`{"path":"README.md"}`),
+	}
+	var startedEarly atomic.Bool
+	llm := &streamingSequenceClient{call: call}
+	llm.beforeReturn = func() {
+		select {
+		case <-tool.started:
+			startedEarly.Store(true)
+		case <-time.After(75 * time.Millisecond):
+		}
+	}
+	handler := &streamingToolHandler{}
+	loop := newStreamingToolLoop(t, tool, llm, handler)
+
+	result, _, err := loop.Run(context.Background(), "inspect it", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" {
+		t.Fatalf("result = %q, want done", result)
+	}
+	if startedEarly.Load() {
+		t.Fatal("cold Deferred tool started from a streamed hallucinated call")
+	}
+	if got := tool.runs.Load(); got != 0 {
+		t.Fatalf("cold Deferred tool runs = %d, want 0", got)
+	}
+	if got := handler.starts.Load(); got != 0 {
+		t.Fatalf("cold Deferred OnToolCall starts = %d, want 0", got)
 	}
 }

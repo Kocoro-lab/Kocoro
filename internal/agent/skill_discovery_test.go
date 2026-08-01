@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
@@ -468,7 +469,8 @@ func skillNames(ss []*skills.Skill) []string {
 	return out
 }
 
-// Helper-tier callers must tag CacheSource="helper". See cache-action-plan §1.1.
+// Helper-tier callers tag prompt-cache attribution while disabling replayable
+// whole-response caching.
 func TestDiscoverRelevantSkills_TagsHelperCacheSource(t *testing.T) {
 	loaded := []*skills.Skill{
 		{Name: "alpha", Description: "alpha skill"},
@@ -484,5 +486,8 @@ func TestDiscoverRelevantSkills_TagsHelperCacheSource(t *testing.T) {
 	_, _ = discoverRelevantSkills(context.Background(), mock, "do something with alpha", loaded)
 	if captured.CacheSource != "helper" {
 		t.Errorf("discoverRelevantSkills CacheSource = %q, want %q", captured.CacheSource, "helper")
+	}
+	if captured.ResponseCachePolicy != executionprofile.ResponseCacheOff {
+		t.Errorf("discoverRelevantSkills ResponseCachePolicy = %q, want off", captured.ResponseCachePolicy)
 	}
 }
