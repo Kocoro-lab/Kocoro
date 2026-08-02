@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -80,6 +81,9 @@ func TestReadDisplayTopologyV1ClassifiesReconfigurationRPCFailure(t *testing.T) 
 }
 
 func TestAXClientReadCallPreservesRPCErrorCode(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("AX transport is macOS-only")
+	}
 	writer := &axMutationTestWriter{}
 	client := axMutationTestClient(writer)
 	writer.afterWrite = func(request []byte) {

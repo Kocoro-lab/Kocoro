@@ -2479,7 +2479,7 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	}
 }
 
-func TestOpenAIComputerTaskToolDisplayTopologyReconfigurationKeepsGoalControl(
+func TestOpenAIComputerTaskToolPersistentDisplayTopologyReconfigurationStopsAfterBoundedRetries(
 	t *testing.T,
 ) {
 	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
@@ -2531,12 +2531,17 @@ func TestOpenAIComputerTaskToolDisplayTopologyReconfigurationKeepsGoalControl(
 			result.Content,
 			tools.ComputerUseFailureDisplayTopologyReconfiguringV1,
 		) ||
-		!strings.Contains(result.Content, "retry computer_use") ||
+		!strings.Contains(result.Content, "did not stabilize after bounded observation retries") ||
+		!strings.Contains(result.Content, "do not retry computer_use automatically") ||
+		strings.Contains(result.Content, "retry computer_use in a new turn") ||
 		!strings.Contains(result.Content, "do not switch to another desktop-control tool") ||
 		strings.Contains(result.Content, "another appropriate non-computer_use control path") ||
 		result.ComputerUseOutcome == nil ||
 		result.ComputerUseOutcome.Recovery != agent.ComputerUseRecoveryNone {
 		t.Fatalf("task result = %+v", result)
+	}
+	if got := len(probe.runNames()); got != maxOpenAIComputerInitialObservationsV1 {
+		t.Fatalf("initial observation attempts = %d, want %d", got, maxOpenAIComputerInitialObservationsV1)
 	}
 }
 
