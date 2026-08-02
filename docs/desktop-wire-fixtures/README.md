@@ -43,7 +43,7 @@ Four live transport families, named by file prefix:
 |---|---|---|
 | `bus_event.*` | `GET /events` broadcast SSE stream | `id: <n>\nevent: <type>\ndata: <payload>\n\n` — fixture is the `data` payload |
 | `sse_event.*` | `POST /message` per-request SSE stream | `event: <name>\ndata: <payload>\n\n` — fixture is the `data` payload. NOTE: per-request event names differ from bus types (`approval` not `approval_request`, `tool` not `tool_status`) |
-| `http_get.*` | Plain HTTP GET response body | none — fixture is the whole body |
+| `http_get.*` / `http_post.*` | Plain HTTP request or response body | none — fixture is the whole JSON body |
 | `computer_use.*` | Local Desktop computer-use control plane | Request/response bodies for the authenticated activity, control, and heartbeat routes. |
 
 ## File List
@@ -156,6 +156,12 @@ auto-runs again under the same key.
 | `message_koe_execution_fast_request.json` | Koe → `POST /message` | `source=koe` fast request: semantic `execution_mode` + `requested_execution_mode` claim plus client-minted lineage ids (`logical_task_id`, `execution_run_id`). No provider/model/profile fields — the daemon re-decides admission and resolves the profile itself |
 | `message_koe_execution_full_request.json` | Koe → `POST /message` | Full-mode follow-up: adds `full_reason` (closed vocabulary), `parent_run_id` lineage, and the untrusted `inherited_execution_mode` claim (admission clears it; only ledger validation restores the Full floor) |
 | `sse_event.done.with_execution_run.json` | `handleMessageSSE` `event: done` | `RunAgentResult` carrying the validated `execution_run` (lineage ids + the resolved kfp1 profile incl. `resolution_reason`); Koe records it into the call ledger for follow-up/cancel routing |
+| `sse_event.skill.recommendation.v1.json` | `server.go handleEvents` | Device-targeted, account-bound Desktop capability card. It is deliberately not an EventBus replay event: only the authenticated account + declared Desktop device's current SSE stream receives it. |
+| `http_post.skill_recommendation_continue.request.json` | Desktop → `POST /skill-recommendations/{id}/continue` | The single **Install and continue** action: account/device/session-bound claim carrying the directed card token. Daemon installs the offer-time descriptor, enables it for the current Agent, records a receipt, then resumes attended SSE. |
+| `http_post.skill_recommendation_continue.accepted.response.json` | same | Idempotent retry while the original continuation is running; HTTP 202. |
+| `http_post.skill_recommendation_continue.completed.response.json` | same | Idempotent replay after completion; HTTP 200. A first claim instead upgrades this endpoint to the ordinary attended request-scoped SSE stream (`tool`, `approval`, `usage`, `done`/`error`). |
+| `http_post.skill_recommendation_dismiss.request.json` | Desktop → `POST /skill-recommendations/{id}/dismiss` | Empty object; ownership comes from verified account plus Desktop device headers, never the body. |
+| `http_post.skill_recommendation_dismiss.response.json` | same | Terminal dismissal acknowledgement. |
 
 ## Comparison Rule: Semantic Equality, Not Byte Equality
 

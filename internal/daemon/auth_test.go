@@ -123,6 +123,21 @@ func TestAuthManager_InitialStateIsSignedOut(t *testing.T) {
 	}
 }
 
+func TestAuthManagerVerifiedAccountIDFailsClosedWithoutVerifiedUser(t *testing.T) {
+	f := newAuthFixture(t)
+	if _, ok := f.manager.VerifiedAccountID(); ok {
+		t.Fatal("signed-out manager exposed account")
+	}
+	f.manager.setState(AuthStateSignedIn, nil, "")
+	if _, ok := f.manager.VerifiedAccountID(); ok {
+		t.Fatal("optimistic sign-in exposed account")
+	}
+	f.manager.setState(AuthStateSignedIn, &client.AuthUser{ID: "opaque-account-id"}, "")
+	if got, ok := f.manager.VerifiedAccountID(); !ok || got != "opaque-account-id" {
+		t.Fatalf("account=%q ok=%v", got, ok)
+	}
+}
+
 func TestAuthManager_Register_202_TransitionsPendingVerification(t *testing.T) {
 	f := newAuthFixture(t)
 	f.on(http.MethodPost, "/api/v1/auth/register", http.StatusAccepted, map[string]bool{"verification_sent": true})

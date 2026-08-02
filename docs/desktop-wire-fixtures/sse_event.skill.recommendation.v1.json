@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "recommendation_id": "rec_01",
+  "session_id": "session_demo",
+  "turn_id": "turn_demo",
+  "catalog_revision": "sha256:446db696c226df088858cfcf8e1ee2259922ee1f7140516b939d5175b89d841c",
+  "state": "offered",
+  "items": [
+    {
+      "catalog_id": "official:pptx",
+      "slug": "pptx",
+      "source": "official",
+      "display_name": "Presentation",
+      "capability_summary": "Create and edit presentations"
+    }
+  ],
+  "reason_code": "task_capability_missing",
+  "continuation_token": "continue_opaque_01",
+  "expires_at": "2026-08-02T12:00:00Z"
+}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -124,43 +125,20 @@ type DownloadableSkill struct {
 	Installed   bool   `json:"installed"`
 }
 
-// DownloadableSkills is the registry of skills available for on-demand installation.
-// Includes both formerly-bundled skills (copied from embedded binary) and
-// proprietary skills (fetched from Anthropic's repo).
-var DownloadableSkills = []struct {
-	Name        string
-	Description string
-}{
-	// Formerly bundled — installed from embedded binary
-	{"pdf-reader", "Analyze PDF files using file_read's built-in PDF rendering and vision"},
-	{"algorithmic-art", "Create algorithmic art using p5.js with seeded randomness"},
-	{"brand-guidelines", "Apply brand colors and typography to artifacts"},
-	{"canvas-design", "Create visual art in PNG and PDF using design philosophy"},
-	{"claude-api", "Build apps with the Claude API or Anthropic SDK"},
-	{"doc-coauthoring", "Structured workflow for co-authoring documentation"},
-	{"frontend-design", "Create production-grade frontend interfaces with high design quality"},
-	{"internal-comms", "Write internal communications using company formats"},
-	{"mcp-builder", "Create MCP servers for LLM-to-service integration"},
-	{"skill-creator", "Create, modify, and measure skill performance"},
-	{"slack-gif-creator", "Create animated GIFs optimized for Slack"},
-	{"theme-factory", "Style artifacts with pre-set or custom themes"},
-	{"web-artifacts-builder", "Create multi-component HTML artifacts with React and Tailwind"},
-	{"webapp-testing", "Test local web applications using Playwright"},
-	// Proprietary — installed from Anthropic's repo
-	{"docx", "Document creation, editing, and analysis with tracked changes and comments"},
-	{"pdf", "PDF extraction, creation, merging, splitting, and form filling"},
-	{"pptx", "Presentation creation, editing, and analysis"},
-	{"xlsx", "Spreadsheet creation, editing, analysis with formulas and formatting"},
+// IsDownloadable admits only reviewed official catalog entries. The catalog is
+// the source of truth for display, installation and recommendation eligibility.
+func IsDownloadable(name string) bool {
+	_, ok := CatalogEntryForSlug(name)
+	return ok
+}
+func IsDownloadableAt(shannonDir, name string) bool {
+	_, ok := CatalogEntryForSlugAt(shannonDir, name)
+	return ok
 }
 
-// IsDownloadable returns true if the skill name is in the downloadable registry.
-func IsDownloadable(name string) bool {
-	for _, s := range DownloadableSkills {
-		if s.Name == name {
-			return true
-		}
-	}
-	return false
+func IsDownloadableFrom(ctx context.Context, provider CatalogProvider, name string) bool {
+	_, ok, err := CatalogEntryForSlugFrom(ctx, provider, name)
+	return err == nil && ok
 }
 
 // builtinSkills are skills that are auto-installed on startup.
@@ -398,15 +376,21 @@ func overlayBuiltinFromEmbed(name, destDir string) error {
 }
 
 // InstallSkill installs a downloadable skill to the global skills directory
-// (~/.shannon/skills/<name>/). First checks if the skill is available in the
-// embedded bundled directory (fast, no network). Falls back to fetching from
-// Anthropic's skills repo over HTTP. ctx propagates request cancellation into
-// the network download.
+// (~/.shannon/skills/<name>/) using the embedded bootstrap catalog. Daemon
+// callers use InstallSkillFromCatalog with the live controlled provider.
 func InstallSkill(ctx context.Context, shannonDir, name string) error {
+	return InstallSkillFromCatalog(ctx, shannonDir, name, NewEmbeddedCatalogProvider(shannonDir))
+}
+
+func InstallSkillFromCatalog(ctx context.Context, shannonDir, name string, provider CatalogProvider) error {
 	if err := ValidateSkillName(name); err != nil {
 		return err
 	}
-	if !IsDownloadable(name) {
+	entry, ok, err := CatalogEntryForSlugFrom(ctx, provider, name)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return fmt.Errorf("skill %q is not available for download", name)
 	}
 
@@ -414,14 +398,169 @@ func InstallSkill(ctx context.Context, shannonDir, name string) error {
 	if _, err := os.Stat(filepath.Join(destDir, "SKILL.md")); err == nil {
 		return fmt.Errorf("skill %q is already installed", name)
 	}
+	_, err = InstallCatalogEntry(ctx, shannonDir, entry, provider)
+	return err
+}
 
-	// Try bundled source first (no network required)
-	if err := installFromBundled(shannonDir, name, destDir); err == nil {
-		return nil
+const catalogInstallReceiptFile = ".kocoro-catalog-install.json"
+
+// CatalogInstallReceipt is written inside the staged skill before the
+// directory is atomically committed. It lets recommendation continuation
+// distinguish the exact catalog artifact it offered from a same-slug manual
+// or later-catalog installation.
+type CatalogInstallReceipt struct {
+	SchemaVersion    int       `json:"schema_version"`
+	CatalogID        string    `json:"catalog_id"`
+	Slug             string    `json:"slug"`
+	Version          string    `json:"version"`
+	DescriptorDigest string    `json:"descriptor_digest"`
+	TreeSHA256       string    `json:"tree_sha256"`
+	InstalledAt      time.Time `json:"installed_at"`
+}
+
+// InstallCatalogEntry installs one already-validated immutable catalog
+// snapshot. Unlike InstallSkillFromCatalog it never re-reads the provider's
+// catalog, closing the offer-to-install TOCTOU window. Callers must serialize
+// the same slug (the daemon uses Server.slugLocks).
+func InstallCatalogEntry(ctx context.Context, shannonDir string, entry CatalogEntry, provider CatalogProvider) (CatalogInstallReceipt, error) {
+	if err := validateOfficialCatalog([]CatalogEntry{entry}); err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	digest, err := CatalogInstallDescriptorDigest(entry)
+	if err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	receipt := CatalogInstallReceipt{SchemaVersion: 1, CatalogID: entry.ID, Slug: entry.Slug, Version: entry.Version, DescriptorDigest: digest, InstalledAt: time.Now().UTC()}
+	destDir := filepath.Join(shannonDir, "skills", entry.Slug)
+	if existing, ok, readErr := ReadCatalogInstallReceipt(destDir); readErr != nil {
+		return CatalogInstallReceipt{}, readErr
+	} else if ok {
+		if existing.CatalogID == receipt.CatalogID && existing.Slug == receipt.Slug && existing.DescriptorDigest == receipt.DescriptorDigest {
+			if treeHash, hashErr := hashCatalogSkillTree(destDir); hashErr == nil && treeHash == existing.TreeSHA256 {
+				return existing, nil
+			}
+		}
+		return CatalogInstallReceipt{}, fmt.Errorf("skill %q is installed from a different catalog artifact", entry.Slug)
+	}
+	if _, statErr := os.Stat(destDir); statErr == nil {
+		return CatalogInstallReceipt{}, fmt.Errorf("skill %q already exists without a matching catalog receipt", entry.Slug)
+	} else if !os.IsNotExist(statErr) {
+		return CatalogInstallReceipt{}, statErr
 	}
 
-	// Fall back to Anthropic's repo
-	return installFromRepo(ctx, shannonDir, name, destDir)
+	skillsRoot := filepath.Join(shannonDir, "skills")
+	if err := os.MkdirAll(skillsRoot, 0700); err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	stageRoot := filepath.Join(skillsRoot, ".staging")
+	if err := os.MkdirAll(stageRoot, 0700); err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	stageDir, err := os.MkdirTemp(stageRoot, entry.Slug+"-*")
+	if err != nil {
+		return CatalogInstallReceipt{}, fmt.Errorf("create skill stage: %w", err)
+	}
+	defer os.RemoveAll(stageDir)
+
+	switch entry.Installation.Provider {
+	case "bundled":
+		err = installFromBundled(shannonDir, entry.Slug, stageDir)
+	case "github_archive":
+		var opener catalogArtifactOpener
+		if artifactProvider, ok := provider.(CatalogArtifactProvider); ok {
+			opener = artifactProvider.OpenCatalogArtifact
+		}
+		err = installFromRepoWithOpener(ctx, shannonDir, entry.Slug, stageDir, entry.Installation, opener)
+	default:
+		err = fmt.Errorf("skill %q has unsupported installation provider %q", entry.Slug, entry.Installation.Provider)
+	}
+	if err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	if _, err := loadSkillMD(filepath.Join(stageDir, "SKILL.md"), entry.Slug, SourceGlobal); err != nil {
+		return CatalogInstallReceipt{}, fmt.Errorf("invalid catalog skill payload: %w", err)
+	}
+	receipt.TreeSHA256, err = hashCatalogSkillTree(stageDir)
+	if err != nil {
+		return CatalogInstallReceipt{}, fmt.Errorf("hash installed skill: %w", err)
+	}
+	receiptBytes, err := json.Marshal(receipt)
+	if err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	if err := atomicWrite(filepath.Join(stageDir, catalogInstallReceiptFile), receiptBytes); err != nil {
+		return CatalogInstallReceipt{}, fmt.Errorf("write catalog install receipt: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	if err := commitStagedSkill(stageDir, destDir); err != nil {
+		return CatalogInstallReceipt{}, err
+	}
+	return receipt, nil
+}
+
+// ReadCatalogInstallReceipt returns the immutable receipt stored with an
+// installed official skill. A missing receipt is not an error: it identifies a
+// manual/legacy install, which recommendation continuation must not accept.
+func ReadCatalogInstallReceipt(skillDir string) (CatalogInstallReceipt, bool, error) {
+	b, err := os.ReadFile(filepath.Join(skillDir, catalogInstallReceiptFile))
+	if os.IsNotExist(err) {
+		return CatalogInstallReceipt{}, false, nil
+	}
+	if err != nil {
+		return CatalogInstallReceipt{}, false, err
+	}
+	var receipt CatalogInstallReceipt
+	if err := json.Unmarshal(b, &receipt); err != nil {
+		return CatalogInstallReceipt{}, false, fmt.Errorf("parse catalog install receipt: %w", err)
+	}
+	if receipt.SchemaVersion != 1 || receipt.CatalogID == "" || ValidateSkillName(receipt.Slug) != nil || !strings.HasPrefix(receipt.DescriptorDigest, "sha256:") || !validLowerHex(strings.TrimPrefix(receipt.DescriptorDigest, "sha256:"), 64) || !validLowerHex(receipt.TreeSHA256, 64) {
+		return CatalogInstallReceipt{}, false, fmt.Errorf("invalid catalog install receipt")
+	}
+	return receipt, true, nil
+}
+
+func commitStagedSkill(stageDir, destDir string) error {
+	if _, err := os.Stat(destDir); err == nil {
+		return fmt.Errorf("skill destination already exists")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(stageDir, destDir); err != nil {
+		return fmt.Errorf("commit skill install: %w", err)
+	}
+	return nil
+}
+
+func hashCatalogSkillTree(dir string) (string, error) {
+	h := sha256.New()
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		if filepath.ToSlash(rel) == catalogInstallReceiptFile {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(h, "%s\x00%d\x00", filepath.ToSlash(rel), len(data))
+		_, _ = h.Write(data)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // ErrPreviewUnavailable is returned by PreviewSkill when a downloadable skill
@@ -440,10 +579,14 @@ var ErrPreviewUnavailable = errors.New("no local preview available for skill")
 // If neither exists (a proprietary skill not yet installed), returns
 // ErrPreviewUnavailable so the caller can fall back to the short description.
 func PreviewSkill(shannonDir, name string) (string, error) {
+	return PreviewSkillFromCatalog(context.Background(), shannonDir, name, NewEmbeddedCatalogProvider(shannonDir))
+}
+
+func PreviewSkillFromCatalog(ctx context.Context, shannonDir, name string, provider CatalogProvider) (string, error) {
 	if err := ValidateSkillName(name); err != nil {
 		return "", err
 	}
-	if !IsDownloadable(name) {
+	if !IsDownloadableFrom(ctx, provider, name) {
 		return "", fmt.Errorf("skill %q is not available for download", name)
 	}
 
@@ -490,20 +633,28 @@ func installFromBundled(shannonDir, name, destDir string) error {
 // Override: not currently exposed; recompile if 3 attempts proves wrong.
 const installFromRepoMaxAttempts = 3
 
-// ErrSkillNotInRepo is returned by tryInstallFromRepo when the tarball
-// downloads and extracts fine but the requested skill's directory is absent
-// from the upstream tree — a deterministic 404 against
-// github.com/anthropics/skills, not a transient flake. installFromRepo
-// uses errors.Is to short-circuit retry on this sentinel.
-var ErrSkillNotInRepo = errors.New("skill not found in Anthropic repo")
+// ErrSkillNotInRepo is returned when the verified archive does not contain the
+// catalog-declared artifact path. It is deterministic for an immutable ref.
+var ErrSkillNotInRepo = errors.New("skill not found in catalog archive")
 
-// installFromRepo downloads a skill from Anthropic's skills repo over HTTP
+// ErrSkillArchiveIntegrity means the downloaded bytes did not match the
+// controlled catalog's immutable archive digest. Retrying the same ref cannot make
+// mismatched bytes trustworthy, so installFromRepo fails immediately.
+var ErrSkillArchiveIntegrity = errors.New("skill archive integrity verification failed")
+
+// installFromRepo downloads a skill from a catalog-declared GitHub repo over HTTP
 // (the GitHub codeload tarball — no `git` binary required, so it works on a
 // stock Windows/macOS/Linux machine that has never installed git). Retries the
 // download on transient failures (network flake, github.com reachability).
-// Does NOT retry ErrSkillNotInRepo — that's a real 404 against the upstream
-// tree, not a flake.
-func installFromRepo(ctx context.Context, shannonDir, name, destDir string) error {
+// It does not retry ErrSkillNotInRepo or ErrSkillArchiveIntegrity: neither can
+// become trustworthy by fetching the same immutable ref again.
+func installFromRepo(ctx context.Context, shannonDir, name, destDir string, installation CatalogInstallation) error {
+	return installFromRepoWithOpener(ctx, shannonDir, name, destDir, installation, nil)
+}
+
+type catalogArtifactOpener func(context.Context, CatalogInstallation) (io.ReadCloser, error)
+
+func installFromRepoWithOpener(ctx context.Context, shannonDir, name, destDir string, installation CatalogInstallation, opener catalogArtifactOpener) error {
 	var lastErr error
 	for attempt := 0; attempt < installFromRepoMaxAttempts; attempt++ {
 		if attempt > 0 {
@@ -513,12 +664,12 @@ func installFromRepo(ctx context.Context, shannonDir, name, destDir string) erro
 				return ctx.Err()
 			}
 		}
-		err := tryInstallFromRepo(ctx, shannonDir, name, destDir)
+		err := tryInstallFromRepoWithOpener(ctx, shannonDir, name, destDir, installation, opener)
 		if err == nil {
 			return nil
 		}
 		// Don't retry a genuine "skill not in upstream" — that's deterministic.
-		if errors.Is(err, ErrSkillNotInRepo) {
+		if errors.Is(err, ErrSkillNotInRepo) || errors.Is(err, ErrSkillArchiveIntegrity) {
 			return err
 		}
 		lastErr = err
@@ -527,28 +678,68 @@ func installFromRepo(ctx context.Context, shannonDir, name, destDir string) erro
 }
 
 // tryInstallFromRepo is a single attempt of installFromRepo. It downloads the
-// anthropics/skills repo as a gzip tarball, extracts only skills/<name>/** into
-// a fresh per-attempt staging dir, then copies that into destDir. A fresh
-// tmpDir per attempt guarantees a partially-written download from a previous
-// failure cannot contaminate the next try.
-func tryInstallFromRepo(ctx context.Context, shannonDir, name, destDir string) error {
+// declared repository as a gzip tarball, writes the complete compressed
+// response to a fresh temp file, verifies its catalog-pinned SHA-256, extracts
+// only skills/<name>/** into a staging dir, then copies that into destDir. A
+// fresh tmpDir per attempt guarantees a partial or unverified download cannot
+// contaminate the next try.
+func tryInstallFromRepo(ctx context.Context, shannonDir, name, destDir string, installation CatalogInstallation) error {
+	return tryInstallFromRepoWithOpener(ctx, shannonDir, name, destDir, installation, nil)
+}
+
+func tryInstallFromRepoWithOpener(ctx context.Context, shannonDir, name, destDir string, installation CatalogInstallation, opener catalogArtifactOpener) error {
 	tmpDir, err := os.MkdirTemp(shannonDir, "skill-install-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	rc, err := openRepoTarball(ctx)
+	var rc io.ReadCloser
+	if opener != nil {
+		rc, err = opener(ctx, installation)
+	} else {
+		rc, err = openRepoTarball(ctx, installation.Repository, installation.Ref)
+	}
 	if err != nil {
 		return fmt.Errorf("download skills tarball: %w", err)
 	}
-	defer rc.Close()
+
+	archivePath := filepath.Join(tmpDir, "skills.tar.gz")
+	archive, err := os.OpenFile(archivePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		rc.Close()
+		return fmt.Errorf("create skills archive: %w", err)
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(archive, h), io.LimitReader(rc, maxCompressedSkillTarballBytes+1))
+	closeErr := rc.Close()
+	archiveCloseErr := archive.Close()
+	if copyErr != nil {
+		return fmt.Errorf("download skills tarball: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close skills tarball response: %w", closeErr)
+	}
+	if archiveCloseErr != nil {
+		return fmt.Errorf("close skills archive: %w", archiveCloseErr)
+	}
+	if n > maxCompressedSkillTarballBytes {
+		return fmt.Errorf("%w: compressed archive exceeds %d bytes", ErrSkillArchiveIntegrity, maxCompressedSkillTarballBytes)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != installation.ArchiveSHA256 {
+		return fmt.Errorf("%w: sha256 mismatch", ErrSkillArchiveIntegrity)
+	}
+	verifiedArchive, err := os.Open(archivePath)
+	if err != nil {
+		return fmt.Errorf("open verified skills archive: %w", err)
+	}
+	defer verifiedArchive.Close()
 
 	// Extract into a staging dir first; only touch destDir once the whole
 	// extraction succeeds so a mid-download failure never leaves a half-written
 	// skill in ~/.shannon/skills.
 	stageDir := filepath.Join(tmpDir, "stage")
-	if err := extractSkillFromTarball(rc, name, stageDir); err != nil {
+	if err := extractSkillFromTarball(verifiedArchive, name, installation.ArtifactPath, stageDir); err != nil {
 		return err // ErrSkillNotInRepo when the skill is absent upstream
 	}
 
@@ -565,17 +756,19 @@ func tryInstallFromRepo(ctx context.Context, shannonDir, name, destDir string) e
 	return copyDir(stageDir, destDir)
 }
 
-// anthropicSkillsTarballURL is the GitHub codeload endpoint that serves the
-// whole anthropics/skills repo as a gzip tarball for the main branch. codeload
-// is the same backend `git` archive/clone hits, but over plain HTTP — no local
-// git binary, no partial-clone/sparse-checkout git-version requirements.
-const anthropicSkillsTarballURL = "https://codeload.github.com/anthropics/skills/tar.gz/refs/heads/main"
+// githubArchiveURL returns the immutable commit archive selected by controlled
+// catalog metadata. Mutable branch names are rejected by catalog
+// validation before this function is reachable.
+func githubArchiveURL(repository, ref string) string {
+	repo := strings.TrimSuffix(strings.TrimPrefix(repository, "https://github.com/"), ".git")
+	return "https://codeload.github.com/" + repo + "/tar.gz/" + ref
+}
 
 // Extraction backstops for the downloaded tarball. The payload is
 // attacker-influenced (compromised upstream / MITM), so we cap total
 // decompressed bytes (decompression-bomb guard), per-file size, and file
 // count. Because install extracts from a whole-repo tarball, these bound the
-// ENTIRE anthropics/skills tree, not a single skill.
+// entire declared repository, not a single skill.
 //
 //   - Workload: the full anthropics/skills repo — today ~4 MiB compressed,
 //     tens of MiB decompressed, a few hundred files — so these sit well above
@@ -588,9 +781,10 @@ const anthropicSkillsTarballURL = "https://codeload.github.com/anthropics/skills
 //     outgrows the headroom, bump here and recompile. Vars (not consts) only so
 //     tests can shrink them to exercise the guards cheaply.
 var (
-	maxSkillTarballBytes int64 = 512 << 20 // 512 MiB total decompressed (whole repo)
-	maxSkillFileBytes    int64 = 25 << 20  // 25 MiB per file
-	maxSkillFiles              = 20000     // whole-repo file count
+	maxCompressedSkillTarballBytes int64 = 128 << 20 // 128 MiB compressed download
+	maxSkillTarballBytes           int64 = 512 << 20 // 512 MiB total decompressed (whole repo)
+	maxSkillFileBytes              int64 = 25 << 20  // 25 MiB per file
+	maxSkillFiles                        = 20000     // whole-repo file count
 )
 
 // skillsHTTPClient downloads the skills tarball. The 2-minute ceiling bounds a
@@ -603,8 +797,8 @@ var skillsHTTPClient = &http.Client{Timeout: 2 * time.Minute}
 // tarball or a transient error without any network access.
 var openRepoTarball = openRepoTarballReal
 
-func openRepoTarballReal(ctx context.Context) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, anthropicSkillsTarballURL, nil)
+func openRepoTarballReal(ctx context.Context, repository, ref string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubArchiveURL(repository, ref), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -631,7 +825,7 @@ func openRepoTarballReal(ctx context.Context) (io.ReadCloser, error) {
 // Symlinks/hardlinks/devices are skipped (they can be a path-escape vector and
 // never belong in a skill), and every target is re-checked to stay within
 // destDir as defense-in-depth against tar-slip.
-func extractSkillFromTarball(r io.Reader, name, destDir string) error {
+func extractSkillFromTarball(r io.Reader, name, artifactPath, destDir string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("gzip: %w", err)
@@ -652,7 +846,7 @@ func extractSkillFromTarball(r io.Reader, name, destDir string) error {
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
 		}
-		rel, ok := stripSkillPrefix(path.Clean(hdr.Name), name)
+		rel, ok := stripSkillPrefix(path.Clean(hdr.Name), artifactPath)
 		if !ok {
 			// codeload tar entries are path-sorted (git tree order), so once
 			// we've extracted at least one entry of the target skill and then
@@ -703,16 +897,16 @@ func extractSkillFromTarball(r io.Reader, name, destDir string) error {
 // stripSkillPrefix matches "<root>/skills/<name>/<rest>" (or the bare
 // "<root>/skills/<name>" directory entry) and returns <rest> ("" for the dir
 // entry itself). ok is false for any path that isn't under the target skill.
-func stripSkillPrefix(clean, name string) (rest string, ok bool) {
-	// [root, "skills", name, rest] — SplitN keeps the remainder intact in [3].
-	parts := strings.SplitN(clean, "/", 4)
-	if len(parts) < 3 || parts[1] != "skills" || parts[2] != name {
+func stripSkillPrefix(clean, artifactPath string) (rest string, ok bool) {
+	prefix := path.Clean(artifactPath)
+	parts := strings.SplitN(clean, "/", 2)
+	if len(parts) != 2 || (parts[1] != prefix && !strings.HasPrefix(parts[1], prefix+"/")) {
 		return "", false
 	}
-	if len(parts) == 3 {
+	if parts[1] == prefix {
 		return "", true
 	}
-	return parts[3], true
+	return strings.TrimPrefix(parts[1], prefix+"/"), true
 }
 
 // withinDir reports whether target resolves inside root (tar-slip guard).

@@ -104,13 +104,19 @@ type Server struct {
 	remoteRunOutbox   sync.Map // map[string][]remoteRunEventRecord
 	onReload          func()   // called after config reload to restart watchers/heartbeat
 
-	marketplace  *skills.MarketplaceClient // static registry → /skills/marketplace/*
-	clawhub      *skills.MarketplaceClient // ClawHub live catalog → /skills/clawhub/*
-	slugLocks    *skills.SlugLocks
-	secretsStore *skills.SecretsStore
-	memSvc       *memory.Service
-	suggestions  *agent.SuggestionState
-	migratePlans *claudecode.PlanStore
+	marketplace                *skills.MarketplaceClient // static registry → /skills/marketplace/*
+	catalog                    skills.CatalogProvider
+	clawhub                    *skills.MarketplaceClient // ClawHub live catalog → /skills/clawhub/*
+	slugLocks                  *skills.SlugLocks
+	secretsStore               *skills.SecretsStore
+	memSvc                     *memory.Service
+	suggestions                *agent.SuggestionState
+	skillRecommendations       *skillRecommendationStore
+	skillRecommendationsOff    atomic.Bool
+	skillRecommendationSinksMu sync.RWMutex
+	skillRecommendationSinks   map[string]skillRecommendationSink
+	recommendationAgentMu      sync.Mutex
+	migratePlans               *claudecode.PlanStore
 
 	// auth manages the /local/auth/* email/password flow. May be nil on
 	// platforms without a credential store (everything except macOS /
@@ -229,14 +235,13 @@ func (s *Server) auditHTTPOpError(method, path, summary string, err error) {
 // back to the public default. Tolerates nil deps / nil Config so tests that
 // construct NewServer with nil deps continue to work.
 func resolveRegistryURL(deps *ServerDeps) string {
-	const defaultURL = "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json"
 	if deps == nil || deps.Config == nil {
-		return defaultURL
+		return skills.DefaultMarketplaceRegistryURL
 	}
 	if u := deps.Config.Skills.Marketplace.RegistryURL; u != "" {
 		return u
 	}
-	return defaultURL
+	return skills.DefaultMarketplaceRegistryURL
 }
 
 // applyMarketplaceConfig injects the config-tunable retry policy
@@ -309,6 +314,19 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	if deps != nil {
 		deps.SecretsStore = store
 	}
+	marketplace := newMarketplaceClient(deps)
+	catalogProvider := skills.CatalogProvider(nil)
+	if deps != nil {
+		catalogProvider = deps.CatalogProvider
+	}
+	if catalogProvider == nil {
+		registryURL := resolveRegistryURL(deps)
+		catalogProvider = skills.NewRegistryCatalogProvider(
+			marketplace,
+			skills.NewEmbeddedCatalogProvider(shannonDir),
+			registryURL == skills.DefaultMarketplaceRegistryURL,
+		)
+	}
 	// suggestions is initialized unconditionally so HTTP handlers work even
 	// when deps == nil (existing test fixtures pass nil). The same pointer is
 	// wired into deps.Suggestions below — when deps is non-nil — so the
@@ -331,14 +349,20 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		consequentialRiskHTTPAuthorizer: localPresenceAuthorized,
 		notifyApprovalResolved:          func(p ApprovalResolvedPayload) error { return nil },
 		remoteRunSlots:                  make(chan struct{}, MaxConcurrentAgents),
-		marketplace:                     newMarketplaceClient(deps),
+		marketplace:                     marketplace,
+		catalog:                         catalogProvider,
 		clawhub:                         newClawHubClient(deps),
 		slugLocks:                       skills.NewSlugLocks(),
 		secretsStore:                    store,
 		suggestions:                     agent.NewSuggestionState(),
+		skillRecommendations:            newSkillRecommendationStore(shannonDir),
+		skillRecommendationSinks:        make(map[string]skillRecommendationSink),
 		migratePlans:                    claudecode.NewPlanStore(),
 		agentSyncTrigger:                make(chan struct{}, 1),
 		pullDone:                        make(chan struct{}),
+	}
+	if deps != nil && !skillRecommendationsEnabled(deps.Config) {
+		s.skillRecommendationsOff.Store(true)
 	}
 	// Wire approval bus hooks so SSE per-request brokers (which inherit from
 	// s.approvalBroker in handleMessageSSE) publish EventApprovalRequest /
@@ -360,6 +384,8 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 	WireQuestionBusHooks(s.questionBroker, s.eventBus, nil)
 	if deps != nil {
 		deps.Suggestions = s.suggestions
+		deps.SkillRecommendations = s.skillRecommendations
+		deps.CatalogProvider = catalogProvider
 		deps.ComputerUseCoordinator = s.computerUseCoordinator
 		deps.ComputerUsePreview = s.computerUsePreview
 		deps.ConsequentialRiskBroker = s.consequentialRiskBroker
@@ -470,6 +496,30 @@ func (s *Server) SetOnReload(fn func()) {
 // Nil is permitted (platforms without a credential store) — handlers respond 503.
 func (s *Server) SetAuth(a *AuthManager) {
 	s.auth = a
+	if s.deps != nil {
+		s.deps.AuthManager = a
+	}
+	if a != nil {
+		a.SetPrincipalChangedHandler(func(previous, _ string) {
+			if previous == "" {
+				return
+			}
+			if err := s.skillRecommendations.invalidateAccount(previous); err != nil {
+				log.Printf("daemon: invalidate old recommendation principal: %v", err)
+				s.skillRecommendations.failClosedAccount(previous, err)
+			}
+			s.skillRecommendationSinksMu.Lock()
+			for key, sink := range s.skillRecommendationSinks {
+				if strings.HasPrefix(key, previous+"\x00") {
+					if sink.close != nil {
+						sink.close()
+					}
+					delete(s.skillRecommendationSinks, key)
+				}
+			}
+			s.skillRecommendationSinksMu.Unlock()
+		})
+	}
 }
 
 // SetComputerUseCoordinator injects the GUI control authority before the
@@ -667,6 +717,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /skills/downloadable", s.handleListDownloadableSkills)
 	mux.HandleFunc("GET /skills/downloadable/{name}/preview", s.handlePreviewDownloadableSkill)
 	mux.HandleFunc("POST /skills/install/{name}", s.handleInstallSkill)
+	mux.HandleFunc("POST /skill-recommendations/{id}/continue", s.handleSkillRecommendationContinue)
+	mux.HandleFunc("POST /skill-recommendations/{id}/dismiss", s.handleSkillRecommendationDismiss)
 	mux.HandleFunc("POST /skills/marketplace/install/{slug}", s.handleMarketplaceInstall)
 	mux.HandleFunc("POST /skills/upload", s.handleUploadSkill)
 	mux.HandleFunc("POST /channels/feishu/app-installs", s.handleCreateFeishuAppInstall)
@@ -845,7 +897,7 @@ func withLocalCORS(h http.Handler) http.Handler {
 			hdr.Set("Access-Control-Allow-Credentials", "true")
 			hdr.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			// Last-Event-ID covers the SSE /events reconnection header.
-			hdr.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, X-Kocoro-Local-Presence")
+			hdr.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID, X-Kocoro-Local-Presence, X-Kocoro-Consumer-Capabilities, X-Kocoro-Desktop-Device-ID")
 			hdr.Set("Access-Control-Max-Age", "600")
 		}
 		if r.Method == http.MethodOptions {
@@ -1546,6 +1598,58 @@ func (s *Server) handleQuestion(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"ok":true}`))
 }
 
+type recommendationDelivery struct {
+	value    skillRecommendationV1
+	ack      chan bool
+	deadline time.Time
+	state    atomic.Int32 // 0 queued, 1 writer claimed, -1 sender cancelled
+}
+
+func enqueueSkillRecommendation(ch chan<- *recommendationDelivery, done <-chan struct{}, value skillRecommendationV1, timeout time.Duration) bool {
+	delivery := &recommendationDelivery{value: value, ack: make(chan bool, 1), deadline: time.Now().Add(timeout)}
+	select {
+	case ch <- delivery:
+	default:
+		return false
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case delivered := <-delivery.ack:
+		return delivered
+	case <-done:
+		if delivery.state.CompareAndSwap(0, -1) {
+			return false
+		}
+		// The writer already claimed this delivery. It owns a response write
+		// deadline; wait only one additional bounded interval for its real
+		// write/flush result instead of reporting success or waiting forever.
+		grace := time.NewTimer(timeout)
+		defer grace.Stop()
+		select {
+		case delivered := <-delivery.ack:
+			return delivered
+		case <-grace.C:
+			return false
+		}
+	case <-timer.C:
+		if delivery.state.CompareAndSwap(0, -1) {
+			return false
+		}
+		// Once the event loop has atomically claimed the delivery it owns the
+		// write. Waiting for its flush result avoids expiring a card that is
+		// already crossing the response boundary and can no longer be recalled.
+		grace := time.NewTimer(timeout)
+		defer grace.Stop()
+		select {
+		case delivered := <-delivery.ack:
+			return delivered
+		case <-grace.C:
+			return false
+		}
+	}
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1557,6 +1661,30 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
+	var recommendationCh <-chan *recommendationDelivery
+	var unregisterRecommendation func()
+	var principalDone <-chan struct{}
+	if s.skillRecommendationsEnabled() {
+		if deviceID, caps := skillRecommendationAdmission(r, "desktop"); deviceID != "" && caps[CapSkillInstallRecommendationV1] && s.auth != nil {
+			if accountID, ok := s.auth.VerifiedAccountID(); ok {
+				ch := make(chan *recommendationDelivery, 8)
+				done := make(chan struct{})
+				recommendationCh = ch
+				principalDone = done
+				var closeOnce sync.Once
+				unregisterRecommendation = s.registerSkillRecommendationSink(accountID, deviceID, func(v skillRecommendationV1) bool {
+					return enqueueSkillRecommendation(ch, done, v, 2*time.Second)
+				}, func() { closeOnce.Do(func() { close(done) }) })
+				for _, pending := range s.skillRecommendations.offeredFor(accountID, deviceID) {
+					fmt.Fprintf(w, "event: skill.recommendation.v1\ndata: %s\n\n", mustJSON(pending))
+				}
+				flusher.Flush()
+			}
+		}
+	}
+	if unregisterRecommendation != nil {
+		defer unregisterRecommendation()
+	}
 
 	// Subscribe with atomic replay if client provides a last event ID.
 	// Check both query param (custom clients) and Last-Event-ID header
@@ -1589,6 +1717,19 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case evt := <-ch:
 			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", evt.ID, evt.Type, string(evt.Payload))
 			flusher.Flush()
+		case recommendation := <-recommendationCh:
+			if !recommendation.state.CompareAndSwap(0, 1) || time.Now().After(recommendation.deadline) || !s.skillRecommendations.isOffered(recommendation.value.RecommendationID, recommendation.value.OwnerAccountID, recommendation.value.OwnerDeviceID) {
+				recommendation.ack <- false
+				continue
+			}
+			controller := http.NewResponseController(w)
+			_ = controller.SetWriteDeadline(recommendation.deadline)
+			_, writeErr := fmt.Fprintf(w, "event: skill.recommendation.v1\ndata: %s\n\n", mustJSON(recommendation.value))
+			flushErr := controller.Flush()
+			_ = controller.SetWriteDeadline(time.Time{})
+			recommendation.ack <- writeErr == nil && flushErr == nil
+		case <-principalDone:
+			return
 		case <-ticker.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()
@@ -2760,6 +2901,9 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	if req.Source == "" {
 		req.Source = "kocoro"
 	}
+	// Recommendation tools are opt-in per request. The daemon never infers
+	// Desktop support from its own /status capability list.
+	req.DesktopDeviceID, req.ConsumerCapabilities = skillRecommendationAdmission(r, req.Source)
 	applyKoeModeAdmission(&req)
 	if !isKoeSource(req.Source) {
 		req.ExecutionMode = executionprofile.NormalizeMode(string(req.ExecutionMode))
@@ -3014,6 +3158,13 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
+	if req.DesktopDeviceID != "" && req.ConsumerCapabilities[CapSkillInstallRecommendationV1] && s.auth != nil {
+		if accountID, ok := s.auth.VerifiedAccountID(); ok {
+			if emit, live := s.skillRecommendationEmitter(accountID, req.DesktopDeviceID); live {
+				req.SkillRecommendationEmit = emit
+			}
+		}
+	}
 
 	// Create a per-request broker to avoid racing with concurrent SSE requests.
 	// Each SSE stream gets its own broker with its own sendFn and pending map.
@@ -5477,16 +5628,27 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListDownloadableSkills(w http.ResponseWriter, r *http.Request) {
+	entries, _, err := s.catalog.Catalog(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	globalDir := filepath.Join(s.deps.ShannonDir, "skills")
-	result := make([]skills.DownloadableSkill, 0, len(skills.DownloadableSkills))
-	for _, ds := range skills.DownloadableSkills {
+	result := make([]skills.DownloadableSkill, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.Installable || skills.IsBuiltinSkill(entry.Slug) {
+			continue
+		}
 		installed := false
-		if _, err := os.Stat(filepath.Join(globalDir, ds.Name, "SKILL.md")); err == nil {
+		if _, err := os.Stat(filepath.Join(globalDir, entry.Slug, "SKILL.md")); err == nil {
 			installed = true
+		} else if !os.IsNotExist(err) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 		result = append(result, skills.DownloadableSkill{
-			Name:        ds.Name,
-			Description: ds.Description,
+			Name:        entry.Slug,
+			Description: entry.Description,
 			Installed:   installed,
 		})
 	}
@@ -5501,11 +5663,11 @@ func (s *Server) handleListDownloadableSkills(w http.ResponseWriter, r *http.Req
 func (s *Server) handlePreviewDownloadableSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	endpoint := "/skills/downloadable/" + name + "/preview"
-	if !skills.IsDownloadable(name) {
+	if !skills.IsDownloadableFrom(r.Context(), s.catalog, name) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("skill %q is not available for download", name))
 		return
 	}
-	content, err := skills.PreviewSkill(s.deps.ShannonDir, name)
+	content, err := skills.PreviewSkillFromCatalog(r.Context(), s.deps.ShannonDir, name, s.catalog)
 	if err != nil {
 		if errors.Is(err, skills.ErrPreviewUnavailable) {
 			writeError(w, http.StatusNotFound, err.Error())
@@ -5523,20 +5685,22 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("name")
+	unlock := s.slugLocks.Lock(name)
+	defer unlock()
 	endpoint := "/skills/install/" + name
-	if !skills.IsDownloadable(name) {
+	if !skills.IsDownloadableFrom(r.Context(), s.catalog, name) {
 		s.auditHTTPOpError("POST", endpoint, "not in downloadable registry", nil)
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("skill %q is not available for download", name))
 		return
 	}
 
-	if err := skills.InstallSkillFromRepo(r.Context(), s.deps.ShannonDir, name); err != nil {
+	if err := skills.InstallSkillFromCatalog(r.Context(), s.deps.ShannonDir, name, s.catalog); err != nil {
 		if strings.Contains(err.Error(), "already installed") {
 			s.auditHTTPOpError("POST", endpoint, "already installed", err)
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
-		// Deterministic "not in the upstream Anthropic repo" is a 404, not an
+		// Deterministic "not in the catalog-declared archive path" is a 404, not an
 		// internal error — the download/extraction succeeded, the skill just
 		// isn't there. Everything else (network, extraction) stays a 500.
 		if errors.Is(err, skills.ErrSkillNotInRepo) {
@@ -6633,6 +6797,19 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("config load failed: %v", err))
 		return
+	}
+	turningRecommendationsOff := skillRecommendationsEnabled(oldCfg) && !skillRecommendationsEnabled(newCfg)
+	s.skillRecommendationsOff.Store(!skillRecommendationsEnabled(newCfg))
+	if turningRecommendationsOff && s.skillRecommendations != nil {
+		// Apply the protocol gate before any potentially slow tool/MCP rebuild.
+		// Concurrent /events and /continue requests must observe the kill switch
+		// as soon as the reloaded config has been validated.
+		s.closeSkillRecommendationSinks()
+		if err := s.skillRecommendations.invalidateAll(); err != nil {
+			s.skillRecommendations.failClosedAll(err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	mcpChanged := mcpConfigChanged(oldCfg, newCfg)

@@ -326,6 +326,7 @@ var Capabilities = []string{
 	CapComputerUseRiskConfirmationV1,
 	CapKoeFastProfileV1,
 	CapAgentServiceTierV1,
+	CapSkillInstallRecommendationV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

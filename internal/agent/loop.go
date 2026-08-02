@@ -1712,6 +1712,32 @@ func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText s
 	}
 }
 
+// responseWithOnlyToolCalls produces the exact assistant trajectory for an
+// admitted subset of a model batch. This matters for terminal tools: omitted
+// calls must not remain as unpaired tool_use blocks in persisted history.
+func responseWithOnlyToolCalls(resp *client.CompletionResponse, calls []client.FunctionCall) *client.CompletionResponse {
+	if resp == nil || len(calls) == len(resp.AllToolCalls()) {
+		return resp
+	}
+	clone := *resp
+	clone.FunctionCall = nil
+	clone.ToolCalls = append([]client.FunctionCall(nil), calls...)
+	allowed := make(map[string]bool, len(calls))
+	for _, call := range calls {
+		allowed[call.ID+"\x00"+call.Name] = true
+	}
+	if len(resp.ContentBlocks) != 0 {
+		blocks := make([]client.ContentBlock, 0, len(resp.ContentBlocks))
+		for _, block := range resp.ContentBlocks {
+			if block.Type != "tool_use" || allowed[block.ID+"\x00"+block.Name] {
+				blocks = append(blocks, block)
+			}
+		}
+		clone.ContentBlocks = blocks
+	}
+	return &clone
+}
+
 func (a *AgentLoop) SetReasoningEffort(effort string) {
 	a.reasoningEffort = effort
 }
@@ -5208,6 +5234,23 @@ iterationLoop:
 
 		// Execute all tool calls
 		toolCalls := resp.AllToolCalls()
+		for _, call := range toolCalls {
+			if tool, ok := effTools.Get(call.Name); ok {
+				if terminal, ok := tool.(TurnTerminalTool); ok && terminal.StopsAgentLoop() {
+					// The terminal tool wins this batch. The omitted calls are never
+					// approved or executed and the loop will stop after its result.
+					toolCalls = []client.FunctionCall{call}
+					break
+				}
+			}
+		}
+		// Streaming speculation is committed against the provider's complete
+		// response before terminal-tool admission is known. Reconcile it again
+		// against the admitted subset so a read-only call that started early but
+		// lost to a terminal boundary is cancelled and never becomes visible.
+		if committedStreamTools != nil {
+			committedStreamTools.CancelUnmatched(toolCalls)
+		}
 		modelToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
 		normalizedToolText := modelToolText
 		if normalizedToolText == "" && !a.unattendedRun {
@@ -5242,6 +5285,7 @@ iterationLoop:
 		}
 
 		useNative := hasNativeToolIDs(toolCalls)
+		messageResp := responseWithOnlyToolCalls(resp, toolCalls)
 
 		// Native path: build assistant message with tool_use blocks before execution.
 		// Uses buildAssistantMessage so Anthropic thinking content blocks (when
@@ -5251,7 +5295,7 @@ iterationLoop:
 		// shape predates 2026-05.
 		var resultBlocks []client.ContentBlock
 		if useNative {
-			messages = append(messages, buildAssistantMessage(resp, normalizedToolText))
+			messages = append(messages, buildAssistantMessage(messageResp, normalizedToolText))
 			stampMessage()
 		}
 
@@ -6071,6 +6115,25 @@ iterationLoop:
 			stampMessage()
 		}
 
+		// A daemon-owned action-card boundary deliberately ends the turn after
+		// its tool result is paired into the transcript. Do not give the model a
+		// further turn: it might otherwise continue the original task while the
+		// user is still deciding whether to install a missing capability.
+		for _, er := range execResults {
+			if !er.result.StopAgentLoop {
+				continue
+			}
+			text := er.result.Content
+			messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent(text)})
+			stampMessage()
+			captureRunMessages()
+			setRunStatus(runstatus.CodeNone, false)
+			if a.handler != nil {
+				a.handler.OnText(text)
+			}
+			return text, usage, nil
+		}
+
 		// Cloud result bypass: render the deliverable directly to the user
 		// without an additional LLM summarization turn. The full result is
 		// already recorded in messages[] for follow-up context.
@@ -6826,12 +6889,21 @@ func (a *AgentLoop) logAudit(toolName, argsStr, outputSummary, decision string, 
 	if a.auditor == nil {
 		return
 	}
+	inputSummary := RedactGUIActivityArguments(toolName, argsStr)
+	redactedOutput := RedactGUIActivityResult(toolName, outputSummary)
+	if a.tools != nil {
+		if tool, ok := a.tools.Get(toolName); ok {
+			if sanitizer, ok := tool.(AuditSummarySanitizer); ok {
+				inputSummary, redactedOutput = sanitizer.AuditSummaries(argsStr, outputSummary)
+			}
+		}
+	}
 	entry := audit.AuditEntry{
 		Timestamp:     time.Now(),
 		SessionID:     a.sessionID,
 		ToolName:      toolName,
-		InputSummary:  RedactGUIActivityArguments(toolName, argsStr),
-		OutputSummary: RedactGUIActivityResult(toolName, outputSummary),
+		InputSummary:  inputSummary,
+		OutputSummary: redactedOutput,
 		Decision:      decision,
 		Approved:      approved,
 		DurationMs:    durationMs,

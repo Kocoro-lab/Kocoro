@@ -50,10 +50,13 @@ func runGitCtx(ctx context.Context, dir string, args ...string) error {
 // registry repo. Field names match the schema in
 // docs/superpowers/specs/2026-04-06-skill-marketplace-design.md.
 type RegistryIndex struct {
-	Version   int                `json:"version"`
-	UpdatedAt string             `json:"updated_at"`
-	Skills    []MarketplaceEntry `json:"skills"`
+	Version                 int                `json:"version"`
+	UpdatedAt               string             `json:"updated_at"`
+	Skills                  []MarketplaceEntry `json:"skills"`
+	InstallableCapabilities []CatalogEntry     `json:"installable_capabilities,omitempty"`
 }
+
+const DefaultMarketplaceRegistryURL = "https://raw.githubusercontent.com/Kocoro-lab/shanclaw-skill-registry/main/index.json"
 
 // MarketplaceEntry is one skill listing in the registry.
 //

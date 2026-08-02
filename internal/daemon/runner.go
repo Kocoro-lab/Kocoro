@@ -77,30 +77,33 @@ type RequestContentBlock struct {
 
 // RunAgentRequest is the input for RunAgent.
 type RunAgentRequest struct {
-	Text            string                `json:"text"`
-	Content         []RequestContentBlock `json:"content,omitempty"` // multimodal content blocks (optional)
-	Agent           string                `json:"agent,omitempty"`
-	SessionID       string                `json:"session_id,omitempty"`
-	NewSession      bool                  `json:"new_session,omitempty"`
-	Source          string                `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still accepted by router for one release)
-	Sender          string                `json:"sender,omitempty"`            // user identifier from channel
-	Channel         string                `json:"channel,omitempty"`           // channel/thread source context
-	ThreadID        string                `json:"thread_id,omitempty"`         // thread context for messaging platforms
-	CWD             string                `json:"cwd,omitempty"`               // absolute project path override
-	ProjectID       string                `json:"project_id,omitempty"`        // owning project entity for a session created inside a project; tags the session once (tag-only-if-empty) so project instructions/memory apply. Orthogonal to CWD and Agent.
-	InjectOnly      bool                  `json:"inject_only,omitempty"`       // busy-state inject: on InjectNoActiveRun race, return 409 instead of starting a new run so the client re-queues locally (avoids duplicate run)
-	ClientMessageID string                `json:"client_message_id,omitempty"` // client-supplied id (e.g. Desktop queued-draft id) echoed back in the injected_committed SSE event when the loop drains this inject, so the client flips its queued card into a real bubble at the consume boundary
-	IdempotencyKey  string                `json:"idempotency_key,omitempty"`   // stable key for a primary request with a client-minted session_id; completed retries return the persisted result, while interrupted/failed attempts never replay tools automatically
-	RouteKey        string                `json:"-"`                           // internal routing key
-	PinnedRouteKey  string                `json:"-"`                           // internal: returned verbatim by ComputeRouteKey so it survives the post-@mention recompute. Sticky schedules pin their dedicated agent:<name>:schedule:<id> key here; json:"-" so HTTP clients cannot pin an arbitrary route.
-	ScheduleID      string                `json:"-"`                           // internal: owning schedule for scheduler-created sessions. Persisted onto session metadata; HTTP clients cannot forge the association.
-	Ephemeral       bool                  `json:"-"`                           // caller owns persistence + events
-	ModelOverride   string                `json:"-"`                           // overrides agent model tier
-	BypassRouting   bool                  `json:"-"`                           // skip route lock (heartbeat runs)
-	SessionHistory  []client.Message      `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
-	OmitHistory     bool                  `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
-	StickyContext   string                `json:"-"`                           // 额外的 sticky context，注入系统提示（对用户不可见）
-	ForegroundHint  *ForegroundHint       `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
+	Text                    string                           `json:"text"`
+	Content                 []RequestContentBlock            `json:"content,omitempty"` // multimodal content blocks (optional)
+	Agent                   string                           `json:"agent,omitempty"`
+	SessionID               string                           `json:"session_id,omitempty"`
+	NewSession              bool                             `json:"new_session,omitempty"`
+	Source                  string                           `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still accepted by router for one release)
+	Sender                  string                           `json:"sender,omitempty"`            // user identifier from channel
+	Channel                 string                           `json:"channel,omitempty"`           // channel/thread source context
+	ThreadID                string                           `json:"thread_id,omitempty"`         // thread context for messaging platforms
+	CWD                     string                           `json:"cwd,omitempty"`               // absolute project path override
+	ProjectID               string                           `json:"project_id,omitempty"`        // owning project entity for a session created inside a project; tags the session once (tag-only-if-empty) so project instructions/memory apply. Orthogonal to CWD and Agent.
+	InjectOnly              bool                             `json:"inject_only,omitempty"`       // busy-state inject: on InjectNoActiveRun race, return 409 instead of starting a new run so the client re-queues locally (avoids duplicate run)
+	ClientMessageID         string                           `json:"client_message_id,omitempty"` // client-supplied id (e.g. Desktop queued-draft id) echoed back in the injected_committed SSE event when the loop drains this inject, so the client flips its queued card into a real bubble at the consume boundary
+	IdempotencyKey          string                           `json:"idempotency_key,omitempty"`   // stable key for a primary request with a client-minted session_id; completed retries return the persisted result, while interrupted/failed attempts never replay tools automatically
+	RouteKey                string                           `json:"-"`                           // internal routing key
+	PinnedRouteKey          string                           `json:"-"`                           // internal: returned verbatim by ComputeRouteKey so it survives the post-@mention recompute. Sticky schedules pin their dedicated agent:<name>:schedule:<id> key here; json:"-" so HTTP clients cannot pin an arbitrary route.
+	ScheduleID              string                           `json:"-"`                           // internal: owning schedule for scheduler-created sessions. Persisted onto session metadata; HTTP clients cannot forge the association.
+	Ephemeral               bool                             `json:"-"`                           // caller owns persistence + events
+	ModelOverride           string                           `json:"-"`                           // overrides agent model tier
+	BypassRouting           bool                             `json:"-"`                           // skip route lock (heartbeat runs)
+	SessionHistory          []client.Message                 `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
+	OmitHistory             bool                             `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
+	StickyContext           string                           `json:"-"`                           // 额外的 sticky context，注入系统提示（对用户不可见）
+	ForegroundHint          *ForegroundHint                  `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
+	DesktopDeviceID         string                           `json:"-"`
+	ConsumerCapabilities    map[string]bool                  `json:"-"`
+	SkillRecommendationEmit func(skillRecommendationV1) bool `json:"-"`
 	// Koe sends both the locally admitted mode and the raw selector evidence.
 	// The daemon independently recomputes ModeAdmission before routing.
 	ExecutionMode          executionprofile.Mode       `json:"execution_mode,omitempty"`
@@ -1655,27 +1658,30 @@ func computeReportedUsage(usage *agent.TurnUsage, handler agent.EventHandler) Ru
 // ServerDeps holds shared dependencies required by both the WS callback
 // and the HTTP server for running agent loops.
 type ServerDeps struct {
-	mu              sync.RWMutex // guards Config, Registry, Cleanup during reload
-	Config          *config.Config
-	GW              *client.GatewayClient
-	Registry        *agent.ToolRegistry
-	MCPManager      *mcp.ClientManager  // live MCP connections; swapped on reload
-	Supervisor      *mcp.Supervisor     // MCP health supervisor; swapped on reload
-	Cleanup         func()              // closes MCP connections; swapped on reload
-	BaselineReg     *agent.ToolRegistry // local-only tools; refreshed on reload
-	GatewayOverlay  []agent.Tool        // cached gateway tools; refreshed on reload
-	PostOverlays    []agent.Tool        // cloud_delegate etc.; refreshed on reload
-	ShannonDir      string
-	AgentsDir       string
-	ProjectsDir     string // ~/.shannon/projects — project entity container
-	Auditor         *audit.AuditLogger
-	HookRunner      *hooks.HookRunner
-	SessionCache    *SessionCache
-	EventBus        *EventBus
-	ScheduleManager *schedule.Manager
-	WSClient        *Client              // WebSocket client for proactive messages
-	SecretsStore    *skills.SecretsStore // skill secrets for env injection
-	MemSvc          *memory.Service      // structured memory orchestrator (Phase 2.3)
+	mu                   sync.RWMutex // guards Config, Registry, Cleanup during reload
+	Config               *config.Config
+	GW                   *client.GatewayClient
+	Registry             *agent.ToolRegistry
+	MCPManager           *mcp.ClientManager  // live MCP connections; swapped on reload
+	Supervisor           *mcp.Supervisor     // MCP health supervisor; swapped on reload
+	Cleanup              func()              // closes MCP connections; swapped on reload
+	BaselineReg          *agent.ToolRegistry // local-only tools; refreshed on reload
+	GatewayOverlay       []agent.Tool        // cached gateway tools; refreshed on reload
+	PostOverlays         []agent.Tool        // cloud_delegate etc.; refreshed on reload
+	ShannonDir           string
+	AuthManager          *AuthManager
+	SkillRecommendations *skillRecommendationStore
+	CatalogProvider      skills.CatalogProvider
+	AgentsDir            string
+	ProjectsDir          string // ~/.shannon/projects — project entity container
+	Auditor              *audit.AuditLogger
+	HookRunner           *hooks.HookRunner
+	SessionCache         *SessionCache
+	EventBus             *EventBus
+	ScheduleManager      *schedule.Manager
+	WSClient             *Client              // WebSocket client for proactive messages
+	SecretsStore         *skills.SecretsStore // skill secrets for env injection
+	MemSvc               *memory.Service      // structured memory orchestrator (Phase 2.3)
 	// ReadTrackerCache holds per-session ReadTrackers so file_read dedup
 	// history persists across the per-message AgentLoop instances created
 	// by RunAgent. nil-safe: callers can leave it unset (each turn falls
@@ -3337,6 +3343,31 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loadedSkills = applyDefaultAgentSkillDenylist(loadedSkills, runCfg.Skills.Disabled, agentOverride == nil)
 
 	tools.SetRegistrySkills(reg, loadedSkills)
+	var skillRecommendationRun *skillRecommendationRunContext
+	if skillRecommendationsEnabled(runCfg) && isSkillRecommendationDesktopSource(req.Source) && req.DesktopDeviceID != "" &&
+		req.ConsumerCapabilities[CapSkillInstallRecommendationV1] &&
+		deps.SkillRecommendations != nil && deps.AuthManager != nil && req.SkillRecommendationEmit != nil {
+		accountID, ok := deps.AuthManager.VerifiedAccountID()
+		if ok {
+			turnID := "skillrec/" + generateRequestID()
+			visibleSkills := make(map[string]bool, len(loadedSkills))
+			for _, loaded := range loadedSkills {
+				visibleSkills[loaded.Slug] = true
+			}
+			skillRecommendationRun = &skillRecommendationRunContext{
+				accountID: accountID, deviceID: req.DesktopDeviceID, agentName: agentName,
+				sessionID: sess.ID, turnID: turnID, store: deps.SkillRecommendations,
+				emit: req.SkillRecommendationEmit, discovered: map[string]bool{}, visibleSkills: visibleSkills,
+				enabled: func() bool {
+					cfg, _, _ := deps.Snapshot()
+					return skillRecommendationsEnabled(cfg)
+				},
+			}
+			ctx = withSkillRecommendationRun(ctx, skillRecommendationRun)
+			reg.Register(&discoverInstallableSkillsTool{shannonDir: deps.ShannonDir, catalog: deps.CatalogProvider})
+			reg.Register(&offerSkillInstallationTool{shannonDir: deps.ShannonDir, catalog: deps.CatalogProvider})
+		}
+	}
 
 	// Always expose local session search for daemon-served agents.
 	// Use the per-agent manager so searches are scoped to that agent's sessions.
@@ -3606,6 +3637,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// outputFormatForSource / markdownCloudSources.
 	loop.SetOutputFormat(outputFormatForSource(req.Source))
 
+	if skillRecommendationRun != nil {
+		handler = &skillRecommendationEffectHandler{EventHandler: handler, registry: reg, run: skillRecommendationRun}
+	}
 	loop.SetHandler(handler)
 
 	// Wire handler and agent context to the per-run cloud_delegate copy.

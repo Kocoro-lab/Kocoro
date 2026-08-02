@@ -120,6 +120,11 @@ type ToolResult struct {
 	//
 	// Field is intentionally untagged for JSON — it never crosses the wire.
 	InternalOnly bool `json:"-"`
+	// StopAgentLoop ends the current run after this tool result has been
+	// durably recorded. It is for daemon-owned workflow boundaries such as a
+	// user action card; it is not model-controllable and never asks the model
+	// for another tool call or synthesis turn.
+	StopAgentLoop bool `json:"-"`
 }
 
 type GUIObservationOutcome struct {
@@ -270,6 +275,23 @@ type Tool interface {
 	Info() ToolInfo
 	Run(ctx context.Context, args string) (ToolResult, error)
 	RequiresApproval() bool
+}
+
+// TurnTerminalTool marks a daemon-owned tool whose successful result ends the
+// current model turn. The dispatcher admits only that call from a mixed model
+// batch, preventing a later tool in the same response from producing side
+// effects after the terminal boundary.
+type TurnTerminalTool interface {
+	StopsAgentLoop() bool
+}
+
+// AuditSummarySanitizer lets a tool replace its generic argument/result audit
+// summaries with a content-free domain summary. This is required for tools
+// whose inputs may contain private user text even after ordinary secret
+// redaction. The returned strings are the only input/output content written to
+// audit.log; duration, decision, and tool name remain owned by AgentLoop.
+type AuditSummarySanitizer interface {
+	AuditSummaries(args, result string) (inputSummary, outputSummary string)
 }
 
 // ApprovalAdmissionChecker is a daemon-facing, fail-closed gate evaluated
