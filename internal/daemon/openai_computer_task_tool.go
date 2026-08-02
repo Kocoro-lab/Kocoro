@@ -1184,7 +1184,9 @@ func (t *openAIComputerTaskToolV1) Run(
 			return result, nil
 		}
 		terminalFailureCode := "initial_observation_unavailable"
-		if failureCode == "display_not_actionable" {
+		if failureCode == "display_not_actionable" ||
+			failureCode ==
+				tools.ComputerUseFailureDisplayTopologyReconfiguringV1 {
 			terminalFailureCode = failureCode
 		}
 		recovery := agent.ComputerUseRecoveryNone
@@ -1193,6 +1195,10 @@ func (t *openAIComputerTaskToolV1) Run(
 		if failureCode == "display_not_actionable" {
 			recoveryText =
 				"move or resize the target window so it is fully contained in one active, online, awake, unmirrored, unrotated display, then retry the task"
+		} else if failureCode ==
+			tools.ComputerUseFailureDisplayTopologyReconfiguringV1 {
+			recoveryText =
+				"wait for macOS display topology to settle, then retry computer_use in a new turn; do not switch to another desktop-control tool"
 		} else if failureCode == "initial_image_unavailable" ||
 			initial.IsRetryable {
 			recovery = agent.ComputerUseRecoveryAlternateControl

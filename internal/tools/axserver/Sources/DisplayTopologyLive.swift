@@ -34,8 +34,17 @@ enum DisplayTopologyLiveError: Error, Equatable {
     case coreGraphics(String)
 }
 
-private let displayTopologySetMismatchReason =
+let displayTopologySetMismatchReason =
     "CoreGraphics and NSScreen display IDs do not match exactly"
+let displayTopologyReconfigurationRPCErrorCode = -32001
+
+func displayTopologyRPCErrorCode(_ error: Error) -> Int {
+    guard let topologyError = error as? DisplayTopologyLiveError,
+          topologyError == .invalid(displayTopologySetMismatchReason) else {
+        return -1
+    }
+    return displayTopologyReconfigurationRPCErrorCode
+}
 
 private struct DisplayTopologyStructuralSignature: Encodable {
     let mainDisplayID: UInt32
@@ -236,6 +245,9 @@ final class LiveDisplayTopologyService {
     init(
         helperBootID: String,
         topologyID: String,
+        prepareAppKit: () -> Void = {
+            _ = NSApplication.shared
+        },
         now: @escaping () -> Date = Date.init,
         collect: @escaping () throws -> DisplayTopologyRawSnapshot = {
             try collectDisplayTopologyRawSnapshot(
@@ -244,9 +256,10 @@ final class LiveDisplayTopologyService {
                 readAppKit: readAppKitDisplayTopology)
         },
         settleBeforeRetry: @escaping () -> Void = {
-            Thread.sleep(forTimeInterval: 0.05)
+            refreshAppKitState(for: 0.05)
         }
     ) {
+        prepareAppKit()
         builder = DisplayTopologyObservationBuilder(
             helperBootID: helperBootID,
             topologyID: topologyID)
