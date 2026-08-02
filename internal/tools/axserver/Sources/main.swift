@@ -339,7 +339,7 @@ func dispatch(
             return Response(id: id, result: AnyCodable(topology))
         } catch {
             return Response(id: id, error: ErrorInfo(
-                code: -1,
+                code: displayTopologyRPCErrorCode(error),
                 message: "Cannot collect display topology: \(error)"))
         }
 

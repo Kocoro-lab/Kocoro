@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -65,6 +66,46 @@ func TestReadDisplayTopologyV1PropagatesRPCFailure(t *testing.T) {
 	if _, err := ReadDisplayTopologyV1(context.Background(), caller); err == nil ||
 		!strings.Contains(err.Error(), "collector failed") {
 		t.Fatalf("RPC error = %v", err)
+	}
+}
+
+func TestReadDisplayTopologyV1ClassifiesReconfigurationRPCFailure(t *testing.T) {
+	caller := &displayTopologyAXCaller{err: &AXRPCError{
+		Code:    -32001,
+		Message: "display topology is reconfiguring",
+	}}
+	_, err := ReadDisplayTopologyV1(context.Background(), caller)
+	if !errors.Is(err, ErrDisplayTopologyReconfiguringV1) {
+		t.Fatalf("RPC error = %v", err)
+	}
+}
+
+func TestAXClientReadCallPreservesRPCErrorCode(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("AX transport is macOS-only")
+	}
+	writer := &axMutationTestWriter{}
+	client := axMutationTestClient(writer)
+	writer.afterWrite = func(request []byte) {
+		var envelope AXRequest
+		if err := json.Unmarshal(request, &envelope); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		client.pendingMu.Lock()
+		response := client.pending[envelope.ID]
+		client.pendingMu.Unlock()
+		response <- AXResponse{ID: envelope.ID, Error: &AXError{
+			Code:    -32001,
+			Message: "display topology is reconfiguring",
+		}}
+	}
+
+	_, err := client.Call(context.Background(), "display_topology", map[string]any{})
+	var rpcErr *AXRPCError
+	if !errors.As(err, &rpcErr) ||
+		rpcErr.Code != axRPCDisplayTopologyReconfiguringCodeV1 {
+		t.Fatalf("RPC error = %#v", err)
 	}
 }
 

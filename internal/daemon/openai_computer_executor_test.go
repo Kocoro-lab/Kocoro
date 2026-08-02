@@ -2479,6 +2479,72 @@ func TestOpenAIComputerTaskToolInitialObservationFailureDoesNotLeakStaleState(
 	}
 }
 
+func TestOpenAIComputerTaskToolPersistentDisplayTopologyReconfigurationStopsAfterBoundedRetries(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-display-reconfiguration",
+		"turn-openai-display-reconfiguration",
+	)
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.apple.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content:     "[transient error] read display topology",
+				IsError:     true,
+				IsRetryable: true,
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result:      agent.GUIActionResultFailed,
+					Phase:       agent.GUIActionPhaseObserving,
+					FailureCode: tools.ComputerUseFailureDisplayTopologyReconfiguringV1,
+				},
+			},
+		},
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:    &openAIComputerDaemonLoopLLM{},
+		profile:    trustedOpenAIComputerProfileForDaemon(t),
+		childTools: agent.NewToolRegistry(),
+		workflow:   workflow,
+		runtime:    &openAIComputerDaemonRuntimeProbe{tool: probe},
+		observationRetry: func(context.Context, int) error {
+			return nil
+		},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Inspect Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed","description":"Inspect the app"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(
+			result.Content,
+			tools.ComputerUseFailureDisplayTopologyReconfiguringV1,
+		) ||
+		!strings.Contains(result.Content, "did not stabilize after bounded observation retries") ||
+		!strings.Contains(result.Content, "do not retry computer_use automatically") ||
+		strings.Contains(result.Content, "retry computer_use in a new turn") ||
+		!strings.Contains(result.Content, "do not switch to another desktop-control tool") ||
+		strings.Contains(result.Content, "another appropriate non-computer_use control path") ||
+		result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Recovery != agent.ComputerUseRecoveryNone {
+		t.Fatalf("task result = %+v", result)
+	}
+	if got := len(probe.runNames()); got != maxOpenAIComputerInitialObservationsV1 {
+		t.Fatalf("initial observation attempts = %d, want %d", got, maxOpenAIComputerInitialObservationsV1)
+	}
+}
+
 func TestOpenAIComputerTaskToolAppResolutionFailureHasExecutableRecovery(
 	t *testing.T,
 ) {

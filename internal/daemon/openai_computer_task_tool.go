@@ -1184,7 +1184,11 @@ func (t *openAIComputerTaskToolV1) Run(
 			return result, nil
 		}
 		terminalFailureCode := "initial_observation_unavailable"
-		if failureCode == "display_not_actionable" {
+		terminalMessage :=
+			"Computer Use could not capture the verified initial app window"
+		if failureCode == "display_not_actionable" ||
+			failureCode ==
+				tools.ComputerUseFailureDisplayTopologyReconfiguringV1 {
 			terminalFailureCode = failureCode
 		}
 		recovery := agent.ComputerUseRecoveryNone
@@ -1193,6 +1197,12 @@ func (t *openAIComputerTaskToolV1) Run(
 		if failureCode == "display_not_actionable" {
 			recoveryText =
 				"move or resize the target window so it is fully contained in one active, online, awake, unmirrored, unrotated display, then retry the task"
+		} else if failureCode ==
+			tools.ComputerUseFailureDisplayTopologyReconfiguringV1 {
+			terminalMessage =
+				"Computer Use could not establish a stable macOS display topology"
+			recoveryText =
+				"macOS display topology did not stabilize after bounded observation retries; do not retry computer_use automatically; do not switch to another desktop-control tool; ask the user to finish or undo the display change, and if the displays are already stable, restart Kocoro Desktop before trying the task again"
 		} else if failureCode == "initial_image_unavailable" ||
 			initial.IsRetryable {
 			recovery = agent.ComputerUseRecoveryAlternateControl
@@ -1210,7 +1220,7 @@ func (t *openAIComputerTaskToolV1) Run(
 		return withOpenAIComputerTaskFailureOutcomeV1(
 			agent.BusinessError(
 				"computer_use_error: "+terminalFailureCode+"\n"+
-					"message: Computer Use could not capture the verified initial app window\n"+
+					"message: "+terminalMessage+"\n"+
 					"recovery: "+recoveryText+"\n"+
 					"detail: "+detail,
 			),

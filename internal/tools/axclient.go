@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -38,6 +39,21 @@ type AXError struct {
 	Message string `json:"message"`
 }
 
+const axRPCDisplayTopologyReconfiguringCodeV1 = -32001
+
+var ErrDisplayTopologyReconfiguringV1 = errors.New(
+	"display topology is reconfiguring",
+)
+
+type AXRPCError struct {
+	Code    int
+	Message string
+}
+
+func (err *AXRPCError) Error() string {
+	return fmt.Sprintf("ax_server: %s", err.Message)
+}
+
 type displayTopologyRPCCaller interface {
 	Call(context.Context, string, any) (json.RawMessage, error)
 }
@@ -47,6 +63,15 @@ type displayTopologyRPCCaller interface {
 func ReadDisplayTopologyV1(ctx context.Context, caller displayTopologyRPCCaller) (DisplayTopologyV1, error) {
 	result, err := caller.Call(ctx, "display_topology", map[string]any{})
 	if err != nil {
+		var rpcErr *AXRPCError
+		if errors.As(err, &rpcErr) &&
+			rpcErr.Code == axRPCDisplayTopologyReconfiguringCodeV1 {
+			return DisplayTopologyV1{}, fmt.Errorf(
+				"read display topology v1: %w: %v",
+				ErrDisplayTopologyReconfiguringV1,
+				err,
+			)
+		}
 		return DisplayTopologyV1{}, fmt.Errorf("read display topology v1: %w", err)
 	}
 	topology, err := DecodeDisplayTopologyV1(result)
@@ -401,7 +426,10 @@ func (c *AXClient) Call(ctx context.Context, method string, params any) (json.Ra
 	select {
 	case resp := <-ch:
 		if resp.Error != nil {
-			return nil, fmt.Errorf("ax_server: %s", resp.Error.Message)
+			return nil, &AXRPCError{
+				Code:    resp.Error.Code,
+				Message: resp.Error.Message,
+			}
 		}
 		return resp.Result, nil
 	case <-ctx.Done():

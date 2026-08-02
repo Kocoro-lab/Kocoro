@@ -118,6 +118,22 @@ final class DisplayTopologyLiveTests: XCTestCase {
         XCTAssertNotEqual(first.capturedAt, second.capturedAt)
     }
 
+    func testLiveServicePreparesAppKitBeforeFirstCollection() throws {
+        var order: [String] = []
+        let service = LiveDisplayTopologyService(
+            helperBootID: "helper_boot_live",
+            topologyID: "topo_live",
+            prepareAppKit: { order.append("prepare") },
+            collect: {
+                order.append("collect")
+                return Self.snapshot()
+            })
+
+        XCTAssertEqual(order, ["prepare"])
+        _ = try service.observe()
+        XCTAssertEqual(order, ["prepare", "collect"])
+    }
+
     func testLiveServiceRetriesTransientDisplaySetMismatch() throws {
         var mismatched = Self.snapshot()
         mismatched.appKitScreens.removeLast()
@@ -137,6 +153,39 @@ final class DisplayTopologyLiveTests: XCTestCase {
         XCTAssertEqual(topology.displays.map(\.displayID), [1, 2])
         XCTAssertEqual(collections, 2)
         XCTAssertEqual(settles, 1)
+    }
+
+    func testLiveServiceDefaultSettleProcessesDisplayChangeBeforeRetry() throws {
+        var mismatched = Self.snapshot()
+        mismatched.appKitScreens.removeLast()
+        var collections = 0
+        var displayChangeDelivered = false
+        var displayChangeTimer: Timer?
+        defer { displayChangeTimer?.invalidate() }
+
+        let service = LiveDisplayTopologyService(
+            helperBootID: "helper_boot_live",
+            topologyID: "topo_live",
+            collect: {
+                collections += 1
+                if collections == 1 {
+                    let timer = Timer(
+                        timeInterval: 0.01,
+                        repeats: false
+                    ) { _ in
+                        displayChangeDelivered = true
+                    }
+                    displayChangeTimer = timer
+                    RunLoop.current.add(timer, forMode: .default)
+                }
+                return displayChangeDelivered ? Self.snapshot() : mismatched
+            })
+
+        let topology = try service.observe()
+
+        XCTAssertEqual(topology.displays.map(\.displayID), [1, 2])
+        XCTAssertEqual(collections, 2)
+        XCTAssertTrue(displayChangeDelivered)
     }
 
     func testLiveServiceRejectsPersistentDisplaySetMismatchAfterBoundedRetries() {
@@ -182,9 +231,11 @@ final class DisplayTopologyLiveTests: XCTestCase {
             id: request.id,
             method: request.method,
             params: try XCTUnwrap(request.params),
-            displayTopologyProvider: { throw DisplayTopologyLiveError.invalid("ambiguous NSScreen") })
+            displayTopologyProvider: {
+                throw DisplayTopologyLiveError.invalid(displayTopologySetMismatchReason)
+            })
         XCTAssertNil(failure.result)
-        XCTAssertNotNil(failure.error)
+        XCTAssertEqual(failure.error?.code, -32001)
     }
 
     private static func snapshot() -> DisplayTopologyRawSnapshot {
