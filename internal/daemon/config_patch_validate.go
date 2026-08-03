@@ -21,8 +21,9 @@ import (
 // The allowed-key tree is derived by reflection from config.Config's
 // mapstructure tags (no hand-maintained mirror to drift), with two escape
 // hatches:
-//   - map-typed fields (mcp_servers, hooks, …) are OPEN subtrees — their keys
-//     are user-defined (server names, env vars) and never "unknown";
+//   - map-typed fields (mcp_servers, its env, …) have OPEN key names — those
+//     are user-defined (server names, env vars) and never "unknown" — while
+//     struct-typed map VALUES still validate field-by-field;
 //   - configPatchViperOnlyKeys lists dotted keys read straight from viper with
 //     no struct field.
 
@@ -89,6 +90,13 @@ func configPatchAllowedKeys() *configPatchKeyNode {
 				if node.open {
 					break // already accepted wholesale
 				}
+				if node.children == nil {
+					// Grafting under a leaf (a viper-only key nested below a
+					// scalar struct field). Without this init the write below
+					// panics INSIDE sync.Once — the Once is then spent with a
+					// nil tree and every subsequent PATCH nil-derefs.
+					node.children = map[string]*configPatchKeyNode{}
+				}
 				child, ok := node.children[segment]
 				if !ok {
 					child = &configPatchKeyNode{}
@@ -117,6 +125,15 @@ func buildConfigPatchKeyNode(t reflect.Type) *configPatchKeyNode {
 		}
 		name = strings.Split(name, ",")[0]
 		if name == "" || name == "-" {
+			// Not persistable — but if the field is still JSON-visible
+			// (e.g. mcp_servers.<name>.builtin: mapstructure:"-" with a json
+			// tag), a GET /config → PATCH round-trip legitimately echoes it
+			// back. Accept it as a harmless leaf instead of 400ing the whole
+			// round-trip; the merge writes it to yaml where every loader
+			// ignores it.
+			if jsonName := strings.Split(field.Tag.Get("json"), ",")[0]; jsonName != "" && jsonName != "-" {
+				node.children[jsonName] = &configPatchKeyNode{}
+			}
 			continue
 		}
 		ft := field.Type

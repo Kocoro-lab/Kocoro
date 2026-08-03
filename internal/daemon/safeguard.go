@@ -36,24 +36,27 @@ var protectedNestedFields = map[[2]string]string{
 
 // checkProtectedFields inspects a config patch for protected fields.
 // Returns (reason, true) if a protected field is being modified.
+//
+// Matching is CASE-FOLDED, and must stay that way: viper reads yaml keys
+// case-insensitively, so `Endpoint:` in config.yaml binds to `endpoint` on
+// the next load. Historically `{"Endpoint": ...}` deep-merged past this wall;
+// today the unknown-field validator also rejects case variants, but this
+// wall must not be load-bearing on that coincidence — if the validator ever
+// goes case-insensitive, exact-case matching here would silently reopen the
+// bypass.
 func checkProtectedFields(patch map[string]interface{}) (string, bool) {
-	for key, reason := range protectedFields {
-		if _, ok := patch[key]; ok {
+	for key, value := range patch {
+		if reason, hit := protectedFields[strings.ToLower(key)]; hit {
 			return reason, true
 		}
-	}
-	for pair, reason := range protectedNestedFields {
-		parent, child := pair[0], pair[1]
-		parentVal, ok := patch[parent]
+		childMap, ok := value.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		parentMap, ok := parentVal.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if _, ok := parentMap[child]; ok {
-			return reason, true
+		for child := range childMap {
+			if reason, hit := protectedNestedFields[[2]string{strings.ToLower(key), strings.ToLower(child)}]; hit {
+				return reason, true
+			}
 		}
 	}
 	return "", false

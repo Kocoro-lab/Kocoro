@@ -1,0 +1,4 @@
+{
+  "error": "protected_field",
+  "message": "changes API connection target — edit ~/.shannon/config.yaml directly"
+}

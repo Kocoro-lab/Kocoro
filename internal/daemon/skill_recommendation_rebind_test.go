@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -356,6 +357,78 @@ func TestSkillRecommendationSinkRecoversFromRapidKillSwitchFlip(t *testing.T) {
 	// Exactly ONE bind trigger after the flip (stands in for the next tick).
 	s.eventBus.Emit(Event{Type: EventAuthStateChanged, Payload: []byte("{}")})
 	waitForSinkState(t, s, "acct", deviceID, true)
+}
+
+func recommendationCardStream(t *testing.T, resp *http.Response) <-chan string {
+	t.Helper()
+	ch := make(chan string, 4)
+	go func() {
+		defer close(ch)
+		scanner := bufio.NewScanner(resp.Body)
+		current := ""
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "event: ") {
+				current = strings.TrimPrefix(line, "event: ")
+				continue
+			}
+			if strings.HasPrefix(line, "data: ") && current == "skill.recommendation.v1" {
+				ch <- strings.TrimPrefix(line, "data: ")
+			}
+		}
+	}()
+	return ch
+}
+
+func TestSkillRecommendationSinkNoStealBackAfterReplacement(t *testing.T) {
+	// Last-one-wins: when a NEWER connection for the same account+device owns
+	// the sink, the replaced connection's rebind checks (auth events, ticker)
+	// must NOT steal it back — cards keep flowing to the newest connection.
+	// This is the one branch of the bind state machine that was previously
+	// asserted only in a comment.
+	dir := t.TempDir()
+	deps := &ServerDeps{Config: &config.Config{}, ShannonDir: dir}
+	s := NewServer(0, nil, deps, "test")
+	auth := NewAuthManager(AuthManagerConfig{ShannonDir: dir})
+	auth.SetEventBus(s.eventBus)
+	s.SetAuth(auth)
+	deviceID := "12345678-1234-1234-1234-123456789abc"
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "acct"}, "")
+
+	conn1 := startRecommendationEventsStream(t, s, deviceID)
+	waitForSinkState(t, s, "acct", deviceID, true)
+	cards1 := recommendationCardStream(t, conn1)
+
+	conn2 := startRecommendationEventsStream(t, s, deviceID)
+	time.Sleep(150 * time.Millisecond) // conn2's connect-time bind replaces conn1's sink
+	cards2 := recommendationCardStream(t, conn2)
+
+	// Poke every connection's rebind logic; conn1 must observe the live sink
+	// and stay quiet instead of re-registering over conn2.
+	s.eventBus.Emit(Event{Type: EventAuthStateChanged, Payload: []byte("{}")})
+	time.Sleep(150 * time.Millisecond)
+
+	v, _, err := s.skillRecommendations.offer("acct", deviceID, "researcher", "session", "turn", "sha256:test", []skillRecommendationItemWireV1{{CatalogID: "official:pptx", Slug: "pptx", Source: "official", DisplayName: "P", CapabilitySummary: "c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.emitSkillRecommendation(v) {
+		t.Fatal("card delivery failed entirely")
+	}
+	select {
+	case payload := <-cards2:
+		if !strings.Contains(payload, v.RecommendationID) {
+			t.Fatalf("unexpected card on newest connection: %s", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("card did not reach the newest connection")
+	}
+	select {
+	case payload := <-cards1:
+		t.Fatalf("replaced connection received the card (steal-back): %s", payload)
+	case <-time.After(300 * time.Millisecond):
+		// quiet — last-one-wins held
+	}
 }
 
 func TestSkillRecommendationEventsSinkRebindsAfterSameAccountRelogin(t *testing.T) {

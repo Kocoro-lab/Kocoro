@@ -320,12 +320,13 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		catalogProvider = deps.CatalogProvider
 	}
 	if catalogProvider == nil {
-		registryURL := resolveRegistryURL(deps)
-		catalogProvider = skills.NewRegistryCatalogProvider(
-			marketplace,
-			skills.NewEmbeddedCatalogProvider(shannonDir),
-			registryURL == skills.DefaultMarketplaceRegistryURL,
-		)
+		// Task-time recommendations are deliberately local and binary-pinned.
+		// Do not make an ordinary Desktop task wait on GitHub registry access
+		// (especially on high-latency or filtered networks), and do not let a
+		// growing marketplace broaden the model-visible recommendation surface.
+		// The online marketplace remains available through its explicit browse
+		// endpoints; tests may still inject a CatalogProvider through deps.
+		catalogProvider = skills.NewEmbeddedCatalogProvider(shannonDir)
 	}
 	// suggestions is initialized unconditionally so HTTP handlers work even
 	// when deps == nil (existing test fixtures pass nil). The same pointer is
@@ -1725,10 +1726,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		boundAccount = accountID
 		boundEpoch = epoch
+		// Bounded like every other write site in this handler: post-reorder
+		// this runs from INSIDE the select loop (auth events, keepalive
+		// ticks), where an unbounded write to a stalled client would wedge
+		// the SSE goroutine and stop the very keepalive that detects it.
+		replayController := http.NewResponseController(w)
+		_ = replayController.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		for _, pending := range s.skillRecommendations.offeredFor(accountID, recommendationDevice) {
 			fmt.Fprintf(w, "event: skill.recommendation.v1\ndata: %s\n\n", mustJSON(pending))
 		}
 		flusher.Flush()
+		_ = replayController.SetWriteDeadline(time.Time{})
 	}
 	defer func() {
 		if unbindRecommendationSink != nil {
@@ -3927,6 +3935,24 @@ func stripRedactedSecrets(m map[string]interface{}) {
 	}
 }
 
+// stripUnpersistableMCPFields drops daemon-computed read-only fields that
+// GET /config exposes over JSON but that must never be written to yaml.
+// A GET→PATCH round-trip legitimately echoes them back (the validator
+// accepts them for that reason); persisting them would freeze a computed
+// value into user config. Today: mcp_servers.<name>.builtin (mapstructure:"-",
+// recomputed from the built-in catalog on every Load).
+func stripUnpersistableMCPFields(m map[string]interface{}) {
+	servers, ok := m["mcp_servers"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for _, srv := range servers {
+		if srvMap, ok := srv.(map[string]interface{}); ok {
+			delete(srvMap, "builtin")
+		}
+	}
+}
+
 // redactConfigSecrets removes sensitive values from a config map before
 // sending it over the API. Redacts api_key at top level and env vars
 // inside mcp_servers entries.
@@ -4004,6 +4030,7 @@ func (s *Server) patchGlobalConfig(patch map[string]interface{}) error {
 
 	normalizePatchKeys(patch)
 	stripRedactedSecrets(patch)
+	stripUnpersistableMCPFields(patch)
 	deepMerge(current, patch)
 	pruneEmptyMaps(current)
 
@@ -5771,9 +5798,9 @@ func orderDownloadableCatalogEntries(entries []skills.CatalogEntry) {
 
 // handlePreviewDownloadableSkill serves an official skill's SKILL.md so the UI
 // can render a full preview before install. Content comes from the daemon only
-// (installed copy or embedded bundle) — never the network. Skills with no local
-// copy (the proprietary docx/pdf/pptx/xlsx before install) return 404 so the
-// client falls back to the short description.
+// (installed copy or embedded bundle) — never the network. A provider-injected
+// entry with no local copy returns 404 so the client can fall back to its short
+// description; every production catalog entry is currently bundled.
 func (s *Server) handlePreviewDownloadableSkill(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	endpoint := "/skills/downloadable/" + name + "/preview"

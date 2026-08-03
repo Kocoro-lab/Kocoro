@@ -42,7 +42,8 @@ internal/
     bus_handler.go     # EventHandler → EventBus bridge
     multi_handler.go   # Fan-out EventHandler wrapper
     scheduler.go       # Cron tick + scheduleHandler
-    safeguard.go       # ?confirm=true gate for destructive edits
+    safeguard.go       # ?confirm=true gate for destructive edits + protected-field wall (case-folded)
+    config_patch_validate.go # PATCH /config unknown-key rejection (reflection tree from config.Config)
     rules.go           # /rules HTTP handlers
     pidfile.go         # Single-instance flock
     permissions.go     # System permission probes (see permissions_{darwin,other}.go)

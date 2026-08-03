@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 )
 
-func newConfigPatchTestServer(t *testing.T) (*Server, func()) {
+func newConfigPatchTestServer(t *testing.T) *Server {
 	t.Helper()
-	srv := NewServer(0, nil, &ServerDeps{ShannonDir: t.TempDir()}, "test")
-	return srv, func() {}
+	return NewServer(0, nil, &ServerDeps{ShannonDir: t.TempDir()}, "test")
 }
 
 func doConfigPatch(t *testing.T, srv *Server, patch map[string]interface{}) (int, map[string]string) {
@@ -82,8 +86,7 @@ func TestFindUnknownConfigField(t *testing.T) {
 }
 
 func TestPatchConfigRejectsUnknownFieldWithStructuredCode(t *testing.T) {
-	srv, cleanup := newConfigPatchTestServer(t)
-	defer cleanup()
+	srv := newConfigPatchTestServer(t)
 
 	code, body := doConfigPatch(t, srv, map[string]interface{}{"daemon": map[string]interface{}{"endpoint": "https://apiv1.kocoro.ai"}})
 	if code != 400 {
@@ -97,9 +100,141 @@ func TestPatchConfigRejectsUnknownFieldWithStructuredCode(t *testing.T) {
 	}
 }
 
+func TestConfigPatchAcceptsEveryViperDefaultKey(t *testing.T) {
+	// Drift guard: the viper-only allowlist is hand-maintained and the cost
+	// of a miss is a 400 on a documented knob. Enumerate every dotted key
+	// that config.Load registers a default for and assert the validator
+	// accepts it — mirrors the mechanical-sync pattern of
+	// TestSupportedMatchesBuildTag / skill_filter_test.go.
+	src, err := os.ReadFile(filepath.Join("..", "config", "config.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPattern := regexp.MustCompile(`viper\.SetDefault\("([a-z0-9_.]+)"`)
+	matches := keyPattern.FindAllStringSubmatch(string(src), -1)
+	if len(matches) < 20 {
+		t.Fatalf("suspiciously few viper.SetDefault keys found (%d) — did config.go move?", len(matches))
+	}
+	protected := func(dotted string) bool {
+		if _, hit := protectedFields[dotted]; hit {
+			return true
+		}
+		parts := strings.SplitN(dotted, ".", 2)
+		if len(parts) == 2 {
+			if _, hit := protectedNestedFields[[2]string{parts[0], parts[1]}]; hit {
+				return true
+			}
+		}
+		return false
+	}
+	for _, m := range matches {
+		dotted := m[1]
+		if protected(dotted) {
+			continue // 409 by design, not "unknown"
+		}
+		segments := strings.Split(dotted, ".")
+		patch := map[string]interface{}{}
+		cursor := patch
+		for _, segment := range segments[:len(segments)-1] {
+			next := map[string]interface{}{}
+			cursor[segment] = next
+			cursor = next
+		}
+		cursor[segments[len(segments)-1]] = "probe"
+		if field, found := findUnknownConfigField(patch); found {
+			t.Errorf("viper default key %q rejected as unknown (%s) — add it to configPatchViperOnlyKeys", dotted, field)
+		}
+	}
+}
+
+func TestPatchConfigProtectedFieldsAreCaseFolded(t *testing.T) {
+	srv := newConfigPatchTestServer(t)
+
+	// viper reads yaml keys case-insensitively, so a case-variant spelling
+	// that reaches config.yaml would still bind to the protected key on the
+	// next load. Both walls must hold: the protected check case-folds, and
+	// (independently) the unknown-field validator rejects case variants.
+	for name, patch := range map[string]map[string]interface{}{
+		"Endpoint":       {"Endpoint": "https://evil.example"},
+		"ENDPOINT":       {"ENDPOINT": "https://evil.example"},
+		"cloud.Endpoint": {"cloud": map[string]interface{}{"Endpoint": "https://evil.example"}},
+		"Gateway_URL":    {"Gateway_URL": "https://evil.example"},
+	} {
+		code, body := doConfigPatch(t, srv, patch)
+		if code != 409 {
+			t.Fatalf("%s: status = %d, want 409 (body %v)", name, code, body)
+		}
+	}
+}
+
+func TestPatchConfigAcceptsJSONVisibleUnpersistableFields(t *testing.T) {
+	// GET /config marshals with JSON tags, so mcp_servers.<name>.builtin
+	// (mapstructure:"-", json:"builtin") appears in what clients read back.
+	// A GET→PATCH round-trip of a server object must not 400 on it…
+	if field, found := findUnknownConfigField(map[string]interface{}{
+		"mcp_servers": map[string]interface{}{
+			"intercom": map[string]interface{}{"disabled": true, "builtin": true},
+		},
+	}); found {
+		t.Fatalf("round-tripped builtin flag rejected as %q", field)
+	}
+
+	// …but the computed field is STRIPPED before the merge, never persisted:
+	// freezing a daemon-computed value into user yaml would shadow the
+	// catalog recomputation on later loads.
+	srv := newConfigPatchTestServer(t)
+	code, body := doConfigPatch(t, srv, map[string]interface{}{
+		"mcp_servers": map[string]interface{}{
+			"intercom": map[string]interface{}{"disabled": true, "builtin": true},
+		},
+	})
+	if code != 200 {
+		t.Fatalf("round-trip PATCH status = %d (body %v)", code, body)
+	}
+	data, err := os.ReadFile(filepath.Join(srv.deps.ShannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "builtin") {
+		t.Fatalf("computed builtin field persisted to yaml:\n%s", data)
+	}
+	if !strings.Contains(string(data), "disabled: true") {
+		t.Fatalf("legitimate sibling field lost:\n%s", data)
+	}
+}
+
+func TestPatchConfigErrorBodiesMatchWireFixtures(t *testing.T) {
+	// unknown_config_field (400) and protected_field (409) are narrowing HTTP
+	// contract changes documented in references/config.md — pin the exact
+	// bodies a partially-deployed Desktop will decode.
+	unknownFixture := loadWireFixture(t, "http_patch.config.unknown_field.response.json")
+	protectedFixture := loadWireFixture(t, "http_patch.config.protected_field.response.json")
+
+	srv := newConfigPatchTestServer(t)
+	handler := srv.Handler()
+
+	post := func(body string) map[string]any {
+		req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		var produced map[string]any
+		if err := json.NewDecoder(rec.Body).Decode(&produced); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return produced
+	}
+
+	if produced := post(`{"daemon":{"endpoint":"https://apiv1.kocoro.ai"}}`); !reflect.DeepEqual(unknownFixture, produced) {
+		t.Fatalf("unknown_config_field body drifted:\nfixture:  %v\nproduced: %v", unknownFixture, produced)
+	}
+	if produced := post(`{"endpoint":"https://evil.example"}`); !reflect.DeepEqual(protectedFixture, produced) {
+		t.Fatalf("protected_field body drifted:\nfixture:  %v\nproduced: %v", protectedFixture, produced)
+	}
+}
+
 func TestPatchConfigProtectedAliasesAndTargets(t *testing.T) {
-	srv, cleanup := newConfigPatchTestServer(t)
-	defer cleanup()
+	srv := newConfigPatchTestServer(t)
 
 	for name, patch := range map[string]map[string]interface{}{
 		// viper aliases cloud.endpoint → endpoint: the nested spelling must
