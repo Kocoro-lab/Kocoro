@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -36,7 +37,48 @@ const (
 	// the token is a bearer capability and a longer window widens its replay
 	// surface; raise this const if the overnight workload proves too tight.
 	skillRecommendationTTL = 24 * time.Hour
+
+	skillRecommendationCodeNotFound      = "skill_recommendation_not_found"
+	skillRecommendationCodeOwnerMismatch = "skill_recommendation_owner_mismatch"
+	skillRecommendationCodeExpired       = "skill_recommendation_expired"
+	skillRecommendationCodeInvalidToken  = "skill_recommendation_invalid_token"
+	skillRecommendationCodeDismissed     = "skill_recommendation_dismissed"
+	skillRecommendationCodeSuperseded    = "skill_recommendation_superseded"
+	skillRecommendationCodeInvalidated   = "skill_recommendation_invalidated"
+	skillRecommendationCodeNotActionable = "skill_recommendation_not_actionable"
 )
+
+type skillRecommendationProtocolError struct {
+	code    string
+	message string
+}
+
+func (e *skillRecommendationProtocolError) Error() string { return e.message }
+
+func newSkillRecommendationProtocolError(code, message string) error {
+	return &skillRecommendationProtocolError{code: code, message: message}
+}
+
+func skillRecommendationProtocolErrorCode(err error) (string, bool) {
+	var protocolErr *skillRecommendationProtocolError
+	if !errors.As(err, &protocolErr) {
+		return "", false
+	}
+	return protocolErr.code, protocolErr.code != ""
+}
+
+func inactiveSkillRecommendationError(state string) error {
+	code := skillRecommendationCodeNotActionable
+	switch state {
+	case "expired":
+		code = skillRecommendationCodeExpired
+	case "dismissed":
+		code = skillRecommendationCodeDismissed
+	case "superseded":
+		code = skillRecommendationCodeSuperseded
+	}
+	return newSkillRecommendationProtocolError(code, fmt.Sprintf("recommendation is %s", state))
+}
 
 // skillRecommendationTerminalStates are the states a record can never leave.
 // Once past its TTL such a record is dead weight: the card cannot be shown,
@@ -174,7 +216,7 @@ func (s *skillRecommendationStore) dismiss(account, device, id string) error {
 	}
 	v := s.byID[id]
 	if v == nil || v.OwnerAccountID != account || v.OwnerDeviceID != device {
-		return fmt.Errorf("recommendation not found")
+		return newSkillRecommendationProtocolError(skillRecommendationCodeNotFound, "recommendation not found")
 	}
 	if v.State == "offered" {
 		previous := v.State
@@ -334,10 +376,10 @@ func (s *skillRecommendationStore) beginContinuation(account, device, session, i
 	}
 	v := s.byID[id]
 	if v == nil {
-		return skillRecommendationV1{}, false, fmt.Errorf("recommendation not found")
+		return skillRecommendationV1{}, false, newSkillRecommendationProtocolError(skillRecommendationCodeNotFound, "recommendation not found")
 	}
 	if v.OwnerAccountID != account || v.OwnerDeviceID != device || v.SessionID != session {
-		return skillRecommendationV1{}, false, fmt.Errorf("recommendation owner mismatch")
+		return skillRecommendationV1{}, false, newSkillRecommendationProtocolError(skillRecommendationCodeOwnerMismatch, "recommendation owner mismatch")
 	}
 	if v.ExpiresAt.Before(time.Now()) {
 		previous := v.State
@@ -349,18 +391,18 @@ func (s *skillRecommendationStore) beginContinuation(account, device, session, i
 			v.Generation = previousGeneration
 			return skillRecommendationV1{}, false, fmt.Errorf("persist recommendation expiry: %w", err)
 		}
-		return skillRecommendationV1{}, false, fmt.Errorf("recommendation expired")
+		return skillRecommendationV1{}, false, newSkillRecommendationProtocolError(skillRecommendationCodeExpired, "recommendation expired")
 	}
 	// Constant-time: this is a bearer capability, so comparison time must not
 	// depend on how many leading bytes a guess got right.
 	if subtle.ConstantTimeCompare([]byte(v.ContinuationToken), []byte(token)) != 1 {
-		return skillRecommendationV1{}, false, fmt.Errorf("invalid continuation token")
+		return skillRecommendationV1{}, false, newSkillRecommendationProtocolError(skillRecommendationCodeInvalidToken, "invalid continuation token")
 	}
 	if v.ContinuationRunning || v.State == "completed" {
 		return cloneSkillRecommendation(v), false, nil
 	}
 	if v.State != "offered" && v.State != "accepted" && v.State != "installation_failed" {
-		return skillRecommendationV1{}, false, fmt.Errorf("recommendation is %s", v.State)
+		return skillRecommendationV1{}, false, inactiveSkillRecommendationError(v.State)
 	}
 	previous := *v
 	v.Consumed = true
@@ -386,7 +428,7 @@ func (s *skillRecommendationStore) recordInstallReceipt(v skillRecommendationV1,
 	}
 	current := s.byID[v.RecommendationID]
 	if current == nil || current.State != "accepted" || !current.ContinuationRunning || current.Generation != v.Generation {
-		return skillRecommendationV1{}, fmt.Errorf("recommendation was invalidated during installation")
+		return skillRecommendationV1{}, newSkillRecommendationProtocolError(skillRecommendationCodeInvalidated, "recommendation was invalidated during installation")
 	}
 	current.InstallReceipt = &receipt
 	if err := s.saveLocked(); err != nil {
@@ -1266,7 +1308,11 @@ func (s *Server) handleSkillRecommendationContinue(w http.ResponseWriter, r *htt
 	}
 	v, shouldRun, err := s.skillRecommendations.beginContinuation(account, device, body.SessionID, r.PathValue("id"), body.ContinuationToken)
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		if code, ok := skillRecommendationProtocolErrorCode(err); ok {
+			writeErrorCode(w, http.StatusConflict, code, err.Error())
+		} else {
+			writeError(w, http.StatusConflict, err.Error())
+		}
 		return
 	}
 	if v.State == "completed" {
@@ -1280,7 +1326,7 @@ func (s *Server) handleSkillRecommendationContinue(w http.ResponseWriter, r *htt
 	continuationCtx, cancel := context.WithCancel(r.Context())
 	if !s.skillRecommendations.registerContinuation(v.RecommendationID, v.Generation, cancel) {
 		cancel()
-		writeError(w, http.StatusConflict, "recommendation was invalidated")
+		writeErrorCode(w, http.StatusConflict, skillRecommendationCodeInvalidated, "recommendation was invalidated")
 		return
 	}
 	defer func() { s.skillRecommendations.unregisterContinuation(v.RecommendationID, v.Generation); cancel() }()
@@ -1299,7 +1345,11 @@ func (s *Server) handleSkillRecommendationContinue(w http.ResponseWriter, r *htt
 	}
 	v, err = s.skillRecommendations.recordInstallReceipt(v, receipt)
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		if code, ok := skillRecommendationProtocolErrorCode(err); ok {
+			writeErrorCode(w, http.StatusConflict, code, err.Error())
+		} else {
+			writeError(w, http.StatusConflict, err.Error())
+		}
 		return
 	}
 	parts := make([]string, 0, len(v.Items))
@@ -1372,7 +1422,11 @@ func (s *Server) handleSkillRecommendationDismiss(w http.ResponseWriter, r *http
 		return
 	}
 	if err := s.skillRecommendations.dismiss(account, device, r.PathValue("id")); err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		if code, ok := skillRecommendationProtocolErrorCode(err); ok {
+			writeErrorCode(w, http.StatusNotFound, code, err.Error())
+		} else {
+			writeError(w, http.StatusNotFound, err.Error())
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "dismissed"})

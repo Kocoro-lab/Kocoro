@@ -875,6 +875,84 @@ func TestSkillRecommendationContinueUsesAttendedDesktopApprovalSSE(t *testing.T)
 	}
 }
 
+func TestSkillRecommendationHTTPErrorCodes(t *testing.T) {
+	dir := t.TempDir()
+	deps := &ServerDeps{
+		Config:          &config.Config{},
+		ShannonDir:      dir,
+		CatalogProvider: skills.NewEmbeddedCatalogProvider(dir),
+	}
+	s := NewServer(0, nil, deps, "test")
+	auth := NewAuthManager(AuthManagerConfig{ShannonDir: dir})
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "opaque-account"}, "")
+	s.auth = auth
+	device := "12345678-1234-1234-1234-123456789abc"
+
+	callContinue := func(id, sessionID, token string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{
+			"session_id":         sessionID,
+			"continuation_token": token,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/skill-recommendations/"+id+"/continue", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(desktopDeviceHeader, device)
+		req.Header.Set(skillRecommendationHeader, CapSkillInstallRecommendationV1)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+	assertCode := func(rr *httptest.ResponseRecorder, status int, code string) {
+		t.Helper()
+		if rr.Code != status {
+			t.Fatalf("status=%d body=%s, want %d", rr.Code, rr.Body.String(), status)
+		}
+		var body struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Code != code || body.Error == "" {
+			t.Fatalf("body=%+v, want code=%q and English fallback", body, code)
+		}
+	}
+
+	assertCode(
+		callContinue("missing", "session", "token"),
+		http.StatusConflict,
+		skillRecommendationCodeNotFound,
+	)
+
+	v, _, err := s.skillRecommendations.offer(
+		"opaque-account",
+		device,
+		"",
+		"session",
+		"turn",
+		"sha256:test",
+		[]skillRecommendationItemWireV1{{CatalogID: "official:pptx"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.skillRecommendations.mu.Lock()
+	s.skillRecommendations.byID[v.RecommendationID].ExpiresAt = time.Now().Add(-time.Second)
+	s.skillRecommendations.mu.Unlock()
+	assertCode(
+		callContinue(v.RecommendationID, v.SessionID, v.ContinuationToken),
+		http.StatusConflict,
+		skillRecommendationCodeExpired,
+	)
+
+	dismissRequest := httptest.NewRequest(http.MethodPost, "/skill-recommendations/missing/dismiss", nil)
+	dismissRequest.Header.Set(desktopDeviceHeader, device)
+	dismissRequest.Header.Set(skillRecommendationHeader, CapSkillInstallRecommendationV1)
+	dismissResponse := httptest.NewRecorder()
+	s.Handler().ServeHTTP(dismissResponse, dismissRequest)
+	assertCode(dismissResponse, http.StatusNotFound, skillRecommendationCodeNotFound)
+}
+
 func TestSkillRecommendationContinuationRestartKeepsStableIdempotency(t *testing.T) {
 	dir := t.TempDir()
 	s := newSkillRecommendationStore(dir)
