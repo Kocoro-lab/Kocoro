@@ -986,9 +986,10 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 }
 
 type CompletionRequest struct {
-	Messages      []Message `json:"messages"`
-	ModelTier     string    `json:"model_tier,omitempty"`
-	SpecificModel string    `json:"specific_model,omitempty"`
+	Messages            []Message `json:"messages"`
+	ModelTier           string    `json:"model_tier,omitempty"`
+	SpecificModel       string    `json:"specific_model,omitempty"`
+	PreferredAPISurface string    `json:"preferred_api_surface,omitempty"`
 	// Temperature keeps omitempty deliberately: `agent.temperature` defaults
 	// to 0, and the pre-existing wire contract is "0 = unset → provider
 	// default sampling". Dropping omitempty would silently flip EVERY
@@ -1468,6 +1469,7 @@ func usesKoeFastExecutionProfile(req CompletionRequest) bool {
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.
 func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
+	req.PreferredAPISurface = "responses"
 	koeFastProfile := usesKoeFastExecutionProfile(req)
 	if !koeFastProfile {
 		if err := validateProviderNativeExecution(req); err != nil {
@@ -1605,6 +1607,7 @@ type StreamDelta struct {
 // that returns ErrStreamIdleTimeout if no chunk arrives within that interval.
 func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionRequest, onDelta func(StreamDelta)) (*CompletionResponse, error) {
 	req.Stream = true
+	req.PreferredAPISurface = "responses"
 	koeFastProfile := usesKoeFastExecutionProfile(req)
 	if !koeFastProfile {
 		if err := validateProviderNativeExecution(req); err != nil {

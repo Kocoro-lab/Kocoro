@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -160,6 +162,99 @@ func TestAgentLoopOrdinaryOpenAIResponsesContinuesToolResult(t *testing.T) {
 	fresh := llm.requests[2]
 	if fresh.PreviousResponseID != "" || fresh.SpecificModel != "" {
 		t.Fatalf("ordinary Responses continuation leaked into fresh Run: %+v", fresh)
+	}
+}
+
+func TestAgentLoopOrdinaryOpenAIResponsesKeepsToolResultBeforeLoopNudge(t *testing.T) {
+	responses := make([]*client.CompletionResponse, 0, 5)
+	for index := 1; index <= 4; index++ {
+		response := ordinaryOpenAIToolResponse(
+			"openai",
+			"gpt-5.6-sol",
+			fmt.Sprintf("resp_tool_turn_%d", index),
+		)
+		callID := fmt.Sprintf("call_lookup_%d", index)
+		response.ToolCalls[0].ID = callID
+		response.ToolCalls[0].CallID = callID
+		responses = append(responses, response)
+	}
+	responses = append(responses, &client.CompletionResponse{
+		Provider:     "openai",
+		Model:        "gpt-5.6-sol",
+		OutputText:   "done",
+		FinishReason: "stop",
+		RequestID:    "resp_final",
+	})
+
+	llm := &budgetCaptureLLMClient{responses: responses}
+	registry := NewToolRegistry()
+	registry.Register(&mockSimpleTool{
+		name:   "lookup",
+		result: ToolResult{Content: "BLUE"},
+	})
+	loop := NewAgentLoop(
+		llm,
+		registry,
+		"large",
+		t.TempDir(),
+		8,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+	loop.SetSkillDiscovery(false)
+	loop.SetEnableStreaming(false)
+
+	result, _, err := loop.Run(context.Background(), "repeat lookup", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" {
+		t.Fatalf("result = %q, want done", result)
+	}
+
+	requests := llm.requests
+	var nudgeRequest *client.CompletionRequest
+	for index := range requests {
+		messages := requests[index].Messages
+		if len(messages) == 0 {
+			continue
+		}
+		last := messages[len(messages)-1]
+		if last.Role == "user" && strings.HasPrefix(last.Content.Text(), "[system] ") {
+			nudgeRequest = &requests[index]
+			break
+		}
+	}
+	if nudgeRequest == nil {
+		t.Fatalf("no continuation request carried a loop nudge: %+v", requests)
+	}
+	if nudgeRequest.PreviousResponseID == "" {
+		t.Fatal("loop nudge request lost the OpenAI Responses cursor")
+	}
+
+	messages := nudgeRequest.Messages
+	if len(messages) < 3 {
+		t.Fatalf("nudge request has %d messages, want at least 3", len(messages))
+	}
+	assistant := messages[len(messages)-3]
+	toolResult := messages[len(messages)-2]
+	nudge := messages[len(messages)-1]
+	assistantBlocks := assistant.Content.Blocks()
+	resultBlocks := toolResult.Content.Blocks()
+	if assistant.Role != "assistant" || len(assistantBlocks) != 1 ||
+		assistantBlocks[0].Type != "tool_use" {
+		t.Fatalf("assistant before nudge = %#v", assistant)
+	}
+	if toolResult.Role != "user" || len(resultBlocks) != 1 ||
+		resultBlocks[0].Type != "tool_result" ||
+		resultBlocks[0].ToolUseID != assistantBlocks[0].ID {
+		t.Fatalf("paired tool result before nudge = %#v", toolResult)
+	}
+	if nudge.Role != "user" || !strings.HasPrefix(nudge.Content.Text(), "[system] ") {
+		t.Fatalf("nudge tail = %#v", nudge)
 	}
 }
 

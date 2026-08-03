@@ -72,7 +72,7 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 			nil,
 		)
 		loop.SetSpecificModel(openAIResponsesLiveModel)
-		loop.SetReasoningEffort("high")
+		loop.SetReasoningEffort("none")
 		loop.SetTemperature(0)
 		loop.SetMaxTokens(512)
 		loop.SetSkillDiscovery(false)

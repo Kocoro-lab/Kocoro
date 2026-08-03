@@ -18,9 +18,10 @@ import (
 
 func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	got := struct {
-		Messages    []Message `json:"messages"`
-		Tools       []Tool    `json:"tools"`
-		ServiceTier string    `json:"service_tier"`
+		Messages            []Message `json:"messages"`
+		Tools               []Tool    `json:"tools"`
+		ServiceTier         string    `json:"service_tier"`
+		PreferredAPISurface string    `json:"preferred_api_surface"`
 	}{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +83,9 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	}
 	if got.ServiceTier != "fast" {
 		t.Errorf("service_tier = %q, want fast", got.ServiceTier)
+	}
+	if got.PreferredAPISurface != "responses" {
+		t.Errorf("preferred_api_surface = %q, want responses", got.PreferredAPISurface)
 	}
 }
 
