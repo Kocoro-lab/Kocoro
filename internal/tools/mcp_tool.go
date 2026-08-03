@@ -35,6 +35,19 @@ var fileProducingMCPArgs = map[string][]string{
 
 const maxMCPDescLen = 500
 
+// fileOutputArgHint steers the model's filename choice for the tools in
+// fileProducingMCPArgs. 2026-08-02 incident: with the session CWD set to
+// ~/Desktop, the model self-addressed browser_snapshot intermediates as
+// absolute paths under that CWD. Absolute paths deliberately bypass the
+// artifact-scratch rewrite (they are the model's only way to place a
+// user-requested deliverable), so machine intermediates piled up on the
+// user's Desktop. The adapter cannot tell deliverable from intermediate on
+// an absolute path — only the model can, and the tool description is the
+// surface it reads while choosing the argument. Appended AFTER the
+// maxMCPDescLen truncation so it is never cut off; byte-stable per session,
+// so prompt-cache safe.
+const fileOutputArgHint = " When saving output to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into a per-session artifact directory and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
+
 var (
 	isPlaywrightCDPMode          = mcp.IsPlaywrightCDPMode
 	playwrightCDPPort            = mcp.PlaywrightCDPPort
@@ -72,6 +85,9 @@ func (t *MCPTool) Info() agent.ToolInfo {
 	}
 	if r := []rune(desc); len(r) > maxMCPDescLen {
 		desc = string(r[:maxMCPDescLen]) + "..."
+	}
+	if _, ok := fileProducingMCPArgs[t.serverName+"/"+t.tool.Name]; ok {
+		desc += fileOutputArgHint
 	}
 
 	// Strip control characters from tool name
