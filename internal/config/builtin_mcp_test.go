@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
@@ -233,5 +234,59 @@ func TestMergeBuiltinMCPServers_PreservesUserToolTimeoutAndWorkspaceBase(t *test
 	}
 	if got.Command != mcp.BuiltinMCPServers["intercom"].Config.Command {
 		t.Errorf("catalog-owned command must still win, got %q", got.Command)
+	}
+}
+
+// Structural guard for the recurring bug class "a field was added to
+// MCPServerConfig and mergeBuiltinMCPServers forgot to preserve it": every
+// field that is not catalog-owned must survive the merge with a user-set
+// value. A new field failing here means the merge (and this set) needs a
+// decision, not that the test is wrong.
+func TestMergeBuiltinMCPServers_EveryUserFieldSurvivesMerge(t *testing.T) {
+	catalogOwned := map[string]bool{
+		"Command": true, "Args": true, "Type": true, "URL": true,
+		"Context": true, // catalog-owned LLM context
+		"Builtin": true, // set by the merge itself, never persisted
+	}
+
+	var existing mcp.MCPServerConfig
+	v := reflect.ValueOf(&existing).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		name := v.Type().Field(i).Name
+		if catalogOwned[name] {
+			continue
+		}
+		f := v.Field(i)
+		switch f.Kind() {
+		case reflect.String:
+			f.SetString("user-" + name)
+		case reflect.Bool:
+			f.SetBool(true)
+		case reflect.Int:
+			f.SetInt(int64(100 + i))
+		case reflect.Map:
+			m := reflect.MakeMap(f.Type())
+			m.SetMapIndex(reflect.ValueOf("USER_KEY"), reflect.ValueOf("user-value"))
+			f.Set(m)
+		case reflect.Slice:
+			f.Set(reflect.MakeSlice(f.Type(), 0, 0))
+		default:
+			t.Fatalf("unhandled kind %s for field %s — extend this test", f.Kind(), name)
+		}
+	}
+
+	cfg := &Config{MCPServers: map[string]mcp.MCPServerConfig{"intercom": existing}}
+	mergeBuiltinMCPServers(cfg)
+
+	got := reflect.ValueOf(cfg.MCPServers["intercom"])
+	for i := 0; i < v.NumField(); i++ {
+		name := v.Type().Field(i).Name
+		if catalogOwned[name] {
+			continue
+		}
+		if !reflect.DeepEqual(got.Field(i).Interface(), v.Field(i).Interface()) {
+			t.Errorf("field %s: user value %#v lost in merge (got %#v) — preserve it in mergeBuiltinMCPServers or declare it catalog-owned here",
+				name, v.Field(i).Interface(), got.Field(i).Interface())
+		}
 	}
 }
