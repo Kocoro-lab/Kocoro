@@ -1387,6 +1387,9 @@ func RebuildRegistryForHealth(
 			tools := mcpMgr.CachedTools(serverName)
 			for _, t := range tools {
 				if _, exists := reg.Get(t.Tool.Name); exists {
+					// Deterministic shadowing is permanent shadowing: without
+					// this line a hidden tool is undiagnosable from the outside.
+					log.Printf("[mcp] %s/%s hidden: name already registered (first-wins in sorted server order)", serverName, t.Tool.Name)
 					continue
 				}
 				mt := NewMCPTool(t.ServerName, t.Tool, mcpMgr)

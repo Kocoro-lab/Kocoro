@@ -48,6 +48,12 @@ const maxMCPDescLen = 500
 // so prompt-cache safe.
 const fileOutputArgHint = " When saving output to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into a per-session artifact directory and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
 
+// snapshotOutputArgHint is the browser_snapshot variant: for that tool an
+// omitted filename means the INLINE accessibility snapshot — the model's
+// primary page-reading channel — so the hint must not nudge it into file
+// mode by default.
+const snapshotOutputArgHint = " Prefer omitting filename entirely — the inline snapshot is the primary way to read a page. If you DO save to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into a per-session artifact directory and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
+
 var (
 	isPlaywrightCDPMode          = mcp.IsPlaywrightCDPMode
 	playwrightCDPPort            = mcp.PlaywrightCDPPort
@@ -86,8 +92,12 @@ func (t *MCPTool) Info() agent.ToolInfo {
 	if r := []rune(desc); len(r) > maxMCPDescLen {
 		desc = string(r[:maxMCPDescLen]) + "..."
 	}
-	if _, ok := fileProducingMCPArgs[t.serverName+"/"+t.tool.Name]; ok {
-		desc += fileOutputArgHint
+	if key := t.serverName + "/" + t.tool.Name; fileProducingMCPArgs[key] != nil {
+		if key == "playwright/browser_snapshot" {
+			desc += snapshotOutputArgHint
+		} else {
+			desc += fileOutputArgHint
+		}
 	}
 
 	// Strip control characters from tool name

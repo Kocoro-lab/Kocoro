@@ -85,4 +85,18 @@ func TestCallTool_Unsupervised_WriteNotReplayedWhenServerDiesBeforeResponse(t *t
 	if got := strings.Count(string(data), "COMMIT\n"); got != 1 {
 		t.Fatalf("write must be committed exactly once, got %d", got)
 	}
+
+	// Repair-always is the other half of the invariant: declining the replay
+	// must NOT have skipped the reconnect. A second (explicit, caller-issued)
+	// call must reach a fresh server process — its commit is the proof. If a
+	// refactor ever moves the reconnect inside the replay-safe branch, this
+	// second dispatch would fail with "not connected" and commit nothing.
+	_, _, secondErr := mgr.CallTool(ctx, "dying", "e2e_commit_write", map[string]any{"to": "y"})
+	if secondErr == nil {
+		t.Fatal("second call against the always-dying server should error")
+	}
+	data, _ = os.ReadFile(commitLog)
+	if got := strings.Count(string(data), "COMMIT\n"); got != 2 {
+		t.Fatalf("second explicit call must reach a repaired transport (2 commits), got %d", got)
+	}
 }

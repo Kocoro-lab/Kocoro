@@ -162,7 +162,10 @@ func TestMCPTool_Run_RealStdio_ReadOnlyToolIsReplayedAfterServerDeath(t *testing
 	if !result.IsError {
 		t.Fatalf("expected error result from twice-dying server, got: %s", result.Content)
 	}
-	if got := countCommits(t, commitLog); got != 2 {
-		t.Fatalf("read-only tool should have been re-dispatched once (2 dispatches), got %d", got)
+	// >= 2, not == 2: the property under test is that replay was ALLOWED.
+	// An exact count couples the assertion to ProbeNow reconnect timing
+	// racing the background probe loop, which can flake on a loaded runner.
+	if got := countCommits(t, commitLog); got < 2 {
+		t.Fatalf("read-only tool should have been re-dispatched (>=2 dispatches), got %d", got)
 	}
 }

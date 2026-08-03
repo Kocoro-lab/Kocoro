@@ -671,7 +671,11 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 		delete(m.cancellers, serverName)
 		m.mu.Unlock()
 
-		if hasCfg {
+		// The Disabled check is defensive: today a disabled server has no
+		// client so a post-dispatch failure can't reach here, but "no path
+		// relaunches a disabled server" should hold by construction, not by
+		// reachability argument.
+		if hasCfg && !cfg.Disabled {
 			// Reap the old process group + close the stale client. Skipping
 			// staleCancel here would leave an orphan when the client died
 			// from something other than transport EOF (e.g. user toggled
@@ -685,7 +689,12 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 			}
 			reconnectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			if _, reconnErr := m.connect(reconnectCtx, serverName, cfg); reconnErr == nil && replaySafe {
+			if _, reconnErr := m.connect(reconnectCtx, serverName, cfg); reconnErr != nil {
+				// Repair-always is the invariant; a failed repair must stay
+				// attributable even when the OutcomeUnknownError return below
+				// doesn't carry it.
+				log.Printf("[mcp] %s: post-dispatch reconnect failed: %v", serverName, reconnErr)
+			} else if replaySafe {
 				m.mu.Lock()
 				c = m.clients[serverName]
 				m.mu.Unlock()

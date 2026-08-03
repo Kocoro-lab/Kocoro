@@ -174,7 +174,7 @@ Must match `^[a-z0-9][a-z0-9_-]{0,63}$`. Validated before any path concatenation
 
 ### Tool Priority
 
-Local tools > MCP tools > Gateway tools. Deduplicated by name.
+Local tools > MCP tools > Gateway tools. Deduplicated by name. MCP-vs-MCP name collisions resolve to the **alphabetically-first server** (sorted iteration in `RebuildRegistryForHealth`, stable across rebuilds); the shadowed tool is logged, never registered.
 
 ### Tool Concurrency
 

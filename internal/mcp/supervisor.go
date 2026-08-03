@@ -76,15 +76,18 @@ func newBackoffState(baseMin, baseMax, dormant time.Duration) *backoffState {
 	}
 }
 
+// maxBackoffAttempts caps the failure-count exponent. 2^19·baseMin already
+// exceeds any sane baseMax, so past this point attempts only feeds the
+// dormant branch. Unbounded growth overflows the int64 multiply after ~32
+// consecutive failures (baseMin 5s ≈ 2^32 ns · 2^31 > MaxInt64) — the
+// product goes negative, skips the dormant clamp, and a server dead for
+// ~2.5h snaps back to fast-tier probing forever. recordSuccess resets the
+// counter, so the cap has no effect on any recovering server. Not
+// user-tunable: it only exists to keep the shift finite.
+const maxBackoffAttempts = 20
+
 func (b *backoffState) recordFailure() {
-	// Cap the exponent at 20: 2^19·baseMin already exceeds any sane baseMax,
-	// so past this point attempts only feeds the dormant branch. Unbounded
-	// growth overflows the int64 multiply after ~32 consecutive failures
-	// (baseMin 5s ≈ 2^32 ns · 2^31 > MaxInt64) — the product goes negative,
-	// skips the dormant clamp, and a server dead for ~2.5h snaps back to
-	// fast-tier probing forever. recordSuccess resets the counter, so the
-	// cap has no effect on any recovering server.
-	if b.attempts < 20 {
+	if b.attempts < maxBackoffAttempts {
 		b.attempts++
 	}
 	base := b.baseMin * time.Duration(1<<(b.attempts-1))
