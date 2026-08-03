@@ -18,11 +18,20 @@ func requireConfirm(confirmParam string) bool {
 var protectedFields = map[string]string{
 	"endpoint": "changes API connection target",
 	"api_key":  "changes authentication credentials",
+	// Legacy alias: config.Load's migrateOldConfig maps it onto endpoint AND
+	// rewrites config.yaml down to four keys, discarding every other section.
+	"gateway_url": "changes API connection target (legacy alias; also triggers destructive config migration)",
 }
 
 // protectedNestedFields maps [parent, child] to a reason.
 var protectedNestedFields = map[[2]string]string{
 	{"permissions", "denied_commands"}: "removes security restrictions",
+	// viper aliases cloud.endpoint/cloud.api_key onto the protected top-level
+	// keys — the nested spelling must not bypass the wall above.
+	{"cloud", "endpoint"}: "changes API connection target",
+	{"cloud", "api_key"}:  "changes authentication credentials",
+	// Redirects session-content uploads — same exfiltration class as endpoint.
+	{"sync", "endpoint"}: "changes session upload target",
 }
 
 // checkProtectedFields inspects a config patch for protected fields.

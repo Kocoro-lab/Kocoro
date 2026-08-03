@@ -6559,6 +6559,18 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject unknown keys in the PATCH increment (existing yaml is never
+	// re-validated). Without this, a misplaced key deep-merges into yaml and
+	// the "successful" write silently changes nothing at runtime.
+	if field, found := findUnknownConfigField(patch); found {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "unknown_config_field",
+			"field":   field,
+			"message": fmt.Sprintf("unknown config field %q — the daemon does not read this key, so writing it would silently change nothing", field),
+		})
+		return
+	}
+
 	// Validate MCP server commands
 	if servers, ok := patch["mcp_servers"].(map[string]interface{}); ok {
 		confirmed := r.Header.Get("X-Confirm") != ""
