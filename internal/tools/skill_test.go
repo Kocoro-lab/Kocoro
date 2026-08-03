@@ -202,3 +202,44 @@ func TestUseSkill_NoActivatedSetInContext_NoPanic(t *testing.T) {
 		t.Fatalf("error: %v", err)
 	}
 }
+
+func TestUseSkill_StatesSkillDirectory(t *testing.T) {
+	// A skill that ships code OUTSIDE the scripts/references/assets rewrite
+	// convention (e.g. core/ imported as Python modules) previously gave the
+	// model no path anchor at all — observed failure: a disk-wide `find /`
+	// hunting for the bundled files. The absolute directory must always be
+	// stated up front.
+	dir := t.TempDir()
+	s := &skills.Skill{Name: "gif", Prompt: "from core.gif_builder import GIFBuilder", Dir: dir}
+	skillList := []*skills.Skill{s}
+	tool := newUseSkillTool(&skillList)
+
+	args, _ := json.Marshal(map[string]string{"skill_name": "gif"})
+	result, err := tool.Run(context.Background(), string(args))
+	if err != nil || result.IsError {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if !strings.Contains(result.Content, "Skill directory: "+dir) {
+		t.Fatalf("skill directory not stated:\n%s", result.Content)
+	}
+}
+
+func TestMaterialSideEffectClassifications(t *testing.T) {
+	// These feed the daemon's offer-before-side-effects invariant: non-read-
+	// only flags that exist for scheduling must not count as material side
+	// effects (production false-positive, 2026-08-03).
+	skillList := []*skills.Skill{}
+	if (&AskUserQuestionTool{}).HasMaterialSideEffect(`{"questions":[]}`) {
+		t.Fatal("ask_user_question misclassified as a material side effect")
+	}
+	if newUseSkillTool(&skillList).HasMaterialSideEffect(`{"skill_name":"x"}`) {
+		t.Fatal("use_skill misclassified as a material side effect")
+	}
+	p := &ProcessTool{}
+	if p.HasMaterialSideEffect(`{"action":"list","description":"d"}`) || p.HasMaterialSideEffect(`{"action":"ports","description":"d"}`) {
+		t.Fatal("process observation actions misclassified as material side effects")
+	}
+	if !p.HasMaterialSideEffect(`{"action":"kill","pid":1,"description":"d"}`) || !p.HasMaterialSideEffect(`not-json`) {
+		t.Fatal("process kill / unparseable args must count as material side effects")
+	}
+}

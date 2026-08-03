@@ -27,7 +27,7 @@ Skills are knowledge packages that teach agents specific abilities — like read
 - Method: GET
 - Path: /skills/downloadable
 - Response: `{"skills": [{"name": "...", "description": "...", "installed": false}]}`
-- Notes: Skills that ship with Shannon and can be installed with one call.
+- Notes: The binary-pinned catalog of 18 skills available through Shannon. Listing is local and never fetches the static GitHub registry. Four document skills (`pptx`, `docx`, `xlsx`, `pdf`) use a pinned GitHub archive when installed because their upstream license prohibits redistribution; the other 14 copy embedded payloads locally.
 
 ### List marketplace skills
 - Method: GET
@@ -95,7 +95,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Method: POST
 - Path: /skills/install/{name}
 - Response: `{"name": "...", "slug": "...", "description": "...", "install_source": "..."}`
-- Notes: Installs from the current controlled downloadable catalog. The `{name}` path segment is the skill's slug (always lowercase + hyphens). Each catalog entry selects an explicit provider: `bundled` copies an embedded path offline; `github_archive` downloads a catalog-pinned repository commit, verifies the whole archive SHA-256, then extracts only the declared artifact path (no `git` required). Error matrix: **400** invalid/unknown skill name, **404** artifact path absent from the verified archive, **409** already installed, **500** otherwise (transport/integrity/extraction failure).
+- Notes: Installs from the binary-pinned downloadable catalog. The `{name}` path segment is the skill's slug (always lowercase + hyphens). Four document skills (`pptx`, `docx`, `xlsx`, `pdf`) download one immutable GitHub commit and verify the whole archive SHA-256 before extracting their declared path; the other 14 entries copy embedded payloads offline. Recommendation discovery is always local, but accepting one of the four document skills requires this download. Error matrix: **400** invalid/unknown skill name, **404** declared artifact absent, **409** already installed, **500** otherwise (including transport/integrity/extraction failure).
 
 ### Install a marketplace skill
 - Method: POST
@@ -228,32 +228,25 @@ identity is not exposed in the card. It never replays the original request.
 Retries are idempotent and reuse the same token. Sign-out or account switch
 expires outstanding offers for the old account.
 
-The production update path reuses the existing
-`Kocoro-lab/shanclaw-skill-registry` `index.json` transport. Its optional
-`installable_capabilities` array is considered publisher-authorized only when
-it comes from the compiled-in official registry URL over HTTPS. V1 explicitly
-uses the official GitHub repository ACL plus TLS as its publisher trust root;
-it does not claim an independent Ed25519 signature root. Compromise of the
-official registry's write access is therefore inside this threat boundary and
-would require registry rollback/revocation. A custom marketplace URL can still
-be browsed and installed manually, but it cannot nominate recommendations. The
-marketplace client's atomic TTL cache and stale-on-error path fetch updates
-without a daemon rebuild; catalog validation happens before the snapshot swap.
-A malformed/unsupported refresh retains the last trusted in-memory snapshot,
-and a cold-start failure uses the embedded bootstrap catalog.
-`catalog_revision` detects snapshot changes but is not an authenticity claim.
+Task-time recommendations use only the binary-pinned embedded catalog. They do
+not contact the static GitHub registry, ClawHub, or any custom marketplace URL,
+so an ordinary Desktop task has no catalog-network latency and marketplace
+growth cannot broaden the model-visible recommendation surface. The production
+recommendation allowlist is deliberately small: `pptx`, `docx`, `xlsx`, `pdf`,
+and `slack-gif-creator`. The other downloadable entries remain available for
+explicit manual browsing/install but are not eligible for proactive discovery.
+The four document entries cannot be embedded under their upstream license, so
+discovery stays local but an accepted install downloads the pinned archive.
+Changing this allowlist or its payloads requires a daemon release;
+`catalog_revision` detects the binary-pinned snapshot change but is not an
+authenticity claim.
 
-Every installable entry also owns its installation provider. Bundled entries
-name their embedded `skills/<slug>` path. `github_archive` entries must name
-an HTTPS GitHub repository, immutable 40-hex commit, exact artifact path, and
-SHA-256 of that commit archive. Install downloads that commit, verifies all
-compressed bytes before extraction, then admits only the declared skill path;
-it never downloads a mutable branch. The complete staged Skill tree is hashed,
-written into a receipt, and committed by directory rename before continuation.
-A registry publisher can therefore add a
-reviewed Skill using an existing provider without a daemon code change.
-Ordinary marketplace entries remain ineligible unless the controlled official
-registry supplies reviewed recommendation metadata. Catalog display
+`slack-gif-creator` names an embedded `skills/<slug>` path. The four document
+entries use validated immutable `github_archive` descriptors after acceptance.
+In both cases the complete staged Skill tree is hashed, written into a receipt,
+and committed by directory rename before continuation. The online provider is
+not used for task-time discovery. Ordinary marketplace entries are always
+ineligible for proactive task-time recommendations. Catalog display
 text and tags are length-bounded UTF-8 and reject control/format characters;
 Desktop must still render every field as plain text, never markup.
 

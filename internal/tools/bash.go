@@ -361,6 +361,21 @@ func (t *BashTool) IsConcurrencySafeCall(argsStr string) bool {
 	return IsCommandConcurrencySafe(args.Command)
 }
 
+// HasMaterialSideEffect reuses the strict read-only static analysis
+// (whitelisted leading token, no shell metacharacters) DIRECTLY — not via
+// IsConcurrencySafeCall, whose contract is batch scheduling and whose
+// ConcurrencyEnabled gate is a batching knob that must not change side-effect
+// classification. `git status` / `ls` / `go version` are not material side
+// effects regardless of how they are scheduled; anything the analyzer cannot
+// prove read-only is.
+func (t *BashTool) HasMaterialSideEffect(argsStr string) bool {
+	var args bashArgs
+	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
+		return true
+	}
+	return !IsCommandConcurrencySafe(args.Command)
+}
+
 func (t *BashTool) IsSafe(command string) bool {
 	return isSafeCommand(command, t.ExtraSafeCommands)
 }

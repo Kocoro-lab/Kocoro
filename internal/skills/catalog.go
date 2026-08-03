@@ -101,9 +101,10 @@ type CatalogArtifactProvider interface {
 
 type officialCatalogProvider struct{ shannonDir string }
 
-// OfficialCatalogAt retains the legacy embedded-catalog API. Live production
-// refreshes are owned by NewRegistryCatalogProvider; this function is the
-// binary-pinned fallback and intentionally does not trust local JSON files.
+// OfficialCatalogAt returns the binary-pinned production catalog. Task-time
+// skill discovery deliberately stays on this local snapshot: it neither waits
+// on the online marketplace nor lets marketplace growth broaden the automatic
+// recommendation surface. It intentionally does not trust local JSON files.
 func OfficialCatalogAt(shannonDir string) ([]CatalogEntry, string, error) {
 	return officialCatalogProvider{shannonDir: shannonDir}.Catalog(context.Background())
 }
@@ -118,18 +119,16 @@ func (p officialCatalogProvider) Catalog(context.Context) ([]CatalogEntry, strin
 	return entries, revision, nil
 }
 
-// NewEmbeddedCatalogProvider returns the binary-pinned fallback catalog. It is
-// used when the controlled registry is unavailable or has not published the
-// optional installable_capabilities field yet.
+// NewEmbeddedCatalogProvider returns the binary-pinned production catalog used
+// by downloadable-skill APIs and task-time recommendations.
 func NewEmbeddedCatalogProvider(shannonDir string) CatalogProvider {
 	return officialCatalogProvider{shannonDir: shannonDir}
 }
 
-// registryCatalogProvider reuses the existing shanclaw-skill-registry index
-// transport, TTL cache, retry, and stale-on-error behavior. Only a caller that
-// has authenticated the registry URL as controlled may set trusted=true;
-// arbitrary operator marketplace URLs remain browse/install-only and cannot
-// nominate recommendation candidates.
+// registryCatalogProvider is retained as an explicit provider seam for tests
+// and future controlled transports. The production daemon does not wire the
+// online static registry into task-time recommendations: marketplace browsing
+// and automatic recommendation admission are intentionally separate.
 type registryCatalogProvider struct {
 	registry *MarketplaceClient
 	fallback CatalogProvider
