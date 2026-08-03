@@ -89,6 +89,37 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	}
 }
 
+func TestCompleteStreamPrefersResponsesForOrdinaryRequests(t *testing.T) {
+	var got struct {
+		PreferredAPISurface string `json:"preferred_api_surface"`
+		Stream              bool   `json:"stream"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"type":"done","provider":"openai","model":"gpt-test","output_text":"done","usage":{}}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer server.Close()
+
+	response, err := NewGatewayClient(server.URL, "").CompleteStream(
+		context.Background(),
+		CompletionRequest{Messages: []Message{{Role: "user", Content: NewTextContent("hi")}}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("CompleteStream: %v", err)
+	}
+	if response.OutputText != "done" {
+		t.Fatalf("output = %q, want done", response.OutputText)
+	}
+	if got.PreferredAPISurface != "responses" || !got.Stream {
+		t.Fatalf("stream request = %+v, want Responses preference and stream=true", got)
+	}
+}
+
 func TestToolMarshalJSONStrictTaggedUnion(t *testing.T) {
 	t.Run("function preserves existing wire shape", func(t *testing.T) {
 		tool := Tool{

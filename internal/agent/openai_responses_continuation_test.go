@@ -216,18 +216,13 @@ func TestAgentLoopOrdinaryOpenAIResponsesKeepsToolResultBeforeLoopNudge(t *testi
 	}
 
 	requests := llm.requests
-	var nudgeRequest *client.CompletionRequest
-	for index := range requests {
-		messages := requests[index].Messages
-		if len(messages) == 0 {
-			continue
-		}
-		last := messages[len(messages)-1]
-		if last.Role == "user" && strings.HasPrefix(last.Content.Text(), "[system] ") {
-			nudgeRequest = &requests[index]
-			break
-		}
+	if len(requests) != 5 {
+		t.Fatalf("completion requests = %d, want 5", len(requests))
 	}
+	if len(llm.responses) != 0 {
+		t.Fatalf("scripted responses remaining = %d, want 0", len(llm.responses))
+	}
+	nudgeRequest := findLoopNudgeRequest(requests)
 	if nudgeRequest == nil {
 		t.Fatalf("no continuation request carried a loop nudge: %+v", requests)
 	}
@@ -235,7 +230,29 @@ func TestAgentLoopOrdinaryOpenAIResponsesKeepsToolResultBeforeLoopNudge(t *testi
 		t.Fatal("loop nudge request lost the OpenAI Responses cursor")
 	}
 
-	messages := nudgeRequest.Messages
+	assertToolResultPrecedesNudge(t, nudgeRequest)
+}
+
+func findLoopNudgeRequest(requests []client.CompletionRequest) *client.CompletionRequest {
+	for index := range requests {
+		if len(requests[index].Tools) == 0 {
+			continue
+		}
+		messages := requests[index].Messages
+		if len(messages) == 0 {
+			continue
+		}
+		last := messages[len(messages)-1]
+		if last.Role == "user" && strings.HasPrefix(last.Content.Text(), "[system] ") {
+			return &requests[index]
+		}
+	}
+	return nil
+}
+
+func assertToolResultPrecedesNudge(t *testing.T, request *client.CompletionRequest) {
+	t.Helper()
+	messages := request.Messages
 	if len(messages) < 3 {
 		t.Fatalf("nudge request has %d messages, want at least 3", len(messages))
 	}

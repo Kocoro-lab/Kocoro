@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -72,7 +73,7 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 			nil,
 		)
 		loop.SetSpecificModel(openAIResponsesLiveModel)
-		loop.SetReasoningEffort("none")
+		loop.SetReasoningEffort("high")
 		loop.SetTemperature(0)
 		loop.SetMaxTokens(512)
 		loop.SetSkillDiscovery(false)
@@ -240,37 +241,11 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 		t.Fatal("final response unexpectedly contained a tool call")
 	}
 
-	var nudgeRequest *client.CompletionRequest
-	for index := range requests {
-		messages := requests[index].Messages
-		if len(messages) == 0 {
-			continue
-		}
-		last := messages[len(messages)-1]
-		if last.Role == "user" && strings.HasPrefix(last.Content.Text(), "[system] ") {
-			nudgeRequest = &requests[index]
-			break
-		}
-	}
+	nudgeRequest := findLoopNudgeRequest(requests)
 	if nudgeRequest == nil {
 		t.Fatal("no continuation request carried the loop nudge")
 	}
-	if len(nudgeRequest.Messages) < 3 {
-		t.Fatalf("nudge request has %d messages, want at least 3", len(nudgeRequest.Messages))
-	}
-	assistant := nudgeRequest.Messages[len(nudgeRequest.Messages)-3]
-	toolResult := nudgeRequest.Messages[len(nudgeRequest.Messages)-2]
-	assistantBlocks := assistant.Content.Blocks()
-	resultBlocks := toolResult.Content.Blocks()
-	if assistant.Role != "assistant" || len(assistantBlocks) != 1 ||
-		assistantBlocks[0].Type != "tool_use" {
-		t.Fatalf("assistant before nudge = %#v", assistant)
-	}
-	if toolResult.Role != "user" || len(resultBlocks) != 1 ||
-		resultBlocks[0].Type != "tool_result" ||
-		resultBlocks[0].ToolUseID != assistantBlocks[0].ID {
-		t.Fatalf("paired tool result before nudge = %#v", toolResult)
-	}
+	assertToolResultPrecedesNudge(t, nudgeRequest)
 	if usage == nil || usage.TotalTokens <= 0 || usage.CostUSD <= 0 {
 		t.Fatal("run did not report non-zero usage and cost")
 	}
@@ -300,10 +275,16 @@ func (t *openAIResponsesLiveLookupTool) Info() ToolInfo {
 }
 
 func (t *openAIResponsesLiveLookupTool) Run(_ context.Context, args string) (ToolResult, error) {
-	t.executions.Add(1)
-	if !strings.Contains(args, `"cobalt"`) {
-		return ToolResult{Content: "invalid lookup key", IsError: true}, nil
+	var input struct {
+		Key string `json:"key"`
 	}
+	if err := json.Unmarshal([]byte(args), &input); err != nil {
+		return ValidationError("lookup: invalid arguments: " + err.Error()), nil
+	}
+	if input.Key != "cobalt" {
+		return ValidationError("lookup: key must be cobalt"), nil
+	}
+	t.executions.Add(1)
 	return ToolResult{Content: "BLUE"}, nil
 }
 
@@ -329,8 +310,14 @@ func (t *openAIResponsesLiveCountdownTool) Info() ToolInfo {
 }
 
 func (t *openAIResponsesLiveCountdownTool) Run(_ context.Context, args string) (ToolResult, error) {
-	if !strings.Contains(args, `"cobalt"`) {
-		return ToolResult{Content: "invalid countdown key", IsError: true}, nil
+	var input struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal([]byte(args), &input); err != nil {
+		return ValidationError("countdown: invalid arguments: " + err.Error()), nil
+	}
+	if input.Key != "cobalt" {
+		return ValidationError("countdown: key must be cobalt"), nil
 	}
 	step := t.executions.Add(1)
 	if step < 3 {
