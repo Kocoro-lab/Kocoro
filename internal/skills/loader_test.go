@@ -971,9 +971,15 @@ func TestBundledPlatformSkills_ToolAllowlistIntentionallyAbsent(t *testing.T) {
 				slug, strings.Join(found.AllowedTools, " "))
 		}
 		if slug == "kocoro" {
+			if !strings.Contains(found.Description, "Do not use this platform-management skill merely to fill a task-time capability gap") {
+				t.Errorf("kocoro description missing task-time capability routing guard: %q", found.Description)
+			}
 			for _, want := range []string{
 				"Activating this skill never means “HTTP only” for the whole run.",
 				"Complete every requested subtask",
+				"Task-time capability gaps",
+				"guess a `use_skill` name",
+				"A user's consent reply",
 			} {
 				if !strings.Contains(found.Prompt, want) {
 					t.Errorf("kocoro prompt missing mixed-turn routing guard %q", want)

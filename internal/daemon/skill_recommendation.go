@@ -757,7 +757,7 @@ type discoverInstallableSkillsTool struct {
 }
 
 func (t *discoverInstallableSkillsTool) Info() agent.ToolInfo {
-	return agent.ToolInfo{Name: "discover_installable_skills", Description: "Find up to three installable official capabilities for the current Desktop task. Provide concise task_summary and/or stable intent_tags; never guess skill names.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"task_summary": map[string]any{"type": "string"}, "intent_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}}}
+	return agent.ToolInfo{Name: "discover_installable_skills", Description: "When the current Desktop task needs a capability missing from the visible installed skills, call this before guessing use_skill, loading the kocoro management skill, calling generic skill list/install APIs, or asking the user to install. Finds up to three installable official capabilities. Provide concise task_summary and/or stable intent_tags; never guess skill names.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"task_summary": map[string]any{"type": "string"}, "intent_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}}}
 }
 func (*discoverInstallableSkillsTool) RequiresApproval() bool     { return false }
 func (*discoverInstallableSkillsTool) IsReadOnlyCall(string) bool { return true }
@@ -977,7 +977,7 @@ type offerSkillInstallationTool struct {
 }
 
 func (*offerSkillInstallationTool) Info() agent.ToolInfo {
-	return agent.ToolInfo{Name: "offer_skill_installation", Description: "Offer only catalog IDs returned by discover_installable_skills. This only shows a Desktop card; it never installs a skill.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"catalog_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "reason": map[string]any{"type": "string"}}}, Required: []string{"catalog_ids", "reason"}}
+	return agent.ToolInfo{Name: "offer_skill_installation", Description: "Immediately offer relevant catalog IDs returned by discover_installable_skills instead of asking in text or calling generic install APIs. This shows a localized Desktop card and never installs a skill itself.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"catalog_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "reason": map[string]any{"type": "string"}}}, Required: []string{"catalog_ids", "reason"}}
 }
 func (*offerSkillInstallationTool) RequiresApproval() bool     { return false }
 func (*offerSkillInstallationTool) IsReadOnlyCall(string) bool { return false }

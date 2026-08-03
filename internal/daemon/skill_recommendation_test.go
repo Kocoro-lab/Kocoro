@@ -1659,6 +1659,30 @@ func TestSkillRecommendationDiscoveryMatchesProductionQueries(t *testing.T) {
 	}
 }
 
+func TestSkillRecommendationToolDescriptionsPreferCardWorkflow(t *testing.T) {
+	discoverDescription := (&discoverInstallableSkillsTool{}).Info().Description
+	for _, want := range []string{
+		"before guessing use_skill",
+		"generic skill list/install APIs",
+		"asking the user to install",
+	} {
+		if !strings.Contains(discoverDescription, want) {
+			t.Errorf("discovery description missing task-time routing guard %q: %s", want, discoverDescription)
+		}
+	}
+
+	offerDescription := (&offerSkillInstallationTool{}).Info().Description
+	for _, want := range []string{
+		"instead of asking in text",
+		"generic install APIs",
+		"localized Desktop card",
+	} {
+		if !strings.Contains(offerDescription, want) {
+			t.Errorf("offer description missing card routing guard %q: %s", want, offerDescription)
+		}
+	}
+}
+
 func TestSkillRecommendationDiscoveryEmptyResultCarriesTagVocabulary(t *testing.T) {
 	dir := t.TempDir()
 	store := newSkillRecommendationStore(dir)

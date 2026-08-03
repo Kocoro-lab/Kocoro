@@ -192,6 +192,17 @@ Some skills need API keys to call external services. These are declared by the s
 
 ## Desktop skill-install recommendations (v1)
 
+Routing priority is load-bearing: when the recommendation tools are available
+and the current task needs a capability missing from the visible installed
+skills, call `discover_installable_skills` first and immediately follow a match
+with `offer_skill_installation`. Do not guess a `use_skill` name, use the
+generic `/skills/downloadable` or `/skills/install/{name}` endpoints, or ask for
+installation permission in text. Those generic endpoints remain available for
+explicit skill administration outside a capability-dependent task and for
+consumers without the recommendation tools. A consent reply to a task-time
+suggestion still belongs to the card workflow; it is not a generic install
+request.
+
 Set `daemon.skill_recommendations_enabled: false` for an immediate operator
 kill switch. It defaults on but stays inert without the signed-in Desktop
 consumer capability.
@@ -205,7 +216,8 @@ The daemon enables discovery only for a verified signed-in Cloud account; old,
 unsigned, and non-Desktop clients receive the normal tool list unchanged.
 
 The agent first calls `discover_installable_skills` with catalog intent tags,
-then may call `offer_skill_installation` using only IDs returned in that run.
+then calls `offer_skill_installation` using only IDs returned in that run when
+discovery finds a relevant match.
 The latter only offers a card; it never installs. The card is delivered solely
 to the active `/events` stream for the same account + device and is never put
 on the global replay bus. Event name: `skill.recommendation.v1`; payload is
