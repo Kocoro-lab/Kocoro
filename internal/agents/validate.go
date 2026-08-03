@@ -44,10 +44,6 @@ func ValidateToolsFilter(f *AgentToolsFilter) error {
 // See the precedence chain in references/agents.md.
 var modelTierKeywords = map[string]bool{"small": true, "medium": true, "large": true}
 
-var reservedExecutionProfileModels = map[string]bool{
-	"gpt-5.6-luna": true,
-}
-
 // IsModelTierKeyword reports whether s is a routing-tier name (small/medium/
 // large). It is the single source of truth for "this is a tier, not a model id"
 // across every config write boundary. Matching is case- and whitespace-
@@ -56,17 +52,6 @@ var reservedExecutionProfileModels = map[string]bool{
 // the very model_id_unknown failure this guard exists to prevent.
 func IsModelTierKeyword(s string) bool {
 	return modelTierKeywords[strings.ToLower(strings.TrimSpace(s))]
-}
-
-// IsReservedExecutionProfileModel reports whether a model may only be used
-// through a server-minted execution profile. These routes are not valid
-// agent.model values even though the provider catalog knows their ids.
-func IsReservedExecutionProfileModel(s string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(s))
-	if strings.HasPrefix(normalized, "openai:") {
-		normalized = strings.TrimPrefix(normalized, "openai:")
-	}
-	return reservedExecutionProfileModels[normalized]
 }
 
 // ValidateAgentModelConfig rejects a tier keyword wedged into agent.model, and
@@ -79,9 +64,6 @@ func ValidateAgentModelConfig(c *AgentModelConfig) error {
 	}
 	if c.Model != nil && IsModelTierKeyword(*c.Model) {
 		return fmt.Errorf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use agent.model_tier for tiers", *c.Model)
-	}
-	if c.Model != nil && IsReservedExecutionProfileModel(*c.Model) {
-		return fmt.Errorf("agent.model %q requires a server-minted execution profile and cannot be selected directly", *c.Model)
 	}
 	if c.EffortTier != nil && !IsValidEffortTier(*c.EffortTier) {
 		return fmt.Errorf("agent.effort_tier %q is not valid; use one of %s", *c.EffortTier, strings.Join(EffortTierAllowedValues(), ", "))

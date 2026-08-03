@@ -21,7 +21,8 @@ const (
 	openAIResponsesLiveRepeatsEnv = "KOE_SOL_RESPONSES_REPEATS"
 	openAIResponsesLiveEndpoint   = "KOE_SOL_RESPONSES_ENDPOINT"
 	openAIResponsesLiveAPIKey     = "KOE_SOL_RESPONSES_API_KEY"
-	openAIResponsesLiveModel      = "gpt-5.6-sol"
+	openAIResponsesLiveModelEnv   = "KOE_OPENAI_RESPONSES_MODEL"
+	openAIResponsesDefaultModel   = "gpt-5.6-sol"
 )
 
 // TestAgentLoopOpenAIResponsesContinuationLive is a paid, opt-in release gate.
@@ -50,6 +51,10 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 	if apiKey == "" {
 		apiKey = "sk_test_123456"
 	}
+	model := strings.TrimSpace(os.Getenv(openAIResponsesLiveModelEnv))
+	if model == "" {
+		model = openAIResponsesDefaultModel
+	}
 
 	latencies := make([]time.Duration, 0, repeats)
 	var totalCost float64
@@ -72,7 +77,7 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 			nil,
 			nil,
 		)
-		loop.SetSpecificModel(openAIResponsesLiveModel)
+		loop.SetSpecificModel(model)
 		loop.SetReasoningEffort("high")
 		loop.SetTemperature(0)
 		loop.SetMaxTokens(512)
@@ -119,19 +124,19 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 		if !validOrdinaryOpenAIResponseID(requests[1].PreviousResponseID) {
 			t.Fatalf("run %d continuation did not carry a trusted Responses cursor", run)
 		}
-		if requests[1].SpecificModel != openAIResponsesLiveModel {
+		if requests[1].SpecificModel != model {
 			t.Fatalf(
 				"run %d continuation model = %q, want %q",
 				run,
 				requests[1].SpecificModel,
-				openAIResponsesLiveModel,
+				model,
 			)
 		}
 		if responses[0].Provider != "openai" ||
-			responses[0].Model != openAIResponsesLiveModel ||
+			responses[0].Model != model ||
 			!responses[0].HasToolCalls() ||
 			responses[1].Provider != "openai" ||
-			responses[1].Model != openAIResponsesLiveModel ||
+			responses[1].Model != model ||
 			responses[1].HasToolCalls() {
 			t.Fatalf("run %d provider/model/tool trajectory failed", run)
 		}
@@ -141,7 +146,8 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 		totalCost += usage.CostUSD
 		latencies = append(latencies, elapsed)
 		t.Logf(
-			"content-free Sol continuation run=%d pass=true completion_calls=2 tool_effects=1 total_millis=%d cost_usd=%.6f",
+			"content-free continuation model=%s run=%d pass=true completion_calls=2 tool_effects=1 total_millis=%d cost_usd=%.6f",
+			model,
 			run,
 			elapsed.Milliseconds(),
 			usage.CostUSD,
@@ -150,7 +156,8 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	t.Logf(
-		"content-free Sol continuation verdict pass=true runs=%d p50_millis=%d p95_millis=%d total_cost_usd=%.6f",
+		"content-free continuation model=%s verdict pass=true runs=%d p50_millis=%d p95_millis=%d total_cost_usd=%.6f",
+		model,
 		repeats,
 		nearestRankDuration(latencies, 50).Milliseconds(),
 		nearestRankDuration(latencies, 95).Milliseconds(),
@@ -170,6 +177,10 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 	apiKey := strings.TrimSpace(os.Getenv(openAIResponsesLiveAPIKey))
 	if apiKey == "" {
 		apiKey = "sk_test_123456"
+	}
+	model := strings.TrimSpace(os.Getenv(openAIResponsesLiveModelEnv))
+	if model == "" {
+		model = openAIResponsesDefaultModel
 	}
 
 	gateway := client.NewGatewayClient(endpoint, apiKey)
@@ -192,7 +203,7 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 		nil,
 		nil,
 	)
-	loop.SetSpecificModel(openAIResponsesLiveModel)
+	loop.SetSpecificModel(model)
 	loop.SetReasoningEffort("none")
 	loop.SetTemperature(0)
 	loop.SetMaxTokens(512)
@@ -252,7 +263,8 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 		t.Fatal("run did not report non-zero usage and cost")
 	}
 	t.Logf(
-		"content-free loop nudge verdict pass=true completion_calls=4 tool_effects=3 total_millis=%d cost_usd=%.6f",
+		"content-free loop nudge model=%s verdict pass=true completion_calls=4 tool_effects=3 total_millis=%d cost_usd=%.6f",
+		model,
 		time.Since(started).Milliseconds(),
 		usage.CostUSD,
 	)
