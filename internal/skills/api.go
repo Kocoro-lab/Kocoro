@@ -376,8 +376,8 @@ func overlayBuiltinFromEmbed(name, destDir string) error {
 }
 
 // InstallSkill installs a downloadable skill to the global skills directory
-// (~/.shannon/skills/<name>/) using the embedded bootstrap catalog. Daemon
-// callers use InstallSkillFromCatalog with the live controlled provider.
+// (~/.shannon/skills/<name>/) using the binary-pinned embedded catalog. Daemon
+// callers use the same catalog unless a test explicitly injects a provider.
 func InstallSkill(ctx context.Context, shannonDir, name string) error {
 	return InstallSkillFromCatalog(ctx, shannonDir, name, NewEmbeddedCatalogProvider(shannonDir))
 }
@@ -573,10 +573,9 @@ func hashCatalogSkillTree(dir string) (string, error) {
 }
 
 // ErrPreviewUnavailable is returned by PreviewSkill when a downloadable skill
-// has no locally-available SKILL.md — it is neither installed nor present in the
-// embedded bundle. The four proprietary skills (docx/pdf/pptx/xlsx) ship only as
-// a git-fetched install and have no bundled copy, so there is nothing to preview
-// before installing.
+// has no locally-available SKILL.md — it is neither installed nor present in
+// the embedded bundle. The GitHub-backed document skills are the production
+// case: their upstream license permits pinned installation but not redistribution.
 var ErrPreviewUnavailable = errors.New("no local preview available for skill")
 
 // PreviewSkill returns the raw SKILL.md content for a downloadable skill WITHOUT
@@ -585,8 +584,8 @@ var ErrPreviewUnavailable = errors.New("no local preview available for skill")
 //  1. Already installed on disk → read the on-disk SKILL.md.
 //  2. Bundled (embedded in the binary) → read from the extracted bundled dir.
 //
-// If neither exists (a proprietary skill not yet installed), returns
-// ErrPreviewUnavailable so the caller can fall back to the short description.
+// If neither exists, returns ErrPreviewUnavailable so the caller can fall back
+// to the short description.
 func PreviewSkill(shannonDir, name string) (string, error) {
 	return PreviewSkillFromCatalog(context.Background(), shannonDir, name, NewEmbeddedCatalogProvider(shannonDir))
 }
@@ -785,12 +784,13 @@ func githubArchiveURL(repository, ref string) string {
 // count. Because install extracts from a whole-repo tarball, these bound the
 // entire declared repository, not a single skill.
 //
-//   - Workload: the full anthropics/skills repo — today ~4 MiB compressed,
-//     tens of MiB decompressed, a few hundred files — so these sit well above
-//     (roughly 10x) the real payload.
-//   - Symptom when a cap binds: EVERY official (docx/pdf/pptx/xlsx) install
-//     fails with a "decompression guard" / "exceeds N files" error (not just
-//     one skill), because the shared tarball can't be read to completion.
+//   - Workload: an explicitly injected GitHub-backed catalog artifact, such as
+//     the historical anthropics/skills repo (~4 MiB compressed, tens of MiB
+//     decompressed, a few hundred files), so these sit well above the observed
+//     payload.
+//   - Symptom when a cap binds: that injected install fails with a
+//     "decompression guard" / "exceeds N files" error because the repository
+//     archive can't be read to completion.
 //   - Override: intentionally not exposed as config — a decompression-bomb
 //     backstop is a security floor, not a tuning knob. If upstream legitimately
 //     outgrows the headroom, bump here and recompile. Vars (not consts) only so

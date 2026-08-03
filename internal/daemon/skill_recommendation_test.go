@@ -228,6 +228,36 @@ func TestSkillRecommendationDynamicCatalogInstallsThroughHTTP(t *testing.T) {
 	}
 }
 
+func TestServerDefaultsRecommendationCatalogToEmbeddedOfflineAllowlist(t *testing.T) {
+	var registryHits atomic.Int32
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		registryHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer registry.Close()
+
+	dir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.Skills.Marketplace.RegistryURL = registry.URL
+	deps := &ServerDeps{Config: cfg, ShannonDir: dir}
+	s := NewServer(0, nil, deps, "test")
+	entries, _, err := skills.RecommendationCatalogFrom(context.Background(), s.catalog, dir, "desktop", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := registryHits.Load(); got != 0 {
+		t.Fatalf("task-time discovery contacted registry %d times", got)
+	}
+	want := []string{"docx", "pdf", "pptx", "slack-gif-creator", "xlsx"}
+	got := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		got = append(got, entry.Slug)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("recommendation allowlist=%v want=%v", got, want)
+	}
+}
+
 func TestSkillRecommendationCatalogFiltersInstalledAndBuiltin(t *testing.T) {
 	dir := t.TempDir()
 	entries, err := skills.InstallableCatalog(dir, "desktop")
@@ -239,7 +269,7 @@ func TestSkillRecommendationCatalogFiltersInstalledAndBuiltin(t *testing.T) {
 	}
 	found := false
 	for _, e := range entries {
-		if e.ID == "official:pptx" {
+		if e.ID == "official:slack-gif-creator" {
 			found = true
 		}
 		if skills.IsBuiltinSkill(e.Slug) {
@@ -247,12 +277,12 @@ func TestSkillRecommendationCatalogFiltersInstalledAndBuiltin(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("pptx absent")
+		t.Fatal("slack-gif-creator absent")
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "skills", "pptx"), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "skills", "slack-gif-creator"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "skills", "pptx", "SKILL.md"), []byte("x"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "skills", "slack-gif-creator", "SKILL.md"), []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	entries, err = skills.InstallableCatalog(dir, "desktop")
@@ -260,8 +290,8 @@ func TestSkillRecommendationCatalogFiltersInstalledAndBuiltin(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.ID == "official:pptx" {
-			t.Fatal("installed pptx leaked")
+		if e.ID == "official:slack-gif-creator" {
+			t.Fatal("installed slack-gif-creator leaked")
 		}
 	}
 }
@@ -271,12 +301,12 @@ func TestSkillRecommendationOfferFiltersUnknownDuplicateAndTOCTOU(t *testing.T) 
 	store := newSkillRecommendationStore(dir)
 	emitted := 0
 	rc := withSkillRecommendationRun(context.Background(), &skillRecommendationRunContext{accountID: "acct", deviceID: "12345678-1234-1234-1234-123456789abc", sessionID: "session", turnID: "turn", store: store, emit: func(skillRecommendationV1) bool { emitted++; return true }})
-	discovery, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(rc, `{"intent_tags":["presentation.create"]}`)
+	discovery, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(rc, `{"intent_tags":["gif.create"]}`)
 	if err != nil || discovery.IsError {
 		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}
 	tool := &offerSkillInstallationTool{shannonDir: dir}
-	result, err := tool.Run(rc, `{"catalog_ids":["unknown","official:pptx","official:pptx","official:kocoro"],"reason":"presentations"}`)
+	result, err := tool.Run(rc, `{"catalog_ids":["unknown","official:slack-gif-creator","official:slack-gif-creator","official:kocoro"],"reason":"animated GIF"}`)
 	if err != nil || result.IsError {
 		t.Fatalf("offer=%+v err=%v", result, err)
 	}
@@ -292,7 +322,7 @@ func TestSkillRecommendationOfferFiltersUnknownDuplicateAndTOCTOU(t *testing.T) 
 		t.Fatalf("offers=%d", len(store.byID))
 	}
 	for _, v := range store.byID {
-		if len(v.Items) != 1 || v.Items[0].CatalogID != "official:pptx" {
+		if len(v.Items) != 1 || v.Items[0].CatalogID != "official:slack-gif-creator" {
 			t.Fatalf("items=%+v", v.Items)
 		}
 	}
@@ -303,13 +333,13 @@ func TestSkillRecommendationOfferFailsClosedWithoutActiveSink(t *testing.T) {
 	store := newSkillRecommendationStore(dir)
 	ctx := withSkillRecommendationRun(context.Background(), &skillRecommendationRunContext{
 		accountID: "acct", deviceID: "12345678-1234-1234-1234-123456789abc", sessionID: "s", turnID: "t", store: store,
-		emit: func(skillRecommendationV1) bool { return false }, discovered: map[string]bool{"official:pptx": true},
+		emit: func(skillRecommendationV1) bool { return false }, discovered: map[string]bool{"official:slack-gif-creator": true},
 		catalogRevision: "", // offer verifies revision after the discovery helper below.
 	})
-	if _, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(ctx, `{"intent_tags":["presentation.create"]}`); err != nil {
+	if _, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(ctx, `{"intent_tags":["gif.create"]}`); err != nil {
 		t.Fatal(err)
 	}
-	result, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:pptx"],"reason":"presentation"}`)
+	result, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:slack-gif-creator"],"reason":"animated GIF"}`)
 	if err != nil || !result.IsError || !result.StopAgentLoop {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -318,7 +348,7 @@ func TestSkillRecommendationOfferFailsClosedWithoutActiveSink(t *testing.T) {
 			t.Fatalf("undeliverable offer state=%s", offer.State)
 		}
 	}
-	retry, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:pptx"],"reason":"presentation"}`)
+	retry, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:slack-gif-creator"],"reason":"animated GIF"}`)
 	if err != nil || !retry.IsError || !retry.StopAgentLoop {
 		t.Fatalf("expired same-turn offer was revived: result=%+v err=%v", retry, err)
 	}
@@ -1596,6 +1626,71 @@ func TestSkillRecommendationEffectHandlerSideEffectLadder(t *testing.T) {
 	}
 }
 
+func TestSkillRecommendationDiscoveryMatchesProductionQueries(t *testing.T) {
+	// The EXACT arguments the model sent in production (2026-08-03) that
+	// returned [] against a catalog whose Document entry literally says
+	// "tracked changes and comments": Chinese task_summary welds Latin terms
+	// to CJK text with full-width punctuation, the model-invented tags never
+	// equal the closed catalog vocabulary, and "docx" appears only in the
+	// slug — which the haystack used to exclude.
+	dir := t.TempDir()
+	store := newSkillRecommendationStore(dir)
+	run := &skillRecommendationRunContext{accountID: "acct", deviceID: "12345678-1234-1234-1234-123456789abc", sessionID: "s", turnID: "t", store: store, emit: func(skillRecommendationV1) bool { return true }}
+	ctx := withSkillRecommendationRun(context.Background(), run)
+	tool := &discoverInstallableSkillsTool{shannonDir: dir}
+
+	for _, args := range []string{
+		`{"intent_tags": ["docx", "word", "tracked-changes", "comments", "office-document"], "task_summary": "生成带有 Word 修订记录（tracked changes）和批注（comments）的 .docx 文档"}`,
+		`{"intent_tags": ["docx", "word", "tracked-changes", "comments", "document-generation"], "task_summary": "生成带 Word 修订记录（tracked changes）和批注（comments）的 .docx 文档"}`,
+	} {
+		result, err := tool.Run(ctx, args)
+		if err != nil || result.IsError {
+			t.Fatalf("discovery=%+v err=%v", result, err)
+		}
+		var candidates []struct {
+			CatalogID string `json:"catalog_id"`
+		}
+		if uerr := json.Unmarshal([]byte(result.Content), &candidates); uerr != nil {
+			t.Fatalf("discovery returned non-array content: %s", result.Content)
+		}
+		if len(candidates) != 1 || candidates[0].CatalogID != "official:docx" {
+			t.Fatalf("production query returned non-exact candidates %s → %s", args, result.Content)
+		}
+	}
+}
+
+func TestSkillRecommendationDiscoveryEmptyResultCarriesTagVocabulary(t *testing.T) {
+	dir := t.TempDir()
+	store := newSkillRecommendationStore(dir)
+	run := &skillRecommendationRunContext{accountID: "acct", deviceID: "12345678-1234-1234-1234-123456789abc", sessionID: "s", turnID: "t", store: store, emit: func(skillRecommendationV1) bool { return true }}
+	ctx := withSkillRecommendationRun(context.Background(), run)
+	result, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(ctx, `{"task_summary":"квантовая телепортация"}`)
+	if err != nil || result.IsError {
+		t.Fatalf("discovery=%+v err=%v", result, err)
+	}
+	if !strings.Contains(result.Content, "CLOSED intent-tag vocabulary") || !strings.Contains(result.Content, "document.create") {
+		t.Fatalf("empty result lacks the self-correction vocabulary hint: %s", result.Content)
+	}
+}
+
+func TestSkillRecommendationDiscoveryRejectsGenericNearMissTag(t *testing.T) {
+	dir := t.TempDir()
+	run := &skillRecommendationRunContext{accountID: "acct", deviceID: "12345678-1234-1234-1234-123456789abc", sessionID: "s", turnID: "t", store: newSkillRecommendationStore(dir), emit: func(skillRecommendationV1) bool { return true }}
+	ctx := withSkillRecommendationRun(context.Background(), run)
+	tool := &discoverInstallableSkillsTool{shannonDir: dir}
+
+	result, err := tool.Run(ctx, `{"intent_tags":["image-create"]}`)
+	if err != nil || result.IsError {
+		t.Fatalf("discovery=%+v err=%v", result, err)
+	}
+	if !strings.HasPrefix(result.Content, "[]\n") {
+		t.Fatalf("generic near-miss tag returned unrelated candidates: %s", result.Content)
+	}
+	if len(run.discovered) != 0 {
+		t.Fatalf("generic near-miss tag admitted offer IDs: %v", run.discovered)
+	}
+}
+
 func TestSkillRecommendationOfferSurvivesQuestionOnPublicPath(t *testing.T) {
 	// Full public path of the production flow that used to fail: the
 	// question runs through the REAL tool + effect handler, then discover
@@ -1614,11 +1709,11 @@ func TestSkillRecommendationOfferSurvivesQuestionOnPublicPath(t *testing.T) {
 	if run.hasSideEffects() {
 		t.Fatal("user question poisoned the run before discovery")
 	}
-	discovery, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(ctx, `{"intent_tags":["presentation.create"]}`)
+	discovery, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(ctx, `{"intent_tags":["gif.create"]}`)
 	if err != nil || discovery.IsError {
 		t.Fatalf("discovery=%+v err=%v", discovery, err)
 	}
-	offer, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:pptx"],"reason":"presentation work"}`)
+	offer, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:slack-gif-creator"],"reason":"animated GIF"}`)
 	if err != nil || offer.IsError {
 		t.Fatalf("offer=%+v err=%v", offer, err)
 	}

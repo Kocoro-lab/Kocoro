@@ -318,6 +318,14 @@ These tools are absent from TUI, one-shot, MCP serve, schedules, IM channels,
 heartbeat, and watcher runs. Accepting the card installs the pinned catalog
 artifact and resumes the original Desktop session.
 
+Task-time discovery is deliberately offline and narrow: the daemon consults
+only its binary-pinned recommendation allowlist (`pptx`, `docx`, `xlsx`, `pdf`,
+and `slack-gif-creator`). It never contacts GitHub or the community marketplace
+while discovering candidates during a task. `slack-gif-creator` installs from
+the embedded payload; after explicit acceptance, the four document skills use
+an immutable, SHA-256-verified GitHub archive because their upstream license
+prohibits redistributing them inside the daemon.
+
 ### Cloud Tools (gated on `cloud.enabled` + `api_key`)
 
 | Tool | Approval | Description |

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -802,6 +803,7 @@ func (t *discoverInstallableSkillsTool) Run(ctx context.Context, args string) (a
 	ranked := make([]rankedCandidate, 0, len(entries))
 	for _, e := range entries {
 		score := recommendationQueryScore(e, queryTerms)
+		score += recommendationTagQueryScore(e, in.IntentTags)
 		for _, tag := range in.IntentTags {
 			if containsFold(e.Recommendation.IntentTags, tag) {
 				score += 100
@@ -837,21 +839,62 @@ func (t *discoverInstallableSkillsTool) Run(ctx context.Context, args string) (a
 		rc.mu.Unlock()
 	}
 	b, _ := json.Marshal(out)
+	if len(out) == 0 {
+		// Self-correction hint: the model cannot see the catalog's closed
+		// tag vocabulary, so a plain "[]" reads as "nothing exists" and the
+		// model tells the user so (production, 2026-08-03 — two retries with
+		// invented tags, then a false "no matching skill" answer). Surfacing
+		// the vocabulary lets one retry succeed or fail honestly.
+		vocabulary := map[string]bool{}
+		for _, e := range entries {
+			for _, tag := range e.Recommendation.IntentTags {
+				vocabulary[tag] = true
+			}
+		}
+		tags := make([]string, 0, len(vocabulary))
+		for tag := range vocabulary {
+			tags = append(tags, tag)
+		}
+		sort.Strings(tags)
+		return agent.ToolResult{Content: "[]\n\nNo catalog entry matched. The catalog uses a CLOSED intent-tag vocabulary: " +
+			strings.Join(tags, ", ") +
+			". If one of these tags could fit the task, retry with it; otherwise tell the user no installable skill matches."}, nil
+	}
 	return agent.ToolResult{Content: string(b)}, nil
 }
+
+// recommendationASCIIRuns extracts lowercase ASCII word runs. This is the
+// CJK lifeline: strings.Fields on a Chinese task_summary yields tokens like
+// "修订记录（tracked" — a Latin term welded to CJK text by FULL-WIDTH
+// punctuation the old ASCII-only Trim never stripped, so nothing matched and
+// discovery returned [] for a catalog entry whose description literally says
+// "tracked changes" (production, 2026-08-03).
+var recommendationASCIIRuns = regexp.MustCompile(`[a-z0-9]{3,}`)
+
 func recommendationQueryTerms(value string) []string {
-	fields := strings.Fields(strings.ToLower(value))
-	out := make([]string, 0, len(fields))
-	for _, field := range fields {
+	lowered := strings.ToLower(value)
+	seen := map[string]bool{}
+	out := make([]string, 0, 8)
+	for _, field := range strings.Fields(lowered) {
 		field = strings.Trim(field, " ,.;:!?()[]{}\"'")
-		if len([]rune(field)) >= 3 {
+		if len([]rune(field)) >= 3 && !seen[field] {
+			seen[field] = true
 			out = append(out, field)
+		}
+	}
+	for _, run := range recommendationASCIIRuns.FindAllString(lowered, -1) {
+		if !seen[run] {
+			seen[run] = true
+			out = append(out, run)
 		}
 	}
 	return out
 }
 func recommendationQueryScore(entry skills.CatalogEntry, terms []string) int {
-	haystack := strings.ToLower(entry.DisplayName + " " + entry.Description + " " + strings.Join(entry.Recommendation.IntentTags, " "))
+	// Slug and ID are part of the haystack on purpose: "docx" is the single
+	// most natural query term for the Document skill, and it appears ONLY in
+	// the slug — name/description/tags never contain it.
+	haystack := strings.ToLower(entry.ID + " " + entry.Slug + " " + entry.DisplayName + " " + entry.Description + " " + strings.Join(entry.Recommendation.IntentTags, " "))
 	score := 0
 	for _, term := range terms {
 		if strings.Contains(haystack, term) {
@@ -859,6 +902,40 @@ func recommendationQueryScore(entry skills.CatalogEntry, terms []string) int {
 		}
 	}
 	return score
+}
+
+// recommendationTagQueryScore admits a near-miss tag only when ALL of its word
+// units occur in the skill's own identity/display metadata. It deliberately
+// excludes catalog intent tags from the haystack: otherwise a guessed tag such
+// as "image-create" matches every *.create entry through the generic "create"
+// suffix and spuriously offers docx/pdf/pptx. The production
+// "tracked-changes" tag still matches Document's prose exactly.
+func recommendationTagQueryScore(entry skills.CatalogEntry, tags []string) int {
+	haystack := strings.ToLower(entry.ID + " " + entry.Slug + " " + entry.DisplayName + " " + entry.Description)
+	score := 0
+	for _, tag := range tags {
+		subterms := recommendationTagSubterms(tag)
+		if len(subterms) == 0 {
+			continue
+		}
+		matched := true
+		for _, subterm := range subterms {
+			if !strings.Contains(haystack, subterm) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			score += len(subterms)
+		}
+	}
+	return score
+}
+
+// recommendationTagSubterms splits a model-supplied intent tag into matchable
+// ASCII word units ("tracked-changes" → tracked, changes).
+func recommendationTagSubterms(tag string) []string {
+	return recommendationASCIIRuns.FindAllString(strings.ToLower(tag), -1)
 }
 
 // offerCardReadyResult is the model-facing tool_result for a delivered card.
