@@ -157,6 +157,130 @@ func TestAgentLoopOpenAIResponsesContinuationLive(t *testing.T) {
 	)
 }
 
+func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
+	if os.Getenv(openAIResponsesLiveGate) != "1" {
+		t.Skip("set KOE_SOL_RESPONSES_LIVE=1 to run the paid Sol continuation gate")
+	}
+
+	endpoint := strings.TrimSpace(os.Getenv(openAIResponsesLiveEndpoint))
+	if endpoint == "" {
+		endpoint = "http://127.0.0.1:8080"
+	}
+	apiKey := strings.TrimSpace(os.Getenv(openAIResponsesLiveAPIKey))
+	if apiKey == "" {
+		apiKey = "sk_test_123456"
+	}
+
+	gateway := client.NewGatewayClient(endpoint, apiKey)
+	recording := &openAIResponsesLiveRecordingClient{inner: gateway}
+	effect := &openAIResponsesLiveCountdownTool{
+		final: fmt.Sprintf("VERIFIED_%d", time.Now().UnixNano()),
+	}
+	registry := NewToolRegistry()
+	registry.Register(effect)
+
+	loop := NewAgentLoop(
+		recording,
+		registry,
+		"large",
+		t.TempDir(),
+		8,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+	loop.SetSpecificModel(openAIResponsesLiveModel)
+	loop.SetReasoningEffort("none")
+	loop.SetTemperature(0)
+	loop.SetMaxTokens(512)
+	loop.SetSkillDiscovery(false)
+	loop.SetEnableStreaming(true)
+	loop.SetBypassPermissions(true)
+	loop.SetCacheSource("koe_sol_responses_nudge_live")
+	loop.SetSessionID(fmt.Sprintf("koe-sol-responses-nudge-%d", time.Now().UnixNano()))
+	loop.SetHandler(&mockHandler{approveResult: true})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	started := time.Now()
+	result, usage, err := loop.Run(
+		ctx,
+		"Call countdown exactly once per response with key cobalt. If its result "+
+			"starts with CONTINUE, call countdown again with the same key. "+
+			"Otherwise reply with that exact result and nothing else.",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("AgentLoop failed: %v", err)
+	}
+	if !strings.Contains(result, effect.final) {
+		t.Fatal("final answer did not contain the runtime oracle")
+	}
+	if got := effect.executions.Load(); got != 3 {
+		t.Fatalf("tool executions = %d, want exactly 3", got)
+	}
+
+	requests, responses := recording.snapshot()
+	if len(requests) != 4 || len(responses) != 4 {
+		t.Fatalf(
+			"completion shape = %d requests/%d responses, want 4/4",
+			len(requests),
+			len(responses),
+		)
+	}
+	for index, request := range requests[1:] {
+		if !validOrdinaryOpenAIResponseID(request.PreviousResponseID) {
+			t.Fatalf("continuation request %d lost its cursor", index+1)
+		}
+	}
+	if responses[3].HasToolCalls() {
+		t.Fatal("final response unexpectedly contained a tool call")
+	}
+
+	var nudgeRequest *client.CompletionRequest
+	for index := range requests {
+		messages := requests[index].Messages
+		if len(messages) == 0 {
+			continue
+		}
+		last := messages[len(messages)-1]
+		if last.Role == "user" && strings.HasPrefix(last.Content.Text(), "[system] ") {
+			nudgeRequest = &requests[index]
+			break
+		}
+	}
+	if nudgeRequest == nil {
+		t.Fatal("no continuation request carried the loop nudge")
+	}
+	if len(nudgeRequest.Messages) < 3 {
+		t.Fatalf("nudge request has %d messages, want at least 3", len(nudgeRequest.Messages))
+	}
+	assistant := nudgeRequest.Messages[len(nudgeRequest.Messages)-3]
+	toolResult := nudgeRequest.Messages[len(nudgeRequest.Messages)-2]
+	assistantBlocks := assistant.Content.Blocks()
+	resultBlocks := toolResult.Content.Blocks()
+	if assistant.Role != "assistant" || len(assistantBlocks) != 1 ||
+		assistantBlocks[0].Type != "tool_use" {
+		t.Fatalf("assistant before nudge = %#v", assistant)
+	}
+	if toolResult.Role != "user" || len(resultBlocks) != 1 ||
+		resultBlocks[0].Type != "tool_result" ||
+		resultBlocks[0].ToolUseID != assistantBlocks[0].ID {
+		t.Fatalf("paired tool result before nudge = %#v", toolResult)
+	}
+	if usage == nil || usage.TotalTokens <= 0 || usage.CostUSD <= 0 {
+		t.Fatal("run did not report non-zero usage and cost")
+	}
+	t.Logf(
+		"content-free loop nudge verdict pass=true completion_calls=4 tool_effects=3 total_millis=%d cost_usd=%.6f",
+		time.Since(started).Milliseconds(),
+		usage.CostUSD,
+	)
+}
+
 type openAIResponsesLiveLookupTool struct {
 	executions atomic.Int32
 }
@@ -184,6 +308,41 @@ func (t *openAIResponsesLiveLookupTool) Run(_ context.Context, args string) (Too
 }
 
 func (*openAIResponsesLiveLookupTool) RequiresApproval() bool { return false }
+
+type openAIResponsesLiveCountdownTool struct {
+	executions atomic.Int32
+	final      string
+}
+
+func (t *openAIResponsesLiveCountdownTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "countdown",
+		Description: "Advance a fixed verification countdown by one step.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"key": map[string]any{"type": "string"},
+			},
+			"required": []string{"key"},
+		},
+	}
+}
+
+func (t *openAIResponsesLiveCountdownTool) Run(_ context.Context, args string) (ToolResult, error) {
+	if !strings.Contains(args, `"cobalt"`) {
+		return ToolResult{Content: "invalid countdown key", IsError: true}, nil
+	}
+	step := t.executions.Add(1)
+	if step < 3 {
+		return ToolResult{Content: fmt.Sprintf("CONTINUE_%d", step)}, nil
+	}
+	if step == 3 {
+		return ToolResult{Content: t.final}, nil
+	}
+	return ToolResult{Content: "countdown called too many times", IsError: true}, nil
+}
+
+func (*openAIResponsesLiveCountdownTool) RequiresApproval() bool { return false }
 
 type openAIResponsesLiveRecordingClient struct {
 	inner client.LLMClient
