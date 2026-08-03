@@ -46,13 +46,13 @@ const maxMCPDescLen = 500
 // surface it reads while choosing the argument. Appended AFTER the
 // maxMCPDescLen truncation so it is never cut off; byte-stable per session,
 // so prompt-cache safe.
-const fileOutputArgHint = " When saving output to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into a per-session artifact directory and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
+const fileOutputArgHint = " When saving output to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into the session's artifact directory (a per-session scratch dir on daemon-served runs, the working directory in CLI/TUI runs) and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
 
 // snapshotOutputArgHint is the browser_snapshot variant: for that tool an
 // omitted filename means the INLINE accessibility snapshot — the model's
 // primary page-reading channel — so the hint must not nudge it into file
 // mode by default.
-const snapshotOutputArgHint = " Prefer omitting filename entirely — the inline snapshot is the primary way to read a page. If you DO save to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into a per-session artifact directory and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
+const snapshotOutputArgHint = " Prefer omitting filename entirely — the inline snapshot is the primary way to read a page. If you DO save to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into the session's artifact directory (a per-session scratch dir on daemon-served runs, the working directory in CLI/TUI runs) and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
 
 var (
 	isPlaywrightCDPMode          = mcp.IsPlaywrightCDPMode
