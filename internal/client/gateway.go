@@ -989,7 +989,8 @@ type CompletionRequest struct {
 	Messages      []Message `json:"messages"`
 	ModelTier     string    `json:"model_tier,omitempty"`
 	SpecificModel string    `json:"specific_model,omitempty"`
-	// PreferredAPISurface is a non-binding Cloud routing hint. A sealed
+	// PreferredAPISurface is a non-binding Cloud routing hint. Cloud ignores it
+	// for providers that do not implement the requested surface. A sealed
 	// execution profile owns its route and therefore omits this field.
 	PreferredAPISurface string `json:"preferred_api_surface,omitempty"`
 	// Temperature keeps omitempty deliberately: `agent.temperature` defaults
@@ -1006,7 +1007,7 @@ type CompletionRequest struct {
 
 	// Provider-specific parameters (passed through to gateway)
 	Thinking        *ThinkingConfig `json:"thinking,omitempty"`
-	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // OpenAI o-models: minimal/low/medium/high
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // Model-dependent: none/minimal/low/medium/high/xhigh/max
 	// EffortTier is the unified cross-provider reasoning-effort intent
 	// ("low"/"high"/"xhigh"/"max"). Cloud translates it to each provider's
 	// native value (Anthropic output_config.effort direct; OpenAI reasoning_effort
@@ -1067,6 +1068,9 @@ type CompletionRequest struct {
 	ResolvedExecutionProfile *ExecutionProfile `json:"-"`
 }
 
+// The request hint deliberately uses Cloud's coarse "responses" vocabulary,
+// not the sealed-profile api_surface token "openai_responses". Cloud owns the
+// provider-specific interpretation and rollback of this preference.
 const ordinaryPreferredAPISurface = "responses"
 
 // ThinkingConfig for Anthropic extended thinking.

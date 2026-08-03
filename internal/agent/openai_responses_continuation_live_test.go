@@ -203,6 +203,8 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 	loop.SetSessionID(fmt.Sprintf("koe-sol-responses-nudge-%d", time.Now().UnixNano()))
 	loop.SetHandler(&mockHandler{approveResult: true})
 
+	// Three identical successful calls make request 4 carry the loop nudge;
+	// the tool's third result is the runtime oracle that ends the live turn.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	started := time.Now()

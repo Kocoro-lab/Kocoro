@@ -166,6 +166,8 @@ func TestAgentLoopOrdinaryOpenAIResponsesContinuesToolResult(t *testing.T) {
 }
 
 func TestAgentLoopOrdinaryOpenAIResponsesKeepsToolResultBeforeLoopNudge(t *testing.T) {
+	// With the consecutive-duplicate threshold at 3, request 4 carries the
+	// nudge and the fourth identical tool call triggers request 5's force-stop.
 	responses := make([]*client.CompletionResponse, 0, 5)
 	for index := 1; index <= 4; index++ {
 		response := ordinaryOpenAIToolResponse(
