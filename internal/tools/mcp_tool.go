@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -33,6 +34,25 @@ var fileProducingMCPArgs = map[string][]string{
 }
 
 const maxMCPDescLen = 500
+
+// fileOutputArgHint steers the model's filename choice for the tools in
+// fileProducingMCPArgs. 2026-08-02 incident: with the session CWD set to
+// ~/Desktop, the model self-addressed browser_snapshot intermediates as
+// absolute paths under that CWD. Absolute paths deliberately bypass the
+// artifact-scratch rewrite (they are the model's only way to place a
+// user-requested deliverable), so machine intermediates piled up on the
+// user's Desktop. The adapter cannot tell deliverable from intermediate on
+// an absolute path — only the model can, and the tool description is the
+// surface it reads while choosing the argument. Appended AFTER the
+// maxMCPDescLen truncation so it is never cut off; byte-stable per session,
+// so prompt-cache safe.
+const fileOutputArgHint = " When saving output to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into the session's artifact directory (a per-session scratch dir on daemon-served runs, the working directory in CLI/TUI runs) and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
+
+// snapshotOutputArgHint is the browser_snapshot variant: for that tool an
+// omitted filename means the INLINE accessibility snapshot — the model's
+// primary page-reading channel — so the hint must not nudge it into file
+// mode by default.
+const snapshotOutputArgHint = " Prefer omitting filename entirely — the inline snapshot is the primary way to read a page. If you DO save to a file for your own later reading, pass a BARE relative filename (e.g. \"page.md\") — it resolves into the session's artifact directory (a per-session scratch dir on daemon-served runs, the working directory in CLI/TUI runs) and the result echoes the absolute path. Only pass an absolute path when the user explicitly asked for the file at that location."
 
 var (
 	isPlaywrightCDPMode          = mcp.IsPlaywrightCDPMode
@@ -71,6 +91,13 @@ func (t *MCPTool) Info() agent.ToolInfo {
 	}
 	if r := []rune(desc); len(r) > maxMCPDescLen {
 		desc = string(r[:maxMCPDescLen]) + "..."
+	}
+	if key := t.serverName + "/" + t.tool.Name; fileProducingMCPArgs[key] != nil {
+		if key == "playwright/browser_snapshot" {
+			desc += snapshotOutputArgHint
+		} else {
+			desc += fileOutputArgHint
+		}
 	}
 
 	// Strip control characters from tool name
@@ -166,19 +193,26 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 
 	content, isError, err := t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
 	if err != nil && t.supervisor != nil && ctx.Err() == nil && mcp.IsTransportError(err) {
-		// Retry gate — TRANSPORT failures only. A retry re-executes the
-		// tool, so it is only safe when the request provably never reached a
-		// live server: dead pipe, EOF, killed process. Deliberately excluded:
-		//   - per-call timeouts: not evidence the server didn't act — a
-		//     write tool (send email, create event) may time out AFTER its
-		//     side effect landed, and a retry would duplicate it;
-		//   - JSON-RPC/protocol errors (mcp-go returns them as err): a
-		//     second identical dispatch fails identically;
+		// Post-dispatch TRANSPORT failure. The request was already written to
+		// a server that was alive at dispatch time, and "connection died"
+		// does NOT prove the server never acted: a stdio server can execute
+		// its side effect and exit before writing the JSON-RPC response —
+		// on the wire that is indistinguishable from died-before-acting.
+		// Recovery therefore splits into two independent halves:
+		//   - REPAIR always runs: MarkTransportSuspect invalidates the
+		//     supervisor's <60s health-cache freshness so ProbeNow performs a
+		//     REAL probe (and on-demand reconnect) — the NEXT call must not
+		//     land on the corpse (2026-07-29: 6.5 min on a dead pipe);
+		//   - REPLAY is gated on the tool's own MCP annotations
+		//     (readOnlyHint/idempotentHint): only a tool whose duplicate
+		//     execution is declared harmless is re-dispatched. Everything
+		//     else — send-message, create-event, unannotated tools — surfaces
+		//     as outcome-unknown so the model verifies instead of silently
+		//     double-executing a write.
+		// Deliberately excluded from all of this (see IsTransportError):
+		//   - per-call timeouts: the server may still be executing;
+		//   - JSON-RPC/protocol errors: a second dispatch fails identically;
 		//   - cancelled ctx: retry after user interrupt is wasted work.
-		// MarkTransportSuspect invalidates the supervisor's <60s health-cache
-		// freshness so ProbeNow performs a REAL probe (and, if the transport
-		// is confirmed dead, an on-demand reconnect) instead of blessing a
-		// retry with cached pre-failure state.
 		log.Printf("[mcp-tool] %s/%s: transport failure (%v), probing for on-demand reconnect", t.serverName, t.tool.Name, err)
 		t.supervisor.MarkTransportSuspect(t.serverName)
 		// Re-ensure Chrome CDP is available before reconnecting — Chrome may
@@ -189,11 +223,17 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 			}
 		}
 		reconHealth := t.supervisor.ProbeNow(t.serverName)
-		if reconHealth.State == mcp.StateHealthy {
+		if !mcp.ToolReplaySafe(t.tool) {
+			err = &mcp.OutcomeUnknownError{Server: t.serverName, Tool: t.tool.Name, Err: err}
+		} else if reconHealth.State == mcp.StateHealthy {
 			content, isError, err = t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
 		}
 	}
 	if err != nil {
+		var unknown *mcp.OutcomeUnknownError
+		if errors.As(err, &unknown) {
+			return agent.ToolResult{Content: outcomeUnknownResultMessage(unknown), IsError: true}, nil
+		}
 		return agent.ToolResult{Content: fmt.Sprintf("MCP call failed: %v", err), IsError: true}, nil
 	}
 
@@ -211,6 +251,19 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		content = maybeAnnotateResultPaths(t.serverName, content, t.manager)
 	}
 	return agent.ToolResult{Content: content, IsError: isError}, nil
+}
+
+// outcomeUnknownResultMessage renders a post-dispatch transport failure for
+// the model. The wording is load-bearing: an error result's default read is
+// "the operation did not happen", and for this failure that read is exactly
+// what produces duplicate side effects — the model must be steered to verify
+// before re-issuing the call, without being forbidden from recovering.
+func outcomeUnknownResultMessage(e *mcp.OutcomeUnknownError) string {
+	return fmt.Sprintf(
+		"MCP call outcome UNKNOWN: %s/%s was dispatched, but the connection to the server died before a response arrived (%v). "+
+			"The operation may or may not have taken effect — do not assume it failed. "+
+			"If this tool has side effects, verify the outcome first (e.g. with a read-only list/get/search call) and only retry if the effect is confirmed absent; a blind retry can execute the operation twice.",
+		e.Server, e.Tool, e.Err)
 }
 
 func (t *MCPTool) RequiresApproval() bool { return false }

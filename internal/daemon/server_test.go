@@ -3884,3 +3884,35 @@ func TestServer_UpdateAgent_WritesAvatar(t *testing.T) {
 		t.Fatalf("avatar = %q, want %q", profile.Avatar, "https://cdn.example.com/b.png")
 	}
 }
+
+func TestMCPConfigChanged_RuntimeTunableFieldsDetected(t *testing.T) {
+	base := func() *config.Config {
+		return &config.Config{
+			MCPServers: map[string]mcp.MCPServerConfig{
+				"srv": {Command: "cmd"},
+			},
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate func(*mcp.MCPServerConfig)
+	}{
+		{"tool_timeout_secs", func(c *mcp.MCPServerConfig) { c.ToolTimeoutSeconds = 600 }},
+		{"workspace_base", func(c *mcp.MCPServerConfig) { c.WorkspaceBase = "/tmp/x" }},
+		{"connect_timeout_secs", func(c *mcp.MCPServerConfig) { c.ConnectTimeoutSeconds = 120 }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldCfg, newCfg := base(), base()
+			srv := newCfg.MCPServers["srv"]
+			tc.mutate(&srv)
+			newCfg.MCPServers["srv"] = srv
+			if !mcpConfigChanged(oldCfg, newCfg) {
+				t.Fatalf("%s change must trigger an MCP rebuild on reload — otherwise the preserved value never reaches the runtime", tc.name)
+			}
+		})
+	}
+	if mcpConfigChanged(base(), base()) {
+		t.Fatal("identical configs must not report a change")
+	}
+}

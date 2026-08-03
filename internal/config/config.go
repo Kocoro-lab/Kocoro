@@ -1468,6 +1468,17 @@ func mergeBuiltinMCPServers(cfg *Config) {
 			if existing.ConnectTimeoutSeconds > 0 {
 				merged.ConnectTimeoutSeconds = existing.ConnectTimeoutSeconds
 			}
+			// ToolTimeoutSeconds and WorkspaceBase are user-tunable (their
+			// struct comments say so) and PATCH /config accepts them on
+			// builtins — before this they survived in yaml but were silently
+			// rebuilt away here on every config load, so the runtime ignored
+			// the user's value while the yaml kept showing it.
+			if existing.ToolTimeoutSeconds > 0 {
+				merged.ToolTimeoutSeconds = existing.ToolTimeoutSeconds
+			}
+			if existing.WorkspaceBase != "" {
+				merged.WorkspaceBase = existing.WorkspaceBase
+			}
 			for k, v := range existing.Env {
 				if merged.Env == nil {
 					merged.Env = make(map[string]string, len(existing.Env))

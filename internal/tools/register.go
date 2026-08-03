@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -1347,7 +1348,19 @@ func RebuildRegistryForHealth(
 
 	playwrightPresent := false
 	if mcpMgr != nil {
-		for serverName, health := range healthStates {
+		// Deterministic server order. Registration is first-wins on tool-name
+		// collisions, so iterating the healthStates map directly made the
+		// owning server of a shared tool name flip with Go's randomized map
+		// order on every rebuild — mid-session the same tool name could start
+		// dispatching to a different backend. Sorted order pins the owner to
+		// the alphabetically-first server, stable across rebuilds.
+		serverNames := make([]string, 0, len(healthStates))
+		for name := range healthStates {
+			serverNames = append(serverNames, name)
+		}
+		sort.Strings(serverNames)
+		for _, serverName := range serverNames {
+			health := healthStates[serverName]
 			switch health.State {
 			case mcp.StateHealthy, mcp.StateDisconnected:
 				// Healthy works directly; Disconnected is exposed with on-demand
@@ -1374,6 +1387,9 @@ func RebuildRegistryForHealth(
 			tools := mcpMgr.CachedTools(serverName)
 			for _, t := range tools {
 				if _, exists := reg.Get(t.Tool.Name); exists {
+					// Deterministic shadowing is permanent shadowing: without
+					// this line a hidden tool is undiagnosable from the outside.
+					log.Printf("[mcp] %s/%s hidden: name already registered (first-wins in sorted server order)", serverName, t.Tool.Name)
 					continue
 				}
 				mt := NewMCPTool(t.ServerName, t.Tool, mcpMgr)
