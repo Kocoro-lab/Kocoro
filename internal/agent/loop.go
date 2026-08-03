@@ -6123,12 +6123,28 @@ iterationLoop:
 			if !er.result.StopAgentLoop {
 				continue
 			}
+			// Content is written at the model; TerminalUserMessage is written at
+			// the user. This assistant message is both the run's answer and what
+			// the session transcript replays, so it must be the human-addressed
+			// one. The model-facing Content is already in the transcript as the
+			// tool_result appended just above, so no context is lost.
 			text := er.result.Content
-			messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent(text)})
-			stampMessage()
+			if er.result.TerminalUserMessage != "" {
+				text = er.result.TerminalUserMessage
+			}
+			if er.result.TerminalUserSuppressed {
+				text = ""
+			}
+			// An empty answer writes no assistant message: the transcript ends on
+			// the tool_result user message, which is a valid resume point, and no
+			// blank bubble is persisted or streamed.
+			if text != "" {
+				messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent(text)})
+				stampMessage()
+			}
 			captureRunMessages()
 			setRunStatus(runstatus.CodeNone, false)
-			if a.handler != nil {
+			if a.handler != nil && text != "" {
 				a.handler.OnText(text)
 			}
 			return text, usage, nil

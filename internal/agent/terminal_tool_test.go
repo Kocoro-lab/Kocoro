@@ -227,6 +227,124 @@ func TestAgentLoop_TerminalToolLegacyToolCallsFilterTranscript(t *testing.T) {
 	}
 }
 
+type terminalErrorCardTool struct{}
+
+func (terminalErrorCardTool) Info() ToolInfo {
+	return ToolInfo{Name: "terminal_card", Parameters: map[string]any{"type": "object"}}
+}
+func (terminalErrorCardTool) RequiresApproval() bool { return false }
+func (terminalErrorCardTool) StopsAgentLoop() bool   { return true }
+func (terminalErrorCardTool) Run(context.Context, string) (ToolResult, error) {
+	result := BusinessError("stream disconnected; do not continue this task")
+	result.StopAgentLoop = true
+	result.TerminalUserMessage = "I couldn't show the installation card. Please try again."
+	return result, nil
+}
+
+// A terminal tool's Content is written at the model, so promoting it to the
+// run's answer put model-directed instructions — and raw "[business error] ..."
+// strings — in the user's final chat bubble and in the replayed transcript.
+// TerminalUserMessage is what the user must get instead; Content must still
+// reach the model as the tool_result so a resumed run keeps its context.
+func TestAgentLoop_TerminalToolUserMessageReplacesModelFacingContent(t *testing.T) {
+	sideEffect := &terminalSideEffectTool{}
+	reg := NewToolRegistry()
+	reg.Register(terminalErrorCardTool{})
+	reg.Register(sideEffect)
+	loop := NewAgentLoop(&terminalTestClient{}, reg, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
+	result, _, err := loop.Run(context.Background(), "need a card", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "I couldn't show the installation card. Please try again." {
+		t.Fatalf("run answer was not the user-facing text: %q", result)
+	}
+	if strings.Contains(result, "[business error]") {
+		t.Fatalf("business-error prefix reached the user: %q", result)
+	}
+	for _, msg := range loop.RunMessages() {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, block := range msg.Content.Blocks() {
+			if block.Type != "text" {
+				continue
+			}
+			if strings.Contains(block.Text, "[business error]") || strings.Contains(block.Text, "do not continue this task") {
+				t.Fatalf("model-directed text persisted as an assistant message: %q", block.Text)
+			}
+		}
+	}
+	transcript, err := json.Marshal(loop.RunMessages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(transcript), "do not continue this task") {
+		t.Fatalf("model-facing tool_result lost its content: %s", transcript)
+	}
+	assertNativeToolPairs(t, loop.RunMessages())
+}
+
+type terminalSilentCardTool struct{}
+
+func (terminalSilentCardTool) Info() ToolInfo {
+	return ToolInfo{Name: "terminal_card", Parameters: map[string]any{"type": "object"}}
+}
+func (terminalSilentCardTool) RequiresApproval() bool { return false }
+func (terminalSilentCardTool) StopsAgentLoop() bool   { return true }
+func (terminalSilentCardTool) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{Content: "card delivered; stop here", StopAgentLoop: true, TerminalUserSuppressed: true}, nil
+}
+
+type recordingTextHandler struct {
+	streamingToolHandler
+	texts []string
+}
+
+func (h *recordingTextHandler) OnText(text string) { h.texts = append(h.texts, text) }
+
+// When the client already rendered the boundary itself (a localized installation
+// card), the run must end with no assistant bubble at all rather than an English
+// sentence no client can localize. The model-facing Content still has to survive
+// as the tool_result so a resumed run keeps its context.
+func TestAgentLoop_TerminalToolSuppressedUserMessageEmitsNoAssistantText(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(terminalSilentCardTool{})
+	reg.Register(&terminalSideEffectTool{})
+	loop := NewAgentLoop(&terminalTestClient{}, reg, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
+	handler := &recordingTextHandler{}
+	loop.SetHandler(handler)
+	result, _, err := loop.Run(context.Background(), "need a card", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "" {
+		t.Fatalf("suppressed terminal result still produced an answer: %q", result)
+	}
+	if len(handler.texts) != 0 {
+		t.Fatalf("suppressed terminal result streamed text to the client: %v", handler.texts)
+	}
+	messages := loop.RunMessages()
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, block := range msg.Content.Blocks() {
+			if block.Type == "text" && strings.Contains(block.Text, "stop here") {
+				t.Fatalf("suppressed text persisted as an assistant message: %q", block.Text)
+			}
+		}
+	}
+	transcript, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(transcript), "card delivered; stop here") {
+		t.Fatalf("model-facing tool_result lost its content: %s", transcript)
+	}
+	assertNativeToolPairs(t, messages)
+}
+
 type terminalSpeculativeRead struct {
 	started   chan struct{}
 	cancelled chan struct{}

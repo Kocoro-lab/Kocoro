@@ -3,6 +3,7 @@ package skills
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -195,6 +196,52 @@ func TestValidateOfficialCatalogRejectsMalformedEntries(t *testing.T) {
 			}
 			if err := validateOfficialCatalog(entries); err == nil {
 				t.Fatalf("malformed catalog admitted: %+v", entries)
+			}
+		})
+	}
+}
+
+// An occupied destination is never the installer's to clear. Installs stage
+// under skills/.staging and commit by rename, so an interrupted install leaves
+// nothing at the destination — anything there is user content, whether or not it
+// has a SKILL.md yet (a half-authored skill is indistinguishable from
+// "leftovers"). Both shapes must survive untouched and surface as a recoverable
+// conflict, so the daemon answers 409 with the path instead of a bare 500.
+func TestInstallCatalogEntryPreservesOccupiedDestinationAsRecoverableConflict(t *testing.T) {
+	dir := t.TempDir()
+	tarball := fakeTarball(t, "skills-"+strings.Repeat("b", 40), "half-authored", "hand-made")
+	original := openRepoTarball
+	t.Cleanup(func() { openRepoTarball = original })
+	openRepoTarball = func(context.Context, string, string) (io.ReadCloser, error) {
+		return tarballReader(tarball), nil
+	}
+
+	for _, tc := range []struct {
+		name, slug, file, body string
+	}{
+		{"no SKILL.md yet", "half-authored", "notes.md", "my draft"},
+		{"manual install", "hand-made", "SKILL.md", "---\nname: hand-made\ndescription: mine\n---\nbody\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := testCatalogEntry(tc.slug)
+			entry.Installation = pinnedTestInstallation(tarball, entry.Slug)
+			skillDir := filepath.Join(dir, "skills", entry.Slug)
+			if err := os.MkdirAll(skillDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(skillDir, tc.file), []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := InstallCatalogEntry(context.Background(), dir, entry, nil)
+			if !errors.Is(err, ErrSkillInstallConflict) {
+				t.Fatalf("want ErrSkillInstallConflict, got %v", err)
+			}
+			if !strings.Contains(err.Error(), skillDir) {
+				t.Fatalf("conflict error does not name the path the user must clear: %v", err)
+			}
+			data, readErr := os.ReadFile(filepath.Join(skillDir, tc.file))
+			if readErr != nil || string(data) != tc.body {
+				t.Fatalf("installer modified user content: data=%q err=%v", data, readErr)
 			}
 		})
 	}

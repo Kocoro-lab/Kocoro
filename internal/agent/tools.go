@@ -125,6 +125,29 @@ type ToolResult struct {
 	// user action card; it is not model-controllable and never asks the model
 	// for another tool call or synthesis turn.
 	StopAgentLoop bool `json:"-"`
+	// TerminalUserMessage is the user-addressed final answer for a
+	// StopAgentLoop result. Content stays model-facing — it is the tool_result
+	// the model reads if the run resumes — while this string is what the run
+	// returns as its reply and what the transcript records as the assistant
+	// message. Without it, a boundary tool's model-directed instruction ("stop
+	// here and wait") or a raw "[business error] ..." string becomes the user's
+	// final chat bubble, since loop.go promotes a terminal result's Content to
+	// the run's answer. Same motivation as InternalOnly, opposite direction:
+	// that flag hides LLM-addressed text from clients, this one substitutes
+	// human-addressed text for them.
+	//
+	// Ignored unless StopAgentLoop is set. Never crosses the wire as a field.
+	TerminalUserMessage string `json:"-"`
+	// TerminalUserSuppressed ends a StopAgentLoop run with no assistant message
+	// at all, because the client already rendered the boundary itself — a
+	// localized installation card, for instance. Prefer this over writing an
+	// English sentence the client cannot localize: TerminalUserMessage is
+	// persisted prose, not a structured i18n key, so anything put there ships
+	// untranslated. Content still reaches the model as the tool_result, so a
+	// resumed run keeps its context.
+	//
+	// Takes precedence over TerminalUserMessage. Ignored unless StopAgentLoop.
+	TerminalUserSuppressed bool `json:"-"`
 }
 
 type GUIObservationOutcome struct {

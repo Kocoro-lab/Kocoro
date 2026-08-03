@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,8 +26,24 @@ const (
 	CapSkillInstallRecommendationV1 = "skill_install_recommendation_v1"
 	skillRecommendationHeader       = "X-Kocoro-Consumer-Capabilities"
 	desktopDeviceHeader             = "X-Kocoro-Desktop-Device-ID"
-	skillRecommendationTTL          = 24 * time.Hour
+	// skillRecommendationTTL bounds how long an offered card stays actionable,
+	// and (via pruneLocked) how long a terminal record is retained for
+	// idempotent re-entry. Workload: a user who leaves Desktop open overnight
+	// and installs the next morning must still be able to continue the same
+	// card. Symptom when it binds: continue/dismiss returns "no longer active"
+	// and the run has to be re-asked. Override: not user-tunable by design —
+	// the token is a bearer capability and a longer window widens its replay
+	// surface; raise this const if the overnight workload proves too tight.
+	skillRecommendationTTL = 24 * time.Hour
 )
+
+// skillRecommendationTerminalStates are the states a record can never leave.
+// Once past its TTL such a record is dead weight: the card cannot be shown,
+// continued, or dismissed again, and the install receipt it carries has already
+// been applied to disk.
+var skillRecommendationTerminalStates = map[string]bool{
+	"completed": true, "dismissed": true, "expired": true, "superseded": true,
+}
 
 func skillRecommendationsEnabled(cfg *config.Config) bool {
 	return cfg == nil || cfg.Daemon.SkillRecommendationsEnabled == nil || *cfg.Daemon.SkillRecommendationsEnabled
@@ -521,12 +538,37 @@ func (s *skillRecommendationStore) load() error {
 		s.byID[v.RecommendationID] = v
 		s.byTurn[v.OwnerAccountID+"\x00"+v.OwnerDeviceID+"\x00"+v.SessionID+"\x00"+v.TurnID] = v.RecommendationID
 	}
+	s.pruneLocked()
 	return nil
+}
+
+// pruneLocked drops terminal records whose TTL has elapsed. Without it the store
+// is a pure accumulator: nothing else deletes from byID/byTurn, turn keys embed
+// a per-run random turnID so they never collide across runs, and saveLocked
+// re-serializes the entire map — including each record's InstallEntries — on
+// every offer/dismiss/continue/expire. Both the file and the per-mutation cost
+// would grow without bound.
+//
+// Callers hold s.mu (load() runs in the constructor, before the store is
+// shared).
+func (s *skillRecommendationStore) pruneLocked() {
+	now := time.Now()
+	for id, v := range s.byID {
+		if skillRecommendationTerminalStates[v.State] && v.ExpiresAt.Before(now) {
+			delete(s.byID, id)
+		}
+	}
+	for key, id := range s.byTurn {
+		if _, ok := s.byID[id]; !ok {
+			delete(s.byTurn, key)
+		}
+	}
 }
 func (s *skillRecommendationStore) saveLocked() error {
 	if s.path == "" {
 		return nil
 	}
+	s.pruneLocked()
 	values := make([]skillRecommendationDiskV1, 0, len(s.byID))
 	for _, v := range s.byID {
 		values = append(values, skillRecommendationDiskV1{Recommendation: *v, OwnerAccountID: v.OwnerAccountID, OwnerDeviceID: v.OwnerDeviceID, OwnerAgentName: v.OwnerAgentName, Consumed: v.Consumed, ContinuationRunning: v.ContinuationRunning, Generation: v.Generation, InstallEntries: cloneCatalogEntriesForRecommendation(v.InstallEntries), InstallReceipt: v.InstallReceipt})
@@ -740,6 +782,39 @@ func recommendationQueryScore(entry skills.CatalogEntry, terms []string) int {
 	return score
 }
 
+// offerCardReadyResult is the model-facing tool_result for a delivered card.
+// It is a const rather than an inline literal because AuditSummaries classifies
+// the offer state by matching it: two copies of the prose let the audit silently
+// record "not_offered" the moment one of them was reworded.
+const offerCardReadyResult = "A skill installation card is ready. Stop here and wait for the user's choice."
+
+// User-addressed counterparts to this tool's terminal FAILURE results. loop.go
+// promotes a terminal result to the run's final answer, so these — not the
+// model-facing Content — are what the user reads.
+//
+// These are persisted prose, not structured i18n keys, so they ship in English
+// and clients cannot localize them; that is why the success path emits nothing
+// here and lets the already-localized installation card be the only user-facing
+// result. Giving terminal failures a structured reason code (the
+// EventApprovalNotice {code, message} shape) is the follow-up that would let
+// clients localize these too.
+const (
+	offerDisabledUserMessage      = "Skill recommendations are turned off, so I can't offer to install the skill this task needs."
+	offerInactiveUserMessage      = "This skill installation offer is no longer active."
+	offerUndeliverableUserMessage = "I couldn't show the skill installation card — the Desktop connection dropped. Nothing was installed; please try again."
+	offerStoreErrorUserMessage    = "I couldn't prepare the skill installation card. Nothing was installed; please try again."
+)
+
+// terminalOffer pairs a model-facing tool_result with the sentence the user
+// actually sees. Every StopAgentLoop return from this tool must go through it —
+// otherwise a raw "[business error] ..." string ends the chat as the user's
+// final bubble and is persisted into the session transcript.
+func terminalOffer(result agent.ToolResult, userMessage string) agent.ToolResult {
+	result.StopAgentLoop = true
+	result.TerminalUserMessage = userMessage
+	return result
+}
+
 type offerSkillInstallationTool struct {
 	shannonDir string
 	catalog    skills.CatalogProvider
@@ -777,7 +852,7 @@ func (t *offerSkillInstallationTool) AuditSummaries(args, result string) (string
 		}
 	}
 	state := "not_offered"
-	if strings.Contains(result, "installation card is ready") {
+	if strings.Contains(result, offerCardReadyResult) {
 		state = "offered"
 	}
 	input, _ := json.Marshal(map[string]any{"catalog_ids": ids, "reason_code": "task_capability_missing"})
@@ -790,9 +865,7 @@ func (t *offerSkillInstallationTool) Run(ctx context.Context, args string) (agen
 		return agent.BusinessError("skill recommendation is unavailable for this consumer"), nil
 	}
 	if rc.enabled != nil && !rc.enabled() {
-		result := agent.BusinessError("skill recommendations are disabled")
-		result.StopAgentLoop = true
-		return result, nil
+		return terminalOffer(agent.BusinessError("skill recommendations are disabled"), offerDisabledUserMessage), nil
 	}
 	var in struct {
 		CatalogIDs []string `json:"catalog_ids"`
@@ -837,28 +910,30 @@ func (t *offerSkillInstallationTool) Run(ctx context.Context, args string) (agen
 	}
 	v, created, err := rc.store.offer(rc.accountID, rc.deviceID, rc.agentName, rc.sessionID, rc.turnID, revision, items, installEntries)
 	if err != nil {
-		result := agent.BusinessError(err.Error())
-		result.StopAgentLoop = true
-		return result, nil
+		// The raw error is logged, not returned: it is a persistence detail
+		// (path, errno, wrapped %w chain) and this string reaches the user.
+		log.Printf("daemon: skill recommendation offer failed to persist: %v", err)
+		return terminalOffer(agent.BusinessError("persist recommendation offer"), offerStoreErrorUserMessage), nil
 	}
 	if v.State != "offered" {
-		result := agent.BusinessError("the recommendation for this turn is no longer active")
-		result.StopAgentLoop = true
-		return result, nil
+		return terminalOffer(agent.BusinessError("the recommendation for this turn is no longer active"), offerInactiveUserMessage), nil
 	}
 	if created {
-		if !rc.emit(v) {
+		// emit is nil when no /events sink was live at admission time. The tool
+		// stays registered regardless (registration keys on stable request
+		// attributes so the tools array does not flap across turns), so an
+		// undeliverable card fails here rather than by vanishing from the schema.
+		if rc.emit == nil || !rc.emit(v) {
 			if err := rc.store.expire(v.RecommendationID); err != nil {
-				result := agent.BusinessError(err.Error())
-				result.StopAgentLoop = true
-				return result, nil
+				log.Printf("daemon: skill recommendation expire after failed delivery: %v", err)
+				return terminalOffer(agent.BusinessError("expire undelivered recommendation"), offerStoreErrorUserMessage), nil
 			}
-			result := agent.BusinessError("Desktop recommendation stream disconnected; do not continue this task")
-			result.StopAgentLoop = true
-			return result, nil
+			return terminalOffer(agent.BusinessError("Desktop recommendation stream disconnected; do not continue this task"), offerUndeliverableUserMessage), nil
 		}
 	}
-	return agent.ToolResult{Content: "A skill installation card is ready. Stop here and wait for the user's choice.", StopAgentLoop: true}, nil
+	// Success is silent: Desktop has already rendered the localized card, so an
+	// extra English sentence would be both redundant and untranslatable.
+	return agent.ToolResult{Content: offerCardReadyResult, StopAgentLoop: true, TerminalUserSuppressed: true}, nil
 }
 func containsFold(a []string, b string) bool {
 	for _, v := range a {
@@ -1265,7 +1340,10 @@ func (s *Server) handleSkillRecommendationContinue(w http.ResponseWriter, r *htt
 	flusher.Flush()
 }
 func skillRecommendationContinuationRequest(v skillRecommendationV1, followup string) RunAgentRequest {
-	return RunAgentRequest{Text: followup, SessionID: v.SessionID, Agent: v.OwnerAgentName, Source: "desktop", IdempotencyKey: "skillrec:" + v.RecommendationID}
+	// followup is daemon-authored ("User enabled ..."), not something the user
+	// typed — SystemInjected keeps it out of displayed history, share exports and
+	// the session index. Without it the user sees a bubble they never wrote.
+	return RunAgentRequest{Text: followup, SessionID: v.SessionID, Agent: v.OwnerAgentName, Source: "desktop", SystemInjected: true, IdempotencyKey: "skillrec:" + v.RecommendationID}
 }
 func (s *Server) handleSkillRecommendationDismiss(w http.ResponseWriter, r *http.Request) {
 	if !s.skillRecommendationsEnabled() || s.auth == nil || s.skillRecommendations == nil {

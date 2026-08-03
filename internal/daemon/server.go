@@ -5633,6 +5633,7 @@ func (s *Server) handleListDownloadableSkills(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	orderDownloadableCatalogEntries(entries)
 	globalDir := filepath.Join(s.deps.ShannonDir, "skills")
 	result := make([]skills.DownloadableSkill, 0, len(entries))
 	for _, entry := range entries {
@@ -5643,8 +5644,11 @@ func (s *Server) handleListDownloadableSkills(w http.ResponseWriter, r *http.Req
 		if _, err := os.Stat(filepath.Join(globalDir, entry.Slug, "SKILL.md")); err == nil {
 			installed = true
 		} else if !os.IsNotExist(err) {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+			// One unreadable skill directory must not 500 the entire listing.
+			// This endpoint was a static table plus os.Stat before the catalog
+			// move and treated any stat failure as "not installed"; a permission
+			// or I/O error on a single slug should not blank the skill browser.
+			log.Printf("daemon: /skills/downloadable: stat %q: %v", entry.Slug, err)
 		}
 		result = append(result, skills.DownloadableSkill{
 			Name:        entry.Slug,
@@ -5653,6 +5657,32 @@ func (s *Server) handleListDownloadableSkills(w http.ResponseWriter, r *http.Req
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"skills": result})
+}
+
+// orderDownloadableCatalogEntries preserves the original /skills/downloadable
+// response order consumed by released Desktop builds. Catalog storage order is
+// not a UI contract: trusted registry updates may regroup entries or add new
+// ones. Known legacy slugs keep their historical positions; new slugs follow in
+// provider order.
+func orderDownloadableCatalogEntries(entries []skills.CatalogEntry) {
+	legacy := []string{
+		"pdf-reader", "algorithmic-art", "brand-guidelines", "canvas-design",
+		"claude-api", "doc-coauthoring", "frontend-design", "internal-comms",
+		"mcp-builder", "skill-creator", "slack-gif-creator", "theme-factory",
+		"web-artifacts-builder", "webapp-testing", "docx", "pdf", "pptx", "xlsx",
+	}
+	rank := make(map[string]int, len(legacy))
+	for i, slug := range legacy {
+		rank[slug] = i
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		left, leftKnown := rank[entries[i].Slug]
+		right, rightKnown := rank[entries[j].Slug]
+		if leftKnown != rightKnown {
+			return leftKnown
+		}
+		return leftKnown && left < right
+	})
 }
 
 // handlePreviewDownloadableSkill serves an official skill's SKILL.md so the UI
@@ -5706,6 +5736,14 @@ func (s *Server) handleInstallSkill(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, skills.ErrSkillNotInRepo) {
 			s.auditHTTPOpError("POST", endpoint, "not in upstream repo", err)
 			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		// The destination holds content the installer did not write. That is a
+		// user-resolvable conflict (the message names the path), not an internal
+		// failure — and never something to resolve by deleting for them.
+		if errors.Is(err, skills.ErrSkillInstallConflict) {
+			s.auditHTTPOpError("POST", endpoint, "destination conflict", err)
+			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 		s.auditHTTPOpError("POST", endpoint, "install failed", err)
@@ -6806,9 +6844,14 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		// as soon as the reloaded config has been validated.
 		s.closeSkillRecommendationSinks()
 		if err := s.skillRecommendations.invalidateAll(); err != nil {
+			// failClosedAll already disables the protocol and the kill switch was
+			// stored above, so the end state the user asked for holds. Do NOT
+			// abort the reload: everything below belongs to unrelated subsystems
+			// (MCP servers, watchers, heartbeat, the config swap itself), and
+			// returning here silently dropped all of them while leaving the
+			// stored gate ahead of the config actually in effect.
 			s.skillRecommendations.failClosedAll(err)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+			log.Printf("daemon: reload warning: skill recommendation invalidation failed: %v", err)
 		}
 	}
 

@@ -157,6 +157,13 @@ type RunAgentRequest struct {
 	// by daemon startup recovery: Text is an internal continuation marker, not
 	// a new user request, and is persisted as SystemInjected.
 	ResumeInterrupted bool `json:"-"`
+	// SystemInjected marks Text as daemon-authored control input rather than
+	// something the user typed — e.g. the follow-up that resumes a run after a
+	// skill installation card was accepted. It is persisted to MessageMeta so
+	// display, share export, and the FTS index all filter it out; without it the
+	// user's history shows a bubble they never wrote. Internal only: `json:"-"`
+	// keeps an HTTP client from claiming it.
+	SystemInjected bool `json:"-"`
 	// Interrupted recovery fields are internal claim metadata. RunAgent checks
 	// and persists them only after acquiring the session route lock, so a
 	// foreground turn that completed after discovery supersedes the stale
@@ -3217,7 +3224,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				Source:         source,
 				MessageID:      msgID,
 				Timestamp:      session.TimePtr(userMsgTime),
-				SystemInjected: req.ResumeInterrupted,
+				SystemInjected: req.ResumeInterrupted || req.SystemInjected,
 			},
 		)
 		preLoopUserAppended = true
@@ -3344,9 +3351,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 
 	tools.SetRegistrySkills(reg, loadedSkills)
 	var skillRecommendationRun *skillRecommendationRunContext
+	// Gate on stable request attributes only (source + device id + declared
+	// capability + config), never on live SSE sink state. Both tools are Direct,
+	// so they sit in the first-turn schema set: keying registration on whether an
+	// /events sink happened to be connected at admission time made the tools
+	// array differ between turns of the SAME session purely because the stream
+	// was reconnecting, fragmenting the prompt cache (docs/cache-strategy.md
+	// request stability). A missing sink is handled at call time instead — the
+	// offer tool fails closed on a nil emit.
 	if skillRecommendationsEnabled(runCfg) && isSkillRecommendationDesktopSource(req.Source) && req.DesktopDeviceID != "" &&
 		req.ConsumerCapabilities[CapSkillInstallRecommendationV1] &&
-		deps.SkillRecommendations != nil && deps.AuthManager != nil && req.SkillRecommendationEmit != nil {
+		deps.SkillRecommendations != nil && deps.AuthManager != nil {
 		accountID, ok := deps.AuthManager.VerifiedAccountID()
 		if ok {
 			turnID := "skillrec/" + generateRequestID()

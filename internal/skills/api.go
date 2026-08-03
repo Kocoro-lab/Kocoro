@@ -442,8 +442,17 @@ func InstallCatalogEntry(ctx context.Context, shannonDir string, entry CatalogEn
 		}
 		return CatalogInstallReceipt{}, fmt.Errorf("skill %q is installed from a different catalog artifact", entry.Slug)
 	}
+	// A destination that exists without a receipt is never ours to replace, with
+	// or without a SKILL.md. Installs stage under skills/.staging and commit by
+	// rename, so an interrupted catalog install cannot leave a partial
+	// destination directory — there is no such thing as a remnant we can prove is
+	// ours. What is there is user content: a manual/legacy install of the same
+	// slug, or a skill someone is still authoring by hand (which looks identical
+	// to "leftovers" right up until they write SKILL.md). Report a recoverable
+	// conflict naming the path so the caller can answer 409 with something
+	// actionable, instead of a bare 500 the user cannot interpret.
 	if _, statErr := os.Stat(destDir); statErr == nil {
-		return CatalogInstallReceipt{}, fmt.Errorf("skill %q already exists without a matching catalog receipt", entry.Slug)
+		return CatalogInstallReceipt{}, fmt.Errorf("%w: %q exists without a matching catalog receipt; move or remove %s to install it", ErrSkillInstallConflict, entry.Slug, destDir)
 	} else if !os.IsNotExist(statErr) {
 		return CatalogInstallReceipt{}, statErr
 	}
@@ -641,6 +650,12 @@ var ErrSkillNotInRepo = errors.New("skill not found in catalog archive")
 // controlled catalog's immutable archive digest. Retrying the same ref cannot make
 // mismatched bytes trustworthy, so installFromRepo fails immediately.
 var ErrSkillArchiveIntegrity = errors.New("skill archive integrity verification failed")
+
+// ErrSkillInstallConflict reports that the destination directory already holds
+// content this installer did not write and cannot prove it owns. It is
+// recoverable by the user (move or delete the path), so callers surface it as a
+// conflict rather than an internal error — and never resolve it by deleting.
+var ErrSkillInstallConflict = errors.New("skill install destination conflict")
 
 // installFromRepo downloads a skill from a catalog-declared GitHub repo over HTTP
 // (the GitHub codeload tarball — no `git` binary required, so it works on a

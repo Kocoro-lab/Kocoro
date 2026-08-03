@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"github.com/spf13/viper"
 )
@@ -359,6 +361,45 @@ func TestSkillRecommendationPersistsNamedAgentForContinuation(t *testing.T) {
 	}
 }
 
+// Nothing else ever deletes from the store, so without pruning the file and the
+// per-mutation serialization cost grow monotonically: turn keys embed a random
+// per-run turnID and every terminal record was retained forever.
+func TestSkillRecommendationStorePrunesExpiredTerminalRecords(t *testing.T) {
+	dir := t.TempDir()
+	s := newSkillRecommendationStore(dir)
+	device := "12345678-1234-1234-1234-123456789abc"
+	stale, _, err := s.offer("acct", device, "", "session", "turn-stale", "revision", []skillRecommendationItemWireV1{{CatalogID: "official:pptx"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, _, err := s.offer("acct", device, "", "session", "turn-live", "revision", []skillRecommendationItemWireV1{{CatalogID: "official:docx"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.byID[stale.RecommendationID].State = "dismissed"
+	s.byID[stale.RecommendationID].ExpiresAt = time.Now().Add(-time.Hour)
+	saveErr := s.saveLocked()
+	s.mu.Unlock()
+	if saveErr != nil {
+		t.Fatal(saveErr)
+	}
+
+	reloaded := newSkillRecommendationStore(dir)
+	if reloaded.loadErr != nil {
+		t.Fatal(reloaded.loadErr)
+	}
+	if _, ok := reloaded.byID[stale.RecommendationID]; ok {
+		t.Fatal("expired terminal record survived the prune")
+	}
+	if _, ok := reloaded.byID[live.RecommendationID]; !ok {
+		t.Fatal("prune dropped a still-actionable record")
+	}
+	if len(reloaded.byTurn) != 1 {
+		t.Fatalf("byTurn kept a dangling key: %+v", reloaded.byTurn)
+	}
+}
+
 func TestSkillRecommendationEventsPublicSeamIsAccountDeviceDirected(t *testing.T) {
 	dir := t.TempDir()
 	deps := &ServerDeps{Config: &config.Config{}, ShannonDir: dir}
@@ -584,6 +625,10 @@ func TestSkillRecommendationContinuePublicSeamResumesNamedAgentSession(t *testin
 		{Role: "user", Content: client.NewTextContent("prior turn")},
 		{Role: "assistant", Content: client.NewTextContent("prior answer")},
 	}
+	// Seed meta alongside so the two stay index-aligned, as every production
+	// append does. Without this the fixture desyncs them and injected-message
+	// filtering silently drops the wrong rows.
+	sess.MessageMeta = []session.MessageMeta{{Source: "desktop"}, {Source: "desktop"}}
 	if err := mgr.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -656,6 +701,28 @@ func TestSkillRecommendationContinuePublicSeamResumesNamedAgentSession(t *testin
 	transcript, _ := json.Marshal(resumed.Messages)
 	if !bytes.Contains(transcript, []byte("continued in researcher")) {
 		t.Fatalf("named session was not resumed: %s", transcript)
+	}
+	// The install follow-up is daemon-authored control input. It must be flagged
+	// SystemInjected so displayed history, share export and the FTS index all
+	// drop it — otherwise the user sees a bubble reading "User enabled ..." that
+	// they never typed.
+	followupIdx := -1
+	for i, msg := range resumed.Messages {
+		if msg.Role == "user" && strings.Contains(msg.Content.Text(), "User enabled ") {
+			followupIdx = i
+		}
+	}
+	if followupIdx < 0 {
+		t.Fatalf("continuation follow-up was not persisted: %s", transcript)
+	}
+	if followupIdx >= len(resumed.MessageMeta) || !resumed.MessageMeta[followupIdx].SystemInjected {
+		t.Fatalf("continuation follow-up persisted as ordinary user history: meta=%+v", resumed.MessageMeta)
+	}
+	visible := session.FilterInjected(resumed.Messages, resumed.MessageMeta)
+	for _, msg := range visible {
+		if strings.Contains(msg.Content.Text(), "User enabled ") {
+			t.Fatal("continuation follow-up survived injected-message filtering")
+		}
 	}
 	if _, err := deps.SessionCache.GetOrCreate("").Load(sess.ID); err == nil {
 		t.Fatal("continuation incorrectly created the named session in the default agent directory")
@@ -973,9 +1040,11 @@ func TestSkillRecommendationToolsRequireAuthenticatedConsumerCapability(t *testi
 		name     string
 		source   string
 		admitted bool
+		liveSink bool
 	}{
 		{name: "old Desktop", source: "kocoro", admitted: false},
-		{name: "capable signed-in Desktop", source: "kocoro", admitted: true},
+		{name: "capable signed-in Desktop without live sink", source: "kocoro", admitted: true},
+		{name: "capable signed-in Desktop with live sink", source: "kocoro", admitted: true, liveSink: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := &fakeGatewayBackend{reply: "ordinary reply"}
@@ -1000,6 +1069,8 @@ func TestSkillRecommendationToolsRequireAuthenticatedConsumerCapability(t *testi
 			if tc.admitted {
 				req.DesktopDeviceID = "12345678-1234-1234-1234-123456789abc"
 				req.ConsumerCapabilities = map[string]bool{CapSkillInstallRecommendationV1: true}
+			}
+			if tc.liveSink {
 				req.SkillRecommendationEmit = func(skillRecommendationV1) bool { return true }
 			}
 			if _, err := RunAgent(context.Background(), deps, req, nullEventHandler{}); err != nil {
@@ -1025,6 +1096,29 @@ func TestSkillRecommendationToolsRequireAuthenticatedConsumerCapability(t *testi
 				}
 			}
 		})
+	}
+}
+
+func TestDownloadableCatalogOrderPreservesReleasedDesktopContract(t *testing.T) {
+	entries, err := skills.OfficialCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = append(entries, skills.CatalogEntry{Slug: "future-skill"})
+	orderDownloadableCatalogEntries(entries)
+	want := []string{
+		"pdf-reader", "algorithmic-art", "brand-guidelines", "canvas-design",
+		"claude-api", "doc-coauthoring", "frontend-design", "internal-comms",
+		"mcp-builder", "skill-creator", "slack-gif-creator", "theme-factory",
+		"web-artifacts-builder", "webapp-testing", "docx", "pdf", "pptx", "xlsx",
+		"future-skill",
+	}
+	got := make([]string, len(entries))
+	for i := range entries {
+		got[i] = entries[i].Slug
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("downloadable order=%v, want %v", got, want)
 	}
 }
 
@@ -1318,6 +1412,11 @@ func TestSkillRecommendationConfigReloadKillSwitchIsImmediate(t *testing.T) {
 	}
 	sinkClosed := atomic.Bool{}
 	s.registerSkillRecommendationSink("acct", device, func(skillRecommendationV1) bool { return true }, func() { sinkClosed.Store(true) })
+	// Force invalidateAll's atomic rename to fail. The recommendation protocol
+	// must fail closed, but the rest of this reload must still commit.
+	s.skillRecommendations.path = t.TempDir()
+	reloadCalled := make(chan struct{}, 1)
+	s.SetOnReload(func() { reloadCalled <- struct{}{} })
 
 	if err := os.WriteFile(configPath, []byte("daemon:\n  skill_recommendations_enabled: false\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -1328,6 +1427,15 @@ func TestSkillRecommendationConfigReloadKillSwitchIsImmediate(t *testing.T) {
 	s.Handler().ServeHTTP(reloadResponse, reload)
 	if reloadResponse.Code != http.StatusOK {
 		t.Fatalf("reload status=%d body=%s", reloadResponse.Code, reloadResponse.Body.String())
+	}
+	select {
+	case <-reloadCalled:
+	case <-time.After(time.Second):
+		t.Fatal("reload callback was skipped after recommendation persistence failure")
+	}
+	reloadedConfig, _, _ := deps.Snapshot()
+	if skillRecommendationsEnabled(reloadedConfig) {
+		t.Fatal("config swap was skipped after recommendation persistence failure")
 	}
 	if s.skillRecommendationsEnabled() || !cancelled.Load() || !sinkClosed.Load() || s.hasSkillRecommendationSink("acct", device) {
 		t.Fatalf("kill switch enabled=%v cancelled=%v sinkClosed=%v sinkPresent=%v", s.skillRecommendationsEnabled(), cancelled.Load(), sinkClosed.Load(), s.hasSkillRecommendationSink("acct", device))
