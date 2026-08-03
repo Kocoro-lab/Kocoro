@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -23,6 +24,8 @@ const (
 	openAIResponsesLiveAPIKey     = "KOE_SOL_RESPONSES_API_KEY"
 	openAIResponsesLiveModelEnv   = "KOE_OPENAI_RESPONSES_MODEL"
 	openAIResponsesDefaultModel   = "gpt-5.6-sol"
+	anthropicNudgeLiveGate        = "KOE_ANTHROPIC_NUDGE_LIVE"
+	anthropicNudgeLiveModelsEnv   = "KOE_ANTHROPIC_NUDGE_MODELS"
 )
 
 // TestAgentLoopOpenAIResponsesContinuationLive is a paid, opt-in release gate.
@@ -182,6 +185,46 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 	if model == "" {
 		model = openAIResponsesDefaultModel
 	}
+	runAgentLoopNudgeLive(t, endpoint, apiKey, "openai", model, true)
+}
+
+func TestAgentLoopAnthropicLoopNudgeLive(t *testing.T) {
+	if os.Getenv(anthropicNudgeLiveGate) != "1" {
+		t.Skip("set KOE_ANTHROPIC_NUDGE_LIVE=1 to run the paid Anthropic nudge gate")
+	}
+
+	endpoint := strings.TrimSpace(os.Getenv(openAIResponsesLiveEndpoint))
+	if endpoint == "" {
+		endpoint = "http://127.0.0.1:8080"
+	}
+	apiKey := strings.TrimSpace(os.Getenv(openAIResponsesLiveAPIKey))
+	if apiKey == "" {
+		apiKey = "sk_test_123456"
+	}
+	models := strings.TrimSpace(os.Getenv(anthropicNudgeLiveModelsEnv))
+	if models == "" {
+		models = "claude-haiku-4-5-20251001,claude-sonnet-5,claude-opus-5"
+	}
+	for _, rawModel := range strings.Split(models, ",") {
+		model := strings.TrimSpace(rawModel)
+		if model == "" {
+			continue
+		}
+		t.Run(model, func(t *testing.T) {
+			runAgentLoopNudgeLive(t, endpoint, apiKey, "anthropic", model, false)
+		})
+	}
+}
+
+func runAgentLoopNudgeLive(
+	t *testing.T,
+	endpoint string,
+	apiKey string,
+	expectedProvider string,
+	model string,
+	expectsCursor bool,
+) {
+	t.Helper()
 
 	gateway := client.NewGatewayClient(endpoint, apiKey)
 	recording := &openAIResponsesLiveRecordingClient{inner: gateway}
@@ -204,14 +247,16 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 		nil,
 	)
 	loop.SetSpecificModel(model)
-	loop.SetReasoningEffort("none")
+	if expectedProvider == "openai" {
+		loop.SetReasoningEffort("none")
+	}
 	loop.SetTemperature(0)
 	loop.SetMaxTokens(512)
 	loop.SetSkillDiscovery(false)
 	loop.SetEnableStreaming(true)
 	loop.SetBypassPermissions(true)
-	loop.SetCacheSource("koe_sol_responses_nudge_live")
-	loop.SetSessionID(fmt.Sprintf("koe-sol-responses-nudge-%d", time.Now().UnixNano()))
+	loop.SetCacheSource("koe_tool_nudge_live")
+	loop.SetSessionID(fmt.Sprintf("koe-tool-nudge-%d", time.Now().UnixNano()))
 	loop.SetHandler(&mockHandler{approveResult: true})
 
 	// Three identical successful calls make request 4 carry the loop nudge;
@@ -230,12 +275,6 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AgentLoop failed: %v", err)
 	}
-	if !strings.Contains(result, effect.final) {
-		t.Fatal("final answer did not contain the runtime oracle")
-	}
-	if got := effect.executions.Load(); got != 3 {
-		t.Fatalf("tool executions = %d, want exactly 3", got)
-	}
 
 	requests, responses := recording.snapshot()
 	if len(requests) != 4 || len(responses) != 4 {
@@ -245,9 +284,27 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 			len(responses),
 		)
 	}
-	for index, request := range requests[1:] {
-		if !validOrdinaryOpenAIResponseID(request.PreviousResponseID) {
+	for index, request := range requests {
+		if request.SpecificModel != model {
+			t.Fatalf("request %d model = %q, want %q", index+1, request.SpecificModel, model)
+		}
+		if index == 0 || !expectsCursor {
+			if request.PreviousResponseID != "" {
+				t.Fatalf("request %d unexpectedly carried cursor %q", index+1, request.PreviousResponseID)
+			}
+		} else if !validOrdinaryOpenAIResponseID(request.PreviousResponseID) {
 			t.Fatalf("continuation request %d lost its cursor", index+1)
+		}
+		response := responses[index]
+		if response.Provider != expectedProvider || response.Model != model {
+			t.Fatalf(
+				"response %d route = %s/%s, want %s/%s",
+				index+1,
+				response.Provider,
+				response.Model,
+				expectedProvider,
+				model,
+			)
 		}
 	}
 	if responses[3].HasToolCalls() {
@@ -259,12 +316,26 @@ func TestAgentLoopOpenAIResponsesLoopNudgeLive(t *testing.T) {
 		t.Fatal("no continuation request carried the loop nudge")
 	}
 	assertToolResultPrecedesNudge(t, nudgeRequest)
+	if got := effect.executions.Load(); got != 3 {
+		t.Fatalf("tool executions = %d, want exactly 3", got)
+	}
+	if !strings.Contains(result, effect.final) {
+		digest := sha256.Sum256([]byte(result))
+		t.Fatalf(
+			"final answer missed runtime oracle: result_empty=%t result_len=%d result_sha256=%x",
+			result == "",
+			len(result),
+			digest[:6],
+		)
+	}
 	if usage == nil || usage.TotalTokens <= 0 || usage.CostUSD <= 0 {
 		t.Fatal("run did not report non-zero usage and cost")
 	}
 	t.Logf(
-		"content-free loop nudge model=%s verdict pass=true completion_calls=4 tool_effects=3 total_millis=%d cost_usd=%.6f",
+		"content-free loop nudge provider=%s model=%s cursor=%t verdict pass=true completion_calls=4 tool_effects=3 total_millis=%d cost_usd=%.6f",
+		expectedProvider,
 		model,
+		expectsCursor,
 		time.Since(started).Milliseconds(),
 		usage.CostUSD,
 	)

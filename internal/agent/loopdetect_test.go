@@ -32,6 +32,12 @@ func TestLoopDetector_ConsecutiveDup_Nudge(t *testing.T) {
 	if msg == "" {
 		t.Error("nudge should have a message")
 	}
+	if strings.Contains(msg, "won't change") {
+		t.Errorf("nudge must not claim a stateful tool result cannot change: %s", msg)
+	}
+	if !strings.Contains(msg, "Inspect the latest result") {
+		t.Errorf("nudge must direct the model to inspect the latest result: %s", msg)
+	}
 }
 
 func TestLoopDetector_ConsecutiveDup_ForceStop(t *testing.T) {
@@ -167,9 +173,12 @@ func TestLoopDetector_WindowDup_Nudge(t *testing.T) {
 	ld.Record("file_edit", `{"old":"d","new":"e"}`, false, "", "", false)
 	ld.Record("file_read", `{"file":"main.go"}`, false, "", "", false)
 
-	action, _ := ld.Check("file_read")
+	action, msg := ld.Check("file_read")
 	if action != LoopNudge {
 		t.Errorf("5 spread-out identical calls should trigger window nudge, got %v", action)
+	}
+	if !strings.Contains(msg, "Inspect the latest result") {
+		t.Errorf("window nudge must direct the model to inspect the latest result: %s", msg)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -3192,6 +3193,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			responseID         string
 			model              string
 			executionProfileID string
+			request            client.CompletionRequest
 		}
 		emptyPostToolRetries        int // one recovery turn when tools ran but the model returned no visible final
 		emptyPostToolRecovery       bool
@@ -3333,9 +3335,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		responseID := ordinaryOpenAIContinuation.responseID
 		model := ordinaryOpenAIContinuation.model
 		executionProfileID := ordinaryOpenAIContinuation.executionProfileID
+		previousRequest := ordinaryOpenAIContinuation.request
 		ordinaryOpenAIContinuation.responseID = ""
 		ordinaryOpenAIContinuation.model = ""
 		ordinaryOpenAIContinuation.executionProfileID = ""
+		ordinaryOpenAIContinuation.request = client.CompletionRequest{}
 		if req == nil || responseID == "" {
 			return
 		}
@@ -3345,7 +3349,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// execution routes.
 		if openAIContinuationRequest != nil ||
 			req.ExecutionProfileID != executionProfileID ||
-			validateTrustedOpenAIComputerProfile(a.executionProfile) == nil {
+			validateTrustedOpenAIComputerProfile(a.executionProfile) == nil ||
+			!ordinaryOpenAIContinuationRequestCompatible(previousRequest, *req) {
 			return
 		}
 		req.PreviousResponseID = responseID
@@ -4934,6 +4939,7 @@ iterationLoop:
 			ordinaryOpenAIContinuation.responseID = responseID
 			ordinaryOpenAIContinuation.model = model
 			ordinaryOpenAIContinuation.executionProfileID = req.ExecutionProfileID
+			ordinaryOpenAIContinuation.request = cloneOrdinaryOpenAIContinuationRequest(req)
 		}
 
 		// Handle text-only responses (no tool calls).
@@ -6126,8 +6132,8 @@ iterationLoop:
 				return text, usage, nil
 			}
 			messages = append(messages, client.Message{
-				Role:    "user",
-				Content: client.NewTextContent("[system] " + worstMsg),
+				Role:    "developer",
+				Content: client.NewTextContent(worstMsg),
 			})
 			markInjected()
 		}
@@ -7094,6 +7100,83 @@ func ordinaryOpenAIResponsesContinuation(resp *client.CompletionResponse) (strin
 		return "", ""
 	}
 	return responseID, model
+}
+
+func cloneOrdinaryOpenAIContinuationRequest(
+	request client.CompletionRequest,
+) client.CompletionRequest {
+	cloned := request
+	cloned.Messages = cloneMessages(request.Messages)
+	cloned.Tools = append([]client.Tool(nil), request.Tools...)
+	if request.Thinking != nil {
+		thinking := *request.Thinking
+		cloned.Thinking = &thinking
+	}
+	return cloned
+}
+
+func ordinaryOpenAIContinuationRequestCompatible(
+	previous client.CompletionRequest,
+	current client.CompletionRequest,
+) bool {
+	if len(previous.Messages) == 0 || len(current.Messages) <= len(previous.Messages) {
+		return false
+	}
+	if !reflect.DeepEqual(
+		previous.Messages,
+		current.Messages[:len(previous.Messages)],
+	) {
+		return false
+	}
+
+	previousProperties := previous
+	currentProperties := current
+	previousProperties.Messages = nil
+	currentProperties.Messages = nil
+	previousProperties.PreviousResponseID = ""
+	currentProperties.PreviousResponseID = ""
+	if !reflect.DeepEqual(previousProperties, currentProperties) {
+		return false
+	}
+
+	delta := current.Messages[len(previous.Messages):]
+	if len(delta) < 2 || delta[0].Role != "assistant" {
+		return false
+	}
+	expected := make(map[string]struct{})
+	for _, block := range delta[0].Content.Blocks() {
+		if block.Type == "tool_use" && block.ID != "" {
+			expected[block.ID] = struct{}{}
+		}
+	}
+	if len(expected) == 0 {
+		return false
+	}
+
+	outputs := make(map[string]struct{})
+	seenDeveloper := false
+	for _, message := range delta[1:] {
+		switch message.Role {
+		case "user":
+			if seenDeveloper || !message.Content.HasBlocks() {
+				return false
+			}
+			for _, block := range message.Content.Blocks() {
+				if block.Type != "tool_result" || block.ToolUseID == "" {
+					return false
+				}
+				outputs[block.ToolUseID] = struct{}{}
+			}
+		case "developer":
+			if seenDeveloper || strings.TrimSpace(message.Content.Text()) == "" {
+				return false
+			}
+			seenDeveloper = true
+		default:
+			return false
+		}
+	}
+	return reflect.DeepEqual(expected, outputs)
 }
 
 func validOrdinaryOpenAIResponseID(value string) bool {

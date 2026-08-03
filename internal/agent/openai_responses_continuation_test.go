@@ -245,7 +245,7 @@ func findLoopNudgeRequest(requests []client.CompletionRequest) *client.Completio
 			continue
 		}
 		last := messages[len(messages)-1]
-		if last.Role == "user" && strings.HasPrefix(last.Content.Text(), "[system] ") {
+		if last.Role == "developer" && strings.Contains(last.Content.Text(), "Inspect the latest result") {
 			return &requests[index]
 		}
 	}
@@ -263,17 +263,94 @@ func assertToolResultPrecedesNudge(t *testing.T, request *client.CompletionReque
 	nudge := messages[len(messages)-1]
 	assistantBlocks := assistant.Content.Blocks()
 	resultBlocks := toolResult.Content.Blocks()
-	if assistant.Role != "assistant" || len(assistantBlocks) != 1 ||
-		assistantBlocks[0].Type != "tool_use" {
+	toolUseIDs := make(map[string]struct{})
+	for _, block := range assistantBlocks {
+		if block.Type == "tool_use" && block.ID != "" {
+			toolUseIDs[block.ID] = struct{}{}
+		}
+	}
+	if assistant.Role != "assistant" || len(toolUseIDs) == 0 {
 		t.Fatalf("assistant before nudge = %#v", assistant)
 	}
 	if toolResult.Role != "user" || len(resultBlocks) != 1 ||
-		resultBlocks[0].Type != "tool_result" ||
-		resultBlocks[0].ToolUseID != assistantBlocks[0].ID {
+		resultBlocks[0].Type != "tool_result" {
 		t.Fatalf("paired tool result before nudge = %#v", toolResult)
 	}
-	if nudge.Role != "user" || !strings.HasPrefix(nudge.Content.Text(), "[system] ") {
+	if _, ok := toolUseIDs[resultBlocks[0].ToolUseID]; !ok {
+		t.Fatalf("paired tool result before nudge = %#v", toolResult)
+	}
+	if nudge.Role != "developer" || !strings.Contains(nudge.Content.Text(), "Inspect the latest result") {
 		t.Fatalf("nudge tail = %#v", nudge)
+	}
+}
+
+type ordinaryContinuationMutatingClient struct {
+	loop     *AgentLoop
+	requests []client.CompletionRequest
+	calls    int
+}
+
+func (m *ordinaryContinuationMutatingClient) Complete(
+	_ context.Context,
+	req client.CompletionRequest,
+) (*client.CompletionResponse, error) {
+	m.requests = append(m.requests, req)
+	m.calls++
+	if m.calls == 1 {
+		m.loop.SetReasoningEffort("high")
+		return ordinaryOpenAIToolResponse(
+			"openai",
+			"gpt-5.6-sol",
+			"resp_before_request_change",
+		), nil
+	}
+	return &client.CompletionResponse{
+		Provider:     "openai",
+		Model:        "gpt-5.6-sol",
+		OutputText:   "BLUE",
+		FinishReason: "stop",
+		RequestID:    "resp_after_request_change",
+	}, nil
+}
+
+func (m *ordinaryContinuationMutatingClient) CompleteStream(
+	ctx context.Context,
+	req client.CompletionRequest,
+	_ func(client.StreamDelta),
+) (*client.CompletionResponse, error) {
+	return m.Complete(ctx, req)
+}
+
+func TestAgentLoopOrdinaryOpenAIResponsesFallsBackAfterRequestChange(t *testing.T) {
+	llm := &ordinaryContinuationMutatingClient{}
+	loop := newOrdinaryOpenAIContinuationLoop(t, llm)
+	llm.loop = loop
+
+	result, _, err := loop.Run(context.Background(), "look up cobalt", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "BLUE" {
+		t.Fatalf("result = %q, want BLUE", result)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("completion requests = %d, want 2", len(llm.requests))
+	}
+	continuation := llm.requests[1]
+	if continuation.PreviousResponseID != "" {
+		t.Fatalf(
+			"changed request reused previous_response_id %q",
+			continuation.PreviousResponseID,
+		)
+	}
+	if continuation.SpecificModel != "" {
+		t.Fatalf("changed request retained provider cursor model pin %q", continuation.SpecificModel)
+	}
+	if continuation.ReasoningEffort != "high" {
+		t.Fatalf("changed request reasoning_effort = %q, want high", continuation.ReasoningEffort)
+	}
+	if len(continuation.Messages) != len(llm.requests[0].Messages)+2 {
+		t.Fatalf("fallback did not carry the full local transcript")
 	}
 }
 
