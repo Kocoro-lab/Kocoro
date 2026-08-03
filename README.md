@@ -304,6 +304,20 @@ Operates the user's iCloud / Google / Microsoft 365 / Exchange / Outlook calenda
 | `calendar_update_event` | Yes | Update with `patch` semantics (missing/null = no change, empty string/array = clear, lists are replaced not merged). `scope`: `this` or `this_and_future` only (no `all` — use delete + create). |
 | `calendar_delete_event` | Yes | Delete one instance / this-and-future / entire recurring series. |
 
+### Desktop Skill Recommendation Tools
+
+For signed-in Desktop requests that declare the `skill_install_recommendation_v1`
+capability, the daemon exposes two Desktop-only tools:
+
+| Tool | Approval | Description |
+|------|----------|-------------|
+| `discover_installable_skills` | No | Find reviewed, uninstalled catalog skills relevant to the current task. |
+| `offer_skill_installation` | No | Show a localized Desktop installation card for IDs returned by discovery; it never installs by itself. |
+
+These tools are absent from TUI, one-shot, MCP serve, schedules, IM channels,
+heartbeat, and watcher runs. Accepting the card installs the pinned catalog
+artifact and resumes the original Desktop session.
+
 ### Cloud Tools (gated on `cloud.enabled` + `api_key`)
 
 | Tool | Approval | Description |
@@ -534,7 +548,7 @@ shan --agent ops-bot                                 # TUI (with agent commands 
 
 Names must match `^[a-z0-9][a-z0-9_-]{0,63}$`. Each agent gets its own session directory at `~/.shannon/agents/<name>/sessions/`.
 
-Skills can be installed from **ClawHub** (the Kocoro skill marketplace) via the daemon HTTP API — `GET /skills/marketplace`, `POST /skills/marketplace/install/{slug}`, or upload a local ZIP with `POST /skills/upload`. Kocoro Desktop surfaces the marketplace as a browseable UI.
+Skills can be installed from **ClawHub** (the Kocoro skill marketplace) via the daemon HTTP API — `GET /skills/marketplace`, `POST /skills/marketplace/install/{slug}`, or upload a local ZIP with `POST /skills/upload`. Kocoro Desktop surfaces the marketplace as a browseable UI. A capable signed-in Desktop can also let the agent discover a missing reviewed skill during a task and present an installation card; installation occurs only after the user accepts it.
 
 See [docs/agents-reference.md](docs/agents-reference.md) for the full `config.yaml` reference, `cwd` resolution, project-local config scope, tool filtering semantics, attached skills, builtin skills (`kocoro`, `kocoro-generative-ui`), skill secrets, and ZIP installs.
 
