@@ -325,6 +325,9 @@ type MemoryConfig struct {
 type DaemonConfig struct {
 	AutoApprove   bool   `mapstructure:"auto_approve" yaml:"auto_approve" json:"auto_approve"`
 	ChromeProfile string `mapstructure:"chrome_profile" yaml:"chrome_profile,omitempty" json:"chrome_profile,omitempty"`
+	// SkillRecommendationsEnabled is the operator kill switch for the
+	// Desktop-only capability-card protocol. Nil preserves default-on behavior.
+	SkillRecommendationsEnabled *bool `mapstructure:"skill_recommendations_enabled" yaml:"skill_recommendations_enabled,omitempty" json:"skill_recommendations_enabled,omitempty"`
 	// ShareAsyncDefault controls whether POST /sessions/{id}/share returns
 	// 202+task_id (true, default) or blocks until upload completes (false).
 	// Operators on stacks where the UI has not yet learned to subscribe to

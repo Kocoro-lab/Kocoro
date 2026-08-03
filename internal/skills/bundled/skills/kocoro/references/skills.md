@@ -95,7 +95,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Method: POST
 - Path: /skills/install/{name}
 - Response: `{"name": "...", "slug": "...", "description": "...", "install_source": "..."}`
-- Notes: Installs from bundled (downloadable) skills. The `{name}` path segment is the skill's slug (always lowercase + hyphens). Bundled skills come from the embedded binary (offline); the proprietary set (docx/pdf/pptx/xlsx) is fetched over HTTP from the upstream Anthropic skills repo (no `git` required). Error matrix: **400** invalid/unknown skill name, **404** not in the upstream Anthropic repo, **409** already installed, **500** otherwise (download/extraction failure).
+- Notes: Installs from the current controlled downloadable catalog. The `{name}` path segment is the skill's slug (always lowercase + hyphens). Each catalog entry selects an explicit provider: `bundled` copies an embedded path offline; `github_archive` downloads a catalog-pinned repository commit, verifies the whole archive SHA-256, then extracts only the declared artifact path (no `git` required). Error matrix: **400** invalid/unknown skill name, **404** artifact path absent from the verified archive, **409** already installed, **500** otherwise (transport/integrity/extraction failure).
 
 ### Install a marketplace skill
 - Method: POST
@@ -189,6 +189,73 @@ Some skills need API keys to call external services. These are declared by the s
 ### "Remove one API key" / "Remove all API keys for a skill"
 - Single key: DELETE /skills/{slug}/secrets/{KEY_NAME}
 - All keys: DELETE /skills/{slug}/secrets
+
+## Desktop skill-install recommendations (v1)
+
+Set `daemon.skill_recommendations_enabled: false` for an immediate operator
+kill switch. It defaults on but stays inert without the signed-in Desktop
+consumer capability.
+
+Desktop chat (`source: desktop` or the existing Quick Panel `source: kocoro`)
+may opt into task-scoped installation recommendations only when it
+declares daemon capability `skill_install_recommendation_v1`, sends a stable
+random `X-Kocoro-Desktop-Device-ID`, and declares the same token in
+`X-Kocoro-Consumer-Capabilities` on both `POST /message` and `GET /events`.
+The daemon enables discovery only for a verified signed-in Cloud account; old,
+unsigned, and non-Desktop clients receive the normal tool list unchanged.
+
+The agent first calls `discover_installable_skills` with catalog intent tags,
+then may call `offer_skill_installation` using only IDs returned in that run.
+The latter only offers a card; it never installs. The card is delivered solely
+to the active `/events` stream for the same account + device and is never put
+on the global replay bus. Event name: `skill.recommendation.v1`; payload is
+schema version 1 and includes recommendation/session/turn IDs, catalog items,
+state `offered`, and expiry. It never includes account IDs or device IDs; its
+recommendation-bound `continuation_token` is intentionally present only in this
+directed event so the same Desktop can call and idempotently retry the bound
+continuation endpoint.
+
+When the user chooses **Install and continue**, Desktop makes one call to
+`POST /skill-recommendations/{id}/continue` with `session_id` and the directed
+card's `continuation_token`. That single daemon-owned operation installs the
+immutable catalog descriptors captured at offer time, writes content-bound
+receipts, attaches the Skills to the current named Agent (or enables them for
+the default Agent), and only then appends the controlled continuation. Desktop
+must not call the generic `/skills/install/{name}` endpoint for this workflow.
+The recommendation persists the resolved named-Agent identity internally, so
+continuation resumes the same Agent session and attended approval policy; that
+identity is not exposed in the card. It never replays the original request.
+Retries are idempotent and reuse the same token. Sign-out or account switch
+expires outstanding offers for the old account.
+
+The production update path reuses the existing
+`Kocoro-lab/shanclaw-skill-registry` `index.json` transport. Its optional
+`installable_capabilities` array is considered publisher-authorized only when
+it comes from the compiled-in official registry URL over HTTPS. V1 explicitly
+uses the official GitHub repository ACL plus TLS as its publisher trust root;
+it does not claim an independent Ed25519 signature root. Compromise of the
+official registry's write access is therefore inside this threat boundary and
+would require registry rollback/revocation. A custom marketplace URL can still
+be browsed and installed manually, but it cannot nominate recommendations. The
+marketplace client's atomic TTL cache and stale-on-error path fetch updates
+without a daemon rebuild; catalog validation happens before the snapshot swap.
+A malformed/unsupported refresh retains the last trusted in-memory snapshot,
+and a cold-start failure uses the embedded bootstrap catalog.
+`catalog_revision` detects snapshot changes but is not an authenticity claim.
+
+Every installable entry also owns its installation provider. Bundled entries
+name their embedded `skills/<slug>` path. `github_archive` entries must name
+an HTTPS GitHub repository, immutable 40-hex commit, exact artifact path, and
+SHA-256 of that commit archive. Install downloads that commit, verifies all
+compressed bytes before extraction, then admits only the declared skill path;
+it never downloads a mutable branch. The complete staged Skill tree is hashed,
+written into a receipt, and committed by directory rename before continuation.
+A registry publisher can therefore add a
+reviewed Skill using an existing provider without a daemon code change.
+Ordinary marketplace entries remain ineligible unless the controlled official
+registry supplies reviewed recommendation metadata. Catalog display
+text and tags are length-bounded UTF-8 and reject control/format characters;
+Desktop must still render every field as plain text, never markup.
 
 ## Safety Notes
 

@@ -178,6 +178,7 @@ See `docs/session-sync-launchd.md` for running session sync via launchd when the
 ```yaml
 daemon:
   auto_approve: false              # skip approval round-trip globally (permission engine still enforced)
+  skill_recommendations_enabled: true # Desktop skill recommendation protocol kill switch
   capabilities: []                 # opt-in protocol features advertised on the WS handshake
 ```
 

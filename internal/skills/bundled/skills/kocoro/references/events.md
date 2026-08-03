@@ -218,6 +218,31 @@ If no events match, `notifications` is `[]` and `next_cursor` echoes the `since`
 
 ## Backward compatibility
 
+### Desktop skill-install recommendation v1
+
+`skill.recommendation.v1` is a directed Desktop-only SSE event, not an
+EventBus event. Desktop first advertises daemon capability
+`skill_install_recommendation_v1`, then sends its stable random UUID in
+`X-Kocoro-Desktop-Device-ID` and the same capability in
+`X-Kocoro-Consumer-Capabilities` on `/message`, `/events`, and continuation
+requests. Both Desktop source values (`desktop` and the Quick Panel's existing
+`kocoro`) are admitted; cloud-distributed sources are not. The daemon binds it to the verified signed-in account internally;
+account identity never appears on the wire. Older clients, unauthenticated
+clients, and non-Desktop sources never receive the discovery/offer tools.
+
+The event has `{schema_version:1, recommendation_id, session_id, turn_id,
+catalog_revision, state:"offered", items, reason_code, continuation_token,
+expires_at}`. `continuation_token` is an opaque recommendation-bound capability delivered
+only on that account/device's directed stream; it is never broadcast, audited,
+or included in other APIs. Items
+contain reviewed catalog metadata, not model-selected slugs. After the user
+accepts, Desktop calls only
+`POST /skill-recommendations/{id}/continue` with `session_id` and the directed
+continuation token. The daemon installs the offer-time descriptor, attaches or
+enables the Skill for the current Agent, records a receipt, and then resumes the
+attended request-scoped SSE run. Duplicate calls are idempotent. Account
+changes expire old offers and close the old device's stream.
+
 - `args` / `is_error` / `preview` on `tool_status` are **additive** — older subscribers that ignore unknown fields keep working.
 - `ts` is additive on `tool_status` and `usage`.
 - `session_id`, `agent`, `title`, `source`, `channel`, `args`, `flags`, `ts` on `approval_request` and `resolved_by` / `ts` on `approval_resolved` are additive; older Desktop clients that only read `request_id` / `tool` / `decision` keep working.
