@@ -715,3 +715,19 @@ func TestComputerUse_LegacyGUIToolsShareOperationLock(t *testing.T) {
 		}
 	}
 }
+
+func TestComputerUseCallErrorClassifiesDisplayTopologyReconfiguration(t *testing.T) {
+	result := computerUseCallError(
+		"future topology observer",
+		fmt.Errorf("read display topology v1: %w", ErrDisplayTopologyReconfiguringV1),
+	)
+
+	if !result.IsError || !result.IsRetryable ||
+		result.GUIOutcome == nil ||
+		result.GUIOutcome.Result != agent.GUIActionResultFailed ||
+		result.GUIOutcome.Phase != agent.GUIActionPhaseObserving ||
+		result.GUIOutcome.FailureCode !=
+			ComputerUseFailureDisplayTopologyReconfiguringV1 {
+		t.Fatalf("display topology result = %+v", result)
+	}
+}

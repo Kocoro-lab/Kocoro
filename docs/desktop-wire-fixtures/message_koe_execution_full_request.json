@@ -1,0 +1,13 @@
+{
+  "text": "rotate the production signing keys",
+  "source": "koe",
+  "channel": "koe",
+  "session_id": "koe-session-001",
+  "execution_mode": "full",
+  "requested_execution_mode": "full",
+  "full_reason": "security_or_permissions",
+  "inherited_execution_mode": "full",
+  "logical_task_id": "burst-4f2a:t02",
+  "execution_run_id": "burst-4f2a:t02.r02",
+  "parent_run_id": "burst-4f2a:t02.r01"
+}

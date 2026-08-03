@@ -141,7 +141,7 @@ func TestToolSearchE2E_LegacyFallbackLoadsBM25MatchAndContinues(t *testing.T) {
 	}
 }
 
-func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.T) {
+func TestToolSearchE2E_ExplicitSonnetUsesLegacyContinuation(t *testing.T) {
 	direct := &toolSearchE2ETool{
 		name:     "web_search",
 		desc:     "Search the web.",
@@ -215,16 +215,110 @@ func TestToolSearchE2E_ToolReferencePathReturnsReferenceAndContinues(t *testing.
 	}
 	assertToolExposureInRequest(t, requests[0], "web_search", true, false)
 	assertToolExposureInRequest(t, requests[0], "tool_search", true, false)
-	assertToolExposureInRequest(t, requests[0], "browser_navigate", true, true)
-	if !requestHasToolReference(requests[1], "browser_navigate") {
+	assertToolExposureInRequest(t, requests[0], "browser_navigate", false, false)
+	assertToolExposureInRequest(t, requests[1], "browser_navigate", true, false)
+	if !requestHasToolResultText(requests[1], "LOADED:browser_navigate") ||
+		!requestHasToolResultText(requests[1], `"url"`) {
 		wire, _ := json.Marshal(requests[1].Messages)
-		t.Fatalf("tool-reference continuation request is missing browser_navigate reference: %s", wire)
+		t.Fatalf("legacy continuation request is missing browser_navigate schema: %s", wire)
+	}
+	if requestHasToolReference(requests[1], "browser_navigate") {
+		t.Fatal("explicit Sonnet continuation unexpectedly used tool_reference")
 	}
 	if deferred.runs != 1 {
 		t.Fatalf("browser_navigate runs = %d, want 1", deferred.runs)
 	}
 	if len(handler.preambleCalls) != 0 {
 		t.Fatalf("external tool description must not become a fallback preamble, got %#v", handler.preambleCalls)
+	}
+}
+
+func TestToolSearchE2E_ColdDeferredDirectCallIsRejected(t *testing.T) {
+	deferred := &toolSearchE2ETool{
+		name:     "calendar_create_event",
+		desc:     "Create a calendar event.",
+		source:   SourceIntegration,
+		exposure: ToolExposureDeferred,
+		params:   map[string]any{"type": "object"},
+		result:   "event-created",
+	}
+	reg := NewToolRegistry()
+	reg.Register(deferred)
+
+	llm := &budgetCaptureLLMClient{responses: []*client.CompletionResponse{
+		{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID: "toolu_cold", Name: deferred.name, Arguments: json.RawMessage(`{}`),
+			}},
+		},
+		{OutputText: "recovered", FinishReason: "end_turn"},
+	}}
+	loop := NewAgentLoop(llm, reg, "medium", "", 4, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "Create an event.", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "recovered" {
+		t.Fatalf("result = %q, want recovered", result)
+	}
+	if deferred.runs != 0 {
+		t.Fatalf("cold Deferred tool ran %d times, want 0", deferred.runs)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("completion requests = %d, want 2", len(llm.requests))
+	}
+	assertToolExposureInRequest(t, llm.requests[0], deferred.name, false, false)
+	if !requestHasToolResultText(llm.requests[1], "deferred tool is not loaded") {
+		t.Fatal("continuation is missing the fail-closed Deferred rejection")
+	}
+}
+
+func TestToolSearchE2E_SameResponseSearchDoesNotAuthorizeColdCall(t *testing.T) {
+	deferred := &toolSearchE2ETool{
+		name:     "calendar_create_event",
+		desc:     "Create a calendar event.",
+		source:   SourceIntegration,
+		exposure: ToolExposureDeferred,
+		params:   map[string]any{"type": "object"},
+		result:   "event-created",
+	}
+	reg := NewToolRegistry()
+	reg.Register(deferred)
+
+	llm := &budgetCaptureLLMClient{responses: []*client.CompletionResponse{
+		{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{
+				{ID: "toolu_search", Name: "tool_search", Arguments: json.RawMessage(`{"query":"select:calendar_create_event"}`)},
+				{ID: "toolu_cold", Name: deferred.name, Arguments: json.RawMessage(`{}`)},
+			},
+		},
+		{OutputText: "continuing", FinishReason: "end_turn"},
+		{OutputText: "recovered", FinishReason: "end_turn"},
+	}}
+	loop := NewAgentLoop(llm, reg, "medium", "", 8, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "Create an event.", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "recovered" {
+		t.Fatalf("result = %q, want recovered", result)
+	}
+	if deferred.runs != 0 {
+		t.Fatalf("same-response cold Deferred tool ran %d times, want 0", deferred.runs)
+	}
+	if len(llm.requests) != 3 {
+		t.Fatalf("completion requests = %d, want 3", len(llm.requests))
+	}
+	assertToolExposureInRequest(t, llm.requests[1], deferred.name, true, false)
+	if !requestHasToolResultText(llm.requests[1], "LOADED:calendar_create_event") {
+		t.Fatal("tool_search result was not recorded")
+	}
+	if !requestHasToolResultText(llm.requests[1], "deferred tool is not loaded") {
+		t.Fatal("same-response cold call was not rejected")
 	}
 }
 

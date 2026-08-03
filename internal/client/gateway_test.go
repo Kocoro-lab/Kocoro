@@ -4,18 +4,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	got := struct {
-		Messages []Message `json:"messages"`
-		Tools    []Tool    `json:"tools"`
+		Messages    []Message `json:"messages"`
+		Tools       []Tool    `json:"tools"`
+		ServiceTier string    `json:"service_tier"`
 	}{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +55,8 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	defer cancel()
 
 	resp, err := gw.Complete(ctx, CompletionRequest{
-		Messages: []Message{{Role: "user", Content: NewTextContent("ping")}},
+		Messages:    []Message{{Role: "user", Content: NewTextContent("ping")}},
+		ServiceTier: "fast",
 		Tools: []Tool{{
 			Type: "function",
 			Function: FunctionDef{
@@ -73,6 +79,9 @@ func TestCompleteUsesCompletionsEndpoint(t *testing.T) {
 	}
 	if len(got.Tools) != 1 || got.Tools[0].Type != "function" {
 		t.Errorf("expected tool payload to include tools")
+	}
+	if got.ServiceTier != "fast" {
+		t.Errorf("service_tier = %q, want fast", got.ServiceTier)
 	}
 }
 
@@ -189,6 +198,290 @@ func TestToolMarshalJSONStrictTaggedUnion(t *testing.T) {
 	}
 }
 
+func TestToolMarshalJSONKeepsNativeAndFunctionShapesDisjoint(t *testing.T) {
+	native, err := json.Marshal(Tool{
+		Type:            "computer_20251124",
+		Name:            "computer",
+		DisplayWidthPx:  1280,
+		DisplayHeightPx: 800,
+	})
+	if err != nil {
+		t.Fatalf("marshal native tool: %v", err)
+	}
+	if got, want := string(native), `{"type":"computer_20251124","name":"computer","display_width_px":1280,"display_height_px":800}`; got != want {
+		t.Fatalf("native tool wire = %s, want %s", got, want)
+	}
+	if bytes.Contains(native, []byte(`"function"`)) {
+		t.Fatalf("native tool leaked a function arm: %s", native)
+	}
+
+	function, err := json.Marshal(Tool{
+		Type: "function",
+		Function: FunctionDef{
+			Name:       "bash",
+			Parameters: map[string]any{"type": "object"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal function tool: %v", err)
+	}
+	if !bytes.Contains(function, []byte(`"function":{"name":"bash"`)) {
+		t.Fatalf("function tool omitted its function arm: %s", function)
+	}
+}
+
+func TestResolveKoeExecutionProfileUsesClosedContract(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/completions/resolve" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("X-API-Key") != "secret" {
+			t.Fatalf("X-API-Key = %q", r.Header.Get("X-API-Key"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"schema_version":        1,
+			"profile_version":       2,
+			"profile_name":          "koe-fast-v1",
+			"profile_id":            "kfp1_server-minted",
+			"provider":              "openai",
+			"model":                 "gpt-5.6-luna",
+			"api_surface":           "openai_responses",
+			"tool_contract":         "kocoro.function_tools.v1",
+			"reasoning_effort":      "medium",
+			"service_tier":          "fast",
+			"parallel_tool_calls":   true,
+			"response_cache_policy": "off",
+		})
+	}))
+	defer server.Close()
+
+	profile, err := NewGatewayClient(server.URL, "secret").ResolveKoeExecutionProfile(context.Background())
+	if err != nil {
+		t.Fatalf("ResolveKoeExecutionProfile: %v", err)
+	}
+	if got["capability"] != "koe_fast" || got["schema_version"] != float64(1) || got["allow_model_fallback"] != false {
+		t.Fatalf("resolver request = %#v", got)
+	}
+	if len(got) != 3 {
+		t.Fatalf("resolver request leaked provider/model selectors: %#v", got)
+	}
+	if profile.ProfileID != "kfp1_server-minted" ||
+		profile.EffectiveMode != executionprofile.ModeFast ||
+		profile.ServiceTier != "fast" {
+		t.Fatalf("profile = %+v", profile)
+	}
+}
+
+func TestResolveKoeExecutionProfileRejectsInvalidProfile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"schema_version":        1,
+			"profile_version":       2,
+			"profile_name":          "koe-fast-v1",
+			"profile_id":            "caller-chosen",
+			"provider":              "openai",
+			"model":                 "gpt-5.6-luna",
+			"api_surface":           "openai_responses",
+			"tool_contract":         "kocoro.function_tools.v1",
+			"reasoning_effort":      "medium",
+			"service_tier":          "fast",
+			"parallel_tool_calls":   true,
+			"response_cache_policy": "off",
+		})
+	}))
+	defer server.Close()
+	if _, err := NewGatewayClient(server.URL, "").ResolveKoeExecutionProfile(context.Background()); err == nil || !strings.Contains(err.Error(), "opaque kfp1") {
+		t.Fatalf("ResolveKoeExecutionProfile error = %v, want opaque-id validation", err)
+	}
+}
+
+func validNativeComputerProfileResponse() map[string]any {
+	return map[string]any{
+		"schema_version":              1,
+		"contract_revision":           1,
+		"profile_id":                  "ep1_server-minted",
+		"provider":                    "anthropic",
+		"model":                       "claude-sonnet-5",
+		"api_surface":                 "anthropic_messages",
+		"execution_mode":              "native_computer",
+		"tool_contract":               "anthropic.computer_20251124",
+		"beta_contract":               "computer-use-2025-11-24",
+		"supports_image_input":        true,
+		"supports_tool_result_images": true,
+		"supports_function_tools":     true,
+		"supports_batched_actions":    false,
+	}
+}
+
+func TestResolveComputerExecutionProfileUsesClosedContract(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/completions/resolve" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("X-API-Key") != "secret" {
+			t.Errorf("X-API-Key = %q", r.Header.Get("X-API-Key"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := json.NewEncoder(w).Encode(validNativeComputerProfileResponse()); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	profile, err := NewGatewayClient(server.URL, "secret").ResolveComputerExecutionProfile(
+		context.Background(),
+		ComputerExecutionProfileRequest{
+			SchemaVersion:        99,
+			ModelTier:            "",
+			SpecificModel:        "anthropic:claude-sonnet-5",
+			Capability:           "caller-selected",
+			RequiredToolContract: executionprofile.AnthropicComputerToolContract,
+			AllowModelFallback:   true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ResolveComputerExecutionProfile: %v", err)
+	}
+
+	want := map[string]any{
+		"schema_version":         float64(executionprofile.ComputerSchemaVersion),
+		"specific_model":         "anthropic:claude-sonnet-5",
+		"capability":             executionprofile.ComputerCapability,
+		"required_tool_contract": executionprofile.AnthropicComputerToolContract,
+		"allow_model_fallback":   false,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("resolver request = %#v, want exactly %#v", got, want)
+	}
+	for key, value := range want {
+		if got[key] != value {
+			t.Fatalf("resolver request[%q] = %#v, want %#v; full request = %#v", key, got[key], value, got)
+		}
+	}
+	if profile.ProfileID != "ep1_server-minted" ||
+		profile.Provider != "anthropic" ||
+		profile.Model != "claude-sonnet-5" ||
+		profile.EffectiveMode != executionprofile.ModeFull ||
+		profile.ResponseCachePolicy != "" {
+		t.Fatalf("resolved profile = %+v", profile)
+	}
+}
+
+func TestResolveComputerExecutionProfileRejectsRouteDrift(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		response := validNativeComputerProfileResponse()
+		response["model"] = "claude-opus-4-7"
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	_, err := NewGatewayClient(server.URL, "").ResolveComputerExecutionProfile(
+		context.Background(),
+		ComputerExecutionProfileRequest{
+			SpecificModel:        "anthropic:claude-sonnet-5",
+			RequiredToolContract: executionprofile.AnthropicComputerToolContract,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not match exact route") {
+		t.Fatalf("ResolveComputerExecutionProfile error = %v, want exact-route rejection", err)
+	}
+}
+
+func TestResolveComputerExecutionProfileAcceptsColonModelID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"schema_version":              1,
+			"contract_revision":           1,
+			"profile_id":                  "ep1_ollama-colon-model",
+			"provider":                    "ollama",
+			"model":                       "qwen3:4b",
+			"api_surface":                 "openai_chat_completions",
+			"execution_mode":              "function_computer_use",
+			"tool_contract":               "kocoro.computer_use.v1",
+			"supports_function_tools":     true,
+			"supports_batched_actions":    false,
+			"supports_image_input":        false,
+			"supports_tool_result_images": false,
+		}); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	profile, err := NewGatewayClient(server.URL, "").ResolveComputerExecutionProfile(
+		context.Background(),
+		ComputerExecutionProfileRequest{
+			SpecificModel:        "ollama:qwen3:4b",
+			RequiredToolContract: executionprofile.GenericComputerUseToolContract,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ResolveComputerExecutionProfile: %v", err)
+	}
+	if profile.Provider != "ollama" || profile.Model != "qwen3:4b" {
+		t.Fatalf("resolved colon model profile = %+v", profile)
+	}
+}
+
+func TestResolveComputerExecutionProfileRejectsInvalidProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(map[string]any)
+		wantErr string
+	}{
+		{
+			name: "profile id is not opaque ep1",
+			mutate: func(profile map[string]any) {
+				profile["profile_id"] = "caller-chosen"
+			},
+			wantErr: "opaque ep1",
+		},
+		{
+			name: "native batched actions are unsupported",
+			mutate: func(profile map[string]any) {
+				profile["supports_batched_actions"] = true
+			},
+			wantErr: "supports_batched_actions must be false",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			response := validNativeComputerProfileResponse()
+			tc.mutate(response)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if err := json.NewEncoder(w).Encode(response); err != nil {
+					t.Errorf("encode response: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			_, err := NewGatewayClient(server.URL, "").ResolveComputerExecutionProfile(
+				context.Background(),
+				ComputerExecutionProfileRequest{
+					SpecificModel:        "anthropic:claude-sonnet-5",
+					RequiredToolContract: executionprofile.AnthropicComputerToolContract,
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ResolveComputerExecutionProfile error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestCompletionRequestMarshalFunctionToolExact(t *testing.T) {
 	req := CompletionRequest{
 		Messages: []Message{{Role: "user", Content: NewTextContent("ping")}},
@@ -267,6 +560,79 @@ func TestNativeToolDefValidate(t *testing.T) {
 	}
 }
 
+func TestResolveComputerExecutionProfileRejectsUnsupportedContractBeforeHTTP(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		http.Error(w, "must not be called", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	_, err := NewGatewayClient(server.URL, "secret").ResolveComputerExecutionProfile(
+		context.Background(),
+		ComputerExecutionProfileRequest{
+			SpecificModel:        "anthropic:claude-sonnet-5",
+			RequiredToolContract: "openai.computer.v99",
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "unsupported computer tool contract") {
+		t.Fatalf("ResolveComputerExecutionProfile error = %v, want unsupported-contract validation", err)
+	}
+	if called {
+		t.Fatal("unsupported contract reached the HTTP server")
+	}
+}
+
+func TestResolveComputerExecutionProfileRequiresExactModelBeforeHTTP(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		http.Error(w, "must not be called", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	_, err := NewGatewayClient(server.URL, "secret").ResolveComputerExecutionProfile(
+		context.Background(),
+		ComputerExecutionProfileRequest{
+			RequiredToolContract: executionprofile.AnthropicComputerToolContract,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "exact specific model") {
+		t.Fatalf("ResolveComputerExecutionProfile error = %v, want exact-model validation", err)
+	}
+	if called {
+		t.Fatal("missing exact model reached the HTTP server")
+	}
+}
+
+func TestCompletionRequestExecutionProfileMarshaling(t *testing.T) {
+	raw, err := json.Marshal(CompletionRequest{
+		Messages:            []Message{{Role: "user", Content: NewTextContent("hi")}},
+		Temperature:         0,
+		ExecutionProfileID:  "kfp1_server-minted",
+		ParallelToolCalls:   true,
+		ResponseCachePolicy: executionprofile.ResponseCacheOff,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	// Zero temperature must stay OFF the wire (omitempty): 0 means "unset →
+	// provider default", not an explicit greedy override.
+	if strings.Contains(text, `"temperature"`) {
+		t.Fatalf("payload %s carries a temperature for the zero value", text)
+	}
+	for _, field := range []string{
+		`"execution_profile_id":"kfp1_server-minted"`,
+		`"parallel_tool_calls":true`,
+		`"response_cache_policy":"off"`,
+	} {
+		if !strings.Contains(text, field) {
+			t.Fatalf("payload %s missing %s", text, field)
+		}
+	}
+}
+
 func TestProcessSSEData_EmitsOnlyCompleteToolCalls(t *testing.T) {
 	var deltas []StreamDelta
 	onDelta := func(delta StreamDelta) {
@@ -286,6 +652,98 @@ func TestProcessSSEData_EmitsOnlyCompleteToolCalls(t *testing.T) {
 	}
 	if deltas[1].ToolCall == nil || deltas[1].ToolCall.ID != "tool-3" {
 		t.Fatalf("nested tool delta = %#v", deltas[1])
+	}
+}
+
+func TestCompleteReturnsTypedJSONAPIErrorAfterHeaderFlush(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w)
+		fmt.Fprintln(
+			w,
+			`{"error":{"type":"invalid_request","code":"model_id_unknown","message":"unknown exact model","status":400}}`,
+		)
+	}))
+	defer server.Close()
+
+	gateway := NewGatewayClient(server.URL, "")
+	_, err := gateway.Complete(
+		context.Background(),
+		CompletionRequest{
+			Messages: []Message{{
+				Role:    "user",
+				Content: NewTextContent("hi"),
+			}},
+		},
+	)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Complete error = %T %v, want *APIError", err, err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest ||
+		apiErr.Code != "model_id_unknown" ||
+		!strings.Contains(apiErr.Body, "unknown exact model") {
+		t.Fatalf("typed JSON error = %+v", apiErr)
+	}
+}
+
+func TestCompleteStreamReturnsTypedSSEAPIError(t *testing.T) {
+	for _, timeout := range []time.Duration{0, time.Second} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintln(w, `data: {"type":"error","error":{"type":"invalid_request","code":"execution_profile_mismatch","message":"profile drift","status":409}}`)
+				fmt.Fprintln(w, `data: [DONE]`)
+			}))
+			defer server.Close()
+
+			gateway := NewGatewayClient(server.URL, "")
+			gateway.SetStreamIdleTimeout(timeout)
+			_, err := gateway.CompleteStream(
+				context.Background(),
+				CompletionRequest{Messages: []Message{{Role: "user", Content: NewTextContent("hi")}}},
+				nil,
+			)
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("CompleteStream error = %T %v, want *APIError", err, err)
+			}
+			if apiErr.StatusCode != http.StatusConflict ||
+				apiErr.Code != "execution_profile_mismatch" ||
+				!strings.Contains(apiErr.Body, "profile drift") {
+				t.Fatalf("typed stream error = %+v", apiErr)
+			}
+		})
+	}
+}
+
+func TestCompleteStreamReturnsDonePayloadDecodeError(t *testing.T) {
+	for _, timeout := range []time.Duration{0, time.Second} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintln(w, `data: {"type":"done","usage":"not-an-object"}`)
+				fmt.Fprintln(w, `data: [DONE]`)
+			}))
+			defer server.Close()
+
+			gateway := NewGatewayClient(server.URL, "")
+			gateway.SetStreamIdleTimeout(timeout)
+			resp, err := gateway.CompleteStream(
+				context.Background(),
+				CompletionRequest{Messages: []Message{{Role: "user", Content: NewTextContent("hi")}}},
+				nil,
+			)
+			if resp != nil {
+				t.Fatalf("CompleteStream response = %+v, want nil", resp)
+			}
+			if err == nil || !strings.Contains(err.Error(), "decode stream done response:") {
+				t.Fatalf("CompleteStream error = %v, want explicit done payload decode error", err)
+			}
+			if strings.Contains(err.Error(), "stream ended without done event") {
+				t.Fatalf("CompleteStream hid done decode failure: %v", err)
+			}
+		})
 	}
 }
 

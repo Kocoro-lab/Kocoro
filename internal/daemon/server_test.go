@@ -1097,6 +1097,60 @@ func TestServer_PatchConfigAcceptsEmptyEffortTier(t *testing.T) {
 	}
 }
 
+func TestServer_PatchConfigRejectsInvalidServiceTier(t *testing.T) {
+	shannonDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("model_tier: medium\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(`{"agent":{"service_tier":"priority"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.handlePatchConfig(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "service_tier") {
+		t.Fatalf("expected actionable message, got %s", rec.Body.String())
+	}
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "service_tier:") {
+		t.Fatalf("invalid service_tier should not have been written, got %s", string(data))
+	}
+}
+
+func TestServer_PatchConfigWritesAndClearsServiceTier(t *testing.T) {
+	shannonDir := t.TempDir()
+	configPath := filepath.Join(shannonDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("model_tier: medium\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+
+	for _, value := range []string{"fast", ""} {
+		rec := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"agent":{"service_tier":%q}}`, value)
+		req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		srv.handlePatchConfig(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH service_tier=%q status = %d, want 200, body=%s", value, rec.Code, rec.Body.String())
+		}
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("read config: %v", err)
+		}
+		if !strings.Contains(string(data), fmt.Sprintf("service_tier: %s", value)) {
+			t.Fatalf("service_tier=%q not persisted: %s", value, string(data))
+		}
+	}
+}
+
 // TestE2E_ModelTierKeywordRejectedAcrossWritePaths drives a running daemon over
 // real HTTP and verifies the tier-keyword guard holds end-to-end on every
 // config write path: named-agent create, named-agent config replace (PUT), and

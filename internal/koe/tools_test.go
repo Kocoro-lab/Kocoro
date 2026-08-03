@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 func TestToolDefsShape(t *testing.T) {
@@ -497,6 +499,134 @@ func TestToolDefsLedgerSchema(t *testing.T) {
 		strings.Contains(string(find(off, "cancel").Parameters), `"task_id"`) ||
 		strings.Contains(string(find(off, "cancel").Parameters), `"all_running"`) {
 		t.Fatal("ledger rollback must restore legacy schemas")
+	}
+	for name, defs := range map[string][]ToolDef{"ledger": on, "legacy": off} {
+		doTask := find(defs, "do_task")
+		params := string(doTask.Parameters)
+		for _, want := range []string{
+			`"execution_mode"`,
+			`"full_reason"`,
+			`"fast"`,
+			`"full"`,
+			`"none"`,
+			`"production_incident_or_recovery"`,
+			`"broad_cross_system_change"`,
+			`"additionalproperties":false`,
+			"classify only the current task",
+			"choose fast by default",
+			"weather or news briefs",
+			"focused code fixes with tests",
+			"one failure",
+			"when unsure, choose fast",
+			"diagnostic telemetry",
+			"imperfect label",
+			"exact enum token",
+		} {
+			if !strings.Contains(strings.ToLower(params), want) {
+				t.Fatalf("%s do_task schema missing %q: %s", name, want, params)
+			}
+		}
+		var schema struct {
+			Properties           map[string]json.RawMessage `json:"properties"`
+			Required             []string                   `json:"required"`
+			AdditionalProperties *bool                      `json:"additionalProperties"`
+		}
+		if err := json.Unmarshal(doTask.Parameters, &schema); err != nil {
+			t.Fatalf("%s do_task schema: %v", name, err)
+		}
+		required := make(map[string]bool, len(schema.Required))
+		for _, field := range schema.Required {
+			required[field] = true
+		}
+		for field := range schema.Properties {
+			if !required[field] {
+				t.Errorf("%s closed do_task field %q is not required", name, field)
+			}
+		}
+		if schema.AdditionalProperties == nil || *schema.AdditionalProperties {
+			t.Errorf("%s closed do_task must reject additional properties", name)
+		}
+		if strings.Contains(strings.ToLower(params), "missing or unknown values are treated as full") {
+			t.Fatalf("%s do_task schema contains contradictory unknown-value fallback: %s", name, params)
+		}
+	}
+}
+
+func TestPrepareDoTaskExecutionModeAndLineage(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	state := NewCallState("burst-mode", "")
+	dispatcher := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+
+	fastReq, task, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"check one stable value","relationship":"new","execution_mode":"fast","full_reason":"none"}`), "en", false)
+	if err != nil || clarify != nil || task == nil {
+		t.Fatalf("prepare fast: req=%+v task=%+v clarify=%+v err=%v", fastReq, task, clarify, err)
+	}
+	if fastReq.ExecutionMode != executionprofile.ModeFast ||
+		fastReq.RequestedExecutionMode == nil || *fastReq.RequestedExecutionMode != "fast" ||
+		fastReq.FullReason != executionprofile.FullReasonNone ||
+		fastReq.LogicalTaskID == "" || fastReq.ExecutionRunID == "" || fastReq.ParentRunID != "" {
+		t.Fatalf("fast request lineage = %+v", fastReq)
+	}
+
+	fullReq, followed, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"use Full mode for the sensitive review","relationship":"follow_up","task_id":"`+task.ID+`","execution_mode":"full","full_reason":"explicit_full_mode_request"}`), "en", false)
+	if err != nil || clarify != nil || followed == nil {
+		t.Fatalf("prepare upgrade: req=%+v task=%+v clarify=%+v err=%v", fullReq, followed, clarify, err)
+	}
+	if fullReq.ExecutionMode != executionprofile.ModeFull ||
+		fullReq.RequestedExecutionMode == nil || *fullReq.RequestedExecutionMode != "full" ||
+		fullReq.FullReason != executionprofile.FullReasonExplicitFullRequest ||
+		fullReq.ParentRunID != fastReq.ExecutionRunID ||
+		fullReq.ExecutionRunID == fastReq.ExecutionRunID ||
+		fullReq.LogicalTaskID != fastReq.LogicalTaskID {
+		t.Fatalf("fast->full child lineage = %+v, parent=%+v", fullReq, fastReq)
+	}
+	state.LandResult(task.ID, SayResult{Status: "ok", Reply: "done"})
+	stickyReq, _, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"make one quick correction","relationship":"follow_up","task_id":"`+task.ID+`","execution_mode":"fast","full_reason":"none"}`), "en", false)
+	if err != nil || clarify != nil || stickyReq.ExecutionMode != executionprofile.ModeFast ||
+		stickyReq.InheritedMode != executionprofile.ModeFull {
+		t.Fatalf("completed full->fast lineage did not preserve requested/effective modes: req=%+v clarify=%+v err=%v", stickyReq, clarify, err)
+	}
+
+	unknownReq, _, _, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"separate work","relationship":"new","execution_mode":"turbo","full_reason":"none"}`), "en", false)
+	if err != nil || unknownReq.ExecutionMode != executionprofile.ModeFull {
+		t.Fatalf("unknown execution mode = %+v err=%v, want full", unknownReq, err)
+	}
+}
+
+func TestPrepareDoTaskModeIsAuthoritativeAndReasonIsTelemetry(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	state := NewCallState("burst-admission", "")
+	dispatcher := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+
+	selectedFull, task, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"Run the full unit-test suite for internal/cache.","relationship":"new","execution_mode":"full","full_reason":"none"}`),
+		"en",
+		false,
+	)
+	if err != nil || clarify != nil || task == nil {
+		t.Fatalf("prepare selected Full: req=%+v task=%+v clarify=%+v err=%v", selectedFull, task, clarify, err)
+	}
+	if selectedFull.ExecutionMode != executionprofile.ModeFull ||
+		selectedFull.RequestedExecutionMode == nil ||
+		*selectedFull.RequestedExecutionMode != "full" {
+		t.Fatalf("selected Full was changed by missing diagnostic reason: %+v", selectedFull)
+	}
+
+	selectedFast, _, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"Investigate the real production data-loss incident.","relationship":"new","execution_mode":"fast","full_reason":"production_incident_or_recovery"}`),
+		"en",
+		false,
+	)
+	if err != nil || clarify != nil {
+		t.Fatalf("prepare selected Fast: req=%+v clarify=%+v err=%v", selectedFast, clarify, err)
+	}
+	if selectedFast.ExecutionMode != executionprofile.ModeFast ||
+		selectedFast.FullReason != executionprofile.FullReasonProductionIncident {
+		t.Fatalf("diagnostic reason overrode selected Fast: %+v", selectedFast)
 	}
 }
 

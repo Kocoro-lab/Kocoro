@@ -6,9 +6,10 @@ import (
 )
 
 type budgetTestTool struct {
-	name     string
-	desc     string
-	exposure ToolExposure
+	name        string
+	desc        string
+	exposure    ToolExposure
+	requirement ToolProfileRequirement
 }
 
 func (t *budgetTestTool) Info() ToolInfo {
@@ -26,6 +27,9 @@ func (t *budgetTestTool) Run(context.Context, string) (ToolResult, error) {
 func (t *budgetTestTool) RequiresApproval() bool { return false }
 func (t *budgetTestTool) ToolExposure() ToolExposure {
 	return t.exposure
+}
+func (t *budgetTestTool) ToolProfileRequirement() ToolProfileRequirement {
+	return t.requirement
 }
 
 func TestEstimateSchemaTokens_Simple(t *testing.T) {
@@ -118,5 +122,23 @@ func TestToolSchemaFingerprint_Deterministic(t *testing.T) {
 	}
 	if fp1 != fp2 {
 		t.Fatalf("fingerprints should be deterministic, got %q vs %q", fp1, fp2)
+	}
+}
+
+func TestToolSchemaFingerprint_ChangesWithProfileRequirement(t *testing.T) {
+	unbound := NewToolRegistry()
+	unbound.Register(&budgetTestTool{
+		name:     "computer",
+		exposure: ToolExposureDeferred,
+	})
+	profileBound := NewToolRegistry()
+	profileBound.Register(&budgetTestTool{
+		name:        "computer",
+		exposure:    ToolExposureDeferred,
+		requirement: ToolProfileComputer,
+	})
+
+	if toolSchemaFingerprint(unbound) == toolSchemaFingerprint(profileBound) {
+		t.Fatal("profile requirement change must alter toolset fingerprint")
 	}
 }

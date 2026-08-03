@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 // ToolDef is an OpenAI Realtime function-tool definition.
@@ -23,13 +25,46 @@ type ToolDef struct {
 
 const VoiceIdentityInstructions = "Speak as Kocoro in the first person when describing your actions, work, or results. Never describe Kocoro as a separate worker, delegate, or result source. Even when a specialist handles work, you remain the single Kocoro voice and own the result. Kocoro Desktop is the app name, not another assistant; refer to the app only by its full name."
 
-const ParallelTaskInstructions = "Default to exactly one do_task call. Use multiple do_task calls in one response only when the user explicitly asks for independent work to run in parallel or concurrently. When emitting multiple calls, each call must contain exactly one disjoint work unit and exclude work assigned to every other call. Never send the full compound request in one call while also sending any of its parts in other calls. If the user asks to run A and B in parallel, send one A-only call and one B-only call. This multiple-call rule overrides guidance to pass the whole utterance as spoken or preserve every detail in each call."
+const ParallelTaskInstructions = "Default to exactly one do_task call. Use multiple do_task calls in one response only when the user explicitly asks for independent work to run in parallel or concurrently. When emitting multiple calls, each call must contain exactly one disjoint work unit and exclude work assigned to other calls. Never send the full compound request in one call while also sending any of its parts in other calls. If the user asks to run A and B in parallel, send one A-only call and one B-only call. This multiple-call rule overrides guidance to pass the whole utterance as spoken or preserve every detail in each call."
+
+const executionModeSchemaInstructions = `# do_task execution profile
+Classify only the current task. Use exact enum tokens, never translated prose.
+
+- Default: execution_mode=fast and full_reason=none.
+- Choose execution_mode first. Full is a practical routing judgment for work where extra deliberation is materially useful, not a precise taxonomy.
+- If the task is borderline, stay Fast.
+- Then report the closest reason for telemetry: Fast uses none; Full uses the best-fitting reason below. Reasons may overlap and the label need not be perfect.
+- Full reasons:
+  1. explicit_full_mode_request: the user literally requests Full mode or directly asks to use a deep/thorough reasoning mode.
+  2. production_incident_or_recovery: a real production incident, data loss, or recovery.
+  3. security_or_permissions: a broad real security, authentication, secret-exposure, or permission investigation.
+  4. high_stakes_judgment: consequential medical, legal, or major financial judgment.
+  5. destructive_migration: a live database or multi-region migration requiring rollback.
+  6. broad_cross_system_change: dependent design, implementation, migration or rollout, rollback, and validation across systems.
+  7. long_research_synthesis: genuinely long multi-source research and synthesis.
+- Never choose Full merely because work uses several tools or steps, edits files, runs tests, has one failure, may take a long time, contains words such as "full" or "deep", or quotes a Full instruction.
+
+Examples:
+- "Run the full unit-test suite", "implement deep copy", or "this may take 45 minutes" -> fast/none.
+- "Use Full mode for this plan" -> full/explicit_full_mode_request.
+- "Production orders were deleted; recover them" -> full/production_incident_or_recovery.
+- "A contractor can read every tenant secret; investigate and fix access control" -> full/security_or_permissions.
+- "Compare cancer treatments for this patient", "decide legal launch risk", or "make an acquisition go/no-go judgment" -> full/high_stakes_judgment.
+- "Rewrite the production primary key with rollback" -> full/destructive_migration.
+- "Design, implement, migrate, roll out, roll back, and validate the account system across mobile, API, auth, and DB" -> full/broad_cross_system_change.
+- "Research three years of sources, reconcile conflicts, benchmark, and synthesize a report" -> full/long_research_synthesis.`
 
 func obj(raw string) json.RawMessage { return json.RawMessage(raw) }
 
-const doTaskParamsLegacy = `{"type":"object","properties":{"task":{"type":"string","description":"The task to perform, in the user's own words."},"agent":{"type":"string","description":"Optional: the agent the user named for this task, verbatim. Omit to use the bound agent."}},"required":["task"]}`
+const executionModeDescription = "Classify only the current task. Choose fast by default. Fast includes lookups, weather or news briefs, comparisons, calculations, short document work, small file/config changes, focused code fixes with tests, routine app actions, and other bounded goals even when several tools or steps are needed. Choose full when unusually complex, high-stakes, broad, or long work materially benefits from extra deliberation. Tools, file edits, tests, one failure, elapsed time, or unknown information never justify full by themselves. When unsure, choose fast."
 
-const doTaskParamsLedger = `{"type":"object","properties":{"task":{"type":"string","description":"Exactly one task scope for this call, in the user's own words. With the default single call, include the complete request. For explicit parallel calls, include only this call's disjoint work unit and exclude work assigned to other calls."},"agent":{"type":"string","description":"Only when the user explicitly named an agent in this utterance; otherwise omit it."},"relationship":{"type":"string","enum":["new","follow_up"],"description":"new starts another independent task; follow_up refines or corrects an existing task. Omit only when genuinely unsure."},"task_id":{"type":"string","description":"For follow_up, the target task id from a prior result or get_status. Omit only when one running task is unambiguous."}},"required":["task"]}`
+const fullReasonDescription = "Diagnostic telemetry for the execution_mode decision. Return one exact enum token, never prose or a translation. Use none for Fast. For Full choose the closest reason; overlap and an imperfect label are acceptable: explicit_full_mode_request only when the user literally asks for Full mode or directly requests deep/thorough reasoning mode; production_incident_or_recovery for a real production incident, data loss, or recovery; security_or_permissions for a broad security/auth/permission investigation; high_stakes_judgment for consequential medical, legal, or major financial judgment; destructive_migration for a live database or multi-region migration requiring rollback; broad_cross_system_change for a broad dependent design+implementation+migration/rollout+rollback/validation change; long_research_synthesis for genuinely long, multi-source research and synthesis."
+
+const fullReasonEnum = `["none","explicit_full_mode_request","production_incident_or_recovery","security_or_permissions","high_stakes_judgment","destructive_migration","broad_cross_system_change","long_research_synthesis"]`
+
+var doTaskParamsLegacy = `{"type":"object","properties":{"task":{"type":"string","description":"The task to perform, in the user's own words."},"agent":{"type":["string","null"],"description":"The agent the user named for this task, or null to use the bound agent."},"execution_mode":{"type":"string","enum":["fast","full"],"description":` + fmt.Sprintf("%q", executionModeDescription) + `},"full_reason":{"type":"string","enum":` + fullReasonEnum + `,"description":` + fmt.Sprintf("%q", fullReasonDescription) + `}},"required":["task","agent","execution_mode","full_reason"],"additionalProperties":false}`
+
+var doTaskParamsLedger = `{"type":"object","properties":{"task":{"type":"string","description":"Exactly one task scope for this call, in the user's own words. With the default single call, include the complete request. For explicit parallel calls, include only this call's disjoint work unit and exclude work assigned to other calls."},"agent":{"type":["string","null"],"description":"The explicitly named agent, or null when none was named."},"relationship":{"type":["string","null"],"enum":["new","follow_up",null],"description":"new starts an independent task; follow_up refines or corrects an existing task; null only when genuinely unsure."},"task_id":{"type":["string","null"],"description":"For follow_up, the target task id; otherwise null."},"execution_mode":{"type":"string","enum":["fast","full"],"description":` + fmt.Sprintf("%q", executionModeDescription) + `},"full_reason":{"type":"string","enum":` + fullReasonEnum + `,"description":` + fmt.Sprintf("%q", fullReasonDescription) + `}},"required":["task","agent","relationship","task_id","execution_mode","full_reason"],"additionalProperties":false}`
 
 const cancelParamsLegacy = `{"type":"object","properties":{"reason":{"type":"string","enum":["user_cancel","interrupt"],"description":"Why the task is being cancelled."}},"required":[]}`
 
@@ -499,10 +534,12 @@ func agentOverrideAllowed(task string, names []string) bool {
 // after) so get_status reflects the async delegation, not a blocking call.
 func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string, sameTurnMultiDispatch bool) (DoTaskRequest, *VoiceTask, *SayResult, error) {
 	var a struct {
-		Task         string `json:"task"`
-		Agent        string `json:"agent"`
-		Relationship string `json:"relationship"`
-		TaskID       string `json:"task_id"`
+		Task          string `json:"task"`
+		Agent         string `json:"agent"`
+		Relationship  string `json:"relationship"`
+		TaskID        string `json:"task_id"`
+		ExecutionMode string `json:"execution_mode"`
+		FullReason    string `json:"full_reason"`
 	}
 	if err := json.Unmarshal(argsJSON, &a); err != nil || a.Task == "" {
 		return DoTaskRequest{}, nil, nil, fmt.Errorf("do_task requires a task")
@@ -536,8 +573,15 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string, sameTurnMultiDi
 	burstID := d.state.burstID
 	cwd, foregroundHint := d.state.callContextLocked()
 	d.state.mu.Unlock()
+	admission := executionprofile.DecideModeAdmission(a.ExecutionMode, a.FullReason)
+	executionMode := admission.AdmittedMode
+	requestedExecutionMode := a.ExecutionMode
 	if !TaskLedgerEnabled() {
-		return DoTaskRequest{Text: a.Task, Agent: agent, ThreadID: burstID, CWD: cwd, ForegroundHint: foregroundHint}, nil, nil, nil
+		return DoTaskRequest{
+			Text: a.Task, Agent: agent, ThreadID: burstID, CWD: cwd, ForegroundHint: foregroundHint,
+			ExecutionMode: executionMode, RequestedExecutionMode: &requestedExecutionMode,
+			FullReason: admission.RequestedFullReason,
+		}, nil, nil, nil
 	}
 
 	// Relationship is native-model semantic evidence, resolved against the live
@@ -545,37 +589,44 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string, sameTurnMultiDi
 	var task *VoiceTask
 	switch strings.ToLower(strings.TrimSpace(a.Relationship)) {
 	case "follow_up", "followup", "follow-up":
-		if resolved, ok := d.state.BeginFollowUp(a.TaskID, a.Task); ok {
+		if resolved, ok := d.state.BeginFollowUpWithMode(a.TaskID, a.Task, executionMode); ok {
 			task = resolved
 		} else {
 			switch running := d.state.RunningTasks(); len(running) {
 			case 1:
-				task, _ = d.state.BeginFollowUp(running[0].ID, a.Task)
+				task, _ = d.state.BeginFollowUpWithMode(running[0].ID, a.Task, executionMode)
 			case 0:
-				task = d.state.BeginTask(a.Task, agent)
+				task = d.state.BeginTaskWithMode(a.Task, agent, executionMode)
 			default:
 				say := clarifyWhichTask(lang, running)
 				return DoTaskRequest{}, nil, &SayResult{Status: "clarify", SpokenSummary: say, Say: say}, nil
 			}
 		}
 	case "new":
-		task = d.state.BeginTask(a.Task, agent)
+		task = d.state.BeginTaskWithMode(a.Task, agent, executionMode)
 	default:
 		// Keep main's existing merge bias when the model is unsure: a later P3
 		// transaction groups same-turn parallel calls so they still split correctly.
 		if sameTurnMultiDispatch {
-			task = d.state.BeginTask(a.Task, agent)
+			task = d.state.BeginTaskWithMode(a.Task, agent, executionMode)
 		} else if running := d.state.RunningMainLaneTask(agent); running != nil {
-			task, _ = d.state.BeginFollowUp(running.ID, a.Task)
+			task, _ = d.state.BeginFollowUpWithMode(running.ID, a.Task, executionMode)
 		} else if running := d.state.RunningTasksForAgent(agent); len(running) == 1 {
-			task, _ = d.state.BeginFollowUp(running[0].ID, a.Task)
+			task, _ = d.state.BeginFollowUpWithMode(running[0].ID, a.Task, executionMode)
 		} else {
-			task = d.state.BeginTask(a.Task, agent)
+			task = d.state.BeginTaskWithMode(a.Task, agent, executionMode)
 		}
+	}
+	run := task.CurrentExecutionRun()
+	inheritedMode := executionprofile.Mode("")
+	if executionMode == executionprofile.ModeFast && task.CurrentExecutionMode() == executionprofile.ModeFull {
+		inheritedMode = executionprofile.ModeFull
 	}
 	return DoTaskRequest{
 		Text: a.Task, Agent: task.Agent, ThreadID: task.ThreadID,
-		CWD: cwd, ForegroundHint: foregroundHint,
+		CWD: cwd, ForegroundHint: foregroundHint, ExecutionMode: executionMode, InheritedMode: inheritedMode,
+		RequestedExecutionMode: &requestedExecutionMode, FullReason: admission.RequestedFullReason,
+		LogicalTaskID: run.LogicalTaskID, ExecutionRunID: run.RunID, ParentRunID: run.ParentRunID,
 	}, task, nil, nil
 }
 

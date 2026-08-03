@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -206,6 +208,17 @@ func fakeTarball(t *testing.T, root string, names ...string) []byte {
 
 func tarballReader(b []byte) io.ReadCloser { return io.NopCloser(bytes.NewReader(b)) }
 
+func pinnedTestInstallation(tarball []byte, slug string) CatalogInstallation {
+	digest := sha256.Sum256(tarball)
+	return CatalogInstallation{
+		Provider:      "github_archive",
+		Repository:    "https://github.com/example/skills",
+		Ref:           strings.Repeat("a", 40),
+		ArtifactPath:  "skills/" + slug,
+		ArchiveSHA256: hex.EncodeToString(digest[:]),
+	}
+}
+
 // TestInstallFromRepo_RetriesOnTransientFailure pins the retry contract:
 // a single transient download failure must NOT surface to the caller;
 // the next attempt's success should produce a clean install. This is the
@@ -219,7 +232,7 @@ func TestInstallFromRepo_RetriesOnTransientFailure(t *testing.T) {
 	shannonDir := t.TempDir()
 	var attempts atomic.Int32
 	tarball := fakeTarball(t, "skills-main", "retry-fixture")
-	openRepoTarball = func(ctx context.Context) (io.ReadCloser, error) {
+	openRepoTarball = func(ctx context.Context, repository, ref string) (io.ReadCloser, error) {
 		if attempts.Add(1) == 1 {
 			return nil, fmt.Errorf("simulated network flake")
 		}
@@ -227,7 +240,7 @@ func TestInstallFromRepo_RetriesOnTransientFailure(t *testing.T) {
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "retry-fixture")
-	if err := installFromRepo(context.Background(), shannonDir, "retry-fixture", destDir); err != nil {
+	if err := installFromRepo(context.Background(), shannonDir, "retry-fixture", destDir, pinnedTestInstallation(tarball, "retry-fixture")); err != nil {
 		t.Fatalf("install should succeed after retry, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(destDir, "SKILL.md")); err != nil {
@@ -252,13 +265,13 @@ func TestInstallFromRepo_NoRetryOnNotFoundSentinel(t *testing.T) {
 	shannonDir := t.TempDir()
 	var fetches atomic.Int32
 	tarball := fakeTarball(t, "skills-main", "some-other-skill")
-	openRepoTarball = func(ctx context.Context) (io.ReadCloser, error) {
+	openRepoTarball = func(ctx context.Context, repository, ref string) (io.ReadCloser, error) {
 		fetches.Add(1)
 		return tarballReader(tarball), nil
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "does-not-exist")
-	err := installFromRepo(context.Background(), shannonDir, "does-not-exist", destDir)
+	err := installFromRepo(context.Background(), shannonDir, "does-not-exist", destDir, pinnedTestInstallation(tarball, "does-not-exist"))
 	if err == nil {
 		t.Fatalf("expected sentinel error, got nil")
 	}
@@ -272,6 +285,30 @@ func TestInstallFromRepo_NoRetryOnNotFoundSentinel(t *testing.T) {
 	}
 }
 
+func TestInstallFromRepoRejectsArchiveDigestMismatchWithoutRetry(t *testing.T) {
+	orig := openRepoTarball
+	t.Cleanup(func() { openRepoTarball = orig })
+	tarball := fakeTarball(t, "skills-pinned", "pptx")
+	var fetches atomic.Int32
+	openRepoTarball = func(context.Context, string, string) (io.ReadCloser, error) {
+		fetches.Add(1)
+		return tarballReader(tarball), nil
+	}
+	installation := pinnedTestInstallation(tarball, "pptx")
+	installation.ArchiveSHA256 = strings.Repeat("0", 64)
+	destDir := filepath.Join(t.TempDir(), "skills", "pptx")
+	err := installFromRepo(context.Background(), filepath.Dir(filepath.Dir(destDir)), "pptx", destDir, installation)
+	if !errors.Is(err, ErrSkillArchiveIntegrity) {
+		t.Fatalf("digest mismatch error=%v", err)
+	}
+	if fetches.Load() != 1 {
+		t.Fatalf("integrity mismatch retried %d times", fetches.Load())
+	}
+	if _, statErr := os.Stat(destDir); !os.IsNotExist(statErr) {
+		t.Fatalf("unverified artifact reached destination: %v", statErr)
+	}
+}
+
 // TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError pins the failure
 // shape after all retries are exhausted: the last download error is returned
 // unchanged so the audit log captures the actual failure the user needs to
@@ -282,13 +319,13 @@ func TestInstallFromRepo_ExhaustsRetriesAndReturnsLastError(t *testing.T) {
 
 	shannonDir := t.TempDir()
 	var attempts atomic.Int32
-	openRepoTarball = func(ctx context.Context) (io.ReadCloser, error) {
+	openRepoTarball = func(ctx context.Context, repository, ref string) (io.ReadCloser, error) {
 		attempts.Add(1)
 		return nil, fmt.Errorf("persistent failure: connection refused")
 	}
 
 	destDir := filepath.Join(shannonDir, "skills", "always-fails")
-	err := installFromRepo(context.Background(), shannonDir, "always-fails", destDir)
+	err := installFromRepo(context.Background(), shannonDir, "always-fails", destDir, CatalogInstallation{Ref: strings.Repeat("a", 40)})
 	if err == nil {
 		t.Fatalf("expected error after exhausting retries, got nil")
 	}
@@ -330,7 +367,7 @@ func TestExtractSkillFromTarball_ArbitraryRootAndNested(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "pdf")
-	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", dest); err != nil {
+	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", "skills/pdf", dest); err != nil {
 		t.Fatalf("extract: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dest, "SKILL.md")); err != nil {
@@ -367,7 +404,7 @@ func TestExtractSkillFromTarball_SkipsSymlinkAndTraversal(t *testing.T) {
 	must(gz.Close())
 
 	dest := filepath.Join(t.TempDir(), "pdf")
-	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", dest); err != nil {
+	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", "skills/pdf", dest); err != nil {
 		t.Fatalf("extract: %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(dest, "evil-link")); err == nil {
@@ -403,7 +440,7 @@ func TestExtractSkillFromTarball_PerFileSizeCap(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "pdf")
-	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", dest); err == nil {
+	if err := extractSkillFromTarball(bytes.NewReader(buf.Bytes()), "pdf", "skills/pdf", dest); err == nil {
 		t.Fatalf("expected per-file size cap error, got nil")
 	}
 }
@@ -445,7 +482,7 @@ func TestExtractSkillFromTarball_FileCountCap(t *testing.T) {
 		{"root/skills/pdf/b.md", "b"},
 	})
 	dest := filepath.Join(t.TempDir(), "pdf")
-	if err := extractSkillFromTarball(bytes.NewReader(data), "pdf", dest); err == nil ||
+	if err := extractSkillFromTarball(bytes.NewReader(data), "pdf", "skills/pdf", dest); err == nil ||
 		!strings.Contains(err.Error(), "files") {
 		t.Fatalf("expected file-count cap error, got %v", err)
 	}
@@ -463,7 +500,7 @@ func TestExtractSkillFromTarball_TotalDecompressionCap(t *testing.T) {
 		{"root/skills/pdf/SKILL.md", "---\nname: pdf\ndescription: x\n---\nbody"},
 	})
 	dest := filepath.Join(t.TempDir(), "pdf")
-	if err := extractSkillFromTarball(bytes.NewReader(data), "pdf", dest); err == nil ||
+	if err := extractSkillFromTarball(bytes.NewReader(data), "pdf", "skills/pdf", dest); err == nil ||
 		!strings.Contains(err.Error(), "decompression") {
 		t.Fatalf("expected decompression-guard error, got %v", err)
 	}

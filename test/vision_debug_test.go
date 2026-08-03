@@ -30,7 +30,17 @@ func TestVisionLoop_FullPipeline(t *testing.T) {
 		}
 
 		if callCount == 1 {
-			// First call: tell the model to call screenshot
+			// screenshot is Deferred: load its schema before calling it.
+			json.NewEncoder(w).Encode(client.CompletionResponse{
+				OutputText:   "",
+				FinishReason: "tool_use",
+				FunctionCall: &client.FunctionCall{
+					Name:      "tool_search",
+					Arguments: json.RawMessage(`{"query":"select:screenshot"}`),
+				},
+				Usage: client.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+			})
+		} else if callCount == 2 {
 			json.NewEncoder(w).Encode(client.CompletionResponse{
 				OutputText:   "",
 				FinishReason: "tool_use",
@@ -65,11 +75,12 @@ func TestVisionLoop_FullPipeline(t *testing.T) {
 	t.Logf("Result: %s", result)
 	t.Logf("LLM calls: %d, tokens: %d", usage.LLMCalls, usage.TotalTokens)
 
-	if callCount < 2 {
-		t.Fatalf("expected at least 2 LLM calls, got %d", callCount)
+	if callCount < 3 {
+		t.Fatalf("expected at least 3 LLM calls, got %d", callCount)
 	}
 
-	// Parse the captured messages from the 2nd API call to verify image blocks
+	// Parse the captured messages from the post-screenshot API call to verify
+	// image blocks.
 	if len(capturedMessages) == 0 {
 		t.Fatal("no messages captured from API request")
 	}
@@ -77,7 +88,7 @@ func TestVisionLoop_FullPipeline(t *testing.T) {
 	var messages []json.RawMessage
 	json.Unmarshal(capturedMessages[0], &messages)
 
-	t.Logf("Messages in 2nd API call: %d", len(messages))
+	t.Logf("Messages in post-screenshot API call: %d", len(messages))
 
 	foundImage := false
 	imageBytes := 0

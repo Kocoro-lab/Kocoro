@@ -16,6 +16,7 @@ package daemon
 // compare.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -31,8 +32,11 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
+	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
@@ -863,9 +867,178 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	if !has(CapComputerUseRiskConfirmationV1) {
 		t.Fatalf("capabilities lost %q: %v", CapComputerUseRiskConfirmationV1, *status.Capabilities)
 	}
+	if !has(CapSkillInstallRecommendationV1) {
+		t.Fatalf("capabilities lost %q: %v", CapSkillInstallRecommendationV1, *status.Capabilities)
+	}
 	if status.Memory == nil || status.Memory.Provider != "disabled" || status.Memory.Reason != nil {
 		t.Fatalf("memory block decode mismatch: %+v", status.Memory)
 	}
+}
+
+func TestWireFixture_SkillRecommendationV1(t *testing.T) {
+	fixture := loadWireFixture(t, "sse_event.skill.recommendation.v1.json")
+	dir := t.TempDir()
+	deps := &ServerDeps{Config: &config.Config{}, ShannonDir: dir, CatalogProvider: skills.NewEmbeddedCatalogProvider(dir)}
+	s := NewServer(0, nil, deps, "test")
+	auth := NewAuthManager(AuthManagerConfig{ShannonDir: dir})
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "opaque-account"}, "")
+	s.auth = auth
+	httpServer := httptest.NewServer(http.HandlerFunc(s.handleEvents))
+	defer httpServer.Close()
+	request, err := http.NewRequest(http.MethodGet, httpServer.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceID := "12345678-1234-1234-1234-123456789abc"
+	request.Header.Set(desktopDeviceHeader, deviceID)
+	request.Header.Set(skillRecommendationHeader, CapSkillInstallRecommendationV1)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for !s.hasSkillRecommendationSink("opaque-account", deviceID) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	run := &skillRecommendationRunContext{accountID: "opaque-account", deviceID: deviceID, agentName: "researcher", sessionID: "session_demo", turnID: "turn_demo", store: s.skillRecommendations, emit: s.emitSkillRecommendation, discovered: map[string]bool{}}
+	runContext := withSkillRecommendationRun(context.Background(), run)
+	discovery, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(runContext, `{"intent_tags":["presentation.create"]}`)
+	if err != nil || discovery.IsError {
+		t.Fatalf("catalog discovery=%+v err=%v", discovery, err)
+	}
+	offered := make(chan agent.ToolResult, 1)
+	go func() {
+		result, _ := (&offerSkillInstallationTool{shannonDir: dir}).Run(runContext, `{"catalog_ids":["official:pptx"],"reason":"Create the requested presentation"}`)
+		offered <- result
+	}()
+	scanner := bufio.NewScanner(response.Body)
+	var payload []byte
+	for scanner.Scan() {
+		if line := scanner.Bytes(); bytes.HasPrefix(line, []byte("data: ")) {
+			payload = append([]byte(nil), line[len("data: "):]...)
+			break
+		}
+	}
+	if len(payload) == 0 {
+		t.Fatal("real /events producer emitted no recommendation payload")
+	}
+	if result := <-offered; result.IsError || !result.StopAgentLoop {
+		t.Fatalf("real offer producer result=%+v", result)
+	}
+	produced := parseJSONMap(t, payload)
+	for _, field := range []string{"recommendation_id", "continuation_token", "expires_at"} {
+		if produced[field] == nil || produced[field] == "" {
+			t.Fatalf("dynamic field %s missing from producer: %v", field, produced)
+		}
+		produced[field] = fixture[field]
+	}
+	assertSemanticEqual(t, fixture, produced)
+	var consumer struct {
+		SchemaVersion     int    `json:"schema_version"`
+		RecommendationID  string `json:"recommendation_id"`
+		SessionID         string `json:"session_id"`
+		TurnID            string `json:"turn_id"`
+		CatalogRevision   string `json:"catalog_revision"`
+		State             string `json:"state"`
+		ContinuationToken string `json:"continuation_token"`
+		Items             []struct {
+			CatalogID         string `json:"catalog_id"`
+			Slug              string `json:"slug"`
+			CapabilitySummary string `json:"capability_summary"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(payload, &consumer); err != nil {
+		t.Fatal(err)
+	}
+	if consumer.SchemaVersion != 1 || consumer.SessionID != "session_demo" || consumer.TurnID != "turn_demo" || consumer.ContinuationToken == "" || len(consumer.Items) != 1 || consumer.Items[0].CatalogID != "official:pptx" {
+		t.Fatalf("consumer decode mismatch: %+v", consumer)
+	}
+}
+
+func TestWireFixture_SkillRecommendationContinuationAndDismiss(t *testing.T) {
+	continueRequestFixture := loadWireFixture(t, "http_post.skill_recommendation_continue.request.json")
+	acceptedFixture := loadWireFixture(t, "http_post.skill_recommendation_continue.accepted.response.json")
+	completedFixture := loadWireFixture(t, "http_post.skill_recommendation_continue.completed.response.json")
+	dismissRequestFixture := loadWireFixture(t, "http_post.skill_recommendation_dismiss.request.json")
+	dismissFixture := loadWireFixture(t, "http_post.skill_recommendation_dismiss.response.json")
+	if len(dismissRequestFixture) != 0 {
+		t.Fatalf("dismiss request must remain body-empty: %v", dismissRequestFixture)
+	}
+
+	dir := t.TempDir()
+	deps := &ServerDeps{Config: &config.Config{}, ShannonDir: dir, CatalogProvider: skills.NewEmbeddedCatalogProvider(dir)}
+	s := NewServer(0, nil, deps, "test")
+	auth := NewAuthManager(AuthManagerConfig{ShannonDir: dir})
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "opaque-account"}, "")
+	s.auth = auth
+	deviceID := "12345678-1234-1234-1234-123456789abc"
+	if err := os.MkdirAll(filepath.Join(dir, "skills", "pptx"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "skills", "pptx", "SKILL.md"), []byte("---\nname: pptx\ndescription: fixture\n---\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v, _, err := s.skillRecommendations.offer("opaque-account", deviceID, "", continueRequestFixture["session_id"].(string), "turn_demo", "sha256:fixture", []skillRecommendationItemWireV1{{CatalogID: "official:pptx", Slug: "pptx", DisplayName: "Presentation"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, run, err := s.skillRecommendations.beginContinuation("opaque-account", deviceID, v.SessionID, v.RecommendationID, v.ContinuationToken)
+	if err != nil || !run {
+		t.Fatalf("prime accepted state run=%v err=%v", run, err)
+	}
+
+	callContinue := func() *httptest.ResponseRecorder {
+		body := map[string]any{
+			"session_id":         continueRequestFixture["session_id"],
+			"continuation_token": v.ContinuationToken,
+		}
+		encoded, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/skill-recommendations/"+v.RecommendationID+"/continue", bytes.NewReader(encoded))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(desktopDeviceHeader, deviceID)
+		req.Header.Set(skillRecommendationHeader, CapSkillInstallRecommendationV1)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		return rr
+	}
+
+	acceptedResponse := callContinue()
+	if acceptedResponse.Code != http.StatusAccepted {
+		t.Fatalf("accepted retry status=%d body=%s", acceptedResponse.Code, acceptedResponse.Body.String())
+	}
+	assertSemanticEqual(t, acceptedFixture, parseJSONMap(t, acceptedResponse.Body.Bytes()))
+	var acceptedConsumer struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(acceptedResponse.Body.Bytes(), &acceptedConsumer); err != nil || acceptedConsumer.Status != "accepted" {
+		t.Fatalf("accepted consumer decode=%+v err=%v", acceptedConsumer, err)
+	}
+
+	if err := s.skillRecommendations.finishContinuation(accepted, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	completedResponse := callContinue()
+	if completedResponse.Code != http.StatusOK {
+		t.Fatalf("completed replay status=%d body=%s", completedResponse.Code, completedResponse.Body.String())
+	}
+	assertSemanticEqual(t, completedFixture, parseJSONMap(t, completedResponse.Body.Bytes()))
+
+	dismissed, _, err := s.skillRecommendations.offer("opaque-account", deviceID, "", "dismiss_session", "dismiss_turn", "sha256:fixture", []skillRecommendationItemWireV1{{CatalogID: "official:pptx", Slug: "pptx"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dismissBody, _ := json.Marshal(dismissRequestFixture)
+	dismissRequest := httptest.NewRequest(http.MethodPost, "/skill-recommendations/"+dismissed.RecommendationID+"/dismiss", bytes.NewReader(dismissBody))
+	dismissRequest.Header.Set("Content-Type", "application/json")
+	dismissRequest.Header.Set(desktopDeviceHeader, deviceID)
+	dismissRequest.Header.Set(skillRecommendationHeader, CapSkillInstallRecommendationV1)
+	dismissResponse := httptest.NewRecorder()
+	s.Handler().ServeHTTP(dismissResponse, dismissRequest)
+	if dismissResponse.Code != http.StatusOK {
+		t.Fatalf("dismiss status=%d body=%s", dismissResponse.Code, dismissResponse.Body.String())
+	}
+	assertSemanticEqual(t, dismissFixture, parseJSONMap(t, dismissResponse.Body.Bytes()))
 }
 
 func TestWireFixture_HTTPRemoteSessionTimeline(t *testing.T) {
@@ -1452,4 +1625,128 @@ func TestWireFixture_MessageIdempotencyRequest(t *testing.T) {
 		t.Fatalf("re-encode failed: %v", err)
 	}
 	assertSemanticEqual(t, fixture, parseJSONMap(t, reEncoded))
+}
+
+// TestWireFixture_MessageKoeExecutionFastRequest pins the source=koe fast
+// request: the semantic execution_mode/requested_execution_mode claim plus
+// client-minted lineage ids. The wire deliberately carries NO provider, model,
+// or profile fields — the daemon re-decides admission and resolves the profile.
+func TestWireFixture_MessageKoeExecutionFastRequest(t *testing.T) {
+	fixture := loadWireFixture(t, "message_koe_execution_fast_request.json")
+
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatalf("re-marshal fixture: %v", err)
+	}
+	var req RunAgentRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("request decode failed: %v", err)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("request validation failed: %v", err)
+	}
+	if req.Source != "koe" || req.ExecutionMode != executionprofile.ModeFast {
+		t.Fatalf("source=%q mode=%q, want koe/fast", req.Source, req.ExecutionMode)
+	}
+	if req.RequestedExecutionMode == nil || *req.RequestedExecutionMode != "fast" {
+		t.Fatalf("requested_execution_mode = %v, want fast", req.RequestedExecutionMode)
+	}
+	if req.LogicalTaskID != "burst-4f2a:t01" || req.ExecutionRunID != "burst-4f2a:t01.r01" {
+		t.Fatalf("lineage ids = %q / %q", req.LogicalTaskID, req.ExecutionRunID)
+	}
+	// json:"-" injection surfaces must stay zero even if a hostile client
+	// added them; the fixture omits them, so this pins the decode default.
+	if !req.ExecutionRun.IsZero() {
+		t.Fatalf("execution_run decoded from wire: %+v", req.ExecutionRun)
+	}
+
+	// Producer side: the koe-visible execution fields survive re-encoding
+	// through the production struct with the same tags and values.
+	produced := parseJSONMap(t, []byte(mustJSON(req)))
+	for _, key := range []string{"execution_mode", "requested_execution_mode", "logical_task_id", "execution_run_id"} {
+		if produced[key] != fixture[key] {
+			t.Fatalf("field %q drifted: fixture=%v produced=%v", key, fixture[key], produced[key])
+		}
+	}
+}
+
+// TestWireFixture_MessageKoeExecutionFullRequest pins the full-mode follow-up:
+// full_reason (closed vocabulary), parent lineage, and the untrusted
+// inherited_execution_mode claim (admission clears it — only validation
+// against the execution ledger may restore the Full floor).
+func TestWireFixture_MessageKoeExecutionFullRequest(t *testing.T) {
+	fixture := loadWireFixture(t, "message_koe_execution_full_request.json")
+
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatalf("re-marshal fixture: %v", err)
+	}
+	var req RunAgentRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("request decode failed: %v", err)
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("request validation failed: %v", err)
+	}
+	if req.ExecutionMode != executionprofile.ModeFull ||
+		req.FullReason != executionprofile.FullReasonSecurityPermissions {
+		t.Fatalf("mode=%q full_reason=%q", req.ExecutionMode, req.FullReason)
+	}
+	if req.InheritedMode != executionprofile.ModeFull {
+		t.Fatalf("inherited_execution_mode = %q, want full", req.InheritedMode)
+	}
+	if req.ParentRunID != "burst-4f2a:t02.r01" {
+		t.Fatalf("parent_run_id = %q", req.ParentRunID)
+	}
+
+	produced := parseJSONMap(t, []byte(mustJSON(req)))
+	for _, key := range []string{"execution_mode", "full_reason", "inherited_execution_mode", "logical_task_id", "execution_run_id", "parent_run_id"} {
+		if produced[key] != fixture[key] {
+			t.Fatalf("field %q drifted: fixture=%v produced=%v", key, fixture[key], produced[key])
+		}
+	}
+}
+
+// TestWireFixture_DoneWithExecutionRun pins the `event: done` payload carrying
+// the validated execution run (lineage ids + the resolved kfp1 profile).
+// handleMessageSSE marshals *RunAgentResult directly, so serializing the
+// producer type IS the production path; Koe's ledger is the consumer.
+func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
+	fixture := loadWireFixture(t, "sse_event.done.with_execution_run.json")
+
+	result := &RunAgentResult{
+		Reply:     fixture["reply"].(string),
+		SessionID: fixture["session_id"].(string),
+		Agent:     fixture["agent"].(string),
+		Usage: RunAgentUsage{
+			InputTokens: 8120, OutputTokens: 240, TotalTokens: 8360, CostUSD: 0.021,
+		},
+		ExecutionRun: &executionprofile.Run{
+			LogicalTaskID: "burst-4f2a:t01",
+			RunID:         "burst-4f2a:t01.r01",
+			Profile:       fastProfileForDaemonTest(),
+		},
+	}
+	if err := result.ExecutionRun.ValidatePersisted(); err != nil {
+		t.Fatalf("fixture run must satisfy the persisted contract: %v", err)
+	}
+	raw := []byte(mustJSON(result))
+	produced := parseJSONMap(t, raw)
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer shape: Koe decodes execution_run into executionprofile.Run for
+	// ledger recording; pin the key fields it routes on.
+	var done struct {
+		Reply        string                `json:"reply"`
+		ExecutionRun *executionprofile.Run `json:"execution_run"`
+	}
+	if err := json.Unmarshal(raw, &done); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if done.ExecutionRun == nil ||
+		done.ExecutionRun.RunID != "burst-4f2a:t01.r01" ||
+		!done.ExecutionRun.Profile.IsFast() ||
+		done.ExecutionRun.Profile.ResolutionReason != "cloud_profile_resolved" {
+		t.Fatalf("consumer decode lost execution_run fields: %+v", done.ExecutionRun)
+	}
 }

@@ -73,12 +73,13 @@ type KoeConfig struct {
 	// this only under advanced voice settings and forwards it as
 	// --audio-processing.
 	AudioProcessing string `mapstructure:"audio_processing" yaml:"audio_processing,omitempty" json:"audio_processing,omitempty"`
-	// BargeIn opts into reversible native-S2S floor control while Kocoro speaks
-	// instead of the default half-duplex "finish then listen". A *bool for the same
-	// reason as
-	// Enabled: the off state (&false) must survive Desktop's RFC-7386 PATCH merge,
-	// which a plain bool+omitempty would swallow. Desktop forwards this as the
-	// `--barge-in` flag; it is a no-op unless the VPIO backend is active.
+	// BargeIn selects reversible native-S2S floor control while Kocoro speaks.
+	// The bare CLI remains half-duplex when unset; Desktop resolves an unset
+	// preference to enabled and preserves an explicit false. A *bool is used for
+	// the same reason as Enabled: the off state (&false) must survive Desktop's
+	// RFC-7386 PATCH merge, which a plain bool+omitempty would swallow. Desktop
+	// forwards the resolved preference as `--barge-in`; it is a no-op unless the
+	// VPIO backend is active.
 	BargeIn *bool `mapstructure:"barge_in" yaml:"barge_in,omitempty" json:"barge_in,omitempty"`
 	// PersonaSource selects where Koe's spoken persona comes from: "" / "global"
 	// (default) distills the user's global instructions + memory; "custom" uses
@@ -88,15 +89,13 @@ type KoeConfig struct {
 	// PersonaSource == "custom". Injected as-is (already voice-friendly), wrapped
 	// by Koe's base persona; empty falls back to the base persona only.
 	CustomPersona string `mapstructure:"custom_persona" yaml:"custom_persona,omitempty" json:"custom_persona,omitempty"`
-	// FastEffort forces the Kocoro agent TASK triggered by voice (Path A
-	// /v1/completions) to run at the fastest effort tier ("low") for low
-	// latency, NOT the realtime voice model itself (which has no effort knob).
+	// FastEffort enables semantic fast-task requests from Koe. It does not
+	// change the realtime voice model and does not override the normal Agent's
+	// model or effort. The daemon resolves fast through Cloud's trusted profile;
+	// full/missing/invalid/resolver failure preserves normal Agent config.
 	// A *bool so the three states round-trip Desktop's RFC-7386 PATCH:
-	//   nil (unset) / &true  → force low (default ON — voice is snappy)
-	//   &false               → do NOT override; the voice-triggered task
-	//                          inherits the agent's normal global/per-agent
-	//                          effort (for users who don't mind waiting).
-	// Independent of the agent's text-mode effort.
+	//   nil (unset) / &true  → allow a do_task classified as fast (default ON)
+	//   &false               → every voice-triggered task runs full.
 	FastEffort *bool `mapstructure:"fast_effort" yaml:"fast_effort,omitempty" json:"fast_effort,omitempty"`
 }
 
@@ -147,9 +146,16 @@ type AgentConfig struct {
 	// from ReasoningEffort (which stays OpenAI-native minimal/low/medium/high
 	// for back-compat). Cloud translates the tier to each provider's native
 	// value at request time (Anthropic passes it straight through as
-	// output_config.effort; OpenAI maps low→low/high→medium/xhigh→high/max→high).
+	// output_config.effort; GPT-5.6 maps low→low/high→medium/xhigh→xhigh/max→max,
+	// while older OpenAI models compress xhigh/max to high).
 	// Empty = unset (Cloud falls back to ReasoningEffort, then provider default).
-	EffortTier    string `mapstructure:"effort_tier" yaml:"effort_tier" json:"effort_tier"`
+	EffortTier string `mapstructure:"effort_tier" yaml:"effort_tier" json:"effort_tier"`
+	// ServiceTier is the process-global OpenAI processing lane. It is kept out
+	// of project/local overlays and named-agent config: Desktop exposes it only
+	// with an exact global OpenAI model. Sealed execution profiles (including
+	// Koe Fast) own their lane independently and suppress this value.
+	// Empty = provider default; accepted explicit values are "default"/"fast".
+	ServiceTier   string `mapstructure:"service_tier" yaml:"service_tier" json:"service_tier"`
 	Model         string `mapstructure:"model"       yaml:"model"       json:"model"`                    // specific model override
 	Language      string `mapstructure:"language"         yaml:"language"         json:"language"`       // locked reply language as a native name (e.g. "中文"); empty = mirror the user's current-message language
 	ContextWindow int    `mapstructure:"context_window"   yaml:"context_window"   json:"context_window"` // model context window in tokens
@@ -319,6 +325,9 @@ type MemoryConfig struct {
 type DaemonConfig struct {
 	AutoApprove   bool   `mapstructure:"auto_approve" yaml:"auto_approve" json:"auto_approve"`
 	ChromeProfile string `mapstructure:"chrome_profile" yaml:"chrome_profile,omitempty" json:"chrome_profile,omitempty"`
+	// SkillRecommendationsEnabled is the operator kill switch for the
+	// Desktop-only capability-card protocol. Nil preserves default-on behavior.
+	SkillRecommendationsEnabled *bool `mapstructure:"skill_recommendations_enabled" yaml:"skill_recommendations_enabled,omitempty" json:"skill_recommendations_enabled,omitempty"`
 	// ShareAsyncDefault controls whether POST /sessions/{id}/share returns
 	// 202+task_id (true, default) or blocks until upload completes (false).
 	// Operators on stacks where the UI has not yet learned to subscribe to
@@ -442,6 +451,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.force_think_tool", false)
 	viper.SetDefault("agent.reasoning_effort", "")
 	viper.SetDefault("agent.effort_tier", "")
+	viper.SetDefault("agent.service_tier", "")
 	viper.SetDefault("agent.model", "")
 	viper.SetDefault("agent.context_window", 1_000_000)
 	// NOTE: if you change these idle/stream defaults, also update
@@ -898,6 +908,7 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.force_think_tool":                 {Level: "default"},
 		"agent.reasoning_effort":                 {Level: "default"},
 		"agent.effort_tier":                      {Level: "default"},
+		"agent.service_tier":                     {Level: "default"},
 		"agent.model":                            {Level: "default"},
 		"agent.context_window":                   {Level: "default"},
 		"agent.observation_window":               {Level: "default"},
@@ -962,6 +973,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.effort_tier") {
 		cfg.Sources["agent.effort_tier"] = src
+	}
+	if viper.IsSet("agent.service_tier") {
+		cfg.Sources["agent.service_tier"] = src
 	}
 	if viper.IsSet("agent.model") {
 		cfg.Sources["agent.model"] = src
@@ -1343,6 +1357,9 @@ func validateConfig(cfg *Config) error {
 	case "small", "medium", "large":
 		return fmt.Errorf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use model_tier for tiers", cfg.Agent.Model)
 	}
+	if !IsValidAgentServiceTier(cfg.Agent.ServiceTier) {
+		return fmt.Errorf("invalid agent.service_tier %q: use one of %s", cfg.Agent.ServiceTier, strings.Join(AgentServiceTierAllowedValues(), ", "))
+	}
 	if cfg.Agent.IdleSoftTimeoutSecs < 0 {
 		return fmt.Errorf("agent.idle_soft_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.IdleSoftTimeoutSecs)
 	}
@@ -1384,6 +1401,22 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("tools.browser_result_truncation (%d) must be >= 0 (0 = fall back to result_truncation)", cfg.Tools.BrowserResultTruncation)
 	}
 	return nil
+}
+
+// IsValidAgentServiceTier reports whether s is a supported process-global
+// OpenAI processing lane. Empty leaves the provider at its default.
+func IsValidAgentServiceTier(s string) bool {
+	switch s {
+	case "", "default", "fast":
+		return true
+	default:
+		return false
+	}
+}
+
+// AgentServiceTierAllowedValues renders the closed enum for config/API errors.
+func AgentServiceTierAllowedValues() []string {
+	return []string{`""`, `"default"`, `"fast"`}
 }
 
 // mergeBuiltinMCPServers folds the in-binary BuiltinMCPServers catalog onto

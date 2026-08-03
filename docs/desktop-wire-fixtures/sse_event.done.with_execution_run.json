@@ -1,0 +1,33 @@
+{
+  "reply": "Reminder added for 15:00.",
+  "session_id": "koe-session-001",
+  "agent": "default",
+  "usage": {
+    "input_tokens": 8120,
+    "output_tokens": 240,
+    "total_tokens": 8360,
+    "cost_usd": 0.021
+  },
+  "execution_run": {
+    "logical_task_id": "burst-4f2a:t01",
+    "run_id": "burst-4f2a:t01.r01",
+    "evidence": {},
+    "profile": {
+      "requested_mode": "fast",
+      "effective_mode": "fast",
+      "schema_version": 1,
+      "profile_name": "koe-fast-v1",
+      "profile_version": 2,
+      "profile_id": "kfp1_daemon-test",
+      "provider": "openai",
+      "model": "gpt-5.6-luna",
+      "api_surface": "openai_responses",
+      "tool_contract": "kocoro.function_tools.v1",
+      "reasoning_effort": "medium",
+      "service_tier": "fast",
+      "parallel_tool_calls": true,
+      "response_cache_policy": "off",
+      "resolution_reason": "cloud_profile_resolved"
+    }
+  }
+}

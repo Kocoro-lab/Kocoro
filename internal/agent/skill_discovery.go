@@ -10,6 +10,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
@@ -610,10 +611,11 @@ func discoverRelevantSkills(ctx context.Context, c ctxwin.Completer, userText st
 		Messages: []client.Message{
 			{Role: "user", Content: client.NewTextContent(prompt)},
 		},
-		ModelTier:   "small",
-		Temperature: 0.0,
-		MaxTokens:   30,
-		CacheSource: "helper",
+		ModelTier:           "small",
+		Temperature:         0.0,
+		MaxTokens:           30,
+		CacheSource:         "helper",
+		ResponseCachePolicy: executionprofile.ResponseCacheOff,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[skill-discovery] error: %v\n", err)

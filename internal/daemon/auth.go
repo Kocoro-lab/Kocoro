@@ -76,16 +76,17 @@ type AuthManager struct {
 	lastErr      string
 	updatedAt    time.Time
 
-	kc              *keychain.Store
-	cloud           *client.AuthClient
-	gw              *client.GatewayClient
-	wsClient        *Client
-	wsCtl           *WSController
-	bus             *EventBus
-	onAPIKeyChanged func(context.Context)
-	logger          *log.Logger
-	shanDir         string
-	sf              singleflight.Group
+	kc                 *keychain.Store
+	cloud              *client.AuthClient
+	gw                 *client.GatewayClient
+	wsClient           *Client
+	wsCtl              *WSController
+	bus                *EventBus
+	onPrincipalChanged func(previous, current string)
+	onAPIKeyChanged    func(context.Context)
+	logger             *log.Logger
+	shanDir            string
+	sf                 singleflight.Group
 }
 
 // NewAuthManager builds an AuthManager. WSController and EventBus are
@@ -127,6 +128,12 @@ func (a *AuthManager) SetWSController(ctl *WSController) {
 	a.mu.Unlock()
 }
 
+func (a *AuthManager) SetPrincipalChangedHandler(fn func(previous, current string)) {
+	a.mu.Lock()
+	a.onPrincipalChanged = fn
+	a.mu.Unlock()
+}
+
 // Snapshot returns a value-copy of the current auth state. Safe to expose
 // to handlers and tests.
 func (a *AuthManager) Snapshot() authSnapshot {
@@ -156,6 +163,23 @@ func (a *AuthManager) State() AuthState {
 	return a.state
 }
 
+// VerifiedAccountID returns the Cloud-issued opaque account identifier only
+// when this daemon has a fully verified signed-in principal. In particular it
+// fails closed for Bootstrap's offline optimistic signed-in state, where a
+// usable API key may exist but /auth/me has not supplied an account ID.
+// Callers must never substitute an email, username, or HTTP header value.
+func (a *AuthManager) VerifiedAccountID() (string, bool) {
+	if a == nil {
+		return "", false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.state != AuthStateSignedIn || a.user == nil || a.user.ID == "" {
+		return "", false
+	}
+	return a.user.ID, true
+}
+
 // setState is the single mutator. Emits auth_state_changed whenever any
 // terminal observable field (state OR last_error_code) changes — both
 // drive Desktop UI affordances, so a state-stable error transition
@@ -171,6 +195,10 @@ func (a *AuthManager) State() AuthState {
 // reading from the bus cannot deadlock against the mutator.
 func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode string) {
 	a.mu.Lock()
+	previousAccountID := ""
+	if a.user != nil {
+		previousAccountID = a.user.ID
+	}
 	prev := a.state
 	prevErr := a.lastErr
 	a.state = s
@@ -192,7 +220,15 @@ func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode strin
 	a.updatedAt = time.Now()
 	snap := a.snapshotLocked()
 	bus := a.bus
+	principalChanged := a.onPrincipalChanged
+	currentAccountID := ""
+	if a.user != nil {
+		currentAccountID = a.user.ID
+	}
 	a.mu.Unlock()
+	if previousAccountID != currentAccountID && principalChanged != nil {
+		principalChanged(previousAccountID, currentAccountID)
+	}
 
 	if prev == s && prevErr == errCode {
 		return

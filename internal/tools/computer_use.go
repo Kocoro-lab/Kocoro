@@ -3676,6 +3676,14 @@ func computerUseActionMessage(raw json.RawMessage, fallback string) string {
 func computerUseCallError(operation string, err error) agent.ToolResult {
 	message := strings.ToLower(err.Error())
 	switch {
+	case errors.Is(err, ErrDisplayTopologyReconfiguringV1):
+		result := agent.TransientError(fmt.Sprintf("%s: %v", operation, err))
+		result.GUIOutcome = &agent.GUIActionOutcome{
+			Result:      agent.GUIActionResultFailed,
+			Phase:       agent.GUIActionPhaseObserving,
+			FailureCode: ComputerUseFailureDisplayTopologyReconfiguringV1,
+		}
+		return result
 	case strings.Contains(message, "permission"), strings.Contains(message, "not trusted"), strings.Contains(message, "screen recording"):
 		return agent.PermissionError(fmt.Sprintf("%s: %v", operation, err))
 	case strings.Contains(message, "timeout"), strings.Contains(message, "deadline"), strings.Contains(message, "unexpected eof"), strings.Contains(message, "read error"):
@@ -3684,3 +3692,5 @@ func computerUseCallError(operation string, err error) agent.ToolResult {
 		return agent.BusinessError(fmt.Sprintf("%s: %v", operation, err))
 	}
 }
+
+const ComputerUseFailureDisplayTopologyReconfiguringV1 = "display_topology_reconfiguring"

@@ -766,6 +766,12 @@ func TestHandleEventMarksSpeakingWithFullDuplexAEC(t *testing.T) {
 
 func TestSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	cfg := sessionConfig("persona", "marin", false)
+	session := cfg["session"].(map[string]any)
+	instructions, _ := session["instructions"].(string)
+	if !strings.HasPrefix(instructions, "persona\n\n") ||
+		!strings.Contains(instructions, executionModeSchemaInstructions) {
+		t.Fatalf("sessionConfig execution-mode schema instructions = %q", instructions)
+	}
 	raw, _ := json.Marshal(cfg)
 	s := string(raw)
 

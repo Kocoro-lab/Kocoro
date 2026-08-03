@@ -9,6 +9,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 // mockCompleter returns a fixed response for micro-compact tests.
@@ -483,7 +484,8 @@ func TestMicroCompact_ReturnsUsage(t *testing.T) {
 	}
 }
 
-// Helper-tier callers must tag CacheSource="helper". See cache-action-plan §1.1.
+// Helper-tier callers tag prompt-cache attribution while disabling replayable
+// whole-response caching.
 func TestMicroCompact_TagsHelperCacheSource(t *testing.T) {
 	mc := &mockCompleter{output: "summary text"}
 	content := strings.Repeat("data ", 1000)
@@ -493,5 +495,8 @@ func TestMicroCompact_TagsHelperCacheSource(t *testing.T) {
 	}
 	if got := mc.lastReq.CacheSource; got != "helper" {
 		t.Errorf("microCompactResult CacheSource = %q, want %q", got, "helper")
+	}
+	if got := mc.lastReq.ResponseCachePolicy; got != executionprofile.ResponseCacheOff {
+		t.Errorf("microCompactResult ResponseCachePolicy = %q, want off", got)
 	}
 }

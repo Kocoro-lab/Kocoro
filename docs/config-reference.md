@@ -77,6 +77,8 @@ agent:
   model: ""                        # specific model override (empty = use model_tier)
   model_tier: ""                   # tier override (medium | large); empty = inherit global model_tier. "small" reserved for daemon-internal calls — do not pin via UI.
   reasoning_effort: ""             # "low" / "medium" / "high" (empty = model default)
+  effort_tier: ""                  # unified intent: low | high | xhigh | max (empty = provider default)
+  service_tier: ""                 # global OpenAI processing: "" | default | fast; pair with an exact OpenAI model
   context_window: 1_000_000        # seed; auto-adjusted from observed model. Per-agent override locks the cap. (Ollama callers clamp to 200K — see ContextWindowFloorForProvider.)
 
   # Extended thinking (Anthropic native)
@@ -114,6 +116,10 @@ agent:
   max_recent_images: 50            # keep the N most recent image-bearing messages (all images); older screenshots become a placeholder. 0 disables (keep all). Negative is rejected.
   max_recent_browser_images: 1     # keep only the N most recent browser/GUI screenshots; user uploads + non-GUI images stay under max_recent_images. 0 disables. Negative is rejected.
 ```
+
+`effort_tier` is the preferred user-facing reasoning control: **Light** (`low`), **Balanced** (`high`), **Deep** (`xhigh`), and **Max** (`max`), plus **Default** (`""`). Cloud translates those stable product tiers to each provider's native value. GPT-5.6 uses `low` / `medium` / `xhigh` / `max`; Anthropic uses `low` / `high` / `xhigh` / `max`. Claude Haiku does not advertise effort support and stays at the model default.
+
+`service_tier` is a process-global developer selector for OpenAI processing. `default` requests Standard processing and `fast` requests Fast processing; `""` leaves the provider default untouched. Kocoro Desktop exposes it only alongside an exact OpenAI model. It is intentionally not merged from project/local config and is not available in named-agent config. A named agent's exact model override clears the global processing lane, while sealed Koe/computer execution profiles provide their own lane independently.
 
 ## Tool Settings
 
@@ -172,6 +178,7 @@ See `docs/session-sync-launchd.md` for running session sync via launchd when the
 ```yaml
 daemon:
   auto_approve: false              # skip approval round-trip globally (permission engine still enforced)
+  skill_recommendations_enabled: true # Desktop skill recommendation protocol kill switch
   capabilities: []                 # opt-in protocol features advertised on the WS handshake
 ```
 

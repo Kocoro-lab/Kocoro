@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
 // These tests make real provider calls and cost real tokens. They stay gated
@@ -123,7 +124,34 @@ func TestToolSearchLive_CloudToolReference(t *testing.T) {
 		forceFirstTool:      "tool_search",
 		hideDeferredOnFirst: true,
 	}
-	runToolSearchLiveTrace(t, recorder, model, true)
+	runToolSearchLiveTrace(t, recorder, model, true, nil)
+}
+
+func TestToolSearchLive_KoeFastProfile(t *testing.T) {
+	if os.Getenv("KOE_FAST_PROFILE_LIVE") != "1" {
+		t.Skip("set KOE_FAST_PROFILE_LIVE=1 to run the real Koe Fast ToolSearch trace")
+	}
+
+	endpoint := strings.TrimSpace(os.Getenv("TOOLSEARCH_CLOUD_ENDPOINT"))
+	if endpoint == "" {
+		t.Fatal("Koe Fast live gate is enabled but TOOLSEARCH_CLOUD_ENDPOINT is empty")
+	}
+	gateway := client.NewGatewayClient(
+		endpoint,
+		strings.TrimSpace(os.Getenv("TOOLSEARCH_CLOUD_API_KEY")),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	profile, err := gateway.ResolveKoeExecutionProfile(ctx)
+	if err != nil {
+		t.Fatalf("resolve Koe fast execution profile: %v", err)
+	}
+
+	recorder := &recordingLLMClient{
+		inner:               gateway,
+		hideDeferredOnFirst: true,
+	}
+	runToolSearchLiveTrace(t, recorder, profile.Model, false, &profile)
 }
 
 func TestToolSearchLive_OllamaLegacy(t *testing.T) {
@@ -143,7 +171,7 @@ func TestToolSearchLive_OllamaLegacy(t *testing.T) {
 	recorder := &recordingLLMClient{
 		inner: client.NewOllamaClient(endpoint, model),
 	}
-	runToolSearchLiveTrace(t, recorder, model, false)
+	runToolSearchLiveTrace(t, recorder, model, false, nil)
 }
 
 func runToolSearchLiveTrace(
@@ -151,6 +179,7 @@ func runToolSearchLiveTrace(
 	recorder *recordingLLMClient,
 	model string,
 	wantToolReference bool,
+	profile *executionprofile.Profile,
 ) {
 	t.Helper()
 
@@ -176,7 +205,11 @@ func runToolSearchLiveTrace(
 	registry.Register(probe)
 
 	loop := NewAgentLoop(recorder, registry, "medium", "", 8, 4000, 500, nil, nil, nil)
-	loop.SetSpecificModel(model)
+	if profile != nil {
+		loop.SetKoeExecutionProfile(*profile)
+	} else {
+		loop.SetSpecificModel(model)
+	}
 	// Keep the trace compatible with both current Cloud and legacy gateways
 	// whose request validator still caps max_tokens at 32K.
 	loop.SetMaxTokens(32000)

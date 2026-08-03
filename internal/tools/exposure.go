@@ -29,6 +29,10 @@ func (*ComputerUseTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDeferred
 }
 
+func (*ComputerUseTool) ToolProfileRequirement() agent.ToolProfileRequirement {
+	return agent.ToolProfileComputer
+}
+
 func (*GhosttyTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDeferred
 }
@@ -43,6 +47,10 @@ func (*ScreenshotTool) ToolExposure() agent.ToolExposure {
 
 func (*ComputerTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDeferred
+}
+
+func (*ComputerTool) ToolProfileRequirement() agent.ToolProfileRequirement {
+	return agent.ToolProfileComputer
 }
 
 func (*WaitTool) ToolExposure() agent.ToolExposure {

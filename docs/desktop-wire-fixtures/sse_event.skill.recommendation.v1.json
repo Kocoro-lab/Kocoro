@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "recommendation_id": "rec_01",
+  "session_id": "session_demo",
+  "turn_id": "turn_demo",
+  "catalog_revision": "sha256:318ca327bf371198f341ff630587cdccaab91a23f3cce2ccce565fdcdecea1b8",
+  "state": "offered",
+  "items": [
+    {
+      "catalog_id": "official:pptx",
+      "slug": "pptx",
+      "source": "official",
+      "display_name": "Presentation",
+      "capability_summary": "Presentation creation, editing, and analysis"
+    }
+  ],
+  "reason_code": "task_capability_missing",
+  "continuation_token": "continue_opaque_01",
+  "expires_at": "2099-08-02T12:00:00Z"
+}

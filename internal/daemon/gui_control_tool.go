@@ -775,6 +775,12 @@ func (t *daemonGUIToolBase) ToolExposure() agent.ToolExposure {
 	}
 	return agent.ToolExposureDefault
 }
+func (t *daemonGUIToolBase) ToolProfileRequirement() agent.ToolProfileRequirement {
+	if provider, ok := t.inner.(agent.ToolProfileRequirementProvider); ok {
+		return provider.ToolProfileRequirement()
+	}
+	return agent.ToolProfileNone
+}
 func (t *daemonGUIToolBase) ApprovalAdmission(ctx context.Context, args string) agent.ApprovalAdmissionDecision {
 	describer, ok := t.inner.(agent.GUIActionDescriber)
 	if !ok {
