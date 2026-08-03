@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -160,6 +162,195 @@ func TestAgentLoopOrdinaryOpenAIResponsesContinuesToolResult(t *testing.T) {
 	fresh := llm.requests[2]
 	if fresh.PreviousResponseID != "" || fresh.SpecificModel != "" {
 		t.Fatalf("ordinary Responses continuation leaked into fresh Run: %+v", fresh)
+	}
+}
+
+func TestAgentLoopOrdinaryOpenAIResponsesKeepsToolResultBeforeLoopNudge(t *testing.T) {
+	// With the consecutive-duplicate threshold at 3, request 4 carries the
+	// nudge and the fourth identical tool call triggers request 5's force-stop.
+	responses := make([]*client.CompletionResponse, 0, 5)
+	for index := 1; index <= 4; index++ {
+		response := ordinaryOpenAIToolResponse(
+			"openai",
+			"gpt-5.6-sol",
+			fmt.Sprintf("resp_tool_turn_%d", index),
+		)
+		callID := fmt.Sprintf("call_lookup_%d", index)
+		response.ToolCalls[0].ID = callID
+		response.ToolCalls[0].CallID = callID
+		responses = append(responses, response)
+	}
+	responses = append(responses, &client.CompletionResponse{
+		Provider:     "openai",
+		Model:        "gpt-5.6-sol",
+		OutputText:   "done",
+		FinishReason: "stop",
+		RequestID:    "resp_final",
+	})
+
+	llm := &budgetCaptureLLMClient{responses: responses}
+	registry := NewToolRegistry()
+	registry.Register(&mockSimpleTool{
+		name:   "lookup",
+		result: ToolResult{Content: "BLUE"},
+	})
+	loop := NewAgentLoop(
+		llm,
+		registry,
+		"large",
+		t.TempDir(),
+		8,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+	loop.SetSkillDiscovery(false)
+	loop.SetEnableStreaming(false)
+
+	result, _, err := loop.Run(context.Background(), "repeat lookup", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "done" {
+		t.Fatalf("result = %q, want done", result)
+	}
+
+	requests := llm.requests
+	if len(requests) != 5 {
+		t.Fatalf("completion requests = %d, want 5", len(requests))
+	}
+	if len(llm.responses) != 0 {
+		t.Fatalf("scripted responses remaining = %d, want 0", len(llm.responses))
+	}
+	nudgeRequest := findLoopNudgeRequest(requests)
+	if nudgeRequest == nil {
+		t.Fatalf("no continuation request carried a loop nudge: %+v", requests)
+	}
+	if nudgeRequest.PreviousResponseID == "" {
+		t.Fatal("loop nudge request lost the OpenAI Responses cursor")
+	}
+
+	assertToolResultPrecedesNudge(t, nudgeRequest)
+}
+
+func findLoopNudgeRequest(requests []client.CompletionRequest) *client.CompletionRequest {
+	for index := range requests {
+		if len(requests[index].Tools) == 0 {
+			continue
+		}
+		messages := requests[index].Messages
+		if len(messages) == 0 {
+			continue
+		}
+		last := messages[len(messages)-1]
+		if last.Role == "developer" && strings.Contains(last.Content.Text(), "Inspect the latest result") {
+			return &requests[index]
+		}
+	}
+	return nil
+}
+
+func assertToolResultPrecedesNudge(t *testing.T, request *client.CompletionRequest) {
+	t.Helper()
+	messages := request.Messages
+	if len(messages) < 3 {
+		t.Fatalf("nudge request has %d messages, want at least 3", len(messages))
+	}
+	assistant := messages[len(messages)-3]
+	toolResult := messages[len(messages)-2]
+	nudge := messages[len(messages)-1]
+	assistantBlocks := assistant.Content.Blocks()
+	resultBlocks := toolResult.Content.Blocks()
+	toolUseIDs := make(map[string]struct{})
+	for _, block := range assistantBlocks {
+		if block.Type == "tool_use" && block.ID != "" {
+			toolUseIDs[block.ID] = struct{}{}
+		}
+	}
+	if assistant.Role != "assistant" || len(toolUseIDs) == 0 {
+		t.Fatalf("assistant before nudge = %#v", assistant)
+	}
+	if toolResult.Role != "user" || len(resultBlocks) != 1 ||
+		resultBlocks[0].Type != "tool_result" {
+		t.Fatalf("paired tool result before nudge = %#v", toolResult)
+	}
+	if _, ok := toolUseIDs[resultBlocks[0].ToolUseID]; !ok {
+		t.Fatalf("paired tool result before nudge = %#v", toolResult)
+	}
+	if nudge.Role != "developer" || !strings.Contains(nudge.Content.Text(), "Inspect the latest result") {
+		t.Fatalf("nudge tail = %#v", nudge)
+	}
+}
+
+type ordinaryContinuationMutatingClient struct {
+	loop     *AgentLoop
+	requests []client.CompletionRequest
+	calls    int
+}
+
+func (m *ordinaryContinuationMutatingClient) Complete(
+	_ context.Context,
+	req client.CompletionRequest,
+) (*client.CompletionResponse, error) {
+	m.requests = append(m.requests, req)
+	m.calls++
+	if m.calls == 1 {
+		m.loop.SetReasoningEffort("high")
+		return ordinaryOpenAIToolResponse(
+			"openai",
+			"gpt-5.6-sol",
+			"resp_before_request_change",
+		), nil
+	}
+	return &client.CompletionResponse{
+		Provider:     "openai",
+		Model:        "gpt-5.6-sol",
+		OutputText:   "BLUE",
+		FinishReason: "stop",
+		RequestID:    "resp_after_request_change",
+	}, nil
+}
+
+func (m *ordinaryContinuationMutatingClient) CompleteStream(
+	ctx context.Context,
+	req client.CompletionRequest,
+	_ func(client.StreamDelta),
+) (*client.CompletionResponse, error) {
+	return m.Complete(ctx, req)
+}
+
+func TestAgentLoopOrdinaryOpenAIResponsesFallsBackAfterRequestChange(t *testing.T) {
+	llm := &ordinaryContinuationMutatingClient{}
+	loop := newOrdinaryOpenAIContinuationLoop(t, llm)
+	llm.loop = loop
+
+	result, _, err := loop.Run(context.Background(), "look up cobalt", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "BLUE" {
+		t.Fatalf("result = %q, want BLUE", result)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("completion requests = %d, want 2", len(llm.requests))
+	}
+	continuation := llm.requests[1]
+	if continuation.PreviousResponseID != "" {
+		t.Fatalf(
+			"changed request reused previous_response_id %q",
+			continuation.PreviousResponseID,
+		)
+	}
+	if continuation.SpecificModel != "" {
+		t.Fatalf("changed request retained provider cursor model pin %q", continuation.SpecificModel)
+	}
+	if continuation.ReasoningEffort != "high" {
+		t.Fatalf("changed request reasoning_effort = %q, want high", continuation.ReasoningEffort)
+	}
+	if len(continuation.Messages) != len(llm.requests[0].Messages)+2 {
+		t.Fatalf("fallback did not carry the full local transcript")
 	}
 }
 

@@ -143,8 +143,9 @@ type AgentConfig struct {
 	ReasoningEffort string `mapstructure:"reasoning_effort" yaml:"reasoning_effort" json:"reasoning_effort"`
 	// EffortTier is the unified cross-provider reasoning-effort intent
 	// (Anthropic-native tier names: "low"/"high"/"xhigh"/"max"). Distinct
-	// from ReasoningEffort (which stays OpenAI-native minimal/low/medium/high
-	// for back-compat). Cloud translates the tier to each provider's native
+	// from ReasoningEffort (whose supported values are model-dependent and can
+	// include none/minimal/low/medium/high/xhigh/max). Cloud translates the tier
+	// to each provider's native
 	// value at request time (Anthropic passes it straight through as
 	// output_config.effort; GPT-5.6 maps low→low/high→medium/xhigh→xhigh/max→max,
 	// while older OpenAI models compress xhigh/max to high).

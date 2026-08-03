@@ -989,6 +989,10 @@ type CompletionRequest struct {
 	Messages      []Message `json:"messages"`
 	ModelTier     string    `json:"model_tier,omitempty"`
 	SpecificModel string    `json:"specific_model,omitempty"`
+	// PreferredAPISurface is a non-binding Cloud routing hint. Cloud ignores it
+	// for providers that do not implement the requested surface. A sealed
+	// execution profile owns its route and therefore omits this field.
+	PreferredAPISurface string `json:"preferred_api_surface,omitempty"`
 	// Temperature keeps omitempty deliberately: `agent.temperature` defaults
 	// to 0, and the pre-existing wire contract is "0 = unset → provider
 	// default sampling". Dropping omitempty would silently flip EVERY
@@ -1003,7 +1007,7 @@ type CompletionRequest struct {
 
 	// Provider-specific parameters (passed through to gateway)
 	Thinking        *ThinkingConfig `json:"thinking,omitempty"`
-	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // OpenAI o-models: minimal/low/medium/high
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"` // Model-dependent: none/minimal/low/medium/high/xhigh/max
 	// EffortTier is the unified cross-provider reasoning-effort intent
 	// ("low"/"high"/"xhigh"/"max"). Cloud translates it to each provider's
 	// native value (Anthropic output_config.effort direct; OpenAI reasoning_effort
@@ -1063,6 +1067,11 @@ type CompletionRequest struct {
 	// echoed by Cloud before returning any tool calls to the executor.
 	ResolvedExecutionProfile *ExecutionProfile `json:"-"`
 }
+
+// The request hint deliberately uses Cloud's coarse "responses" vocabulary,
+// not the sealed-profile api_surface token "openai_responses". Cloud owns the
+// provider-specific interpretation and rollback of this preference.
+const ordinaryPreferredAPISurface = "responses"
 
 // ThinkingConfig for Anthropic extended thinking.
 // Sent as-is to the gateway which passes it to the Anthropic provider.
@@ -1464,10 +1473,19 @@ func usesKoeFastExecutionProfile(req CompletionRequest) bool {
 	return !hasNativeTool
 }
 
+func applyPreferredAPISurface(req *CompletionRequest) {
+	if req.ExecutionProfileID != "" || req.ResolvedExecutionProfile != nil {
+		req.PreferredAPISurface = ""
+		return
+	}
+	req.PreferredAPISurface = ordinaryPreferredAPISurface
+}
+
 // Complete sends a completion request to the gateway's /v1/completions endpoint.
 // This endpoint is a thin proxy to the LLM service that returns raw function_call
 // responses for client-side tool execution.
 func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
+	applyPreferredAPISurface(&req)
 	koeFastProfile := usesKoeFastExecutionProfile(req)
 	if !koeFastProfile {
 		if err := validateProviderNativeExecution(req); err != nil {
@@ -1605,6 +1623,7 @@ type StreamDelta struct {
 // that returns ErrStreamIdleTimeout if no chunk arrives within that interval.
 func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionRequest, onDelta func(StreamDelta)) (*CompletionResponse, error) {
 	req.Stream = true
+	applyPreferredAPISurface(&req)
 	koeFastProfile := usesKoeFastExecutionProfile(req)
 	if !koeFastProfile {
 		if err := validateProviderNativeExecution(req); err != nil {
