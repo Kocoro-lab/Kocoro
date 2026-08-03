@@ -27,6 +27,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
+	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 	"github.com/spf13/viper"
 )
 
@@ -1537,6 +1538,102 @@ func TestSkillRecommendationOfferRejectedAfterSideEffect(t *testing.T) {
 	result, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:pptx"],"reason":"presentation"}`)
 	if err != nil || !result.IsError {
 		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+type effectProbeTool struct {
+	name     string
+	readOnly bool
+}
+
+func (t *effectProbeTool) Info() agent.ToolInfo       { return agent.ToolInfo{Name: t.name} }
+func (t *effectProbeTool) RequiresApproval() bool     { return false }
+func (t *effectProbeTool) IsReadOnlyCall(string) bool { return t.readOnly }
+func (t *effectProbeTool) Run(context.Context, string) (agent.ToolResult, error) {
+	return agent.ToolResult{}, nil
+}
+
+func TestSkillRecommendationEffectHandlerSideEffectLadder(t *testing.T) {
+	// IsReadOnlyCall conflates concurrency scheduling with side effects and
+	// blocked the canonical "ask how to proceed → user picks recommend-a-
+	// skill → discover → offer" flow in production (2026-08-03). The ladder:
+	// MaterialSideEffectChecker → IsReadOnlyCall → unknown fails closed.
+	// ConcurrencySafeChecker is deliberately NOT consulted (orthogonal
+	// contract); bash exposes its static analysis through its own
+	// MaterialSideEffectChecker instead — exercised here via the REAL tools.
+	reg := agent.NewToolRegistry()
+	reg.Register(&tools.AskUserQuestionTool{}) // real: MaterialSideEffectChecker false
+	reg.Register(&tools.ProcessTool{})         // real: argument-level checker
+	reg.Register(&tools.BashTool{})            // real: strict read-only static analysis
+	reg.Register(&effectProbeTool{name: "plain-reader", readOnly: true})
+	reg.Register(&effectProbeTool{name: "plain-writer"})
+
+	newRun := func() (*skillRecommendationRunContext, *skillRecommendationEffectHandler) {
+		run := &skillRecommendationRunContext{discovered: map[string]bool{}}
+		return run, &skillRecommendationEffectHandler{EventHandler: nullEventHandler{}, registry: reg, run: run}
+	}
+
+	for _, tc := range []struct {
+		name string
+		args string
+		want bool
+	}{
+		{name: "ask_user_question", args: `{"questions":[]}`, want: false},
+		{name: "process", args: `{"action":"list","description":"x"}`, want: false},
+		{name: "process", args: `{"action":"kill","pid":1,"description":"x"}`, want: true},
+		{name: "bash", args: `{"command":"git status"}`, want: false},
+		{name: "bash", args: `{"command":"rm -rf /tmp/x"}`, want: true},
+		{name: "bash", args: `{"command":"echo hi > file"}`, want: true},
+		{name: "plain-reader", args: `{}`, want: false},
+		{name: "plain-writer", args: `{}`, want: true},
+		{name: "never-registered", args: `{}`, want: true},
+	} {
+		run, h := newRun()
+		h.OnToolCall(tc.name, tc.args, "t")
+		if run.hasSideEffects() != tc.want {
+			t.Fatalf("%s %s: sideEffects=%v want %v", tc.name, tc.args, run.hasSideEffects(), tc.want)
+		}
+	}
+}
+
+func TestSkillRecommendationOfferSurvivesQuestionOnPublicPath(t *testing.T) {
+	// Full public path of the production flow that used to fail: the
+	// question runs through the REAL tool + effect handler, then discover
+	// and offer run their real Run() paths, and the offer must reach the
+	// sink and persist as offered.
+	dir := t.TempDir()
+	store := newSkillRecommendationStore(dir)
+	emitted := 0
+	run := &skillRecommendationRunContext{accountID: "acct", deviceID: "12345678-1234-1234-1234-123456789abc", sessionID: "session", turnID: "turn", store: store, emit: func(skillRecommendationV1) bool { emitted++; return true }}
+	ctx := withSkillRecommendationRun(context.Background(), run)
+	reg := agent.NewToolRegistry()
+	reg.Register(&tools.AskUserQuestionTool{})
+	h := &skillRecommendationEffectHandler{EventHandler: nullEventHandler{}, registry: reg, run: run}
+
+	h.OnToolCall("ask_user_question", `{"questions":[{"question":"如何继续？","header":"方式","options":[{"label":"推荐 skill"},{"label":"手动"}]}]}`, "t1")
+	if run.hasSideEffects() {
+		t.Fatal("user question poisoned the run before discovery")
+	}
+	discovery, err := (&discoverInstallableSkillsTool{shannonDir: dir}).Run(ctx, `{"intent_tags":["presentation.create"]}`)
+	if err != nil || discovery.IsError {
+		t.Fatalf("discovery=%+v err=%v", discovery, err)
+	}
+	offer, err := (&offerSkillInstallationTool{shannonDir: dir}).Run(ctx, `{"catalog_ids":["official:pptx"],"reason":"presentation work"}`)
+	if err != nil || offer.IsError {
+		t.Fatalf("offer=%+v err=%v", offer, err)
+	}
+	if emitted != 1 {
+		t.Fatalf("card emitted %d times, want 1", emitted)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, v := range store.byID {
+		if v.State != "offered" {
+			t.Fatalf("stored state=%q, want offered", v.State)
+		}
+	}
+	if len(store.byID) != 1 {
+		t.Fatalf("stored offers=%d, want 1", len(store.byID))
 	}
 }
 

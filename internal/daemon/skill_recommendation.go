@@ -684,14 +684,40 @@ type skillRecommendationEffectHandler struct {
 }
 
 func (h *skillRecommendationEffectHandler) OnToolCall(name, args, toolUseID string) {
-	if name != "discover_installable_skills" && name != "offer_skill_installation" {
-		if tool, ok := h.registry.Get(name); !ok {
-			h.run.markSideEffect() // unknown execution is never assumed harmless.
-		} else if readOnly, ok := tool.(interface{ IsReadOnlyCall(string) bool }); !ok || !readOnly.IsReadOnlyCall(args) {
-			h.run.markSideEffect()
-		}
+	if name != "discover_installable_skills" && name != "offer_skill_installation" && h.callHasMaterialSideEffect(name, args) {
+		h.run.markSideEffect()
 	}
 	h.EventHandler.OnToolCall(name, args, toolUseID)
+}
+
+// callHasMaterialSideEffect classifies one tool call for the
+// offer-before-side-effects invariant. IsReadOnlyCall alone is the WRONG
+// predicate here — it conflates concurrency scheduling with side effects and
+// blocked the canonical "ask how to proceed → user picks recommend-a-skill →
+// discover → offer" flow in production (2026-08-03). Ladder, most-specific
+// first, unknown fails closed:
+//  1. MaterialSideEffectChecker — the tool's own semantic answer, argument-
+//     level where it matters (process list/ports vs kill; bash reuses its
+//     strict read-only static analysis so `git status` / `ls` don't
+//     spuriously kill an offer).
+//  2. IsReadOnlyCall — the legacy default for everything else.
+//  3. Unknown tool — never assumed harmless.
+//
+// Deliberately NOT consulted: ConcurrencySafeChecker. Its contract is batch
+// scheduling — orthogonal to side effects (a future tool could be safe to
+// parallelize yet still mutate external state). Tools whose scheduling
+// analysis happens to prove read-onlyness expose that through their OWN
+// MaterialSideEffectChecker (see BashTool.HasMaterialSideEffect).
+func (h *skillRecommendationEffectHandler) callHasMaterialSideEffect(name, args string) bool {
+	tool, ok := h.registry.Get(name)
+	if !ok {
+		return true
+	}
+	if effect, ok := tool.(agent.MaterialSideEffectChecker); ok {
+		return effect.HasMaterialSideEffect(args)
+	}
+	readOnly, ok := tool.(interface{ IsReadOnlyCall(string) bool })
+	return !ok || !readOnly.IsReadOnlyCall(args)
 }
 func (h *skillRecommendationEffectHandler) SetSessionID(id string) {
 	if v, ok := h.EventHandler.(interface{ SetSessionID(string) }); ok {
@@ -972,10 +998,12 @@ func (t *offerSkillInstallationTool) Run(ctx context.Context, args string) (agen
 		return terminalOffer(agent.BusinessError("the recommendation for this turn is no longer active"), offerInactiveUserMessage), nil
 	}
 	if created {
-		// emit is nil when no /events sink was live at admission time. The tool
-		// stays registered regardless (registration keys on stable request
-		// attributes so the tools array does not flap across turns), so an
-		// undeliverable card fails here rather than by vanishing from the schema.
+		// emit is nil when the request had no VERIFIED principal at admission
+		// (sink liveness no longer gates admission — delivery resolves the
+		// live sink at call time). The tool stays registered regardless
+		// (registration keys on stable request attributes so the tools array
+		// does not flap across turns), so an undeliverable card fails here
+		// rather than by vanishing from the schema.
 		if rc.emit == nil || !rc.emit(v) {
 			if err := rc.store.expire(v.RecommendationID); err != nil {
 				log.Printf("daemon: skill recommendation expire after failed delivery: %v", err)

@@ -196,6 +196,13 @@ func (t *AskUserQuestionTool) RequiresApproval() bool { return false }
 // prompt), so it must not batch concurrently with other calls.
 func (t *AskUserQuestionTool) IsReadOnlyCall(string) bool { return false }
 
+// HasMaterialSideEffect reports false: asking the user a question mutates no
+// external state and is not task work a resumed continuation could repeat —
+// it is the canonical PRECEDING step of a skill-installation offer ("how
+// should I proceed?" → "recommend a skill"). The non-read-only flag above
+// exists purely for concurrency scheduling.
+func (t *AskUserQuestionTool) HasMaterialSideEffect(string) bool { return false }
+
 func (t *AskUserQuestionTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	if len(argsJSON) > askUserQuestionMaxPayloadBytes {
 		return agent.ValidationError(fmt.Sprintf(
