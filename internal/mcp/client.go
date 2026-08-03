@@ -645,9 +645,19 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 		if skip {
 			return "", true, fmt.Errorf("tools/call failed (supervised, no inline reconnect): %w", err)
 		}
-		// Transport failure (process died, broken pipe, EOF).
-		// Attempt a one-shot reconnect using a fresh background context so a
-		// cancelled request context doesn't prevent recovery.
+		// Transport failure (process died, broken pipe, EOF) AFTER the
+		// request was written to a server that was alive at dispatch time.
+		// This does NOT prove the server never acted: it may have executed
+		// the tool's side effect and died before writing the response, and
+		// the wire cannot distinguish that from died-before-acting. So the
+		// two halves of recovery are separated:
+		//   - reconnect always runs (repairing the transport benefits the
+		//     NEXT call regardless);
+		//   - re-dispatch runs ONLY for tools whose own annotations say a
+		//     duplicate execution is harmless (readOnlyHint/idempotentHint).
+		// Everything else returns OutcomeUnknownError so the caller can
+		// verify the effect instead of silently double-executing a write.
+		replaySafe := m.replaySafeFromCache(serverName, toolName)
 		origErr := err
 		m.mu.Lock()
 		cfg, hasCfg := m.configs[serverName]
@@ -660,7 +670,8 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 			// Reap the old process group + close the stale client. Skipping
 			// staleCancel here would leave an orphan when the client died
 			// from something other than transport EOF (e.g. user toggled
-			// reload concurrently).
+			// reload concurrently). Reconnect uses a fresh background context
+			// so a cancelled request context doesn't prevent recovery.
 			if staleCancel != nil {
 				staleCancel()
 			}
@@ -669,7 +680,7 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 			}
 			reconnectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			if _, reconnErr := m.connect(reconnectCtx, serverName, cfg); reconnErr == nil {
+			if _, reconnErr := m.connect(reconnectCtx, serverName, cfg); reconnErr == nil && replaySafe {
 				m.mu.Lock()
 				c = m.clients[serverName]
 				m.mu.Unlock()
@@ -679,6 +690,9 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 			}
 		}
 		if err != nil {
+			if !replaySafe {
+				return "", true, &OutcomeUnknownError{Server: serverName, Tool: toolName, Err: origErr}
+			}
 			// Preserve the original transport error for diagnostics.
 			return "", true, fmt.Errorf("tools/call failed: %w (reconnect attempted after: %v)", origErr, err)
 		}
@@ -957,6 +971,22 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 // (process exited, broken pipe, EOF) rather than a tool-logic or protocol error.
 // Only transport errors should trigger a reconnect attempt — retrying on logic
 // errors risks duplicating non-idempotent side effects.
+// replaySafeFromCache reports whether the cached tool advertisement for
+// serverName/toolName carries annotations that make an automatic
+// re-dispatch safe (see ToolReplaySafe). A cache miss — server never
+// listed, tool renamed, cache cleared — is conservatively unsafe: without
+// the advertisement there is no evidence the tool is side-effect-free.
+func (m *ClientManager) replaySafeFromCache(serverName, toolName string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.toolCache[serverName] {
+		if t.Tool.Name == toolName {
+			return ToolReplaySafe(t.Tool)
+		}
+	}
+	return false
+}
+
 func IsTransportError(err error) bool {
 	// Innermost semantics win over wrapper type: mcp-go's client layer wraps
 	// EVERY transport SendRequest error in *transport.Error — including the

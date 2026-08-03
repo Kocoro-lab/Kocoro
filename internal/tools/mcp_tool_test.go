@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,12 +46,18 @@ func TestMCPTool_Run_ReconnectOnDisconnected(t *testing.T) {
 	fake := &controllableCallToolClient{}
 	mgr.SeedClient("playwright", fake)
 
-	// Create MCPTool with supervisor for on-demand reconnect.
-	tool := mcpgo.Tool{Name: "browser_navigate"}
+	// Create MCPTool with supervisor for on-demand reconnect. The tool must
+	// carry a read-only/idempotent annotation: since the write-replay fix, a
+	// POST-dispatch transport failure re-dispatches ONLY annotation-blessed
+	// tools (unannotated ones surface as outcome-unknown instead).
+	tool := mcpgo.Tool{
+		Name:        "browser_tabs",
+		Annotations: mcpgo.ToolAnnotation{ReadOnlyHint: mcpgo.ToBoolPtr(true)},
+	}
 	mt := NewMCPTool("playwright", tool, mgr)
 	mt.SetSupervisor(sup)
 
-	result, err := mt.Run(ctx, `{"url":"https://example.com"}`)
+	result, err := mt.Run(ctx, `{"action":"list"}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -62,6 +69,76 @@ func TestMCPTool_Run_ReconnectOnDisconnected(t *testing.T) {
 	calls := int(fake.callToolCount.Load())
 	if calls != 2 {
 		t.Errorf("expected 2 CallTool calls (fail + retry), got %d", calls)
+	}
+}
+
+// The duplicate-write bug this guards: a stdio server can execute a write (send message,
+// create event), then die before writing the JSON-RPC response. The client
+// sees a transport error that is indistinguishable from died-before-acting,
+// so re-dispatching an unannotated tool risks a duplicate side effect. The
+// tool must be dispatched exactly once and the model must see an explicit
+// outcome-unknown result, not a plain failure it would read as "didn't run".
+func TestMCPTool_Run_WriteToolNotReplayedAfterPostDispatchTransportError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := &alwaysErrClient{err: io.EOF} // dead pipe AFTER dispatch
+	mt, _ := newHealthySupervisedTool(t, ctx, "gws", "send_message", fake)
+
+	result, err := mt.Run(ctx, `{"to":"x"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected error result")
+	}
+	if got := fake.callToolCount.Load(); got != 1 {
+		t.Fatalf("unannotated tool must be dispatched exactly once, got %d", got)
+	}
+	if !strings.Contains(result.Content, "outcome UNKNOWN") {
+		t.Errorf("result must surface the in-doubt outcome, got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "verify") {
+		t.Errorf("result must steer the model to verify before retrying, got: %s", result.Content)
+	}
+}
+
+// The counterpart: a tool whose server-advertised annotations declare
+// duplicate execution harmless keeps the availability-preserving replay.
+func TestMCPTool_Run_IdempotentToolReplayedAfterTransportError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := &controllableCallToolClient{} // fails once with EOF, then succeeds
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("gws", mcp.MCPServerConfig{Command: "dummy"})
+	mgr.SeedClient("gws", fake)
+	sup := mcp.NewSupervisor(mgr)
+	sup.Start(ctx)
+	t.Cleanup(sup.Stop)
+	deadline := time.Now().Add(3 * time.Second)
+	for sup.HealthFor("gws").State != mcp.StateHealthy {
+		if time.Now().After(deadline) {
+			t.Fatal("precondition: server never became healthy")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	tool := mcpgo.Tool{
+		Name:        "upsert_row",
+		Annotations: mcpgo.ToolAnnotation{IdempotentHint: mcpgo.ToBoolPtr(true)},
+	}
+	mt := NewMCPTool("gws", tool, mgr)
+	mt.SetSupervisor(sup)
+
+	result, err := mt.Run(ctx, `{"key":"a"}`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected replayed success, got error result: %s", result.Content)
+	}
+	if got := fake.callToolCount.Load(); got != 2 {
+		t.Fatalf("idempotent tool should be re-dispatched once, got %d dispatches", got)
 	}
 }
 
