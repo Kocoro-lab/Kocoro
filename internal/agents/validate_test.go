@@ -1,6 +1,9 @@
 package agents
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidateCommandName(t *testing.T) {
 	// Valid names
@@ -60,6 +63,17 @@ func TestValidateAgentModelConfig(t *testing.T) {
 	for _, tier := range []string{"small", "medium", "large", "Large", " large", "MEDIUM", "Small "} {
 		if err := ValidateAgentModelConfig(&AgentModelConfig{Model: ptr(tier)}); err == nil {
 			t.Errorf("expected error for tier %q in agent.model", tier)
+		}
+	}
+
+	for _, model := range []string{
+		"gpt-5.6-luna",
+		"openai:gpt-5.6-luna",
+		" OpenAI:GPT-5.6-LUNA ",
+	} {
+		err := ValidateAgentModelConfig(&AgentModelConfig{Model: ptr(model)})
+		if err == nil || !strings.Contains(err.Error(), "server-minted execution profile") {
+			t.Errorf("reserved model %q error = %v", model, err)
 		}
 	}
 

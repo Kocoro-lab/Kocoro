@@ -6382,6 +6382,10 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.model expects a specific model id (e.g. \"claude-opus-4-8\"), not the tier %q; use model_tier for tiers", model))
 			return
 		}
+		if model, ok := agentPatch["model"].(string); ok && agents.IsReservedExecutionProfileModel(model) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.model %q requires a server-minted execution profile and cannot be selected directly", model))
+			return
+		}
 		// effort_tier is a closed enum ("" / low / high / xhigh / max) sent
 		// verbatim to the LLM provider; an out-of-enum value fails the run far
 		// downstream with an obscure remote 400. Reject at the boundary.

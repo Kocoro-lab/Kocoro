@@ -1022,6 +1022,39 @@ func TestServer_PatchConfigRejectsTierKeywordAsModel(t *testing.T) {
 	}
 }
 
+func TestServer_PatchConfigRejectsReservedInternalModelBeforeWrite(t *testing.T) {
+	shannonDir := t.TempDir()
+	configPath := filepath.Join(shannonDir, "config.yaml")
+	initial := "agent:\n  model: gpt-5.6-sol\n"
+	if err := os.WriteFile(configPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/config",
+		strings.NewReader(`{"agent":{"model":"gpt-5.6-luna"}}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	srv.handlePatchConfig(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "server-minted execution profile") {
+		t.Fatalf("expected actionable error, got %s", rec.Body.String())
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(data) != initial {
+		t.Fatalf("reserved model mutation reached config.yaml: %s", data)
+	}
+}
+
 func TestServer_PatchConfigRejectsInvalidEffortTier(t *testing.T) {
 	shannonDir := t.TempDir()
 	initial := "model_tier: medium\n"
@@ -1151,13 +1184,10 @@ func TestServer_PatchConfigWritesAndClearsServiceTier(t *testing.T) {
 	}
 }
 
-// TestE2E_ModelTierKeywordRejectedAcrossWritePaths drives a running daemon over
-// real HTTP and verifies the tier-keyword guard holds end-to-end on every
-// config write path: named-agent create, named-agent config replace (PUT), and
-// global PATCH /config — plus that legitimate values (specific model id on
-// agent.model, tier on model_tier) still pass. This is the "enter from outside"
-// regression test for the model_id_unknown stuck-agent bug.
-func TestE2E_ModelTierKeywordRejectedAcrossWritePaths(t *testing.T) {
+// TestE2E_InvalidAgentModelsRejectedAcrossWritePaths drives a running daemon
+// over real HTTP and verifies model guards on named-agent create, named-agent
+// config replace, and global config patch before legitimate values still pass.
+func TestE2E_InvalidAgentModelsRejectedAcrossWritePaths(t *testing.T) {
 	agentsDir := t.TempDir()
 	shannonDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("model_tier: medium\n"), 0o600); err != nil {
@@ -1205,6 +1235,14 @@ func TestE2E_ModelTierKeywordRejectedAcrossWritePaths(t *testing.T) {
 	if entries, _ := os.ReadDir(agentsDir); len(entries) != 0 {
 		t.Fatalf("rejected create must not write an agent dir, found %d entries", len(entries))
 	}
+	resp = post("/agents", `{"display_name":"reservedbot","prompt":"hi","config":{"agent":{"model":"gpt-5.6-luna"}}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create with reserved model: want 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	if entries, _ := os.ReadDir(agentsDir); len(entries) != 0 {
+		t.Fatalf("rejected reserved create must not write an agent dir, found %d entries", len(entries))
+	}
 
 	// 2. Create a valid agent (specific model id + tier on model_tier) → 201.
 	resp = post("/agents", `{"display_name":"goodbot","prompt":"hi","config":{"agent":{"model":"claude-opus-4-8","model_tier":"large"}}}`)
@@ -1230,6 +1268,11 @@ func TestE2E_ModelTierKeywordRejectedAcrossWritePaths(t *testing.T) {
 		t.Fatalf("PUT config with tier model: want 400, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+	resp = do(http.MethodPut, "/agents/"+created.Name+"/config", `{"agent":{"model":"openai:gpt-5.6-luna"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT config with reserved model: want 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
 
 	// 4. Global PATCH /config with a tier word → rejected, not persisted.
 	resp = do(http.MethodPatch, "/config", `{"agent":{"model":" medium "}}`)
@@ -1243,6 +1286,18 @@ func TestE2E_ModelTierKeywordRejectedAcrossWritePaths(t *testing.T) {
 	}
 	if strings.Contains(string(data), "model:") {
 		t.Fatalf("tier keyword leaked into config.yaml: %s", data)
+	}
+	resp = do(http.MethodPatch, "/config", `{"agent":{"model":"gpt-5.6-luna"}}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH config with reserved model: want 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	data, err = os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "model:") {
+		t.Fatalf("reserved model leaked into config.yaml: %s", data)
 	}
 
 	// 5. Global PATCH /config with a legitimate model id → accepted + persisted.
