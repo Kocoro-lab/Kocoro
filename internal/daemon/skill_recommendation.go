@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -253,6 +254,11 @@ func (s *skillRecommendationStore) invalidateAll() error {
 // this method ensures the current process also cancels every owner and cannot
 // serve uncertain recommendation state.
 func (s *skillRecommendationStore) failClosedAll(cause error) {
+	// Logged because the degraded state is indistinguishable from the feature
+	// simply being off: offers stop appearing and nothing errors anywhere the
+	// operator can see. This line is how "bricked until restart" is told apart
+	// from "disabled".
+	log.Printf("daemon: skill recommendations fail-closed for all accounts until restart: %v", cause)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, v := range s.byID {
@@ -276,6 +282,9 @@ func (s *skillRecommendationStore) failClosedAll(cause error) {
 // running after AuthManager has switched identity. The uncertain store is
 // disabled process-wide until restart/recovery.
 func (s *skillRecommendationStore) failClosedAccount(account string, cause error) {
+	// See failClosedAll: without a log line an operator cannot tell a poisoned
+	// store from a disabled feature.
+	log.Printf("daemon: skill recommendations fail-closed for one account until restart: %v", cause)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, v := range s.byID {
@@ -342,7 +351,9 @@ func (s *skillRecommendationStore) beginContinuation(account, device, session, i
 		}
 		return skillRecommendationV1{}, false, fmt.Errorf("recommendation expired")
 	}
-	if v.ContinuationToken != token {
+	// Constant-time: this is a bearer capability, so comparison time must not
+	// depend on how many leading bytes a guess got right.
+	if subtle.ConstantTimeCompare([]byte(v.ContinuationToken), []byte(token)) != 1 {
 		return skillRecommendationV1{}, false, fmt.Errorf("invalid continuation token")
 	}
 	if v.ContinuationRunning || v.State == "completed" {
@@ -1016,6 +1027,13 @@ type skillRecommendationSink struct {
 func (s *Server) registerSkillRecommendationSink(accountID, deviceID string, emit func(skillRecommendationV1) bool, close func()) func() {
 	key := skillRecommendationSinkKey(accountID, deviceID)
 	sinkID := randomRecommendationID()
+	if sinkID == "" {
+		// crypto/rand failed. Two empty ids compare equal, which would let an
+		// unrelated sink's unregister delete a live one; refuse to register
+		// instead. The stream still runs, it just carries no recommendations.
+		log.Printf("daemon: skill recommendation sink not registered: could not mint sink id")
+		return func() {}
+	}
 	s.skillRecommendationSinksMu.Lock()
 	if old, ok := s.skillRecommendationSinks[key]; ok && old.close != nil {
 		old.close()
@@ -1126,9 +1144,6 @@ func (s *Server) installAndEnableRecommendation(ctx context.Context, v skillReco
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Slug < entries[j].Slug })
-	if s.slugLocks == nil {
-		s.slugLocks = skills.NewSlugLocks()
-	}
 	unlocks := make([]func(), 0, len(entries))
 	for _, entry := range entries {
 		unlocks = append(unlocks, s.slugLocks.Lock(entry.Slug))

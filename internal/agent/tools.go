@@ -313,6 +313,12 @@ type TurnTerminalTool interface {
 // whose inputs may contain private user text even after ordinary secret
 // redaction. The returned strings are the only input/output content written to
 // audit.log; duration, decision, and tool name remain owned by AgentLoop.
+//
+// REPLACES, does not compose: implementing this discards
+// RedactGUIActivityArguments / RedactGUIActivityResult for this tool entirely.
+// That is correct for tools with no GUI surface, but a GUI-driving tool that
+// adopts it silently loses GUI redaction — such a tool must reapply those
+// helpers inside its own AuditSummaries.
 type AuditSummarySanitizer interface {
 	AuditSummaries(args, result string) (inputSummary, outputSummary string)
 }

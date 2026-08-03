@@ -1698,10 +1698,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if lastID, err := strconv.ParseUint(lastIDStr, 10, 64); err == nil {
 			var missed []Event
 			missed, ch = s.eventBus.SubscribeWithReplay(lastID)
+			// Bounded like the live path below: a stalled client must not block
+			// the handler here, before the event loop that owns the deadline is
+			// even running.
+			replayController := http.NewResponseController(w)
+			_ = replayController.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			for _, evt := range missed {
 				fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", evt.ID, evt.Type, string(evt.Payload))
 			}
 			flusher.Flush()
+			_ = replayController.SetWriteDeadline(time.Time{})
 		}
 	}
 	if ch == nil {

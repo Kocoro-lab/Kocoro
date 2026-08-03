@@ -5239,6 +5239,19 @@ iterationLoop:
 				if terminal, ok := tool.(TurnTerminalTool); ok && terminal.StopsAgentLoop() {
 					// The terminal tool wins this batch. The omitted calls are never
 					// approved or executed and the loop will stop after its result.
+					// That includes calls the model emitted BEFORE this one, so log
+					// what was dropped — otherwise the discard is invisible when
+					// diagnosing "the model asked for X and X never happened".
+					if len(toolCalls) > 1 {
+						dropped := make([]string, 0, len(toolCalls)-1)
+						for _, other := range toolCalls {
+							if other.ID != call.ID || other.Name != call.Name {
+								dropped = append(dropped, other.Name)
+							}
+						}
+						log.Printf("agent: terminal tool %s admitted; dropped %d unexecuted call(s): %s",
+							call.Name, len(dropped), strings.Join(dropped, ", "))
+					}
 					toolCalls = []client.FunctionCall{call}
 					break
 				}

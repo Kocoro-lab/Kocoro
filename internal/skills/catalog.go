@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -195,7 +196,7 @@ func parseOfficialCatalog(data []byte) ([]CatalogEntry, error) {
 	// Retain the once-parsed embedded fallback for normal startup. Registry
 	// snapshots are validated before reaching this helper and remain provider-
 	// owned so an arbitrary local JSON file cannot become official metadata.
-	if string(data) == string(officialCatalogJSON) {
+	if bytes.Equal(data, officialCatalogJSON) {
 		officialCatalogOnce.Do(func() {
 			officialCatalogErr = json.Unmarshal(officialCatalogJSON, &officialCatalog)
 			if officialCatalogErr != nil {
