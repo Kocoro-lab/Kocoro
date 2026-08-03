@@ -207,3 +207,31 @@ func TestLoad_InjectsBuiltinIntercomWithEnvCasingPreserved(t *testing.T) {
 		t.Errorf("expected env casing preserved, got map %v", srv.Env)
 	}
 }
+
+func TestMergeBuiltinMCPServers_PreservesUserToolTimeoutAndWorkspaceBase(t *testing.T) {
+	// These two are user-tunable per their struct docs and accepted by
+	// PATCH /config on builtins, but the merge used to rebuild the entry
+	// without them — yaml kept the values while the runtime silently
+	// reverted to catalog defaults on every load.
+	cfg := &Config{
+		MCPServers: map[string]mcp.MCPServerConfig{
+			"intercom": {
+				Disabled:           false,
+				ToolTimeoutSeconds: 600,
+				WorkspaceBase:      "/tmp/intercom-artifacts",
+			},
+		},
+	}
+	mergeBuiltinMCPServers(cfg)
+
+	got := cfg.MCPServers["intercom"]
+	if got.ToolTimeoutSeconds != 600 {
+		t.Errorf("ToolTimeoutSeconds = %d, want user-set 600 to survive the merge", got.ToolTimeoutSeconds)
+	}
+	if got.WorkspaceBase != "/tmp/intercom-artifacts" {
+		t.Errorf("WorkspaceBase = %q, want user-set value to survive the merge", got.WorkspaceBase)
+	}
+	if got.Command != mcp.BuiltinMCPServers["intercom"].Config.Command {
+		t.Errorf("catalog-owned command must still win, got %q", got.Command)
+	}
+}
