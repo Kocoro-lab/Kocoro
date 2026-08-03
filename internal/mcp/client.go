@@ -584,6 +584,11 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 
 	// Lazy-start: server was discovered at boot but disconnected (keepAlive=false).
 	// Reconnect on first tool invocation, serialized per-server to avoid duplicate processes.
+	// Never lazy-start a disabled server — a stale registry can still hold its
+	// tools right after a disable, and dispatching must not relaunch it.
+	if !ok && hasCfg && cfg.Disabled {
+		return "", true, fmt.Errorf("MCP server %q is disabled", serverName)
+	}
 	if !ok && hasCfg {
 		m.mu.Lock()
 		rmu, rmOK := m.reconnectMu[serverName]
@@ -928,6 +933,14 @@ func (m *ClientManager) Reconnect(ctx context.Context, serverName string) ([]Rem
 	if !hasCfg {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("no config for MCP server %q", serverName)
+	}
+	// A disabled server's config stays in m.configs (so /config/status can
+	// render it), but reconnect must never spawn its subprocess — the user
+	// turned it off. Without this gate any ProbeNow/reconnect path aimed at
+	// a disabled name silently relaunched it.
+	if cfg.Disabled {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("MCP server %q is disabled", serverName)
 	}
 	rmu, ok := m.reconnectMu[serverName]
 	if !ok {
