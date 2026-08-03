@@ -1097,21 +1097,25 @@ func (s *Server) hasSkillRecommendationSink(accountID, deviceID string) bool {
 	return ok
 }
 
-// skillRecommendationEmitter captures the exact SSE connection generation
-// that admitted a /message request. A replacement connection for the same
-// account+device is not interchangeable: the old turn must fail delivery
-// rather than silently moving its card to a newer subscription.
-func (s *Server) skillRecommendationEmitter(accountID, deviceID string) (func(skillRecommendationV1) bool, bool) {
-	key := skillRecommendationSinkKey(accountID, deviceID)
-	s.skillRecommendationSinksMu.RLock()
-	sink, ok := s.skillRecommendationSinks[key]
-	s.skillRecommendationSinksMu.RUnlock()
-	if !ok || sink.emit == nil {
-		return nil, false
-	}
+// skillRecommendationEmitterAt binds delivery to the verified-principal epoch
+// that admitted the request and resolves the live sink at CALL time. Within
+// one sign-in session a transport reconnect is interchangeable: the card
+// follows the current /events connection (the same contract as the
+// connect-time replay of offered cards). Across a principal transition —
+// sign-out, account switch, or a sign-out→sign-in of the same account — the
+// epoch differs and delivery fails closed, so a run admitted under one
+// sign-in session can never deliver into a later one.
+func (s *Server) skillRecommendationEmitterAt(accountID, deviceID string, epoch uint64) func(skillRecommendationV1) bool {
 	return func(v skillRecommendationV1) bool {
-		return s.emitSkillRecommendationGeneration(key, sink.id, v)
-	}, true
+		currentAccount, currentEpoch, ok := s.auth.VerifiedPrincipal()
+		if !ok || currentAccount != accountID || currentEpoch != epoch {
+			return false
+		}
+		if v.OwnerAccountID != accountID || v.OwnerDeviceID != deviceID {
+			return false
+		}
+		return s.emitSkillRecommendation(v)
+	}
 }
 
 func (s *Server) emitSkillRecommendationGeneration(key, generation string, v skillRecommendationV1) bool {

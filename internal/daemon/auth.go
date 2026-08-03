@@ -75,6 +75,13 @@ type AuthManager struct {
 	refreshToken string // RAM only
 	lastErr      string
 	updatedAt    time.Time
+	// verifiedID / principalEpoch track the verified-principal session.
+	// verifiedID mirrors what VerifiedPrincipal would return ("" when not
+	// verified); principalEpoch increments on EVERY change of that value —
+	// including sign-out and a re-login of the SAME account — so work admitted
+	// under one sign-in session can never deliver into a later one.
+	verifiedID     string
+	principalEpoch uint64
 
 	kc                 *keychain.Store
 	cloud              *client.AuthClient
@@ -180,6 +187,24 @@ func (a *AuthManager) VerifiedAccountID() (string, bool) {
 	return a.user.ID, true
 }
 
+// VerifiedPrincipal returns the verified account ID together with the
+// current principal epoch. The epoch changes on every verified-principal
+// transition (sign-in, sign-out, account switch, same-account re-login), so
+// callers that capture (account, epoch) at admission time can later detect
+// that the sign-in session which admitted them has ended — even when the
+// same account signed back in. Same fail-closed rules as VerifiedAccountID.
+func (a *AuthManager) VerifiedPrincipal() (string, uint64, bool) {
+	if a == nil {
+		return "", 0, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.state != AuthStateSignedIn || a.user == nil || a.user.ID == "" {
+		return "", 0, false
+	}
+	return a.user.ID, a.principalEpoch, true
+}
+
 // setState is the single mutator. Emits auth_state_changed whenever any
 // terminal observable field (state OR last_error_code) changes — both
 // drive Desktop UI affordances, so a state-stable error transition
@@ -195,10 +220,7 @@ func (a *AuthManager) VerifiedAccountID() (string, bool) {
 // reading from the bus cannot deadlock against the mutator.
 func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode string) {
 	a.mu.Lock()
-	previousAccountID := ""
-	if a.user != nil {
-		previousAccountID = a.user.ID
-	}
+	previousVerifiedID := a.verifiedID
 	prev := a.state
 	prevErr := a.lastErr
 	a.state = s
@@ -218,19 +240,38 @@ func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode strin
 	}
 	a.lastErr = errCode
 	a.updatedAt = time.Now()
+	// Advance the principal epoch on every verified-principal transition.
+	// Computed AFTER the user/state writes above so it reflects the final
+	// state of this transition, and BEFORE unlock so VerifiedPrincipal can
+	// never observe a new principal under an old epoch.
+	newVerifiedID := ""
+	if a.state == AuthStateSignedIn && a.user != nil {
+		newVerifiedID = a.user.ID
+	}
+	principalTransition := newVerifiedID != a.verifiedID
+	if principalTransition {
+		a.verifiedID = newVerifiedID
+		a.principalEpoch++
+	}
 	snap := a.snapshotLocked()
 	bus := a.bus
 	principalChanged := a.onPrincipalChanged
-	currentAccountID := ""
-	if a.user != nil {
-		currentAccountID = a.user.ID
-	}
 	a.mu.Unlock()
-	if previousAccountID != currentAccountID && principalChanged != nil {
-		principalChanged(previousAccountID, currentAccountID)
+	// Fire cleanup on the SAME predicate that advances the epoch — verified
+	// principal transitions — not on raw user.ID changes. The two diverge on
+	// signed_in(A) → logging_in: user is retained (still A) but the verified
+	// principal is GONE, and outstanding offers must be invalidated then, or
+	// a same-account re-login would replay cards from the previous sign-in
+	// session (violating the fail-closed rule the epoch enforces on the
+	// emit path).
+	if principalTransition && principalChanged != nil {
+		principalChanged(previousVerifiedID, newVerifiedID)
 	}
 
-	if prev == s && prevErr == errCode {
+	// A verified-principal transition is an observable change even when the
+	// state enum is stable (e.g. a direct account switch stays signed_in):
+	// subscribers — the /events sink rebind in particular — must hear it.
+	if prev == s && prevErr == errCode && !principalTransition {
 		return
 	}
 	if bus != nil {

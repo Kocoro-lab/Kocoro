@@ -582,28 +582,6 @@ func TestSkillRecommendationEventsWriteFailureReturnsNegativeACK(t *testing.T) {
 	}
 }
 
-func TestSkillRecommendationMessageBoundEmitterRejectsSinkReplacement(t *testing.T) {
-	s := &Server{skillRecommendationSinks: make(map[string]skillRecommendationSink)}
-	device := "12345678-1234-1234-1234-123456789abc"
-	oldCalls := 0
-	unregisterOld := s.registerSkillRecommendationSink("acct", device, func(skillRecommendationV1) bool { oldCalls++; return true }, func() {})
-	defer unregisterOld()
-	emit, ok := s.skillRecommendationEmitter("acct", device)
-	if !ok {
-		t.Fatal("live sink did not admit message")
-	}
-	newCalls := 0
-	unregisterNew := s.registerSkillRecommendationSink("acct", device, func(skillRecommendationV1) bool { newCalls++; return true }, func() {})
-	defer unregisterNew()
-	v := skillRecommendationV1{State: "offered", OwnerAccountID: "acct", OwnerDeviceID: device, ExpiresAt: time.Now().Add(time.Hour)}
-	if emit(v) {
-		t.Fatal("message-bound emitter delivered through a replacement connection")
-	}
-	if oldCalls != 0 || newCalls != 0 {
-		t.Fatalf("replacement routing old=%d new=%d", oldCalls, newCalls)
-	}
-}
-
 func TestSkillRecommendationContinuePublicSeamResumesNamedAgentSession(t *testing.T) {
 	gw := &fakeGatewayBackend{reply: "continued in researcher"}
 	upstream := httptest.NewServer(gw.handler())
@@ -1147,6 +1125,10 @@ func TestSkillRecommendationToolsRequireAuthenticatedConsumerCapability(t *testi
 			if tc.admitted {
 				req.DesktopDeviceID = "12345678-1234-1234-1234-123456789abc"
 				req.ConsumerCapabilities = map[string]bool{CapSkillInstallRecommendationV1: true}
+				// The verified principal is read once at the HTTP admission
+				// boundary and carried on the request; the runner never
+				// re-reads the AuthManager (account/epoch coherence).
+				req.SkillRecommendationAccountID = "opaque-account"
 			}
 			if tc.liveSink {
 				req.SkillRecommendationEmit = func(skillRecommendationV1) bool { return true }

@@ -1661,59 +1661,121 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
-	var recommendationCh <-chan *recommendationDelivery
-	var unregisterRecommendation func()
-	var principalDone <-chan struct{}
-	if s.skillRecommendationsEnabled() {
-		if deviceID, caps := skillRecommendationAdmission(r, "desktop"); deviceID != "" && caps[CapSkillInstallRecommendationV1] && s.auth != nil {
-			if accountID, ok := s.auth.VerifiedAccountID(); ok {
-				ch := make(chan *recommendationDelivery, 8)
-				done := make(chan struct{})
-				recommendationCh = ch
-				principalDone = done
-				var closeOnce sync.Once
-				unregisterRecommendation = s.registerSkillRecommendationSink(accountID, deviceID, func(v skillRecommendationV1) bool {
-					return enqueueSkillRecommendation(ch, done, v, 2*time.Second)
-				}, func() { closeOnce.Do(func() { close(done) }) })
-				for _, pending := range s.skillRecommendations.offeredFor(accountID, deviceID) {
-					fmt.Fprintf(w, "event: skill.recommendation.v1\ndata: %s\n\n", mustJSON(pending))
-				}
-				flusher.Flush()
-			}
+	// Skill-recommendation sink lifecycle. Auth and this stream race at
+	// startup (Bootstrap's /auth/me round-trip vs a fast local SSE connect),
+	// so the sink binds LAZILY: whenever the verified principal (account +
+	// epoch) changes — observable on this very stream via auth_state_changed,
+	// with the keepalive ticker as a backstop for dropped bus events — the
+	// connection unbinds any stale sink and binds a fresh one, replaying
+	// still-offered cards exactly like the connect-time path. Keyed on epoch,
+	// not account: a sign-out→sign-in of the same account is a new sign-in
+	// session and needs a fresh bind (the old one was closed by the
+	// principal-change cleanup in SetAuth).
+	var recommendationCh chan *recommendationDelivery
+	var unbindRecommendationSink func()
+	var boundAccount string
+	var boundEpoch uint64
+	recommendationDevice, recommendationCaps := skillRecommendationAdmission(r, "desktop")
+	// Admission freezes only what the CLIENT declared (device + capability);
+	// the kill switch is consulted live inside bind so a runtime off→on
+	// enables this connection (ticker latency ≤30s) and on→off cannot
+	// re-register a sink the reload cleanup just closed.
+	recommendationAdmitted := recommendationDevice != "" && recommendationCaps[CapSkillInstallRecommendationV1] && s.auth != nil
+	if recommendationAdmitted {
+		recommendationCh = make(chan *recommendationDelivery, 8)
+	}
+	bindRecommendationSink := func() {
+		if !recommendationAdmitted {
+			return
 		}
+		accountID, epoch, ok := s.auth.VerifiedPrincipal()
+		if !s.skillRecommendationsEnabled() {
+			ok = false // treat as principal-gone: unbind if bound, never bind
+		}
+		if ok && unbindRecommendationSink != nil && boundAccount == accountID && boundEpoch == epoch &&
+			s.hasSkillRecommendationSink(accountID, recommendationDevice) {
+			// Same principal AND a sink is actually registered. The liveness
+			// check matters: a kill-switch off→on inside one ticker period
+			// wipes the map without this handler ever observing the off state
+			// — local state alone would early-return forever on a dead sink.
+			// When the registered sink belongs to a NEWER connection for the
+			// same account+device, early-returning is also right (last one
+			// wins, no steal-back); if that connection later goes away, the
+			// map empties and the next tick falls through to rebind.
+			return
+		}
+		if unbindRecommendationSink != nil {
+			unbindRecommendationSink()
+			unbindRecommendationSink = nil
+			boundAccount = ""
+			boundEpoch = 0
+		}
+		if !ok {
+			return
+		}
+		done := make(chan struct{})
+		var closeOnce sync.Once
+		closeDone := func() { closeOnce.Do(func() { close(done) }) }
+		unregister := s.registerSkillRecommendationSink(accountID, recommendationDevice, func(v skillRecommendationV1) bool {
+			return enqueueSkillRecommendation(recommendationCh, done, v, 2*time.Second)
+		}, closeDone)
+		unbindRecommendationSink = func() {
+			closeDone()
+			unregister()
+		}
+		boundAccount = accountID
+		boundEpoch = epoch
+		for _, pending := range s.skillRecommendations.offeredFor(accountID, recommendationDevice) {
+			fmt.Fprintf(w, "event: skill.recommendation.v1\ndata: %s\n\n", mustJSON(pending))
+		}
+		flusher.Flush()
 	}
-	if unregisterRecommendation != nil {
-		defer unregisterRecommendation()
-	}
+	defer func() {
+		if unbindRecommendationSink != nil {
+			unbindRecommendationSink()
+		}
+	}()
 
 	// Subscribe with atomic replay if client provides a last event ID.
 	// Check both query param (custom clients) and Last-Event-ID header
 	// (standard SSE EventSource reconnection per spec).
 	var ch <-chan Event
+	var missed []Event
 	lastIDStr := r.URL.Query().Get("last_event_id")
 	if lastIDStr == "" {
 		lastIDStr = r.Header.Get("Last-Event-ID")
 	}
 	if lastIDStr != "" {
 		if lastID, err := strconv.ParseUint(lastIDStr, 10, 64); err == nil {
-			var missed []Event
 			missed, ch = s.eventBus.SubscribeWithReplay(lastID)
-			// Bounded like the live path below: a stalled client must not block
-			// the handler here, before the event loop that owns the deadline is
-			// even running.
-			replayController := http.NewResponseController(w)
-			_ = replayController.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			for _, evt := range missed {
-				fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", evt.ID, evt.Type, string(evt.Payload))
-			}
-			flusher.Flush()
-			_ = replayController.SetWriteDeadline(time.Time{})
 		}
 	}
 	if ch == nil {
 		ch = s.eventBus.Subscribe()
 	}
 	defer s.eventBus.Unsubscribe(ch)
+
+	// ORDERING INVARIANT: the initial bind runs AFTER the bus subscription
+	// above. bind reads the principal at call time, so any auth transition is
+	// covered by exactly one of the two — completed before Subscribe ⇒ seen by
+	// this bind; completed after ⇒ its auth_state_changed event is already
+	// queued in ch and triggers a rebind in the loop. Binding first would
+	// leave a window where a sign-in lands between bind and Subscribe and is
+	// only recovered by the 30s ticker backstop.
+	bindRecommendationSink()
+
+	if len(missed) > 0 {
+		// Bounded like the live path below: a stalled client must not block
+		// the handler here, before the event loop that owns the deadline is
+		// even running.
+		replayController := http.NewResponseController(w)
+		_ = replayController.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		for _, evt := range missed {
+			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", evt.ID, evt.Type, string(evt.Payload))
+		}
+		flusher.Flush()
+		_ = replayController.SetWriteDeadline(time.Time{})
+	}
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1723,6 +1785,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case evt := <-ch:
 			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", evt.ID, evt.Type, string(evt.Payload))
 			flusher.Flush()
+			if evt.Type == EventAuthStateChanged {
+				bindRecommendationSink()
+			}
 		case recommendation := <-recommendationCh:
 			if !recommendation.state.CompareAndSwap(0, 1) || time.Now().After(recommendation.deadline) || !s.skillRecommendations.isOffered(recommendation.value.RecommendationID, recommendation.value.OwnerAccountID, recommendation.value.OwnerDeviceID) {
 				recommendation.ack <- false
@@ -1734,11 +1799,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flushErr := controller.Flush()
 			_ = controller.SetWriteDeadline(time.Time{})
 			recommendation.ack <- writeErr == nil && flushErr == nil
-		case <-principalDone:
-			return
 		case <-ticker.C:
 			fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()
+			// Backstop: the bus subscription can drop events under load; the
+			// keepalive tick re-checks the principal so a missed
+			// auth_state_changed delays the bind instead of losing it.
+			bindRecommendationSink()
 		case <-r.Context().Done():
 			return
 		}
@@ -2910,6 +2977,24 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Recommendation tools are opt-in per request. The daemon never infers
 	// Desktop support from its own /status capability list.
 	req.DesktopDeviceID, req.ConsumerCapabilities = skillRecommendationAdmission(r, req.Source)
+	// The verified principal is read ONCE here, at the request boundary, and
+	// flows to the runner via the request — the runner never re-reads the
+	// AuthManager, so the account that keys tool registration and the epoch
+	// baked into the emit closure always come from the same instant. The
+	// emitter resolves the live sink at call time; sink liveness at admission
+	// is logged for diagnosis only and gates nothing.
+	if req.DesktopDeviceID != "" && s.skillRecommendationsEnabled() {
+		accountID, epoch, verified := s.auth.VerifiedPrincipal()
+		sinkLive := false
+		if verified {
+			req.SkillRecommendationAccountID = accountID
+			req.SkillRecommendationEmit = s.skillRecommendationEmitterAt(accountID, req.DesktopDeviceID, epoch)
+			sinkLive = s.hasSkillRecommendationSink(accountID, req.DesktopDeviceID)
+		}
+		// Content-free admission trace so a missing card can be attributed to
+		// "tools never registered" vs "model never called them" after the fact.
+		log.Printf("daemon: skill recommendation admission source=%s principal_verified=%t sink_live=%t", req.Source, verified, sinkLive)
+	}
 	applyKoeModeAdmission(&req)
 	if !isKoeSource(req.Source) {
 		req.ExecutionMode = executionprofile.NormalizeMode(string(req.ExecutionMode))
@@ -3164,13 +3249,6 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher.Flush()
-	if req.DesktopDeviceID != "" && req.ConsumerCapabilities[CapSkillInstallRecommendationV1] && s.auth != nil {
-		if accountID, ok := s.auth.VerifiedAccountID(); ok {
-			if emit, live := s.skillRecommendationEmitter(accountID, req.DesktopDeviceID); live {
-				req.SkillRecommendationEmit = emit
-			}
-		}
-	}
 
 	// Create a per-request broker to avoid racing with concurrent SSE requests.
 	// Each SSE stream gets its own broker with its own sendFn and pending map.
