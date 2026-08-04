@@ -147,11 +147,11 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 			}
 		}
 	}
-	var skills json.RawMessage
-	if api.Skills != nil {
-		if b, err := json.Marshal(api.Skills); err == nil {
-			skills = b
-		}
+	syncedSkills, err := syncedAgentSkills(agentsDir, name, api.Skills)
+	if err != nil {
+		log.Printf("agentsync: skipping agent %q: attachment snapshot failed: %v", name, err)
+		s.auditAgentSyncFailure(name, "attachment snapshot failed", err)
+		return client.SyncAgentItem{}, false
 	}
 
 	return client.SyncAgentItem{
@@ -160,10 +160,52 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 		Prompt:      api.Prompt,
 		Memory:      api.Memory,
 		Config:      config,
-		Skills:      skills,
+		Skills:      syncedSkills,
 		Profile:     profile,
 		UpdatedAt:   agentLastModified(filepath.Join(agentsDir, name)).UTC(),
 	}, true
+}
+
+// syncedAgentSkills serializes the attachment manifest itself, not only the
+// subset that resolves against this device's installed skill inventory. A
+// second device may not have installed a remotely attached skill yet; dropping
+// that unresolved identifier from an outbound sync would turn local absence
+// into a cross-device detach. Resolved entries retain their full metadata for
+// compatibility, while unresolved entries round-trip by slug/name.
+func syncedAgentSkills(agentsDir, agentName string, resolved []skills.SkillMeta) (json.RawMessage, error) {
+	manifestPath := filepath.Join(agentsDir, agentName, "_attached.yaml")
+	if _, err := os.Stat(manifestPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	attached, err := agents.ReadAttachedSkills(agentsDir, agentName)
+	if err != nil {
+		return nil, err
+	}
+	byIdentifier := make(map[string]skills.SkillMeta, len(resolved)*2)
+	for _, meta := range resolved {
+		byIdentifier[meta.Slug] = meta
+		byIdentifier[meta.Name] = meta
+	}
+	metas := make([]skills.SkillMeta, 0, len(attached))
+	for _, identifier := range attached {
+		if meta, ok := byIdentifier[identifier]; ok {
+			metas = append(metas, meta)
+			continue
+		}
+		meta := skills.SkillMeta{Name: identifier}
+		if skills.ValidateSkillName(identifier) == nil {
+			meta.Slug = identifier
+		}
+		metas = append(metas, meta)
+	}
+	b, err := json.Marshal(metas)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 // agentDefinitionFiles is the set of files whose mtimes drive the cross-device
@@ -311,19 +353,25 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 			continue
 		}
 
+		syncSkillNames, writeSyncedSkills := decodeSyncedSkillNames(it.AgentKey, it.Skills)
+		unlockSkills := s.lockSkillIdentifiers(syncSkillNames)
+
 		// Materialize/overwrite under the same per-route lock the create/update
-		// handlers take. Lock per-item (not the whole loop) to keep critical
-		// sections short.
+		// handlers take. Skill locks are acquired first, matching the global
+		// delete path's slug -> route order, so a pull cannot reattach a skill
+		// after its directory was removed.
 		s.deps.SessionCache.LockRoute(routeKey)
 		if _, statErr := os.Stat(dir); statErr == nil {
 			// LWW: only overwrite when cloud is strictly newer than local.
 			if !it.UpdatedAt.After(agentLastModified(dir)) {
 				s.deps.SessionCache.UnlockRoute(routeKey)
+				unlockSkills()
 				continue // local newer or equal — keep local edits.
 			}
 		}
-		materializeAgentFromItem(agentsDir, it)
+		materializeAgentFromItem(agentsDir, it, syncSkillNames, writeSyncedSkills)
 		s.deps.SessionCache.UnlockRoute(routeKey)
+		unlockSkills()
 	}
 	return nil
 }
@@ -341,7 +389,7 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 // Note: SyncAgentItem.DisplayName is intentionally NOT applied here — the
 // display name is sourced from the config blob (AgentConfigAPI.DisplayName), so
 // the top-level field would be redundant/conflicting.
-func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
+func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNames []string, writeSyncedSkills bool) {
 	writeFailed := false
 
 	// Capture the local cwd before any writes. It is device-local state: remote
@@ -436,32 +484,10 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem) {
 		writeFailed = true
 	}
 
-	// skills — attached-skills manifest. The blob mirrors api.Skills
-	// ([]skills.SkillMeta); SetAttachedSkills wants the slug (fallback name).
-	// An empty / JSON null / empty-array skills field means skills were cleared
-	// → SetAttachedSkills([]) removes _attached.yaml (DeleteAttachedSkills).
-	var skillNames []string
-	skillsClear := true
-	if len(it.Skills) > 0 && !isJSONNull(it.Skills) {
-		var metas []skills.SkillMeta
-		if err := json.Unmarshal(it.Skills, &metas); err != nil {
-			// Malformed-but-present skills is NOT a clear signal — leave the
-			// existing manifest untouched rather than wiping attached skills.
-			log.Printf("agentsync: pull of %q: skills decode (skipped): %v", it.AgentKey, err)
-			skillsClear = false
-		} else {
-			for _, m := range metas {
-				ident := m.Slug
-				if ident == "" {
-					ident = m.Name
-				}
-				if ident != "" {
-					skillNames = append(skillNames, ident)
-				}
-			}
-		}
-	}
-	if skillsClear || len(skillNames) > 0 {
+	// skills — decoded before locking, then installation-filtered while the
+	// matching slug and route locks are held. A malformed-but-present blob
+	// leaves the existing manifest untouched.
+	if writeSyncedSkills {
 		if err := agents.SetAttachedSkills(agentsDir, it.AgentKey, skillNames); err != nil {
 			log.Printf("agentsync: write skills for %q failed: %v", it.AgentKey, err)
 			writeFailed = true
@@ -551,4 +577,26 @@ func deleteAgentDefinitionFiles(dir string) {
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
 		_ = os.Remove(dir)
 	}
+}
+
+func decodeSyncedSkillNames(agentKey string, raw json.RawMessage) ([]string, bool) {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return nil, true
+	}
+	var metas []skills.SkillMeta
+	if err := json.Unmarshal(raw, &metas); err != nil {
+		log.Printf("agentsync: pull of %q: skills decode (skipped): %v", agentKey, err)
+		return nil, false
+	}
+	names := make([]string, 0, len(metas))
+	for _, meta := range metas {
+		ident := meta.Slug
+		if ident == "" {
+			ident = meta.Name
+		}
+		if ident != "" {
+			names = append(names, ident)
+		}
+	}
+	return names, true
 }

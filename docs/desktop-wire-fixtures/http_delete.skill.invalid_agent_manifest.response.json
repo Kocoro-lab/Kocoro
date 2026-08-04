@@ -1,0 +1,4 @@
+{
+  "code": "agent_skill_manifest_invalid",
+  "error": "agent \"broken\" has an invalid _attached.yaml; repair it with PUT /agents/broken and a skills list before deleting a global skill"
+}

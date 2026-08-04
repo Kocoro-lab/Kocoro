@@ -101,17 +101,17 @@ type skillFrontmatter struct {
 	// YAML key so authors who historically set it don't blow up
 	// unmarshal, but we intentionally ignore its value — Skill.Slug is
 	// always the on-disk directory name.
-	Slug          string         `yaml:"slug,omitempty"`
-	Description   string         `yaml:"description"`
-	License       string         `yaml:"license"`
-	Compatibility string         `yaml:"compatibility"`
+	Slug          string `yaml:"slug,omitempty"`
+	Description   string `yaml:"description"`
+	License       string `yaml:"license"`
+	Compatibility string `yaml:"compatibility"`
 	// Metadata is intentionally `map[string]any` so nested YAML values
 	// (ClawHub skills embed a structured `clawdbot` object with emoji,
 	// required bins, etc.) round-trip through loadSkillMD without blowing
 	// up unmarshal. A flat `map[string]string` would reject any non-string
 	// value and surface as ErrInvalidSkillPayload / HTTP 422 "malformed"
 	// — see the regression test in marketplace_test.go.
-	Metadata     map[string]any `yaml:"metadata,omitempty"`
+	Metadata map[string]any `yaml:"metadata,omitempty"`
 	// AllowedTools accepts both the scalar-string and YAML-list forms — see
 	// stringOrList. On disk it is always re-serialized as the scalar form.
 	AllowedTools stringOrList `yaml:"allowed-tools,omitempty"`
@@ -133,7 +133,6 @@ type skillFrontmatter struct {
 	// paragraph heuristic and then to the first non-heading paragraph.
 	StickySnippet string `yaml:"sticky-snippet,omitempty"`
 }
-
 
 func LoadSkills(sources ...SkillSource) ([]*Skill, error) {
 	seen := make(map[string]bool)
@@ -184,6 +183,31 @@ func LoadSkills(sources ...SkillSource) ([]*Skill, error) {
 		}
 	}
 	return result, nil
+}
+
+// LoadSkillIdentity reads only the identity fields needed to resolve legacy
+// display-name references. It intentionally does not require description or
+// body validity, so a temporarily incomplete skill can still retain its
+// existing agent attachments. Unparseable frontmatter remains an error because
+// callers cannot safely classify unknown aliases in that state.
+func LoadSkillIdentity(path, dirName string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var fm struct {
+		Name string `yaml:"name"`
+	}
+	if _, err := frontmatter.Parse(bytes.NewReader(data), &fm, frontmatter.NewFormat("---", "---", yaml.Unmarshal)); err != nil {
+		return "", fmt.Errorf("parse frontmatter: %w", err)
+	}
+	if err := ValidateSkillName(dirName); err != nil {
+		return "", fmt.Errorf("directory name %q is not a valid slug: %w", dirName, err)
+	}
+	if err := validateFrontmatterName(fm.Name); err != nil {
+		return "", err
+	}
+	return fm.Name, nil
 }
 
 func loadSkillMD(path, dirName, source string) (*Skill, error) {
@@ -277,9 +301,10 @@ var imperativeMarkers = []string{
 
 // extractStickySnippet returns a single paragraph from the SKILL.md body
 // most likely to be actionable guidance. Selection order:
-//   1. First paragraph containing any imperativeMarker ("MUST", "NEVER",
-//      "必须", "必ず", …) — these are pre-filtered actionable policy.
-//   2. First non-heading paragraph — title/boilerplate is skipped.
+//  1. First paragraph containing any imperativeMarker ("MUST", "NEVER",
+//     "必须", "必ず", …) — these are pre-filtered actionable policy.
+//  2. First non-heading paragraph — title/boilerplate is skipped.
+//
 // Newlines within the paragraph are collapsed to single spaces so the
 // snippet renders cleanly inside a single-line <system-reminder>.
 // Returns "" when no suitable paragraph is found (caller falls back to

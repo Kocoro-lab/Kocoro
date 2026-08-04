@@ -130,7 +130,13 @@ func handleBashAlwaysAllow(deps *ServerDeps, broker *ApprovalBroker, agentName, 
 // Callers must reject DisallowsAutoApproval tools before invoking this, except
 // for computer_use's explicit product-level grant path above.
 func persistGlobalToolAlwaysAllow(deps *ServerDeps, broker *ApprovalBroker, tool string) {
-	if err := config.AppendGlobalAlwaysAllowTool(deps.ShannonDir, tool); err != nil {
+	unlockConfig := func() {}
+	if deps.LockConfigMutation != nil {
+		unlockConfig = deps.LockConfigMutation()
+	}
+	defer unlockConfig()
+	revisions, err := config.AppendGlobalAlwaysAllowToolWithRevision(deps.ShannonDir, tool)
+	if err != nil {
 		log.Printf("daemon: failed to persist global always-allow for %s: %v", tool, err)
 		emitAlwaysAllowNotice(deps, "warn", NoticeCodePersistFailed, tool,
 			"Click honored for this session, but could not save to config — you may be prompted again after a daemon restart.")
@@ -151,6 +157,9 @@ func persistGlobalToolAlwaysAllow(deps *ServerDeps, broker *ApprovalBroker, tool
 		perms.AlwaysAllowTools = append(perms.AlwaysAllowTools, tool)
 	}
 	deps.WriteUnlock()
+	if deps.RecordConfigMutation != nil {
+		deps.RecordConfigMutation(revisions)
+	}
 	broker.SetToolAutoApprove(tool)
 	log.Printf("daemon: always-allow persisted to global always_allow_tools: %s", tool)
 }

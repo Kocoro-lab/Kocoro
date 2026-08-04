@@ -9,33 +9,33 @@ Global settings control how Shannon behaves across all agents — which AI model
 ### Get current config
 - Method: GET
 - Path: /config
-- Response: `{"global": {...}, "effective": {...}, "sources": {"provider": "global", "endpoint": "global"}}`
-- Notes: `effective` is the merged result. `sources` shows which config file each setting came from.
+- Response: `{"global": {...}, "effective": {...}, "sources": [...], "reload_required": false, "reload_reason": "..."}`
+- Notes: `effective` is the daemon's currently loaded result. `sources` shows which config files contributed settings. If `reload_required` is true, `global` contains newer on-disk content that has not been applied to `effective`; call POST /config/reload or restart the daemon. This revision signal tracks only the global `~/.shannon/config.yaml`; it does not watch project or local overlay files. Clients gate this contract on `config_reload_state_v1`.
 
 ### Update config (deep merge)
 - Method: PATCH
 - Path: /config
 - Body: `{"agent": {"model": "claude-opus-4-5"}}`
 - Response: `{"status": "updated"}`
-- Notes: PATCH merges deeply — you only need to include the fields you want to change. Protected fields (`endpoint`, `api_key`, their nested aliases `cloud.endpoint` / `cloud.api_key`, the legacy alias `gateway_url`, `sync.endpoint`, and `permissions.denied_commands`) return HTTP 409 and cannot be changed through this API. Unknown keys are rejected with HTTP 400 `{"error":"unknown_config_field","field":"<dotted.path>"}` — the daemon does not read such keys, so writing them would silently change nothing (e.g. `daemon.endpoint` is invalid; the real key is top-level `endpoint`). Setting a NON-protected key to `null` deletes it, including unknown/stray keys (that is the cleanup path for leftovers like a misplaced `daemon.endpoint`); protected fields return 409 even for `null` — removing a stray `gateway_url` requires editing `~/.shannon/config.yaml` directly. Keys are exact-case snake_case (`{"agent":{"Model":...}}` is rejected as unknown; protected fields are matched case-insensitively so case variants 409 rather than bypassing).
+- Notes: PATCH merges deeply — you only need to include the fields you want to change. It writes the global file; follow it with POST /config/reload, then verify `effective` with GET /config. Protected fields (`endpoint`, `api_key`, their nested aliases `cloud.endpoint` / `cloud.api_key`, the legacy alias `gateway_url`, `sync.endpoint`, and `permissions.denied_commands`) return HTTP 409 and cannot be changed through this API. Unknown keys are rejected with HTTP 400 `{"error":"unknown_config_field","field":"<dotted.path>"}` — the daemon does not read such keys, so writing them would silently change nothing (e.g. `daemon.endpoint` is invalid; the real key is top-level `endpoint`). Setting a NON-protected key to `null` deletes it, including unknown/stray keys (that is the cleanup path for leftovers like a misplaced `daemon.endpoint`); protected fields return 409 even for `null` — removing a stray `gateway_url` requires editing `~/.shannon/config.yaml` directly. Keys are exact-case snake_case (`{"agent":{"Model":...}}` is rejected as unknown; protected fields are matched case-insensitively so case variants 409 rather than bypassing).
 
 ### Reload config from disk
 - Method: POST
 - Path: /config/reload
-- Response: `{"status": "reloaded"}`
-- Notes: Picks up changes made directly to config files on disk. Also reconnects MCP servers.
+- Response: `{"status": "reloaded", "restart_required": true, "restart_reason": "..."}` (`restart_*` fields appear only when needed)
+- Notes: Picks up changes made directly to config files on disk and clears `reload_required`. Also reconnects MCP servers. Endpoint changes and some legacy API-key changes still require the daemon restart reported by the response.
 
 ### Get config status
 - Method: GET
 - Path: /config/status
-- Response: `{"mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "...", "audio_processing": "auto"|"mac_voice"|"clean_device", "fast_effort": bool|null}}`
-- Notes: Shows live connection status for MCP servers and provider health. The `koe` block reflects the voice front brain's settings (managed by Kocoro Desktop's settings panel; credential-free — Koe mints via the daemon, no key here).
+- Response: `{"reload_required": false, "reload_reason": "...", "mcp_servers": {"slack": "connected"|"enabled"|"disabled"}, "koe": {"enabled": bool, "model": "...", "voice": "...", "agent": "...", "language": "...", "audio_processing": "auto"|"mac_voice"|"clean_device", "fast_effort": bool|null}}`
+- Notes: Shows whether the global `~/.shannon/config.yaml` is pending reload, plus live connection status for MCP servers and provider health. Project/local overlay edits are not represented by `reload_required`. The `koe` block reflects the voice front brain's settings (managed by Kocoro Desktop's settings panel; credential-free — Koe mints via the daemon, no key here). Clients gate the reload fields on `config_reload_state_v1`.
 
 ### Get daemon status
 - Method: GET
 - Path: /status
 - Response: `{"is_connected": bool, "active_agent": string, "uptime": int_seconds, "version": string, "capabilities": [string], "memory": {...}}`
-- Notes: `capabilities` is the list of daemon capability tokens this binary advertises — the same set the WS handshake sends to Cloud. UI clients read it to gate features behind a token rather than a version string, so a feature lights up only when the running daemon actually supports it. The canonical complete list is pinned by `docs/desktop-wire-fixtures/http_get.status.response.json`; never copy a partial list into a client. `agent_service_tier_v1` gates the global OpenAI Standard/Fast processing selector and means the daemon validates, checkpoints, and forwards it without leaking it into sealed Koe/computer profiles. `computer_use_topology_v1` gates the strict read-only display-topology contract. `computer_use_control_v1` gates the local-presence-protected activity snapshot, heartbeat, and Pause/Resume/Take Over/Stop control plane; once present, clients fail closed on endpoint errors instead of falling back to legacy inference. `koe_fast_profile_v1` means Koe defaults semantic work to Fast, treats Realtime's valid Fast/Full mode as a soft routing judgment, records the closed `full_reason` only as diagnostic telemetry, resolves the trusted Fast profile through Cloud, pins the result across continuation/recovery, and fails closed to the unchanged Full Agent configuration on protocol/configuration/capability failure. `remote_session_timeline_v1` means `GET /sessions/{id}?view=remote_timeline` returns a byte-bounded mobile history page with explicit cursors and omission counts while the default session-detail endpoint remains lossless. `agent_default_cwd_v1` means named-agent cwd writes are validated, stale cwd loads return a warning instead of taking the agent down, and agent sync treats cwd as device-local. `schedule_broadcast_gate` advertises that the daemon honors the per-schedule broadcast gate (see `schedules.md`). `im_timeline_v1` means the daemon's final answer travels only via `WORKFLOW_COMPLETED`, while Cloud renders each mid-turn `LLM_OUTPUT` as a discrete timeline narration segment interleaved with tool lines. `agent_avatar_v1` gates avatar editing in Desktop. `deliverable_event_v1` gates the live SSE path for the Deliverables sidebar; clients still dedupe live, replayed, and persisted deliverable records by `id`. `memory` is present only when the memory sidecar is configured (its `reason` / `detail` fields are documented in `memory.md`).
+- Notes: `capabilities` is the list of daemon capability tokens this binary advertises — the same set the WS handshake sends to Cloud. UI clients read it to gate features behind a token rather than a version string, so a feature lights up only when the running daemon actually supports it. The canonical complete list is pinned by `docs/desktop-wire-fixtures/http_get.status.response.json`; never copy a partial list into a client. `config_reload_state_v1` gates the global-config revision fields on GET `/config` and GET `/config/status`. `agent_service_tier_v1` gates the global OpenAI Standard/Fast processing selector and means the daemon validates, checkpoints, and forwards it without leaking it into sealed Koe/computer profiles. `computer_use_topology_v1` gates the strict read-only display-topology contract. `computer_use_control_v1` gates the local-presence-protected activity snapshot, heartbeat, and Pause/Resume/Take Over/Stop control plane; once present, clients fail closed on endpoint errors instead of falling back to legacy inference. `koe_fast_profile_v1` means Koe defaults semantic work to Fast, treats Realtime's valid Fast/Full mode as a soft routing judgment, records the closed `full_reason` only as diagnostic telemetry, resolves the trusted Fast profile through Cloud, pins the result across continuation/recovery, and fails closed to the unchanged Full Agent configuration on protocol/configuration/capability failure. `remote_session_timeline_v1` means `GET /sessions/{id}?view=remote_timeline` returns a byte-bounded mobile history page with explicit cursors and omission counts while the default session-detail endpoint remains lossless. `agent_default_cwd_v1` means named-agent cwd writes are validated, stale cwd loads return a warning instead of taking the agent down, and agent sync treats cwd as device-local. `schedule_broadcast_gate` advertises that the daemon honors the per-schedule broadcast gate (see `schedules.md`). `im_timeline_v1` means the daemon's final answer travels only via `WORKFLOW_COMPLETED`, while Cloud renders each mid-turn `LLM_OUTPUT` as a discrete timeline narration segment interleaved with tool lines. `agent_avatar_v1` gates avatar editing in Desktop. `deliverable_event_v1` gates the live SSE path for the Deliverables sidebar; clients still dedupe live, replayed, and persisted deliverable records by `id`. `memory` is present only when the memory sidecar is configured (its `reason` / `detail` fields are documented in `memory.md`).
 
 ## Key Config Fields
 
@@ -87,12 +87,13 @@ Global settings control how Shannon behaves across all agents — which AI model
 
 ### "Change the AI model"
 1. PATCH /config with `{"agent": {"model": "claude-opus-4-5"}}`
-2. POST /config/reload (optional — model is picked up on next conversation)
+2. POST /config/reload
 3. Verify: GET /config → check `effective.agent.model`
 
 ### "Increase bash command timeout"
 1. PATCH /config with `{"tools": {"bash_timeout": 300}}`
-2. Bash commands can now run up to 5 minutes before timing out.
+2. POST /config/reload
+3. Verify: GET /config → check `effective.tools.bash_timeout`
 
 ### "Check which model is being used"
 1. GET /config → look at `effective.agent.model`

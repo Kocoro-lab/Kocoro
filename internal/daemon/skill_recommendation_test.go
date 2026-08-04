@@ -190,6 +190,84 @@ func daemonSkillArchive(t *testing.T, slug, content string) []byte {
 	return out.Bytes()
 }
 
+func TestSkillRecommendationAttachmentUsesAgentRouteLock(t *testing.T) {
+	dir := t.TempDir()
+	agentsDir := filepath.Join(dir, "agents")
+	agentDir := filepath.Join(agentsDir, "researcher")
+	if err := os.MkdirAll(agentDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("You are the researcher."), 0600); err != nil {
+		t.Fatal(err)
+	}
+	provider, entry := recommendationCatalogFixture(t, "route-lock-fixture")
+	cache := NewSessionCache(filepath.Join(dir, "sessions"))
+	defer cache.CloseAll()
+	s := NewServer(0, nil, &ServerDeps{
+		Config:          &config.Config{},
+		ShannonDir:      dir,
+		AgentsDir:       agentsDir,
+		SessionCache:    cache,
+		CatalogProvider: provider,
+	}, "test")
+	v := skillRecommendationV1{
+		OwnerAgentName: "researcher",
+		Items: []skillRecommendationItemWireV1{{
+			CatalogID: entry.ID,
+			Slug:      entry.Slug,
+		}},
+		InstallEntries: []skills.CatalogEntry{entry},
+	}
+
+	routeKey := "agent:researcher"
+	cache.LockRoute(routeKey)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.installAndEnableRecommendation(context.Background(), v)
+		done <- err
+	}()
+
+	installedPath := filepath.Join(dir, "skills", entry.Slug, "SKILL.md")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(installedPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cache.UnlockRoute(routeKey)
+			t.Fatal("recommendation did not reach the attachment boundary")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "_attached.yaml")); !os.IsNotExist(err) {
+		cache.UnlockRoute(routeKey)
+		t.Fatalf("attachment changed while the agent route was locked: %v", err)
+	}
+	select {
+	case err := <-done:
+		cache.UnlockRoute(routeKey)
+		t.Fatalf("recommendation finished before route unlock: %v", err)
+	default:
+	}
+
+	cache.UnlockRoute(routeKey)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recommendation did not finish after route unlock")
+	}
+	attached, err := agents.ReadAttachedSkills(agentsDir, "researcher")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(attached, []string{entry.Slug}) {
+		t.Fatalf("attached skills = %v, want [%s]", attached, entry.Slug)
+	}
+}
+
 func TestSkillRecommendationDynamicCatalogInstallsThroughHTTP(t *testing.T) {
 	dir := t.TempDir()
 	slug := "dynamic-fixture"
