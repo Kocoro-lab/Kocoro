@@ -79,15 +79,36 @@ func ShouldCompact(inputTokens, outputTokens, contextWindow int) bool {
 	return inputTokens+outputTokens >= compactTargetTokens(contextWindow)
 }
 
-// compactTargetTokens is the token budget every compaction layer aims for:
+// compactTargetTokens is the line compaction layers judge "over" against:
 // compactThreshold × contextWindow. Shared by ShouldCompact (the proactive
-// trigger), ShapeHistory (skip gate + candidate acceptance) and
-// TruncateOversizedLastUserMessage so all three judge "fits" against the SAME
-// line. Before this helper the trigger fired at 90% while ShapeHistory
-// accepted anything under 100%, so a session could trigger every iteration
-// yet never shrink below the trigger — paying a summary per Run for nothing.
+// trigger), ShapeHistory's skip gate and TruncateOversizedLastUserMessage so
+// they all agree with the trigger. Before this helper the trigger fired at
+// 90% while ShapeHistory accepted anything under 100%, so a session could
+// trigger every iteration yet never shrink below the trigger — paying a
+// summary per Run for nothing.
 func compactTargetTokens(contextWindow int) int {
 	return int(float64(contextWindow) * compactThreshold)
+}
+
+// compactRetargetFraction is where a compaction aims to LAND — deliberately
+// below the compactThreshold trigger so one compaction buys real headroom
+// (hysteresis) instead of stopping exactly at the line and re-triggering on
+// the next large tool result (observed live: two full compactions within
+// three iterations, each paying PersistLearnings + GenerateSummary + a full
+// prompt-cache rebuild).
+//   - Workload: sessions with large per-turn tool results (file reads,
+//     browser snapshots) near the window limit.
+//   - Symptom when it binds: keepLast shrinks further than strictly needed —
+//     up to an extra (compactThreshold − compactRetargetFraction) × window of
+//     recent turn pairs is summarized away per compaction.
+//   - Override: raise toward compactThreshold for maximum context retention
+//     at the cost of more frequent compactions; the gap between the two is
+//     the hysteresis band.
+const compactRetargetFraction = 0.80
+
+// compactLandingTokens is the acceptance budget for shaped candidates.
+func compactLandingTokens(contextWindow int) int {
+	return int(float64(contextWindow) * compactRetargetFraction)
 }
 
 // ShapeHistory builds a sliding window over messages:
@@ -140,7 +161,7 @@ func ShapeHistory(messages []client.Message, summary string, contextWindow int, 
 	keepLast := defaultKeepLast
 	for keepLast >= minKeepLast {
 		shaped := buildShaped(system, firstUser, summary, rest, keepLast)
-		if contextWindow <= 0 || EstimateTokens(shaped)+overheadTokens < compactTargetTokens(contextWindow) {
+		if contextWindow <= 0 || EstimateTokens(shaped)+overheadTokens < compactLandingTokens(contextWindow) {
 			if len(shaped) >= len(messages) {
 				// Fits, but nothing was dropped (summary-only insertion).
 				return messages

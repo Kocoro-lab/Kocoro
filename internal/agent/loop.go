@@ -4840,11 +4840,12 @@ iterationLoop:
 		}
 		lastPromptTokens = totalPromptTokens(normalizedUsage)
 		lastOutputTokens = normalizedUsage.OutputTokens
-		// Recalibrate the estimator against real usage: requestMessages is
-		// exactly what produced lastPromptTokens, so the gap is the mass the
-		// estimator cannot see (tools[] schemas, chars/3.5 error). Clamped at
-		// 0 — a provider reporting less than the estimate just means the
-		// estimate was conservative, which needs no correction.
+		// Recalibrate the estimator against real usage: the gap between
+		// lastPromptTokens and the estimate of the request that (modulo the
+		// rare error-retry rebuild of req.Messages) produced it is the mass
+		// the estimator cannot see (tools[] schemas, chars/3.5 error).
+		// Clamped at 0, and re-derived on every response, so a skewed sample
+		// from a retry corrects itself one turn later.
 		if lastPromptTokens > 0 {
 			overhead := lastPromptTokens - ctxwin.EstimateTokens(requestMessages)
 			if overhead < 0 {
