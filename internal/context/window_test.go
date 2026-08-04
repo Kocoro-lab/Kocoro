@@ -844,3 +844,57 @@ func cloneForTruncateTest(messages []client.Message) []client.Message {
 	copy(out, messages)
 	return out
 }
+
+// TestForceShapeHistory_CompactsWhenBudgetGateWouldSkip: an explicit user
+// /compact must shape even when the session fits the budget — the standard
+// ShapeHistory declines exactly this case (skip gate), which silently wasted
+// the PersistLearnings + summary calls the user already paid for.
+func TestForceShapeHistory_CompactsWhenBudgetGateWouldSkip(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 8; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent("assistant reply")},
+			client.Message{Role: "user", Content: client.NewTextContent("follow up")},
+		)
+	}
+	contextWindow := 1_000_000 // far under budget → standard gate skips
+
+	if same := ShapeHistory(messages, "the summary", contextWindow, 0); len(same) != len(messages) {
+		t.Fatalf("precondition: standard ShapeHistory should skip under budget, got %d msgs", len(same))
+	}
+
+	shaped := ForceShapeHistory(messages, "the summary", contextWindow, 0)
+	if len(shaped) >= len(messages) {
+		t.Fatalf("forced shaping must reduce history: got %d msgs, want < %d", len(shaped), len(messages))
+	}
+	found := false
+	for _, m := range shaped {
+		if strings.Contains(m.Content.Text(), "the summary") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("forced shaping should insert the summary")
+	}
+}
+
+// TestForceShapeHistory_TooShortReturnsOriginal: when even the minKeepLast
+// floor cannot net a reduction, the original slice comes back unchanged.
+func TestForceShapeHistory_TooShortReturnsOriginal(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 3; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent("a")},
+			client.Message{Role: "user", Content: client.NewTextContent("r")},
+		)
+	}
+	if out := ForceShapeHistory(messages, "s", 0, 0); len(out) != len(messages) {
+		t.Fatalf("3-pair session cannot net-reduce: got %d msgs, want %d", len(out), len(messages))
+	}
+}

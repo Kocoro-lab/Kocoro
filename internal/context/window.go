@@ -180,6 +180,55 @@ func ShapeHistory(messages []client.Message, summary string, contextWindow int, 
 	return floor
 }
 
+// ForceShapeHistory shapes unconditionally on behalf of an explicit user
+// request (TUI /compact): the caller has already paid for PersistLearnings
+// and the summary, so the budget-based skip gates of ShapeHistory — which
+// exist to avoid pointless compaction the user never asked for — do not
+// apply. keepLast is capped so at least one message is actually dropped
+// (net of the inserted summary); when even the minKeepLast floor cannot
+// reduce the history, the original slice is returned unchanged and the
+// caller should report "too short to compact".
+func ForceShapeHistory(messages []client.Message, summary string, contextWindow int, overheadTokens int) []client.Message {
+	if overheadTokens < 0 {
+		overheadTokens = 0
+	}
+	if len(messages) <= 3+minKeepLast*2 {
+		return messages
+	}
+
+	system := messages[0]
+	firstUser := messages[1]
+	rest := messages[2:]
+
+	// Largest keepLast that still nets a reduction: buildShaped keeps
+	// keepLast*2 tail messages and adds the summary message (when present),
+	// so require keepLast*2 ≤ len(rest) − (1 + summaryLen).
+	minDrop := 1
+	if summary != "" {
+		minDrop = 2
+	}
+	keepLast := (len(rest) - minDrop) / 2
+	if keepLast > defaultKeepLast {
+		keepLast = defaultKeepLast
+	}
+	for keepLast > minKeepLast {
+		shaped := buildShaped(system, firstUser, summary, rest, keepLast)
+		if contextWindow <= 0 || EstimateTokens(shaped)+overheadTokens < compactLandingTokens(contextWindow) {
+			if len(shaped) >= len(messages) {
+				return messages
+			}
+			return shaped
+		}
+		keepLast--
+	}
+
+	floor := buildShaped(system, firstUser, summary, rest, minKeepLast)
+	if len(floor) >= len(messages) {
+		return messages
+	}
+	return floor
+}
+
 // buildShaped assembles the shaped message array.
 //
 // The recent slice is taken positionally from the tail of rest, which means

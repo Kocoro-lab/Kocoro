@@ -2042,8 +2042,8 @@ func TestAgentLoop_CompactionFiresWhenEstimateLags(t *testing.T) {
 		t.Logf("status: %s %s", ev.code, ev.detail)
 	}
 
-	if loop.estOverheadTokens <= 0 {
-		t.Errorf("estOverheadTokens should be calibrated from real usage, got %d", loop.estOverheadTokens)
+	if loop.estOverhead() <= 0 {
+		t.Errorf("estOverheadTokens should be calibrated from real usage, got %d", loop.estOverhead())
 	}
 	if !sawSummary {
 		t.Fatal("proactive compaction should have generated a summary")
@@ -2054,5 +2054,90 @@ func TestAgentLoop_CompactionFiresWhenEstimateLags(t *testing.T) {
 	// the shaped history (containing the summary) must feed later requests.
 	if !summaryReachedMainRequest {
 		t.Errorf("summary never reached a main request — ShapeHistory declined despite the real-usage trigger: %v", mainMsgCounts)
+	}
+}
+
+// TestAgentLoop_ReactiveEvidenceFloorShapesDespiteLowEstimate: a provider can
+// 400 for length while both the estimate AND the reported usage are far below
+// the configured window (token-counting mismatch, or a resumed session whose
+// Run has no usage sample yet). The 400 itself is proof the prompt exceeds
+// the window, so reactive compaction must shape regardless of what the
+// estimate claims. This mock keeps 400ing until the retry actually carries
+// fewer messages — the pre-fix behavior (ShapeHistory skipped via the
+// under-budget gate, history resent at full size) fails here.
+func TestAgentLoop_ReactiveEvidenceFloorShapesDespiteLowEstimate(t *testing.T) {
+	memoryDir := t.TempDir()
+
+	var mu sync.Mutex
+	firstErrorMsgCount := 0
+	shrunkRetrySucceeded := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := readBody(r.Body)
+		defer r.Body.Close()
+
+		var req struct {
+			ModelTier string `json:"model_tier"`
+			Messages  []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		json.Unmarshal(raw, &req)
+
+		if req.ModelTier == "small" {
+			json.NewEncoder(w).Encode(nativeResponse("summary of prior steps", "end_turn", nil, 50, 30))
+			return
+		}
+
+		mu.Lock()
+		msgCount := len(req.Messages)
+
+		if msgCount < 12 && firstErrorMsgCount == 0 {
+			mu.Unlock()
+			// Tiny reported usage: estOverheadTokens stays ~0, so only the
+			// 400-evidence floor can open ShapeHistory's gates later. Vary the
+			// thought so the loop detector doesn't force-stop the run early.
+			json.NewEncoder(w).Encode(nativeResponse(
+				"", "tool_use",
+				toolCall("think", fmt.Sprintf(`{"thought":"step %d"}`, msgCount)),
+				50, 20))
+			return
+		}
+
+		if firstErrorMsgCount == 0 || msgCount >= firstErrorMsgCount {
+			if firstErrorMsgCount == 0 {
+				firstErrorMsgCount = msgCount
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"prompt is too long"}}`))
+			return
+		}
+
+		shrunkRetrySucceeded = true
+		mu.Unlock()
+		json.NewEncoder(w).Encode(nativeResponse("done after shaped retry", "end_turn", nil, 100, 20))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&thinkTool{})
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+	loop.SetContextWindowExplicit(200_000) // estimate stays FAR below → old gate skipped
+	loop.SetMemoryDir(memoryDir)
+	loop.SetHandler(&mockHandler{approveResult: true})
+
+	_, _, err := loop.Run(context.Background(), "run the steps", nil, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !shrunkRetrySucceeded {
+		t.Fatalf("retry after reactive compaction never carried fewer messages (first 400 at %d msgs, err=%v)", firstErrorMsgCount, err)
+	}
+	if err != nil {
+		t.Errorf("Run should succeed once the shaped retry goes through: %v", err)
 	}
 }
