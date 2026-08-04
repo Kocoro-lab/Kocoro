@@ -100,6 +100,14 @@ func (t *useSkillTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	body := skill.Prompt
 	if skill.Dir != "" {
 		body = rewriteRelativePaths(body, skill.Dir)
+		// Always state the skill's absolute directory. The regex rewrite
+		// above only covers the scripts/references/assets convention — a
+		// skill that ships code under any other layout (e.g. core/ imported
+		// as Python modules) gives the model NO path anchor, and the
+		// observed failure mode is a disk-wide `find /` hunting for the
+		// bundled files (2026-08-03, slack-gif-creator).
+		body = "Skill directory: " + skill.Dir + "\n" +
+			"(Bundled files live under this directory. Run bundled scripts with it as the working directory unless the skill says otherwise.)\n\n" + body
 	}
 	if args.Args != "" {
 		body += "\n\n## User Context\n\n" + args.Args
@@ -139,6 +147,14 @@ func rewriteRelativePaths(body, dir string) string {
 func (t *useSkillTool) RequiresApproval() bool { return false }
 
 func (t *useSkillTool) IsReadOnlyCall(string) bool { return false }
+
+// HasMaterialSideEffect reports false: activating a skill only mutates
+// run-local instruction/filter state (and unlocks scoped secrets for child
+// processes) — nothing external, nothing a resumed continuation could
+// double-execute. Reading a skill's instructions and then offering a BETTER
+// installable skill is a legitimate flow that must not trip the
+// offer-before-side-effects invariant.
+func (t *useSkillTool) HasMaterialSideEffect(string) bool { return false }
 
 // SkillExempt keeps use_skill callable regardless of the active skill's
 // allowed-tools list — without this, a skill that omitted "use_skill" would

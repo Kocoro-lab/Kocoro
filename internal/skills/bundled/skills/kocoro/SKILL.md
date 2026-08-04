@@ -5,10 +5,12 @@ description: >
   permissions, config, rules. 中:列出/查看/查询/创建/修改/删除/配置/安装 agent/skill/MCP/计划/权限/规则。
   日:一覧/表示/確認/検索/作成/更新/削除/設定/インストール エージェント/スキル/MCPサーバー/スケジュール/権限/ルール。
 
-  Use for operations on Kocoro-managed platform state under ~/.shannon/, including
+  Use for explicit operations on Kocoro-managed platform state under ~/.shannon/, including
   configured agents, skills, MCP servers, schedules, permissions, rules, and config.
   Route only that platform-state portion through the daemon API; mixed requests may
   and should continue with file, shell, web, and integration tools as appropriate.
+  Do not use this platform-management skill merely to fill a task-time capability gap
+  when discover_installable_skills is available.
 # allowed-tools is intentionally absent. The use_skill filter is run-scoped:
 # once a skill with an allowlist activates, every later tool call in the run is
 # denied unless listed. Kocoro platform work is frequently one part of a mixed
@@ -28,6 +30,22 @@ Use the `http` tool for those operations — with ONE exception: **schedules** u
 
 This routing rule is scoped. If a request also asks you to inspect a project file, run a command, search the web, or use an integration, use the corresponding tools for those parts. Activating this skill never means “HTTP only” for the whole run.
 
+## Task-time capability gaps
+
+When `discover_installable_skills` is available and the current task needs a
+capability that is not in the visible installed skills, call it first. Do not
+guess a `use_skill` name, call `/skills/downloadable` or
+`/skills/install/{name}`, or ask for installation permission in text. If
+discovery returns a match, immediately call `offer_skill_installation` with the
+returned catalog IDs; that tool shows the localized Desktop card and stops the
+run so the user can choose.
+
+The generic skill HTTP operations below are only for explicit platform
+administration, such as when the user asks to browse the catalog or directly
+install a named skill outside a capability-dependent task, and for consumers
+where the recommendation tools are not available. A user's consent reply to a
+task-time suggestion is not platform administration; use the card workflow.
+
 ## Common Operations
 
 **Create an agent:**
@@ -45,9 +63,9 @@ body: {"display_name": "Agent Name", "prompt": "You are a ... assistant. You hel
 
 **Agent config (model, tools):** `http PUT http://localhost:7533/agents/{name}/config` body: `{"agent": {"model": "..."}, "tools": {"allow": [...]}}`
 
-**List available skills:** `http GET http://localhost:7533/skills/downloadable`
+**List available skills (explicit administration):** `http GET http://localhost:7533/skills/downloadable`
 
-**Install a skill:** `http POST http://localhost:7533/skills/install/{name}`
+**Install a named skill directly (explicit administration only, outside a capability-dependent task):** `http POST http://localhost:7533/skills/install/{name}`
 
 **Attach skill to agent:** `http PUT http://localhost:7533/agents/{name}/skills/{skill}`
 

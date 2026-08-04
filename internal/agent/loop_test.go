@@ -5032,10 +5032,10 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		llmCallCount++
 		switch llmCallCount {
-		case 1, 2, 3:
+		case 1, 2, 3, 4:
 			// Return the SAME tool call with identical args each turn so
-			// the detector sees ConsecutiveDup at count=2 (LoopNudge) and
-			// count=3 (LoopForceStop).
+			// the detector sees ConsecutiveDup at count=3 (LoopNudge) and
+			// count=4 (LoopForceStop).
 			json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
 				toolCallWithID("mock_tool", `{"same":"args"}`, fmt.Sprintf("toolu_%d", llmCallCount)), 10, 5))
 		default:

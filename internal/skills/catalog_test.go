@@ -137,6 +137,60 @@ func TestRegistryCatalogProviderDoesNotTrustArbitraryMarketplaceURL(t *testing.T
 	}
 }
 
+func TestEmbeddedCatalogUsesNarrowOfflineRecommendationAllowlist(t *testing.T) {
+	dir := t.TempDir()
+	provider := NewEmbeddedCatalogProvider(dir)
+	entries, revision, err := provider.Catalog(context.Background())
+	if err != nil || !strings.HasPrefix(revision, "sha256:") {
+		t.Fatalf("catalog revision=%q err=%v", revision, err)
+	}
+
+	wantRecommended := map[string]bool{
+		"pptx": true, "docx": true, "xlsx": true, "pdf": true,
+		"slack-gif-creator": true,
+	}
+	gotRecommended := map[string]bool{}
+	bySlug := make(map[string]CatalogEntry, len(entries))
+	for _, entry := range entries {
+		bySlug[entry.Slug] = entry
+		if entry.Recommendation.Eligible {
+			gotRecommended[entry.Slug] = true
+		}
+	}
+	if len(gotRecommended) != len(wantRecommended) {
+		t.Fatalf("recommendation allowlist=%v want=%v", gotRecommended, wantRecommended)
+	}
+	for slug := range wantRecommended {
+		if !gotRecommended[slug] {
+			t.Fatalf("recommendation allowlist missing %q: %v", slug, gotRecommended)
+		}
+	}
+
+	// The four document skills cannot be redistributed under their upstream
+	// license. Their recommendation metadata is local, while acceptance uses an
+	// immutable, integrity-checked archive descriptor.
+	for _, slug := range []string{"pptx", "docx", "xlsx", "pdf"} {
+		entry, ok := bySlug[slug]
+		if !ok {
+			t.Fatalf("catalog missing %q", slug)
+		}
+		if !entry.Recommendation.Eligible || entry.Installation.Provider != "github_archive" {
+			t.Fatalf("%s installation=%+v", slug, entry.Installation)
+		}
+	}
+
+	entry := bySlug["slack-gif-creator"]
+	if entry.Installation.Provider != "bundled" {
+		t.Fatalf("recommended installation=%+v", entry.Installation)
+	}
+	if _, err := InstallCatalogEntry(context.Background(), dir, entry, provider); err != nil {
+		t.Fatalf("offline bundled install: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "skills", entry.Slug, "SKILL.md")); err != nil {
+		t.Fatalf("installed SKILL.md: %v", err)
+	}
+}
+
 func TestRegistryCatalogMarketplaceRecommendationRequiresExplicitEligibility(t *testing.T) {
 	dir := t.TempDir()
 	entry := testCatalogEntry("reviewed-marketplace")

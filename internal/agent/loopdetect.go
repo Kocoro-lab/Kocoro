@@ -476,7 +476,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		}
 		if consecCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
-				"You've called %s %d times consecutively with identical arguments. The results won't change. Use the results you already have or try a different approach.", name, consecCount)
+				"You've called %s %d times consecutively with identical arguments. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, consecCount)
 		}
 	}
 
@@ -512,7 +512,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		}
 		if dupCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
-				"You've called %s %d times with identical arguments and similar results. Try a fundamentally different approach.", name, dupCount)
+				"You've called %s %d times with identical arguments. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a fundamentally different approach.", name, dupCount)
 		}
 	}
 

@@ -76,8 +76,20 @@ func newBackoffState(baseMin, baseMax, dormant time.Duration) *backoffState {
 	}
 }
 
+// maxBackoffAttempts caps the failure-count exponent. 2^19·baseMin already
+// exceeds any sane baseMax, so past this point attempts only feeds the
+// dormant branch. Unbounded growth overflows the int64 multiply after ~32
+// consecutive failures (baseMin 5s ≈ 2^32 ns · 2^31 > MaxInt64) — the
+// product goes negative, skips the dormant clamp, and a server dead for
+// ~2.5h snaps back to fast-tier probing forever. recordSuccess resets the
+// counter, so the cap has no effect on any recovering server. Not
+// user-tunable: it only exists to keep the shift finite.
+const maxBackoffAttempts = 20
+
 func (b *backoffState) recordFailure() {
-	b.attempts++
+	if b.attempts < maxBackoffAttempts {
+		b.attempts++
+	}
 	base := b.baseMin * time.Duration(1<<(b.attempts-1))
 	if base > b.baseMax {
 		base = b.dormant
@@ -267,6 +279,15 @@ func (s *Supervisor) Start(ctx context.Context) {
 
 	now := time.Now()
 	for name, cfg := range configs {
+		// Disabled servers are configured-but-off: ConnectAll/StartConnectAll
+		// never connect them, so probing produces nothing but a goroutine per
+		// server failing forever (and, once the failure count grows, endless
+		// backoff churn). ProbeNow on an unregistered name safely returns
+		// StateDisconnected without side effects, so skipping here cannot
+		// strand a caller.
+		if cfg.Disabled {
+			continue
+		}
 		var lastTransportOK time.Time
 		if connectedServers[name] {
 			lastTransportOK = now

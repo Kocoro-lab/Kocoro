@@ -1,0 +1,5 @@
+{
+  "error": "unknown_config_field",
+  "field": "daemon.endpoint",
+  "message": "unknown config field \"daemon.endpoint\" — the daemon does not read this key, so writing it would silently change nothing"
+}

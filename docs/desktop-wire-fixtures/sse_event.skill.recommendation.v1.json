@@ -3,7 +3,7 @@
   "recommendation_id": "rec_01",
   "session_id": "session_demo",
   "turn_id": "turn_demo",
-  "catalog_revision": "sha256:318ca327bf371198f341ff630587cdccaab91a23f3cce2ccce565fdcdecea1b8",
+  "catalog_revision": "sha256:f88bab24ff734c84de33accfe1a64e9653090efc6ea5d24f50ef41207af55a72",
   "state": "offered",
   "items": [
     {

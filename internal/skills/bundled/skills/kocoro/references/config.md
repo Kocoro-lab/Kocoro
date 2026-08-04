@@ -17,7 +17,7 @@ Global settings control how Shannon behaves across all agents — which AI model
 - Path: /config
 - Body: `{"agent": {"model": "claude-opus-4-5"}}`
 - Response: `{"status": "updated"}`
-- Notes: PATCH merges deeply — you only need to include the fields you want to change. Protected fields (`endpoint`, `api_key`, `permissions.denied_commands`) return HTTP 409 and cannot be changed through this API.
+- Notes: PATCH merges deeply — you only need to include the fields you want to change. Protected fields (`endpoint`, `api_key`, their nested aliases `cloud.endpoint` / `cloud.api_key`, the legacy alias `gateway_url`, `sync.endpoint`, and `permissions.denied_commands`) return HTTP 409 and cannot be changed through this API. Unknown keys are rejected with HTTP 400 `{"error":"unknown_config_field","field":"<dotted.path>"}` — the daemon does not read such keys, so writing them would silently change nothing (e.g. `daemon.endpoint` is invalid; the real key is top-level `endpoint`). Setting a NON-protected key to `null` deletes it, including unknown/stray keys (that is the cleanup path for leftovers like a misplaced `daemon.endpoint`); protected fields return 409 even for `null` — removing a stray `gateway_url` requires editing `~/.shannon/config.yaml` directly. Keys are exact-case snake_case (`{"agent":{"Model":...}}` is rejected as unknown; protected fields are matched case-insensitively so case variants 409 rather than bypassing).
 
 ### Reload config from disk
 - Method: POST
@@ -79,7 +79,7 @@ Global settings control how Shannon behaves across all agents — which AI model
 | `cloud.publish_allowed_extensions` | Extra file extensions allowed for `publish_to_web` (e.g. `[".go", ".sql"]`). Additive on top of the built-in default; denylist is **not** user-configurable. | No |
 | `cloud.stream_idle_timeout_secs` | Abort a cloud-delegate SSE connection when no line (event or 10s heartbeat) arrives for this many seconds, then reconnect via Last-Event-ID. Per-connection liveness probe, NOT a workflow time limit (`cloud.timeout` bounds total duration). 0 = disabled. Default: 45. | No |
 | `mcp_servers` | External service integrations (see mcp reference) | No |
-| `mcp.tool_timeout_secs` | Global bound (seconds) on a single MCP tools/call attempt; per-server `tool_timeout_secs` overrides it. Bounds one attempt, not the whole tool call — after a transport failure the daemon reconnects and retries once, so the theoretical worst case is two attempts plus reconnect. Cannot be disabled; `0` means the default. Default: 300. | No |
+| `mcp.tool_timeout_secs` | Global bound (seconds) on a single MCP tools/call attempt; per-server `tool_timeout_secs` overrides it. Bounds one attempt, not the whole tool call — after a transport failure the daemon reconnects, and re-dispatches only read-only/idempotent-annotated tools (others surface an outcome-unknown error instead of a blind retry), so the theoretical worst case is two attempts plus reconnect. Cannot be disabled; `0` means the default. Default: 300. | No |
 | `koe.audio_processing` | Voice microphone processing mode: `auto` (default), `mac_voice` (use Apple VoiceProcessingIO voice processing/AEC), or `clean_device` (for microphones/apps that already clean voice; keep VPIO device binding/playback but bypass Apple's voice processing). In `auto`, Koe uses `clean_device` only for a conservative list of known self-processed conference device/app pairs and otherwise keeps Mac voice processing. Kocoro Desktop exposes this under Voice → Advanced and forwards it to `shan koe --audio-processing`. | No |
 | `koe.barge_in` | Enables VPIO full-duplex turn-taking. Koe pauses the exact assistant PCM locally, asks the native speech-to-speech model to choose only `resume_playback` (backchannel/no reply) or `accept_turn` (real interruption), then resumes or discards playback. ASR is not an admission dependency. Requires the VPIO backend. The bare `shan koe` CLI stays half-duplex when unset; Kocoro Desktop resolves an unset preference to enabled while preserving an explicit `false`. | No |
 
@@ -148,7 +148,7 @@ See `references/memory.md` for the full mode breakdown, diagnostics, and audit e
 
 ## Safety Notes
 
-- **Protected fields**: `endpoint` and `api_key` are protected. Attempting to modify them returns HTTP 409. These fields cannot be changed through this skill — the user must edit `~/.shannon/config.yaml` directly.
+- **Protected fields**: `endpoint`, `api_key` (and their `cloud.*` aliases), the legacy `gateway_url`, and `sync.endpoint` are protected. Attempting to modify them returns HTTP 409. These fields cannot be changed through this skill — the user must edit `~/.shannon/config.yaml` directly.
 - **Three config levels**: Changes via PATCH /config write to the global config (`~/.shannon/config.yaml`). Project-level settings (`.shannon/config.yaml`) override global settings for that project. Local settings (`.shannon/config.local.yaml`) override both.
 - **Reload after file edits**: If you edit config files directly on disk, call POST /config/reload so the daemon picks up the changes.
 - **Model names**: Use exact model IDs from your provider. Invalid model names will cause conversations to fail at the start.

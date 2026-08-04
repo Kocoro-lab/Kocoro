@@ -207,6 +207,13 @@ func TestGatewayAcceptsCanonicalGenericCompletionFixture(t *testing.T) {
 		loadExecutionProfileFixture(t, "profile.openai-generic-ax-only.json"),
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if surface, ok := body["preferred_api_surface"]; ok {
+			t.Errorf("sealed request carried preferred_api_surface = %v", surface)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(loadExecutionProfileFixture(t, "completion.openai-generic-ax-only.json"))
 	}))

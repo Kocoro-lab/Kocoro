@@ -109,3 +109,10 @@ func (t *ProcessTool) IsSafeArgs(argsJSON string) bool {
 	}
 	return args.Action == "list" || args.Action == "ports"
 }
+
+// HasMaterialSideEffect is argument-level: list/ports only observe; kill (and
+// anything unparseable) is a real side effect. Mirrors IsSafeArgs so the two
+// classifications cannot drift.
+func (t *ProcessTool) HasMaterialSideEffect(argsJSON string) bool {
+	return !t.IsSafeArgs(argsJSON)
+}

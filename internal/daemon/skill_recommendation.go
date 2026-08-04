@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -684,14 +685,40 @@ type skillRecommendationEffectHandler struct {
 }
 
 func (h *skillRecommendationEffectHandler) OnToolCall(name, args, toolUseID string) {
-	if name != "discover_installable_skills" && name != "offer_skill_installation" {
-		if tool, ok := h.registry.Get(name); !ok {
-			h.run.markSideEffect() // unknown execution is never assumed harmless.
-		} else if readOnly, ok := tool.(interface{ IsReadOnlyCall(string) bool }); !ok || !readOnly.IsReadOnlyCall(args) {
-			h.run.markSideEffect()
-		}
+	if name != "discover_installable_skills" && name != "offer_skill_installation" && h.callHasMaterialSideEffect(name, args) {
+		h.run.markSideEffect()
 	}
 	h.EventHandler.OnToolCall(name, args, toolUseID)
+}
+
+// callHasMaterialSideEffect classifies one tool call for the
+// offer-before-side-effects invariant. IsReadOnlyCall alone is the WRONG
+// predicate here — it conflates concurrency scheduling with side effects and
+// blocked the canonical "ask how to proceed → user picks recommend-a-skill →
+// discover → offer" flow in production (2026-08-03). Ladder, most-specific
+// first, unknown fails closed:
+//  1. MaterialSideEffectChecker — the tool's own semantic answer, argument-
+//     level where it matters (process list/ports vs kill; bash reuses its
+//     strict read-only static analysis so `git status` / `ls` don't
+//     spuriously kill an offer).
+//  2. IsReadOnlyCall — the legacy default for everything else.
+//  3. Unknown tool — never assumed harmless.
+//
+// Deliberately NOT consulted: ConcurrencySafeChecker. Its contract is batch
+// scheduling — orthogonal to side effects (a future tool could be safe to
+// parallelize yet still mutate external state). Tools whose scheduling
+// analysis happens to prove read-onlyness expose that through their OWN
+// MaterialSideEffectChecker (see BashTool.HasMaterialSideEffect).
+func (h *skillRecommendationEffectHandler) callHasMaterialSideEffect(name, args string) bool {
+	tool, ok := h.registry.Get(name)
+	if !ok {
+		return true
+	}
+	if effect, ok := tool.(agent.MaterialSideEffectChecker); ok {
+		return effect.HasMaterialSideEffect(args)
+	}
+	readOnly, ok := tool.(interface{ IsReadOnlyCall(string) bool })
+	return !ok || !readOnly.IsReadOnlyCall(args)
 }
 func (h *skillRecommendationEffectHandler) SetSessionID(id string) {
 	if v, ok := h.EventHandler.(interface{ SetSessionID(string) }); ok {
@@ -730,7 +757,7 @@ type discoverInstallableSkillsTool struct {
 }
 
 func (t *discoverInstallableSkillsTool) Info() agent.ToolInfo {
-	return agent.ToolInfo{Name: "discover_installable_skills", Description: "Find up to three installable official capabilities for the current Desktop task. Provide concise task_summary and/or stable intent_tags; never guess skill names.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"task_summary": map[string]any{"type": "string"}, "intent_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}}}
+	return agent.ToolInfo{Name: "discover_installable_skills", Description: "When the current Desktop task needs a capability missing from the visible installed skills, call this before guessing use_skill, loading the kocoro management skill, calling generic skill list/install APIs, or asking the user to install. Finds up to three installable official capabilities. Provide concise task_summary and/or stable intent_tags; never guess skill names.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"task_summary": map[string]any{"type": "string"}, "intent_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}}}
 }
 func (*discoverInstallableSkillsTool) RequiresApproval() bool     { return false }
 func (*discoverInstallableSkillsTool) IsReadOnlyCall(string) bool { return true }
@@ -776,6 +803,7 @@ func (t *discoverInstallableSkillsTool) Run(ctx context.Context, args string) (a
 	ranked := make([]rankedCandidate, 0, len(entries))
 	for _, e := range entries {
 		score := recommendationQueryScore(e, queryTerms)
+		score += recommendationTagQueryScore(e, in.IntentTags)
 		for _, tag := range in.IntentTags {
 			if containsFold(e.Recommendation.IntentTags, tag) {
 				score += 100
@@ -811,21 +839,62 @@ func (t *discoverInstallableSkillsTool) Run(ctx context.Context, args string) (a
 		rc.mu.Unlock()
 	}
 	b, _ := json.Marshal(out)
+	if len(out) == 0 {
+		// Self-correction hint: the model cannot see the catalog's closed
+		// tag vocabulary, so a plain "[]" reads as "nothing exists" and the
+		// model tells the user so (production, 2026-08-03 — two retries with
+		// invented tags, then a false "no matching skill" answer). Surfacing
+		// the vocabulary lets one retry succeed or fail honestly.
+		vocabulary := map[string]bool{}
+		for _, e := range entries {
+			for _, tag := range e.Recommendation.IntentTags {
+				vocabulary[tag] = true
+			}
+		}
+		tags := make([]string, 0, len(vocabulary))
+		for tag := range vocabulary {
+			tags = append(tags, tag)
+		}
+		sort.Strings(tags)
+		return agent.ToolResult{Content: "[]\n\nNo catalog entry matched. The catalog uses a CLOSED intent-tag vocabulary: " +
+			strings.Join(tags, ", ") +
+			". If one of these tags could fit the task, retry with it; otherwise tell the user no installable skill matches."}, nil
+	}
 	return agent.ToolResult{Content: string(b)}, nil
 }
+
+// recommendationASCIIRuns extracts lowercase ASCII word runs. This is the
+// CJK lifeline: strings.Fields on a Chinese task_summary yields tokens like
+// "修订记录（tracked" — a Latin term welded to CJK text by FULL-WIDTH
+// punctuation the old ASCII-only Trim never stripped, so nothing matched and
+// discovery returned [] for a catalog entry whose description literally says
+// "tracked changes" (production, 2026-08-03).
+var recommendationASCIIRuns = regexp.MustCompile(`[a-z0-9]{3,}`)
+
 func recommendationQueryTerms(value string) []string {
-	fields := strings.Fields(strings.ToLower(value))
-	out := make([]string, 0, len(fields))
-	for _, field := range fields {
+	lowered := strings.ToLower(value)
+	seen := map[string]bool{}
+	out := make([]string, 0, 8)
+	for _, field := range strings.Fields(lowered) {
 		field = strings.Trim(field, " ,.;:!?()[]{}\"'")
-		if len([]rune(field)) >= 3 {
+		if len([]rune(field)) >= 3 && !seen[field] {
+			seen[field] = true
 			out = append(out, field)
+		}
+	}
+	for _, run := range recommendationASCIIRuns.FindAllString(lowered, -1) {
+		if !seen[run] {
+			seen[run] = true
+			out = append(out, run)
 		}
 	}
 	return out
 }
 func recommendationQueryScore(entry skills.CatalogEntry, terms []string) int {
-	haystack := strings.ToLower(entry.DisplayName + " " + entry.Description + " " + strings.Join(entry.Recommendation.IntentTags, " "))
+	// Slug and ID are part of the haystack on purpose: "docx" is the single
+	// most natural query term for the Document skill, and it appears ONLY in
+	// the slug — name/description/tags never contain it.
+	haystack := strings.ToLower(entry.ID + " " + entry.Slug + " " + entry.DisplayName + " " + entry.Description + " " + strings.Join(entry.Recommendation.IntentTags, " "))
 	score := 0
 	for _, term := range terms {
 		if strings.Contains(haystack, term) {
@@ -833,6 +902,40 @@ func recommendationQueryScore(entry skills.CatalogEntry, terms []string) int {
 		}
 	}
 	return score
+}
+
+// recommendationTagQueryScore admits a near-miss tag only when ALL of its word
+// units occur in the skill's own identity/display metadata. It deliberately
+// excludes catalog intent tags from the haystack: otherwise a guessed tag such
+// as "image-create" matches every *.create entry through the generic "create"
+// suffix and spuriously offers docx/pdf/pptx. The production
+// "tracked-changes" tag still matches Document's prose exactly.
+func recommendationTagQueryScore(entry skills.CatalogEntry, tags []string) int {
+	haystack := strings.ToLower(entry.ID + " " + entry.Slug + " " + entry.DisplayName + " " + entry.Description)
+	score := 0
+	for _, tag := range tags {
+		subterms := recommendationTagSubterms(tag)
+		if len(subterms) == 0 {
+			continue
+		}
+		matched := true
+		for _, subterm := range subterms {
+			if !strings.Contains(haystack, subterm) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			score += len(subterms)
+		}
+	}
+	return score
+}
+
+// recommendationTagSubterms splits a model-supplied intent tag into matchable
+// ASCII word units ("tracked-changes" → tracked, changes).
+func recommendationTagSubterms(tag string) []string {
+	return recommendationASCIIRuns.FindAllString(strings.ToLower(tag), -1)
 }
 
 // offerCardReadyResult is the model-facing tool_result for a delivered card.
@@ -874,7 +977,7 @@ type offerSkillInstallationTool struct {
 }
 
 func (*offerSkillInstallationTool) Info() agent.ToolInfo {
-	return agent.ToolInfo{Name: "offer_skill_installation", Description: "Offer only catalog IDs returned by discover_installable_skills. This only shows a Desktop card; it never installs a skill.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"catalog_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "reason": map[string]any{"type": "string"}}}, Required: []string{"catalog_ids", "reason"}}
+	return agent.ToolInfo{Name: "offer_skill_installation", Description: "Immediately offer relevant catalog IDs returned by discover_installable_skills instead of asking in text or calling generic install APIs. This shows a localized Desktop card and never installs a skill itself.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"catalog_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "reason": map[string]any{"type": "string"}}}, Required: []string{"catalog_ids", "reason"}}
 }
 func (*offerSkillInstallationTool) RequiresApproval() bool     { return false }
 func (*offerSkillInstallationTool) IsReadOnlyCall(string) bool { return false }
@@ -972,10 +1075,12 @@ func (t *offerSkillInstallationTool) Run(ctx context.Context, args string) (agen
 		return terminalOffer(agent.BusinessError("the recommendation for this turn is no longer active"), offerInactiveUserMessage), nil
 	}
 	if created {
-		// emit is nil when no /events sink was live at admission time. The tool
-		// stays registered regardless (registration keys on stable request
-		// attributes so the tools array does not flap across turns), so an
-		// undeliverable card fails here rather than by vanishing from the schema.
+		// emit is nil when the request had no VERIFIED principal at admission
+		// (sink liveness no longer gates admission — delivery resolves the
+		// live sink at call time). The tool stays registered regardless
+		// (registration keys on stable request attributes so the tools array
+		// does not flap across turns), so an undeliverable card fails here
+		// rather than by vanishing from the schema.
 		if rc.emit == nil || !rc.emit(v) {
 			if err := rc.store.expire(v.RecommendationID); err != nil {
 				log.Printf("daemon: skill recommendation expire after failed delivery: %v", err)
@@ -1097,21 +1202,25 @@ func (s *Server) hasSkillRecommendationSink(accountID, deviceID string) bool {
 	return ok
 }
 
-// skillRecommendationEmitter captures the exact SSE connection generation
-// that admitted a /message request. A replacement connection for the same
-// account+device is not interchangeable: the old turn must fail delivery
-// rather than silently moving its card to a newer subscription.
-func (s *Server) skillRecommendationEmitter(accountID, deviceID string) (func(skillRecommendationV1) bool, bool) {
-	key := skillRecommendationSinkKey(accountID, deviceID)
-	s.skillRecommendationSinksMu.RLock()
-	sink, ok := s.skillRecommendationSinks[key]
-	s.skillRecommendationSinksMu.RUnlock()
-	if !ok || sink.emit == nil {
-		return nil, false
-	}
+// skillRecommendationEmitterAt binds delivery to the verified-principal epoch
+// that admitted the request and resolves the live sink at CALL time. Within
+// one sign-in session a transport reconnect is interchangeable: the card
+// follows the current /events connection (the same contract as the
+// connect-time replay of offered cards). Across a principal transition —
+// sign-out, account switch, or a sign-out→sign-in of the same account — the
+// epoch differs and delivery fails closed, so a run admitted under one
+// sign-in session can never deliver into a later one.
+func (s *Server) skillRecommendationEmitterAt(accountID, deviceID string, epoch uint64) func(skillRecommendationV1) bool {
 	return func(v skillRecommendationV1) bool {
-		return s.emitSkillRecommendationGeneration(key, sink.id, v)
-	}, true
+		currentAccount, currentEpoch, ok := s.auth.VerifiedPrincipal()
+		if !ok || currentAccount != accountID || currentEpoch != epoch {
+			return false
+		}
+		if v.OwnerAccountID != accountID || v.OwnerDeviceID != deviceID {
+			return false
+		}
+		return s.emitSkillRecommendation(v)
+	}
 }
 
 func (s *Server) emitSkillRecommendationGeneration(key, generation string, v skillRecommendationV1) bool {

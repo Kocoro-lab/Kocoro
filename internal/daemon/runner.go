@@ -104,6 +104,11 @@ type RunAgentRequest struct {
 	DesktopDeviceID         string                           `json:"-"`
 	ConsumerCapabilities    map[string]bool                  `json:"-"`
 	SkillRecommendationEmit func(skillRecommendationV1) bool `json:"-"`
+	// SkillRecommendationAccountID is the verified account read ONCE at the
+	// HTTP admission boundary (same instant as the epoch inside the emit
+	// closure). Non-empty ⇒ the request had a verified principal. The runner
+	// keys tool registration on this and never re-reads the AuthManager.
+	SkillRecommendationAccountID string `json:"-"`
 	// Koe sends both the locally admitted mode and the raw selector evidence.
 	// The daemon independently recomputes ModeAdmission before routing.
 	ExecutionMode          executionprofile.Mode       `json:"execution_mode,omitempty"`
@@ -3361,8 +3366,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// offer tool fails closed on a nil emit.
 	if skillRecommendationsEnabled(runCfg) && isSkillRecommendationDesktopSource(req.Source) && req.DesktopDeviceID != "" &&
 		req.ConsumerCapabilities[CapSkillInstallRecommendationV1] &&
-		deps.SkillRecommendations != nil && deps.AuthManager != nil {
-		accountID, ok := deps.AuthManager.VerifiedAccountID()
+		deps.SkillRecommendations != nil {
+		accountID := req.SkillRecommendationAccountID
+		ok := accountID != ""
+		// Content-free registration trace — pairs with the admission line in
+		// handleMessage so "tools never registered" is distinguishable from
+		// "model never called them" during evals.
+		log.Printf("daemon: skill recommendation tools registered=%t session=%s", ok, sess.ID)
 		if ok {
 			turnID := "skillrec/" + generateRequestID()
 			visibleSkills := make(map[string]bool, len(loadedSkills))
