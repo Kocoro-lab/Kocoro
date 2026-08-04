@@ -181,9 +181,10 @@ func ShapeHistory(messages []client.Message, summary string, contextWindow int, 
 	}
 
 	// Floor: return with minKeepLast even if over budget — unless even the
-	// floor drops nothing, in which case shaping cannot help. Reachable:
-	// at len(messages) == 10 with a summary the floor is also 10 messages
-	// (3 + summary + minKeepLast*2), so the guard is not dead code.
+	// floor drops nothing, in which case shaping cannot help. With the
+	// current constants the ≤ 3+minKeepLast*2 early return above already
+	// excludes every history the floor could fail to shrink, so this guard
+	// is defence-in-depth for future constant changes, not live logic.
 	floor := buildShaped(system, firstUser, summary, rest, minKeepLast)
 	if len(floor) >= len(messages) {
 		return messages
@@ -393,7 +394,13 @@ func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow i
 			if text == "" {
 				continue
 			}
-			msgTokens := int(math.Ceil(float64(utf8.RuneCountInString(text))/charsPerToken)) + overheadPerMessage
+			// Content tokens only — deliberately NOT + overheadPerMessage
+			// (unlike the oversized scan above): a truncated message still
+			// exists and still pays its per-message overhead, so only the
+			// content above the floor is actually recoverable. Including the
+			// overhead would make this guard optimistic by 4 tokens per
+			// message — engaging truncation in cases that cannot reach target.
+			msgTokens := int(math.Ceil(float64(utf8.RuneCountInString(text)) / charsPerToken))
 			if msgTokens > minUserTokenFloor {
 				maxRecoverable += msgTokens - minUserTokenFloor
 			}

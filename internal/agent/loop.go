@@ -3280,6 +3280,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		lastPromptTokens            int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
 		lastOutputTokens            int    // actual output tokens from last LLM response
 		compactionSummary           string // cached summary from compaction
+		compactionSummaryIter       int    // iteration compactionSummary was generated in; preflight reuse is scoped to the same iteration (stale summaries lack the newest turns)
 		compactionApplied           bool   // true once messages have been shaped
 		shapeNoopLogged             bool   // once-per-Run stderr note for the designed ShapeHistory no-op retry path
 		reactiveCompacted           bool   // true once reactive compaction fired (never resets)
@@ -4047,6 +4048,7 @@ iterationLoop:
 						// the counter is 0, so any stale value is inert until a new failure
 						// streak begins and overwrites it.
 						compactionSummary = trimmedSummary
+						compactionSummaryIter = i
 					}
 				}
 				if compactionSummary != "" {
@@ -4230,21 +4232,32 @@ iterationLoop:
 			}
 
 			// Build summary and shape, mirroring the reactive emergency profile.
-			// Reuse the summary the proactive path already paid for this Run
-			// (cached across its no-op retries) — since that path no longer
-			// latches on a no-op, both gates can fire in the same iteration
-			// and regenerating here would bill a second small-tier transcript
-			// pass for the same history.
+			// Reuse the summary the proactive path generated THIS iteration —
+			// since that path no longer latches on a no-op, both gates can
+			// fire in the same iteration and regenerating here would bill a
+			// second small-tier transcript pass for the same history. The
+			// iteration scope matters: a summary cached across earlier no-op
+			// retries predates the newest turns, and this path can shape all
+			// the way to the minKeepLast floor — reusing a stale summary there
+			// would drop those turns with no summary coverage.
 			emergencyMessages := cloneMessages(messages)
 			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
-			summary := compactionSummary
+			var summary string
 			var sumErr error
-			if strings.TrimSpace(summary) == "" {
+			if compactionSummaryIter == i && strings.TrimSpace(compactionSummary) != "" {
+				summary = compactionSummary
+			} else {
 				restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 				var sumUsage client.Usage
 				summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 				restoreLLM()
 				a.emitInternalUsage(sumUsage)
+				if sumErr == nil {
+					if trimmed := strings.TrimSpace(summary); trimmed != "" {
+						compactionSummary = trimmed
+						compactionSummaryIter = i
+					}
+				}
 			}
 			before := len(messages)
 			if sumErr == nil {
@@ -4360,7 +4373,6 @@ iterationLoop:
 		// different provider while carrying an OpenAI-owned cursor.
 		consumeOrdinaryOpenAIContinuation(&req)
 		reuseExactRequestOnRetry := false
-		requestRebuiltOnRetry := false // a rebuilt req.Messages invalidates this iteration's calibration sample
 		isOpenAIComputerContinuation := openAIContinuationRequest != nil
 		// A Responses continuation carries previous_response_id plus exactly
 		// the latest assistant computer_call / user computer_call_output pair.
@@ -4672,6 +4684,7 @@ iterationLoop:
 
 					messages = shaped
 					compactionSummary = nextSummary
+					compactionSummaryIter = i
 					compactionApplied = true
 					reactiveCompacted = true // never reset — prevents infinite reactive loops
 					// Durable: the summary was expensive; checkpoint before we
@@ -4767,6 +4780,14 @@ iterationLoop:
 						// is dropped.
 						req.SpecificModel = ordinarySpecificModel
 					}
+					// Keep the calibration denominator honest: the request was
+					// just rebuilt from the compacted history, so the usage of
+					// the successful retry must be compared against THIS
+					// payload — against the stale pre-compaction slice the
+					// overhead computes negative and clamps the calibration to
+					// 0, wiping it on exactly the session that proved it
+					// should be large.
+					requestMessages = req.Messages
 					// Checkpoint the compacted state before retrying. Gated on
 					// the dirty flag we just set — a no-op compaction path
 					// (same message count, no MarkDirty) would not write.
@@ -4792,7 +4813,11 @@ iterationLoop:
 				reanchorActiveTask(MetaBoundaryRetryAfterError)
 				if !reuseExactRequestOnRetry {
 					req.Messages = messages
-					requestRebuiltOnRetry = true
+					// Denominator follows the rebuild (see the reactive
+					// rebuild above): the retried request is what the
+					// provider will bill, so the calibration sample stays
+					// valid instead of needing to be discarded.
+					requestMessages = req.Messages
 				}
 				fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxLLMRetries, backoff, err)
 				if a.handler != nil {
@@ -4908,12 +4933,13 @@ iterationLoop:
 		// the estimator cannot see (tools[] schemas, chars/3.5 error).
 		// Clamped at 0, and re-derived on every response, so a skewed sample
 		// from a retry corrects itself one turn later.
-		// Skip the sample when an error retry rebuilt req.Messages from the
-		// raw history: the provider then billed a request that requestMessages
-		// no longer describes (tool_result replacements bypassed), which can
-		// inflate the overhead by the full spilled-content delta for one
-		// iteration — enough to drive an unnecessary lossy ShapeHistory.
-		if lastPromptTokens > 0 && !requestRebuiltOnRetry {
+		// requestMessages is kept in sync at every rebuild site (error retry,
+		// reactive compaction), so the denominator always describes the
+		// request the provider actually billed. The OpenAI Responses
+		// continuation is the deliberate exception: its req.Messages is just
+		// the cursor pair while billing covers the server-side chain, so the
+		// full local transcript remains the better denominator there.
+		if lastPromptTokens > 0 {
 			overhead := lastPromptTokens - ctxwin.EstimateTokens(requestMessages)
 			if overhead < 0 {
 				overhead = 0

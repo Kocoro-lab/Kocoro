@@ -2141,3 +2141,29 @@ func TestAgentLoop_ReactiveEvidenceFloorShapesDespiteLowEstimate(t *testing.T) {
 		t.Errorf("Run should succeed once the shaped retry goes through: %v", err)
 	}
 }
+
+// TestEstOverheadResets pins the defensive calibration resets: a tool-registry
+// swap (SwitchAgent) changes the schema mass the overhead measures, and a
+// session switch on a reused loop (SetSessionID) makes the sample unrelated.
+// Both must drop the calibration to 0; setting the SAME session id must not.
+func TestEstOverheadResets(t *testing.T) {
+	gw := client.NewGatewayClient("http://127.0.0.1:0", "")
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 20, 2000, 200, nil, nil, nil)
+
+	loop.estOverheadTokens.Store(12345)
+	loop.SetSessionID("sess-a")
+	if got := loop.estOverhead(); got != 0 {
+		t.Errorf("SetSessionID to a new id must reset calibration, got %d", got)
+	}
+
+	loop.estOverheadTokens.Store(12345)
+	loop.SetSessionID("sess-a")
+	if got := loop.estOverhead(); got != 12345 {
+		t.Errorf("SetSessionID with the same id must keep calibration, got %d", got)
+	}
+
+	loop.SwitchAgent("agent-b", "prompt", NewToolRegistry(), "", nil)
+	if got := loop.estOverhead(); got != 0 {
+		t.Errorf("SwitchAgent must reset calibration, got %d", got)
+	}
+}

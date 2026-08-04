@@ -129,8 +129,14 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 func formatCompactResult(msg compactDoneMsg) string {
 	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 	var sb strings.Builder
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("  Context compressed: ~%s → ~%s tokens",
-		formatTokenCount(msg.beforeTokens), formatTokenCount(msg.afterTokens))))
+	// Small sessions can net out larger (few messages dropped, summary
+	// inserted) — do not call that "compressed".
+	label := "Context compressed"
+	if msg.afterTokens >= msg.beforeTokens {
+		label = "Context reshaped (no size reduction)"
+	}
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("  %s: ~%s → ~%s tokens",
+		label, formatTokenCount(msg.beforeTokens), formatTokenCount(msg.afterTokens))))
 	sb.WriteString("\n")
 	if msg.summary != "" {
 		sb.WriteString(dimStyle.Render("  Summary: " + msg.summary))
