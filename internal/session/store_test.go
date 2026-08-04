@@ -405,6 +405,36 @@ func TestStore_RoundTripToolResultSeen(t *testing.T) {
 	}
 }
 
+func TestStore_RoundTripCompactionCalibration(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+
+	now := time.Now()
+	sess := &Session{
+		ID:        "sess-cal",
+		CreatedAt: now,
+		UpdatedAt: now,
+		Title:     "calibration state",
+		CompactionCalibration: &CompactionCalibration{
+			OverheadTokens:   23456,
+			Model:            "claude-sonnet-5-20260203",
+			ToolsFingerprint: "abc123",
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load("sess-cal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cal := got.CompactionCalibration
+	if cal == nil || cal.OverheadTokens != 23456 ||
+		cal.Model != "claude-sonnet-5-20260203" || cal.ToolsFingerprint != "abc123" {
+		t.Fatalf("calibration state not persisted: %#v", cal)
+	}
+}
+
 func TestStore_List(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)

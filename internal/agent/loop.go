@@ -372,7 +372,13 @@ type MetaBoundary string
 const (
 	MetaBoundaryToolSearchLoaded MetaBoundary = "tool_search_loaded"
 	MetaBoundaryPostCompaction   MetaBoundary = "post_compaction"
-	MetaBoundaryRetryAfterError  MetaBoundary = "retry_after_error"
+	// MetaBoundaryPostCompactionNoRestore is the reactive-compaction variant:
+	// that path deliberately performs no file restoration, so the reanchor
+	// itself must warn that earlier file contents may be gone — otherwise the
+	// model answers confidently from a paraphrase instead of re-reading (the
+	// observed live failure shape).
+	MetaBoundaryPostCompactionNoRestore MetaBoundary = "post_compaction_no_restore"
+	MetaBoundaryRetryAfterError         MetaBoundary = "retry_after_error"
 )
 
 // defaultPersona is the identity line for the default (non-overridden) agent.
@@ -824,6 +830,13 @@ type AgentLoop struct {
 	// active Run (same exposure class as SetExecutionConfig); reads go
 	// through estOverhead().
 	estOverheadTokens atomic.Int64
+	// estOverheadModel is the response model that produced the current
+	// estOverheadTokens sample ("" when no sample or the sample predates this
+	// field). Persisted alongside the sample in session checkpoints so a
+	// resumed daemon loop can reject a sample taken under a different model
+	// (tokenizers and schema overheads differ per provider). Always stores a
+	// string; same concurrency exposure as estOverheadTokens.
+	estOverheadModel  atomic.Value
 	memoryDir         string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
 	projectEntityDir  string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
 	stickyContext     string             // session-scoped facts injected verbatim into system prompt; never truncated
@@ -2384,6 +2397,7 @@ func (a *AgentLoop) SwitchAgent(basePrompt string, memoryDir string, reg *ToolRe
 	// of the estimator calibration — a stale sample from a schema-heavy agent
 	// would over-compact the new agent's first iterations.
 	a.estOverheadTokens.Store(0)
+	a.estOverheadModel.Store("")
 }
 
 // SetSkills updates the agent's skill catalog without touching other fields.
@@ -2414,6 +2428,7 @@ func (a *AgentLoop) SetSessionID(id string) {
 		// estimator calibration rather than carry a stale sample into the
 		// first iterations.
 		a.estOverheadTokens.Store(0)
+		a.estOverheadModel.Store("")
 	}
 	a.sessionID = id
 }
@@ -3702,6 +3717,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			return "[system] Deferred tool schemas are now loaded. Continue working on the current request using those tools:\n\n" + latestUserText
 		case MetaBoundaryPostCompaction:
 			return "[system] Context was compacted. Stay focused on the current request and continue from there:\n\n" + latestUserText
+		case MetaBoundaryPostCompactionNoRestore:
+			return "[system] Context was compacted. File contents you read earlier may no longer be in context — re-read anything you need to quote or use exactly. Stay focused on the current request and continue from there:\n\n" + latestUserText
 		case MetaBoundaryRetryAfterError:
 			return "[system] You are retrying after an interruption. Stay focused on the current request:\n\n" + latestUserText
 		default:
@@ -3727,6 +3744,23 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			Role:    "user",
 			Content: client.NewTextContent(text),
 		})
+		markInjected()
+	}
+
+	// Post-compaction file restoration: an APPLIED compaction just dropped
+	// the middle of the history — including the full text of files the model
+	// read there, whose exact identifiers the summary paraphrases at best.
+	// The content is still on disk, so re-inject the most recent reads before
+	// the task reanchor, which must stay the last message. overheadTokens is
+	// the calibration the calling compaction path judged against. Called only
+	// from the proactive and preflight paths — the reactive (post-400) path
+	// deliberately skips restoration; see the comment at its reanchor site.
+	restoreRecentReads := func(overheadTokens int) {
+		msg, ok := a.buildPostCompactionFileRestore(messages, overheadTokens)
+		if !ok {
+			return
+		}
+		messages = append(messages, msg)
 		markInjected()
 	}
 
@@ -4120,6 +4154,7 @@ iterationLoop:
 						msgTimestamps = rebasedTS
 
 						compactionApplied = true
+						restoreRecentReads(a.estOverhead())
 						reanchorActiveTask(MetaBoundaryPostCompaction)
 					}
 				}
@@ -4301,6 +4336,7 @@ iterationLoop:
 					}
 				}
 				msgTimestamps = rebasedTS
+				restoreRecentReads(a.estOverhead())
 			}
 			compactionApplied = true
 			reanchorActiveTask(MetaBoundaryPostCompaction)
@@ -4730,7 +4766,15 @@ iterationLoop:
 						msgTimestamps = rebasedTS
 					}
 
-					reanchorActiveTask(MetaBoundaryPostCompaction)
+					// Deliberately NO file restoration here: the provider just
+					// rejected this history for length and reactiveCompacted
+					// makes a second overflow terminal. The evidence floor only
+					// proves a LOWER bound on the true overhead, so any budget
+					// computed against it can still overshoot — the post-400
+					// retry keeps every token shaping recovered, and the
+					// NoRestore reanchor variant tells the model to re-read
+					// what it needs once the run survives.
+					reanchorActiveTask(MetaBoundaryPostCompactionNoRestore)
 
 					// Rebuild request with compacted messages. The ordinary
 					// Responses cursor is deliberately NOT carried over: with
@@ -4950,6 +4994,7 @@ iterationLoop:
 			// denominator diverged from what was actually sent; discard it.
 			if a.contextWindow <= 0 || overhead <= a.contextWindow {
 				a.estOverheadTokens.Store(int64(overhead))
+				a.estOverheadModel.Store(resp.Model)
 			}
 		}
 		if resp.Model != "" {

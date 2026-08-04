@@ -115,6 +115,19 @@ func compactLandingTokens(contextWindow int) int {
 	return int(float64(contextWindow) * compactRetargetFraction)
 }
 
+// CompactTriggerTokens exposes the compaction trigger line to callers that
+// add content right after a compaction (post-compaction file restoration):
+// the injected payload must keep the calibrated estimate under this line or
+// the very next iteration re-triggers the compaction it just paid for.
+// Budgeting against the trigger — not the landing line — is deliberate:
+// ShapeHistory stops at the first keepLast that fits under the landing
+// budget, so the slack below THAT line is typically less than one turn pair
+// and restoration would almost never run. The cost is that restoration
+// consumes part of the 90/80 hysteresis band.
+func CompactTriggerTokens(contextWindow int) int {
+	return compactTargetTokens(contextWindow)
+}
+
 // ShapeHistory builds a sliding window over messages:
 //
 //	[system] + [first user message] + [summary] + [last N turn pairs]
