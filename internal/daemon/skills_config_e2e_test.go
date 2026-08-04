@@ -91,6 +91,37 @@ func TestE2E_SkillAndConfigConsistencyHTTP(t *testing.T) {
 		t.Fatalf("legacy attachment survived HTTP delete: %v", err)
 	}
 
+	brokenSkillDir := filepath.Join(shannonDir, "skills", "broken")
+	if err := os.MkdirAll(brokenSkillDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brokenSkillDir, "SKILL.md"), []byte("no frontmatter"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := agents.SetAttachedSkills(agentsDir, "analyst", []string{"broken"}); err != nil {
+		t.Fatal(err)
+	}
+	brokenDeleteReq, err := http.NewRequest(http.MethodDelete, api.URL+"/agents/analyst/skills/broken", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brokenDeleteResp, err := http.DefaultClient.Do(brokenDeleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var brokenDeleteBody map[string]any
+	if err := json.NewDecoder(brokenDeleteResp.Body).Decode(&brokenDeleteBody); err != nil {
+		brokenDeleteResp.Body.Close()
+		t.Fatal(err)
+	}
+	brokenDeleteResp.Body.Close()
+	if brokenDeleteResp.StatusCode != http.StatusOK || brokenDeleteBody["status"] != "deleted" {
+		t.Fatalf("malformed skill per-agent delete = %d %#v", brokenDeleteResp.StatusCode, brokenDeleteBody)
+	}
+	if _, err := os.Stat(filepath.Join(agentsDir, "analyst", "_attached.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("exact slug attachment survived malformed skill delete: %v", err)
+	}
+
 	if err := os.MkdirAll(filepath.Join(agentsDir, "scout"), 0700); err != nil {
 		t.Fatal(err)
 	}

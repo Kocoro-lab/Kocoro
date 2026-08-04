@@ -840,6 +840,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	if !has(CapDeliverableEventV1) {
 		t.Fatalf("capabilities lost %q: %v", CapDeliverableEventV1, *status.Capabilities)
 	}
+	if !has(CapConfigReloadStateV1) {
+		t.Fatalf("capabilities lost %q: %v", CapConfigReloadStateV1, *status.Capabilities)
+	}
 	if !has(CapAgentDefaultCWDV1) {
 		t.Fatalf("capabilities lost %q: %v", CapAgentDefaultCWDV1, *status.Capabilities)
 	}
@@ -872,6 +875,78 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	}
 	if status.Memory == nil || status.Memory.Provider != "disabled" || status.Memory.Reason != nil {
 		t.Fatalf("memory block decode mismatch: %+v", status.Memory)
+	}
+}
+
+func newConfigReloadWireFixtureServer(t *testing.T) *Server {
+	t.Helper()
+	shannonDir := t.TempDir()
+	configPath := filepath.Join(shannonDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("skills:\n  disabled:\n    - old\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := config.FileRevision(shannonDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(0, nil, &ServerDeps{
+		ShannonDir:     shannonDir,
+		Config:         &config.Config{Skills: config.SkillsConfig{Disabled: []string{"old"}}},
+		ConfigRevision: revision,
+	}, "test")
+	if err := os.WriteFile(configPath, []byte("skills:\n  disabled: []\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
+func TestWireFixture_HTTPConfigReloadState(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.config.reload_required.response.json")
+	srv := newConfigReloadWireFixtureServer(t)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /config = %d, body=%s", rec.Code, rec.Body.Bytes())
+	}
+	assertSemanticEqual(t, fixture, parseJSONMap(t, rec.Body.Bytes()))
+
+	var response struct {
+		Global         map[string]any `json:"global"`
+		Effective      map[string]any `json:"effective"`
+		Sources        []string       `json:"sources"`
+		ReloadRequired bool           `json:"reload_required"`
+		ReloadReason   string         `json:"reload_reason"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if !response.ReloadRequired || !strings.Contains(response.ReloadReason, "POST /config/reload") {
+		t.Fatalf("consumer lost config reload state: %+v", response)
+	}
+}
+
+func TestWireFixture_HTTPConfigStatusReloadState(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.config_status.reload_required.response.json")
+	srv := newConfigReloadWireFixtureServer(t)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /config/status = %d, body=%s", rec.Code, rec.Body.Bytes())
+	}
+	assertSemanticEqual(t, fixture, parseJSONMap(t, rec.Body.Bytes()))
+
+	var response struct {
+		ReloadRequired bool   `json:"reload_required"`
+		ReloadReason   string `json:"reload_reason"`
+		Koe            *struct {
+			AudioProcessing string `json:"audio_processing"`
+		} `json:"koe"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if !response.ReloadRequired || response.ReloadReason == "" || response.Koe == nil {
+		t.Fatalf("consumer lost config status fields: %+v", response)
 	}
 }
 

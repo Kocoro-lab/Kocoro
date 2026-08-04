@@ -119,6 +119,7 @@ Agents are specialized AI assistants that you configure for specific tasks or pe
 - Method: DELETE
 - Path: /agents/{name}/skills/{skill}
 - Response: `{"status": "deleted"}`
+- Notes: Detaches both the canonical slug and legacy display-name alias when the installed skill metadata is readable. If SKILL.md is malformed, the endpoint still safely removes the exact URL slug; it does not guess at an unreadable legacy alias.
 
 ### Create agent command
 - Method: PUT

@@ -53,6 +53,9 @@ var daemonStartCmd = &cobra.Command{
 		}
 
 		shanDir := config.ShannonDir()
+		if shanDir == "" {
+			return fmt.Errorf("failed to resolve home directory")
+		}
 		agentsDir := filepath.Join(shanDir, "agents")
 		projectsDir := filepath.Join(shanDir, "projects")
 		pidPath := filepath.Join(shanDir, "daemon.pid")
@@ -66,14 +69,14 @@ var daemonStartCmd = &cobra.Command{
 			log.Println("Warning: daemon is managed by launchd. Use 'shan daemon stop' to remove launchd management.")
 		}
 
-		pidFile, err := daemon.AcquirePIDFile(pidPath)
+		pidFile, err := acquireDaemonPIDFile(shanDir)
 		if err != nil {
 			return err
 		}
 		defer pidFile.Close()
 
-		// Every startup mutation, including config migrations and dangling-skill
-		// cleanup, must happen only after this process owns the daemon singleton.
+		// Every startup mutation, including config migrations, must happen only
+		// after this process owns the daemon singleton.
 		// A second start attempt that later fails the PID lock must never rewrite
 		// files used by the live daemon.
 		cfg, configRevision, err := config.LoadWithRevision()
@@ -99,18 +102,6 @@ var daemonStartCmd = &cobra.Command{
 		}
 		if err := skills.EnsureBuiltinSkills(shanDir); err != nil {
 			log.Printf("WARNING: failed to sync builtin skills: %v", err)
-		}
-		if cleanups, err := agents.PruneDanglingSkillAttachments(agentsDir, shanDir); err != nil {
-			log.Printf("WARNING: failed to prune dangling agent skill references: %v", err)
-		} else if len(cleanups) > 0 {
-			removed := 0
-			agentNames := make([]string, 0, len(cleanups))
-			for _, cleanup := range cleanups {
-				removed += len(cleanup.Skills)
-				agentNames = append(agentNames, cleanup.Agent)
-			}
-			log.Printf("daemon: pruned %d dangling skill reference(s) from agents: %s",
-				removed, strings.Join(agentNames, ", "))
 		}
 
 		// Clean up orphaned Chrome CDP from a previous hard kill. Must run AFTER
@@ -861,6 +852,20 @@ var daemonStartCmd = &cobra.Command{
 		sessionCache.CloseAll()
 		return nil
 	},
+}
+
+func acquireDaemonPIDFile(shannonDir string) (*daemon.PIDFile, error) {
+	if shannonDir == "" {
+		return nil, fmt.Errorf("failed to resolve home directory")
+	}
+	// This is the ordinary start path's sole pre-lock filesystem mutation. A
+	// first-ever daemon start has no ~/.shannon directory yet, while the PID file
+	// opener intentionally does not create parents. Creating the private parent
+	// is idempotent and does not modify state a running daemon reads or writes.
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		return nil, fmt.Errorf("create daemon state directory: %w", err)
+	}
+	return daemon.AcquirePIDFile(filepath.Join(shannonDir, "daemon.pid"))
 }
 
 var daemonStopCmd = &cobra.Command{

@@ -135,7 +135,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Response: `{"status": "deleted"}`
 - Response 403: `{"error": "skill_is_builtin"}` — auto-installed builtin skills cannot be deleted.
 - Response 422: the installed SKILL.md identity is malformed, so the daemon cannot safely identify and remove legacy display-name references.
-- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Before removing the global files, the daemon removes both slug and legacy display-name references from every readable agent manifest. If the skill identity or any manifest is corrupt or unreadable, deletion fails and the global skill remains installed rather than reporting success with dangling references. Stored API keys are cleared from the OS keychain after deletion.
+- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Before removing the global files, the daemon removes both slug and legacy display-name references from every readable agent manifest using one validated change plan. If the skill identity or any manifest is corrupt or unreadable, deletion fails and the global skill remains installed rather than reporting success with dangling references. Stored API keys are cleared from the OS keychain after deletion. Cross-device sync preserves attachment identifiers even when the skill is not installed on the current device; local absence alone is never treated as an instruction to detach another device.
 
 ### Set skill secrets (API keys / env vars)
 - Method: PUT
@@ -179,7 +179,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 
 ### "Completely remove a skill"
 1. DELETE /skills/{skill-name}?confirm=true — removes skill and detaches from ALL agents
-2. If a skill directory was removed manually instead of through the API, daemon startup prunes unresolved references from agent manifests.
+2. Do not remove the skill directory manually: unresolved attachment identifiers are intentionally preserved for cross-device sync. Use the API so the daemon can detach every local agent transactionally before deleting the files.
 
 ### "Configure API keys for a skill" (e.g., image-gen, figma)
 Some skills need API keys to call external services. These are declared by the skill and fetched at runtime from the OS keychain — NEVER edit `.env` or agent config to set them.

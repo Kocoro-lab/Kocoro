@@ -8,6 +8,10 @@ import (
 	"path/filepath"
 )
 
+// Three complete loads cover the short rename/write bursts produced by common
+// atomic-save editors without accepting a mixed snapshot. If all three collide,
+// startup or POST /config/reload returns an explicit retry error; there is no
+// unsafe override, and the operator retries after the editor finishes writing.
 const stableLoadAttempts = 3
 
 // BytesRevision returns the content identity used by the daemon to distinguish

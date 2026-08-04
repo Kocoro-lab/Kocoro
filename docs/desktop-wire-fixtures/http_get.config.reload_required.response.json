@@ -1,0 +1,119 @@
+{
+  "effective": {
+    "agent": {
+      "bash_concurrency_enabled": false,
+      "context_window": 0,
+      "effort_tier": "",
+      "force_think_tool": false,
+      "idle_hard_timeout_secs": 0,
+      "idle_soft_timeout_secs": 0,
+      "interrupted_resume_max_age_hours": 0,
+      "interrupted_resume_max_attempts": 0,
+      "language": "",
+      "max_iterations": 0,
+      "max_recent_browser_images": 0,
+      "max_recent_images": 0,
+      "max_tokens": 0,
+      "model": "",
+      "observation_window": 0,
+      "prompt_suggestion": {
+        "cache_cold_threshold_tokens": 0,
+        "enabled": false,
+        "min_turns": 0
+      },
+      "reasoning_effort": "",
+      "service_tier": "",
+      "stream_idle_timeout_secs": 0,
+      "temperature": 0,
+      "thinking": false,
+      "thinking_budget": 0,
+      "thinking_mode": "",
+      "time_based_compact": {
+        "enabled": false,
+        "gap_threshold_minutes": 0,
+        "keep_recent": 0
+      }
+    },
+    "api_key": "***",
+    "auto_update_check": false,
+    "cloud": {
+      "enabled": false,
+      "stream_idle_timeout_secs": 0,
+      "timeout": 0
+    },
+    "daemon": {
+      "auto_approve": false,
+      "share_async_default": false,
+      "share_metadata": {
+        "default_og_image": "",
+        "logo_url": "",
+        "site_name": "",
+        "site_url": "",
+        "twitter_image": ""
+      }
+    },
+    "endpoint": "",
+    "hooks": {
+      "PostToolUse": null,
+      "PreToolUse": null,
+      "SessionStart": null,
+      "Stop": null
+    },
+    "koe": {},
+    "mcp": {},
+    "mcp_servers": null,
+    "memory": {
+      "api_key": "",
+      "bundle_pull_interval": 0,
+      "bundle_pull_startup_delay": 0,
+      "bundle_root": "",
+      "client_request_timeout": 0,
+      "endpoint": "",
+      "provider": "",
+      "sidecar_ready_timeout": 0,
+      "sidecar_restart_max": 0,
+      "sidecar_shutdown_grace": 0,
+      "socket_path": "",
+      "tlm_path": ""
+    },
+    "model_tier": "",
+    "ollama": {
+      "endpoint": "",
+      "model": ""
+    },
+    "permissions": {
+      "allowed_commands": null,
+      "allowed_dirs": null,
+      "denied_commands": null,
+      "network_allowlist": null,
+      "sensitive_patterns": null
+    },
+    "provider": "",
+    "skills": {
+      "disabled": [
+        "old"
+      ],
+      "marketplace": {
+        "clawhub_url": "",
+        "registry_url": ""
+      }
+    },
+    "tools": {
+      "args_truncation": 0,
+      "bash_max_output": 0,
+      "bash_max_timeout": 0,
+      "bash_timeout": 0,
+      "browser_result_truncation": 0,
+      "result_truncation": 0,
+      "server_tool_timeout": 0
+    }
+  },
+  "global": {
+    "skills": {
+      "disabled": []
+    }
+  },
+  "reload_reason": "config.yaml changed on disk after the running config was loaded; call POST /config/reload or restart the daemon",
+  "reload_required": true,
+  "sources": null
+}

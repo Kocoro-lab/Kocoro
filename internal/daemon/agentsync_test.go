@@ -59,6 +59,35 @@ func TestBuildSyncItems_IncludesAvatarInProfile(t *testing.T) {
 	}
 }
 
+func TestBuildSyncItems_PreservesUninstalledAttachedSkill(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "analyst")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("prompt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := agents.SetAttachedSkills(root, "analyst", []string{"remote-only"}); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := newPullServer(t, root).buildSyncItems(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	var metas []skills.SkillMeta
+	if err := json.Unmarshal(items[0].Skills, &metas); err != nil {
+		t.Fatalf("skills payload %s: %v", items[0].Skills, err)
+	}
+	if len(metas) != 1 || metas[0].Slug != "remote-only" || metas[0].Name != "remote-only" {
+		t.Fatalf("uninstalled attachment was not preserved: %+v", metas)
+	}
+}
+
 func TestBuildSyncItems_SkipsPureBuiltins(t *testing.T) {
 	root := t.TempDir()
 
@@ -248,15 +277,23 @@ func TestPullAndApply_CannotReattachSkillAfterGlobalDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := newPullServer(t, agentsDir)
+	if err := agents.WriteAgentPrompt(agentsDir, "analyst", "local prompt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := agents.SetAttachedSkills(agentsDir, "analyst", []string{"docker"}); err != nil {
+		t.Fatal(err)
+	}
+	staleCloudRevision := time.Now().Add(-time.Minute)
 	unlockDelete := s.slugLocks.Lock("docker")
 
 	done := make(chan error, 1)
 	go func() {
 		done <- s.pullAndApplyAgents(func() ([]client.SyncAgentItem, error) {
 			return []client.SyncAgentItem{{
-				AgentKey: "analyst",
-				Prompt:   "prompt",
-				Skills:   json.RawMessage(`[{"slug":"docker","name":"Docker"}]`),
+				AgentKey:  "analyst",
+				Prompt:    "stale cloud prompt",
+				Skills:    json.RawMessage(`[{"slug":"docker","name":"Docker"}]`),
+				UpdatedAt: staleCloudRevision,
 			}}, nil
 		})
 	}()
@@ -267,6 +304,10 @@ func TestPullAndApply_CannotReattachSkillAfterGlobalDelete(t *testing.T) {
 		t.Fatalf("cloud pull bypassed the skill delete lock: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
+	if err := agents.DetachSkillAliases(agentsDir, "analyst", "docker", "Docker"); err != nil {
+		unlockDelete()
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(skillDir); err != nil {
 		unlockDelete()
 		t.Fatal(err)
@@ -276,7 +317,31 @@ func TestPullAndApply_CannotReattachSkillAfterGlobalDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(agentsDir, "analyst", "_attached.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("cloud pull reattached deleted skill: %v", err)
+		t.Fatalf("stale cloud pull reattached deleted skill: %v", err)
+	}
+}
+
+func TestPullAndApply_PreservesAttachmentForSkillMissingOnDevice(t *testing.T) {
+	shannonDir := t.TempDir()
+	agentsDir := filepath.Join(shannonDir, "agents")
+	s := newPullServer(t, agentsDir)
+	cloudRevision := time.Now().Add(time.Minute)
+	if err := s.pullAndApplyAgents(func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{{
+			AgentKey:  "analyst",
+			Prompt:    "prompt",
+			Skills:    json.RawMessage(`[{"slug":"remote-only","name":"Remote Only"}]`),
+			UpdatedAt: cloudRevision,
+		}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := agents.ReadAttachedSkills(agentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "remote-only" {
+		t.Fatalf("cross-device attachment = %v, want [remote-only]", got)
 	}
 }
 

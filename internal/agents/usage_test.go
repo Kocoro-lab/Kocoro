@@ -108,84 +108,56 @@ func TestDetachSkillAliasesFromAllAgentsRejectsCorruptManifestBeforeWriting(t *t
 	}
 }
 
-func TestPruneDanglingSkillAttachments(t *testing.T) {
-	shannonDir := t.TempDir()
-	agentsDir := filepath.Join(shannonDir, "agents")
-	writeUsageTestSkill(t, shannonDir, "docker", "Docker", true)
-	writeUsageTestSkill(t, shannonDir, "temporarily-broken", "Temporary Broken", false)
-
-	if err := SetAttachedSkills(agentsDir, "analyst", []string{
-		"Docker",
-		"missing-one",
-		"Temporary Broken",
-	}); err != nil {
-		t.Fatalf("SetAttachedSkills analyst: %v", err)
-	}
-	if err := SetAttachedSkills(agentsDir, "operator", []string{"docker", "missing-two"}); err != nil {
-		t.Fatalf("SetAttachedSkills operator: %v", err)
-	}
-
-	got, err := PruneDanglingSkillAttachments(agentsDir, shannonDir)
-	if err != nil {
-		t.Fatalf("PruneDanglingSkillAttachments: %v", err)
-	}
-	want := []SkillAttachmentCleanup{
-		{Agent: "analyst", Skills: []string{"missing-one"}},
-		{Agent: "operator", Skills: []string{"missing-two"}},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("cleanup = %#v, want %#v", got, want)
-	}
-
-	analyst, err := ReadAttachedSkills(agentsDir, "analyst")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(analyst, []string{"Docker", "Temporary Broken"}) {
-		t.Errorf("analyst skills = %v", analyst)
-	}
-	operator, err := ReadAttachedSkills(agentsDir, "operator")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(operator, []string{"docker"}) {
-		t.Errorf("operator skills = %v", operator)
-	}
-}
-
-func TestPruneDanglingSkillAttachmentsRefusesUnparseableIdentity(t *testing.T) {
-	shannonDir := t.TempDir()
-	agentsDir := filepath.Join(shannonDir, "agents")
-	writeUsageTestSkill(t, shannonDir, "broken", "", false)
-	if err := SetAttachedSkills(agentsDir, "analyst", []string{"Legacy Broken", "missing"}); err != nil {
+func TestSkillAttachmentPlanRestoresExactLegacyIdentifiers(t *testing.T) {
+	agentsDir := t.TempDir()
+	before := []string{"Docker", "other"}
+	if err := SetAttachedSkills(agentsDir, "analyst", before); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := PruneDanglingSkillAttachments(agentsDir, shannonDir); err == nil {
-		t.Fatal("expected unsafe alias resolution to stop pruning")
+	plan, err := PlanDetachSkillAliases(agentsDir, "docker", "Docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.AgentNames(); !reflect.DeepEqual(got, []string{"analyst"}) {
+		t.Fatalf("affected agents = %v", got)
+	}
+	if _, err := plan.Apply(agentsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Restore(agentsDir); err != nil {
+		t.Fatal(err)
 	}
 	got, err := ReadAttachedSkills(agentsDir, "analyst")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, []string{"Legacy Broken", "missing"}) {
-		t.Fatalf("manifest changed after conservative prune failure: %v", got)
+	if !reflect.DeepEqual(got, before) {
+		t.Fatalf("restored identifiers = %v, want exact %v", got, before)
 	}
 }
 
-func writeUsageTestSkill(t *testing.T, shannonDir, slug, name string, valid bool) {
-	t.Helper()
-	dir := filepath.Join(shannonDir, "skills", slug)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+func TestSkillAttachmentPlanRejectsConcurrentManifestChange(t *testing.T) {
+	agentsDir := t.TempDir()
+	if err := SetAttachedSkills(agentsDir, "analyst", []string{"docker"}); err != nil {
 		t.Fatal(err)
 	}
-	content := "not valid skill frontmatter\n"
-	if valid {
-		content = "---\nname: " + name + "\ndescription: test\n---\nbody\n"
-	} else if name != "" {
-		content = "---\nname: " + name + "\n---\nbody\n"
-	}
-	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0600); err != nil {
+	plan, err := PlanDetachSkillAliases(agentsDir, "docker")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if err := SetAttachedSkills(agentsDir, "analyst", []string{"docker", "new-unrelated-skill"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Apply(agentsDir); err == nil {
+		t.Fatal("stale attachment plan unexpectedly overwrote a concurrent update")
+	}
+	got, err := ReadAttachedSkills(agentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"docker", "new-unrelated-skill"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("concurrent update changed after rejected plan: got %v want %v", got, want)
 	}
 }

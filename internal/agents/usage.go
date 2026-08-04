@@ -4,10 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"slices"
 	"sort"
-
-	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
 // AgentsAttachingSkill returns the names of agents whose _attached.yaml
@@ -61,11 +59,12 @@ type attachedSkillsChange struct {
 	after     []string
 }
 
-// SkillAttachmentCleanup describes dangling skill references removed from one
-// agent manifest.
-type SkillAttachmentCleanup struct {
-	Agent  string
-	Skills []string
+// SkillAttachmentPlan is an immutable snapshot of every manifest change needed
+// to detach one or more skill identifiers. Destructive callers can inspect the
+// affected agents, take their route locks, and then apply this exact snapshot
+// without a second filesystem scan.
+type SkillAttachmentPlan struct {
+	changes []attachedSkillsChange
 }
 
 // DetachSkillAliases removes every matching slug or legacy display name from a
@@ -94,32 +93,11 @@ func DetachSkillAliases(agentsDir, agentName string, identifiers ...string) erro
 // name from every agent manifest. All manifests are validated before any write,
 // so a corrupt manifest cannot silently survive a successful global deletion.
 func DetachSkillAliasesFromAllAgents(agentsDir string, identifiers ...string) ([]string, error) {
-	targets := make(map[string]struct{}, len(identifiers))
-	for _, identifier := range identifiers {
-		if identifier != "" {
-			targets[identifier] = struct{}{}
-		}
-	}
-	if len(targets) == 0 {
-		return []string{}, nil
-	}
-
-	changes, err := planAttachedSkillChanges(agentsDir, func(name string) bool {
-		_, remove := targets[name]
-		return remove
-	})
+	plan, err := PlanDetachSkillAliases(agentsDir, identifiers...)
 	if err != nil {
 		return nil, err
 	}
-	if err := applyAttachedSkillChanges(agentsDir, changes); err != nil {
-		return nil, err
-	}
-
-	agents := make([]string, 0, len(changes))
-	for _, change := range changes {
-		agents = append(agents, change.agentName)
-	}
-	return agents, nil
+	return plan.Apply(agentsDir)
 }
 
 // AgentsAttachingSkillAliasesStrict returns every agent whose manifest
@@ -127,6 +105,16 @@ func DetachSkillAliasesFromAllAgents(agentsDir string, identifiers ...string) ([
 // unreadable manifest fails the scan so destructive callers can stop before
 // changing any state.
 func AgentsAttachingSkillAliasesStrict(agentsDir string, identifiers ...string) ([]string, error) {
+	plan, err := PlanDetachSkillAliases(agentsDir, identifiers...)
+	if err != nil {
+		return nil, err
+	}
+	return plan.AgentNames(), nil
+}
+
+// PlanDetachSkillAliases validates every agent attachment manifest and records
+// the exact before/after state for manifests containing any identifier.
+func PlanDetachSkillAliases(agentsDir string, identifiers ...string) (*SkillAttachmentPlan, error) {
 	targets := make(map[string]struct{}, len(identifiers))
 	for _, identifier := range identifiers {
 		if identifier != "" {
@@ -134,7 +122,7 @@ func AgentsAttachingSkillAliasesStrict(agentsDir string, identifiers ...string) 
 		}
 	}
 	if len(targets) == 0 {
-		return []string{}, nil
+		return &SkillAttachmentPlan{}, nil
 	}
 	changes, err := planAttachedSkillChanges(agentsDir, func(name string) bool {
 		_, attached := targets[name]
@@ -143,77 +131,61 @@ func AgentsAttachingSkillAliasesStrict(agentsDir string, identifiers ...string) 
 	if err != nil {
 		return nil, err
 	}
-	result := make([]string, 0, len(changes))
-	for _, change := range changes {
+	return &SkillAttachmentPlan{changes: changes}, nil
+}
+
+// AgentNames returns the sorted agent names captured by the plan.
+func (p *SkillAttachmentPlan) AgentNames() []string {
+	if p == nil {
+		return []string{}
+	}
+	result := make([]string, 0, len(p.changes))
+	for _, change := range p.changes {
 		result = append(result, change.agentName)
 	}
-	return result, nil
+	return result
 }
 
-// PruneDanglingSkillAttachments removes manifest entries that cannot resolve to
-// an installed global skill. A reference matching a directory slug remains
-// present whenever that directory contains SKILL.md, even if its metadata is
-// temporarily unparseable.
-func PruneDanglingSkillAttachments(agentsDir, shannonDir string) ([]SkillAttachmentCleanup, error) {
-	present, err := installedSkillIdentifiers(shannonDir)
-	if err != nil {
+// Apply writes the plan's captured after-state transactionally and returns the
+// affected agent names.
+func (p *SkillAttachmentPlan) Apply(agentsDir string) ([]string, error) {
+	if p == nil {
+		return []string{}, nil
+	}
+	// The destructive caller plans while holding every target skill lock, then
+	// acquires the affected route locks. An unrelated attachment update may have
+	// completed in that interval; reject the stale plan instead of overwriting
+	// that update with the captured after-state.
+	for _, change := range p.changes {
+		current, err := ReadAttachedSkills(agentsDir, change.agentName)
+		if err != nil {
+			return nil, fmt.Errorf("revalidate attached skills for agent %q: %w", change.agentName, err)
+		}
+		if !slices.Equal(current, change.before) {
+			return nil, fmt.Errorf("attached skills for agent %q changed while deletion was being prepared; retry", change.agentName)
+		}
+	}
+	if err := applyAttachedSkillChanges(agentsDir, p.changes); err != nil {
 		return nil, err
 	}
-	changes, err := planAttachedSkillChanges(agentsDir, func(name string) bool {
-		_, exists := present[name]
-		return !exists
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := applyAttachedSkillChanges(agentsDir, changes); err != nil {
-		return nil, err
-	}
+	return p.AgentNames(), nil
+}
 
-	result := make([]SkillAttachmentCleanup, 0, len(changes))
-	for _, change := range changes {
-		after := make(map[string]struct{}, len(change.after))
-		for _, name := range change.after {
-			after[name] = struct{}{}
-		}
-		removed := make([]string, 0, len(change.before)-len(change.after))
-		for _, name := range change.before {
-			if _, kept := after[name]; !kept {
-				removed = append(removed, name)
-			}
-		}
-		sort.Strings(removed)
-		result = append(result, SkillAttachmentCleanup{
-			Agent:  change.agentName,
-			Skills: removed,
+// Restore returns every manifest in an applied plan to its exact captured
+// identifier set, including legacy display-name aliases.
+func (p *SkillAttachmentPlan) Restore(agentsDir string) error {
+	if p == nil || len(p.changes) == 0 {
+		return nil
+	}
+	restore := make([]attachedSkillsChange, 0, len(p.changes))
+	for _, change := range p.changes {
+		restore = append(restore, attachedSkillsChange{
+			agentName: change.agentName,
+			before:    append([]string(nil), change.after...),
+			after:     append([]string(nil), change.before...),
 		})
 	}
-	return result, nil
-}
-
-func installedSkillIdentifiers(shannonDir string) (map[string]struct{}, error) {
-	present := make(map[string]struct{})
-	skillsDir := filepath.Join(shannonDir, "skills")
-	entries, err := os.ReadDir(skillsDir)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("read global skills: %w", err)
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		skillFile := filepath.Join(skillsDir, entry.Name(), "SKILL.md")
-		if _, err := os.Stat(skillFile); err != nil {
-			continue
-		}
-		present[entry.Name()] = struct{}{}
-		displayName, err := skills.LoadSkillIdentity(skillFile, entry.Name())
-		if err != nil {
-			return nil, fmt.Errorf("cannot safely resolve aliases for installed skill %q: %w", entry.Name(), err)
-		}
-		present[displayName] = struct{}{}
-	}
-	return present, nil
+	return applyAttachedSkillChanges(agentsDir, restore)
 }
 
 func planAttachedSkillChanges(agentsDir string, remove func(string) bool) ([]attachedSkillsChange, error) {

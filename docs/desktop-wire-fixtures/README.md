@@ -124,6 +124,8 @@ codecs.
 | File | Producer | Notes |
 |---|---|---|
 | `http_get.status.response.json` | `server.go handleStatus` | pins the FULL `capabilities` token list — adding a token without updating this fixture fails the daemon test, which is the point (minting discipline made mechanical). `memory.reason` is explicit-null, not omitted. `uptime` is dynamic (normalized in tests) |
+| `http_get.config.reload_required.response.json` | `server.go handleGetConfig` | pins the split between newer on-disk `global` config and the daemon's stale in-memory `effective` config, including the actionable `reload_required` / `reload_reason` fields |
+| `http_get.config_status.reload_required.response.json` | `server.go handleConfigStatus` | pins the lightweight reload warning exposed alongside runtime config status; gated for clients by `config_reload_state_v1` |
 | `http_get.computer_use_topology.response.json` | `computer_use_topology.go handleComputerUseTopology` (`GET /local/computer-use/topology`) | daemon-owned transport fixture copied semantically from the helper's canonical `display_topology.mixed_horizontal.v1.json`. The HTTP body is the strict topology object itself, with no wrapper. Desktop vendors this fixture from the daemon repo; the endpoint exposes topology only, never coordinate-capture image bytes. |
 | `http_get.agents.response.json` | `server.go handleAgents` | list items use `override` |
 | `http_get.agent_detail.response.json` | `server.go handleGetAgent` (`AgentAPI`) | detail uses `overridden` — historical field-name divergence, pinned here so neither side "fixes" it unilaterally. `memory`/`config`/`commands`/`skills` are explicit-null when absent |

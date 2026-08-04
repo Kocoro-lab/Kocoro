@@ -431,6 +431,10 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		loadConfigWithRevision:          config.LoadWithRevision,
 	}
 	if deps != nil {
+		// These callbacks close over the fully constructed Server and are consumed
+		// by later auth/config mutation paths through the shared deps pointer. Keep
+		// this wiring after s initialization; moving it into the struct literal
+		// would either capture an uninitialized server or duplicate revision state.
 		revision := deps.ConfigRevision
 		if revision == "" {
 			revision, _ = s.currentConfigRevision()
@@ -3868,10 +3872,27 @@ func (s *Server) lockSkillIdentifiers(names []string) func() {
 	if len(names) == 0 || s.slugLocks == nil {
 		return func() {}
 	}
+	exactSlugs := make(map[string]string)
+	displayNames := make(map[string]string)
+	if sources, err := s.skillSources(); err == nil {
+		if list, err := skills.LoadSkills(sources...); err == nil {
+			exactSlugs = make(map[string]string, len(list))
+			displayNames = make(map[string]string, len(list))
+			for _, skill := range list {
+				exactSlugs[skill.Slug] = skill.Slug
+				key := strings.ToLower(skill.Name)
+				if _, exists := displayNames[key]; !exists {
+					displayNames[key] = skill.Slug
+				}
+			}
+		}
+	}
 	seen := make(map[string]struct{}, len(names))
 	canonical := make([]string, 0, len(names))
 	for _, name := range names {
-		if slug, ok := s.resolveSkillIdent(name); ok {
+		if slug, ok := exactSlugs[name]; ok {
+			name = slug
+		} else if slug, ok := displayNames[strings.ToLower(name)]; ok {
 			name = slug
 		}
 		if name == "" {
@@ -5325,8 +5346,13 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	identifiers, err := s.installedSkillAliases(skillName)
 	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
-		return
+		// Per-agent deletion is safely useful even when an installed SKILL.md is
+		// temporarily malformed: remove the exact URL slug, but do not guess at a
+		// legacy display-name alias. Global deletion remains fail-closed because it
+		// must prove that every alias is detached before removing the skill files.
+		log.Printf("daemon: delete skill %q from agent %q: alias lookup failed; detaching exact slug only: %v",
+			skillName, agentName, err)
+		identifiers = []string{skillName}
 	}
 	unlockSkill := s.lockSkillIdentifiers(identifiers)
 	defer unlockSkill()
@@ -6370,7 +6396,7 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	affectedAgents, err := agents.AgentsAttachingSkillAliasesStrict(
+	attachmentPlan, err := agents.PlanDetachSkillAliases(
 		s.deps.AgentsDir,
 		identifiers...,
 	)
@@ -6379,27 +6405,19 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 			fmt.Sprintf("cannot inspect agent skill attachments: %v", err))
 		return
 	}
+	affectedAgents := attachmentPlan.AgentNames()
 	unlockAgentRoutes := s.lockAgentRoutes(affectedAgents)
 	defer unlockAgentRoutes()
-	detachedAgents, err := agents.DetachSkillAliasesFromAllAgents(
-		s.deps.AgentsDir,
-		identifiers...,
-	)
+	detachedAgents, err := attachmentPlan.Apply(s.deps.AgentsDir)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError,
 			fmt.Sprintf("cannot detach skill from all agents: %v", err))
 		return
 	}
 	if err := skills.DeleteGlobalSkill(s.deps.ShannonDir, name); err != nil {
-		rollbackErrs := make([]error, 0)
-		for _, agentName := range detachedAgents {
-			if rollbackErr := agents.AttachSkill(s.deps.AgentsDir, agentName, name); rollbackErr != nil {
-				rollbackErrs = append(rollbackErrs,
-					fmt.Errorf("restore skill attachment for agent %q: %w", agentName, rollbackErr))
-			}
-		}
+		rollbackErr := attachmentPlan.Restore(s.deps.AgentsDir)
 		writeError(w, http.StatusInternalServerError,
-			errors.Join(append([]error{err}, rollbackErrs...)...).Error())
+			errors.Join(err, rollbackErr).Error())
 		return
 	}
 	s.auditHTTPOp("DELETE", "/skills/"+name,

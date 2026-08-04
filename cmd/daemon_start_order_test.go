@@ -9,6 +9,23 @@ import (
 	daemonruntime "github.com/Kocoro-lab/ShanClaw/internal/daemon"
 )
 
+func TestAcquireDaemonPIDFileCreatesStateDirectoryOnFirstStart(t *testing.T) {
+	home := t.TempDir()
+	shannonDir := filepath.Join(home, ".shannon")
+	if _, err := os.Stat(shannonDir); !os.IsNotExist(err) {
+		t.Fatalf("test state directory already exists: %v", err)
+	}
+
+	pidFile, err := acquireDaemonPIDFile(shannonDir)
+	if err != nil {
+		t.Fatalf("first daemon ownership acquisition failed: %v", err)
+	}
+	defer pidFile.Close()
+	if info, err := os.Stat(shannonDir); err != nil || !info.IsDir() {
+		t.Fatalf("daemon state directory was not created: info=%v err=%v", info, err)
+	}
+}
+
 func TestDaemonStartDoesNotMutateBeforePIDLock(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

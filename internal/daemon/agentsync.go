@@ -147,11 +147,10 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 			}
 		}
 	}
-	var skills json.RawMessage
-	if api.Skills != nil {
-		if b, err := json.Marshal(api.Skills); err == nil {
-			skills = b
-		}
+	syncedSkills, err := syncedAgentSkills(agentsDir, name, api.Skills)
+	if err != nil {
+		log.Printf("agentsync: skipping agent %q: attachment snapshot failed: %v", name, err)
+		return client.SyncAgentItem{}, false
 	}
 
 	return client.SyncAgentItem{
@@ -160,10 +159,52 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 		Prompt:      api.Prompt,
 		Memory:      api.Memory,
 		Config:      config,
-		Skills:      skills,
+		Skills:      syncedSkills,
 		Profile:     profile,
 		UpdatedAt:   agentLastModified(filepath.Join(agentsDir, name)).UTC(),
 	}, true
+}
+
+// syncedAgentSkills serializes the attachment manifest itself, not only the
+// subset that resolves against this device's installed skill inventory. A
+// second device may not have installed a remotely attached skill yet; dropping
+// that unresolved identifier from an outbound sync would turn local absence
+// into a cross-device detach. Resolved entries retain their full metadata for
+// compatibility, while unresolved entries round-trip by slug/name.
+func syncedAgentSkills(agentsDir, agentName string, resolved []skills.SkillMeta) (json.RawMessage, error) {
+	manifestPath := filepath.Join(agentsDir, agentName, "_attached.yaml")
+	if _, err := os.Stat(manifestPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	attached, err := agents.ReadAttachedSkills(agentsDir, agentName)
+	if err != nil {
+		return nil, err
+	}
+	byIdentifier := make(map[string]skills.SkillMeta, len(resolved)*2)
+	for _, meta := range resolved {
+		byIdentifier[meta.Slug] = meta
+		byIdentifier[meta.Name] = meta
+	}
+	metas := make([]skills.SkillMeta, 0, len(attached))
+	for _, identifier := range attached {
+		if meta, ok := byIdentifier[identifier]; ok {
+			metas = append(metas, meta)
+			continue
+		}
+		meta := skills.SkillMeta{Name: identifier}
+		if skills.ValidateSkillName(identifier) == nil {
+			meta.Slug = identifier
+		}
+		metas = append(metas, meta)
+	}
+	b, err := json.Marshal(metas)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 // agentDefinitionFiles is the set of files whose mtimes drive the cross-device
@@ -327,7 +368,6 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 				continue // local newer or equal — keep local edits.
 			}
 		}
-		syncSkillNames = filterInstalledSyncedSkills(filepath.Dir(agentsDir), syncSkillNames)
 		materializeAgentFromItem(agentsDir, it, syncSkillNames, writeSyncedSkills)
 		s.deps.SessionCache.UnlockRoute(routeKey)
 		unlockSkills()
@@ -558,40 +598,4 @@ func decodeSyncedSkillNames(agentKey string, raw json.RawMessage) ([]string, boo
 		}
 	}
 	return names, true
-}
-
-func filterInstalledSyncedSkills(shannonDir string, names []string) []string {
-	if len(names) == 0 {
-		return nil
-	}
-	globalDir := filepath.Join(shannonDir, "skills")
-	loaded, _ := skills.LoadSkills(skills.SkillSource{Dir: globalDir, Source: skills.SourceGlobal})
-	aliases := make(map[string]string, len(loaded)*2)
-	for _, skill := range loaded {
-		aliases[skill.Slug] = skill.Slug
-		aliases[skill.Name] = skill.Slug
-	}
-	filtered := make([]string, 0, len(names))
-	seen := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		canonical := ""
-		if err := skills.ValidateSkillName(name); err == nil {
-			if _, err := os.Stat(filepath.Join(globalDir, name, "SKILL.md")); err == nil {
-				canonical = name
-			}
-		}
-		if canonical == "" {
-			canonical = aliases[name]
-		}
-		if canonical == "" {
-			log.Printf("agentsync: dropping attachment to uninstalled skill %q", name)
-			continue
-		}
-		if _, exists := seen[canonical]; exists {
-			continue
-		}
-		seen[canonical] = struct{}{}
-		filtered = append(filtered, canonical)
-	}
-	return filtered
 }
