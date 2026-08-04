@@ -85,13 +85,41 @@ func extractOpaqueIdentifiers(text string) []string {
 // first user) and the minKeepLast tail pairs it always retains. Identifiers
 // that only appear in the protected prefix or the kept tail survive
 // compaction verbatim and are not enforced against the summary.
+//
+// Deliberately NOT buildTranscript: that serializer clips each tool_result to
+// 450 runes for the summarizer's benefit, which blinded the scan to
+// identifiers buried mid-result (2026-08-04 live: the decoy's identifiers sat
+// past the clip, so the audit never enforced them). The scan reads full
+// content — regexp cost over a window-bounded history is negligible.
 func identifiersAtRisk(messages []client.Message) []string {
 	start := 2
 	end := len(messages) - minKeepLast*2
 	if end <= start {
 		return nil
 	}
-	return extractOpaqueIdentifiers(buildTranscript(messages[start:end]))
+	var sb strings.Builder
+	for _, m := range messages[start:end] {
+		if m.Role == "system" {
+			continue
+		}
+		if !m.Content.HasBlocks() {
+			sb.WriteString(m.Content.Text())
+			sb.WriteString("\n")
+			continue
+		}
+		for _, b := range m.Content.Blocks() {
+			switch b.Type {
+			case "text":
+				sb.WriteString(b.Text)
+			case "tool_use":
+				sb.Write(b.Input)
+			case "tool_result":
+				sb.WriteString(client.ToolResultText(b))
+			}
+			sb.WriteString("\n")
+		}
+	}
+	return extractOpaqueIdentifiers(sb.String())
 }
 
 func summaryIncludesIdentifier(summary, id string) bool {

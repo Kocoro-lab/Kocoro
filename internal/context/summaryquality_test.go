@@ -69,6 +69,37 @@ func TestExtractOpaqueIdentifiers(t *testing.T) {
 	}
 }
 
+// TestIdentifiersAtRisk_SeesPastTranscriptTruncation: buildTranscript clips
+// each tool_result to 450 runes for the summarizer, but the identifier scan
+// must read the FULL result — the live e2e buried identifiers mid-file,
+// past the clip, and the audit never enforced them.
+func TestIdentifiersAtRisk_SeesPastTranscriptTruncation(t *testing.T) {
+	buried := strings.Repeat("filler sentence with no identifiers at all. ", 15) + // >450 runes of padding
+		"\nThe buried release commit is 9f3c2a71d4b85e06 and must survive.\n"
+	msgs := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("read it")},
+		{Role: "assistant", Content: client.NewTextContent("reading")},
+		toolResultMsg(buried),
+	}
+	for i := 0; i < minKeepLast+2; i++ {
+		msgs = append(msgs,
+			client.Message{Role: "assistant", Content: client.NewTextContent("working")},
+			client.Message{Role: "user", Content: client.NewTextContent("continue")},
+		)
+	}
+	ids := identifiersAtRisk(msgs)
+	found := false
+	for _, id := range ids {
+		if id == "9F3C2A71D4B85E06" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("identifier buried past the 450-rune transcript clip must still be at risk, got %v", ids)
+	}
+}
+
 func TestIdentifiersAtRisk_ScansOnlyDroppableMiddle(t *testing.T) {
 	msgs := buildAuditableHistory()
 	ids := identifiersAtRisk(msgs)
