@@ -372,7 +372,13 @@ type MetaBoundary string
 const (
 	MetaBoundaryToolSearchLoaded MetaBoundary = "tool_search_loaded"
 	MetaBoundaryPostCompaction   MetaBoundary = "post_compaction"
-	MetaBoundaryRetryAfterError  MetaBoundary = "retry_after_error"
+	// MetaBoundaryPostCompactionNoRestore is the reactive-compaction variant:
+	// that path deliberately performs no file restoration, so the reanchor
+	// itself must warn that earlier file contents may be gone — otherwise the
+	// model answers confidently from a paraphrase instead of re-reading (the
+	// observed live failure shape).
+	MetaBoundaryPostCompactionNoRestore MetaBoundary = "post_compaction_no_restore"
+	MetaBoundaryRetryAfterError         MetaBoundary = "retry_after_error"
 )
 
 // defaultPersona is the identity line for the default (non-overridden) agent.
@@ -3711,6 +3717,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			return "[system] Deferred tool schemas are now loaded. Continue working on the current request using those tools:\n\n" + latestUserText
 		case MetaBoundaryPostCompaction:
 			return "[system] Context was compacted. Stay focused on the current request and continue from there:\n\n" + latestUserText
+		case MetaBoundaryPostCompactionNoRestore:
+			return "[system] Context was compacted. File contents you read earlier may no longer be in context — re-read anything you need to quote or use exactly. Stay focused on the current request and continue from there:\n\n" + latestUserText
 		case MetaBoundaryRetryAfterError:
 			return "[system] You are retrying after an interruption. Stay focused on the current request:\n\n" + latestUserText
 		default:
@@ -4763,9 +4771,10 @@ iterationLoop:
 					// makes a second overflow terminal. The evidence floor only
 					// proves a LOWER bound on the true overhead, so any budget
 					// computed against it can still overshoot — the post-400
-					// retry keeps every token shaping recovered, and the model
-					// re-reads files on demand once the run survives.
-					reanchorActiveTask(MetaBoundaryPostCompaction)
+					// retry keeps every token shaping recovered, and the
+					// NoRestore reanchor variant tells the model to re-read
+					// what it needs once the run survives.
+					reanchorActiveTask(MetaBoundaryPostCompactionNoRestore)
 
 					// Rebuild request with compacted messages. The ordinary
 					// Responses cursor is deliberately NOT carried over: with

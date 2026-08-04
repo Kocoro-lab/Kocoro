@@ -313,7 +313,7 @@ func TestAgentLoop_ReactiveRestoreRespectsEvidenceFloor(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if restoredInRetry {
-		t.Error("post-400 retry must not carry restored file content — the evidence floor leaves no budget")
+		t.Error("post-400 retry must not carry restored file content — restoration is skipped on the reactive path")
 	}
 }
 

@@ -228,14 +228,14 @@ func clipWithMarker(s string, maxBytes int) string {
 }
 
 // buildPostCompactionFileRestore assembles a user message re-injecting the
-// most recently read files after an APPLIED compaction. overheadTokens is the
-// calibration the CALLER's compaction path judged against — a.estOverhead()
-// on the proactive/preflight paths, the 400-evidence floor on the reactive
-// path (budgeting the reactive restore against the plain calibration would
-// re-inflate a prompt the provider just rejected, and reactiveCompacted makes
-// the second overflow terminal). Returns ok=false when there is nothing to
-// restore or no headroom: the payload must keep the calibrated estimate under
-// the compaction trigger line (it deliberately MAY consume part of the 90/80
+// most recently read files after an applied PROACTIVE or PREFLIGHT
+// compaction; both callers pass a.estOverhead(). The reactive (post-400)
+// path deliberately does NOT call this at all: its evidence floor is only a
+// lower bound on the true overhead, so any budget computed there can
+// overshoot into the one prompt where reactiveCompacted makes a second
+// overflow terminal. Returns ok=false when there is nothing to restore or no
+// headroom: the payload must keep the calibrated estimate under the
+// compaction trigger line (it deliberately MAY consume part of the 90/80
 // hysteresis band — see CompactTriggerTokens).
 func (a *AgentLoop) buildPostCompactionFileRestore(shaped []client.Message, overheadTokens int) (client.Message, bool) {
 	rt := a.readTracker
