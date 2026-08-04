@@ -47,12 +47,22 @@ const preflightCompactThreshold = 0.95
 // any tool_results accumulated during the current iteration. A single
 // iteration that loads multiple large file_reads can push history above
 // the cap before the proactive trigger evaluates.
-func shouldPreflightCompact(messages []client.Message, contextWindow int) bool {
+//
+// overheadTokens is the caller's observed (real prompt tokens − estimate at
+// send time) — see AgentLoop.estOverheadTokens. Without it the raw estimate
+// under-counts by the tool-schema mass plus the chars/3.5 error (~25% on
+// code-heavy prompts), which moved the real firing point past the model cap
+// on true-window configs: est ≥ 0.95W meant real ≈ 1.2W, so the API 400'd
+// before this guard ever fired. Pass 0 when no real measurement exists.
+func shouldPreflightCompact(messages []client.Message, contextWindow int, overheadTokens int) bool {
 	if contextWindow <= 0 {
 		return false
 	}
+	if overheadTokens < 0 {
+		overheadTokens = 0
+	}
 	threshold := int(float64(contextWindow) * preflightCompactThreshold)
-	return ctxwin.EstimateTokens(messages) >= threshold
+	return ctxwin.EstimateTokens(messages)+overheadTokens >= threshold
 }
 
 // emitCompactionFailureStatus surfaces a compaction failure as a non-fatal
@@ -87,7 +97,7 @@ func emitCompactionFailureStatus(handler any, phase string, err error) {
 // every client-side defense was gated by MinShapeable=9, the message
 // escaped to the API untouched.
 func (a *AgentLoop) shortSessionTruncate(messages []client.Message, sourceTag string) []client.Message {
-	if !shouldPreflightCompact(messages, a.contextWindow) {
+	if !shouldPreflightCompact(messages, a.contextWindow, a.estOverheadTokens) {
 		return messages
 	}
 	if len(messages) > ctxwin.MinShapeable() {
@@ -125,9 +135,9 @@ func (a *AgentLoop) truncateUserMessageOverBudget(messages []client.Message, sou
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	for shouldPreflightCompact(messages, a.contextWindow) && truncations < maxAttempts {
+	for shouldPreflightCompact(messages, a.contextWindow, a.estOverheadTokens) && truncations < maxAttempts {
 		var dropped int
-		messages, dropped = ctxwin.TruncateOversizedLastUserMessage(messages, a.contextWindow)
+		messages, dropped = ctxwin.TruncateOversizedLastUserMessage(messages, a.contextWindow, a.estOverheadTokens)
 		if dropped <= 0 {
 			break
 		}
@@ -787,11 +797,26 @@ type AgentLoop struct {
 	// override); locks against auto-detect from observed model.
 	contextWindow         int
 	contextWindowExplicit bool
-	memoryDir             string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
-	projectEntityDir      string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
-	stickyContext         string             // session-scoped facts injected verbatim into system prompt; never truncated
-	outputFormat          string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
-	userFilePaths         []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
+	// estOverheadTokens calibrates ctxwin.EstimateTokens against the
+	// provider's real prompt accounting: (real prompt tokens of the last main
+	// completion) − (EstimateTokens of the request messages that produced
+	// them). Captures everything the estimator cannot see — the tools[] schema
+	// mass lives outside messages, and chars/3.5 under-counts dense code —
+	// which measured ~25% on code-heavy sessions. Every estimate-based
+	// compaction decision (ShapeHistory, preflight, user truncation) adds this
+	// so it judges against the same scale as the real-usage ShouldCompact
+	// trigger; 0 until the first response (pure-estimate behavior). Re-derived
+	// on every response, so a mid-session provider/model switch (different
+	// tokenizers and schema overheads per provider) recalibrates within one
+	// turn. Persists across Run()
+	// calls: a resumed daemon session's first-iteration estimates reuse the
+	// previous Run's calibration instead of dropping back to 0.
+	estOverheadTokens int
+	memoryDir         string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	projectEntityDir  string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
+	stickyContext     string             // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat      string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	userFilePaths     []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
 	// alwaysAllowTools is the per-agent persisted set loaded from the agent's
 	// permissions.always_allow_tools config. Sourced from
 	// internal/agents/loader.go AgentPermissionsConfig and injected by the
@@ -3305,7 +3330,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		rawMsgs := []client.Message{
 			{Role: "user", Content: client.NewTextContent(raw)},
 		}
-		rawMsgs, dropped := ctxwin.TruncateOversizedLastUserMessage(rawMsgs, a.contextWindow)
+		rawMsgs, dropped := ctxwin.TruncateOversizedLastUserMessage(rawMsgs, a.contextWindow, 0)
 		if dropped <= 0 || len(rawMsgs) == 0 || rawMsgs[0].Content.HasBlocks() {
 			return raw
 		}
@@ -3444,7 +3469,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// force-stop is the last-resort turn and especially must not 400.
 		// MinShapeable gate matches the main-loop site — without enough
 		// messages, ShapeHistory is a no-op and the summary call wastes tokens.
-		if shouldPreflightCompact(messages, a.contextWindow) && len(messages) > ctxwin.MinShapeable() {
+		if shouldPreflightCompact(messages, a.contextWindow, a.estOverheadTokens) && len(messages) > ctxwin.MinShapeable() {
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
 					fmt.Sprintf("force-stop turn estimate %d tokens >= %.0f%% of %d cap",
@@ -3458,14 +3483,14 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
 			if sumErr == nil {
-				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow)
+				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverheadTokens)
 			} else {
 				// Summary failed on the force-stop fallback path: emit telemetry
 				// (parity with main-loop preflight at line ~2279) so this last-resort
 				// degradation is visible. ShapeHistory without summary still drops
 				// middle messages. (See 2026-05-11 GPT review F3.)
 				a.recordCompactionFailure("force_stop_summary_failure", sumErr)
-				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow)
+				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow, a.estOverheadTokens)
 			}
 			if dropped := fsBefore - len(messages); dropped > 0 {
 				a.recordCompactionSuccess("force_stop_preflight",
@@ -3996,8 +4021,23 @@ iterationLoop:
 				}
 				if compactionSummary != "" {
 					before := len(messages)
-					messages = ctxwin.ShapeHistory(messages, compactionSummary, a.contextWindow)
-					if len(messages) < before {
+					shaped := ctxwin.ShapeHistory(messages, compactionSummary, a.contextWindow, a.estOverheadTokens)
+					if len(shaped) >= before {
+						// ShapeHistory declined (nothing would be dropped).
+						// Do NOT latch compactionApplied and do NOT reanchor:
+						// no history was rewritten, so telling the model
+						// "context was compacted" would be false, and the
+						// latch would disable both this trigger and the
+						// preflight gate for the rest of the Run while the
+						// prompt keeps growing (2026-08-04 e2e). The summary
+						// stays cached in compactionSummary, so the retry on
+						// a later iteration — when more history has
+						// accumulated — costs no extra LLM call.
+						a.recordCompactionFailure("proactive_shape_noop",
+							fmt.Errorf("ShapeHistory dropped nothing (msgs=%d, window=%d, est_overhead=%d)",
+								before, a.contextWindow, a.estOverheadTokens))
+					} else {
+						messages = shaped
 						dropped := before - len(messages)
 						a.recordCompactionSuccess("proactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
 						// Adjust newMsgOffset: compaction drops middle messages
@@ -4036,9 +4076,10 @@ iterationLoop:
 							}
 						}
 						msgTimestamps = rebasedTS
+
+						compactionApplied = true
+						reanchorActiveTask(MetaBoundaryPostCompaction)
 					}
-					compactionApplied = true
-					reanchorActiveTask(MetaBoundaryPostCompaction)
 				}
 			}
 		}
@@ -4142,7 +4183,7 @@ iterationLoop:
 		// prompt itself can exceed thresholds in artificially-small context
 		// windows (test fixtures or pinned configs); fire-without-shape would
 		// repeatedly burn calls until lastPromptTokens drops back under 90%.
-		if shouldPreflightCompact(messages, a.contextWindow) && !compactionApplied && !reactiveCompacted && len(messages) > ctxwin.MinShapeable() {
+		if shouldPreflightCompact(messages, a.contextWindow, a.estOverheadTokens) && !compactionApplied && !reactiveCompacted && len(messages) > ctxwin.MinShapeable() {
 			a.tracker.Enter(PhaseCompacting)
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
@@ -4159,11 +4200,11 @@ iterationLoop:
 			a.emitInternalUsage(sumUsage)
 			before := len(messages)
 			if sumErr == nil {
-				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow)
+				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverheadTokens)
 			} else {
 				// Summary failed; ShapeHistory without summary still drops middle messages.
 				a.recordCompactionFailure("preflight_summary_failure", sumErr)
-				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow)
+				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow, a.estOverheadTokens)
 			}
 			if dropped := before - len(messages); dropped > 0 {
 				a.recordCompactionSuccess("preflight", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
@@ -4217,7 +4258,7 @@ iterationLoop:
 		// scaffoldedUserText and rawUserMessage stay in sync when the
 		// clip lands on the current turn — otherwise captureRunMessages
 		// would persist the scaffolded body into session.json.
-		if shouldPreflightCompact(messages, a.contextWindow) {
+		if shouldPreflightCompact(messages, a.contextWindow, a.estOverheadTokens) {
 			applyLongSessionTruncate("post_compaction")
 		}
 
@@ -4545,8 +4586,8 @@ iterationLoop:
 						nextSummary = trimmed
 					}
 
-					shaped := ctxwin.ShapeHistory(softMessages, nextSummary, a.contextWindow)
-					if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped) >= a.contextWindow {
+					shaped := ctxwin.ShapeHistory(softMessages, nextSummary, a.contextWindow, a.estOverheadTokens)
+					if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped)+a.estOverheadTokens >= a.contextWindow {
 						fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
 						emergencyMessages := cloneMessages(messages)
 						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
@@ -4565,7 +4606,7 @@ iterationLoop:
 							nextSummary = trimmed
 						}
 
-						shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow)
+						shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow, a.estOverheadTokens)
 					}
 
 					messages = shaped
@@ -4799,6 +4840,18 @@ iterationLoop:
 		}
 		lastPromptTokens = totalPromptTokens(normalizedUsage)
 		lastOutputTokens = normalizedUsage.OutputTokens
+		// Recalibrate the estimator against real usage: requestMessages is
+		// exactly what produced lastPromptTokens, so the gap is the mass the
+		// estimator cannot see (tools[] schemas, chars/3.5 error). Clamped at
+		// 0 — a provider reporting less than the estimate just means the
+		// estimate was conservative, which needs no correction.
+		if lastPromptTokens > 0 {
+			overhead := lastPromptTokens - ctxwin.EstimateTokens(requestMessages)
+			if overhead < 0 {
+				overhead = 0
+			}
+			a.estOverheadTokens = overhead
+		}
 		if resp.Model != "" {
 			usage.Model = resp.Model
 		}

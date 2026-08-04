@@ -85,6 +85,16 @@ var modelContextWindowPrefix = map[string]int{
 	"claude-sonnet-4-6-": 1_000_000,
 	"claude-opus-4-6-":   1_000_000,
 	"claude-opus-4-7-":   1_000_000,
+	// OpenAI 1M families (dated snapshots use a -YYYY-MM-DD suffix, e.g. a
+	// future "gpt-5.6-luna-2026-09-01"). Persona-suffixed ids are full model
+	// names, so these prefixes only ever catch dated variants — same
+	// reasoning as the dated-variant prefix entries above. Broader "gpt-5.1-" style
+	// prefixes are intentionally absent: they would catch unknown sibling
+	// families (hypothetical gpt-5.1-mini) and guess their window; unknown
+	// ids must return (0,false) per the graceful-degradation doctrine.
+	"gpt-5.6-terra-": 1_050_000,
+	"gpt-5.6-luna-":  1_050_000,
+	"gpt-5.6-sol-":   1_050_000,
 	// 200K families. Note: we intentionally do NOT add a broader
 	// "claude-sonnet-4-" prefix — that would silently catch hypothetical
 	// future "claude-sonnet-4-NN" forms (e.g. claude-sonnet-4-60) and

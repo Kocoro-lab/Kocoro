@@ -77,7 +77,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		withSystem := make([]client.Message, 0, 1+len(messages))
 		withSystem = append(withSystem, client.Message{Role: "system", Content: client.NewTextContent("(compaction placeholder)")})
 		withSystem = append(withSystem, messages...)
-		shaped := ctxwin.ShapeHistory(withSystem, summary, ctxWindow)
+		shaped := ctxwin.ShapeHistory(withSystem, summary, ctxWindow, 0)
 
 		// Strip the placeholder system message from shaped result
 		if len(shaped) > 0 && shaped[0].Role == "system" {
