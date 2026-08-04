@@ -8,12 +8,24 @@ import "strings"
 // (the tools[] schema mass is the dominant term of the sample, so a registry
 // change invalidates it). Callers persist the trio in the session checkpoint
 // and hand it back to SetEstOverheadState when resuming on a fresh loop.
+// With no sample the fingerprint is "" — computing it means JSON-marshalling
+// and hashing every tool schema, and this runs on every checkpoint and save.
 func (a *AgentLoop) EstOverheadState() (tokens int, model, toolsFingerprint string) {
 	tokens = int(a.estOverheadTokens.Load())
+	if tokens <= 0 {
+		return tokens, "", ""
+	}
 	if m, ok := a.estOverheadModel.Load().(string); ok {
 		model = m
 	}
 	return tokens, model, toolSchemaFingerprint(a.tools)
+}
+
+// ToolsFingerprint exposes the current registry fingerprint for callers that
+// need it independently of a calibration sample (e.g. seeding a sample onto
+// a loop via SetEstOverheadState).
+func (a *AgentLoop) ToolsFingerprint() string {
+	return toolSchemaFingerprint(a.tools)
 }
 
 // SetEstOverheadState restores a checkpointed calibration sample onto a fresh

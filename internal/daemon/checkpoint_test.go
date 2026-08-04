@@ -266,7 +266,7 @@ func TestApplyTurnState_CopiesCalibration(t *testing.T) {
 	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
 	// Seed via the public restore path: snapshot the fingerprint of the
 	// loop's own registry so validation accepts the sample.
-	_, _, fp := loop.EstOverheadState()
+	fp := loop.ToolsFingerprint()
 	loop.SetEstOverheadState(4321, "test-model", fp)
 
 	applyTurnState(sess, loop, nil, base)

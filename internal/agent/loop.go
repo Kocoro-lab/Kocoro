@@ -3742,11 +3742,14 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// Post-compaction file restoration: an APPLIED compaction just dropped
 	// the middle of the history — including the full text of files the model
 	// read there, whose exact identifiers the summary paraphrases at best.
-	// The content is still on disk, so re-inject the most recent reads
-	// (budgeted against the compaction landing line) before the task
-	// reanchor, which must stay the last message.
-	restoreRecentReads := func() {
-		msg, ok := a.buildPostCompactionFileRestore(messages)
+	// The content is still on disk, so re-inject the most recent reads before
+	// the task reanchor, which must stay the last message. overheadTokens is
+	// the calibration the calling compaction path judged against — the
+	// reactive path MUST pass its 400-evidence floor, not the plain (possibly
+	// zero) calibration, or restoration re-inflates a prompt the provider
+	// just rejected.
+	restoreRecentReads := func(overheadTokens int) {
+		msg, ok := a.buildPostCompactionFileRestore(messages, overheadTokens)
 		if !ok {
 			return
 		}
@@ -4144,7 +4147,7 @@ iterationLoop:
 						msgTimestamps = rebasedTS
 
 						compactionApplied = true
-						restoreRecentReads()
+						restoreRecentReads(a.estOverhead())
 						reanchorActiveTask(MetaBoundaryPostCompaction)
 					}
 				}
@@ -4326,7 +4329,7 @@ iterationLoop:
 					}
 				}
 				msgTimestamps = rebasedTS
-				restoreRecentReads()
+				restoreRecentReads(a.estOverhead())
 			}
 			compactionApplied = true
 			reanchorActiveTask(MetaBoundaryPostCompaction)
@@ -4754,7 +4757,7 @@ iterationLoop:
 							}
 						}
 						msgTimestamps = rebasedTS
-						restoreRecentReads()
+						restoreRecentReads(reactiveOverhead)
 					}
 
 					reanchorActiveTask(MetaBoundaryPostCompaction)

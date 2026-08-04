@@ -25,7 +25,7 @@ const (
 	//   - Workload: long tool-heavy sessions where dozens of files were read.
 	//   - Symptom when it binds: only the 5 most recent files come back; older
 	//     reads must be re-read by the model on demand.
-	//   - Override: raise together with restoreTotalTokenCap — the landing
+	//   - Override: raise together with restoreTotalTokenCap — the trigger
 	//     budget below is the real ceiling.
 	restoreMaxFiles = 5
 	// restoreFileTokenCap caps a single re-read (≈5K tokens at chars/3.5).
@@ -92,18 +92,61 @@ var restoreExcludedBasenames = map[string]bool{
 	"agent.md":  true,
 }
 
-// keptFileReadPaths collects the normalized paths of file_read tool_use
-// blocks that survived shaping. Known limitation: a surviving read whose
-// result was a dedup stub ("file unchanged since last read") also suppresses
-// restoration even though the full text it points at may have been dropped —
-// acceptable because the stub itself tells the model how to re-read.
+// restoreExcludedExtensions are formats file_read serves as vision blocks
+// (readImage/readPDF record them in the tracker too). Re-reading them here
+// would interpolate raw binary bytes as prompt text — json.Marshal replaces
+// the invalid UTF-8 with U+FFFD, so it fails as silent token waste. The
+// utf8.Valid check in readRestoreRange backstops extensions not listed here.
+var restoreExcludedExtensions = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
+	".heic": true, ".heif": true, ".avif": true, ".bmp": true, ".tiff": true,
+	".pdf": true,
+}
+
+// restoreHeaderPrefix marks each restored file section; it doubles as the
+// dedup key a later compaction in the same Run uses to avoid re-injecting a
+// file whose restore block still survives in the kept tail.
+const restoreHeaderPrefix = "## "
+
+const restoreIntro = "Context was compacted. The most recently read files were re-read from disk to preserve continuity (fresh content — a file may have changed since the earlier read):"
+
+// keptFileReadPaths collects the normalized paths whose content already
+// survives in the shaped history: file_read tool_use blocks in the kept tail,
+// plus files named by an earlier restore block (a second compaction in the
+// same Run must not inject the same file twice). Known limitation: a
+// surviving read whose result was a dedup stub ("file unchanged since last
+// read") also suppresses restoration even though the full text it points at
+// may have been dropped — acceptable because the stub itself tells the model
+// how to re-read.
 func keptFileReadPaths(messages []client.Message, cwd string) map[string]bool {
 	out := make(map[string]bool)
+	collectRestoreBlockPaths := func(text string) {
+		if !strings.Contains(text, restoreIntro) {
+			return
+		}
+		for _, line := range strings.Split(text, "\n") {
+			if !strings.HasPrefix(line, restoreHeaderPrefix) {
+				continue
+			}
+			path := strings.TrimPrefix(line, restoreHeaderPrefix)
+			if i := strings.LastIndex(path, " (lines "); i > 0 {
+				path = path[:i]
+			}
+			if p := normalizePathWithCWD(strings.TrimSpace(path), cwd); p != "" {
+				out[p] = true
+			}
+		}
+	}
 	for _, m := range messages {
 		if !m.Content.HasBlocks() {
+			collectRestoreBlockPaths(m.Content.Text())
 			continue
 		}
 		for _, b := range m.Content.Blocks() {
+			if b.Type == "text" {
+				collectRestoreBlockPaths(b.Text)
+				continue
+			}
 			if b.Type != "tool_use" || b.Name != "file_read" {
 				continue
 			}
@@ -123,8 +166,13 @@ func keptFileReadPaths(messages []client.Message, cwd string) map[string]bool {
 
 // readRestoreRange re-reads the recorded line range from disk. When the
 // recorded offset no longer exists (file shrank), it falls back to the head —
-// fresh content beats nothing. limit<=0 means "to the end".
+// fresh content beats nothing. limit<=0 means "to the end". Binary content
+// (extension or invalid UTF-8) is refused: this path re-injects TEXT; vision
+// formats have their own encoding pipeline.
 func readRestoreRange(path string, offset, limit int) (content string, first, last int, err error) {
+	if restoreExcludedExtensions[strings.ToLower(filepath.Ext(path))] {
+		return "", 0, 0, fmt.Errorf("skipped: non-text format")
+	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() || info.Size() > restoreMaxFileBytes {
 		if err == nil {
@@ -136,7 +184,18 @@ func readRestoreRange(path string, offset, limit int) (content string, first, la
 	if err != nil {
 		return "", 0, 0, err
 	}
+	if !utf8.Valid(data) {
+		return "", 0, 0, fmt.Errorf("skipped: not valid UTF-8")
+	}
 	lines := strings.Split(string(data), "\n")
+	// A newline-terminated file splits into a trailing "" — drop it so the
+	// reported line range matches what a reader would count.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return "", 0, 0, fmt.Errorf("skipped: empty file")
+	}
 	if offset < 0 || offset >= len(lines) {
 		offset = 0
 	}
@@ -147,13 +206,15 @@ func readRestoreRange(path string, offset, limit int) (content string, first, la
 	return strings.Join(lines[offset:end], "\n"), offset + 1, end, nil
 }
 
-// clipRunesWithMarker bounds s at maxChars bytes on a rune boundary,
-// appending a marker naming how to get the rest.
-func clipRunesWithMarker(s string, maxChars int) string {
-	if len(s) <= maxChars {
+// clipWithMarker bounds s at maxBytes on a rune boundary, appending a marker
+// naming how to get the rest. Byte-based on purpose: the caller's budget is
+// rune-derived (chars/3.5), so clipping by bytes only ever under-shoots —
+// safe direction for a budget.
+func clipWithMarker(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
 		return s
 	}
-	cut := maxChars
+	cut := maxBytes
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
@@ -161,17 +222,24 @@ func clipRunesWithMarker(s string, maxChars int) string {
 }
 
 // buildPostCompactionFileRestore assembles a user message re-injecting the
-// most recently read files after an APPLIED compaction. Returns ok=false when
-// there is nothing to restore or no headroom: the payload must keep the
-// calibrated estimate under the compaction trigger line, or the restoration
-// itself would re-arm the compaction it just paid for (it deliberately MAY
-// consume part of the 90/80 hysteresis band — see CompactTriggerTokens).
-func (a *AgentLoop) buildPostCompactionFileRestore(shaped []client.Message) (client.Message, bool) {
+// most recently read files after an APPLIED compaction. overheadTokens is the
+// calibration the CALLER's compaction path judged against — a.estOverhead()
+// on the proactive/preflight paths, the 400-evidence floor on the reactive
+// path (budgeting the reactive restore against the plain calibration would
+// re-inflate a prompt the provider just rejected, and reactiveCompacted makes
+// the second overflow terminal). Returns ok=false when there is nothing to
+// restore or no headroom: the payload must keep the calibrated estimate under
+// the compaction trigger line (it deliberately MAY consume part of the 90/80
+// hysteresis band — see CompactTriggerTokens).
+func (a *AgentLoop) buildPostCompactionFileRestore(shaped []client.Message, overheadTokens int) (client.Message, bool) {
 	rt := a.readTracker
 	if rt == nil || a.contextWindow <= 0 {
 		return client.Message{}, false
 	}
-	budget := ctxwin.CompactTriggerTokens(a.contextWindow) - ctxwin.EstimateTokens(shaped) - a.estOverhead()
+	if overheadTokens < 0 {
+		overheadTokens = 0
+	}
+	budget := ctxwin.CompactTriggerTokens(a.contextWindow) - ctxwin.EstimateTokens(shaped) - overheadTokens
 	if budget > restoreTotalTokenCap {
 		budget = restoreTotalTokenCap
 	}
@@ -204,17 +272,20 @@ func (a *AgentLoop) buildPostCompactionFileRestore(shaped []client.Message) (cli
 		if charBudget < clip {
 			clip = charBudget
 		}
-		content = clipRunesWithMarker(content, clip)
-		fmt.Fprintf(&sb, "## %s (lines %d-%d)\n%s\n\n", read.Path, first, last, content)
-		charBudget -= len(content)
+		content = clipWithMarker(content, clip)
+		// A literal closing tag inside file content would end the
+		// system-reminder block early and reframe the rest as instructions.
+		content = strings.ReplaceAll(content, "</system-reminder>", "[/system-reminder]")
+		section := fmt.Sprintf("%s%s (lines %d-%d)\n%s\n\n", restoreHeaderPrefix, read.Path, first, last, content)
+		sb.WriteString(section)
+		charBudget -= len(section)
 		files++
 	}
 	if files == 0 {
 		return client.Message{}, false
 	}
 
-	text := "<system-reminder>\nContext was compacted. The most recently read files were re-read from disk to preserve continuity (fresh content — a file may have changed since the earlier read):\n\n" +
-		sb.String() + "</system-reminder>"
+	text := "<system-reminder>\n" + restoreIntro + "\n\n" + sb.String() + "</system-reminder>"
 	fmt.Fprintf(os.Stderr, "[agent] post-compaction file restore: %d file(s), ~%d chars\n", files, len(text))
 	return client.Message{Role: "user", Content: client.NewTextContent(text)}, true
 }

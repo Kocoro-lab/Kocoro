@@ -75,7 +75,7 @@ func TestBuildPostCompactionFileRestore_RestoresRecentFiles(t *testing.T) {
 	recordRead(rt, gone, 0, 0)
 
 	loop := newRestoreTestLoop(rt)
-	msg, ok := loop.buildPostCompactionFileRestore(smallShaped())
+	msg, ok := loop.buildPostCompactionFileRestore(smallShaped(), 0)
 	if !ok {
 		t.Fatal("restore message expected")
 	}
@@ -109,7 +109,7 @@ func TestBuildPostCompactionFileRestore_SkipsReadsKeptInTail(t *testing.T) {
 	})})
 
 	loop := newRestoreTestLoop(rt)
-	if _, ok := loop.buildPostCompactionFileRestore(shaped); ok {
+	if _, ok := loop.buildPostCompactionFileRestore(shaped, 0); ok {
 		t.Fatal("a file whose file_read survives in the kept tail must not be re-injected")
 	}
 }
@@ -123,7 +123,7 @@ func TestBuildPostCompactionFileRestore_Budgets(t *testing.T) {
 	recordRead(rt, big, 0, 0)
 
 	loop := newRestoreTestLoop(rt)
-	msg, ok := loop.buildPostCompactionFileRestore(smallShaped())
+	msg, ok := loop.buildPostCompactionFileRestore(smallShaped(), 0)
 	if !ok {
 		t.Fatal("restore expected")
 	}
@@ -135,9 +135,154 @@ func TestBuildPostCompactionFileRestore_Budgets(t *testing.T) {
 	// entirely rather than re-arm the compaction it just paid for.
 	tight := newRestoreTestLoop(rt)
 	tight.SetContextWindowExplicit(20_000)
-	tight.estOverheadTokens.Store(17_500) // trigger 18_000 − overhead ≈ 500 < floor
-	if _, ok := tight.buildPostCompactionFileRestore(smallShaped()); ok {
+	// trigger 18_000 − overhead 17_500 ≈ 500 < floor
+	if _, ok := tight.buildPostCompactionFileRestore(smallShaped(), 17_500); ok {
 		t.Fatal("restore must be skipped when the trigger budget has no headroom")
+	}
+}
+
+func TestBuildPostCompactionFileRestore_SkipsBinaryAndInvalidUTF8(t *testing.T) {
+	dir := t.TempDir()
+	png := filepath.Join(dir, "shot.png")
+	os.WriteFile(png, []byte("\x89PNG\r\n\x1a\nfakebinary"), 0o644)
+	pdf := filepath.Join(dir, "doc.pdf")
+	os.WriteFile(pdf, []byte("%PDF-1.7 fake"), 0o644)
+	garbled := filepath.Join(dir, "raw.dat")
+	os.WriteFile(garbled, []byte{0xff, 0xfe, 0x01, 0x02, 0x80, 0x81}, 0o644)
+
+	rt := NewReadTracker()
+	recordRead(rt, png, 0, 0)
+	recordRead(rt, pdf, 0, 0)
+	recordRead(rt, garbled, 0, 0)
+
+	loop := newRestoreTestLoop(rt)
+	if msg, ok := loop.buildPostCompactionFileRestore(smallShaped(), 0); ok {
+		t.Fatalf("binary / non-UTF-8 reads must not be re-injected as text: %.300q", msg.Content.Text())
+	}
+}
+
+func TestBuildPostCompactionFileRestore_SkipsFilesInPriorRestoreBlock(t *testing.T) {
+	dir := t.TempDir()
+	already := filepath.Join(dir, "already.md")
+	os.WriteFile(already, []byte("previously restored content\n"), 0o644)
+
+	rt := NewReadTracker()
+	recordRead(rt, already, 0, 0)
+
+	loop := newRestoreTestLoop(rt)
+	first, ok := loop.buildPostCompactionFileRestore(smallShaped(), 0)
+	if !ok {
+		t.Fatal("first restore expected")
+	}
+	// A second compaction in the same Run keeps the first restore block in
+	// the tail — the same file must not be injected twice.
+	shaped := append(smallShaped(), first)
+	if msg, ok := loop.buildPostCompactionFileRestore(shaped, 0); ok {
+		t.Fatalf("file already present in a prior restore block must be skipped: %.300q", msg.Content.Text())
+	}
+}
+
+func TestBuildPostCompactionFileRestore_MaxFilesCap(t *testing.T) {
+	dir := t.TempDir()
+	rt := NewReadTracker()
+	for i := 0; i < restoreMaxFiles+2; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("f%d.txt", i))
+		os.WriteFile(p, []byte(fmt.Sprintf("content of file %d\n", i)), 0o644)
+		recordRead(rt, p, 0, 0)
+		time.Sleep(time.Millisecond)
+	}
+
+	loop := newRestoreTestLoop(rt)
+	msg, ok := loop.buildPostCompactionFileRestore(smallShaped(), 0)
+	if !ok {
+		t.Fatal("restore expected")
+	}
+	if got := strings.Count(msg.Content.Text(), "## "); got != restoreMaxFiles {
+		t.Fatalf("restore must cap at %d files, got %d sections", restoreMaxFiles, got)
+	}
+}
+
+// TestAgentLoop_ReactiveRestoreRespectsEvidenceFloor: after a context-length
+// 400 the reactive path floors its overhead at window−estimate+1; the
+// restoration budget must use that SAME floor. Budgeting against the plain
+// (possibly zero) calibration would inject tens of thousands of tokens into
+// a prompt the provider just rejected, and reactiveCompacted makes the second
+// overflow terminal.
+func TestAgentLoop_ReactiveRestoreRespectsEvidenceFloor(t *testing.T) {
+	dir := t.TempDir()
+	decoy := filepath.Join(dir, "decoy.md")
+	os.WriteFile(decoy, []byte("alpha\nRESTORE_MARKER_9f3c2a71d4b85e06\nomega\n"), 0o644)
+
+	var mu sync.Mutex
+	firstErrorMsgCount := 0
+	restoredInRetry := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := readBody(r.Body)
+		defer r.Body.Close()
+		var req struct {
+			ModelTier string `json:"model_tier"`
+			Messages  []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		json.Unmarshal(raw, &req)
+
+		if req.ModelTier == "small" {
+			json.NewEncoder(w).Encode(nativeResponse(
+				"## Current task & next steps\nsummary of prior steps", "end_turn", nil, 50, 30))
+			return
+		}
+
+		mu.Lock()
+		msgCount := len(req.Messages)
+		if msgCount < 12 && firstErrorMsgCount == 0 {
+			mu.Unlock()
+			json.NewEncoder(w).Encode(nativeResponse(
+				"", "tool_use",
+				toolCall("think", fmt.Sprintf(`{"thought":"step %d"}`, msgCount)),
+				50, 20))
+			return
+		}
+		if firstErrorMsgCount == 0 || msgCount >= firstErrorMsgCount {
+			if firstErrorMsgCount == 0 {
+				firstErrorMsgCount = msgCount
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"prompt is too long"}}`))
+			return
+		}
+		if strings.Contains(string(raw), "RESTORE_MARKER_9f3c2a71d4b85e06") {
+			restoredInRetry = true
+		}
+		mu.Unlock()
+		json.NewEncoder(w).Encode(nativeResponse("done after shaped retry", "end_turn", nil, 100, 20))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&thinkTool{})
+
+	rt := NewReadTracker()
+	recordRead(rt, decoy, 0, 0)
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+	loop.SetContextWindowExplicit(200_000)
+	loop.SetMemoryDir(t.TempDir())
+	loop.SetHandler(&mockHandler{approveResult: true})
+	loop.SetReadTracker(rt)
+
+	_, _, err := loop.Run(context.Background(), "run the steps", nil, nil)
+	if err != nil {
+		t.Errorf("Run should recover through the shaped retry: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if restoredInRetry {
+		t.Error("post-400 retry must not carry restored file content — the evidence floor leaves no budget")
 	}
 }
 
@@ -200,7 +345,7 @@ func TestAgentLoop_PostCompactionRestoresRecentReads(t *testing.T) {
 	// Restored calibration arms the i==0 trigger: estimate (~12K) + 43K
 	// crosses the 54K trigger, while the shaped floor (~2K) + 43K stays
 	// under the 48K landing with headroom for the restoration payload.
-	_, _, fp := loop.EstOverheadState()
+	fp := loop.ToolsFingerprint()
 	loop.SetEstOverheadState(43_000, "test-model", fp)
 
 	if _, _, err := loop.Run(context.Background(), "continue the work", nil, history); err != nil {

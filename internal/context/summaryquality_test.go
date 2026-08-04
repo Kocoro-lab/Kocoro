@@ -223,6 +223,61 @@ func TestGenerateSummary_MechanicalIdentifierBackstop(t *testing.T) {
 	}
 }
 
+func TestExtractOpaqueIdentifiers_NoMidWordHexMatch(t *testing.T) {
+	// [A-Fa-f0-9]{8,} without word anchoring matched INSIDE ordinary tokens
+	// ("abc123456789xyz" → "bc123456789") and then demanded the summary echo
+	// a fragment no one ever wrote.
+	got := extractOpaqueIdentifiers("the symbol abc123456789xyz is a function name, not an identifier")
+	for _, g := range got {
+		if g == "BC123456789" || g == "123456789" {
+			t.Fatalf("mid-word hex fragment must not be extracted: %v", got)
+		}
+	}
+}
+
+// Identifier-only failures skip the paid retry: the mechanical backstop
+// already guarantees identifier survival for free, and at compaction scale
+// the droppable middle almost always contains identifier-shaped tokens — a
+// retry per compaction would be a recurring small-tier cost with no upside.
+func TestGenerateSummary_IdentifierOnlyFailureSkipsRetry(t *testing.T) {
+	structuredButMissingIDs := `<summary>## Current task & next steps
+Continue the deployment verification workload.
+
+## User corrections & decisions
+None.</summary>`
+	c := &scriptedCompleter{outputs: []string{structuredButMissingIDs}}
+
+	summary, _, err := GenerateSummary(context.Background(), c, buildAuditableHistory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.reqs) != 1 {
+		t.Fatalf("identifier-only failure must go straight to the mechanical backstop, got %d calls", len(c.reqs))
+	}
+	if !strings.Contains(summary, autoPreservedHeader) || !strings.Contains(summary, "9F3C2A71D4B85E06") {
+		t.Errorf("missing identifiers must be auto-preserved without a retry: %.400q", summary)
+	}
+}
+
+// A retry that comes back WORSE than the first candidate must not win.
+func TestGenerateSummary_RetryReauditedKeepsBetterCandidate(t *testing.T) {
+	prose := "<summary>" + e2eJunkSummary + "</summary>" // no sections at all
+	c := &scriptedCompleter{outputs: []string{prose, prose}}
+
+	summary, _, err := GenerateSummary(context.Background(), c, buildAuditableHistory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.reqs) != 2 {
+		t.Fatalf("structural failure must retry once, got %d calls", len(c.reqs))
+	}
+	// Both candidates are equally bad; the point is the result still carries
+	// the mechanical identifier section and did not crash re-auditing.
+	if !strings.Contains(summary, autoPreservedHeader) {
+		t.Errorf("backstop must still fire after an unimproved retry: %.300q", summary)
+	}
+}
+
 func TestGenerateSummary_CleanFirstPassMakesOneCall(t *testing.T) {
 	good := `<summary>## Current task & next steps
 Continue the work.

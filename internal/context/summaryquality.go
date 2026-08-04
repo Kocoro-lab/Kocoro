@@ -22,8 +22,11 @@ const maxExtractedIdentifiers = 12
 // opaqueIdentifierPattern matches token shapes a summarizer paraphrase would
 // destroy and a later turn may need verbatim: long hex (commit hashes), URLs,
 // unix paths, host:port pairs, and long bare numbers (tickets, PR/issue ids).
+// The hex and number alternatives are \b-anchored: unanchored, "abc123def456"
+// would yield the fragment "bc123def456" and the audit would then demand the
+// summary echo a token nobody ever wrote.
 var opaqueIdentifierPattern = regexp.MustCompile(
-	`([A-Fa-f0-9]{8,}|https?://\S+|/[\w.-]{2,}(?:/[\w.-]+)+|[A-Za-z0-9._-]+\.[A-Za-z0-9._/-]+:\d{1,5}|\b\d{6,}\b)`)
+	`(\b[A-Fa-f0-9]{8,}\b|https?://\S+|/[\w.-]{2,}(?:/[\w.-]+)+|[A-Za-z0-9._-]+\.[A-Za-z0-9._/-]+:\d{1,5}|\b\d{6,}\b)`)
 
 // summarySectionHeaders are the labeled sections summarizePrompt demands. The
 // audit requires at least one to be present: the first two are expected on
