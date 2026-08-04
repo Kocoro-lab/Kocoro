@@ -856,8 +856,10 @@ func TestAgentLoop_ReactiveCompaction_UsesEmergencyFallbackWhenSoftStillOverBudg
 
 		if req.ModelTier == "small" {
 			calls = append(calls, "summary")
+			// Structured so the summary quality audit accepts it first try —
+			// this test pins the soft→emergency call sequence, not the audit.
 			json.NewEncoder(w).Encode(nativeResponse(
-				"condensed summary",
+				"## Current task & next steps\ncondensed summary",
 				"end_turn", nil, 50, 30))
 			return
 		}

@@ -3503,9 +3503,11 @@ func TestAgentLoop_CompactionTriggersOnHighTokenUsage(t *testing.T) {
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
 				toolCall("think", `{"thought":"planning"}`), 110000, 10000))
 		case 2:
-			// Summary call: GenerateSummary uses model_tier=small
+			// Summary call: GenerateSummary uses model_tier=small. Structured
+			// so the quality audit accepts it without a retry (this test pins
+			// the exact 3-call sequence).
 			json.NewEncoder(w).Encode(nativeResponse(
-				"User asked to refactor main.go. Assistant read the file and applied changes.",
+				"## Current task & next steps\nUser asked to refactor main.go. Assistant read the file and applied changes.",
 				"end_turn", nil, 500, 100))
 		case 3:
 			// Post-compaction: model responds with final text
@@ -3657,9 +3659,10 @@ func TestAgentLoop_CompactionSummaryTransientFailureRecovers(t *testing.T) {
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
 				toolCall("think", `{"thought":"more"}`), 115000, 10000))
 		case 4:
-			// Summary retry succeeds this time
+			// Summary retry succeeds this time. Structured so the quality
+			// audit accepts it without adding a call to the pinned sequence.
 			json.NewEncoder(w).Encode(nativeResponse(
-				"User was working on a heavy task with deep thinking.",
+				"## Current task & next steps\nUser was working on a heavy task with deep thinking.",
 				"end_turn", nil, 500, 100))
 		case 5:
 			// Post-compaction final response

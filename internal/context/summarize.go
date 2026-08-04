@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -94,6 +95,9 @@ Tools whose schemas were pulled in via tool_search this session. One comma-separ
 
 Rules:
 - Be factual and brief. The goal is continuation, not exposition.
+- Preserve literal identifiers exactly as seen (commit hashes, URLs, ports,
+  issue/PR numbers, version tags, file paths) inside the relevant sections —
+  never paraphrase or round them.
 - If a section has no content, omit its header rather than writing "none" or "N/A".
 - Do not add sections beyond the five above.
 - If the conversation does not fit the five-section structure (e.g. very short,
@@ -133,8 +137,19 @@ func buildTranscript(messages []client.Message) string {
 // GenerateSummary calls the LLM (small tier) to summarize a conversation.
 // It strips the system message from the input to avoid wasting tokens.
 // Serializes both plain text and block content (tool_use, tool_result).
+//
+// The candidate summary is audited before acceptance (auditSummary): it must
+// carry the labeled section structure and echo every at-risk identifier from
+// the droppable middle of the history. A failing summary gets ONE retry with
+// the failure reasons appended; identifiers still missing after that are
+// appended mechanically (appendAutoPreservedIdentifiers), so compaction can
+// no longer silently lose them (2026-08-04 e2e: a one-line junk summary was
+// accepted unvalidated and the identifiers were unrecoverable). An empty
+// extraction keeps the existing semantics — callers treat "" as a failure
+// with their own backoff.
 func GenerateSummary(ctx context.Context, c Completer, messages []client.Message) (string, client.Usage, error) {
 	transcript := capTranscriptForSummarize(buildTranscript(messages))
+	identifiers := identifiersAtRisk(messages)
 	req := client.CompletionRequest{
 		Messages: []client.Message{
 			{Role: "system", Content: client.NewTextContent(summarizePrompt)},
@@ -150,8 +165,37 @@ func GenerateSummary(ctx context.Context, c Completer, messages []client.Message
 	if err != nil {
 		return "", client.Usage{}, fmt.Errorf("summarization failed: %w", err)
 	}
+	usage := resp.Usage
+	summary := extractSummary(resp.OutputText)
 
-	return extractSummary(resp.OutputText), resp.Usage, nil
+	// The audit only makes sense at compaction scale: a history with no
+	// droppable middle (ShapeHistory could not drop anything) legitimately
+	// summarizes as short prose — the prompt's own escape hatch — and has no
+	// at-risk identifiers by definition.
+	if len(messages) <= 2+minKeepLast*2 {
+		return summary, usage, nil
+	}
+	reasons := auditSummary(summary, identifiers)
+	if summary == "" || len(reasons) == 0 {
+		return summary, usage, nil
+	}
+
+	fmt.Fprintf(os.Stderr, "[context] summary failed quality audit (%s), retrying once\n",
+		strings.Join(reasons, "; "))
+	retryReq := req
+	retryReq.Messages = append(append([]client.Message{}, req.Messages...),
+		client.Message{Role: "assistant", Content: client.NewTextContent(resp.OutputText)},
+		client.Message{Role: "user", Content: client.NewTextContent(buildSummaryRetryMessage(reasons, identifiers))},
+	)
+	retryResp, retryErr := c.Complete(ctx, retryReq)
+	if retryErr == nil {
+		usage = addUsage(usage, retryResp.Usage)
+		if retried := extractSummary(retryResp.OutputText); retried != "" {
+			summary = retried
+		}
+	}
+
+	return appendAutoPreservedIdentifiers(summary, identifiers), usage, nil
 }
 
 // userSummarizePrompt is the system prompt for both GET /sessions/{id}/summary
