@@ -43,6 +43,7 @@ const (
 	// keeps head+tail so usable signal survives. Override: lower for a tighter
 	// system-prompt reserve; raising past ~0.9 risks the clipped message alone
 	// re-crossing the compaction threshold.
+	// Same value as compactRetargetFraction by coincidence only; do not unify.
 	stableUserBudgetFraction = 0.80
 
 	// defaultKeepLast is the default number of recent turn pairs to keep.
@@ -76,8 +77,42 @@ func ShouldCompact(inputTokens, outputTokens, contextWindow int) bool {
 	if contextWindow <= 0 {
 		return false
 	}
-	threshold := int(float64(contextWindow) * compactThreshold)
-	return inputTokens+outputTokens >= threshold
+	return inputTokens+outputTokens >= compactTargetTokens(contextWindow)
+}
+
+// compactTargetTokens is the line compaction layers judge "over" against:
+// compactThreshold × contextWindow. Shared by ShouldCompact (the proactive
+// trigger), ShapeHistory's skip gate and TruncateOversizedLastUserMessage so
+// they all agree with the trigger. Before this helper the trigger fired at
+// 90% while ShapeHistory accepted anything under 100%, so a session could
+// trigger every iteration yet never shrink below the trigger — paying a
+// summary per Run for nothing.
+func compactTargetTokens(contextWindow int) int {
+	return int(float64(contextWindow) * compactThreshold)
+}
+
+// compactRetargetFraction is where a compaction aims to LAND — deliberately
+// below the compactThreshold trigger so one compaction buys real headroom
+// (hysteresis) instead of stopping exactly at the line and re-triggering on
+// the next large tool result (observed live: two full compactions within
+// three iterations, each paying PersistLearnings + GenerateSummary + a full
+// prompt-cache rebuild).
+//   - Workload: sessions with large per-turn tool results (file reads,
+//     browser snapshots) near the window limit.
+//   - Symptom when it binds: keepLast shrinks further than strictly needed —
+//     up to an extra (compactThreshold − compactRetargetFraction) × window of
+//     recent turn pairs is summarized away per compaction.
+//   - Override: raise toward compactThreshold for maximum context retention
+//     at the cost of more frequent compactions; the gap between the two is
+//     the hysteresis band.
+//
+// Same value as stableUserBudgetFraction by coincidence only — that one
+// budgets a single user message inside the target; do not unify.
+const compactRetargetFraction = 0.80
+
+// compactLandingTokens is the acceptance budget for shaped candidates.
+func compactLandingTokens(contextWindow int) int {
+	return int(float64(contextWindow) * compactRetargetFraction)
 }
 
 // ShapeHistory builds a sliding window over messages:
@@ -85,15 +120,43 @@ func ShouldCompact(inputTokens, outputTokens, contextWindow int) bool {
 //	[system] + [first user message] + [summary] + [last N turn pairs]
 //
 // If the history is short enough to fit without shaping, it's returned as-is.
-// After shaping, if estimated tokens still exceed the context window,
+// After shaping, if estimated tokens still exceed the compaction target,
 // keepLast is reduced iteratively down to minKeepLast.
-func ShapeHistory(messages []client.Message, summary string, contextWindow int) []client.Message {
+//
+// overheadTokens calibrates EstimateTokens against the provider's real prompt
+// accounting: callers that have observed real usage pass
+// (real prompt tokens − estimate at send time), so tool schemas — which live
+// outside messages — and the chars/3.5 underestimate on dense content both
+// count against the budget. Known bias: the overhead fuses a fixed term
+// (schemas) with one proportional to content, and is charged whole against
+// shaped candidates that retain only part of the content — near the boundary
+// this over-compacts by a pair or two. Direction is safe (never
+// under-compacts); split into ratio + fixed terms if it ever matters.
+// Real usage and the estimate disagreed by ~25% on
+// code-heavy sessions, which put the whole [90% real, 100% est] band into a
+// "trigger fires, shaper declines" dead zone (2026-08-04 e2e). Pass 0 when no
+// real measurement exists (pure-estimate callers keep the old behavior, just
+// against the 90% target).
+//
+// The shaped result is returned only when it actually drops messages.
+// A candidate that merely inserts the summary (keepLast covers every pair)
+// would break the prompt-cache prefix and grow the prompt without freeing
+// anything, so the original slice is returned unchanged instead — callers can
+// detect the no-op via len() and must NOT treat it as an applied compaction.
+func ShapeHistory(messages []client.Message, summary string, contextWindow int, overheadTokens int) []client.Message {
+	if overheadTokens < 0 {
+		overheadTokens = 0
+	}
 	// Skip shaping if too few messages to meaningfully shape (need system + first user + at least minKeepLast pairs)
 	if len(messages) <= 3+minKeepLast*2 {
 		return messages
 	}
-	// Skip if both message count is low AND estimated tokens fit in budget
-	if len(messages) <= 3+defaultKeepLast*2 && (contextWindow <= 0 || EstimateTokens(messages) < contextWindow) {
+	// Skip if both message count is low AND calibrated tokens fit under the
+	// compaction target. Judging against compactTargetTokens (not the raw
+	// window) keeps this gate consistent with the ShouldCompact trigger:
+	// when the trigger says "over the line", this gate must not say "fits".
+	if len(messages) <= 3+defaultKeepLast*2 &&
+		(contextWindow <= 0 || EstimateTokens(messages)+overheadTokens < compactTargetTokens(contextWindow)) {
 		return messages
 	}
 
@@ -107,14 +170,75 @@ func ShapeHistory(messages []client.Message, summary string, contextWindow int) 
 	keepLast := defaultKeepLast
 	for keepLast >= minKeepLast {
 		shaped := buildShaped(system, firstUser, summary, rest, keepLast)
-		if contextWindow <= 0 || EstimateTokens(shaped) < contextWindow {
+		if contextWindow <= 0 || EstimateTokens(shaped)+overheadTokens < compactLandingTokens(contextWindow) {
+			if len(shaped) >= len(messages) {
+				// Fits, but nothing was dropped (summary-only insertion).
+				return messages
+			}
 			return shaped
 		}
 		keepLast--
 	}
 
-	// Floor: return with minKeepLast even if over budget
-	return buildShaped(system, firstUser, summary, rest, minKeepLast)
+	// Floor: return with minKeepLast even if over budget — unless even the
+	// floor drops nothing, in which case shaping cannot help. With the
+	// current constants the ≤ 3+minKeepLast*2 early return above already
+	// excludes every history the floor could fail to shrink, so this guard
+	// is defence-in-depth for future constant changes, not live logic.
+	floor := buildShaped(system, firstUser, summary, rest, minKeepLast)
+	if len(floor) >= len(messages) {
+		return messages
+	}
+	return floor
+}
+
+// ForceShapeHistory shapes unconditionally on behalf of an explicit user
+// request (TUI /compact): the caller has already paid for PersistLearnings
+// and the summary, so the budget-based skip gates of ShapeHistory — which
+// exist to avoid pointless compaction the user never asked for — do not
+// apply. keepLast is capped so at least one message is actually dropped
+// (net of the inserted summary); when even the minKeepLast floor cannot
+// reduce the history, the original slice is returned unchanged and the
+// caller should report "too short to compact".
+func ForceShapeHistory(messages []client.Message, summary string, contextWindow int, overheadTokens int) []client.Message {
+	if overheadTokens < 0 {
+		overheadTokens = 0
+	}
+	if len(messages) <= 3+minKeepLast*2 {
+		return messages
+	}
+
+	system := messages[0]
+	firstUser := messages[1]
+	rest := messages[2:]
+
+	// Largest keepLast that still nets a reduction: buildShaped keeps
+	// keepLast*2 tail messages and adds the summary message (when present),
+	// so require keepLast*2 ≤ len(rest) − (1 + summaryLen).
+	minDrop := 1
+	if summary != "" {
+		minDrop = 2
+	}
+	keepLast := (len(rest) - minDrop) / 2
+	if keepLast > defaultKeepLast {
+		keepLast = defaultKeepLast
+	}
+	for keepLast > minKeepLast {
+		shaped := buildShaped(system, firstUser, summary, rest, keepLast)
+		if contextWindow <= 0 || EstimateTokens(shaped)+overheadTokens < compactLandingTokens(contextWindow) {
+			if len(shaped) >= len(messages) {
+				return messages
+			}
+			return shaped
+		}
+		keepLast--
+	}
+
+	floor := buildShaped(system, firstUser, summary, rest, minKeepLast)
+	if len(floor) >= len(messages) {
+		return messages
+	}
+	return floor
 }
 
 // buildShaped assembles the shaped message array.
@@ -192,12 +316,20 @@ func buildShaped(system, firstUser client.Message, summary string, rest []client
 // mid-sequence. Returns (messages, droppedChars). droppedChars > 0 means
 // truncation actually happened; callers can use it to emit OnRunStatus or
 // audit.
-func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow int) ([]client.Message, int) {
+func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow int, overheadTokens int) ([]client.Message, int) {
 	if contextWindow <= 0 || len(messages) == 0 {
 		return messages, 0
 	}
-	target := int(float64(contextWindow) * compactThreshold)
-	estimated := EstimateTokens(messages)
+	if overheadTokens < 0 {
+		overheadTokens = 0
+	}
+	target := compactTargetTokens(contextWindow)
+	// overheadTokens (real prompt tokens − estimate at send time, when the
+	// caller has observed real usage) counts the same way here as in
+	// ShapeHistory: it is non-user-text mass (tool schemas, estimator
+	// underestimate), so it inflates `estimated` and thereby lands in the
+	// "other messages" side of every budget computation below.
+	estimated := EstimateTokens(messages) + overheadTokens
 	if estimated <= target {
 		return messages, 0
 	}
@@ -242,9 +374,50 @@ func TruncateOversizedLastUserMessage(messages []client.Message, contextWindow i
 		// largest message toward the remaining headroom (slice-aware, NOT
 		// byte-stable). See truncateLargestUserMessageToFit for why this is
 		// acceptable here.
+		//
+		// Futility guard: only clip when plain-text user content can plausibly
+		// fix the overflow. When the overflow is driven by structured content
+		// (tool_result blocks in tool-heavy sessions), the only plain-text
+		// user message is typically the scaffolded first message carrying
+		// user_instructions — clipping it to the floor destroys the persona
+		// and the request while leaving the prompt over target anyway
+		// (observed 2026-08-04: instructions cut 52K→4K chars across three
+		// passes, est still over, all tool_results untouched). If even
+		// clipping every plain-text user message down to the floor cannot
+		// reach target, skip: ShapeHistory / reactive handling own this case.
+		maxRecoverable := 0
+		for i := range messages {
+			if messages[i].Role != "user" || messages[i].Content.HasBlocks() {
+				continue
+			}
+			text := messages[i].Content.Text()
+			if text == "" {
+				continue
+			}
+			// Content tokens only — deliberately NOT + overheadPerMessage
+			// (unlike the oversized scan above): a truncated message still
+			// exists and still pays its per-message overhead, so only the
+			// content above the floor is actually recoverable. Including the
+			// overhead would make this guard optimistic by 4 tokens per
+			// message — engaging truncation in cases that cannot reach target.
+			msgTokens := int(math.Ceil(float64(utf8.RuneCountInString(text)) / charsPerToken))
+			if msgTokens > minUserTokenFloor {
+				maxRecoverable += msgTokens - minUserTokenFloor
+			}
+		}
+		if estimated-maxRecoverable > target {
+			return messages, 0
+		}
 		return truncateLargestUserMessageToFit(messages, target, estimated, minUserTokenFloor)
 	}
 
+	// No futility guard on this branch (unlike the aggregate fallback below):
+	// an oversized message by definition holds > singleCap tokens, so clipping
+	// it recovers a large, usually decisive share of the overflow — and this
+	// branch is the giant-paste protection (2026-05-11 stress: a single
+	// 191K-token user message escaped every gate), where declining would resend
+	// an over-cap prompt with no cheaper layer left to fix it.
+	//
 	// Share singleCap across the oversized messages: N of them each capped at
 	// singleCap/N, so their post-truncation SUM stays within singleCap and the
 	// prompt drops below the preflight threshold even with several huge inputs

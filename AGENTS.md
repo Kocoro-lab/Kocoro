@@ -184,7 +184,7 @@ Any in-place message content rewrite that can affect prompt bytes must emit cach
 
 ### Context Management
 
-Context-window defaults are only seeds; model responses may auto-adjust the active window unless a per-agent override explicitly locks it. Preserve proactive, pre-flight, and reactive compaction as separate gates so context errors do not cascade.
+Context-window defaults are only seeds; model responses may auto-adjust the active window unless a per-agent override explicitly locks it. Preserve proactive, pre-flight, and reactive compaction as separate gates so context errors do not cascade. Estimate-based gates must stay calibrated against real prompt usage (estimator overhead) and share the trigger's scale; compactions land below the trigger (hysteresis) so one compaction cannot immediately re-trigger.
 
 ### Anti-Hallucination
 

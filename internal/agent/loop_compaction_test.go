@@ -1404,7 +1404,7 @@ func TestPreflightCompaction_TriggersBeforeOversizedCall(t *testing.T) {
 	}
 
 	// shouldPreflightCompact is the decision function under test.
-	got := shouldPreflightCompact(messages, 200_000)
+	got := shouldPreflightCompact(messages, 200_000, 0)
 	if !got {
 		t.Errorf("shouldPreflightCompact = false, want true (msg estimate exceeds 95%% of 200K)")
 	}
@@ -1414,12 +1414,12 @@ func TestPreflightCompaction_TriggersBeforeOversizedCall(t *testing.T) {
 		{Role: "system", Content: client.NewTextContent("sys")},
 		{Role: "user", Content: client.NewTextContent("hi")},
 	}
-	if shouldPreflightCompact(smallMsgs, 200_000) {
+	if shouldPreflightCompact(smallMsgs, 200_000, 0) {
 		t.Errorf("shouldPreflightCompact = true on under-budget messages")
 	}
 
 	// Edge: contextWindow=0 (disabled) → never trigger.
-	if shouldPreflightCompact(messages, 0) {
+	if shouldPreflightCompact(messages, 0, 0) {
 		t.Errorf("shouldPreflightCompact = true with contextWindow=0; should be disabled")
 	}
 }
@@ -1434,12 +1434,12 @@ func TestShortSessionTruncate_RepeatsUntilUnderPreflightThreshold(t *testing.T) 
 		{Role: "assistant", Content: client.NewTextContent("ack")},
 		{Role: "user", Content: client.NewTextContent(hugeB)},
 	}
-	if !shouldPreflightCompact(messages, loop.contextWindow) {
+	if !shouldPreflightCompact(messages, loop.contextWindow, 0) {
 		t.Fatal("test setup invariant: input must exceed preflight threshold")
 	}
 
 	out := loop.shortSessionTruncate(messages, "test")
-	if shouldPreflightCompact(out, loop.contextWindow) {
+	if shouldPreflightCompact(out, loop.contextWindow, 0) {
 		t.Fatalf("shortSessionTruncate left prompt over preflight threshold")
 	}
 	if !strings.Contains(out[1].Content.Text(), "user message truncated") {
@@ -1470,7 +1470,7 @@ func TestShortSessionTruncate_LongSessionIsNoop(t *testing.T) {
 		{Role: "assistant", Content: client.NewTextContent("g")},
 		{Role: "user", Content: client.NewTextContent("h")},
 	}
-	if !shouldPreflightCompact(messages, loop.contextWindow) {
+	if !shouldPreflightCompact(messages, loop.contextWindow, 0) {
 		t.Fatal("test setup invariant: input must exceed preflight threshold")
 	}
 	out := loop.shortSessionTruncate(messages, "test")
@@ -1501,11 +1501,11 @@ func TestTruncateUserMessageOverBudget_LongSessionClipsHugeFirstUser(t *testing.
 		{Role: "assistant", Content: client.NewTextContent("g")},
 		{Role: "user", Content: client.NewTextContent("h")},
 	}
-	if !shouldPreflightCompact(messages, loop.contextWindow) {
+	if !shouldPreflightCompact(messages, loop.contextWindow, 0) {
 		t.Fatal("test setup invariant: input must exceed preflight threshold")
 	}
 	out := loop.truncateUserMessageOverBudget(messages, "post_compaction", "long_session")
-	if shouldPreflightCompact(out, loop.contextWindow) {
+	if shouldPreflightCompact(out, loop.contextWindow, 0) {
 		t.Fatalf("post-compaction safety net left long-session prompt over preflight threshold")
 	}
 	if !strings.Contains(out[1].Content.Text(), "user message truncated") {
@@ -1536,11 +1536,11 @@ func TestTruncateUserMessageOverBudget_AggregateMidSizeConverges(t *testing.T) {
 		{Role: "assistant", Content: client.NewTextContent("ack")},
 		{Role: "user", Content: client.NewTextContent(mid)},
 	}
-	if !shouldPreflightCompact(messages, loop.contextWindow) {
+	if !shouldPreflightCompact(messages, loop.contextWindow, 0) {
 		t.Fatal("test setup invariant: input must exceed preflight threshold")
 	}
 	out := loop.truncateUserMessageOverBudget(messages, "test", "short_session")
-	if shouldPreflightCompact(out, loop.contextWindow) {
+	if shouldPreflightCompact(out, loop.contextWindow, 0) {
 		t.Fatalf("aggregate mid-size session left prompt over preflight threshold — no backstop exists below MinShapeable, so this would 400")
 	}
 }
@@ -1942,5 +1942,228 @@ func TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript(t *testing
 		t.Errorf("peak SUMMARY user-content body length = %d, expected the cap to be binding (≥ %d).\n"+
 			"The seeded transcript may not be large enough to actually exercise capTranscriptForSummarize.",
 			peakSummaryChars, summarizeInputCapCharsLocal/2)
+	}
+}
+
+// TestAgentLoop_CompactionFiresWhenEstimateLags is the 2026-08-04 e2e
+// regression: the mock reports real prompt tokens over the 90% trigger while
+// the chars-based estimate of the small tool results stays far below it
+// (simulating tool-schema mass + estimator error). Pre-fix, the proactive
+// trigger fired, paid for PersistLearnings + GenerateSummary, then
+// ShapeHistory's uncalibrated skip gate declined — the summary was discarded,
+// a false "[system] Context was compacted" reanchor was appended, and the
+// compactionApplied latch disabled all further compaction for the Run.
+// Post-fix, estOverheadTokens carries the real-vs-estimate gap into
+// ShapeHistory, so a later main call must see FEWER messages than its
+// predecessor (history actually shrank).
+func TestAgentLoop_CompactionFiresWhenEstimateLags(t *testing.T) {
+	memoryDir := t.TempDir()
+
+	var mu sync.Mutex
+	var mainMsgCounts []int
+	sawSummary := false
+	summaryReachedMainRequest := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := readBody(r.Body)
+		defer r.Body.Close()
+
+		var req struct {
+			ModelTier string `json:"model_tier"`
+			Messages  []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		json.Unmarshal(raw, &req)
+
+		if req.ModelTier == "small" {
+			mu.Lock()
+			for _, m := range req.Messages {
+				var text string
+				json.Unmarshal(m.Content, &text)
+				if strings.Contains(text, "Compress the following conversation") {
+					sawSummary = true
+				}
+			}
+			mu.Unlock()
+			json.NewEncoder(w).Encode(nativeResponse("compact summary of prior steps", "end_turn", nil, 50, 30))
+			return
+		}
+
+		mu.Lock()
+		msgCount := len(req.Messages)
+		mainMsgCounts = append(mainMsgCounts, msgCount)
+		callNum := len(mainMsgCounts)
+		if strings.Contains(string(raw), "compact summary of prior steps") {
+			summaryReachedMainRequest = true
+		}
+		mu.Unlock()
+
+		// Tiny visible content (estimate stays low) but REAL usage far above
+		// it — must exceed EstimateTokens(request) (which includes the real
+		// system prompt) for the overhead calibration to register, and cross
+		// 90% of the 20000-token window to arm the proactive trigger.
+		inputTokens := 3000 * msgCount
+		if callNum < 12 {
+			json.NewEncoder(w).Encode(nativeResponse(
+				"", "tool_use",
+				toolCall("think", fmt.Sprintf(`{"thought":"step %d"}`, callNum)),
+				inputTokens, 50))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, inputTokens, 50))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&thinkTool{})
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+	// Window chosen so the raw estimate (system prompt + tiny tool results,
+	// ~2-3K tokens) stays UNDER the 18000 target while reported real usage
+	// crosses it — the exact dead-zone band from the e2e. An uncalibrated
+	// ShapeHistory skip gate declines here; the calibrated one must not.
+	loop.SetContextWindowExplicit(20000)
+	loop.SetMemoryDir(memoryDir)
+
+	handler := &usageRecordingHandler{mockHandler: mockHandler{approveResult: true}}
+	loop.SetHandler(handler)
+	_, _, err := loop.Run(context.Background(), "run the steps", nil, nil)
+	if err != nil {
+		t.Logf("Run error (tolerated): %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	t.Logf("main-call message counts: %v", mainMsgCounts)
+	for _, ev := range handler.statusEvents {
+		t.Logf("status: %s %s", ev.code, ev.detail)
+	}
+
+	if loop.estOverhead() <= 0 {
+		t.Errorf("estOverheadTokens should be calibrated from real usage, got %d", loop.estOverhead())
+	}
+	if !sawSummary {
+		t.Fatal("proactive compaction should have generated a summary")
+	}
+	// The regression signal: pre-fix, ShapeHistory declined (uncalibrated
+	// estimate said "fits"), so the paid-for summary never entered any main
+	// request — only a false "Context was compacted" reanchor did. Post-fix
+	// the shaped history (containing the summary) must feed later requests.
+	if !summaryReachedMainRequest {
+		t.Errorf("summary never reached a main request — ShapeHistory declined despite the real-usage trigger: %v", mainMsgCounts)
+	}
+}
+
+// TestAgentLoop_ReactiveEvidenceFloorShapesDespiteLowEstimate: a provider can
+// 400 for length while both the estimate AND the reported usage are far below
+// the configured window (token-counting mismatch, or a resumed session whose
+// Run has no usage sample yet). The 400 itself is proof the prompt exceeds
+// the window, so reactive compaction must shape regardless of what the
+// estimate claims. This mock keeps 400ing until the retry actually carries
+// fewer messages — the pre-fix behavior (ShapeHistory skipped via the
+// under-budget gate, history resent at full size) fails here.
+func TestAgentLoop_ReactiveEvidenceFloorShapesDespiteLowEstimate(t *testing.T) {
+	memoryDir := t.TempDir()
+
+	var mu sync.Mutex
+	firstErrorMsgCount := 0
+	shrunkRetrySucceeded := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := readBody(r.Body)
+		defer r.Body.Close()
+
+		var req struct {
+			ModelTier string `json:"model_tier"`
+			Messages  []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		json.Unmarshal(raw, &req)
+
+		if req.ModelTier == "small" {
+			json.NewEncoder(w).Encode(nativeResponse("summary of prior steps", "end_turn", nil, 50, 30))
+			return
+		}
+
+		mu.Lock()
+		msgCount := len(req.Messages)
+
+		if msgCount < 12 && firstErrorMsgCount == 0 {
+			mu.Unlock()
+			// Tiny reported usage: estOverheadTokens stays ~0, so only the
+			// 400-evidence floor can open ShapeHistory's gates later. Vary the
+			// thought so the loop detector doesn't force-stop the run early.
+			json.NewEncoder(w).Encode(nativeResponse(
+				"", "tool_use",
+				toolCall("think", fmt.Sprintf(`{"thought":"step %d"}`, msgCount)),
+				50, 20))
+			return
+		}
+
+		if firstErrorMsgCount == 0 || msgCount >= firstErrorMsgCount {
+			if firstErrorMsgCount == 0 {
+				firstErrorMsgCount = msgCount
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"prompt is too long"}}`))
+			return
+		}
+
+		shrunkRetrySucceeded = true
+		mu.Unlock()
+		json.NewEncoder(w).Encode(nativeResponse("done after shaped retry", "end_turn", nil, 100, 20))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&thinkTool{})
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+	loop.SetContextWindowExplicit(200_000) // estimate stays FAR below → old gate skipped
+	loop.SetMemoryDir(memoryDir)
+	loop.SetHandler(&mockHandler{approveResult: true})
+
+	_, _, err := loop.Run(context.Background(), "run the steps", nil, nil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !shrunkRetrySucceeded {
+		t.Fatalf("retry after reactive compaction never carried fewer messages (first 400 at %d msgs, err=%v)", firstErrorMsgCount, err)
+	}
+	if err != nil {
+		t.Errorf("Run should succeed once the shaped retry goes through: %v", err)
+	}
+}
+
+// TestEstOverheadResets pins the defensive calibration resets: a tool-registry
+// swap (SwitchAgent) changes the schema mass the overhead measures, and a
+// session switch on a reused loop (SetSessionID) makes the sample unrelated.
+// Both must drop the calibration to 0; setting the SAME session id must not.
+func TestEstOverheadResets(t *testing.T) {
+	gw := client.NewGatewayClient("http://127.0.0.1:0", "")
+	loop := NewAgentLoop(gw, NewToolRegistry(), "medium", "", 20, 2000, 200, nil, nil, nil)
+
+	loop.estOverheadTokens.Store(12345)
+	loop.SetSessionID("sess-a")
+	if got := loop.estOverhead(); got != 0 {
+		t.Errorf("SetSessionID to a new id must reset calibration, got %d", got)
+	}
+
+	loop.estOverheadTokens.Store(12345)
+	loop.SetSessionID("sess-a")
+	if got := loop.estOverhead(); got != 12345 {
+		t.Errorf("SetSessionID with the same id must keep calibration, got %d", got)
+	}
+
+	loop.SwitchAgent("agent-b", "prompt", NewToolRegistry(), "", nil)
+	if got := loop.estOverhead(); got != 0 {
+		t.Errorf("SwitchAgent must reset calibration, got %d", got)
 	}
 }

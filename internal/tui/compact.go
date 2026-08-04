@@ -77,7 +77,14 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		withSystem := make([]client.Message, 0, 1+len(messages))
 		withSystem = append(withSystem, client.Message{Role: "system", Content: client.NewTextContent("(compaction placeholder)")})
 		withSystem = append(withSystem, messages...)
-		shaped := ctxwin.ShapeHistory(withSystem, summary, ctxWindow)
+		shaped := ctxwin.ForceShapeHistory(withSystem, summary, ctxWindow, 0)
+		if len(shaped) >= len(withSystem) {
+			// ForceShapeHistory contract: no net reduction possible. Bail
+			// before rewriting MessageMeta/persisting — otherwise we damage
+			// per-message provenance for a compaction that freed nothing and
+			// report a "compression" that grew the session.
+			return compactDoneMsg{err: fmt.Errorf("nothing to compact: %d messages already at minimum shape", len(messages))}
+		}
 
 		// Strip the placeholder system message from shaped result
 		if len(shaped) > 0 && shaped[0].Role == "system" {
@@ -122,8 +129,14 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 func formatCompactResult(msg compactDoneMsg) string {
 	dimStyle := lipgloss.NewStyle().Foreground(colorDim)
 	var sb strings.Builder
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("  Context compressed: ~%s → ~%s tokens",
-		formatTokenCount(msg.beforeTokens), formatTokenCount(msg.afterTokens))))
+	// Small sessions can net out larger (few messages dropped, summary
+	// inserted) — do not call that "compressed".
+	label := "Context compressed"
+	if msg.afterTokens >= msg.beforeTokens {
+		label = "Context reshaped (no size reduction)"
+	}
+	sb.WriteString(dimStyle.Render(fmt.Sprintf("  %s: ~%s → ~%s tokens",
+		label, formatTokenCount(msg.beforeTokens), formatTokenCount(msg.afterTokens))))
 	sb.WriteString("\n")
 	if msg.summary != "" {
 		sb.WriteString(dimStyle.Render("  Summary: " + msg.summary))
