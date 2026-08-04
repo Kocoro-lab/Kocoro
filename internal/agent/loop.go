@@ -3739,6 +3739,21 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		markInjected()
 	}
 
+	// Post-compaction file restoration: an APPLIED compaction just dropped
+	// the middle of the history — including the full text of files the model
+	// read there, whose exact identifiers the summary paraphrases at best.
+	// The content is still on disk, so re-inject the most recent reads
+	// (budgeted against the compaction landing line) before the task
+	// reanchor, which must stay the last message.
+	restoreRecentReads := func() {
+		msg, ok := a.buildPostCompactionFileRestore(messages)
+		if !ok {
+			return
+		}
+		messages = append(messages, msg)
+		markInjected()
+	}
+
 	// Inject skill listing into the scaffolded user message.
 	// Resume suppression: historyHasListing guards against TUI multi-turn
 	// re-injection when the listing survives in context. Note: persisted
@@ -4129,6 +4144,7 @@ iterationLoop:
 						msgTimestamps = rebasedTS
 
 						compactionApplied = true
+						restoreRecentReads()
 						reanchorActiveTask(MetaBoundaryPostCompaction)
 					}
 				}
@@ -4310,6 +4326,7 @@ iterationLoop:
 					}
 				}
 				msgTimestamps = rebasedTS
+				restoreRecentReads()
 			}
 			compactionApplied = true
 			reanchorActiveTask(MetaBoundaryPostCompaction)
@@ -4737,6 +4754,7 @@ iterationLoop:
 							}
 						}
 						msgTimestamps = rebasedTS
+						restoreRecentReads()
 					}
 
 					reanchorActiveTask(MetaBoundaryPostCompaction)
