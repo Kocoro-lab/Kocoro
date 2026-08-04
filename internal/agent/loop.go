@@ -55,11 +55,6 @@ const preflightCompactThreshold = 0.95
 // code-heavy prompts), which moved the real firing point past the model cap
 // on true-window configs: est ≥ 0.95W meant real ≈ 1.2W, so the API 400'd
 // before this guard ever fired. Pass 0 when no real measurement exists.
-// estOverhead returns the current estimator calibration (never negative).
-func (a *AgentLoop) estOverhead() int {
-	return int(a.estOverheadTokens.Load())
-}
-
 func shouldPreflightCompact(messages []client.Message, contextWindow int, overheadTokens int) bool {
 	if contextWindow <= 0 {
 		return false
@@ -69,6 +64,11 @@ func shouldPreflightCompact(messages []client.Message, contextWindow int, overhe
 	}
 	threshold := int(float64(contextWindow) * preflightCompactThreshold)
 	return ctxwin.EstimateTokens(messages)+overheadTokens >= threshold
+}
+
+// estOverhead returns the current estimator calibration (never negative).
+func (a *AgentLoop) estOverhead() int {
+	return int(a.estOverheadTokens.Load())
 }
 
 // emitCompactionFailureStatus surfaces a compaction failure as a non-fatal
@@ -815,8 +815,9 @@ type AgentLoop struct {
 	// on every response, so a mid-session provider/model switch (different
 	// tokenizers and schema overheads per provider) recalibrates within one
 	// turn. Persists across Run()
-	// calls: a resumed daemon session's first-iteration estimates reuse the
-	// previous Run's calibration instead of dropping back to 0. Atomic
+	// calls on loop-reusing frontends (TUI/CLI); the daemon builds a fresh
+	// AgentLoop per request, so daemon Runs start at 0 and calibrate on
+	// their first response. Atomic
 	// because daemon HTTP handlers may touch loop state concurrently with an
 	// active Run (same exposure class as SetExecutionConfig); reads go
 	// through estOverhead().
@@ -2377,6 +2378,10 @@ func (a *AgentLoop) SwitchAgent(basePrompt string, memoryDir string, reg *ToolRe
 	// previous agent's state.
 	a.alwaysAllowTools = nil
 	a.responseLanguage = "" // re-injected by SetResponseLanguage(global) + per-agent overlay
+	// The tool registry just changed and its schema mass is the dominant term
+	// of the estimator calibration — a stale sample from a schema-heavy agent
+	// would over-compact the new agent's first iterations.
+	a.estOverheadTokens.Store(0)
 }
 
 // SetSkills updates the agent's skill catalog without touching other fields.
@@ -2401,6 +2406,13 @@ func (a *AgentLoop) SetSkillDiscovery(enabled bool) {
 
 // SetSessionID sets the session ID used for audit log correlation.
 func (a *AgentLoop) SetSessionID(id string) {
+	if id != a.sessionID {
+		// New session on a reused loop (TUI session switch): its prompt
+		// composition is unrelated to the previous session's, so drop the
+		// estimator calibration rather than carry a stale sample into the
+		// first iterations.
+		a.estOverheadTokens.Store(0)
+	}
 	a.sessionID = id
 }
 
@@ -3269,6 +3281,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		lastOutputTokens            int    // actual output tokens from last LLM response
 		compactionSummary           string // cached summary from compaction
 		compactionApplied           bool   // true once messages have been shaped
+		shapeNoopLogged             bool   // once-per-Run stderr note for the designed ShapeHistory no-op retry path
 		reactiveCompacted           bool   // true once reactive compaction fired (never resets)
 		summaryFailures             int    // consecutive summary failures; backs off after 3
 		// lastSummaryFailureIter records the iteration of the most recent summary
@@ -3339,6 +3352,10 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		rawMsgs := []client.Message{
 			{Role: "user", Content: client.NewTextContent(raw)},
 		}
+		// Overhead 0 on purpose: this clips the PERSISTED raw text, a single
+		// synthetic message with no tool schemas attached — calibrating it
+		// against the live request's overhead would shrink what gets saved to
+		// session.json for reasons unrelated to its own size.
 		rawMsgs, dropped := ctxwin.TruncateOversizedLastUserMessage(rawMsgs, a.contextWindow, 0)
 		if dropped <= 0 || len(rawMsgs) == 0 || rawMsgs[0].Content.HasBlocks() {
 			return raw
@@ -3481,8 +3498,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		if shouldPreflightCompact(messages, a.contextWindow, a.estOverhead()) && len(messages) > ctxwin.MinShapeable() {
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
-					fmt.Sprintf("force-stop turn estimate %d tokens >= %.0f%% of %d cap",
-						ctxwin.EstimateTokens(messages), preflightCompactThreshold*100, a.contextWindow))
+					fmt.Sprintf("force-stop turn estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
+						ctxwin.EstimateTokens(messages), a.estOverhead(), preflightCompactThreshold*100, a.contextWindow))
 			}
 			fsBefore := len(messages)
 			emergencyMessages := cloneMessages(messages)
@@ -3982,7 +3999,11 @@ iterationLoop:
 				// First iteration: use heuristic for resumed sessions with large history.
 				// The MinShapeable guard above ensures we only estimate when there's
 				// enough history to actually shape (prevents wasted summary calls).
-				est := ctxwin.EstimateTokens(messages)
+				// Calibrated like every other estimate-based decision — without the
+				// overhead the calibrated 95% preflight gate can fire while this
+				// uncalibrated 90% gate stays quiet, sending resumed sessions into
+				// the aggressive emergency profile instead of this gentler path.
+				est := ctxwin.EstimateTokens(messages) + a.estOverhead()
 				shouldCompact = ctxwin.ShouldCompact(est, 0, a.contextWindow)
 			}
 			if shouldCompact {
@@ -4042,9 +4063,17 @@ iterationLoop:
 						// stays cached in compactionSummary, so the retry on
 						// a later iteration — when more history has
 						// accumulated — costs no extra LLM call.
-						a.recordCompactionFailure("proactive_shape_noop",
-							fmt.Errorf("ShapeHistory dropped nothing (msgs=%d, window=%d, est_overhead=%d)",
-								before, a.contextWindow, a.estOverhead()))
+						//
+						// This is the designed retry path, not a failure —
+						// recordCompactionFailure would push a
+						// context_compaction_failed degradation signal to
+						// SSE/Desktop on every affected iteration. One stderr
+						// line per Run keeps it observable.
+						if !shapeNoopLogged {
+							shapeNoopLogged = true
+							fmt.Fprintf(os.Stderr, "[agent] proactive ShapeHistory no-op: msgs=%d window=%d est_overhead=%d (summary cached for retry)\n",
+								before, a.contextWindow, a.estOverhead())
+						}
 					} else {
 						messages = shaped
 						dropped := before - len(messages)
@@ -4196,17 +4225,27 @@ iterationLoop:
 			a.tracker.Enter(PhaseCompacting)
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
-					fmt.Sprintf("estimate %d tokens >= %.0f%% of %d cap",
-						ctxwin.EstimateTokens(messages), preflightCompactThreshold*100, a.contextWindow))
+					fmt.Sprintf("estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
+						ctxwin.EstimateTokens(messages), a.estOverhead(), preflightCompactThreshold*100, a.contextWindow))
 			}
 
 			// Build summary and shape, mirroring the reactive emergency profile.
+			// Reuse the summary the proactive path already paid for this Run
+			// (cached across its no-op retries) — since that path no longer
+			// latches on a no-op, both gates can fire in the same iteration
+			// and regenerating here would bill a second small-tier transcript
+			// pass for the same history.
 			emergencyMessages := cloneMessages(messages)
 			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
-			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
-			restoreLLM()
-			a.emitInternalUsage(sumUsage)
+			summary := compactionSummary
+			var sumErr error
+			if strings.TrimSpace(summary) == "" {
+				restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
+				var sumUsage client.Usage
+				summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
+				restoreLLM()
+				a.emitInternalUsage(sumUsage)
+			}
 			before := len(messages)
 			if sumErr == nil {
 				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
@@ -4321,6 +4360,7 @@ iterationLoop:
 		// different provider while carrying an OpenAI-owned cursor.
 		consumeOrdinaryOpenAIContinuation(&req)
 		reuseExactRequestOnRetry := false
+		requestRebuiltOnRetry := false // a rebuilt req.Messages invalidates this iteration's calibration sample
 		isOpenAIComputerContinuation := openAIContinuationRequest != nil
 		// A Responses continuation carries previous_response_id plus exactly
 		// the latest assistant computer_call / user computer_call_output pair.
@@ -4752,6 +4792,7 @@ iterationLoop:
 				reanchorActiveTask(MetaBoundaryRetryAfterError)
 				if !reuseExactRequestOnRetry {
 					req.Messages = messages
+					requestRebuiltOnRetry = true
 				}
 				fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxLLMRetries, backoff, err)
 				if a.handler != nil {
@@ -4867,12 +4908,21 @@ iterationLoop:
 		// the estimator cannot see (tools[] schemas, chars/3.5 error).
 		// Clamped at 0, and re-derived on every response, so a skewed sample
 		// from a retry corrects itself one turn later.
-		if lastPromptTokens > 0 {
+		// Skip the sample when an error retry rebuilt req.Messages from the
+		// raw history: the provider then billed a request that requestMessages
+		// no longer describes (tool_result replacements bypassed), which can
+		// inflate the overhead by the full spilled-content delta for one
+		// iteration — enough to drive an unnecessary lossy ShapeHistory.
+		if lastPromptTokens > 0 && !requestRebuiltOnRetry {
 			overhead := lastPromptTokens - ctxwin.EstimateTokens(requestMessages)
 			if overhead < 0 {
 				overhead = 0
 			}
-			a.estOverheadTokens.Store(int64(overhead))
+			// Sanity clamp: a sample larger than the whole window means the
+			// denominator diverged from what was actually sent; discard it.
+			if a.contextWindow <= 0 || overhead <= a.contextWindow {
+				a.estOverheadTokens.Store(int64(overhead))
+			}
 		}
 		if resp.Model != "" {
 			usage.Model = resp.Model

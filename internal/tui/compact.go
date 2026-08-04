@@ -78,6 +78,13 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		withSystem = append(withSystem, client.Message{Role: "system", Content: client.NewTextContent("(compaction placeholder)")})
 		withSystem = append(withSystem, messages...)
 		shaped := ctxwin.ForceShapeHistory(withSystem, summary, ctxWindow, 0)
+		if len(shaped) >= len(withSystem) {
+			// ForceShapeHistory contract: no net reduction possible. Bail
+			// before rewriting MessageMeta/persisting — otherwise we damage
+			// per-message provenance for a compaction that freed nothing and
+			// report a "compression" that grew the session.
+			return compactDoneMsg{err: fmt.Errorf("nothing to compact: %d messages already at minimum shape", len(messages))}
+		}
 
 		// Strip the placeholder system message from shaped result
 		if len(shaped) > 0 && shaped[0].Role == "system" {

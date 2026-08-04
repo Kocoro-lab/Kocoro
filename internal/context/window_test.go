@@ -898,3 +898,38 @@ func TestForceShapeHistory_TooShortReturnsOriginal(t *testing.T) {
 		t.Fatalf("3-pair session cannot net-reduce: got %d msgs, want %d", len(out), len(messages))
 	}
 }
+
+// TestShapeHistory_LandsUnderRetargetFraction pins the hysteresis band:
+// accepted candidates must land under compactRetargetFraction (0.80), not
+// merely under the 0.90 trigger — otherwise one large tool result re-crosses
+// the trigger immediately and every compaction is followed by another
+// (observed live: two full compactions within three iterations). Reverting
+// the landing target to compactThreshold must fail this test.
+func TestShapeHistory_LandsUnderRetargetFraction(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent(strings.Repeat("s", 350))},
+		{Role: "user", Content: client.NewTextContent(strings.Repeat("u", 350))},
+	}
+	for i := 0; i < 22; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent(strings.Repeat("a", 350))},
+			client.Message{Role: "user", Content: client.NewTextContent(strings.Repeat("r", 350))},
+		)
+	}
+	// 46 messages (> the 43-message skip gate) at ~104 est tokens each.
+	// Window 5000: trigger 4500, landing budget 4000. The keepLast=20
+	// candidate (~4381 est) fits under the trigger but NOT the landing
+	// budget; hysteresis must shrink to keepLast=18 (~3965). With the
+	// landing target reverted to compactThreshold, the 4381 candidate is
+	// accepted and this test fails.
+	contextWindow := 5000
+
+	shaped := ShapeHistory(messages, "sum", contextWindow, 0)
+	if len(shaped) >= len(messages) {
+		t.Fatalf("shaping should engage: got %d msgs", len(shaped))
+	}
+	landing := int(float64(contextWindow) * compactRetargetFraction)
+	if got := EstimateTokens(shaped); got >= landing {
+		t.Errorf("shaped history must land under the retarget budget: est %d >= %d", got, landing)
+	}
+}

@@ -2003,7 +2003,7 @@ func TestAgentLoop_CompactionFiresWhenEstimateLags(t *testing.T) {
 		// Tiny visible content (estimate stays low) but REAL usage far above
 		// it — must exceed EstimateTokens(request) (which includes the real
 		// system prompt) for the overhead calibration to register, and cross
-		// 90% of the 2000-token window to arm the proactive trigger.
+		// 90% of the 20000-token window to arm the proactive trigger.
 		inputTokens := 3000 * msgCount
 		if callNum < 12 {
 			json.NewEncoder(w).Encode(nativeResponse(

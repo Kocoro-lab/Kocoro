@@ -138,11 +138,43 @@ func LookupModelContextWindow(modelID string) (int, bool) {
 		return v, true
 	}
 	for _, prefix := range prefixLookupOrder {
-		if strings.HasPrefix(modelID, prefix) {
+		if strings.HasPrefix(modelID, prefix) && isDateSuffix(modelID[len(prefix):]) {
 			return modelContextWindowPrefix[prefix], true
 		}
 	}
 	return 0, false
+}
+
+// isDateSuffix reports whether s looks like a dated-snapshot suffix:
+// "20251101" (dash-less) or "2025-08-07" (dashed). The prefix table
+// exists ONLY to catch future dated variants of known dateless families;
+// without this check any sibling family sharing the prefix (a hypothetical
+// gpt-5.6-sol-mini) would inherit the family's window instead of falling
+// back to (0,false) graceful degradation.
+func isDateSuffix(s string) bool {
+	switch len(s) {
+	case 8: // YYYYMMDD
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	case 10: // YYYY-MM-DD
+		for i, c := range s {
+			if i == 4 || i == 7 {
+				if c != '-' {
+					return false
+				}
+				continue
+			}
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // SeedContextWindowFromModels picks the best soft-seed for a fresh AgentLoop
