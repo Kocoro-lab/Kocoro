@@ -257,6 +257,33 @@ func TestApplyTurnState_CopiesToolResultReplacements(t *testing.T) {
 	}
 }
 
+// applyTurnState must persist the estimator calibration alongside the
+// tool-result budget state, and clear a stale persisted sample when the loop
+// holds none (e.g. the restore-time validation rejected it).
+func TestApplyTurnState_CopiesCalibration(t *testing.T) {
+	sess := &session.Session{}
+	base := captureTurnBaseline(sess, "web", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	// Seed via the public restore path: snapshot the fingerprint of the
+	// loop's own registry so validation accepts the sample.
+	_, _, fp := loop.EstOverheadState()
+	loop.SetEstOverheadState(4321, "test-model", fp)
+
+	applyTurnState(sess, loop, nil, base)
+
+	cal := sess.CompactionCalibration
+	if cal == nil || cal.OverheadTokens != 4321 || cal.Model != "test-model" || cal.ToolsFingerprint != fp {
+		t.Fatalf("calibration was not copied into session: %#v", cal)
+	}
+
+	// A loop with no sample clears the persisted state.
+	fresh := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	applyTurnState(sess, fresh, nil, base)
+	if sess.CompactionCalibration != nil {
+		t.Fatalf("stale calibration must be cleared when the loop holds no sample: %#v", sess.CompactionCalibration)
+	}
+}
+
 func TestSessionInProgress_FlagCycles(t *testing.T) {
 	sess := &session.Session{}
 	if sess.InProgress {

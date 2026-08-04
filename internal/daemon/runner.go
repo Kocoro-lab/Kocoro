@@ -3826,6 +3826,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// docs/superpowers/specs/2026-05-27-schedule-broadcast-gate-design.md.
 	loop.SetSource(req.Source)
 	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
+	// Restore the checkpointed estimator calibration so this fresh loop's
+	// iteration-0 compaction decisions are not blind on a resumed session.
+	// Must run after SetSessionID / SwitchAgent (both reset the calibration);
+	// the loop validates model + tool-registry fingerprint before applying.
+	if cal := sess.CompactionCalibration; cal != nil {
+		loop.SetEstOverheadState(cal.OverheadTokens, cal.Model, cal.ToolsFingerprint)
+	}
 	// Inject the per-session ReadTracker so file_read dedup history persists
 	// across the per-message AgentLoop instances created here. nil-safe: an
 	// unset cache returns a fresh tracker, which keeps the pre-fix behavior.
@@ -4009,6 +4016,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// the first checkpoint fires.
 			sess.ToolResultReplacements = loop.ToolResultReplacements()
 			sess.ToolResultSeen = loop.ToolResultSeen()
+			sess.CompactionCalibration = calibrationSnapshot(loop)
 			syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())
 			if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
 				return nil, err
@@ -4163,6 +4171,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// checkpoint fires would otherwise lose new dedup/replacement entries.
 		sess.ToolResultReplacements = loop.ToolResultReplacements()
 		sess.ToolResultSeen = loop.ToolResultSeen()
+		sess.CompactionCalibration = calibrationSnapshot(loop)
 		syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())
 		if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
 			return nil, err
@@ -5008,6 +5017,22 @@ func applyTurnState(sess *session.Session, loop *agent.AgentLoop,
 	applyTurnUsage(sess, up, b)
 	sess.ToolResultReplacements = loop.ToolResultReplacements()
 	sess.ToolResultSeen = loop.ToolResultSeen()
+	sess.CompactionCalibration = calibrationSnapshot(loop)
+}
+
+// calibrationSnapshot converts the loop's live estimator calibration into its
+// persisted form; nil when there is no sample (keeps the session JSON clean
+// and clears a stale persisted sample the loop rejected on restore).
+func calibrationSnapshot(loop *agent.AgentLoop) *session.CompactionCalibration {
+	tokens, model, fp := loop.EstOverheadState()
+	if tokens <= 0 {
+		return nil
+	}
+	return &session.CompactionCalibration{
+		OverheadTokens:   tokens,
+		Model:            model,
+		ToolsFingerprint: fp,
+	}
 }
 
 // FriendlyAgentError maps raw agent errors to user-facing messages.

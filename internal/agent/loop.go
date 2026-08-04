@@ -824,6 +824,13 @@ type AgentLoop struct {
 	// active Run (same exposure class as SetExecutionConfig); reads go
 	// through estOverhead().
 	estOverheadTokens atomic.Int64
+	// estOverheadModel is the response model that produced the current
+	// estOverheadTokens sample ("" when no sample or the sample predates this
+	// field). Persisted alongside the sample in session checkpoints so a
+	// resumed daemon loop can reject a sample taken under a different model
+	// (tokenizers and schema overheads differ per provider). Always stores a
+	// string; same concurrency exposure as estOverheadTokens.
+	estOverheadModel  atomic.Value
 	memoryDir         string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
 	projectEntityDir  string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
 	stickyContext     string             // session-scoped facts injected verbatim into system prompt; never truncated
@@ -2384,6 +2391,7 @@ func (a *AgentLoop) SwitchAgent(basePrompt string, memoryDir string, reg *ToolRe
 	// of the estimator calibration — a stale sample from a schema-heavy agent
 	// would over-compact the new agent's first iterations.
 	a.estOverheadTokens.Store(0)
+	a.estOverheadModel.Store("")
 }
 
 // SetSkills updates the agent's skill catalog without touching other fields.
@@ -2414,6 +2422,7 @@ func (a *AgentLoop) SetSessionID(id string) {
 		// estimator calibration rather than carry a stale sample into the
 		// first iterations.
 		a.estOverheadTokens.Store(0)
+		a.estOverheadModel.Store("")
 	}
 	a.sessionID = id
 }
@@ -4950,6 +4959,7 @@ iterationLoop:
 			// denominator diverged from what was actually sent; discard it.
 			if a.contextWindow <= 0 || overhead <= a.contextWindow {
 				a.estOverheadTokens.Store(int64(overhead))
+				a.estOverheadModel.Store(resp.Model)
 			}
 		}
 		if resp.Model != "" {

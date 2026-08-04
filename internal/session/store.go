@@ -104,6 +104,13 @@ type Session struct {
 	// query-time budgeting, even if they were not replaced. This freezes their
 	// fate across turns and prevents old history from drifting later.
 	ToolResultSeen map[string]bool `json:"tool_result_seen,omitempty"`
+	// CompactionCalibration persists the estimator-calibration sample of the
+	// last Run so a fresh daemon AgentLoop resuming this session is not blind
+	// at iteration 0 (the proactive heuristic, preflight, and user truncation
+	// all judge on the calibrated scale). Restored via
+	// AgentLoop.SetEstOverheadState, which validates model and tool-registry
+	// fingerprint before applying.
+	CompactionCalibration *CompactionCalibration `json:"compaction_calibration,omitempty"`
 	// InProgress is true between a mid-turn checkpoint save and the final
 	// post-turn save. If a session is loaded with this set, the previous
 	// run crashed or was killed mid-turn — the transcript is partial but
@@ -144,6 +151,17 @@ type Session struct {
 	// NOT bump UpdatedAt (share/retract is metadata, not activity, and a
 	// bump would re-sort the session to the top of the recency list).
 	PublishedShares []PublishedShareEntry `json:"published_shares,omitempty"`
+}
+
+// CompactionCalibration is the persisted estimator-calibration sample:
+// (real prompt tokens − estimate at send time) of the last main completion,
+// plus the response model and the tool-registry fingerprint it was measured
+// under — both needed to decide on resume whether the sample still describes
+// what the next request will send.
+type CompactionCalibration struct {
+	OverheadTokens   int    `json:"overhead_tokens"`
+	Model            string `json:"model,omitempty"`
+	ToolsFingerprint string `json:"tools_fingerprint,omitempty"`
 }
 
 // PublishedShareEntry is one entry in Session.PublishedShares — a successful
