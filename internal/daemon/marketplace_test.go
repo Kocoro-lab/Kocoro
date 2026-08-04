@@ -512,6 +512,44 @@ func TestHandleDeleteGlobalSkillDetachesAllAgents(t *testing.T) {
 	}
 }
 
+func TestHandleDeleteGlobalSkillDoesNotDetachCollidingExactSlug(t *testing.T) {
+	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
+	s.deps.AgentsDir = filepath.Join(s.deps.ShannonDir, "agents")
+	daemonTestWriteFile(t,
+		filepath.Join(s.deps.ShannonDir, "skills", "docker", "SKILL.md"),
+		"---\nname: Docker\ndescription: containers\n---\nbody\n",
+	)
+	daemonTestWriteFile(t,
+		filepath.Join(s.deps.ShannonDir, "skills", "docker-tools", "SKILL.md"),
+		"---\nname: docker\ndescription: helpers\n---\nbody\n",
+	)
+	daemonTestWriteFile(t, filepath.Join(s.deps.AgentsDir, "analyst", "AGENT.md"), "analyst")
+	if err := agents.SetAttachedSkills(s.deps.AgentsDir, "analyst", []string{"docker"}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("DELETE", "/skills/docker-tools?confirm=true", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	attached, err := agents.ReadAttachedSkills(s.deps.AgentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attached) != 1 || attached[0] != "docker" {
+		t.Fatalf("unrelated exact-slug attachment changed: %v", attached)
+	}
+	loaded, err := agents.LoadAgent(s.deps.AgentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Skills) != 1 || loaded.Skills[0].Slug != "docker" {
+		t.Fatalf("resolved skills after delete = %+v, want docker only", loaded.Skills)
+	}
+}
+
 func TestHandleDeleteGlobalSkillPreservesSkillWhenAgentManifestIsCorrupt(t *testing.T) {
 	s, _ := newTestServerWithMarketplace(t, `{"version":1,"skills":[]}`)
 	skillFile := filepath.Join(s.deps.ShannonDir, "skills", "docker", "SKILL.md")
@@ -524,8 +562,18 @@ func TestHandleDeleteGlobalSkillPreservesSkillWhenAgentManifestIsCorrupt(t *test
 	req := httptest.NewRequest("DELETE", "/skills/docker?confirm=true", nil)
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500; body = %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", rr.Code, rr.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["code"] != "agent_skill_manifest_invalid" {
+		t.Fatalf("code = %q, body = %s", response["code"], rr.Body.String())
+	}
+	if !strings.Contains(response["error"], "PUT /agents/broken") {
+		t.Fatalf("error lacks repair action: %q", response["error"])
 	}
 	if _, err := os.Stat(skillFile); err != nil {
 		t.Fatalf("skill should remain after failed detach: %v", err)

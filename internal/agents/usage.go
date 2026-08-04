@@ -59,6 +59,21 @@ type attachedSkillsChange struct {
 	after     []string
 }
 
+// SkillAttachmentManifestError identifies the agent whose attachment manifest
+// could not be read. Destructive callers use this typed error to return a
+// recoverable conflict instead of presenting malformed user state as an
+// internal server failure.
+type SkillAttachmentManifestError struct {
+	AgentName string
+	Err       error
+}
+
+func (e *SkillAttachmentManifestError) Error() string {
+	return fmt.Sprintf("read attached skills for agent %q: %v", e.AgentName, e.Err)
+}
+
+func (e *SkillAttachmentManifestError) Unwrap() error { return e.Err }
+
 // SkillAttachmentPlan is an immutable snapshot of every manifest change needed
 // to detach one or more skill identifiers. Destructive callers can inspect the
 // affected agents, take their route locks, and then apply this exact snapshot
@@ -208,7 +223,7 @@ func planAttachedSkillChanges(agentsDir string, remove func(string) bool) ([]att
 		}
 		names, err := ReadAttachedSkills(agentsDir, agentName)
 		if err != nil {
-			return nil, fmt.Errorf("read attached skills for agent %q: %w", agentName, err)
+			return nil, &SkillAttachmentManifestError{AgentName: agentName, Err: err}
 		}
 		filtered := make([]string, 0, len(names))
 		for _, name := range names {

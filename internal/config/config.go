@@ -1596,34 +1596,36 @@ func AppendGlobalAlwaysAllowTool(shannonDir, tool string) error {
 }
 
 // AppendGlobalAlwaysAllowToolWithRevision is AppendGlobalAlwaysAllowTool plus
-// the exact revision written. An empty revision means the operation was a
-// no-op, so callers must leave their existing applied revision unchanged.
-func AppendGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (string, error) {
+// the exact before/after revisions captured under config.yaml.lock. After is
+// empty for a no-op.
+func AppendGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (MutationRevisions, error) {
 	if tool == "" {
-		return "", fmt.Errorf("tool name is empty")
+		return MutationRevisions{}, fmt.Errorf("tool name is empty")
 	}
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
 	lockPath := cfgPath + ".lock"
 
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return "", fmt.Errorf("open lock file: %w", err)
+		return MutationRevisions{}, fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return "", fmt.Errorf("lock config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
+	exists := err == nil
 	if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("read config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("read config: %w", err)
 	}
+	revisions := MutationRevisions{Before: SnapshotRevision(data, exists)}
 
 	var raw map[string]interface{}
 	if len(data) > 0 {
 		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return "", fmt.Errorf("parse config: %w", err)
+			return MutationRevisions{}, fmt.Errorf("parse config: %w", err)
 		}
 	}
 	if raw == nil {
@@ -1642,7 +1644,7 @@ func AppendGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (string, e
 	}
 	for _, v := range existing {
 		if s, ok := v.(string); ok && s == tool {
-			return "", nil // already present
+			return revisions, nil // already present
 		}
 	}
 
@@ -1651,17 +1653,18 @@ func AppendGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (string, e
 
 	out, err := yaml.Marshal(raw)
 	if err != nil {
-		return "", fmt.Errorf("marshal config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("marshal config: %w", err)
 	}
 
 	tmpPath := cfgPath + ".tmp"
 	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
-		return "", fmt.Errorf("write temp: %w", err)
+		return MutationRevisions{}, fmt.Errorf("write temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
-	return BytesRevision(out), nil
+	revisions.After = BytesRevision(out)
+	return revisions, nil
 }
 
 // RemoveGlobalAlwaysAllowTool is the symmetric delete for
@@ -1673,45 +1676,46 @@ func RemoveGlobalAlwaysAllowTool(shannonDir, tool string) error {
 	return err
 }
 
-func RemoveGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (string, error) {
+func RemoveGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (MutationRevisions, error) {
 	if tool == "" {
-		return "", fmt.Errorf("tool name is empty")
+		return MutationRevisions{}, fmt.Errorf("tool name is empty")
 	}
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
 	lockPath := cfgPath + ".lock"
 
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return "", fmt.Errorf("open lock file: %w", err)
+		return MutationRevisions{}, fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return "", fmt.Errorf("lock config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return MutationRevisions{Before: "missing"}, nil
 		}
-		return "", fmt.Errorf("read config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("read config: %w", err)
 	}
+	revisions := MutationRevisions{Before: SnapshotRevision(data, true)}
 
 	var raw map[string]interface{}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return "", fmt.Errorf("parse config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("parse config: %w", err)
 	}
 	if raw == nil {
-		return "", nil
+		return revisions, nil
 	}
 	perms, _ := raw["permissions"].(map[string]interface{})
 	if perms == nil {
-		return "", nil
+		return revisions, nil
 	}
 	existing, _ := perms["always_allow_tools"].([]interface{})
 	if len(existing) == 0 {
-		return "", nil
+		return revisions, nil
 	}
 	filtered := make([]interface{}, 0, len(existing))
 	removed := false
@@ -1723,7 +1727,7 @@ func RemoveGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (string, e
 		filtered = append(filtered, v)
 	}
 	if !removed {
-		return "", nil
+		return revisions, nil
 	}
 	if len(filtered) == 0 {
 		delete(perms, "always_allow_tools")
@@ -1733,16 +1737,17 @@ func RemoveGlobalAlwaysAllowToolWithRevision(shannonDir, tool string) (string, e
 
 	out, err := yaml.Marshal(raw)
 	if err != nil {
-		return "", fmt.Errorf("marshal config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("marshal config: %w", err)
 	}
 	tmpPath := cfgPath + ".tmp"
 	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
-		return "", fmt.Errorf("write temp: %w", err)
+		return MutationRevisions{}, fmt.Errorf("write temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
-	return BytesRevision(out), nil
+	revisions.After = BytesRevision(out)
+	return revisions, nil
 }
 
 // AppendGlobalDisabledSkill adds a skill identifier (Name or Slug) to the global
@@ -1769,7 +1774,7 @@ func AppendGlobalDisabledSkills(shannonDir string, skills []string) error {
 	return err
 }
 
-func AppendGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) (string, error) {
+func AppendGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) (MutationRevisions, error) {
 	want := make([]string, 0, len(skills))
 	for _, s := range skills {
 		if s != "" {
@@ -1777,30 +1782,32 @@ func AppendGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) 
 		}
 	}
 	if len(want) == 0 {
-		return "", nil
+		return MutationRevisions{}, nil
 	}
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
 	lockPath := cfgPath + ".lock"
 
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return "", fmt.Errorf("open lock file: %w", err)
+		return MutationRevisions{}, fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return "", fmt.Errorf("lock config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
+	exists := err == nil
 	if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("read config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("read config: %w", err)
 	}
+	revisions := MutationRevisions{Before: SnapshotRevision(data, exists)}
 
 	var raw map[string]interface{}
 	if len(data) > 0 {
 		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return "", fmt.Errorf("parse config: %w", err)
+			return MutationRevisions{}, fmt.Errorf("parse config: %w", err)
 		}
 	}
 	if raw == nil {
@@ -1833,23 +1840,24 @@ func AppendGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) 
 		}
 	}
 	if !changed {
-		return "", nil // all already present
+		return revisions, nil // all already present
 	}
 	sk["disabled"] = existing
 
 	out, err := yaml.Marshal(raw)
 	if err != nil {
-		return "", fmt.Errorf("marshal config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("marshal config: %w", err)
 	}
 
 	tmpPath := cfgPath + ".tmp"
 	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
-		return "", fmt.Errorf("write temp: %w", err)
+		return MutationRevisions{}, fmt.Errorf("write temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
-	return BytesRevision(out), nil
+	revisions.After = BytesRevision(out)
+	return revisions, nil
 }
 
 // RemoveGlobalDisabledSkill is the symmetric delete for
@@ -1872,7 +1880,7 @@ func RemoveGlobalDisabledSkills(shannonDir string, skills []string) error {
 	return err
 }
 
-func RemoveGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) (string, error) {
+func RemoveGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) (MutationRevisions, error) {
 	toRemove := make(map[string]bool, len(skills))
 	for _, s := range skills {
 		if s != "" {
@@ -1880,43 +1888,44 @@ func RemoveGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) 
 		}
 	}
 	if len(toRemove) == 0 {
-		return "", nil
+		return MutationRevisions{}, nil
 	}
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
 	lockPath := cfgPath + ".lock"
 
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return "", fmt.Errorf("open lock file: %w", err)
+		return MutationRevisions{}, fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return "", fmt.Errorf("lock config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return MutationRevisions{Before: "missing"}, nil
 		}
-		return "", fmt.Errorf("read config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("read config: %w", err)
 	}
+	revisions := MutationRevisions{Before: SnapshotRevision(data, true)}
 
 	var raw map[string]interface{}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return "", fmt.Errorf("parse config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("parse config: %w", err)
 	}
 	if raw == nil {
-		return "", nil
+		return revisions, nil
 	}
 	sk, _ := raw["skills"].(map[string]interface{})
 	if sk == nil {
-		return "", nil
+		return revisions, nil
 	}
 	existing, _ := sk["disabled"].([]interface{})
 	if len(existing) == 0 {
-		return "", nil
+		return revisions, nil
 	}
 	filtered := make([]interface{}, 0, len(existing))
 	removed := false
@@ -1928,7 +1937,7 @@ func RemoveGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) 
 		filtered = append(filtered, v)
 	}
 	if !removed {
-		return "", nil
+		return revisions, nil
 	}
 	if len(filtered) == 0 {
 		delete(sk, "disabled")
@@ -1941,16 +1950,17 @@ func RemoveGlobalDisabledSkillsWithRevision(shannonDir string, skills []string) 
 
 	out, err := yaml.Marshal(raw)
 	if err != nil {
-		return "", fmt.Errorf("marshal config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("marshal config: %w", err)
 	}
 	tmpPath := cfgPath + ".tmp"
 	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
-		return "", fmt.Errorf("write temp: %w", err)
+		return MutationRevisions{}, fmt.Errorf("write temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
-	return BytesRevision(out), nil
+	revisions.After = BytesRevision(out)
+	return revisions, nil
 }
 
 // AppendDefaultAgentDisabledMCPServer adds an MCP server name to the global
@@ -1962,32 +1972,34 @@ func AppendDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 	return err
 }
 
-func AppendDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) (string, error) {
+func AppendDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) (MutationRevisions, error) {
 	if server == "" {
-		return "", fmt.Errorf("server name is empty")
+		return MutationRevisions{}, fmt.Errorf("server name is empty")
 	}
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
 	lockPath := cfgPath + ".lock"
 
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return "", fmt.Errorf("open lock file: %w", err)
+		return MutationRevisions{}, fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return "", fmt.Errorf("lock config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
+	exists := err == nil
 	if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("read config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("read config: %w", err)
 	}
+	revisions := MutationRevisions{Before: SnapshotRevision(data, exists)}
 
 	var raw map[string]interface{}
 	if len(data) > 0 {
 		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return "", fmt.Errorf("parse config: %w", err)
+			return MutationRevisions{}, fmt.Errorf("parse config: %w", err)
 		}
 	}
 	if raw == nil {
@@ -2006,7 +2018,7 @@ func AppendDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) 
 	}
 	for _, v := range existing {
 		if s, ok := v.(string); ok && s == server {
-			return "", nil // already present
+			return revisions, nil // already present
 		}
 	}
 
@@ -2015,16 +2027,17 @@ func AppendDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) 
 
 	out, err := yaml.Marshal(raw)
 	if err != nil {
-		return "", fmt.Errorf("marshal config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("marshal config: %w", err)
 	}
 	tmpPath := cfgPath + ".tmp"
 	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
-		return "", fmt.Errorf("write temp: %w", err)
+		return MutationRevisions{}, fmt.Errorf("write temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
-	return BytesRevision(out), nil
+	revisions.After = BytesRevision(out)
+	return revisions, nil
 }
 
 // RemoveDefaultAgentDisabledMCPServer is the symmetric delete. No-op if the
@@ -2035,45 +2048,46 @@ func RemoveDefaultAgentDisabledMCPServer(shannonDir, server string) error {
 	return err
 }
 
-func RemoveDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) (string, error) {
+func RemoveDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) (MutationRevisions, error) {
 	if server == "" {
-		return "", fmt.Errorf("server name is empty")
+		return MutationRevisions{}, fmt.Errorf("server name is empty")
 	}
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
 	lockPath := cfgPath + ".lock"
 
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return "", fmt.Errorf("open lock file: %w", err)
+		return MutationRevisions{}, fmt.Errorf("open lock file: %w", err)
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return "", fmt.Errorf("lock config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("lock config: %w", err)
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return MutationRevisions{Before: "missing"}, nil
 		}
-		return "", fmt.Errorf("read config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("read config: %w", err)
 	}
+	revisions := MutationRevisions{Before: SnapshotRevision(data, true)}
 
 	var raw map[string]interface{}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return "", fmt.Errorf("parse config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("parse config: %w", err)
 	}
 	if raw == nil {
-		return "", nil
+		return revisions, nil
 	}
 	mcpBlk, _ := raw["mcp"].(map[string]interface{})
 	if mcpBlk == nil {
-		return "", nil
+		return revisions, nil
 	}
 	existing, _ := mcpBlk["default_agent_disabled"].([]interface{})
 	if len(existing) == 0 {
-		return "", nil
+		return revisions, nil
 	}
 	filtered := make([]interface{}, 0, len(existing))
 	removed := false
@@ -2085,7 +2099,7 @@ func RemoveDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) 
 		filtered = append(filtered, v)
 	}
 	if !removed {
-		return "", nil
+		return revisions, nil
 	}
 	if len(filtered) == 0 {
 		delete(mcpBlk, "default_agent_disabled")
@@ -2098,16 +2112,17 @@ func RemoveDefaultAgentDisabledMCPServerWithRevision(shannonDir, server string) 
 
 	out, err := yaml.Marshal(raw)
 	if err != nil {
-		return "", fmt.Errorf("marshal config: %w", err)
+		return MutationRevisions{}, fmt.Errorf("marshal config: %w", err)
 	}
 	tmpPath := cfgPath + ".tmp"
 	if err := os.WriteFile(tmpPath, out, 0600); err != nil {
-		return "", fmt.Errorf("write temp: %w", err)
+		return MutationRevisions{}, fmt.Errorf("write temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
-	return BytesRevision(out), nil
+	revisions.After = BytesRevision(out)
+	return revisions, nil
 }
 
 // dedup returns a slice with duplicate strings removed, preserving order.

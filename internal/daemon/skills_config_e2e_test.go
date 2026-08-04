@@ -186,7 +186,7 @@ func TestE2E_SkillAndConfigConsistencyHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	builtinResp.Body.Close()
-	if builtinResp.StatusCode != http.StatusForbidden || builtinBody["error"] != "skill_is_builtin" {
+	if builtinResp.StatusCode != http.StatusForbidden || builtinBody["code"] != "skill_is_builtin" || builtinBody["error"] == "skill_is_builtin" {
 		t.Fatalf("builtin delete = %d %#v", builtinResp.StatusCode, builtinBody)
 	}
 

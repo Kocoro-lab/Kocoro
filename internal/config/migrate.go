@@ -430,44 +430,47 @@ func StripYAMLAPIKey(shannonDir string) error {
 	return err
 }
 
-// StripYAMLAPIKeyWithRevision is StripYAMLAPIKey plus the exact revision
-// written. An empty revision means the file was not changed.
-func StripYAMLAPIKeyWithRevision(shannonDir string) (string, error) {
+// StripYAMLAPIKeyWithRevision is StripYAMLAPIKey plus the exact before/after
+// revisions captured under config.yaml.lock. After is empty when the file was
+// not changed.
+func StripYAMLAPIKeyWithRevision(shannonDir string) (MutationRevisions, error) {
 	cfgPath := filepath.Join(shannonDir, "config.yaml")
 	lockFile, err := os.OpenFile(cfgPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
 	defer lockFile.Close()
 	if err := fslock.Lock(lockFile.Fd()); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
 	defer fslock.Unlock(lockFile.Fd())
 
 	raw, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", nil
+			return MutationRevisions{Before: "missing"}, nil
 		}
-		return "", err
+		return MutationRevisions{}, err
 	}
+	revisions := MutationRevisions{Before: SnapshotRevision(raw, true)}
 	newRaw, removed := removeTopLevelLine(raw, "api_key")
 	if !removed {
-		return "", nil
+		return revisions, nil
 	}
 	info, err := os.Stat(cfgPath)
 	if err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
 	tmpPath := cfgPath + ".selfheal.tmp"
 	if err := os.WriteFile(tmpPath, newRaw, info.Mode().Perm()); err != nil {
-		return "", err
+		return MutationRevisions{}, err
 	}
 	if err := os.Rename(tmpPath, cfgPath); err != nil {
 		_ = os.Remove(tmpPath)
-		return "", err
+		return MutationRevisions{}, err
 	}
-	return BytesRevision(newRaw), nil
+	revisions.After = BytesRevision(newRaw)
+	return revisions, nil
 }
 
 // removeTopLevelLine deletes the first occurrence of a top-level

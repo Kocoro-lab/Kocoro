@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
@@ -85,6 +86,45 @@ func TestBuildSyncItems_PreservesUninstalledAttachedSkill(t *testing.T) {
 	}
 	if len(metas) != 1 || metas[0].Slug != "remote-only" || metas[0].Name != "remote-only" {
 		t.Fatalf("uninstalled attachment was not preserved: %+v", metas)
+	}
+}
+
+func TestBuildSyncItemsAuditsInvalidAttachmentManifest(t *testing.T) {
+	root := t.TempDir()
+	agentDir := filepath.Join(root, "broken")
+	if err := os.MkdirAll(agentDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("prompt"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "_attached.yaml"), []byte("not: a-list\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = auditor.Close() })
+	srv := newPullServer(t, root)
+	srv.deps.Auditor = auditor
+
+	items, err := srv.buildSyncItems(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("invalid agent unexpectedly synced: %+v", items)
+	}
+	logData, err := os.ReadFile(filepath.Join(logDir, "audit.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(logData, []byte(`"event":"agent_sync_failed"`)) ||
+		!bytes.Contains(logData, []byte(`"input_summary":"agent:broken"`)) ||
+		!bytes.Contains(logData, []byte("attachment snapshot failed")) {
+		t.Fatalf("missing invalid-manifest audit entry: %s", logData)
 	}
 }
 

@@ -170,6 +170,47 @@ func TestAppliedAPIMutationDoesNotHideEarlierExternalEdit(t *testing.T) {
 	}
 }
 
+func TestConfigMutationDoesNotBlessEditAfterReloadPrecheck(t *testing.T) {
+	shannonDir := t.TempDir()
+	configPath := filepath.Join(shannonDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("agent:\n  temperature: 0.2\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(0, nil, &ServerDeps{
+		ShannonDir: shannonDir,
+		Config:     &config.Config{Agent: config.AgentConfig{Temperature: 0.2}},
+	}, "test")
+
+	// This is the race the old implementation missed: it observed a clean
+	// revision, then an external editor replaced config.yaml before the locked
+	// read-modify-write began.
+	if required, _, _ := srv.configReloadState(); required {
+		t.Fatal("initial config unexpectedly requires reload")
+	}
+	if err := os.WriteFile(configPath, []byte("agent:\n  temperature: 0.8\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	revisions, err := config.AppendGlobalDisabledSkillsWithRevision(shannonDir, []string{"demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.recordConfigMutationApplied(revisions)
+
+	if required, _, _ := srv.configReloadState(); !required {
+		t.Fatal("external edit between precheck and locked write was incorrectly marked as loaded")
+	}
+	if srv.deps.Config.Agent.Temperature != 0.2 {
+		t.Fatalf("live temperature changed without reload: %v", srv.deps.Config.Agent.Temperature)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "temperature: 0.8") || !strings.Contains(string(data), "demo") {
+		t.Fatalf("locked mutation did not preserve both external and API changes:\n%s", data)
+	}
+}
+
 func TestPatchConfigMakesPendingReloadObservable(t *testing.T) {
 	shannonDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("{}\n"), 0600); err != nil {

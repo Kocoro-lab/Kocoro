@@ -43,7 +43,7 @@ Four live transport families, named by file prefix:
 |---|---|---|
 | `bus_event.*` | `GET /events` broadcast SSE stream | `id: <n>\nevent: <type>\ndata: <payload>\n\n` — fixture is the `data` payload |
 | `sse_event.*` | `POST /message` per-request SSE stream | `event: <name>\ndata: <payload>\n\n` — fixture is the `data` payload. NOTE: per-request event names differ from bus types (`approval` not `approval_request`, `tool` not `tool_status`) |
-| `http_get.*` / `http_post.*` | Plain HTTP request or response body | none — fixture is the whole JSON body |
+| `http_get.*` / `http_post.*` / `http_delete.*` | Plain HTTP request or response body | none — fixture is the whole JSON body |
 | `computer_use.*` | Local Desktop computer-use control plane | Request/response bodies for the authenticated activity, control, and heartbeat routes. |
 
 ## File List
@@ -126,6 +126,8 @@ codecs.
 | `http_get.status.response.json` | `server.go handleStatus` | pins the FULL `capabilities` token list — adding a token without updating this fixture fails the daemon test, which is the point (minting discipline made mechanical). `memory.reason` is explicit-null, not omitted. `uptime` is dynamic (normalized in tests) |
 | `http_get.config.reload_required.response.json` | `server.go handleGetConfig` | pins the split between newer on-disk `global` config and the daemon's stale in-memory `effective` config, including the actionable `reload_required` / `reload_reason` fields |
 | `http_get.config_status.reload_required.response.json` | `server.go handleConfigStatus` | pins the lightweight reload warning exposed alongside runtime config status; gated for clients by `config_reload_state_v1` |
+| `http_delete.skill.builtin.response.json` | `server.go handleDeleteGlobalSkill` | stable `skill_is_builtin` code plus a human-readable deletion error |
+| `http_delete.skill.invalid_agent_manifest.response.json` | `server.go handleDeleteGlobalSkill` | recoverable 409 for a malformed `_attached.yaml`; the fallback message names the agent update route used to repair it |
 | `http_get.computer_use_topology.response.json` | `computer_use_topology.go handleComputerUseTopology` (`GET /local/computer-use/topology`) | daemon-owned transport fixture copied semantically from the helper's canonical `display_topology.mixed_horizontal.v1.json`. The HTTP body is the strict topology object itself, with no wrapper. Desktop vendors this fixture from the daemon repo; the endpoint exposes topology only, never coordinate-capture image bytes. |
 | `http_get.agents.response.json` | `server.go handleAgents` | list items use `override` |
 | `http_get.agent_detail.response.json` | `server.go handleGetAgent` (`AgentAPI`) | detail uses `overridden` — historical field-name divergence, pinned here so neither side "fixes" it unilaterally. `memory`/`config`/`commands`/`skills` are explicit-null when absent |

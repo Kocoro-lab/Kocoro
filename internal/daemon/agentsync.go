@@ -150,6 +150,7 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 	syncedSkills, err := syncedAgentSkills(agentsDir, name, api.Skills)
 	if err != nil {
 		log.Printf("agentsync: skipping agent %q: attachment snapshot failed: %v", name, err)
+		s.auditAgentSyncFailure(name, "attachment snapshot failed", err)
 		return client.SyncAgentItem{}, false
 	}
 

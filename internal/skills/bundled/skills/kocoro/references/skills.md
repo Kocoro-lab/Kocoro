@@ -14,7 +14,7 @@ The skill reminder injected into a conversation is scoped to the current agent. 
 - Query: `?include_hidden=true` (optional) — include skills with frontmatter `hidden: true`
 - Response: `{"skills": [{"name": "...", "slug": "...", "description": "...", "source": "global", "install_source": "...", "hidden": true, "required_secrets": [...], "configured_secrets": [...], "default_agent_disabled": false}]}`
 - `default_agent_disabled`: `true` when the skill is in `config.skills.disabled` — i.e. the **default agent** will not load it (named agents are unaffected). Toggle via POST/DELETE /skills/disabled below. Requires capability `default_agent_skill_denylist`.
-- Notes: Shows all skills currently installed in your Shannon instance. Prefer `slug` (the on-disk / URL-safe identifier) for all subsequent CRUD calls; `name` is a free-form display label that may contain uppercase letters or CJK characters and is not guaranteed to match the slug. The by-name skill endpoints (`GET/PUT/DELETE /skills/{name}`, `/{name}/usage`, `/{name}/secrets`, `/{name}/scripts|references|assets`) accept **either** the slug or the display `name` (canonicalized to the slug server-side) as a backward-compat alias, but slug is the canonical, unambiguous key.
+- Notes: Shows all skills currently installed in your Shannon instance. Prefer `slug` (the on-disk / URL-safe identifier) for all subsequent CRUD calls; `name` is a free-form display label that may contain uppercase letters or CJK characters and is not guaranteed to match the slug. The by-name skill endpoints (`GET/PUT/DELETE /skills/{name}`, `/{name}/usage`, `/{name}/secrets`, `/{name}/scripts|references|assets`) accept **either** the slug or the display `name` as a backward-compat alias. An exact slug always wins when another skill has the same display name, so slug is the canonical, unambiguous key.
 - Hidden skills: By default the response omits skills whose SKILL.md frontmatter sets `hidden: true` (e.g. `kocoro` itself) — this is a display-only filter so user-facing frontends hide internal/policy skills. The skill is still loaded, still invokable via `use_skill`, and still participates in skill discovery. Pass `?include_hidden=true` to see them (e.g. for an admin/management UI that needs to manage their secrets or config).
 
 ### Disable / enable a skill for the default agent
@@ -111,7 +111,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Body: `multipart/form-data`; field `file` = ZIP payload. Size is bounded only by a memory / zip-bomb backstop (1 GiB compressed and 1 GiB uncompressed), not a product limit — skills install to the user's local disk.
 - Response 201: `{"name": "...", "slug": "...", "description": "...", "install_source": "local"}`
 - Response 409: `{"error": "skill_already_exists", "existing_name": "...", "existing_description": "...", "existing_prompt": "...", "new_description": "...", "new_prompt": "..."}`
-- Response 403: `{"error": "skill_is_builtin"}` — returned when the ZIP targets an auto-installed builtin (`kocoro`, `kocoro-generative-ui`). `force=true` does NOT override this; the builtin guard is unconditional because `EnsureBuiltinSkills` would wipe any override on the next daemon restart.
+- Response 403: `{"code": "skill_is_builtin", "error": "builtin skills are managed by the binary and cannot be overwritten"}` — returned when the ZIP targets an auto-installed builtin (`kocoro`, `kocoro-generative-ui`). `force=true` does NOT override this; the builtin guard is unconditional because `EnsureBuiltinSkills` would wipe any override on the next daemon restart.
 - Response 400: `{"error": "invalid multipart form: ..."}` — returned when the multipart body is malformed or the `file` field is missing. Distinct from 413 (which means the archive or its extracted contents exceeded the size backstop).
 - Response 413: the ZIP archive or its extracted contents exceed the size backstop (1 GiB compressed / 1 GiB uncompressed)
 - Response 422: invalid skill payload (missing SKILL.md, malformed frontmatter, invalid name)
@@ -123,7 +123,7 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Body: `{"description": "...", "prompt": "# My Skill\n\n..."}`
 - Response 200: `{"status": "updated"}`
 - Response 409: `{"error": "skill_already_exists", "existing_name": "...", "existing_description": "...", "existing_prompt": "...", "new_description": "...", "new_prompt": "..."}` — same shape as POST /skills/upload so frontends can reuse one compare sheet.
-- Response 403: `{"error": "skill_is_builtin"}` — `{slug}` is an auto-installed builtin (`kocoro`, `kocoro-generative-ui`). `force=true` does NOT override this; the guard is unconditional because `EnsureBuiltinSkills` would wipe any override on the next daemon restart.
+- Response 403: `{"code": "skill_is_builtin", "error": "builtin skills are managed by the binary and cannot be overwritten"}` — `{slug}` is an auto-installed builtin (`kocoro`, `kocoro-generative-ui`). `force=true` does NOT override this; the guard is unconditional because `EnsureBuiltinSkills` would wipe any override on the next daemon restart.
 - Response 422: existing on-disk SKILL.md has malformed frontmatter; fix or delete the directory before retrying.
 - Response 400: missing `description` or `prompt` in the body.
 - Response 503: cannot resolve skill sources or LoadSkills failed while an existing skill is on disk — refused to clobber AllowedTools/Metadata. Transient; retry.
@@ -133,9 +133,10 @@ The `/skills/clawhub/*` endpoints are backed by ClawHub's live online catalog (~
 - Method: DELETE
 - Path: /skills/{slug}?confirm=true
 - Response: `{"status": "deleted"}`
-- Response 403: `{"error": "skill_is_builtin"}` — auto-installed builtin skills cannot be deleted.
+- Response 403: `{"code": "skill_is_builtin", "error": "builtin skills are managed by the binary and cannot be deleted"}` — auto-installed builtin skills cannot be deleted.
+- Response 409: `{"code": "agent_skill_manifest_invalid", "error": "agent \"{agent}\" has an invalid _attached.yaml; repair it with PUT /agents/{agent} and a skills list before deleting a global skill"}` — at least one agent attachment manifest is malformed or unreadable. Repair that agent through the ordinary update endpoint, then retry deletion.
 - Response 422: the installed SKILL.md identity is malformed, so the daemon cannot safely identify and remove legacy display-name references.
-- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Before removing the global files, the daemon removes both slug and legacy display-name references from every readable agent manifest using one validated change plan. If the skill identity or any manifest is corrupt or unreadable, deletion fails and the global skill remains installed rather than reporting success with dangling references. Stored API keys are cleared from the OS keychain after deletion. Cross-device sync preserves attachment identifiers even when the skill is not installed on the current device; local absence alone is never treated as an instruction to detach another device.
+- Notes: DESTRUCTIVE. The `{slug}` path segment is the directory identifier. Before removing the global files, the daemon removes the slug and any non-colliding legacy display-name references from every readable agent manifest using one validated change plan. If the skill identity or any manifest is corrupt or unreadable, deletion fails and the global skill remains installed rather than reporting success with dangling references. Stored API keys are cleared from the OS keychain after deletion. Cross-device sync preserves attachment identifiers even when the skill is not installed on the current device; local absence alone is never treated as an instruction to detach another device.
 
 ### Set skill secrets (API keys / env vars)
 - Method: PUT

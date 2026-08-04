@@ -56,6 +56,42 @@ func TestLoadAgent_MissingMemoryIsOK(t *testing.T) {
 	}
 }
 
+func TestLoadAgent_AttachedSlugWinsOverAnotherSkillDisplayName(t *testing.T) {
+	shannonDir := t.TempDir()
+	agentsDir := filepath.Join(shannonDir, "agents")
+	agentDir := filepath.Join(agentsDir, "analyst")
+	if err := os.MkdirAll(agentDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENT.md"), []byte("analyst"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for slug, name := range map[string]string{
+		"docker":       "Docker",
+		"docker-tools": "docker",
+	} {
+		dir := filepath.Join(shannonDir, "skills", slug)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		body := fmt.Sprintf("---\nname: %s\ndescription: test\n---\nbody\n", name)
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SetAttachedSkills(agentsDir, "analyst", []string{"docker"}); err != nil {
+		t.Fatal(err)
+	}
+
+	agent, err := LoadAgent(agentsDir, "analyst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.Skills) != 1 || agent.Skills[0].Slug != "docker" {
+		t.Fatalf("resolved skills = %+v, want exact slug docker only", agent.Skills)
+	}
+}
+
 func TestLoadAgent_RejectsInvalidNames(t *testing.T) {
 	dir := t.TempDir()
 	invalid := []string{"../etc", "a/b", "", ".hidden", "a b", "A_UPPER", "名前"}

@@ -640,8 +640,8 @@ var daemonStartCmd = &cobra.Command{
 				OnAPIKeyChanged: func(ctx context.Context) {
 					localServer.RebuildAuthSensitiveTools(ctx)
 				},
-				ConfigReloadRequired: deps.ConfigReloadRequired,
-				RecordConfigRevision: deps.RecordConfigRevision,
+				LockConfigMutation:   deps.LockConfigMutation,
+				RecordConfigMutation: deps.RecordConfigMutation,
 				Logger:               log.Default(),
 			})
 			authMgr.SetEventBus(localServer.EventBus())

@@ -14,6 +14,24 @@ import (
 // unsafe override, and the operator retries after the editor finishes writing.
 const stableLoadAttempts = 3
 
+// MutationRevisions binds one locked read-modify-write to the exact config
+// bytes observed before the mutation and written after it. After is empty for
+// a no-op. Daemon callers advance their in-memory applied revision only when
+// Before still matches the revision that produced the live configuration.
+type MutationRevisions struct {
+	Before string
+	After  string
+}
+
+// SnapshotRevision returns the same identity FileRevision would return for a
+// snapshot already read while holding config.yaml.lock.
+func SnapshotRevision(data []byte, exists bool) string {
+	if !exists {
+		return "missing"
+	}
+	return BytesRevision(data)
+}
+
 // BytesRevision returns the content identity used by the daemon to distinguish
 // the exact config.yaml bytes reflected in memory from a later disk revision.
 func BytesRevision(data []byte) string {

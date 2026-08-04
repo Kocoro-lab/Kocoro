@@ -302,12 +302,28 @@ func LoadAgent(agentsDir, name string) (*Agent, error) {
 		// Match manifest entries against both Slug (directory identifier,
 		// canonical post-decoupling) and Name (frontmatter display label)
 		// so manifests written by either API path resolve correctly.
+		bySlug := make(map[string]*skills.Skill, len(allSkills))
+		for _, skill := range allSkills {
+			bySlug[skill.Slug] = skill
+		}
 		attached := make(map[string]bool, len(attachedNames))
 		for _, n := range attachedNames {
-			attached[n] = true
+			// An exact slug is authoritative. A display-name alias is considered
+			// only when no installed skill owns that exact slug; otherwise one
+			// identifier could enable two different skills (for example slug
+			// "docker" plus another skill whose display name is "docker").
+			if exact := bySlug[n]; exact != nil {
+				attached[exact.Slug] = true
+				continue
+			}
+			for _, skill := range allSkills {
+				if skill.Name == n {
+					attached[skill.Slug] = true
+				}
+			}
 		}
 		for _, s := range allSkills {
-			if attached[s.Slug] || attached[s.Name] {
+			if attached[s.Slug] {
 				ag.Skills = append(ag.Skills, s)
 			}
 		}

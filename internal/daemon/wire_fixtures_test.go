@@ -890,8 +890,11 @@ func newConfigReloadWireFixtureServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	srv := NewServer(0, nil, &ServerDeps{
-		ShannonDir:     shannonDir,
-		Config:         &config.Config{Skills: config.SkillsConfig{Disabled: []string{"old"}}},
+		ShannonDir: shannonDir,
+		Config: &config.Config{
+			Skills:  config.SkillsConfig{Disabled: []string{"old"}},
+			Sources: map[string]config.ConfigSource{"skills.disabled": {File: "config.yaml", Level: "global"}},
+		},
 		ConfigRevision: revision,
 	}, "test")
 	if err := os.WriteFile(configPath, []byte("skills:\n  disabled: []\n"), 0600); err != nil {
@@ -947,6 +950,64 @@ func TestWireFixture_HTTPConfigStatusReloadState(t *testing.T) {
 	}
 	if !response.ReloadRequired || response.ReloadReason == "" || response.Koe == nil {
 		t.Fatalf("consumer lost config status fields: %+v", response)
+	}
+}
+
+func TestWireFixture_HTTPSkillDeleteErrors(t *testing.T) {
+	type consumerError struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	tests := []struct {
+		name       string
+		fixture    string
+		skill      string
+		wantStatus int
+		setup      func(*testing.T, string, string)
+	}{
+		{
+			name:       "builtin",
+			fixture:    "http_delete.skill.builtin.response.json",
+			skill:      "kocoro",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "invalid agent manifest",
+			fixture:    "http_delete.skill.invalid_agent_manifest.response.json",
+			skill:      "demo",
+			wantStatus: http.StatusConflict,
+			setup: func(t *testing.T, shannonDir, agentsDir string) {
+				daemonTestWriteFile(t, filepath.Join(shannonDir, "skills", "demo", "SKILL.md"), "---\nname: demo\ndescription: fixture\n---\n")
+				daemonTestWriteFile(t, filepath.Join(agentsDir, "broken", "_attached.yaml"), "not: a-list\n")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			shannonDir := t.TempDir()
+			agentsDir := filepath.Join(shannonDir, "agents")
+			if test.setup != nil {
+				test.setup(t, shannonDir, agentsDir)
+			}
+			srv := NewServer(0, nil, &ServerDeps{
+				Config:     &config.Config{},
+				ShannonDir: shannonDir,
+				AgentsDir:  agentsDir,
+			}, "test")
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/skills/"+test.skill+"?confirm=true", nil))
+			if rec.Code != test.wantStatus {
+				t.Fatalf("DELETE /skills/%s = %d, body=%s", test.skill, rec.Code, rec.Body.Bytes())
+			}
+			assertSemanticEqual(t, loadWireFixture(t, test.fixture), parseJSONMap(t, rec.Body.Bytes()))
+			var decoded consumerError
+			if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Code == "" || decoded.Error == "" || decoded.Code == decoded.Error {
+				t.Fatalf("consumer lost machine code or human message: %+v", decoded)
+			}
+		})
 	}
 }
 

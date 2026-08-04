@@ -49,9 +49,9 @@ type authSnapshot struct {
 }
 
 // AuthManagerConfig collects the daemon dependencies AuthManager needs to
-// operate. All fields are required EXCEPT Cfg (legacy callers/tests may still
-// pass it), OnAPIKeyChanged (nil → skip tool rebuild), and WSController
-// (nil → skip WS lifecycle).
+// operate. Cfg is retained for legacy callers/tests; OnAPIKeyChanged and the
+// config-mutation hooks are optional. WSController is installed separately and
+// may remain nil to skip WS lifecycle.
 type AuthManagerConfig struct {
 	Keychain             *keychain.Store
 	Cloud                *client.AuthClient
@@ -60,8 +60,8 @@ type AuthManagerConfig struct {
 	Cfg                  *config.Config
 	ShannonDir           string
 	OnAPIKeyChanged      func(context.Context)
-	ConfigReloadRequired func() bool
-	RecordConfigRevision func(string)
+	LockConfigMutation   func() func()
+	RecordConfigMutation func(config.MutationRevisions)
 	Logger               *log.Logger
 }
 
@@ -93,8 +93,8 @@ type AuthManager struct {
 	bus                  *EventBus
 	onPrincipalChanged   func(previous, current string)
 	onAPIKeyChanged      func(context.Context)
-	configReloadRequired func() bool
-	recordConfigRevision func(string)
+	lockConfigMutation   func() func()
+	recordConfigMutation func(config.MutationRevisions)
 	logger               *log.Logger
 	shanDir              string
 	sf                   singleflight.Group
@@ -117,8 +117,8 @@ func NewAuthManager(cfg AuthManagerConfig) *AuthManager {
 		gw:                   cfg.Gateway,
 		wsClient:             cfg.WSClient,
 		onAPIKeyChanged:      cfg.OnAPIKeyChanged,
-		configReloadRequired: cfg.ConfigReloadRequired,
-		recordConfigRevision: cfg.RecordConfigRevision,
+		lockConfigMutation:   cfg.LockConfigMutation,
+		recordConfigMutation: cfg.RecordConfigMutation,
 		logger:               logger,
 		shanDir:              cfg.ShannonDir,
 	}
@@ -377,14 +377,18 @@ func (a *AuthManager) selfHealFromYAML(ctx context.Context) {
 		a.logger.Printf("auth: keychain self-heal from yaml api_key failed: %v", err)
 		return
 	}
-	configWasStale := a.configReloadRequired != nil && a.configReloadRequired()
-	revision, err := config.StripYAMLAPIKeyWithRevision(a.shanDir)
+	unlockConfig := func() {}
+	if a.lockConfigMutation != nil {
+		unlockConfig = a.lockConfigMutation()
+	}
+	defer unlockConfig()
+	revisions, err := config.StripYAMLAPIKeyWithRevision(a.shanDir)
 	if err != nil {
 		a.logger.Printf("auth: keychain self-heal: strip yaml api_key: %v", err)
 		return
 	}
-	if !configWasStale && revision != "" && a.recordConfigRevision != nil {
-		a.recordConfigRevision(revision)
+	if a.recordConfigMutation != nil {
+		a.recordConfigMutation(revisions)
 	}
 }
 
