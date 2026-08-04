@@ -18,7 +18,11 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 )
 
-// imageReadExtensions are file extensions that file_read returns as vision image blocks.
+// imageReadExtensions are file extensions that file_read returns as vision
+// image blocks. Keep in sync with restoreExcludedExtensions in
+// internal/agent/filerestore.go — post-compaction restoration must never
+// re-inject these as text, and the sets cannot be shared because this
+// package imports agent.
 var imageReadExtensions = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
 }

@@ -182,6 +182,37 @@ func TestBuildPostCompactionFileRestore_SkipsFilesInPriorRestoreBlock(t *testing
 	}
 }
 
+// A markdown heading INSIDE restored file content must not be misread as a
+// restored-path header: a doc whose text contains a path-shaped heading
+// ("## internal/agent/loop.go") would otherwise silently suppress that
+// file's restoration at the next compaction in the same Run.
+func TestBuildPostCompactionFileRestore_ContentHeadingsAreNotRestorePaths(t *testing.T) {
+	dir := t.TempDir()
+	other := filepath.Join(dir, "other.md")
+	os.WriteFile(other, []byte("real content of the other file\n"), 0o644)
+	doc := filepath.Join(dir, "design.md")
+	os.WriteFile(doc, []byte("# Design\n\n## "+other+"\nsection about that file\n"), 0o644)
+
+	rt := NewReadTracker()
+	recordRead(rt, doc, 0, 0)
+
+	loop := newRestoreTestLoop(rt)
+	first, ok := loop.buildPostCompactionFileRestore(smallShaped(), 0)
+	if !ok {
+		t.Fatal("first restore expected")
+	}
+
+	// Second compaction: the prior block (containing the doc's heading that
+	// NAMES other.md) survives in the tail; other.md itself was read since
+	// and must still be restorable.
+	recordRead(rt, other, 0, 0)
+	shaped := append(smallShaped(), first)
+	msg, ok := loop.buildPostCompactionFileRestore(shaped, 0)
+	if !ok || !strings.Contains(msg.Content.Text(), "real content of the other file") {
+		t.Fatalf("a heading inside restored content must not suppress that file's restoration (ok=%v)", ok)
+	}
+}
+
 func TestBuildPostCompactionFileRestore_MaxFilesCap(t *testing.T) {
 	dir := t.TempDir()
 	rt := NewReadTracker()
@@ -202,12 +233,12 @@ func TestBuildPostCompactionFileRestore_MaxFilesCap(t *testing.T) {
 	}
 }
 
-// TestAgentLoop_ReactiveRestoreRespectsEvidenceFloor: after a context-length
-// 400 the reactive path floors its overhead at window−estimate+1; the
-// restoration budget must use that SAME floor. Budgeting against the plain
-// (possibly zero) calibration would inject tens of thousands of tokens into
-// a prompt the provider just rejected, and reactiveCompacted makes the second
-// overflow terminal.
+// TestAgentLoop_ReactiveRestoreRespectsEvidenceFloor pins the reactive-path
+// policy: NO file restoration after a context-length 400. The provider just
+// rejected this history, the evidence floor only proves a LOWER bound on the
+// true overhead (so any budget computed against it can overshoot), and
+// reactiveCompacted makes a second overflow terminal — the retry must keep
+// every token shaping recovered.
 func TestAgentLoop_ReactiveRestoreRespectsEvidenceFloor(t *testing.T) {
 	dir := t.TempDir()
 	decoy := filepath.Join(dir, "decoy.md")

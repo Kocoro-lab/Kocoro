@@ -3828,8 +3828,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 	// Restore the checkpointed estimator calibration so this fresh loop's
 	// iteration-0 compaction decisions are not blind on a resumed session.
-	// Must run after SetSessionID / SwitchAgent (both reset the calibration);
-	// the loop validates model + tool-registry fingerprint before applying.
+	// Ordering is load-bearing: must run after SetSessionID / SwitchAgent
+	// (both reset the calibration) AND after applyAgentModelOverlayToLoop /
+	// SetSpecificModel — the restore validates the sample against the active
+	// model pin, so a pin applied later would silently accept incompatible
+	// samples. The loop also validates the tool-registry fingerprint.
 	if cal := sess.CompactionCalibration; cal != nil {
 		loop.SetEstOverheadState(cal.OverheadTokens, cal.Model, cal.ToolsFingerprint)
 	}

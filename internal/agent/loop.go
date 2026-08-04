@@ -3744,10 +3744,9 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// read there, whose exact identifiers the summary paraphrases at best.
 	// The content is still on disk, so re-inject the most recent reads before
 	// the task reanchor, which must stay the last message. overheadTokens is
-	// the calibration the calling compaction path judged against — the
-	// reactive path MUST pass its 400-evidence floor, not the plain (possibly
-	// zero) calibration, or restoration re-inflates a prompt the provider
-	// just rejected.
+	// the calibration the calling compaction path judged against. Called only
+	// from the proactive and preflight paths — the reactive (post-400) path
+	// deliberately skips restoration; see the comment at its reanchor site.
 	restoreRecentReads := func(overheadTokens int) {
 		msg, ok := a.buildPostCompactionFileRestore(messages, overheadTokens)
 		if !ok {
@@ -4757,9 +4756,15 @@ iterationLoop:
 							}
 						}
 						msgTimestamps = rebasedTS
-						restoreRecentReads(reactiveOverhead)
 					}
 
+					// Deliberately NO file restoration here: the provider just
+					// rejected this history for length and reactiveCompacted
+					// makes a second overflow terminal. The evidence floor only
+					// proves a LOWER bound on the true overhead, so any budget
+					// computed against it can still overshoot — the post-400
+					// retry keeps every token shaping recovered, and the model
+					// re-reads files on demand once the run survives.
 					reanchorActiveTask(MetaBoundaryPostCompaction)
 
 					// Rebuild request with compacted messages. The ordinary

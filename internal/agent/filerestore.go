@@ -97,6 +97,8 @@ var restoreExcludedBasenames = map[string]bool{
 // would interpolate raw binary bytes as prompt text — json.Marshal replaces
 // the invalid UTF-8 with U+FFFD, so it fails as silent token waste. The
 // utf8.Valid check in readRestoreRange backstops extensions not listed here.
+// Keep in sync with imageReadExtensions in internal/tools/file_read.go —
+// the sets cannot be shared because tools imports agent.
 var restoreExcludedExtensions = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
 	".heic": true, ".heif": true, ".avif": true, ".bmp": true, ".tiff": true,
@@ -105,8 +107,12 @@ var restoreExcludedExtensions = map[string]bool{
 
 // restoreHeaderPrefix marks each restored file section; it doubles as the
 // dedup key a later compaction in the same Run uses to avoid re-injecting a
-// file whose restore block still survives in the kept tail.
-const restoreHeaderPrefix = "## "
+// file whose restore block still survives in the kept tail. The "[restored]"
+// sentinel keeps the dedup parser from misreading ordinary markdown headings
+// INSIDE restored file content as restored paths — a doc containing a
+// path-shaped heading would otherwise silently suppress that file's
+// restoration at the next compaction.
+const restoreHeaderPrefix = "## [restored] "
 
 const restoreIntro = "Context was compacted. The most recently read files were re-read from disk to preserve continuity (fresh content — a file may have changed since the earlier read):"
 
