@@ -46,7 +46,7 @@ func TestCompressOldToolResults_EmitsCompactEvents(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, 8, 300, nil)
+	compressOldToolResults(context.Background(), messages, 8, 300, nil, "")
 
 	data, err := os.ReadFile(filepath.Join(tmp, ".shannon", "logs", "cache-debug.log"))
 	if err != nil {
