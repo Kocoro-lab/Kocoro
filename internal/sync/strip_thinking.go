@@ -6,8 +6,8 @@ import (
 
 // stripThinkingFromSessionJSON returns a copy of the session JSON body with
 // `thinking` and `redacted_thinking` content blocks removed from every
-// assistant message's content array. Other fields and the message order are
-// preserved verbatim.
+// assistant message's content array in both the lossless transcript and the
+// optional compaction checkpoint. Other fields and message order are kept.
 //
 // Why on the upload path: thinking content can contain sensitive intermediate
 // reasoning (private deliberations the user never sees). The local session
@@ -46,52 +46,54 @@ func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 		return body, err
 	}
 
-	rawMessages, ok := top["messages"].([]any)
-	if !ok {
-		// No messages array (or unexpected shape) — nothing to strip.
-		return body, nil
+	var messageArrays [][]any
+	if rawMessages, ok := top["messages"].([]any); ok {
+		messageArrays = append(messageArrays, rawMessages)
+	}
+	if checkpoint, ok := top["compaction_checkpoint"].(map[string]any); ok {
+		if rawMessages, ok := checkpoint["messages"].([]any); ok {
+			messageArrays = append(messageArrays, rawMessages)
+		}
 	}
 
 	mutated := false
-	for _, rawMsg := range rawMessages {
-		msg, ok := rawMsg.(map[string]any)
-		if !ok {
-			continue
-		}
-		role, _ := msg["role"].(string)
-		if role != "assistant" {
-			continue
-		}
-		rawContent, ok := msg["content"].([]any)
-		if !ok {
-			// content is a plain string or missing → no thinking blocks to drop.
-			continue
-		}
-
-		filtered := make([]any, 0, len(rawContent))
-		dropped := false
-		for _, rawBlock := range rawContent {
-			block, ok := rawBlock.(map[string]any)
+	for _, rawMessages := range messageArrays {
+		for _, rawMsg := range rawMessages {
+			msg, ok := rawMsg.(map[string]any)
 			if !ok {
-				// Non-object entry (shouldn't happen for assistant content,
-				// but pass through defensively rather than silently drop).
+				continue
+			}
+			role, _ := msg["role"].(string)
+			if role != "assistant" {
+				continue
+			}
+			rawContent, ok := msg["content"].([]any)
+			if !ok {
+				// content is a plain string or missing → no thinking blocks to drop.
+				continue
+			}
+
+			filtered := make([]any, 0, len(rawContent))
+			dropped := false
+			for _, rawBlock := range rawContent {
+				block, ok := rawBlock.(map[string]any)
+				if !ok {
+					// Non-object entry (shouldn't happen for assistant content,
+					// but pass through defensively rather than silently drop).
+					filtered = append(filtered, rawBlock)
+					continue
+				}
+				blockType, _ := block["type"].(string)
+				if blockType == "thinking" || blockType == "redacted_thinking" {
+					dropped = true
+					continue
+				}
 				filtered = append(filtered, rawBlock)
-				continue
 			}
-			blockType, _ := block["type"].(string)
-			if blockType == "thinking" || blockType == "redacted_thinking" {
-				dropped = true
-				continue
+			if dropped {
+				msg["content"] = filtered
+				mutated = true
 			}
-			filtered = append(filtered, rawBlock)
-		}
-		if dropped {
-			// `msg` is the map[string]any reference already held inside
-			// rawMessages[i] — mutating msg["content"] in place is enough;
-			// no need to re-assign the slice element. Same for the outer
-			// `top["messages"]` (already pointing at rawMessages).
-			msg["content"] = filtered
-			mutated = true
 		}
 	}
 

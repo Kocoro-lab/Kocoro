@@ -212,12 +212,12 @@ type AgentConfig struct {
 	SkillDiscovery           *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
 	// CompactionSnapshotRetention is how many pre-compaction history snapshots
 	// are kept per session (sessions-dir/.compaction-snapshots/<id>/). Each
-	// applied compaction irreversibly replaces the persisted history; the
-	// snapshot is the rollback material for junk summaries and lost
-	// identifiers. Default 1 keeps only the latest rollback point until a
+	// applied compaction replaces the durable model-live checkpoint while the
+	// lossless transcript remains untouched; the snapshot preserves the exact
+	// prior live state for diagnosing or rolling back junk summaries. Default 1 keeps only the latest rollback point until a
 	// supported restore workflow ships. When configured to bind at >=2,
 	// the MIDDLE snapshots are evicted — the oldest is pinned as the only
-	// pre-micro-compaction copy and the newest are kept; retention 1 keeps
+	// pre-first-checkpoint live copy and the newest are kept; retention 1 keeps
 	// only the newest, no pin. 0 disables snapshotting.
 	CompactionSnapshotRetention int `mapstructure:"compaction_snapshot_retention" yaml:"compaction_snapshot_retention" json:"compaction_snapshot_retention"`
 	// CompactionSnapshotMaxAgeDays bounds snapshot disk retention across both

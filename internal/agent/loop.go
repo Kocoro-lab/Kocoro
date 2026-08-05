@@ -855,12 +855,12 @@ type AgentLoop struct {
 	// resumed daemon loop can reject a sample taken under a different model
 	// (tokenizers and schema overheads differ per provider). Always stores a
 	// string; same concurrency exposure as estOverheadTokens.
-	estOverheadModel  atomic.Value
-	memoryDir         string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
-	projectEntityDir  string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
-	stickyContext     string             // session-scoped facts injected verbatim into system prompt; never truncated
-	outputFormat      string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
-	userFilePaths     []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
+	estOverheadModel atomic.Value
+	memoryDir        string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	projectEntityDir string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
+	stickyContext    string             // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat     string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	userFilePaths    []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
 	// alwaysAllowTools is the per-agent persisted set loaded from the agent's
 	// permissions.always_allow_tools config. Sourced from
 	// internal/agents/loader.go AgentPermissionsConfig and injected by the
@@ -959,28 +959,33 @@ type AgentLoop struct {
 	// emit). Injected into the per-tool-call context (WithIMStatusContext) so
 	// schedule_create can snapshot a proactive-delivery target onto a new
 	// Schedule. Set once with firstTurnIMContext; never cleared.
-	runIMStatusContext    json.RawMessage
-	runMessages           []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
-	runMsgInjected        []bool           // parallel to runMessages: true = system-injected guardrail/nudge
-	runMsgTimestamps      []time.Time      // parallel to runMessages: when each message was created
-	lastRunStatus         RunStatus
-	toolRefSupported      bool   // true when the configured model supports defer_loading + tool_reference protocol
-	cacheSource           string // attribution tag sent to gateway on every Complete call
-	executionProfileID    string
-	executionHarnessModel string
-	parallelToolCalls     bool
-	responseCachePolicy   executionprofile.ResponseCachePolicy
-	computerProfile       executionprofile.Profile
-	computerToolName      string
-	computerToolsetHash   string
-	executionEvidence     executionprofile.Evidence
-	sideEffectReplayKeys  map[string]struct{}
-	executionEvidenceMu   sync.Mutex
-	skillDiscovery        bool // opt-in small-tier model call to identify relevant skills
-	memoryPreflight       MemoryPreflightFunc
-	preCompactionSnapshot PreCompactionSnapshotFunc
-	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
-	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
+	runIMStatusContext json.RawMessage
+	runMessages        []client.Message // conversation messages accumulated during the last Run() (excludes system+history)
+	runMsgInjected     []bool           // parallel to runMessages: true = system-injected guardrail/nudge
+	runMsgTimestamps   []time.Time      // parallel to runMessages: when each message was created
+	// compactionCheckpointMessages is the durable model-visible state after an
+	// applied compaction. Unlike runMessages (the lossless current-turn archive),
+	// it contains the shaped history plus the current run, excludes the system
+	// prompt and transient injected messages, and is replaced as the run grows.
+	compactionCheckpointMessages []client.Message
+	lastRunStatus                RunStatus
+	toolRefSupported             bool   // true when the configured model supports defer_loading + tool_reference protocol
+	cacheSource                  string // attribution tag sent to gateway on every Complete call
+	executionProfileID           string
+	executionHarnessModel        string
+	parallelToolCalls            bool
+	responseCachePolicy          executionprofile.ResponseCachePolicy
+	computerProfile              executionprofile.Profile
+	computerToolName             string
+	computerToolsetHash          string
+	executionEvidence            executionprofile.Evidence
+	sideEffectReplayKeys         map[string]struct{}
+	executionEvidenceMu          sync.Mutex
+	skillDiscovery               bool // opt-in small-tier model call to identify relevant skills
+	memoryPreflight              MemoryPreflightFunc
+	preCompactionSnapshot        PreCompactionSnapshotFunc
+	sentSkillNames               map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
+	readTracker                  *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
 	// historical tool_result blocks. It is session-scoped and persisted by
 	// daemon/TUI callers so resumed sessions replay identical bytes.
@@ -1644,17 +1649,16 @@ func (a *AgentLoop) SetMemoryPreflight(fn MemoryPreflightFunc) {
 }
 
 // PreCompactionSnapshotFunc receives the full message history immediately
-// before an applied compaction replaces it — the last moment the droppable
-// middle exists anywhere but disk spill files. Called synchronously; the
-// slice must not be retained after return. Implementations must swallow
-// their own errors: snapshotting is recovery material and must never block
-// or fail a compaction.
+// before an applied compaction replaces the model-live view. Session.Messages
+// remains the lossless archive, but this exact prior live state may include an
+// older summary and in-flight tail that cannot be reproduced byte-for-byte.
+// Called synchronously; the slice must not be retained after return.
 type PreCompactionSnapshotFunc func(phase string, messages []client.Message)
 
 // SetPreCompactionSnapshot installs the pre-compaction history snapshotter
-// (gap #6 rollback path). The daemon wires this per-request to
+// (gap #6 rollback path). Daemon and TUI wire this per-request to
 // session.Manager.SaveCompactionSnapshot with the resolved session id; nil
-// (TUI/CLI default) disables snapshotting. Reset on SwitchAgent and session
+// (one-shot CLI default) disables snapshotting. Reset on SwitchAgent and session
 // change so a closure bound to a stale session id can never fire.
 func (a *AgentLoop) SetPreCompactionSnapshot(fn PreCompactionSnapshotFunc) {
 	a.preCompactionSnapshot = fn
@@ -2282,13 +2286,29 @@ func (a *AgentLoop) RunMessages() []client.Message {
 // and never replays on resume. The in-memory RunMessages is untouched.
 func (a *AgentLoop) SanitizedRunMessages() []client.Message {
 	raw := a.RunMessages()
-	if len(raw) == 0 {
-		return raw
+	return SanitizeMessagesForPersistence(raw)
+}
+
+// SanitizeMessagesForPersistence applies the same image guards used by the
+// daemon's archival save path to any additional durable message collection,
+// such as a TUI-created compaction checkpoint.
+func SanitizeMessagesForPersistence(messages []client.Message) []client.Message {
+	if len(messages) == 0 {
+		return messages
 	}
-	out := make([]client.Message, len(raw))
-	copy(out, raw)
+	out := cloneMessages(messages)
 	filterOversizeImages(out)
 	return out
+}
+
+// CompactionCheckpointMessages returns the latest compacted model-visible
+// state produced during this Run. nil means no compaction was applied, so a
+// caller must preserve any checkpoint already stored on the session.
+func (a *AgentLoop) CompactionCheckpointMessages() []client.Message {
+	if len(a.compactionCheckpointMessages) == 0 {
+		return nil
+	}
+	return SanitizeMessagesForPersistence(a.compactionCheckpointMessages)
 }
 
 // SetToolResultReplacements restores session-scoped query-time tool_result
@@ -2751,6 +2771,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	a.runMessages = nil      // reset for this run
 	a.runMsgInjected = nil   // reset for this run
 	a.runMsgTimestamps = nil // reset for this run
+	a.compactionCheckpointMessages = nil
 	a.lastRunStatus = RunStatus{}
 	if !initialUserInjected {
 		a.clearRunComputerProfile()
@@ -3148,38 +3169,29 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		}
 		return out
 	})
+	// Once compaction rewrites the live message slice, RunMessages can no
+	// longer be derived from a single offset: the shaped view may have dropped
+	// messages from the current run that still belong in the lossless archive.
+	// Freeze the archive portion immediately before each replacement, then
+	// append only messages created after the replacement. A later compaction
+	// freezes that suffix too, so repeated compactions remain lossless.
+	var archivePrefixMessages []client.Message
+	var archivePrefixInjected []bool
+	var archivePrefixTimestamps []time.Time
+	archiveTailOffset := -1
+	liveCheckpointActive := false
+
 	captureRunMessages := func() {
-		if newMsgOffset >= 1 && newMsgOffset < len(messages) {
-			// Count non-delta messages for allocation
-			total := 0
-			for i := newMsgOffset; i < len(messages); i++ {
-				if !deltaIndices[i] {
-					total++
-				}
-			}
-			a.runMessages = make([]client.Message, 0, total)
-			a.runMsgInjected = make([]bool, 0, total)
-			a.runMsgTimestamps = make([]time.Time, 0, total)
-			now := time.Now()
-			first := true
-			for i := newMsgOffset; i < len(messages); i++ {
+		now := time.Now()
+		if archiveTailOffset >= 0 {
+			a.runMessages = append([]client.Message(nil), archivePrefixMessages...)
+			a.runMsgInjected = append([]bool(nil), archivePrefixInjected...)
+			a.runMsgTimestamps = append([]time.Time(nil), archivePrefixTimestamps...)
+			for i := archiveTailOffset; i < len(messages); i++ {
 				if deltaIndices[i] {
-					continue // exclude delta messages from persisted output
+					continue
 				}
-				msg := messages[i]
-				// Strip volatile context framing from the initial user message.
-				// Guarded by an exact text-equality check against scaffoldedUserText:
-				// after compaction the current turn's user message may have been
-				// dropped from the shaped history, in which case newMsgOffset's
-				// subtraction-based shift lands on some unrelated retained message
-				// and overwriting its content would corrupt the persisted session
-				// with userMessage. Same rationale as the snapshot closure guard
-				// above — see that comment for the full explanation.
-				if first && msg.Role == "user" && userMessageTextMatches(msg, scaffoldedUserText) {
-					msg = replaceUserMessageText(msg, rawUserMessage)
-				}
-				first = false
-				a.runMessages = append(a.runMessages, msg)
+				a.runMessages = append(a.runMessages, messages[i])
 				a.runMsgInjected = append(a.runMsgInjected, injectedIndices[i])
 				if ts, ok := msgTimestamps[i]; ok {
 					a.runMsgTimestamps = append(a.runMsgTimestamps, ts)
@@ -3187,7 +3199,61 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 					a.runMsgTimestamps = append(a.runMsgTimestamps, now)
 				}
 			}
+		} else {
+			a.runMessages = nil
+			a.runMsgInjected = nil
+			a.runMsgTimestamps = nil
+			if newMsgOffset >= 1 && newMsgOffset < len(messages) {
+				for i := newMsgOffset; i < len(messages); i++ {
+					if deltaIndices[i] {
+						continue // exclude delta messages from persisted output
+					}
+					msg := messages[i]
+					// Strip volatile context framing from the initial user message.
+					// Guarded by exact equality because compaction may have shifted
+					// newMsgOffset onto an unrelated retained message.
+					if len(a.runMessages) == 0 && msg.Role == "user" && userMessageTextMatches(msg, scaffoldedUserText) {
+						msg = replaceUserMessageText(msg, rawUserMessage)
+					}
+					a.runMessages = append(a.runMessages, msg)
+					a.runMsgInjected = append(a.runMsgInjected, injectedIndices[i])
+					if ts, ok := msgTimestamps[i]; ok {
+						a.runMsgTimestamps = append(a.runMsgTimestamps, ts)
+					} else {
+						a.runMsgTimestamps = append(a.runMsgTimestamps, now)
+					}
+				}
+			}
 		}
+
+		if liveCheckpointActive {
+			checkpoint := make([]client.Message, 0, len(messages)-1)
+			for i := 1; i < len(messages); i++ { // system prompt is rebuilt per run
+				if injectedIndices[i] || deltaIndices[i] {
+					continue
+				}
+				msg := messages[i]
+				if msg.Role == "user" && userMessageTextMatches(msg, scaffoldedUserText) {
+					msg = replaceUserMessageText(msg, rawUserMessage)
+				}
+				checkpoint = append(checkpoint, msg)
+			}
+			// Implicit episodic memory is in-message-only and must never become
+			// durable merely because compaction happened during the turn.
+			a.compactionCheckpointMessages = cloneMessages(stripPrivateMemoryForSummary(checkpoint))
+		}
+	}
+
+	preserveArchiveBeforeCompaction := func() {
+		captureRunMessages()
+		archivePrefixMessages = append([]client.Message(nil), a.runMessages...)
+		archivePrefixInjected = append([]bool(nil), a.runMsgInjected...)
+		archivePrefixTimestamps = append([]time.Time(nil), a.runMsgTimestamps...)
+	}
+
+	activateCompactionCheckpoint := func() {
+		archiveTailOffset = len(messages)
+		liveCheckpointActive = true
 	}
 
 	// markInjected tags the message at the current end of the messages slice
@@ -3467,7 +3533,18 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			return
 		}
 		scaffoldedUserText = currentAfter
+		previousRawUserMessage := rawUserMessage
 		rawUserMessage = truncateRawUserForPersistence(rawUserMessage)
+		// A compaction may already have frozen the current turn into the
+		// lossless archive prefix before this post-compaction safety clip.
+		// Keep that archived prompt aligned with the deliberately truncated
+		// persistence form, just as the pre-compaction offset path does.
+		for i, archived := range archivePrefixMessages {
+			if archived.Role == "user" && userMessageTextMatches(archived, previousRawUserMessage) {
+				archivePrefixMessages[i] = replaceUserMessageText(archived, rawUserMessage)
+				break
+			}
+		}
 	}
 
 	applyShortSessionTruncate := func(sourceTag string) {
@@ -3582,6 +3659,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
+			preserveArchiveBeforeCompaction()
 			a.snapshotBeforeCompaction("force_stop", messages)
 			if sumErr == nil {
 				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
@@ -3593,6 +3671,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				a.recordCompactionFailure("force_stop_summary_failure", sumErr)
 				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow, a.estOverhead())
 			}
+			activateCompactionCheckpoint()
 			if dropped := fsBefore - len(messages); dropped > 0 {
 				a.recordCompactionSuccess("force_stop_preflight",
 					fmt.Sprintf("msgs=%d→%d dropped=%d", fsBefore, len(messages), dropped))
@@ -3632,6 +3711,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				}
 				msgTimestamps = rebasedTS
 			}
+			captureRunMessages()
 		}
 
 		req := client.CompletionRequest{
@@ -4170,8 +4250,10 @@ iterationLoop:
 								before, a.contextWindow, a.estOverhead())
 						}
 					} else {
+						preserveArchiveBeforeCompaction()
 						a.snapshotBeforeCompaction("proactive", messages)
 						messages = shaped
+						activateCompactionCheckpoint()
 						dropped := before - len(messages)
 						a.recordCompactionSuccess("proactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
 						// Adjust newMsgOffset: compaction drops middle messages
@@ -4214,6 +4296,8 @@ iterationLoop:
 						compactionApplied = true
 						restoreRecentReads(a.estOverhead())
 						reanchorActiveTask(MetaBoundaryPostCompaction)
+						captureRunMessages()
+						a.tracker.MarkDirty()
 					}
 				}
 			}
@@ -4355,6 +4439,7 @@ iterationLoop:
 				}
 			}
 			before := len(messages)
+			preserveArchiveBeforeCompaction()
 			a.snapshotBeforeCompaction("preflight", messages)
 			if sumErr == nil {
 				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
@@ -4363,6 +4448,7 @@ iterationLoop:
 				a.recordCompactionFailure("preflight_summary_failure", sumErr)
 				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow, a.estOverhead())
 			}
+			activateCompactionCheckpoint()
 			if dropped := before - len(messages); dropped > 0 {
 				a.recordCompactionSuccess("preflight", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
 				newMsgOffset -= dropped
@@ -4399,6 +4485,7 @@ iterationLoop:
 			}
 			compactionApplied = true
 			reanchorActiveTask(MetaBoundaryPostCompaction)
+			captureRunMessages()
 			a.tracker.MarkDirty()
 		}
 
@@ -4779,8 +4866,10 @@ iterationLoop:
 						shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow, reactiveOverhead)
 					}
 
+					preserveArchiveBeforeCompaction()
 					a.snapshotBeforeCompaction("reactive", messages)
 					messages = shaped
+					activateCompactionCheckpoint()
 					compactionSummary = nextSummary
 					compactionSummaryIter = i
 					compactionApplied = true
@@ -4835,6 +4924,7 @@ iterationLoop:
 					// NoRestore reanchor variant tells the model to re-read
 					// what it needs once the run survives.
 					reanchorActiveTask(MetaBoundaryPostCompactionNoRestore)
+					captureRunMessages()
 
 					// Rebuild request with compacted messages. The ordinary
 					// Responses cursor is deliberately NOT carried over: with

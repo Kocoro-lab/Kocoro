@@ -1930,21 +1930,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		sess.TitleAuto = true
 	}
 	userMsgTime := time.Now()
+	// Snapshot model-visible history before appending the new prompt. A durable
+	// compaction checkpoint replaces the archived prefix in live context while
+	// leaving sess.Messages intact for transcript rendering and search.
+	history := sess.HistoryForLoop()
 	sess.Messages = append(sess.Messages, client.Message{Role: "user", Content: client.NewTextContent(input)})
 	sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local", Timestamp: session.TimePtr(userMsgTime)})
 
 	m.spinnerIdx = 0
 	m.glyphIdx = 0
 	m.colorIdx = 0
-	// Pass everything except the just-appended user message as history,
-	// stripping any prior loop-injected guardrail nudges so they can't
-	// leak into this run's conversation snapshot.
-	priorMsgs := sess.Messages[:len(sess.Messages)-1]
-	priorMeta := sess.MessageMeta
-	if len(priorMeta) > len(priorMsgs) {
-		priorMeta = priorMeta[:len(priorMsgs)]
-	}
-	history := session.FilterInjected(priorMsgs, priorMeta)
 	return m, tea.Batch(m.runAgentLoop(input, history), spinnerTick(), spinnerFrameTick())
 }
 
@@ -1966,6 +1961,15 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID(sess.ID)
+			if m.cfg.Agent.CompactionSnapshotRetention > 0 {
+				retention := m.cfg.Agent.CompactionSnapshotRetention
+				sessionID := sess.ID
+				m.agentLoop.SetPreCompactionSnapshot(func(phase string, messages []client.Message) {
+					if err := m.sessions.SaveCompactionSnapshot(sessionID, phase, messages, retention); err != nil {
+						log.Printf("tui: compaction snapshot failed (session=%s phase=%s): %v", sessionID, phase, err)
+					}
+				})
+			}
 			m.agentLoop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 			m.agentLoop.SetWorkingSet(m.sessions.WorkingSet(sess.ID))
 			m.agentLoop.SetSessionCWD(effectiveCWD)
@@ -2026,6 +2030,13 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				// Fallback: flat text (no RunMessages, e.g. early error).
 				sess.Messages = append(sess.Messages, client.Message{Role: "assistant", Content: client.NewTextContent(result)})
 				sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local", Timestamp: session.TimePtr(time.Now())})
+			}
+			if checkpoint := m.agentLoop.CompactionCheckpointMessages(); len(checkpoint) > 0 {
+				sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+					SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+					ArchiveThroughIndex: len(sess.Messages),
+					Messages:            checkpoint,
+				}
 			}
 			// Persist handler-accumulated usage (direct LLM + cloud_delegate +
 			// gateway tool billing) into the session's cumulative Usage
@@ -2554,7 +2565,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		if sess != nil {
 			sessID = sess.ID
 			msgCount = len(sess.Messages)
-			tokenEst = ctxwin.EstimateTokens(sess.Messages)
+			tokenEst = ctxwin.EstimateTokens(sess.HistoryForLoop())
 		}
 		ctxWindow := m.cfg.Agent.ContextWindow
 		if ctxWindow <= 0 {
@@ -2649,7 +2660,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		}
 	case "/compact":
 		sess := m.sessions.Current()
-		if sess == nil || len(sess.Messages) < ctxwin.MinShapeable() {
+		if sess == nil || len(sess.HistoryForLoop()) < ctxwin.MinShapeable() {
 			m.appendOutput(fmt.Sprintf("Conversation too short to compact (need %d+ messages)", ctxwin.MinShapeable()))
 			break
 		}

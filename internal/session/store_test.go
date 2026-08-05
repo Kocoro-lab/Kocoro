@@ -903,6 +903,87 @@ func TestHistoryForLoop_ShortMeta(t *testing.T) {
 	}
 }
 
+func TestHistoryForLoop_CompactionCheckpointUsesRawArchiveIndex(t *testing.T) {
+	sess := &Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("archived old user")},
+			{Role: "assistant", Content: client.NewTextContent("archived old reply")},
+			{Role: "user", Content: client.NewTextContent("injected before checkpoint")},
+			{Role: "assistant", Content: client.NewTextContent("covered tail")},
+			{Role: "user", Content: client.NewTextContent("new user after checkpoint")},
+			{Role: "user", Content: client.NewTextContent("injected after checkpoint")},
+			{Role: "assistant", Content: client.NewTextContent("new reply after checkpoint")},
+		},
+		MessageMeta: []MessageMeta{
+			{}, {}, {SystemInjected: true}, {}, {}, {SystemInjected: true}, {},
+		},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 4, // raw index, including the injected message
+			Messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("stable compacted summary")},
+			},
+		},
+	}
+
+	got := sess.HistoryForLoop()
+	want := []string{"stable compacted summary", "new user after checkpoint", "new reply after checkpoint"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d live messages, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if text := got[i].Content.Text(); text != want[i] {
+			t.Fatalf("live[%d] = %q, want %q", i, text, want[i])
+		}
+	}
+	if len(sess.Messages) != 7 {
+		t.Fatalf("HistoryForLoop mutated archive: got %d messages", len(sess.Messages))
+	}
+}
+
+func TestHistoryForLoop_InvalidCheckpointFallsBackToArchive(t *testing.T) {
+	sess := &Session{
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("archive")}},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 99,
+			Messages:            []client.Message{{Role: "user", Content: client.NewTextContent("bad checkpoint")}},
+		},
+	}
+	got := sess.HistoryForLoop()
+	if len(got) != 1 || got[0].Content.Text() != "archive" {
+		t.Fatalf("invalid checkpoint should fail open to archive, got %#v", got)
+	}
+}
+
+func TestStore_RoundTripCompactionCheckpoint(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+	sess := &Session{
+		ID:        "checkpoint-roundtrip",
+		Title:     "checkpoint",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("archive")}},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 1,
+			Messages:            []client.Message{{Role: "user", Content: client.NewTextContent("summary")}},
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.CompactionCheckpoint == nil || got.CompactionCheckpoint.ArchiveThroughIndex != 1 ||
+		len(got.CompactionCheckpoint.Messages) != 1 || got.CompactionCheckpoint.Messages[0].Content.Text() != "summary" {
+		t.Fatalf("checkpoint did not round-trip: %#v", got.CompactionCheckpoint)
+	}
+}
+
 func TestFilterInjected_NoFlagsFastPath(t *testing.T) {
 	// When nothing is flagged, FilterInjected takes the fast path: it aliases
 	// the input slice (no allocation) but caps the capacity so a later append

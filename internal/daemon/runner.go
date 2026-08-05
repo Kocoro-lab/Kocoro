@@ -3044,6 +3044,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// per message is sufficient.
 	if len(req.SessionHistory) > 0 {
 		sess.Messages = req.SessionHistory
+		// The request supplied a replacement archive. Any checkpoint bound to
+		// the resumed session's previous raw index space is no longer valid.
+		sess.CompactionCheckpoint = nil
 		meta := make([]session.MessageMeta, len(req.SessionHistory))
 		for i := range meta {
 			meta[i] = session.MessageMeta{Source: req.Source}
@@ -3844,9 +3847,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if cal := sess.CompactionCalibration; cal != nil {
 		loop.SetEstOverheadState(cal.OverheadTokens, cal.Model, cal.ToolsFingerprint)
 	}
-	// Pre-compaction snapshot: persist the full history under this session id
-	// right before an applied compaction replaces it — the rollback material
-	// for junk summaries and lost identifiers. Wired after SetSessionID /
+	// Pre-compaction snapshot: persist the exact model-live state under this
+	// session id right before an applied compaction replaces the durable live
+	// checkpoint. Session.Messages remains the lossless archive; this is the
+	// byte-exact rollback point for junk summaries. Wired after SetSessionID /
 	// SwitchAgent (both reset the snapshotter) so the closure's session id
 	// can never go stale. Errors are logged, never surfaced: snapshotting
 	// must not block or fail a compaction.
@@ -4030,6 +4034,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			//   (c) usage was already folded by a checkpoint — AddUsage
 			//       would double-count, so use baseline+current instead.
 			applyTurnMessages(sess, loop, turnBase)
+			applyCompactionCheckpoint(sess, loop)
 			sess.Messages = append(sess.Messages,
 				client.Message{Role: "assistant", Content: client.NewTextContent(userErr)},
 			)
@@ -4182,6 +4187,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(replyTime)},
 			)
 		}
+		applyCompactionCheckpoint(sess, loop)
 		// Koe: the normal path rebuilt the transcript from the loop's run messages,
 		// which still carry the head <spoken_summary> tag; strip it from EVERY
 		// assistant message this run persisted (a run that absorbed injected
@@ -4998,6 +5004,24 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 	}
 }
 
+// applyCompactionCheckpoint persists an applied compaction as a durable live
+// context transition. The full transcript in sess.Messages remains the
+// lossless archive; ArchiveThroughIndex binds the compacted view to that raw
+// index space so later un-compacted messages can be appended without mixing it
+// with FilterInjected's shorter index space. nil from the loop means this run
+// did not compact and the prior checkpoint must remain in force.
+func applyCompactionCheckpoint(sess *session.Session, loop *agent.AgentLoop) {
+	messages := loop.CompactionCheckpointMessages()
+	if len(messages) == 0 {
+		return
+	}
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: len(sess.Messages),
+		Messages:            messages,
+	}
+}
+
 // usageProvider is the local interface applyTurnUsage needs. Defined here
 // (rather than accepting agent.UsageProvider directly) so the caller type
 // is restricted at compile time — a future refactor that dropped the
@@ -5042,6 +5066,7 @@ func applyTurnUsage(sess *session.Session, up usageProvider, b turnBaseline) {
 func applyTurnState(sess *session.Session, loop *agent.AgentLoop,
 	up usageProvider, b turnBaseline) {
 	applyTurnMessages(sess, loop, b)
+	applyCompactionCheckpoint(sess, loop)
 	applyTurnUsage(sess, up, b)
 	sess.ToolResultReplacements = loop.ToolResultReplacements()
 	sess.ToolResultSeen = loop.ToolResultSeen()

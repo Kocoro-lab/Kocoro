@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -28,7 +29,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		if sess == nil {
 			return compactDoneMsg{err: fmt.Errorf("no active session")}
 		}
-		messages := sess.Messages
+		messages := sess.HistoryForLoop()
 		if len(messages) < ctxwin.MinShapeable() {
 			return compactDoneMsg{err: fmt.Errorf("conversation too short to compact (need %d+ messages, have %d)", ctxwin.MinShapeable(), len(messages))}
 		}
@@ -80,9 +81,8 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		shaped := ctxwin.ForceShapeHistory(withSystem, summary, ctxWindow, 0)
 		if len(shaped) >= len(withSystem) {
 			// ForceShapeHistory contract: no net reduction possible. Bail
-			// before rewriting MessageMeta/persisting — otherwise we damage
-			// per-message provenance for a compaction that freed nothing and
-			// report a "compression" that grew the session.
+			// before replacing the live checkpoint or reporting a compression
+			// that freed nothing.
 			return compactDoneMsg{err: fmt.Errorf("nothing to compact: %d messages already at minimum shape", len(messages))}
 		}
 
@@ -91,15 +91,19 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			shaped = shaped[1:]
 		}
 
-		// Rebuild MessageMeta to stay index-aligned with the new Messages.
-		newMeta := make([]session.MessageMeta, len(shaped))
-		for i := range newMeta {
-			newMeta[i] = session.MessageMeta{Source: "local", Timestamp: session.TimePtr(time.Now())}
+		// Preserve the exact prior live state as best-effort rollback material,
+		// then replace only the live checkpoint. The transcript and its metadata
+		// remain lossless and index-stable for resume/search/share/audit.
+		if retention := m.cfg.Agent.CompactionSnapshotRetention; retention > 0 {
+			if err := m.sessions.SaveCompactionSnapshot(sess.ID, "manual", messages, retention); err != nil {
+				log.Printf("tui: manual compaction snapshot failed (session=%s): %v", sess.ID, err)
+			}
 		}
-
-		// Update session
-		sess.Messages = shaped
-		sess.MessageMeta = newMeta
+		sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+			SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: len(sess.Messages),
+			Messages:            agent.SanitizeMessagesForPersistence(shaped),
+		}
 		acc := usage.Snapshot()
 		if llm := acc.LLM; llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 {
 			m.sessions.AddUsage(sess.ID, session.UsageFromAccumulated(
@@ -108,7 +112,9 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 				acc.ToolCalls, acc.ToolCostUSD,
 			))
 		}
-		m.sessions.Save()
+		if err := m.sessions.Save(); err != nil {
+			return compactDoneMsg{err: fmt.Errorf("save compaction checkpoint: %w", err)}
+		}
 
 		afterTokens := ctxwin.EstimateTokens(shaped)
 

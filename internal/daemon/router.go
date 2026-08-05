@@ -97,6 +97,11 @@ func cloneSessionSnapshot(sess *session.Session) *session.Session {
 	clone := *sess
 	clone.Messages = append([]client.Message(nil), sess.Messages...)
 	clone.MessageMeta = append([]session.MessageMeta(nil), sess.MessageMeta...)
+	if sess.CompactionCheckpoint != nil {
+		checkpoint := *sess.CompactionCheckpoint
+		checkpoint.Messages = append([]client.Message(nil), sess.CompactionCheckpoint.Messages...)
+		clone.CompactionCheckpoint = &checkpoint
+	}
 	clone.RemoteTasks = append([]string(nil), sess.RemoteTasks...)
 	clone.ExecutionRuns = make([]executionprofile.Run, len(sess.ExecutionRuns))
 	for i := range sess.ExecutionRuns {

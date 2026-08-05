@@ -14,11 +14,10 @@ import (
 )
 
 // compactionSnapshotDirName holds per-session pre-compaction history copies
-// under the sessions directory (hidden, like .in-progress). A compaction
-// replaces Session.Messages irreversibly — once the summary lands and the
-// session checkpoints, the dropped middle is gone. These snapshots are the
-// rollback material for junk summaries, lost identifiers, and content the
-// summary-quality audit could not see (already-microcompacted tool results).
+// under the sessions directory (hidden, like .in-progress). Session.Messages
+// remains the lossless archive; compaction replaces the separate model-live
+// checkpoint. Snapshots preserve the exact prior live state so a junk summary
+// can be inspected or rolled back without reconstructing it from the archive.
 const compactionSnapshotDirName = ".compaction-snapshots"
 
 const snapshotImagePlaceholder = "[image omitted from compaction snapshot]"
@@ -32,7 +31,7 @@ type CompactionSnapshot struct {
 	Messages      []client.Message `json:"messages"`
 }
 
-// SaveCompactionSnapshot persists the full pre-compaction message history for
+// SaveCompactionSnapshot persists the full pre-compaction model-live state for
 // session id, then prunes the session's snapshot dir to the maxPerSession
 // newest files. maxPerSession <= 0 disables snapshotting (silent no-op).
 // Write is temp+rename so a crash never leaves a truncated snapshot behind
@@ -143,9 +142,9 @@ func isSafePhase(phase string) bool {
 
 // pruneCompactionSnapshots bounds the snapshot dir to keep files. The OLDEST
 // snapshot is pinned and rotation evicts from the second-oldest up: the
-// pre-first-compaction snapshot is the only one whose tool results have not
-// already been micro-compacted or tier-1'd — evicting it first would discard
-// the most content-rich copy while keeping three already-degraded ones.
+// pre-first-compaction snapshot is the only one whose older history has not
+// already been replaced by a durable summary — evicting it first would discard
+// the most content-rich live copy while keeping already-compacted successors.
 // Stray .tmp files (crash between write and rename) are removed here too;
 // they are inert but nothing else ever sweeps this directory.
 // Best-effort: prune failures must never surface into the compaction path.

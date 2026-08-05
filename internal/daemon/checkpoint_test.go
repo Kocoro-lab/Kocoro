@@ -1,6 +1,12 @@
 package daemon
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,6 +260,150 @@ func TestApplyTurnState_CopiesToolResultReplacements(t *testing.T) {
 	}
 	if !sess.ToolResultSeen["toolu_seen"] || !sess.ToolResultSeen["toolu_saved"] {
 		t.Fatalf("seen state was not copied into session: %#v", sess.ToolResultSeen)
+	}
+}
+
+func TestApplyTurnState_PersistsCompactionCheckpointWithoutReplacingArchive(t *testing.T) {
+	sess := &session.Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("old user")},
+			{Role: "assistant", Content: client.NewTextContent("old reply")},
+		},
+		MessageMeta: []session.MessageMeta{{Source: "web"}, {Source: "web"}},
+	}
+	base := captureTurnBaseline(sess, "web", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("new user")},
+		{Role: "assistant", Content: client.NewTextContent("new reply")},
+	})
+	agent.SetCompactionCheckpointMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("stable summary")},
+		{Role: "user", Content: client.NewTextContent("new user")},
+		{Role: "assistant", Content: client.NewTextContent("new reply")},
+	})
+
+	applyTurnState(sess, loop, nil, base)
+
+	if len(sess.Messages) != 4 {
+		t.Fatalf("archive was replaced instead of appended: %#v", sess.Messages)
+	}
+	wantArchive := []string{"old user", "old reply", "new user", "new reply"}
+	for i := range wantArchive {
+		if got := sess.Messages[i].Content.Text(); got != wantArchive[i] {
+			t.Fatalf("archive[%d] = %q, want %q", i, got, wantArchive[i])
+		}
+	}
+	cp := sess.CompactionCheckpoint
+	if cp == nil || cp.ArchiveThroughIndex != len(sess.Messages) || cp.SchemaVersion != session.CompactionCheckpointSchemaVersion {
+		t.Fatalf("checkpoint not bound to persisted archive: %#v", cp)
+	}
+	if got := sess.HistoryForLoop(); len(got) != 3 || got[0].Content.Text() != "stable summary" {
+		t.Fatalf("live history did not use checkpoint: %#v", got)
+	}
+
+	// A later run with no compaction must leave the existing checkpoint active.
+	fresh := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	nextBase := captureTurnBaseline(sess, "web", false)
+	agent.SetRunMessagesForTest(fresh, []client.Message{
+		{Role: "user", Content: client.NewTextContent("tail user")},
+		{Role: "assistant", Content: client.NewTextContent("tail reply")},
+	})
+	applyTurnState(sess, fresh, nil, nextBase)
+	if sess.CompactionCheckpoint != cp {
+		t.Fatal("non-compacting turn replaced the durable checkpoint")
+	}
+	got := sess.HistoryForLoop()
+	if len(got) != 5 || got[3].Content.Text() != "tail user" || got[4].Content.Text() != "tail reply" {
+		t.Fatalf("raw archive tail was not appended after checkpoint: %#v", got)
+	}
+}
+
+func TestCompactionCheckpoint_SecondRunDoesNotResummarizeArchive(t *testing.T) {
+	var summaryCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		response := client.CompletionResponse{
+			OutputText:   "done",
+			FinishReason: "end_turn",
+			Usage:        client.Usage{InputTokens: 500, OutputTokens: 10, TotalTokens: 510},
+		}
+		if req.ModelTier == "small" {
+			summaryCalls.Add(1)
+			response.OutputText = `<summary>
+## Current task & next steps
+Continue the deterministic checkpoint test.
+## User corrections & decisions
+Keep the transcript lossless and reuse one stable summary.
+</summary>`
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	sess := &session.Session{}
+	for i := 0; i < 15; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		sess.Messages = append(sess.Messages, client.Message{
+			Role: role, Content: client.NewTextContent(strings.Repeat("stable history payload ", 350)),
+		})
+		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "web"})
+	}
+
+	newLoop := func() *agent.AgentLoop {
+		loop := agent.NewAgentLoop(client.NewGatewayClient(server.URL, ""), agent.NewToolRegistry(), "medium", "", 3, 2000, 200, nil, nil, nil)
+		loop.SetContextWindowExplicit(30000)
+		loop.SetSkillDiscovery(false)
+		return loop
+	}
+
+	first := newLoop()
+	firstBase := captureTurnBaseline(sess, "web", false)
+	if _, _, err := first.Run(context.Background(), "first prompt", nil, sess.HistoryForLoop()); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	applyTurnState(sess, first, nil, firstBase)
+	if sess.CompactionCheckpoint == nil {
+		t.Fatal("first run crossed preflight threshold but persisted no checkpoint")
+	}
+	firstSummaryCalls := summaryCalls.Load()
+	if firstSummaryCalls == 0 {
+		t.Fatal("test did not trigger a summary on the first run")
+	}
+	checkpointJSON, err := json.Marshal(sess.CompactionCheckpoint)
+	if err != nil {
+		t.Fatalf("marshal first checkpoint: %v", err)
+	}
+	archiveAfterFirst := len(sess.Messages)
+
+	second := newLoop()
+	secondBase := captureTurnBaseline(sess, "web", false)
+	if _, _, err := second.Run(context.Background(), "short follow-up", nil, sess.HistoryForLoop()); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	applyTurnState(sess, second, nil, secondBase)
+
+	if got := summaryCalls.Load(); got != firstSummaryCalls {
+		t.Fatalf("second run re-summarized the lossless archive: summary calls %d -> %d", firstSummaryCalls, got)
+	}
+	checkpointAfter, err := json.Marshal(sess.CompactionCheckpoint)
+	if err != nil {
+		t.Fatalf("marshal checkpoint after second run: %v", err)
+	}
+	if string(checkpointAfter) != string(checkpointJSON) {
+		t.Fatalf("non-compacting second run rewrote stable checkpoint\nbefore=%s\nafter=%s", checkpointJSON, checkpointAfter)
+	}
+	if len(sess.Messages) <= archiveAfterFirst {
+		t.Fatalf("second run did not append to archive: before=%d after=%d", archiveAfterFirst, len(sess.Messages))
+	}
+	if live := sess.HistoryForLoop(); len(live) >= len(sess.Messages) {
+		t.Fatalf("live context did not remain compacted: live=%d archive=%d", len(live), len(sess.Messages))
 	}
 }
 

@@ -78,24 +78,33 @@ type InterruptedTurn struct {
 }
 
 type Session struct {
-	SchemaVersion      int                          `json:"schema_version,omitempty"`
-	ID                 string                       `json:"id"`
-	CreatedAt          time.Time                    `json:"created_at"`
-	UpdatedAt          time.Time                    `json:"updated_at"`
-	Title              string                       `json:"title"`
-	CWD                string                       `json:"cwd"`
-	Messages           []client.Message             `json:"messages"`
-	RemoteTasks        []string                     `json:"remote_tasks,omitempty"`
-	MessageMeta        []MessageMeta                `json:"message_meta,omitempty"`
-	IdempotentRequests map[string]IdempotentRequest `json:"idempotent_requests,omitempty"`
-	Source             string                       `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still appears in older sessions)
-	Channel            string                       `json:"channel,omitempty"`           // source channel/group identifier
-	ScheduleID         string                       `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
-	RouteKey           string                       `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
-	ProjectID          string                       `json:"project_id,omitempty"`        // owning project entity (~/.shannon/projects/<id>); optional, empty = unfiled. Set once from RunAgentRequest.ProjectID or via PATCH /sessions/{id}.
-	SummaryCache       string                       `json:"summary_cache,omitempty"`     // cached summary Markdown
-	SummaryCacheKey    string                       `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
-	Usage              *UsageSummary                `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
+	SchemaVersion int              `json:"schema_version,omitempty"`
+	ID            string           `json:"id"`
+	CreatedAt     time.Time        `json:"created_at"`
+	UpdatedAt     time.Time        `json:"updated_at"`
+	Title         string           `json:"title"`
+	CWD           string           `json:"cwd"`
+	Messages      []client.Message `json:"messages"`
+	// CompactionCheckpoint is the durable model-visible context produced by an
+	// applied compaction. Messages remains the lossless archive used by history,
+	// search, share, sync, and audit; a fresh agent loop resumes from the
+	// checkpoint plus archive messages appended after ArchiveThroughIndex.
+	//
+	// ArchiveThroughIndex is an EXCLUSIVE index in the raw Messages slice. It is
+	// deliberately not an index into HistoryForLoop's filtered view: injected
+	// messages make those two index spaces differ.
+	CompactionCheckpoint *CompactionCheckpoint        `json:"compaction_checkpoint,omitempty"`
+	RemoteTasks          []string                     `json:"remote_tasks,omitempty"`
+	MessageMeta          []MessageMeta                `json:"message_meta,omitempty"`
+	IdempotentRequests   map[string]IdempotentRequest `json:"idempotent_requests,omitempty"`
+	Source               string                       `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still appears in older sessions)
+	Channel              string                       `json:"channel,omitempty"`           // source channel/group identifier
+	ScheduleID           string                       `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
+	RouteKey             string                       `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
+	ProjectID            string                       `json:"project_id,omitempty"`        // owning project entity (~/.shannon/projects/<id>); optional, empty = unfiled. Set once from RunAgentRequest.ProjectID or via PATCH /sessions/{id}.
+	SummaryCache         string                       `json:"summary_cache,omitempty"`     // cached summary Markdown
+	SummaryCacheKey      string                       `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
+	Usage                *UsageSummary                `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
 	// ToolResultReplacements stores query-time tool_result replacement text
 	// keyed by tool_use_id. It is not model-visible by itself; agent loops
 	// apply it to a request-local message copy before LLM calls.
@@ -151,6 +160,18 @@ type Session struct {
 	// NOT bump UpdatedAt (share/retract is metadata, not activity, and a
 	// bump would re-sort the session to the top of the recency list).
 	PublishedShares []PublishedShareEntry `json:"published_shares,omitempty"`
+}
+
+// CompactionCheckpoint separates the lossless session archive from the
+// compacted live context sent to the model. Messages excludes the system prompt
+// and transient injected messages; the loop prepends the current system prompt
+// when it resumes.
+const CompactionCheckpointSchemaVersion = 1
+
+type CompactionCheckpoint struct {
+	SchemaVersion       int              `json:"schema_version"`
+	ArchiveThroughIndex int              `json:"archive_through_index"`
+	Messages            []client.Message `json:"messages"`
 }
 
 // CompactionCalibration is the persisted estimator-calibration sample:
@@ -293,7 +314,27 @@ func (s *Session) SourceAt(i int) string {
 // When the meta slice is missing or shorter than Messages (legacy sessions
 // predating the flag), unannotated messages are returned unchanged.
 func (s *Session) HistoryForLoop() []client.Message {
-	return FilterInjected(s.Messages, s.MessageMeta)
+	if s == nil {
+		return nil
+	}
+	cp := s.CompactionCheckpoint
+	if cp == nil || cp.SchemaVersion != CompactionCheckpointSchemaVersion || len(cp.Messages) == 0 ||
+		cp.ArchiveThroughIndex < 0 || cp.ArchiveThroughIndex > len(s.Messages) {
+		return FilterInjected(s.Messages, s.MessageMeta)
+	}
+
+	through := cp.ArchiveThroughIndex
+	tailMeta := s.MessageMeta
+	if len(tailMeta) > through {
+		tailMeta = tailMeta[through:]
+	} else {
+		tailMeta = nil
+	}
+	tail := FilterInjected(s.Messages[through:], tailMeta)
+	out := make([]client.Message, 0, len(cp.Messages)+len(tail))
+	out = append(out, cp.Messages...)
+	out = append(out, tail...)
+	return out
 }
 
 // FilterInjected returns msgs with any positions flagged SystemInjected in
@@ -1059,6 +1100,9 @@ func (s *Store) Load(id string) (*Session, error) {
 	// wire-shape that motivates this. The next Save() persists the cleaned
 	// shape, so disk copies repair themselves on first read after upgrade.
 	sess.Messages = ctxwin.DropMalformedThinking(sess.Messages)
+	if sess.CompactionCheckpoint != nil {
+		sess.CompactionCheckpoint.Messages = ctxwin.DropMalformedThinking(sess.CompactionCheckpoint.Messages)
+	}
 	return &sess, nil
 }
 

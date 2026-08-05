@@ -47,6 +47,32 @@ func TestStripThinkingFromSessionJSON_RemovesAssistantThinkingBlocks(t *testing.
 	}
 }
 
+func TestStripThinkingFromSessionJSON_RemovesCheckpointThinkingBlocks(t *testing.T) {
+	input := []byte(`{
+		"messages": [{"role":"assistant","content":[{"type":"text","text":"archive"}]}],
+		"compaction_checkpoint": {
+			"schema_version": 1,
+			"archive_through_index": 1,
+			"messages": [{"role":"assistant","content":[
+				{"type":"thinking","thinking":"PRIVATE_CHECKPOINT_REASONING","signature":"sig"},
+				{"type":"text","text":"checkpoint reply"},
+				{"type":"redacted_thinking","data":"PRIVATE_CHECKPOINT_BLOB"}
+			]}]
+		}
+	}`)
+	out, err := stripThinkingFromSessionJSON(input)
+	if err != nil {
+		t.Fatalf("strip failed: %v", err)
+	}
+	s := string(out)
+	if strings.Contains(s, "PRIVATE_CHECKPOINT_REASONING") || strings.Contains(s, "PRIVATE_CHECKPOINT_BLOB") {
+		t.Fatalf("checkpoint thinking leaked through sync strip: %s", s)
+	}
+	if !strings.Contains(s, "checkpoint reply") || !strings.Contains(s, "archive") {
+		t.Fatalf("non-thinking content was lost: %s", s)
+	}
+}
+
 // TestStripThinkingFromSessionJSON_PreservesNonAssistantContent confirms we
 // don't accidentally touch user / system messages even if they (impossibly)
 // contained type:thinking entries.

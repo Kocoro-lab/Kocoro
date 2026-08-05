@@ -2057,6 +2057,29 @@ func TestAgentLoop_CompactionFiresWhenEstimateLags(t *testing.T) {
 	if !summaryReachedMainRequest {
 		t.Errorf("summary never reached a main request — ShapeHistory declined despite the real-usage trigger: %v", mainMsgCounts)
 	}
+
+	// Compaction is a live-state transition, not a transcript rewrite. Every
+	// tool exchange from this run remains available to the daemon's archival
+	// persistence even though the model-visible checkpoint is shaped.
+	runMessages := loop.RunMessages()
+	var archivedToolExecutions int
+	for _, msg := range runMessages {
+		if strings.Contains(msg.Content.Text(), `<tool_exec tool="think"`) {
+			archivedToolExecutions++
+		}
+	}
+	if archivedToolExecutions != 11 {
+		t.Fatalf("compaction damaged current-run archive: tool executions=%d messages=%d",
+			archivedToolExecutions, len(runMessages))
+	}
+	checkpoint := loop.CompactionCheckpointMessages()
+	if len(checkpoint) == 0 {
+		t.Fatal("applied compaction did not expose a durable live checkpoint")
+	}
+	if len(checkpoint) >= len(runMessages) {
+		t.Fatalf("live checkpoint was not smaller than lossless run archive: checkpoint=%d archive=%d",
+			len(checkpoint), len(runMessages))
+	}
 }
 
 // TestAgentLoop_ReactiveEvidenceFloorShapesDespiteLowEstimate: a provider can

@@ -477,7 +477,7 @@ func (m *Manager) RebuildIndex() error {
 
 // Reset clears a session's conversation history in place, preserving
 // ID/Title/CreatedAt/CWD/Source/Channel/Usage.
-// Cleared fields: Messages, MessageMeta, RemoteTasks, SummaryCache,
+// Cleared fields: Messages, MessageMeta, CompactionCheckpoint, RemoteTasks, SummaryCache,
 // SummaryCacheKey, RouteKey, InProgress, InterruptedTurn. If the target is the in-memory
 // current session, the current pointer is updated and its runtime WorkingSet
 // is reset too.
@@ -494,6 +494,7 @@ func (m *Manager) Reset(id string) error {
 	}
 	sess.Messages = nil
 	sess.MessageMeta = nil
+	sess.CompactionCheckpoint = nil
 	sess.RemoteTasks = nil
 	sess.SummaryCache = ""
 	sess.SummaryCacheKey = ""
@@ -529,6 +530,8 @@ func (m *Manager) TruncateMessages(id string, index int) error {
 	if len(sess.MessageMeta) > index {
 		sess.MessageMeta = sess.MessageMeta[:index]
 	}
+	// Editing history invalidates any checkpoint derived from the old archive.
+	sess.CompactionCheckpoint = nil
 	// 若当前内存中缓存的 session 与截断目标一致，同步更新内存状态
 	if m.current != nil && m.current.ID == id {
 		m.current = sess
