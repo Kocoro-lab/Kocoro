@@ -30,6 +30,11 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			return compactDoneMsg{err: fmt.Errorf("no active session")}
 		}
 		messages := sess.HistoryForLoop()
+		// Captured next to the history snapshot it must agree with. Reading it
+		// after the summarize round-trip would depend on m.state == stateProcessing
+		// blocking handleSubmit from appending in between — a correct but
+		// implicit cross-file invariant.
+		archiveThrough := len(sess.Messages)
 		if len(messages) < ctxwin.MinShapeable() {
 			return compactDoneMsg{err: fmt.Errorf("conversation too short to compact (need %d+ messages, have %d)", ctxwin.MinShapeable(), len(messages))}
 		}
@@ -99,9 +104,13 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 				log.Printf("tui: manual compaction snapshot failed (session=%s): %v", sess.ID, err)
 			}
 		}
+		// Roll back on a failed save. Without this the user is told compaction
+		// failed while the in-memory session already runs on the new checkpoint,
+		// and the next successful Save() persists it anyway.
+		priorCheckpoint := sess.CompactionCheckpoint
 		sess.CompactionCheckpoint = &session.CompactionCheckpoint{
 			SchemaVersion:       session.CompactionCheckpointSchemaVersion,
-			ArchiveThroughIndex: len(sess.Messages),
+			ArchiveThroughIndex: archiveThrough,
 			Messages:            agent.SanitizeMessagesForPersistence(shaped),
 		}
 		acc := usage.Snapshot()
@@ -113,6 +122,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			))
 		}
 		if err := m.sessions.Save(); err != nil {
+			sess.CompactionCheckpoint = priorCheckpoint
 			return compactDoneMsg{err: fmt.Errorf("save compaction checkpoint: %w", err)}
 		}
 

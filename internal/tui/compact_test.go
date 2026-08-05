@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -109,5 +110,54 @@ Keep the transcript lossless.
 	}
 	if loaded.CompactionCheckpoint == nil || len(loaded.Messages) != len(originalMessages) {
 		t.Fatalf("disk round-trip lost checkpoint or archive: cp=%#v archive=%d", loaded.CompactionCheckpoint, len(loaded.Messages))
+	}
+}
+
+// A failed Save() must leave the in-memory session on its previous checkpoint.
+// Otherwise the user is told compaction failed while the next turn already runs
+// on the new compacted view — and the next successful Save() persists it anyway.
+func TestCompact_FailedSaveRollsBackCheckpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(client.CompletionResponse{
+			OutputText: "<summary>\n## Current task & next steps\nkeep going.\n</summary>",
+			Usage:      client.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		})
+	}))
+	defer server.Close()
+
+	sessDir := t.TempDir()
+	m := newCommandTestModelInDir(t, sessDir)
+	m.gateway = client.NewGatewayClient(server.URL, "")
+	m.cfg.Agent.ContextWindow = 128000
+
+	sess := m.sessions.Current()
+	for i := 0; i < 12; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		sess.Messages = append(sess.Messages, client.Message{Role: role, Content: client.NewTextContent(strings.Repeat("history ", 100))})
+		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
+	}
+	prior := &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: 2,
+		Messages:            []client.Message{{Role: "user", Content: client.NewTextContent("earlier checkpoint")}},
+	}
+	sess.CompactionCheckpoint = prior
+
+	// Drop write permission so the atomic session write fails.
+	if err := os.Chmod(sessDir, 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sessDir, 0o755) })
+
+	result := m.runCompact("")()
+
+	if result.err == nil {
+		t.Fatal("expected the failed save to surface as an error")
+	}
+	if sess.CompactionCheckpoint != prior {
+		t.Fatalf("checkpoint was not rolled back after a failed save: %#v", sess.CompactionCheckpoint)
 	}
 }

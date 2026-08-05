@@ -13,7 +13,14 @@ import (
 
 func newCommandTestModel(t *testing.T) *Model {
 	t.Helper()
-	sessDir := t.TempDir()
+	return newCommandTestModelInDir(t, t.TempDir())
+}
+
+// newCommandTestModelInDir is newCommandTestModel with a caller-owned sessions
+// directory, so a test can make persistence fail (e.g. by dropping write
+// permission) and assert the failure path.
+func newCommandTestModelInDir(t *testing.T, sessDir string) *Model {
+	t.Helper()
 	sessMgr := session.NewManager(sessDir)
 	sessMgr.NewSession()
 

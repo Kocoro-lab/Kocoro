@@ -3310,6 +3310,16 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// must become the live checkpoint. Only an exact byte/state duplicate is
 		// a true no-op.
 		if !compactionChangesLiveState(messages, shaped) {
+			// A shape that GREW the history is unreachable today
+			// (ShapeHistoryTracked returns identity or something strictly
+			// shorter), so this is defence-in-depth — and precisely because it
+			// is, it must not be able to regress into a silent no-op if a
+			// future buildShaped adds a message. Same posture as the
+			// provenance branch below.
+			if len(shaped.Messages) > len(messages) {
+				a.recordCompactionFailure(recordPhase+"_grew",
+					fmt.Errorf("shape result grew from %d to %d messages", len(messages), len(shaped.Messages)))
+			}
 			return 0, false
 		}
 		if len(shaped.Messages) != len(shaped.SourceIndices) {
