@@ -276,10 +276,13 @@ type PromptSuggestionConfig struct {
 	MinTurns int `mapstructure:"min_turns" yaml:"min_turns" json:"min_turns"`
 }
 
-// SkillDiscoveryEnabled returns whether skill discovery is enabled (default: true).
+// SkillDiscoveryEnabled returns whether small-model skill discovery is enabled.
+// Metadata listing and on-demand use_skill loading remain available when false.
+// Disabled by default; operators can opt in for unusually large or ambiguous
+// skill catalogs.
 func (c *AgentConfig) SkillDiscoveryEnabled() bool {
 	if c.SkillDiscovery == nil {
-		return true
+		return false
 	}
 	return *c.SkillDiscovery
 }

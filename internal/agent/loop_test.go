@@ -4838,6 +4838,7 @@ func TestAgentLoop_SkillDiscovery(t *testing.T) {
 		testSkills = append(testSkills, &skills.Skill{Name: fmt.Sprintf("skill-%d", si), Description: fmt.Sprintf("test skill %d", si)})
 	}
 	loop.SetSkills(testSkills)
+	loop.SetSkillDiscovery(true)
 
 	_, _, err := loop.Run(context.Background(), "帮我创建一个 agent", nil, nil)
 	if err != nil {
@@ -4866,10 +4867,19 @@ func TestAgentLoop_SkillDiscovery(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_SkillDiscoveryDisabled(t *testing.T) {
+func TestAgentLoop_SkillDiscoveryDisabledByDefault(t *testing.T) {
 	callCount := 0
+	listingSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
+		body, _ := io.ReadAll(r.Body)
+		var req client.CompletionRequest
+		json.Unmarshal(body, &req)
+		for _, msg := range req.Messages {
+			if strings.Contains(msg.Content.Text(), "## Available Skills") {
+				listingSeen = true
+			}
+		}
 		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 10, 5))
 	}))
 	defer server.Close()
@@ -4877,10 +4887,11 @@ func TestAgentLoop_SkillDiscoveryDisabled(t *testing.T) {
 	gw := client.NewGatewayClient(server.URL, "")
 	reg := NewToolRegistry()
 	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-	loop.SetSkills([]*skills.Skill{
-		{Name: "kocoro", Description: "platform management"},
-	})
-	loop.SetSkillDiscovery(false)
+	testSkills := make([]*skills.Skill, 0, 12)
+	for si := 1; si <= 12; si++ {
+		testSkills = append(testSkills, &skills.Skill{Name: fmt.Sprintf("skill-%d", si), Description: fmt.Sprintf("test skill %d", si)})
+	}
+	loop.SetSkills(testSkills)
 
 	_, _, err := loop.Run(context.Background(), "hello", nil, nil)
 	if err != nil {
@@ -4889,7 +4900,10 @@ func TestAgentLoop_SkillDiscoveryDisabled(t *testing.T) {
 
 	// Only 1 LLM call (the main one), no discovery call
 	if callCount != 1 {
-		t.Errorf("expected 1 LLM call (no discovery), got %d", callCount)
+		t.Errorf("expected 1 main LLM call with discovery disabled by default, got %d", callCount)
+	}
+	if !listingSeen {
+		t.Error("skill metadata listing should remain available when small-model discovery is disabled")
 	}
 }
 

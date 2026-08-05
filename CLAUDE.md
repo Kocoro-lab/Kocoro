@@ -195,7 +195,7 @@ The `[validation error]` prefix that `ValidationError` injects is load-bearing: 
 
 Three layers triggering `use_skill`:
 1. **Listing** — full descriptions (4000-char budget) in scaffolded user message on first turn. Not in system prompt (cache stability).
-2. **Semantic** — blocking small-tier call on iter 0 (5s timeout), injects `<system-reminder>` hint. Gated by `agent.skill_discovery`.
+2. **Semantic** — opt-in small-tier prefetch on iter 0; the main path waits up to 2s for a hint while the helper has a 5s timeout. Disabled by default and gated by `agent.skill_discovery`.
 3. **Catalog fallback** — `use_skill` description includes all skill names.
 
 **Per-request channel suppression** (`internal/daemon/skill_filter.go`): `desktopOnlySkills` is filtered out of `loadedSkills` (use_skill registry + listing + semantic discovery) when `isCloudSource(req.Source)`. A single producer-side filter in `runner.go` keeps all three exposure layers consistent. Only entry today: `kocoro-generative-ui` (its `html-artifact` fences render only in Desktop's WKWebView; on cloud channels they'd surface as a code block). Drift test (`skill_filter_test.go`) walks `desktopOnlySkills × cloudSourceSet`. The divergence lives in the scaffolded user message, not the cached system prompt — revisit this filter if listing ever moves into the system prompt.

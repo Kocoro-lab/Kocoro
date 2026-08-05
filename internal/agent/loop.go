@@ -973,7 +973,7 @@ type AgentLoop struct {
 	executionEvidence     executionprofile.Evidence
 	sideEffectReplayKeys  map[string]struct{}
 	executionEvidenceMu   sync.Mutex
-	skillDiscovery        bool // call small-tier model on first turn to identify relevant skills (default true)
+	skillDiscovery        bool // opt-in small-tier model call to identify relevant skills
 	memoryPreflight       MemoryPreflightFunc
 	preCompactionSnapshot PreCompactionSnapshotFunc
 	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
@@ -1081,7 +1081,7 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 		auditor:                auditor,
 		hookRunner:             hookRunner,
 		workingSet:             NewWorkingSet(),
-		skillDiscovery:         true,
+		skillDiscovery:         false,
 		readTracker:            NewReadTracker(),
 		toolResultReplacements: NewToolResultReplacementState(nil),
 		observationWindow:      defaultObservationWindow,
@@ -2463,8 +2463,8 @@ func (a *AgentLoop) SetTimeBasedCompactConfig(cfg TimeBasedCompactConfig) {
 }
 
 // SetSkillDiscovery enables or disables the first-turn skill discovery call.
-// When enabled (default), a small-tier model identifies relevant skills and
-// injects a hint before the main LLM call.
+// When enabled, a small-tier model identifies relevant skills and injects a
+// hint before the main LLM call. Metadata listing remains active either way.
 func (a *AgentLoop) SetSkillDiscovery(enabled bool) {
 	a.skillDiscovery = enabled
 }

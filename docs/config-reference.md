@@ -96,7 +96,7 @@ agent:
   interrupted_resume_enabled: true # gate daemon-start auto-continuation entirely. false leaves interrupted checkpoints in place without any automatic execution.
 
   # Skill matching
-  skill_discovery: true            # per-turn small-model skill matching prefetch (default: true)
+  skill_discovery: false           # opt-in small-model skill matching prefetch (default: false); metadata listing and use_skill remain available
 
   # Prompt suggestion (ghost text)
   prompt_suggestion:
