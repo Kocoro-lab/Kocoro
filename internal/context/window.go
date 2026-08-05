@@ -88,8 +88,26 @@ func ShouldCompact(inputTokens, outputTokens, contextWindow int) bool {
 // trigger every iteration yet never shrink below the trigger — paying a
 // summary per Run for nothing.
 func compactTargetTokens(contextWindow int) int {
-	return int(float64(contextWindow) * compactThreshold)
+	fractional := int(float64(contextWindow) * compactThreshold)
+	absolute := contextWindow - compactAbsoluteBufferTokens
+	if absolute > fractional {
+		return absolute
+	}
+	return fractional
 }
+
+// compactAbsoluteBufferTokens is the flat reserve the absolute trigger keeps
+// free below the context window: room for the response (max_tokens tiers top
+// out well under 32K) plus estimator-error and next-turn-tool-result margin.
+// Workload that justifies it: the 1M-context families the default tiers route
+// to, where the fractional 90% trigger alone forfeits ~100K usable tokens
+// (leading agent harnesses budget absolutely for this reason). Symptom
+// when it binds: sessions on 1M windows run ~40K tokens closer to the limit
+// before compacting, leaning harder on the calibrated estimator; on windows
+// ≤ ~600K the fractional floor wins and behavior is unchanged. Override:
+// edit this constant (raising it returns headroom to the old fractional
+// behavior).
+const compactAbsoluteBufferTokens = 60_000
 
 // compactRetargetFraction is where a compaction aims to LAND — deliberately
 // below the compactThreshold trigger so one compaction buys real headroom
@@ -110,9 +128,18 @@ func compactTargetTokens(contextWindow int) int {
 // budgets a single user message inside the target; do not unify.
 const compactRetargetFraction = 0.80
 
-// compactLandingTokens is the acceptance budget for shaped candidates.
+// compactLandingTokens is the acceptance budget for shaped candidates. It
+// tracks the trigger's shape: fractional on small windows, window − 2×buffer
+// on large ones — so the hysteresis band stays one buffer wide when the
+// absolute trigger governs, instead of ballooning to (trigger − 0.80×window)
+// and summarizing away far more history than the band requires.
 func compactLandingTokens(contextWindow int) int {
-	return int(float64(contextWindow) * compactRetargetFraction)
+	fractional := int(float64(contextWindow) * compactRetargetFraction)
+	absolute := contextWindow - 2*compactAbsoluteBufferTokens
+	if absolute > fractional {
+		return absolute
+	}
+	return fractional
 }
 
 // CompactTriggerTokens exposes the compaction trigger line to callers that
