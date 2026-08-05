@@ -491,7 +491,7 @@ func buildVolatileContext(opts PromptOptions) string {
 
 	if opts.FastMode {
 		sb.WriteString("\n\n## Fast Task\n")
-		sb.WriteString("Use the fewest tool rounds that can answer correctly. After each result, stop and answer once the core request and required evidence are satisfied. Do not repeat a successful search, fetch, read, or other call for wording or optional detail. For an ordinary lookup, budget one broad search at most; exceed that budget only when a required fact, requested source, or important citation is still missing.")
+		sb.WriteString("Use the fewest tool rounds that can answer correctly. After each result, stop and answer once the core request and required evidence are satisfied. Do not repeat a successful search, fetch, read, or other call for wording or optional detail. For an ordinary lookup, budget one broad search at most; exceed that budget only when a required fact, requested source, or important citation is still missing. For current-information lookups, call the directly available web_search without tool_search. Do not substitute web_fetch on a search-results page; use web_fetch only when the task starts from a specific URL or a search result lacks a required detail.")
 	}
 
 	// Memory — stays volatile: memory_append can mutate MEMORY.md during a

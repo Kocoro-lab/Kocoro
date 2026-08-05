@@ -905,6 +905,8 @@ func TestBuildSystemPrompt_FastModeGuidanceIsVolatile(t *testing.T) {
 		"Do not repeat a successful search, fetch, read, or other call",
 		"budget one broad search at most",
 		"exceed that budget only when a required fact, requested source, or important citation is still missing",
+		"call the directly available web_search without tool_search",
+		"Do not substitute web_fetch on a search-results page",
 	} {
 		if !strings.Contains(fast.VolatileContext, want) {
 			t.Errorf("FastMode volatile context missing %q", want)
