@@ -30,7 +30,12 @@ func mkSession() *Session {
 		SummaryCacheKey:        "stale-key",
 		ToolResultReplacements: map[string]string{"id1": "x"},
 		ToolResultSeen:         map[string]bool{"id1": true},
-		InProgress:             true,
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 4,
+			Messages:            []client.Message{mkMsg("user", "summary")},
+		},
+		InProgress: true,
 	}
 }
 
@@ -54,6 +59,9 @@ func TestTruncateAt_TruncatesBothMessagesAndMeta(t *testing.T) {
 	}
 	if len(s.ToolResultReplacements) != 0 || len(s.ToolResultSeen) != 0 {
 		t.Errorf("tool result budget should be reset")
+	}
+	if s.CompactionCheckpoint != nil {
+		t.Errorf("compaction checkpoint should be cleared")
 	}
 	if s.InProgress {
 		t.Errorf("InProgress should be cleared")

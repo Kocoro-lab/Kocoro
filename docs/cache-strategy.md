@@ -75,6 +75,17 @@ Kocoro does not depend on private provider cache-edit protocols or
 cache-key-invisible prompt sections. XML tags such as `<system-reminder>` are
 ordinary message text and participate in the request byte stream.
 
+## Durable Compaction Prefix
+
+Compaction preserves cache convergence by separating archival and model-live
+state. `Session.Messages` remains the complete transcript, while
+`Session.CompactionCheckpoint` stores the exact summary + retained tail sent on
+later turns. `HistoryForLoop` reuses those bytes and appends only raw transcript
+messages created after the checkpoint's exclusive archive index. A
+non-compacting turn never regenerates the summary, so the compacted prefix is
+stable and can become a cache hit again. This is local prompt construction; it
+does not change Cloud's cache TTL or write policy.
+
 ## Query-Time Tool Result Budget
 
 Kocoro applies a second tool-result budget immediately before main LLM

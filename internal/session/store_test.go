@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -900,6 +901,129 @@ func TestHistoryForLoop_ShortMeta(t *testing.T) {
 	got := sess.HistoryForLoop()
 	if len(got) != 3 {
 		t.Errorf("got %d messages, want 3 (unannotated positions must survive)", len(got))
+	}
+}
+
+func TestHistoryForLoop_CompactionCheckpointUsesRawArchiveIndex(t *testing.T) {
+	sess := &Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("archived old user")},
+			{Role: "assistant", Content: client.NewTextContent("archived old reply")},
+			{Role: "user", Content: client.NewTextContent("injected before checkpoint")},
+			{Role: "assistant", Content: client.NewTextContent("covered tail")},
+			{Role: "user", Content: client.NewTextContent("new user after checkpoint")},
+			{Role: "user", Content: client.NewTextContent("injected after checkpoint")},
+			{Role: "assistant", Content: client.NewTextContent("new reply after checkpoint")},
+		},
+		MessageMeta: []MessageMeta{
+			{}, {}, {SystemInjected: true}, {}, {}, {SystemInjected: true}, {},
+		},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 4, // raw index, including the injected message
+			Messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("original primer")},
+				{Role: "user", Content: client.NewTextContent("Previous context summary: stable compacted summary")},
+			},
+		},
+	}
+
+	got := sess.HistoryForLoop()
+	want := []string{"original primer", "Previous context summary: stable compacted summary", "new user after checkpoint", "new reply after checkpoint"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d live messages, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if text := got[i].Content.Text(); text != want[i] {
+			t.Fatalf("live[%d] = %q, want %q", i, text, want[i])
+		}
+	}
+	if len(sess.Messages) != 7 {
+		t.Fatalf("HistoryForLoop mutated archive: got %d messages", len(sess.Messages))
+	}
+}
+
+func TestHistoryForLoop_InvalidCheckpointFallsBackToArchive(t *testing.T) {
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	sess := &Session{
+		ID:       "invalid-checkpoint-session",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("archive")}},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 99,
+			Messages:            []client.Message{{Role: "user", Content: client.NewTextContent("bad checkpoint")}},
+		},
+	}
+	got := sess.HistoryForLoop()
+	if len(got) != 1 || got[0].Content.Text() != "archive" {
+		t.Fatalf("invalid checkpoint should fail open to archive, got %#v", got)
+	}
+	if text := logs.String(); !strings.Contains(text, "ignoring invalid compaction checkpoint") ||
+		!strings.Contains(text, `session="invalid-checkpoint-session"`) ||
+		!strings.Contains(text, "archive_through_index=99") {
+		t.Fatalf("invalid checkpoint fallback was silent: %q", text)
+	}
+
+	// No checkpoint is the normal, pre-compaction state and must stay quiet.
+	logs.Reset()
+	plain := &Session{Messages: []client.Message{{Role: "user", Content: client.NewTextContent("plain")}}}
+	_ = plain.HistoryForLoop()
+	if strings.Contains(logs.String(), "compaction checkpoint") {
+		t.Fatalf("nil checkpoint logged as invalid: %q", logs.String())
+	}
+
+	// Structurally valid legacy/malformed checkpoints still feed their live
+	// view forward, but must be attributable when the compaction marker is
+	// absent — otherwise the next-turn sanitizer failure aliases to normal use.
+	logs.Reset()
+	markerless := &Session{
+		ID:       "markerless-checkpoint-session",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("archive")}},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 1,
+			Messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("primer")},
+				{Role: "user", Content: client.NewTextContent("retained user without marker")},
+			},
+		},
+	}
+	_ = markerless.HistoryForLoop()
+	if text := logs.String(); !strings.Contains(text, "missing the compacted-history marker") ||
+		!strings.Contains(text, `session="markerless-checkpoint-session"`) {
+		t.Fatalf("markerless checkpoint invariant violation was silent: %q", text)
+	}
+}
+
+func TestStore_RoundTripCompactionCheckpoint(t *testing.T) {
+	store := NewStore(t.TempDir())
+	defer store.Close()
+	sess := &Session{
+		ID:        "checkpoint-roundtrip",
+		Title:     "checkpoint",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("archive")}},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 1,
+			Messages:            []client.Message{{Role: "user", Content: client.NewTextContent("summary")}},
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := store.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.CompactionCheckpoint == nil || got.CompactionCheckpoint.ArchiveThroughIndex != 1 ||
+		len(got.CompactionCheckpoint.Messages) != 1 || got.CompactionCheckpoint.Messages[0].Content.Text() != "summary" {
+		t.Fatalf("checkpoint did not round-trip: %#v", got.CompactionCheckpoint)
 	}
 }
 

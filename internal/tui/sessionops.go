@@ -44,6 +44,12 @@ func (m *Model) forkSession(id string) tea.Cmd {
 
 	fork := m.sessions.NewSession()
 	fork.Messages = forkMessages(src.Messages)
+	fork.MessageMeta = append(fork.MessageMeta, src.MessageMeta...)
+	if src.CompactionCheckpoint != nil {
+		checkpoint := *src.CompactionCheckpoint
+		checkpoint.Messages = forkMessages(src.CompactionCheckpoint.Messages)
+		fork.CompactionCheckpoint = &checkpoint
+	}
 	if srcTitle != "" && srcTitle != "New session" {
 		fork.Title = srcTitle + " (fork)"
 		fork.TitleAuto = false

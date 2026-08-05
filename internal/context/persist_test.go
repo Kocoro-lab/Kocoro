@@ -186,7 +186,7 @@ func TestPersistLearningsReturnsUsage(t *testing.T) {
 }
 
 // TestPersistLearnings_CapsOversizedTranscript verifies that the transcript
-// fed to the small-tier summarizer is bounded by summarizeInputCapChars even
+// fed to the small-tier summarizer is bounded by summarizeInputCapBytes even
 // when the source history is way over that. Without this, a long session
 // crossing the 0.90 compaction threshold (180K tokens on a 200K cap) would
 // 400 the small model with "prompt is too long" — observed as the
@@ -223,14 +223,14 @@ func TestPersistLearnings_CapsOversizedTranscript(t *testing.T) {
 		}
 		t.Errorf("expected truncation marker in capped transcript, got: %q...", head)
 	}
-	// The capped transcript itself must respect summarizeInputCapChars; the
+	// The capped transcript itself must respect summarizeInputCapBytes; the
 	// userMsg wraps it with a static header (~70 chars) — allow a small
 	// headroom for the wrapper without forcing this test to track its exact
 	// byte count.
 	const wrapperHeadroom = 256
-	if len(sentBody) > summarizeInputCapChars+wrapperHeadroom {
+	if len(sentBody) > summarizeInputCapBytes+wrapperHeadroom {
 		t.Errorf("sent user-message len = %d, want <= %d (cap %d + wrapper headroom)",
-			len(sentBody), summarizeInputCapChars+wrapperHeadroom, summarizeInputCapChars)
+			len(sentBody), summarizeInputCapBytes+wrapperHeadroom, summarizeInputCapBytes)
 	}
 }
 

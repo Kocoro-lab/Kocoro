@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "id": "sess-default-detail-fixture",
+  "created_at": "2026-08-05T00:00:00Z",
+  "updated_at": "2026-08-05T00:01:00Z",
+  "title": "Default session detail fixture",
+  "cwd": "/tmp/project",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ARCHIVE_ONLY_OLD_TASK"
+    },
+    {
+      "role": "assistant",
+      "content": "ARCHIVE_ONLY_OLD_REPLY"
+    },
+    {
+      "role": "user",
+      "content": "live tail question"
+    }
+  ],
+  "compaction_checkpoint": {
+    "schema_version": 1,
+    "archive_through_index": 2,
+    "messages": [
+      {
+        "role": "user",
+        "content": "stable original primer"
+      },
+      {
+        "role": "user",
+        "content": "Previous context summary: stable state"
+      },
+      {
+        "role": "assistant",
+        "content": "compacted recent reply"
+      }
+    ]
+  },
+  "message_meta": [
+    {
+      "source": "desktop",
+      "timestamp": "2026-08-05T00:00:01Z"
+    },
+    {
+      "source": "desktop",
+      "timestamp": "2026-08-05T00:00:02Z"
+    },
+    {
+      "source": "desktop",
+      "timestamp": "2026-08-05T00:00:03Z"
+    }
+  ],
+  "source": "desktop"
+}

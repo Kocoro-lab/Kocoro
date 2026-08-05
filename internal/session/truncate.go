@@ -61,6 +61,10 @@ func (s *Session) TruncateAt(idx int) (*RestoredMessage, error) {
 	// metadata existed or after partial recovery. Do not extend the slice into
 	// stale capacity; clip to the shorter side.
 	s.MessageMeta = s.MessageMeta[:min(idx, len(s.MessageMeta))]
+	// Rewind/edit changes the archive prefix the live checkpoint was derived
+	// from. Fail closed to the full remaining archive; the next compaction will
+	// create a fresh checkpoint in the correct raw-index space.
+	s.CompactionCheckpoint = nil
 
 	// Summary cache is no longer valid because the conversation tail is gone.
 	s.SummaryCache = ""

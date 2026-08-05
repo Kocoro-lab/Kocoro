@@ -25,6 +25,39 @@ import (
 //
 // Returns a new slice; the original is not modified.
 func SanitizeHistory(messages []client.Message) []client.Message {
+	return sanitizeHistory(messages, false)
+}
+
+// SanitizeCompactedHistory repairs a persisted compacted live history without
+// collapsing its leading user-message prefix. ShapeHistory deliberately emits
+// [first user, summary-as-user, recent tail...]; the request that applied the
+// compaction already used those exact bytes, so a fresh Run must preserve that
+// prefix for both semantics and prompt-cache stability.
+//
+// Histories without the internal summary marker fall back to SanitizeHistory's
+// established keep-later behavior for adjacent user messages.
+func SanitizeCompactedHistory(messages []client.Message) []client.Message {
+	return sanitizeHistory(messages, IsCompactedHistory(messages))
+}
+
+// IsCompactedHistory reports whether messages start with ShapeHistory's
+// model-visible primer + summary representation. Callers normally pass history
+// without a system message, but accepting one keeps the predicate useful in
+// context-level tests and diagnostics.
+func IsCompactedHistory(messages []client.Message) bool {
+	start := 0
+	if len(messages) > 0 && messages[0].Role == "system" {
+		start = 1
+	}
+	if len(messages) < start+2 {
+		return false
+	}
+	first, summary := messages[start], messages[start+1]
+	return first.Role == "user" && summary.Role == "user" &&
+		!summary.Content.HasBlocks() && strings.HasPrefix(summary.Content.Text(), CompactionSummaryPrefix)
+}
+
+func sanitizeHistory(messages []client.Message, preserveLeadingUsers bool) []client.Message {
 	if len(messages) == 0 {
 		return messages
 	}
@@ -47,7 +80,7 @@ func SanitizeHistory(messages []client.Message) []client.Message {
 
 	// Third pass: fix consecutive same-role messages.
 	// Claude API requires strict user/assistant alternation.
-	merged := mergeConsecutiveRoles(repaired)
+	merged := mergeConsecutiveRolesWithPolicy(repaired, preserveLeadingUsers)
 
 	// Fourth pass: strip orphaned tool_use and tool_result blocks.
 	// Runs after role merging so adjacency checks are reliable.
@@ -62,7 +95,7 @@ func SanitizeHistory(messages []client.Message) []client.Message {
 
 	// Final pass: stripping may create new consecutive same-role sequences
 	// (e.g. dropping an empty assistant leaves two adjacent user messages).
-	result := mergeConsecutiveRoles(normalized)
+	result := mergeConsecutiveRolesWithPolicy(normalized, preserveLeadingUsers)
 
 	return result
 }
@@ -399,6 +432,15 @@ func isEmptyOrNullToolInput(raw json.RawMessage) bool {
 // per-position: the same ID reused in a non-adjacent pair does not count.
 // If stripping leaves a message with no content, it is dropped.
 func stripOrphanedToolPairs(messages []client.Message) []client.Message {
+	out, _ := stripOrphanedToolPairsTracked(messages, nil)
+	return out
+}
+
+// stripOrphanedToolPairsTracked is stripOrphanedToolPairs with a parallel
+// source-index slice. When an orphan-only message is removed, its source is
+// removed at the same position so ShapeHistoryTracked retains an exact
+// provenance map.
+func stripOrphanedToolPairsTracked(messages []client.Message, sources []int) ([]client.Message, []int) {
 	// Per-message set of valid tool IDs. An ID is valid at position i only
 	// if it forms a proper adjacent pair (assistant[i] ↔ user[i+1]).
 	validAt := make([]map[string]bool, len(messages))
@@ -434,9 +476,16 @@ func stripOrphanedToolPairs(messages []client.Message) []client.Message {
 	}
 
 	var out []client.Message
+	var outSources []int
+	appendOutput := func(i int, msg client.Message) {
+		out = append(out, msg)
+		if sources != nil {
+			outSources = append(outSources, sources[i])
+		}
+	}
 	for i, msg := range messages {
 		if !msg.Content.HasBlocks() {
-			out = append(out, msg)
+			appendOutput(i, msg)
 			continue
 		}
 
@@ -446,20 +495,20 @@ func stripOrphanedToolPairs(messages []client.Message) []client.Message {
 			if kept == nil {
 				continue
 			}
-			out = append(out, client.Message{Role: msg.Role, Content: client.NewBlockContent(kept)})
+			appendOutput(i, client.Message{Role: msg.Role, Content: client.NewBlockContent(kept)})
 
 		case "user":
 			kept := stripUnpairedBlocks(msg.Content.Blocks(), "tool_result", validAt[i])
 			if kept == nil {
 				continue
 			}
-			out = append(out, client.Message{Role: msg.Role, Content: client.NewBlockContent(kept)})
+			appendOutput(i, client.Message{Role: msg.Role, Content: client.NewBlockContent(kept)})
 
 		default:
-			out = append(out, msg)
+			appendOutput(i, msg)
 		}
 	}
-	return out
+	return out, outSources
 }
 
 // stripUnpairedBlocks removes blocks of blockType whose ID is not in validIDs
@@ -511,11 +560,36 @@ func toolBlockID(b client.ContentBlock) string {
 
 // mergeConsecutiveRoles collapses consecutive same-role messages, keeping the later one.
 func mergeConsecutiveRoles(messages []client.Message) []client.Message {
+	return mergeConsecutiveRolesWithPolicy(messages, false)
+}
+
+// mergeConsecutiveRolesWithPolicy retains ShapeHistory's leading run of user
+// messages when preserveLeadingUsers is true. Only the compacted-history entry
+// point enables this policy; ordinary/legacy histories keep the established
+// keep-later repair behavior.
+func mergeConsecutiveRolesWithPolicy(messages []client.Message, preserveLeadingUsers bool) []client.Message {
 	var out []client.Message
+	leadingUserPrefix := preserveLeadingUsers
+	conversationStarted := false
 	for i, msg := range messages {
+		if !conversationStarted && msg.Role != "system" {
+			conversationStarted = true
+			if msg.Role != "user" {
+				leadingUserPrefix = false
+			}
+		} else if conversationStarted && msg.Role != "user" {
+			leadingUserPrefix = false
+		}
 		if i > 0 && msg.Role == messages[i-1].Role {
 			switch msg.Role {
-			case "assistant", "user":
+			case "user":
+				if leadingUserPrefix {
+					out = append(out, msg)
+					continue
+				}
+				out[len(out)-1] = msg
+				continue
+			case "assistant":
 				out[len(out)-1] = msg
 				continue
 			}
