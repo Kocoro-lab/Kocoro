@@ -618,6 +618,25 @@ func TestPromptSuggestionConfig_Defaults(t *testing.T) {
 	}
 }
 
+func TestCompactionSnapshotConfig_Defaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".shannon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Agent.CompactionSnapshotRetention != 1 {
+		t.Errorf("CompactionSnapshotRetention = %d, want 1", cfg.Agent.CompactionSnapshotRetention)
+	}
+	if cfg.Agent.CompactionSnapshotMaxAgeDays != 14 {
+		t.Errorf("CompactionSnapshotMaxAgeDays = %d, want 14", cfg.Agent.CompactionSnapshotMaxAgeDays)
+	}
+}
+
 func TestPromptSuggestionConfig_OverlayMerge(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

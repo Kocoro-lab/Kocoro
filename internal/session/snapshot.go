@@ -21,6 +21,8 @@ import (
 // summary-quality audit could not see (already-microcompacted tool results).
 const compactionSnapshotDirName = ".compaction-snapshots"
 
+const snapshotImagePlaceholder = "[image omitted from compaction snapshot]"
+
 // CompactionSnapshot is the on-disk shape of one pre-compaction history copy.
 type CompactionSnapshot struct {
 	SchemaVersion int              `json:"schema_version"`
@@ -65,7 +67,7 @@ func (s *Store) SaveCompactionSnapshot(id, phase string, messages []client.Messa
 		SessionID:     id,
 		Phase:         phase,
 		CreatedAt:     now,
-		Messages:      messages,
+		Messages:      stripCompactionSnapshotImages(messages),
 	}
 	data, err := json.Marshal(snap)
 	if err != nil {
@@ -84,6 +86,44 @@ func (s *Store) SaveCompactionSnapshot(id, phase string, messages []client.Messa
 
 	pruneCompactionSnapshots(dir, maxPerSession)
 	return nil
+}
+
+// stripCompactionSnapshotImages returns a shallow message copy whose content
+// owns replacement block slices with every inline image removed. Snapshots are
+// identifier/decision recovery material; retaining screenshot base64 adds
+// substantial disk and marshal cost without improving that recovery path.
+// The caller's in-memory trajectory is never mutated.
+func stripCompactionSnapshotImages(messages []client.Message) []client.Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	out := make([]client.Message, len(messages))
+	copy(out, messages)
+	for i := range out {
+		if !out[i].Content.HasBlocks() {
+			continue
+		}
+		out[i].Content = client.NewBlockContent(stripSnapshotImageBlocks(out[i].Content.Blocks()))
+	}
+	return out
+}
+
+func stripSnapshotImageBlocks(blocks []client.ContentBlock) []client.ContentBlock {
+	out := make([]client.ContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case "image":
+			out = append(out, client.ContentBlock{Type: "text", Text: snapshotImagePlaceholder})
+		case "tool_result":
+			if nested, ok := block.ToolContent.([]client.ContentBlock); ok {
+				block.ToolContent = stripSnapshotImageBlocks(nested)
+			}
+			out = append(out, block)
+		default:
+			out = append(out, block)
+		}
+	}
+	return out
 }
 
 // isSafePhase reports whether phase is a plain lowercase/underscore token —
@@ -178,6 +218,50 @@ func (s *Store) SweepOrphanCompactionSnapshots() {
 			os.RemoveAll(filepath.Join(root, e.Name()))
 		}
 	}
+}
+
+// SweepStaleCompactionSnapshots removes snapshot JSON and interrupted temp
+// files older than maxAge from one sessions directory. Age retention is an
+// outer disk bound and therefore overrides the per-session oldest-file pin.
+// Per-session directories are deliberately retained: removing one can race a
+// concurrent SaveCompactionSnapshot between its MkdirAll and WriteFile calls.
+func SweepStaleCompactionSnapshots(sessionsDir string, maxAge time.Duration) (int, error) {
+	if sessionsDir == "" || maxAge <= 0 {
+		return 0, nil
+	}
+	root := filepath.Join(filepath.Clean(sessionsDir), compactionSnapshotDirName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, file := range files {
+			if file.IsDir() || (filepath.Ext(file.Name()) != ".json" && !strings.HasSuffix(file.Name(), ".tmp")) {
+				continue
+			}
+			info, err := file.Info()
+			if err != nil || info.ModTime().After(cutoff) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir, file.Name())); err == nil {
+				removed++
+			}
+		}
+	}
+	return removed, nil
 }
 
 // SaveCompactionSnapshot on the Manager delegates to the underlying store.

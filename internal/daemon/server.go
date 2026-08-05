@@ -1108,6 +1108,19 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Compaction snapshots are manual rollback material, not permanent session
+	// history. Bound their lifetime independently of session deletion so an
+	// old but still-listed session cannot retain full-history copies forever.
+	days := 0
+	if s.deps != nil {
+		s.deps.mu.RLock()
+		if s.deps.Config != nil {
+			days = s.deps.Config.Agent.CompactionSnapshotMaxAgeDays
+		}
+		s.deps.mu.RUnlock()
+	}
+	s.startCompactionSnapshotSweep(days)
+
 	// One-time agent pull on startup: applies the cloud mirror to local disk
 	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
 	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
