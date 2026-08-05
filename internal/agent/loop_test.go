@@ -394,6 +394,19 @@ func (h *usageRecordingHandler) UsageDeltas() []TurnUsage {
 	return out
 }
 
+func TestAgentLoopReportLLMUsagePreservesSearchOnlyUsage(t *testing.T) {
+	handler := &usageRecordingHandler{}
+	loop := NewAgentLoop(nil, NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	loop.reportLLMUsage(client.Usage{WebSearchCalls: 1}, "")
+
+	deltas := handler.UsageDeltas()
+	if len(deltas) != 1 || deltas[0].WebSearchCalls != 1 {
+		t.Fatalf("usage deltas = %+v, want one hosted-search call", deltas)
+	}
+}
+
 func (h *usageRecordingHandler) StatusEvents() []recordedStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()

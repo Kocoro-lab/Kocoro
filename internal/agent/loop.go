@@ -647,6 +647,7 @@ func (a *AgentLoop) reportLLMUsage(u client.Usage, model string) {
 	}
 	delta := LLMUsageDelta(u, model)
 	if delta.TotalTokens == 0 && delta.CostUSD == 0 &&
+		delta.WebSearchCalls == 0 &&
 		delta.CacheReadTokens == 0 && delta.CacheCreationTokens == 0 &&
 		delta.CacheCreation5mTokens == 0 && delta.CacheCreation1hTokens == 0 {
 		return

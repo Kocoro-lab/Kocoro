@@ -903,6 +903,7 @@ func TestBuildSystemPrompt_FastModeGuidanceIsVolatile(t *testing.T) {
 		"## Fast Task",
 		"fewest tool rounds",
 		"Do not repeat a successful search, fetch, read, or other call",
+		"A failed, empty, or unusable result does not consume the normal search budget",
 		"budget one broad search at most",
 		"exceed that budget only when a required fact, requested source, or important citation is still missing",
 		"call the directly available web_search without tool_search",
