@@ -1654,6 +1654,8 @@ func TestPlaywrightTurnStartProbeAction(t *testing.T) {
 // large/medium/small.
 func TestApplyAgentModelOverlayToLoop_ModelTier(t *testing.T) {
 	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetSpecificModel("inherited-global-model")
+	loop.SetServiceTier("fast")
 	if got := loop.ModelTier(); got != "medium" {
 		t.Fatalf("precondition: baseline ModelTier = %q, want %q", got, "medium")
 	}
@@ -1661,6 +1663,29 @@ func TestApplyAgentModelOverlayToLoop_ModelTier(t *testing.T) {
 	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ModelTier: &tier})
 	if got := loop.ModelTier(); got != "large" {
 		t.Errorf("after overlay: ModelTier = %q, want %q", got, "large")
+	}
+	if got := loop.SpecificModel(); got != "" {
+		t.Errorf("after overlay: SpecificModel = %q, want empty", got)
+	}
+	if got := loop.ServiceTier(); got != "" {
+		t.Errorf("after overlay: ServiceTier = %q, want empty", got)
+	}
+}
+
+func TestEffectiveRunModelIntent_AgentTierClearsInheritedSpecificModel(t *testing.T) {
+	runCfg := &config.Config{ModelTier: "medium"}
+	runCfg.Agent.Model = "inherited-global-model"
+	tier := "large"
+	agentOverride := &agents.Agent{Config: &agents.AgentConfig{
+		Agent: &agents.AgentModelConfig{ModelTier: &tier},
+	}}
+
+	got := effectiveRunModelIntent(runCfg, agentOverride, RunAgentRequest{})
+	if got.ModelTier != "large" {
+		t.Errorf("ModelTier = %q, want large", got.ModelTier)
+	}
+	if got.SpecificModel != "" {
+		t.Errorf("SpecificModel = %q, want empty", got.SpecificModel)
 	}
 }
 

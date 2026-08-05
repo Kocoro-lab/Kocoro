@@ -2002,19 +2002,18 @@ func resumeRoutedColdStart(sessMgr *session.Manager, routeKey string) (bool, err
 // applyAgentModelOverlayToLoop applies the loop-facing fields of the per-agent
 // model overlay onto the AgentLoop. Called per-turn so reload picks up edits.
 //
-// SetModelTier and SetSpecificModel write to independent fields on the loop
-// (modelTier vs specificModel). Call order does NOT decide precedence; the
-// request-time resolver in loop.go:messagesForLLM picks specificModel when
-// non-empty and falls back to modelTier otherwise. Both setters are applied
-// so an operator can later switch between specific-pin and tier without
-// unsetting the other. Idle timeout fields live in runCfg, not on the loop,
-// and are handled inline at the call site.
+// A concrete named-agent tier is authoritative over inherited global routing,
+// while a named-agent exact model remains the final override. Idle timeout
+// fields live in runCfg, not on the loop, and are handled inline at the call
+// site.
 func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelConfig) {
 	if loop == nil || ac == nil {
 		return
 	}
 	if ac.ModelTier != nil && *ac.ModelTier != "" {
 		loop.SetModelTier(*ac.ModelTier)
+		loop.SetSpecificModel("")
+		loop.SetServiceTier("")
 	}
 	// Per-agent effort override. nil OR "" = inherit the global tier already
 	// applied on the loop (Desktop's "Inherit" segment sends the field absent;
@@ -2071,6 +2070,7 @@ func effectiveRunModelIntent(
 		model := agentOverride.Config.Agent
 		if model.ModelTier != nil && *model.ModelTier != "" {
 			intent.ModelTier = *model.ModelTier
+			intent.SpecificModel = ""
 		}
 		if model.Model != nil {
 			intent.SpecificModel = *model.Model
