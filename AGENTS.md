@@ -101,6 +101,8 @@ The daemon is the production integration point for Cloud channels. Route precede
 
 Capabilities are advertised during the WebSocket handshake. Add a capability token in the same PR that ships an optional protocol feature. `delivery_ack` means the daemon acknowledges an inbound message only after reply delivery succeeds, so Cloud can safely drop it from replay.
 
+Global config reload observability is revision-based: only `~/.shannon/config.yaml` participates in `config_reload_state_v1`. Never infer that project/local overlays are watched, and never advance the applied revision by re-reading after an unrelated internal mutation.
+
 Schedule proactive push has two independent three-state knobs (`auto`/`on`/`off`, set via natural language through `schedule_create`/`schedule_update`). `broadcast` gates whether a successful run pushes to IM at all; the push target is always the channel the schedule was created in (its snapshotted `im_status_context` blob) — schedules created outside an IM chat have no target and never push, even with `broadcast=on`. `thread` controls IM thread anchoring: `auto` follows session state (stateful → one thread, stateless → each run top-level), `on`/`off` force it. The daemon resolves `thread` to `ProactivePayload.UseThread *bool` and sends it to Cloud; `nil` means current behavior (anchored thread) and only an explicit off goes top-level. Platforms without threads ignore it. Capability tokens `schedule_broadcast_gate` and `proactive_thread_mode` are observability only.
 
 ### Output Profiles
@@ -182,7 +184,7 @@ Any in-place message content rewrite that can affect prompt bytes must emit cach
 
 ### Context Management
 
-Context-window defaults are only seeds; model responses may auto-adjust the active window unless a per-agent override explicitly locks it. Preserve proactive, pre-flight, and reactive compaction as separate gates so context errors do not cascade.
+Context-window defaults are only seeds; model responses may auto-adjust the active window unless a per-agent override explicitly locks it. Preserve proactive, pre-flight, and reactive compaction as separate gates so context errors do not cascade. Estimate-based gates must stay calibrated against real prompt usage (estimator overhead) and share the trigger's scale; compactions land below the trigger (hysteresis) so one compaction cannot immediately re-trigger. The calibration sample persists in the session checkpoint (overhead + model + tool-registry fingerprint) and is restored onto fresh daemon loops with model/registry validation. Compaction summaries are audited before acceptance (section structure + verbatim identifier preservation, one retry, mechanical identifier backstop). Applied proactive and pre-flight compactions re-inject the most recently read files from disk within a budget that stays under the trigger line; the reactive (post-400) path deliberately skips restoration because its evidence floor is only a lower bound and a second overflow there is terminal.
 
 ### Anti-Hallucination
 

@@ -1327,6 +1327,11 @@ func (s *Server) installAndEnableRecommendation(ctx context.Context, v skillReco
 	if v.OwnerAgentName != "" {
 		s.recommendationAgentMu.Lock()
 		defer s.recommendationAgentMu.Unlock()
+		if s.deps.SessionCache != nil {
+			routeKey := "agent:" + v.OwnerAgentName
+			s.deps.SessionCache.LockRoute(routeKey)
+			defer s.deps.SessionCache.UnlockRoute(routeKey)
+		}
 		userAgentDir := filepath.Join(s.deps.AgentsDir, v.OwnerAgentName)
 		if _, err := os.Stat(filepath.Join(userAgentDir, "AGENT.md")); os.IsNotExist(err) && agents.IsBuiltinAgent(v.OwnerAgentName) {
 			if err := agents.MaterializeBuiltin(s.deps.AgentsDir, v.OwnerAgentName); err != nil {
@@ -1352,6 +1357,11 @@ func (s *Server) installAndEnableRecommendation(ctx context.Context, v skillReco
 			}
 		}
 	} else {
+		unlockConfig := func() {}
+		if s.deps.LockConfigMutation != nil {
+			unlockConfig = s.deps.LockConfigMutation()
+		}
+		defer unlockConfig()
 		enableTargets := append([]string(nil), slugs...)
 		installed, err := skills.LoadSkills(skills.SkillSource{Dir: filepath.Join(s.deps.ShannonDir, "skills"), Source: skills.SourceGlobal})
 		if err != nil {
@@ -1366,7 +1376,8 @@ func (s *Server) installAndEnableRecommendation(ctx context.Context, v skillReco
 				enableTargets = append(enableTargets, installedSkill.Name)
 			}
 		}
-		if err := config.RemoveGlobalDisabledSkills(s.deps.ShannonDir, enableTargets); err != nil {
+		revisions, err := config.RemoveGlobalDisabledSkillsWithRevision(s.deps.ShannonDir, enableTargets)
+		if err != nil {
 			return skillRecommendationInstallReceipt{}, fmt.Errorf("enable installed skill for default agent: %w", err)
 		}
 		rm := make(map[string]bool, len(enableTargets))
@@ -1384,6 +1395,7 @@ func (s *Server) installAndEnableRecommendation(ctx context.Context, v skillReco
 			s.deps.Config.Skills.Disabled = filtered
 		}
 		s.deps.WriteUnlock()
+		s.recordConfigMutationApplied(revisions)
 	}
 	return skillRecommendationInstallReceipt{InstalledAt: time.Now().UTC(), AgentName: v.OwnerAgentName, Items: receipts}, nil
 }

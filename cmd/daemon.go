@@ -52,7 +52,34 @@ var daemonStartCmd = &cobra.Command{
 			return daemonStartDetached()
 		}
 
-		cfg, err := config.Load()
+		shanDir := config.ShannonDir()
+		if shanDir == "" {
+			return fmt.Errorf("failed to resolve home directory")
+		}
+		agentsDir := filepath.Join(shanDir, "agents")
+		projectsDir := filepath.Join(shanDir, "projects")
+		pidPath := filepath.Join(shanDir, "daemon.pid")
+
+		force, _ := cmd.Flags().GetBool("force")
+		if force {
+			stopExistingDaemon(pidPath)
+		}
+
+		if daemon.IsDaemonServiceLoaded() {
+			log.Println("Warning: daemon is managed by launchd. Use 'shan daemon stop' to remove launchd management.")
+		}
+
+		pidFile, err := acquireDaemonPIDFile(shanDir)
+		if err != nil {
+			return err
+		}
+		defer pidFile.Close()
+
+		// Every startup mutation, including config migrations, must happen only
+		// after this process owns the daemon singleton.
+		// A second start attempt that later fails the PID lock must never rewrite
+		// files used by the live daemon.
+		cfg, configRevision, err := config.LoadWithRevision()
 		if err != nil {
 			return fmt.Errorf("config: %w", err)
 		}
@@ -70,32 +97,12 @@ var daemonStartCmd = &cobra.Command{
 				cfg.Agent.IdleHardTimeoutSecs)
 		}
 
-		shanDir := config.ShannonDir()
-		agentsDir := filepath.Join(shanDir, "agents")
-		projectsDir := filepath.Join(shanDir, "projects")
-		pidPath := filepath.Join(shanDir, "daemon.pid")
-
 		if err := agents.EnsureBuiltins(agentsDir, Version); err != nil {
 			log.Printf("WARNING: failed to sync builtin agents: %v", err)
 		}
 		if err := skills.EnsureBuiltinSkills(shanDir); err != nil {
 			log.Printf("WARNING: failed to sync builtin skills: %v", err)
 		}
-
-		force, _ := cmd.Flags().GetBool("force")
-		if force {
-			stopExistingDaemon(pidPath)
-		}
-
-		if daemon.IsDaemonServiceLoaded() {
-			log.Println("Warning: daemon is managed by launchd. Use 'shan daemon stop' to remove launchd management.")
-		}
-
-		pidFile, err := daemon.AcquirePIDFile(pidPath)
-		if err != nil {
-			return err
-		}
-		defer pidFile.Close()
 
 		// Clean up orphaned Chrome CDP from a previous hard kill. Must run AFTER
 		// AcquirePIDFile — holding the lock guarantees no other daemon is alive,
@@ -286,6 +293,7 @@ var daemonStartCmd = &cobra.Command{
 
 		deps := &daemon.ServerDeps{
 			Config:           cfg,
+			ConfigRevision:   configRevision,
 			GW:               gw,
 			Registry:         reg,
 			MCPManager:       mcpMgr,
@@ -632,7 +640,9 @@ var daemonStartCmd = &cobra.Command{
 				OnAPIKeyChanged: func(ctx context.Context) {
 					localServer.RebuildAuthSensitiveTools(ctx)
 				},
-				Logger: log.Default(),
+				LockConfigMutation:   deps.LockConfigMutation,
+				RecordConfigMutation: deps.RecordConfigMutation,
+				Logger:               log.Default(),
 			})
 			authMgr.SetEventBus(localServer.EventBus())
 			wsCtl = daemon.NewWSController(ctx, wsClient)
@@ -842,6 +852,20 @@ var daemonStartCmd = &cobra.Command{
 		sessionCache.CloseAll()
 		return nil
 	},
+}
+
+func acquireDaemonPIDFile(shannonDir string) (*daemon.PIDFile, error) {
+	if shannonDir == "" {
+		return nil, fmt.Errorf("failed to resolve home directory")
+	}
+	// This is the ordinary start path's sole pre-lock filesystem mutation. A
+	// first-ever daemon start has no ~/.shannon directory yet, while the PID file
+	// opener intentionally does not create parents. Creating the private parent
+	// is idempotent and does not modify state a running daemon reads or writes.
+	if err := os.MkdirAll(shannonDir, 0700); err != nil {
+		return nil, fmt.Errorf("create daemon state directory: %w", err)
+	}
+	return daemon.AcquirePIDFile(filepath.Join(shannonDir, "daemon.pid"))
 }
 
 var daemonStopCmd = &cobra.Command{

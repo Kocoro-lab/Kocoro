@@ -869,6 +869,8 @@ func TestAuthManager_SelfHeal_PromotesYamlKeyAndStrips(t *testing.T) {
 	f := newAuthFixture(t)
 	dir := t.TempDir()
 	f.manager.shanDir = dir
+	var recordedRevisions config.MutationRevisions
+	f.manager.recordConfigMutation = func(revisions config.MutationRevisions) { recordedRevisions = revisions }
 	cfgPath := dir + "/config.yaml"
 	if err := os.WriteFile(cfgPath, []byte("endpoint: https://c\napi_key: sk_yaml\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -892,6 +894,16 @@ func TestAuthManager_SelfHeal_PromotesYamlKeyAndStrips(t *testing.T) {
 	}
 	if got := config.PeekYAMLAPIKey(dir); got != "" {
 		t.Fatalf("yaml api_key not stripped after self-heal: %q", got)
+	}
+	currentRevision, err := config.FileRevision(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recordedRevisions.After != currentRevision {
+		t.Fatalf("recorded revision = %q, current stripped revision = %q", recordedRevisions.After, currentRevision)
+	}
+	if recordedRevisions.Before == "" || recordedRevisions.Before == recordedRevisions.After {
+		t.Fatalf("recorded revisions = %+v, want distinct before and after revisions", recordedRevisions)
 	}
 }
 

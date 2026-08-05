@@ -85,6 +85,16 @@ var modelContextWindowPrefix = map[string]int{
 	"claude-sonnet-4-6-": 1_000_000,
 	"claude-opus-4-6-":   1_000_000,
 	"claude-opus-4-7-":   1_000_000,
+	// OpenAI 1M families (dated snapshots use a -YYYY-MM-DD suffix, e.g. a
+	// future "gpt-5.6-luna-2026-09-01"). Persona-suffixed ids are full model
+	// names, so these prefixes only ever catch dated variants — same
+	// reasoning as the dated-variant prefix entries above. Broader "gpt-5.1-" style
+	// prefixes are intentionally absent: they would catch unknown sibling
+	// families (hypothetical gpt-5.1-mini) and guess their window; unknown
+	// ids must return (0,false) per the graceful-degradation doctrine.
+	"gpt-5.6-terra-": 1_050_000,
+	"gpt-5.6-luna-":  1_050_000,
+	"gpt-5.6-sol-":   1_050_000,
 	// 200K families. Note: we intentionally do NOT add a broader
 	// "claude-sonnet-4-" prefix — that would silently catch hypothetical
 	// future "claude-sonnet-4-NN" forms (e.g. claude-sonnet-4-60) and
@@ -128,11 +138,43 @@ func LookupModelContextWindow(modelID string) (int, bool) {
 		return v, true
 	}
 	for _, prefix := range prefixLookupOrder {
-		if strings.HasPrefix(modelID, prefix) {
+		if strings.HasPrefix(modelID, prefix) && isDateSuffix(modelID[len(prefix):]) {
 			return modelContextWindowPrefix[prefix], true
 		}
 	}
 	return 0, false
+}
+
+// isDateSuffix reports whether s looks like a dated-snapshot suffix:
+// "20251101" (dash-less) or "2025-08-07" (dashed). The prefix table
+// exists ONLY to catch future dated variants of known dateless families;
+// without this check any sibling family sharing the prefix (a hypothetical
+// gpt-5.6-sol-mini) would inherit the family's window instead of falling
+// back to (0,false) graceful degradation.
+func isDateSuffix(s string) bool {
+	switch len(s) {
+	case 8: // YYYYMMDD
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	case 10: // YYYY-MM-DD
+		for i, c := range s {
+			if i == 4 || i == 7 {
+				if c != '-' {
+					return false
+				}
+				continue
+			}
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // SeedContextWindowFromModels picks the best soft-seed for a fresh AgentLoop

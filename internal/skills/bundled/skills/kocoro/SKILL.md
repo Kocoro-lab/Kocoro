@@ -63,7 +63,13 @@ body: {"display_name": "Agent Name", "prompt": "You are a ... assistant. You hel
 
 **Agent config (model, tools):** `http PUT http://localhost:7533/agents/{name}/config` body: `{"agent": {"model": "..."}, "tools": {"allow": [...]}}`
 
-**List available skills (explicit administration):** `http GET http://localhost:7533/skills/downloadable`
+**List globally installed skills:** `http GET http://localhost:7533/skills`
+
+**List skills enabled for a named agent:** `http GET http://localhost:7533/agents/{name}` and inspect `skills`
+
+**List bundled skills available to install (explicit administration):** `http GET http://localhost:7533/skills/downloadable`
+
+The runtime skill reminder contains only the skills enabled for the current agent. It is not a platform-wide installation inventory, and another agent can have a different enabled set. Always query `GET /skills` before answering which skills are installed globally.
 
 **Install a named skill directly (explicit administration only, outside a capability-dependent task):** `http POST http://localhost:7533/skills/install/{name}`
 
@@ -71,7 +77,7 @@ body: {"display_name": "Agent Name", "prompt": "You are a ... assistant. You hel
 
 **Set skill API keys:** `http PUT http://localhost:7533/skills/{slug}/secrets` body: `{"KEY_NAME": "value"}` (values go to OS keychain, NEVER edit `.env` or agent config for skill keys — see `references/skills.md`)
 
-**Update settings:** `http PATCH http://localhost:7533/config` body: `{"agent": {"temperature": 0.7}}`
+**Update settings:** `http PATCH http://localhost:7533/config` body: `{"agent": {"temperature": 0.7}}`, then `http POST http://localhost:7533/config/reload` and verify with `GET /config`
 
 **Create rule:** `http PUT http://localhost:7533/rules/{name}` body: `{"content": "..."}`
 
@@ -105,7 +111,7 @@ For detailed docs on MCP servers, skill API keys, permissions, project init, or 
 ## Security
 
 **NEVER modify these fields** — the API rejects with 409. Do NOT add `X-Confirm` or any header to bypass:
-`endpoint`, `api_key`, `permissions.denied_commands`. Tell the user to edit `~/.shannon/config.yaml` directly.
+`endpoint`, `api_key`, `permissions.denied_commands`. Tell the user to edit `~/.shannon/config.yaml` directly, then call `POST /config/reload` and verify the effective value with `GET /config`.
 **MCP servers**: shells (`sh`, `bash`, `zsh`), wrapper commands (`env`, `nohup`, `sudo`), and eval flags (`-c`, `-e`, `--eval`) are blocked. Use actual server binaries, not shell wrappers.
 **`publish_to_web` extension allowlist** (`cloud.publish_allowed_extensions`): additive only. Do not coach users to "just add `.pem` / `.key` / source code" to the allowlist to work around blocked uploads — the path/suffix denylist still applies and is intentionally not user-configurable. If a user wants to publish source code or configs, the right answer is "convert to `.txt` / `.md` first, after auditing for secrets".
 **CONFIRM first**: delete any resource, add MCP server, widen permissions, set `daemon.auto_approve` (disables approval prompts for all tool calls).

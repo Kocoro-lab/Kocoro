@@ -48,7 +48,7 @@ func TestAssembleUserMessage_InstructionsOnlyEmitsCacheBreak(t *testing.T) {
 func TestAssembleUserMessage_CacheBreakRegression(t *testing.T) {
 	t.Run("empty stable omits marker", func(t *testing.T) {
 		result := assembleUserMessage(prompt.PromptParts{
-			StableContext:  "",
+			StableContext:   "",
 			VolatileContext: "current date: 2026-04-03",
 		}, "hello")
 		if strings.Contains(result, "cache_break") {
@@ -58,7 +58,7 @@ func TestAssembleUserMessage_CacheBreakRegression(t *testing.T) {
 
 	t.Run("non-empty stable includes marker", func(t *testing.T) {
 		result := assembleUserMessage(prompt.PromptParts{
-			StableContext:  "system instructions",
+			StableContext:   "system instructions",
 			VolatileContext: "current date: 2026-04-03",
 		}, "hello")
 		if !strings.Contains(result, "cache_break") {
@@ -68,7 +68,7 @@ func TestAssembleUserMessage_CacheBreakRegression(t *testing.T) {
 
 	t.Run("marker separates stable from volatile", func(t *testing.T) {
 		result := assembleUserMessage(prompt.PromptParts{
-			StableContext:  "stable-prefix",
+			StableContext:   "stable-prefix",
 			VolatileContext: "volatile-suffix",
 		}, "user-query")
 
@@ -100,6 +100,27 @@ func TestAssembleUserMessage_SessionPlaceholderEmitsCacheBreak(t *testing.T) {
 	}
 	if !strings.Contains(msg, "Active agent context.") {
 		t.Fatalf("session placeholder not preserved: %q", msg)
+	}
+}
+
+func TestAppendDynamicUserBlocks_SkillScopeStaysOutsideCachedPrefix(t *testing.T) {
+	scaffolded := assembleUserMessage(prompt.PromptParts{
+		StableContext:   "stable-prefix",
+		VolatileContext: "volatile-suffix",
+	}, "which skills are installed?")
+	listing := buildSkillListing([]*skills.Skill{
+		{Name: "kocoro", Description: "Platform configuration assistant"},
+	})
+	result := appendDynamicUserBlocks(scaffolded, "", listing, "")
+
+	cacheBreak := strings.Index(result, "<!-- cache_break -->")
+	scopeNotice := strings.Index(result, "enabled for the current agent")
+	if cacheBreak < 0 || scopeNotice < 0 {
+		t.Fatalf("expected cache marker and skill scope notice:\n%s", result)
+	}
+	if scopeNotice <= cacheBreak {
+		t.Fatalf("skill scope notice must remain outside the stable cached prefix: cache_break=%d scope=%d",
+			cacheBreak, scopeNotice)
 	}
 }
 
@@ -181,6 +202,10 @@ func TestBuildSkillListing_FlagsMultilingualTriggersAsNonLanguageSignal(t *testi
 	required := []string{
 		"<system-reminder>",
 		"## Available Skills",
+		"enabled for the current agent",
+		"not the agent's exhaustive set",
+		"never the complete inventory",
+		"GET /skills",
 		"multilingual trigger keywords",
 		"NOT a signal",
 		"Language directive",

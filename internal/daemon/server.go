@@ -34,6 +34,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
+	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
@@ -104,6 +105,13 @@ type Server struct {
 	remoteRunOutbox   sync.Map // map[string][]remoteRunEventRecord
 	onReload          func()   // called after config reload to restart watchers/heartbeat
 
+	configRevisionMu       sync.Mutex
+	configMutationMu       sync.Mutex
+	loadedConfigRevision   string
+	warnedConfigRevision   string
+	configRevisionTracked  bool
+	loadConfigWithRevision func() (*config.Config, string, error)
+
 	marketplace                *skills.MarketplaceClient // static registry → /skills/marketplace/*
 	catalog                    skills.CatalogProvider
 	clawhub                    *skills.MarketplaceClient // ClawHub live catalog → /skills/clawhub/*
@@ -171,6 +179,89 @@ func (s *Server) requireDeps(w http.ResponseWriter) bool {
 	return true
 }
 
+func (s *Server) currentConfigRevision() (string, error) {
+	if s == nil || s.deps == nil || s.deps.ShannonDir == "" {
+		return "", nil
+	}
+	return config.FileRevision(s.deps.ShannonDir)
+}
+
+// recordConfigRevisionApplied records the exact config.yaml bytes reflected in
+// live state. Callers must pass the revision returned by the read or write that
+// produced that state; re-reading later can accidentally bless a newer external
+// edit that was never loaded.
+func (s *Server) recordConfigRevisionApplied(revision string) {
+	if revision == "" {
+		return
+	}
+	s.configRevisionMu.Lock()
+	s.loadedConfigRevision = revision
+	s.warnedConfigRevision = ""
+	s.configRevisionTracked = true
+	s.configRevisionMu.Unlock()
+}
+
+func (s *Server) lockConfigMutation() func() {
+	s.configMutationMu.Lock()
+	return s.configMutationMu.Unlock
+}
+
+// recordConfigMutationApplied advances the loaded revision only when the
+// mutation began from the exact config bytes represented by live state. Both
+// revisions are captured while the writer holds config.yaml.lock, so an
+// external edit cannot slip between a stale pre-check and the read-modify-write
+// and then be silently treated as loaded.
+func (s *Server) recordConfigMutationApplied(revisions config.MutationRevisions) {
+	if revisions.After == "" {
+		return
+	}
+	s.configRevisionMu.Lock()
+	defer s.configRevisionMu.Unlock()
+	if !s.configRevisionTracked || s.loadedConfigRevision != revisions.Before {
+		return
+	}
+	s.loadedConfigRevision = revisions.After
+	s.warnedConfigRevision = ""
+}
+
+func (s *Server) configReloadState() (required bool, reason, warningKey string) {
+	s.configRevisionMu.Lock()
+	loaded := s.loadedConfigRevision
+	tracked := s.configRevisionTracked
+	s.configRevisionMu.Unlock()
+	if !tracked {
+		return false, "", ""
+	}
+
+	current, err := s.currentConfigRevision()
+	if err != nil {
+		return true,
+			fmt.Sprintf("config.yaml cannot be read: %v; fix the file and call POST /config/reload or restart the daemon", err),
+			"error:" + err.Error()
+	}
+	if current == loaded {
+		return false, "", current
+	}
+	return true,
+		"config.yaml changed on disk after the running config was loaded; call POST /config/reload or restart the daemon",
+		current
+}
+
+func (s *Server) warnIfConfigReloadRequired() {
+	required, reason, warningKey := s.configReloadState()
+	if !required {
+		return
+	}
+	s.configRevisionMu.Lock()
+	if s.warnedConfigRevision == warningKey {
+		s.configRevisionMu.Unlock()
+		return
+	}
+	s.warnedConfigRevision = warningKey
+	s.configRevisionMu.Unlock()
+	log.Printf("daemon: WARNING: %s; this request will continue with the previous in-memory global config", reason)
+}
+
 // auditHTTPOp logs an HTTP API write operation to the audit log.
 func (s *Server) auditHTTPOp(method, path, summary string) {
 	if s.deps == nil || s.deps.Auditor == nil {
@@ -225,6 +316,24 @@ func (s *Server) auditHTTPOpError(method, path, summary string, err error) {
 		Timestamp:     time.Now(),
 		ToolName:      "http_api",
 		InputSummary:  method + " " + path,
+		OutputSummary: output,
+		Decision:      "error",
+		Approved:      false,
+	})
+}
+
+func (s *Server) auditAgentSyncFailure(agentName, stage string, err error) {
+	if s.deps == nil || s.deps.Auditor == nil {
+		return
+	}
+	output := stage
+	if err != nil {
+		output += ": " + err.Error()
+	}
+	s.deps.Auditor.Log(audit.AuditEntry{
+		Timestamp:     time.Now(),
+		Event:         "agent_sync_failed",
+		InputSummary:  "agent:" + agentName,
 		OutputSummary: output,
 		Decision:      "error",
 		Approved:      false,
@@ -361,6 +470,20 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		migratePlans:                    claudecode.NewPlanStore(),
 		agentSyncTrigger:                make(chan struct{}, 1),
 		pullDone:                        make(chan struct{}),
+		loadConfigWithRevision:          config.LoadWithRevision,
+	}
+	if deps != nil {
+		// These callbacks close over the fully constructed Server and are consumed
+		// by later auth/config mutation paths through the shared deps pointer. Keep
+		// this wiring after s initialization; moving it into the struct literal
+		// would either capture an uninitialized server or duplicate revision state.
+		revision := deps.ConfigRevision
+		if revision == "" {
+			revision, _ = s.currentConfigRevision()
+		}
+		s.recordConfigRevisionApplied(revision)
+		deps.LockConfigMutation = s.lockConfigMutation
+		deps.RecordConfigMutation = s.recordConfigMutationApplied
 	}
 	if deps != nil && !skillRecommendationsEnabled(deps.Config) {
 		s.skillRecommendationsOff.Store(true)
@@ -1336,12 +1459,16 @@ func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Reques
 			"chrome_profile": req.Profile,
 		}
 	}
+	unlockConfig := s.lockConfigMutation()
+	defer unlockConfig()
 	prevProfile := s.configuredChromeProfile()
-	if err := s.patchGlobalConfig(patch); err != nil {
+	revisions, err := s.patchGlobalConfigWithRevision(patch)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.setConfiguredChromeProfile(req.Profile)
+	s.recordConfigMutationApplied(revisions)
 	stopChromeFn()
 	if err := resetChromeProfileCloneFn(); err != nil {
 		rollbackPatch := map[string]interface{}{
@@ -1354,11 +1481,13 @@ func (s *Server) handleChromeProfileUpdate(w http.ResponseWriter, r *http.Reques
 				"chrome_profile": prevProfile,
 			}
 		}
-		if rollbackErr := s.patchGlobalConfig(rollbackPatch); rollbackErr != nil {
+		rollbackRevisions, rollbackErr := s.patchGlobalConfigWithRevision(rollbackPatch)
+		if rollbackErr != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to refresh chrome profile clone: %v (rollback failed: %v)", err, rollbackErr))
 			return
 		}
 		s.setConfiguredChromeProfile(prevProfile)
+		s.recordConfigMutationApplied(rollbackRevisions)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2810,6 +2939,7 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "daemon deps not configured")
 		return
 	}
+	s.warnIfConfigReloadRequired()
 	id := r.PathValue("id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "session id required")
@@ -2968,6 +3098,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"daemon deps not configured"}`, http.StatusInternalServerError)
 		return
 	}
+	s.warnIfConfigReloadRequired()
 
 	var req RunAgentRequest
 	if !decodeBody(w, r, &req) {
@@ -3769,6 +3900,74 @@ func skillNamesFromRequest(entries []*skills.Skill) []string {
 	return names
 }
 
+// lockSkillIdentifiers serializes agent attachment writes with global
+// install/update/delete operations. Display-name aliases are canonicalized to
+// their on-disk slug before locking so legacy and current API callers share the
+// same mutex. Locks are sorted to keep multi-skill agent updates deadlock-free.
+func (s *Server) lockSkillIdentifiers(names []string) func() {
+	if len(names) == 0 || s.slugLocks == nil {
+		return func() {}
+	}
+	exactSlugs := make(map[string]string)
+	displayNames := make(map[string]string)
+	if sources, err := s.skillSources(); err == nil {
+		if list, err := skills.LoadSkills(sources...); err == nil {
+			exactSlugs = make(map[string]string, len(list))
+			displayNames = make(map[string]string, len(list))
+			for _, skill := range list {
+				exactSlugs[skill.Slug] = skill.Slug
+				key := strings.ToLower(skill.Name)
+				if _, exists := displayNames[key]; !exists {
+					displayNames[key] = skill.Slug
+				}
+			}
+		}
+	}
+	seen := make(map[string]struct{}, len(names))
+	canonical := make([]string, 0, len(names))
+	for _, name := range names {
+		if slug, ok := exactSlugs[name]; ok {
+			name = slug
+		} else if slug, ok := displayNames[strings.ToLower(name)]; ok {
+			name = slug
+		}
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		canonical = append(canonical, name)
+	}
+	sort.Strings(canonical)
+	unlocks := make([]func(), 0, len(canonical))
+	for _, name := range canonical {
+		unlocks = append(unlocks, s.slugLocks.Lock(name))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
+func (s *Server) lockAgentRoutes(names []string) func() {
+	if len(names) == 0 || s == nil || s.deps == nil || s.deps.SessionCache == nil {
+		return func() {}
+	}
+	names = append([]string(nil), names...)
+	sort.Strings(names)
+	for _, name := range names {
+		s.deps.SessionCache.LockRoute("agent:" + name)
+	}
+	return func() {
+		for i := len(names) - 1; i >= 0; i-- {
+			s.deps.SessionCache.UnlockRoute("agent:" + names[i])
+		}
+	}
+}
+
 func (s *Server) validateInstalledSkills(names []string) error {
 	if len(names) == 0 {
 		return nil
@@ -3850,6 +4049,44 @@ func (s *Server) resolveSkillIdent(ident string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (s *Server) installedSkillAliases(slug string) ([]string, error) {
+	if s == nil || s.deps == nil {
+		return nil, fmt.Errorf("daemon deps not configured")
+	}
+	skillFile := filepath.Join(s.deps.ShannonDir, "skills", slug, "SKILL.md")
+	if _, err := os.Stat(skillFile); err != nil {
+		if os.IsNotExist(err) {
+			return []string{slug}, nil
+		}
+		return nil, err
+	}
+	displayName, err := skills.LoadSkillIdentity(skillFile, slug)
+	if err != nil {
+		return nil, fmt.Errorf("cannot safely resolve aliases for skill %q: %w", slug, err)
+	}
+	aliases := []string{slug}
+	if displayName != slug {
+		// Exact slugs outrank display-name aliases throughout attachment loading.
+		// If this display name is itself another installed skill's slug, treating
+		// it as an alias here would detach that different skill and would also make
+		// the lock set dishonest (the exact-slug canonicalizer selects the other
+		// directory). Keep only this skill's unambiguous slug in that case.
+		collidesWithSlug := false
+		if skills.ValidateSkillName(displayName) == nil {
+			otherSkillFile := filepath.Join(s.deps.ShannonDir, "skills", displayName, "SKILL.md")
+			if _, statErr := os.Stat(otherSkillFile); statErr == nil {
+				collidesWithSlug = true
+			} else if !os.IsNotExist(statErr) {
+				return nil, fmt.Errorf("check display-name alias collision for skill %q: %w", slug, statErr)
+			}
+		}
+		if !collidesWithSlug {
+			aliases = append(aliases, displayName)
+		}
+	}
+	return aliases, nil
 }
 
 func isValidSkillFileName(name string) bool {
@@ -4016,12 +4253,31 @@ func pruneEmptyMaps(m map[string]interface{}) bool {
 }
 
 func (s *Server) patchGlobalConfig(patch map[string]interface{}) error {
+	_, err := s.patchGlobalConfigWithRevision(patch)
+	return err
+}
+
+func (s *Server) patchGlobalConfigWithRevision(patch map[string]interface{}) (config.MutationRevisions, error) {
 	globalPath := filepath.Join(s.deps.ShannonDir, "config.yaml")
-	globalData, _ := os.ReadFile(globalPath)
+	lockFile, err := os.OpenFile(globalPath+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return config.MutationRevisions{}, fmt.Errorf("open config lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := fslock.Lock(lockFile.Fd()); err != nil {
+		return config.MutationRevisions{}, fmt.Errorf("lock config: %w", err)
+	}
+	defer fslock.Unlock(lockFile.Fd())
+
+	globalData, err := os.ReadFile(globalPath)
+	if err != nil && !os.IsNotExist(err) {
+		return config.MutationRevisions{}, fmt.Errorf("read config: %w", err)
+	}
+	revisions := config.MutationRevisions{Before: config.SnapshotRevision(globalData, err == nil)}
 	var current map[string]interface{}
 	if len(globalData) > 0 {
 		if err := yaml.Unmarshal(globalData, &current); err != nil {
-			return fmt.Errorf("existing config is corrupt: %v", err)
+			return config.MutationRevisions{}, fmt.Errorf("existing config is corrupt: %v", err)
 		}
 	}
 	if current == nil {
@@ -4036,9 +4292,13 @@ func (s *Server) patchGlobalConfig(patch map[string]interface{}) error {
 
 	data, err := yaml.Marshal(current)
 	if err != nil {
-		return err
+		return config.MutationRevisions{}, err
 	}
-	return agents.AtomicWrite(globalPath, data)
+	if err := agents.AtomicWrite(globalPath, data); err != nil {
+		return config.MutationRevisions{}, err
+	}
+	revisions.After = config.BytesRevision(data)
+	return revisions, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -4155,7 +4415,10 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Config.DisplayName = req.DisplayName
 	}
-	if err := s.validateInstalledSkills(skillNamesFromRequest(req.Skills)); err != nil {
+	skillNames := skillNamesFromRequest(req.Skills)
+	unlockSkills := s.lockSkillIdentifiers(skillNames)
+	defer unlockSkills()
+	if err := s.validateInstalledSkills(skillNames); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -4210,7 +4473,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(req.Skills) > 0 {
-		if err := agents.SetAttachedSkills(s.deps.AgentsDir, req.Name, skillNamesFromRequest(req.Skills)); err != nil {
+		if err := agents.SetAttachedSkills(s.deps.AgentsDir, req.Name, skillNames); err != nil {
 			rollback()
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write skill manifest: %v", err))
 			return
@@ -4345,7 +4608,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.validateInstalledSkills(skillNamesFromRequest(req.Skills)); err != nil {
+	skillNames := skillNamesFromRequest(req.Skills)
+	unlockSkills := s.lockSkillIdentifiers(skillNames)
+	defer unlockSkills()
+	if err := s.validateInstalledSkills(skillNames); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -4426,7 +4692,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Skills != nil {
 		// Write attached skills manifest — agent loader resolves content from global/bundled.
-		if err := agents.SetAttachedSkills(s.deps.AgentsDir, name, skillNamesFromRequest(req.Skills)); err != nil {
+		if err := agents.SetAttachedSkills(s.deps.AgentsDir, name, skillNames); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write skill manifest: %v", err))
 			return
 		}
@@ -4732,7 +4998,10 @@ func (s *Server) handleAddGlobalAlwaysAllow(w http.ResponseWriter, r *http.Reque
 			"tool requires fresh approval each call and cannot be persisted as always-allow")
 		return
 	}
-	if err := config.AppendGlobalAlwaysAllowTool(s.deps.ShannonDir, req.Tool); err != nil {
+	unlockConfig := s.lockConfigMutation()
+	defer unlockConfig()
+	revisions, err := config.AppendGlobalAlwaysAllowToolWithRevision(s.deps.ShannonDir, req.Tool)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -4751,6 +5020,7 @@ func (s *Server) handleAddGlobalAlwaysAllow(w http.ResponseWriter, r *http.Reque
 		perms.AlwaysAllowTools = append(perms.AlwaysAllowTools, req.Tool)
 	}
 	s.deps.WriteUnlock()
+	s.recordConfigMutationApplied(revisions)
 	s.auditHTTPOp("POST", "/permissions/always-allow", "added "+req.Tool)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "added"})
 }
@@ -4769,7 +5039,10 @@ func (s *Server) handleRemoveGlobalAlwaysAllow(w http.ResponseWriter, r *http.Re
 	if req.Tool == "computer_use" && !requireComputerUseLocalPresence(w, r) {
 		return
 	}
-	if err := config.RemoveGlobalAlwaysAllowTool(s.deps.ShannonDir, req.Tool); err != nil {
+	unlockConfig := s.lockConfigMutation()
+	defer unlockConfig()
+	revisions, err := config.RemoveGlobalAlwaysAllowToolWithRevision(s.deps.ShannonDir, req.Tool)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -4784,6 +5057,7 @@ func (s *Server) handleRemoveGlobalAlwaysAllow(w http.ResponseWriter, r *http.Re
 	}
 	perms.AlwaysAllowTools = filtered
 	s.deps.WriteUnlock()
+	s.recordConfigMutationApplied(revisions)
 	s.auditHTTPOp("DELETE", "/permissions/always-allow", "removed "+req.Tool)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
@@ -4849,7 +5123,10 @@ func (s *Server) handleAddGlobalDisabledSkill(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "skill, skills, or prefix is required")
 		return
 	}
-	if err := config.AppendGlobalDisabledSkills(s.deps.ShannonDir, targets); err != nil {
+	unlockConfig := s.lockConfigMutation()
+	defer unlockConfig()
+	revisions, err := config.AppendGlobalDisabledSkillsWithRevision(s.deps.ShannonDir, targets)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -4866,6 +5143,7 @@ func (s *Server) handleAddGlobalDisabledSkill(w http.ResponseWriter, r *http.Req
 		}
 	}
 	s.deps.WriteUnlock()
+	s.recordConfigMutationApplied(revisions)
 	s.auditHTTPOp("POST", "/skills/disabled", fmt.Sprintf("disabled %d skill(s)", len(targets)))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "disabled", "count": len(targets), "skills": targets})
 }
@@ -4886,7 +5164,10 @@ func (s *Server) handleRemoveGlobalDisabledSkill(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "skill, skills, or prefix is required")
 		return
 	}
-	if err := config.RemoveGlobalDisabledSkills(s.deps.ShannonDir, targets); err != nil {
+	unlockConfig := s.lockConfigMutation()
+	defer unlockConfig()
+	revisions, err := config.RemoveGlobalDisabledSkillsWithRevision(s.deps.ShannonDir, targets)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -4904,6 +5185,7 @@ func (s *Server) handleRemoveGlobalDisabledSkill(w http.ResponseWriter, r *http.
 	}
 	sk.Disabled = filtered
 	s.deps.WriteUnlock()
+	s.recordConfigMutationApplied(revisions)
 	s.auditHTTPOp("DELETE", "/skills/disabled", fmt.Sprintf("enabled %d skill(s)", len(targets)))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "removed", "count": len(targets), "skills": targets})
 }
@@ -4926,7 +5208,10 @@ func (s *Server) handleAddDefaultAgentDisabledMCP(w http.ResponseWriter, r *http
 		writeError(w, http.StatusBadRequest, "server is required")
 		return
 	}
-	if err := config.AppendDefaultAgentDisabledMCPServer(s.deps.ShannonDir, req.Server); err != nil {
+	unlockConfig := s.lockConfigMutation()
+	defer unlockConfig()
+	revisions, err := config.AppendDefaultAgentDisabledMCPServerWithRevision(s.deps.ShannonDir, req.Server)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -4943,6 +5228,7 @@ func (s *Server) handleAddDefaultAgentDisabledMCP(w http.ResponseWriter, r *http
 		mc.DefaultAgentDisabled = append(mc.DefaultAgentDisabled, req.Server)
 	}
 	s.deps.WriteUnlock()
+	s.recordConfigMutationApplied(revisions)
 	s.auditHTTPOp("POST", "/mcp/default-disabled", "disabled "+req.Server)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
 }
@@ -4958,7 +5244,10 @@ func (s *Server) handleRemoveDefaultAgentDisabledMCP(w http.ResponseWriter, r *h
 		writeError(w, http.StatusBadRequest, "server is required")
 		return
 	}
-	if err := config.RemoveDefaultAgentDisabledMCPServer(s.deps.ShannonDir, req.Server); err != nil {
+	unlockConfig := s.lockConfigMutation()
+	defer unlockConfig()
+	revisions, err := config.RemoveDefaultAgentDisabledMCPServerWithRevision(s.deps.ShannonDir, req.Server)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -4972,6 +5261,7 @@ func (s *Server) handleRemoveDefaultAgentDisabledMCP(w http.ResponseWriter, r *h
 	}
 	mc.DefaultAgentDisabled = filtered
 	s.deps.WriteUnlock()
+	s.recordConfigMutationApplied(revisions)
 	s.auditHTTPOp("DELETE", "/mcp/default-disabled", "enabled "+req.Server)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
@@ -5058,9 +5348,19 @@ func (s *Server) handlePutSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "skill name in body must match URL")
 		return
 	}
+	unlockSkill := s.lockSkillIdentifiers([]string{skillName})
+	defer unlockSkill()
 	if err := s.validateInstalledSkills([]string{skillName}); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if s.deps.SessionCache != nil {
+		routeKey := "agent:" + agentName
+		s.deps.SessionCache.LockRoute(routeKey)
+		defer s.deps.SessionCache.UnlockRoute(routeKey)
+		if !s.agentExists(w, agentName) {
+			return
+		}
 	}
 	// Materialize builtin AFTER validation passes — avoids orphaned override dirs on bad input.
 	if !s.materializeIfBuiltin(w, agentName) {
@@ -5074,6 +5374,7 @@ func (s *Server) handlePutSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "attached"})
 }
 
@@ -5087,14 +5388,34 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 	if !s.agentExists(w, agentName) {
 		return
 	}
-	if !s.materializeIfBuiltin(w, agentName) {
-		return
-	}
 	if err := skills.ValidateSkillName(skillName); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := agents.DetachSkill(s.deps.AgentsDir, agentName, skillName); err != nil {
+	identifiers, err := s.installedSkillAliases(skillName)
+	if err != nil {
+		// Per-agent deletion is safely useful even when an installed SKILL.md is
+		// temporarily malformed: remove the exact URL slug, but do not guess at a
+		// legacy display-name alias. Global deletion remains fail-closed because it
+		// must prove that every alias is detached before removing the skill files.
+		log.Printf("daemon: delete skill %q from agent %q: alias lookup failed; detaching exact slug only: %v",
+			skillName, agentName, err)
+		identifiers = []string{skillName}
+	}
+	unlockSkill := s.lockSkillIdentifiers(identifiers)
+	defer unlockSkill()
+	if s.deps.SessionCache != nil {
+		routeKey := "agent:" + agentName
+		s.deps.SessionCache.LockRoute(routeKey)
+		defer s.deps.SessionCache.UnlockRoute(routeKey)
+		if !s.agentExists(w, agentName) {
+			return
+		}
+	}
+	if !s.materializeIfBuiltin(w, agentName) {
+		return
+	}
+	if err := agents.DetachSkillAliases(s.deps.AgentsDir, agentName, identifiers...); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -5102,6 +5423,7 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -5321,7 +5643,7 @@ func (s *Server) handleUploadSkill(w http.ResponseWriter, r *http.Request) {
 		})
 	case errors.Is(err, skills.ErrSkillIsBuiltin):
 		s.auditHTTPOpError("POST", "/skills/upload", "builtin skill rejected", err)
-		writeError(w, http.StatusForbidden, "skill_is_builtin")
+		writeErrorCode(w, http.StatusForbidden, "skill_is_builtin", "builtin skills are managed by the binary and cannot be overwritten")
 	case errors.Is(err, skills.ErrZipTooLarge):
 		s.auditHTTPOpError("POST", "/skills/upload", "zip too large", err)
 		writeError(w, http.StatusRequestEntityTooLarge, "zip too large: archive or extracted contents exceed the size backstop (1 GiB)")
@@ -5951,7 +6273,7 @@ func (s *Server) handlePutGlobalSkill(w http.ResponseWriter, r *http.Request) {
 	// running session a defaced kocoro misleads the AI about the daemon's HTTP
 	// surface. `force=true` does NOT override this; the guard is unconditional.
 	if skills.IsBuiltinSkill(name) {
-		writeError(w, http.StatusForbidden, "skill_is_builtin")
+		writeErrorCode(w, http.StatusForbidden, "skill_is_builtin", "builtin skills are managed by the binary and cannot be overwritten")
 		return
 	}
 	var req struct {
@@ -6100,6 +6422,10 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "daemon deps not configured")
 		return
 	}
+	if skills.IsBuiltinSkill(name) {
+		writeErrorCode(w, http.StatusForbidden, "skill_is_builtin", "builtin skills are managed by the binary and cannot be deleted")
+		return
+	}
 	// Serialize against concurrent PUT /skills/{name} and POST /skills/upload
 	// on the same slug. Without this lock, a PUT can read the existing skill,
 	// DELETE can race in and remove the directory, then PUT proceeds and
@@ -6113,12 +6439,52 @@ func (s *Server) handleDeleteGlobalSkill(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, fmt.Sprintf("skill %q not found in global directory", name))
 		return
 	}
-	if err := skills.DeleteGlobalSkill(s.deps.ShannonDir, name); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	identifiers, err := s.installedSkillAliases(name)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	s.auditHTTPOp("DELETE", "/skills/"+name, "deleted skill")
+	attachmentPlan, err := agents.PlanDetachSkillAliases(
+		s.deps.AgentsDir,
+		identifiers...,
+	)
+	if err != nil {
+		var manifestErr *agents.SkillAttachmentManifestError
+		if errors.As(err, &manifestErr) {
+			message := fmt.Sprintf(
+				"agent %q has an invalid _attached.yaml; repair it with PUT /agents/%s and a skills list before deleting a global skill",
+				manifestErr.AgentName,
+				manifestErr.AgentName,
+			)
+			s.auditHTTPOpError("DELETE", "/skills/"+name, "invalid agent skill manifest", err)
+			writeErrorCode(w, http.StatusConflict, "agent_skill_manifest_invalid", message)
+			return
+		}
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("cannot inspect agent skill attachments: %v", err))
+		return
+	}
+	affectedAgents := attachmentPlan.AgentNames()
+	unlockAgentRoutes := s.lockAgentRoutes(affectedAgents)
+	defer unlockAgentRoutes()
+	detachedAgents, err := attachmentPlan.Apply(s.deps.AgentsDir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("cannot detach skill from all agents: %v", err))
+		return
+	}
+	if err := skills.DeleteGlobalSkill(s.deps.ShannonDir, name); err != nil {
+		rollbackErr := attachmentPlan.Restore(s.deps.AgentsDir)
+		writeError(w, http.StatusInternalServerError,
+			errors.Join(err, rollbackErr).Error())
+		return
+	}
+	s.auditHTTPOp("DELETE", "/skills/"+name,
+		fmt.Sprintf("deleted skill and detached %d agent(s)", len(detachedAgents)))
 	s.secretsStore.Delete(name)
+	if len(detachedAgents) > 0 {
+		s.triggerAgentSync()
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -6637,11 +7003,17 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"global":    globalMap,
 		"effective": effectiveMap,
 		"sources":   sources,
-	})
+	}
+	reloadRequired, reloadReason, _ := s.configReloadState()
+	resp["reload_required"] = reloadRequired
+	if reloadRequired {
+		resp["reload_reason"] = reloadReason
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -6732,6 +7104,11 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 	cfg, _, _ := s.deps.Snapshot()
 	resp := make(map[string]interface{})
+	reloadRequired, reloadReason, _ := s.configReloadState()
+	resp["reload_required"] = reloadRequired
+	if reloadRequired {
+		resp["reload_reason"] = reloadReason
+	}
 
 	if cfg != nil && len(cfg.MCPServers) > 0 {
 		// Build set of live-connected server names from MCPManager.
@@ -6957,7 +7334,7 @@ func mcpConfigChanged(oldCfg, newCfg *config.Config) bool {
 func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	oldCfg, _, _ := s.deps.Snapshot()
 
-	newCfg, err := config.Load()
+	newCfg, loadedRevision, err := s.loadConfigWithRevision()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("config load failed: %v", err))
 		return
@@ -7217,6 +7594,8 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		resp["restart_required"] = true
 		resp["restart_reason"] = reason
 	}
+
+	s.recordConfigRevisionApplied(loadedRevision)
 
 	// MCP server status for UI indicators
 	if len(newCfg.MCPServers) > 0 {

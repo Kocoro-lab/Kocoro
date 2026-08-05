@@ -148,6 +148,12 @@ const (
 	// default-agent skills UI on this token (old daemons → hide the UI, default
 	// agent keeps loading every installed skill).
 	CapDefaultAgentSkillDenylist = "default_agent_skill_denylist"
+	// CapConfigReloadStateV1 — GET /config and GET /config/status expose whether
+	// the global ~/.shannon/config.yaml bytes differ from the revision currently
+	// loaded in daemon memory, plus an actionable reload reason when they do.
+	// Only the global config file is tracked; project/local overlays are outside
+	// this signal. Desktop may surface the state when this token is present.
+	CapConfigReloadStateV1 = "config_reload_state_v1"
 	// CapPerAgentMCPScope — daemon enforces per-agent MCP server selection:
 	// named agents are limited to their mcp_servers set at tool-dispatch time
 	// (not just prompt context), and the default agent honors
@@ -304,6 +310,7 @@ var Capabilities = []string{
 	CapDeliverableEventV1,
 	CapMentionRosterV1,
 	CapDefaultAgentSkillDenylist,
+	CapConfigReloadStateV1,
 	CapPerAgentMCPScope,
 	CapSessionsScopeAll,
 	CapSessionProjectsV1,

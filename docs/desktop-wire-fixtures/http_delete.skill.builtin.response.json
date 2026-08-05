@@ -1,0 +1,4 @@
+{
+  "code": "skill_is_builtin",
+  "error": "builtin skills are managed by the binary and cannot be deleted"
+}

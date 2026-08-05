@@ -215,3 +215,28 @@ func TestSeedContextWindowFromModels(t *testing.T) {
 		})
 	}
 }
+
+func TestLookupModelContextWindow_OpenAIDatedVariants(t *testing.T) {
+	// Dated snapshots of the dateless gpt-5.6 persona families must resolve
+	// via prefix (same forward-compat contract as the existing prefix families).
+	if cw, ok := LookupModelContextWindow("gpt-5.6-luna-2026-09-01"); !ok || cw != 1_050_000 {
+		t.Errorf("gpt-5.6-luna dated variant: got (%d, %v), want (1050000, true)", cw, ok)
+	}
+	if cw, ok := LookupModelContextWindow("gpt-5.6-terra-2026-12-01"); !ok || cw != 1_050_000 {
+		t.Errorf("gpt-5.6-terra dated variant: got (%d, %v), want (1050000, true)", cw, ok)
+	}
+	// Unknown sibling families must stay unknown (graceful degradation) —
+	// no broad "gpt-5.1-" prefix that would guess their window.
+	if _, ok := LookupModelContextWindow("gpt-5.1-mini"); ok {
+		t.Error("unknown gpt-5.1-mini must return ok=false")
+	}
+	// Prefix matches must carry a date-shaped suffix: a non-date sibling
+	// sharing the family prefix is an unknown model, not a snapshot.
+	if _, ok := LookupModelContextWindow("gpt-5.6-sol-mini"); ok {
+		t.Error("gpt-5.6-sol-mini is not a dated snapshot and must return ok=false")
+	}
+	// Suffix validation is family-agnostic: dash-less dated forms still pass.
+	if cw, ok := LookupModelContextWindow("gpt-5.6-sol-20261101"); !ok || cw != 1_050_000 {
+		t.Errorf("dash-less dated suffix must resolve: got (%d, %v)", cw, ok)
+	}
+}

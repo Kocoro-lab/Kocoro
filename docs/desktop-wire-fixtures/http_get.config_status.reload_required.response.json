@@ -1,0 +1,13 @@
+{
+  "koe": {
+    "agent": "",
+    "audio_processing": "",
+    "enabled": null,
+    "fast_effort": null,
+    "language": "",
+    "model": "",
+    "voice": ""
+  },
+  "reload_reason": "config.yaml changed on disk after the running config was loaded; call POST /config/reload or restart the daemon",
+  "reload_required": true
+}

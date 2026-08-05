@@ -110,7 +110,7 @@ func TestShapeHistory(t *testing.T) {
 		turns := makeTurns(3)
 		all := append([]client.Message{system}, turns...)
 
-		got := ShapeHistory(all, "summary text", 128000)
+		got := ShapeHistory(all, "summary text", 128000, 0)
 
 		// History is small, no shaping needed — should return original unchanged
 		if len(got) != len(all) {
@@ -123,7 +123,7 @@ func TestShapeHistory(t *testing.T) {
 		turns := makeTurns(30) // 60 messages
 		all := append([]client.Message{system}, turns...)
 
-		got := ShapeHistory(all, "summary of dropped turns", 128000)
+		got := ShapeHistory(all, "summary of dropped turns", 128000, 0)
 
 		// Should have: system + first user msg + summary + last N turn pairs
 		if len(got) < 5 {
@@ -182,7 +182,7 @@ func TestShapeHistory(t *testing.T) {
 		all := append([]client.Message{system}, turns...)
 
 		// Small context window forces aggressive shrinking
-		got := ShapeHistory(all, "summary", 5000)
+		got := ShapeHistory(all, "summary", 5000, 0)
 
 		// Should keep minimum: system + first user + summary + at least 3 pairs (6 msgs)
 		// Total minimum = 1 + 1 + 1 + 6 = 9
@@ -216,7 +216,7 @@ func TestShapeHistory(t *testing.T) {
 		all := append([]client.Message{system}, turns...)
 
 		// Estimated tokens: ~10 * 2 * (50000/3.5 + 4) ≈ 285k, way over 5000
-		got := ShapeHistory(all, "summary of prior work", 5000)
+		got := ShapeHistory(all, "summary of prior work", 5000, 0)
 
 		// Should be shaped (shorter than original)
 		if len(got) >= len(all) {
@@ -241,7 +241,7 @@ func TestShapeHistory(t *testing.T) {
 		turns := makeTurns(30)
 		all := append([]client.Message{system}, turns...)
 
-		got := ShapeHistory(all, "", 128000)
+		got := ShapeHistory(all, "", 128000, 0)
 
 		// With empty summary and large window, should still shape but no summary message
 		for _, m := range got {
@@ -288,7 +288,7 @@ func TestShapeHistory(t *testing.T) {
 		})}
 
 		all := append([]client.Message{system, firstUser}, rest...)
-		got := ShapeHistory(all, "summary text", 128000)
+		got := ShapeHistory(all, "summary text", 128000, 0)
 
 		// The original first user message must be preserved (regression guard
 		// against a naive post-shape SanitizeHistory that would merge it into
@@ -358,7 +358,7 @@ func TestShapeHistory(t *testing.T) {
 		})}
 
 		all := append([]client.Message{system, firstUser}, rest...)
-		got := ShapeHistory(all, "summary text", 128000)
+		got := ShapeHistory(all, "summary text", 128000, 0)
 
 		// No orphaned tool_use should remain.
 		toolResultIDs := make(map[string]bool)
@@ -399,7 +399,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			{Role: "system", Content: client.NewTextContent("system prompt")},
 			{Role: "user", Content: client.NewTextContent(huge)},
 		}
-		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000, 0)
 		if dropped == 0 {
 			t.Fatalf("expected truncation when input exceeds threshold, dropped=0")
 		}
@@ -423,7 +423,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			{Role: "assistant", Content: client.NewTextContent("ok")},
 			{Role: "user", Content: client.NewTextContent("继续")},
 		}
-		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000, 0)
 		if dropped == 0 {
 			t.Fatalf("expected truncation of huge first user message, dropped=0")
 		}
@@ -442,7 +442,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 		msgs := []client.Message{
 			{Role: "user", Content: client.NewTextContent(small)},
 		}
-		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000, 0)
 		if dropped != 0 {
 			t.Errorf("expected dropped=0 under threshold, got %d", dropped)
 		}
@@ -468,7 +468,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 		msgs := []client.Message{
 			{Role: "user", Content: client.NewTextContent(chinese)},
 		}
-		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000, 0)
 		if dropped == 0 {
 			t.Fatalf("expected truncation; this input is well over threshold")
 		}
@@ -497,7 +497,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 		msgs := []client.Message{
 			{Role: "user", Content: client.NewTextContent(chinese)},
 		}
-		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		out, dropped := TruncateOversizedLastUserMessage(msgs, 200000, 0)
 		if dropped == 0 {
 			t.Fatalf("expected truncation on huge CJK input")
 		}
@@ -515,7 +515,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 				{Type: "text", Text: strings.Repeat("padding ", 100000)},
 			})},
 		}
-		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000, 0)
 		if dropped != 0 {
 			t.Errorf("multi-block message should not be touched; dropped=%d", dropped)
 		}
@@ -525,7 +525,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 		msgs := []client.Message{
 			{Role: "user", Content: client.NewTextContent(strings.Repeat("padding ", 100000))},
 		}
-		_, dropped := TruncateOversizedLastUserMessage(msgs, 0)
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 0, 0)
 		if dropped != 0 {
 			t.Errorf("zero contextWindow should be no-op; dropped=%d", dropped)
 		}
@@ -536,7 +536,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			{Role: "system", Content: client.NewTextContent("just system")},
 			{Role: "assistant", Content: client.NewTextContent("just assistant")},
 		}
-		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000)
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200000, 0)
 		if dropped != 0 {
 			t.Errorf("expected no-op when no user msg; dropped=%d", dropped)
 		}
@@ -556,7 +556,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			{Role: "system", Content: client.NewTextContent("sys")},
 			{Role: "user", Content: client.NewTextContent(huge)},
 		}
-		out, dropped := TruncateOversizedLastUserMessage(msgs, cw)
+		out, dropped := TruncateOversizedLastUserMessage(msgs, cw, 0)
 		if dropped == 0 {
 			t.Fatalf("expected truncation: input exceeds 0.90×1M tokens")
 		}
@@ -585,7 +585,7 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			{Role: "assistant", Content: client.NewTextContent("ack")},
 			{Role: "user", Content: client.NewTextContent(mid)},
 		}
-		_, dropped := TruncateOversizedLastUserMessage(msgs, 200_000)
+		_, dropped := TruncateOversizedLastUserMessage(msgs, 200_000, 0)
 		if dropped == 0 {
 			t.Fatalf("aggregate overflow not truncated: dropped=0 — prompt escapes over budget; short sessions have no ShapeHistory/reactive backstop")
 		}
@@ -606,11 +606,11 @@ func TestTruncateOversizedLastUserMessage(t *testing.T) {
 			{Role: "system", Content: client.NewTextContent(bigSys)},
 			{Role: "user", Content: client.NewTextContent(huge)},
 		}
-		out, d1 := TruncateOversizedLastUserMessage(msgs, cw)
+		out, d1 := TruncateOversizedLastUserMessage(msgs, cw, 0)
 		if d1 == 0 {
 			t.Fatal("first call should truncate the huge user message")
 		}
-		_, d2 := TruncateOversizedLastUserMessage(out, cw)
+		_, d2 := TruncateOversizedLastUserMessage(out, cw, 0)
 		if d2 != 0 {
 			t.Errorf("second call re-clipped an already-truncated message (dropped=%d) — truncateUserMessageOverBudget would not terminate", d2)
 		}
@@ -642,7 +642,7 @@ func TestTruncateOversizedLastUserMessageByteStableAcrossTurns(t *testing.T) {
 		{Role: "system", Content: client.NewTextContent("system prompt")},
 		{Role: "user", Content: client.NewTextContent(huge)},
 	}
-	out1, dropped1 := TruncateOversizedLastUserMessage(r1, contextWindow)
+	out1, dropped1 := TruncateOversizedLastUserMessage(r1, contextWindow, 0)
 	if dropped1 == 0 {
 		t.Fatalf("turn 1: expected truncation of the huge user message, dropped=0")
 	}
@@ -659,7 +659,7 @@ func TestTruncateOversizedLastUserMessageByteStableAcrossTurns(t *testing.T) {
 		{Role: "assistant", Content: client.NewTextContent(tail)},
 		{Role: "user", Content: client.NewTextContent(tail)},
 	}
-	out2, dropped2 := TruncateOversizedLastUserMessage(r2, contextWindow)
+	out2, dropped2 := TruncateOversizedLastUserMessage(r2, contextWindow, 0)
 	if dropped2 == 0 {
 		t.Fatalf("turn 2: expected truncation of the huge user message, dropped=0")
 	}
@@ -693,7 +693,7 @@ func TestTruncateOversizedEqualSplitByteStableAcrossTurns(t *testing.T) {
 		{Role: "assistant", Content: client.NewTextContent("ack")},
 		{Role: "user", Content: client.NewTextContent(hugeB)},
 	}
-	out1, d1 := TruncateOversizedLastUserMessage(r1, cw)
+	out1, d1 := TruncateOversizedLastUserMessage(r1, cw, 0)
 	if d1 == 0 {
 		t.Fatal("turn 1: expected truncation of both oversized messages")
 	}
@@ -710,7 +710,7 @@ func TestTruncateOversizedEqualSplitByteStableAcrossTurns(t *testing.T) {
 		{Role: "assistant", Content: client.NewTextContent("ok")},
 		{Role: "user", Content: client.NewTextContent(tail)},
 	}
-	out2, d2 := TruncateOversizedLastUserMessage(r2, cw)
+	out2, d2 := TruncateOversizedLastUserMessage(r2, cw, 0)
 	if d2 == 0 {
 		t.Fatal("turn 2: expected truncation")
 	}
@@ -721,5 +721,215 @@ func TestTruncateOversizedEqualSplitByteStableAcrossTurns(t *testing.T) {
 	if out2[3].Content.Text() != b1 {
 		t.Errorf("equal-split not byte-stable across turns: hugeB turn1=%d bytes, turn2=%d bytes",
 			len(b1), len(out2[3].Content.Text()))
+	}
+}
+
+// TestShapeHistory_OverheadCalibratesSkipGate reproduces the 2026-08-04 e2e
+// dead zone: real prompt usage over the 90% trigger while the raw estimate
+// (blind to tool schemas and the chars/3.5 error) still "fits". Without
+// calibration ShapeHistory declined and the paid summary was discarded; with
+// the observed overhead passed in, shaping must proceed and drop messages.
+func TestShapeHistory_OverheadCalibratesSkipGate(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent(strings.Repeat("s", 700))},
+		{Role: "user", Content: client.NewTextContent(strings.Repeat("u", 700))},
+	}
+	for i := 0; i < 6; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent(strings.Repeat("a", 700))},
+			client.Message{Role: "user", Content: client.NewTextContent(strings.Repeat("r", 700))},
+		)
+	}
+	// est ≈ 14 msgs × (200 + 4) ≈ 2856 tokens.
+	contextWindow := 4000 // target = 3600 > est → raw estimate says "fits"
+
+	same := ShapeHistory(messages, "summary text", contextWindow, 0)
+	if len(same) != len(messages) {
+		t.Fatalf("without overhead the skip gate should decline shaping: got %d msgs, want %d", len(same), len(messages))
+	}
+
+	// Simulated real-usage gap: schemas + underestimate ≈ 1200 tokens pushes
+	// the calibrated total past the 3600 target.
+	shaped := ShapeHistory(messages, "summary text", contextWindow, 1200)
+	if len(shaped) >= len(messages) {
+		t.Fatalf("with overhead shaping must drop messages: got %d msgs, want < %d", len(shaped), len(messages))
+	}
+	foundSummary := false
+	for _, m := range shaped {
+		if strings.Contains(m.Content.Text(), "summary text") {
+			foundSummary = true
+		}
+	}
+	if !foundSummary {
+		t.Error("shaped history should contain the summary")
+	}
+}
+
+// TestShapeHistory_SummaryOnlyInsertionIsNoop: a candidate that fits the
+// budget but drops nothing (summary-only insertion) must return the original
+// slice — inserting the summary at index 2 would break the prompt-cache
+// prefix and grow the prompt without freeing anything. contextWindow <= 0
+// (no budget) accepts the first candidate, which keeps every pair when the
+// history is shorter than defaultKeepLast pairs.
+func TestShapeHistory_SummaryOnlyInsertionIsNoop(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 4; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent("a")},
+			client.Message{Role: "user", Content: client.NewTextContent("r")},
+		)
+	}
+	shaped := ShapeHistory(messages, "summary text", 0, 0)
+	if len(shaped) != len(messages) {
+		t.Fatalf("summary-only insertion must be a no-op: got %d msgs, want %d", len(shaped), len(messages))
+	}
+	for _, m := range shaped {
+		if strings.Contains(m.Content.Text(), "summary text") {
+			t.Error("no-op result must not contain the inserted summary")
+		}
+	}
+}
+
+// TestTruncateOversized_FutilityGuardProtectsInstructions reproduces the
+// 2026-08-04 e2e damage: overflow driven by tool_result blocks, the only
+// plain-text user message being the scaffolded instructions. Clipping it to
+// the floor cannot bring the prompt under target, so the aggregate fallback
+// must decline instead of destroying the instructions.
+func TestTruncateOversized_FutilityGuardProtectsInstructions(t *testing.T) {
+	instructions := strings.Repeat("i", 8000) // ≈ 2290 tokens, under singleCap
+	blocks := client.NewBlockContent([]client.ContentBlock{
+		{Type: "tool_result", ToolUseID: "t1", ToolContent: strings.Repeat("x", 120000)},
+	})
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(instructions)},
+		{Role: "assistant", Content: client.NewTextContent("calling tool")},
+		{Role: "user", Content: blocks},
+	}
+	contextWindow := 20000 // target 18000; est ≈ 2290 + 34300 ≈ 36600 → over
+
+	out, dropped := TruncateOversizedLastUserMessage(messages, contextWindow, 0)
+	if dropped != 0 {
+		t.Fatalf("futility guard should decline: dropped %d chars", dropped)
+	}
+	if out[1].Content.Text() != instructions {
+		t.Error("instructions must survive untouched when clipping cannot fix the overflow")
+	}
+}
+
+// TestTruncateOversized_OverheadEngagesTruncation: raw estimate under target
+// but calibrated estimate over — the giant-paste path must engage once the
+// overhead is accounted for.
+func TestTruncateOversized_OverheadEngagesTruncation(t *testing.T) {
+	paste := strings.Repeat("p", 56000) // ≈ 16000 tokens
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent(paste)},
+	}
+	contextWindow := 20000 // target 18000; raw est ≈ 16010 → under
+
+	if _, dropped := TruncateOversizedLastUserMessage(cloneForTruncateTest(messages), contextWindow, 0); dropped != 0 {
+		t.Fatalf("raw estimate under target must not truncate, dropped %d", dropped)
+	}
+	if _, dropped := TruncateOversizedLastUserMessage(cloneForTruncateTest(messages), contextWindow, 5000); dropped == 0 {
+		t.Fatal("calibrated estimate over target must truncate the oversized paste")
+	}
+}
+
+func cloneForTruncateTest(messages []client.Message) []client.Message {
+	out := make([]client.Message, len(messages))
+	copy(out, messages)
+	return out
+}
+
+// TestForceShapeHistory_CompactsWhenBudgetGateWouldSkip: an explicit user
+// /compact must shape even when the session fits the budget — the standard
+// ShapeHistory declines exactly this case (skip gate), which silently wasted
+// the PersistLearnings + summary calls the user already paid for.
+func TestForceShapeHistory_CompactsWhenBudgetGateWouldSkip(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 8; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent("assistant reply")},
+			client.Message{Role: "user", Content: client.NewTextContent("follow up")},
+		)
+	}
+	contextWindow := 1_000_000 // far under budget → standard gate skips
+
+	if same := ShapeHistory(messages, "the summary", contextWindow, 0); len(same) != len(messages) {
+		t.Fatalf("precondition: standard ShapeHistory should skip under budget, got %d msgs", len(same))
+	}
+
+	shaped := ForceShapeHistory(messages, "the summary", contextWindow, 0)
+	if len(shaped) >= len(messages) {
+		t.Fatalf("forced shaping must reduce history: got %d msgs, want < %d", len(shaped), len(messages))
+	}
+	found := false
+	for _, m := range shaped {
+		if strings.Contains(m.Content.Text(), "the summary") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("forced shaping should insert the summary")
+	}
+}
+
+// TestForceShapeHistory_TooShortReturnsOriginal: when even the minKeepLast
+// floor cannot net a reduction, the original slice comes back unchanged.
+func TestForceShapeHistory_TooShortReturnsOriginal(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 3; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent("a")},
+			client.Message{Role: "user", Content: client.NewTextContent("r")},
+		)
+	}
+	if out := ForceShapeHistory(messages, "s", 0, 0); len(out) != len(messages) {
+		t.Fatalf("3-pair session cannot net-reduce: got %d msgs, want %d", len(out), len(messages))
+	}
+}
+
+// TestShapeHistory_LandsUnderRetargetFraction pins the hysteresis band:
+// accepted candidates must land under compactRetargetFraction (0.80), not
+// merely under the 0.90 trigger — otherwise one large tool result re-crosses
+// the trigger immediately and every compaction is followed by another
+// (observed live: two full compactions within three iterations). Reverting
+// the landing target to compactThreshold must fail this test.
+func TestShapeHistory_LandsUnderRetargetFraction(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent(strings.Repeat("s", 350))},
+		{Role: "user", Content: client.NewTextContent(strings.Repeat("u", 350))},
+	}
+	for i := 0; i < 22; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent(strings.Repeat("a", 350))},
+			client.Message{Role: "user", Content: client.NewTextContent(strings.Repeat("r", 350))},
+		)
+	}
+	// 46 messages (> the 43-message skip gate) at ~104 est tokens each.
+	// Window 5000: trigger 4500, landing budget 4000. The keepLast=20
+	// candidate (~4381 est) fits under the trigger but NOT the landing
+	// budget; hysteresis must shrink to keepLast=18 (~3965). With the
+	// landing target reverted to compactThreshold, the 4381 candidate is
+	// accepted and this test fails.
+	contextWindow := 5000
+
+	shaped := ShapeHistory(messages, "sum", contextWindow, 0)
+	if len(shaped) >= len(messages) {
+		t.Fatalf("shaping should engage: got %d msgs", len(shaped))
+	}
+	landing := int(float64(contextWindow) * compactRetargetFraction)
+	if got := EstimateTokens(shaped); got >= landing {
+		t.Errorf("shaped history must land under the retarget budget: est %d >= %d", got, landing)
 	}
 }
