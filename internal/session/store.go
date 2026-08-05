@@ -437,7 +437,9 @@ func NewStore(dir string) *Store {
 	os.MkdirAll(dir, 0700)
 	sweepStaleTempFiles(dir)
 	s := &Store{dir: dir}
-	s.SweepOrphanCompactionSnapshots()
+	if _, loaded := orphanSweepDone.LoadOrStore(dir, true); !loaded {
+		s.SweepOrphanCompactionSnapshots()
+	}
 	idx, err := OpenIndex(dir)
 	if err == nil {
 		s.index = idx

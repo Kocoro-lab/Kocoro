@@ -161,6 +161,9 @@ func foldOversizedTranscript(ctx context.Context, c Completer, messages []client
 		fmt.Fprintf(os.Stderr, "[context] transcript fold chunk %d/%d done\n", i+1, len(chunks))
 	}
 
+	// Mark the fold complete before the caller's final structured call — a
+	// hang there must be distinguishable from a hang inside the fold loop.
+	fmt.Fprintf(os.Stderr, "[context] transcript fold done (%d chunks), proceeding to structured summary\n", len(chunks))
 	final := "[Running summary of the earlier part of this conversation]\n" + rolling +
 		"\n\n[Transcript of the most recent part]\n" + capTranscriptForSummarize(buildTranscript(chunks[len(chunks)-1]))
 	return final, usage, true

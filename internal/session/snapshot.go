@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -33,7 +34,8 @@ type CompactionSnapshot struct {
 // session id, then prunes the session's snapshot dir to the maxPerSession
 // newest files. maxPerSession <= 0 disables snapshotting (silent no-op).
 // Write is temp+rename so a crash never leaves a truncated snapshot behind
-// with a valid name; a stale .tmp file is inert and swept with its session dir.
+// with a valid name; a stale .tmp file is inert, removed by the next prune
+// pass for this session and with the directory on session deletion.
 func (s *Store) SaveCompactionSnapshot(id, phase string, messages []client.Message, maxPerSession int) error {
 	if maxPerSession <= 0 {
 		return nil
@@ -92,7 +94,7 @@ func isSafePhase(phase string) bool {
 		return false
 	}
 	for _, r := range phase {
-		if (r < 'a' || r > 'z') && r != '_' {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
 			return false
 		}
 	}
@@ -130,18 +132,34 @@ func pruneCompactionSnapshots(dir string, keep int) {
 		return
 	}
 	sort.Strings(names) // zero-padded UnixNano prefix → lexicographic == chronological
-	evictable := names[1:] // pin the oldest
+	// keep == 1 keeps the NEWEST snapshot, no pin: pinning there would make
+	// every later save a write-then-immediate-delete of the file just
+	// written, and a user setting 1 plausibly means "latest only".
+	evictable := names
+	if keep >= 2 {
+		evictable = names[1:] // pin the oldest
+	}
 	excess := len(names) - keep
 	for _, n := range evictable[:excess] {
 		os.Remove(filepath.Join(dir, n))
 	}
 }
 
+// orphanSweepDone gates SweepOrphanCompactionSnapshots to once per process
+// per sessions directory. NewStore is NOT once-per-process — the daemon's
+// SessionCache constructs a fresh Store per route entry over the same
+// directory — and a repeated concurrent sweep could race a session that
+// compacted before its first checkpoint save (NewSession does not persist;
+// the JSON appears at the first checkpoint) and delete its live snapshots.
+// Gating to the first construction per dir runs the sweep at effective
+// process start, before any session is in flight.
+var orphanSweepDone sync.Map
+
 // SweepOrphanCompactionSnapshots removes snapshot directories whose session
 // JSON no longer exists (deleted before snapshot cleanup shipped, or removed
-// out of band). Called from NewStore so the sweep runs once per process
-// start; deterministic — no age heuristic needed, the session's absence IS
-// the signal.
+// out of band). Deterministic — no age heuristic needed, the session's
+// absence IS the signal. Callers other than NewStore's once-per-dir gate
+// must ensure no unsaved-but-compacted session is in flight.
 func (s *Store) SweepOrphanCompactionSnapshots() {
 	root := filepath.Join(s.dir, compactionSnapshotDirName)
 	entries, err := os.ReadDir(root)

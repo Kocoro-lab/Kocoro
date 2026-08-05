@@ -102,8 +102,13 @@ func compactTargetTokens(contextWindow int) int {
 const CompactAbsoluteBufferTokens = compactAbsoluteBufferTokens
 
 // compactAbsoluteBufferTokens is the flat reserve the absolute trigger keeps
-// free below the context window: room for the response (max_tokens tiers top
-// out well under 32K) plus estimator-error and next-turn-tool-result margin.
+// free below the context window. It does NOT guarantee the model's full
+// output ceiling fits (current tiers cap output at 64K–128K, above this
+// buffer): the request-fit property is guaranteed Cloud-side, where the
+// llm-service clamps max_tokens to the remaining context headroom before
+// calling the provider. What the buffer trades is output-ceiling headroom —
+// between the trigger and the window a response's ceiling may be clamped
+// below the model max — against usable window.
 // Workload that justifies it: the 1M-context families the default tiers route
 // to, where the fractional 90% trigger alone forfeits ~100K usable tokens
 // (leading agent harnesses budget absolutely for this reason). Symptom

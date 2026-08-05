@@ -160,13 +160,31 @@ func TestNewStore_SweepsOrphanCompactionSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	NewStore(dir) // fresh store: startup sweep runs
+	// NewStore's sweep is gated to once per process per directory (this dir's
+	// slot was consumed by the NewStore above), so exercise the sweep
+	// directly — the same code path the gate invokes.
+	s.SweepOrphanCompactionSnapshots()
 
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Error("orphan snapshot dir must be swept at store startup")
+		t.Error("orphan snapshot dir must be swept")
 	}
 	if files := snapshotFiles(t, dir, "sess-live"); len(files) != 1 {
 		t.Errorf("live session's snapshots must survive the sweep, got %v", files)
+	}
+}
+
+func TestStore_SaveCompactionSnapshot_RetentionOneKeepsNewest(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	for _, phase := range []string{"proactive", "preflight", "reactive"} {
+		msgs := []client.Message{{Role: "user", Content: client.NewTextContent(phase)}}
+		if err := s.SaveCompactionSnapshot("sess-one", phase, msgs, 1); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+	}
+	files := snapshotFiles(t, dir, "sess-one")
+	if len(files) != 1 || !contains(files, "reactive") {
+		t.Errorf("retention 1 must keep exactly the NEWEST snapshot (no pin), got %v", files)
 	}
 }
 

@@ -66,9 +66,17 @@ func shouldPreflightCompact(messages []client.Message, contextWindow int, overhe
 	// Complement the fractional line the same way the main trigger does:
 	// on 1M windows 0.95×window (950K) sat only 10K above the absolute
 	// trigger (940K), eroding the backstop margin the 5% was chosen for.
-	// window − buffer/2 keeps the preflight line midway between the
-	// absolute trigger and the window (1M: 970K); small windows keep 0.95.
-	if absolute := contextWindow - ctxwin.CompactAbsoluteBufferTokens/2; absolute > threshold {
+	// The reserve floors at defaultMaxOutputTokens (not buffer/2 = 30K):
+	// current model tiers cap output at 64K–128K, so any line this close
+	// to the window relies on the Cloud llm-service clamping max_tokens to
+	// the remaining context headroom (anthropic_provider adjusted_max) —
+	// the reserve keeps at least the fallback output ceiling un-clamped.
+	// 1M: 968K, comfortably above the 940K trigger; small windows keep 0.95.
+	reserve := ctxwin.CompactAbsoluteBufferTokens / 2
+	if reserve < defaultMaxOutputTokens {
+		reserve = defaultMaxOutputTokens
+	}
+	if absolute := contextWindow - reserve; absolute > threshold {
 		threshold = absolute
 	}
 	return ctxwin.EstimateTokens(messages)+overheadTokens >= threshold
