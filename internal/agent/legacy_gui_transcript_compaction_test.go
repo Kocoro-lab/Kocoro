@@ -82,7 +82,7 @@ func TestLegacyPairedGUITranscript_CompactionPreservesToolIdentityWithoutExecuto
 		t.Fatalf("fixture must contain ordered computer + accessibility pairs, got %+v", wantUses)
 	}
 
-	compressOldToolResults(context.Background(), fixture.Messages, 1, 80, nil)
+	compressOldToolResults(context.Background(), fixture.Messages, 1, 80, nil, "")
 	assertLegacyToolUsesEqual(t, wantUses, legacyToolUsesFromHistory(t, fixture.Messages))
 
 	firstResult := fixture.Messages[2].Content.Blocks()[0]

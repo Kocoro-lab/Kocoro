@@ -3521,7 +3521,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			}
 			fsBefore := len(messages)
 			emergencyMessages := cloneMessages(messages)
-			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
@@ -4278,7 +4278,7 @@ iterationLoop:
 			// the way to the minKeepLast floor — reusing a stale summary there
 			// would drop those turns with no summary coverage.
 			emergencyMessages := cloneMessages(messages)
-			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 			var summary string
 			var sumErr error
 			if compactionSummaryIter == i && strings.TrimSpace(compactionSummary) != "" {
@@ -4682,7 +4682,7 @@ iterationLoop:
 					}
 
 					softMessages := cloneMessages(messages)
-					compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client)
+					compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client, latestUserText)
 					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(softMessages), nextSummary))
 					restoreLLM()
@@ -4701,7 +4701,7 @@ iterationLoop:
 					if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped)+reactiveOverhead >= a.contextWindow {
 						fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
 						emergencyMessages := cloneMessages(messages)
-						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 
 						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 						summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(emergencyMessages), nextSummary))
@@ -7738,7 +7738,10 @@ func isTier2FloorTool(name string) bool {
 	return strings.HasPrefix(name, "browser_")
 }
 
-func compressOldToolResults(ctx context.Context, messages []client.Message, keepRecent int, maxChars int, completer ctxwin.Completer) {
+// taskContext is the current user request (clipped inside microCompactResult);
+// it steers Tier-2 semantic summaries toward task-relevant details and is
+// unused on mechanical paths (nil completer).
+func compressOldToolResults(ctx context.Context, messages []client.Message, keepRecent int, maxChars int, completer ctxwin.Completer, taskContext string) {
 	const tier1Threshold = 20
 
 	// Pre-scan: build tool_use_id → name+args map for tier-1 metadata.
@@ -7800,7 +7803,7 @@ func compressOldToolResults(ctx context.Context, messages []client.Message, keep
 		} else if distFromEnd >= keepRecent {
 			// Tier 2: LLM summary for large results, else head+tail truncation.
 			oldContent := msg.Content
-			messages[idx].Content = compressTier2(ctx, msg, maxChars, completer, toolCallMap, &mcCount)
+			messages[idx].Content = compressTier2(ctx, msg, maxChars, completer, toolCallMap, &mcCount, taskContext)
 			client.LogCacheCompactEvent("tier2", idx, oldContent, messages[idx].Content)
 		}
 	}
@@ -7846,9 +7849,9 @@ func hasTier2FloorTool(msg client.Message, toolCallMap map[string]toolCallInfo) 
 // For results > microCompactMinChars that haven't been summarized yet and the
 // per-pass cap hasn't been hit, it tries LLM summarization. Otherwise falls
 // back to mechanical head+tail truncation.
-func compressTier2(ctx context.Context, msg client.Message, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int) client.MessageContent {
+func compressTier2(ctx context.Context, msg client.Message, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int, taskContext string) client.MessageContent {
 	if msg.Role == "user" && msg.Content.HasBlocks() {
-		return compressTier2Blocks(ctx, msg.Content, maxChars, completer, toolCallMap, mcCount)
+		return compressTier2Blocks(ctx, msg.Content, maxChars, completer, toolCallMap, mcCount, taskContext)
 	}
 	// XML text format
 	text := msg.Content.Text()
@@ -7867,7 +7870,7 @@ func compressTier2(ctx context.Context, msg client.Message, maxChars int, comple
 // mechanical truncation, or no-op for already-small content — the block is
 // marked CompressedTier = 2 so subsequent Tier 2 AND Tier 1 passes treat it
 // as terminal. See docs/issues/cache-message-prefix-invalidation.md.
-func compressTier2Blocks(ctx context.Context, mc client.MessageContent, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int) client.MessageContent {
+func compressTier2Blocks(ctx context.Context, mc client.MessageContent, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int, taskContext string) client.MessageContent {
 	blocks := mc.Blocks()
 	var newBlocks []client.ContentBlock
 	for _, b := range blocks {
@@ -7890,7 +7893,7 @@ func compressTier2Blocks(ctx context.Context, mc client.MessageContent, maxChars
 		}
 		if completer != nil && charLen > microCompactMinChars && !isMicroCompacted(content) && *mcCount < microCompactMaxPerPass && !isMicroCompactSkipTool(toolName) {
 			*mcCount++ // count attempts, not just successes — caps latency
-			if summary, ok, mcUsage := microCompactResult(ctx, completer, toolName, content); ok {
+			if summary, ok, mcUsage := microCompactResult(ctx, completer, toolName, content, taskContext); ok {
 				EmitUsage(ctx, TurnUsage{
 					InputTokens:           mcUsage.InputTokens,
 					OutputTokens:          mcUsage.OutputTokens,

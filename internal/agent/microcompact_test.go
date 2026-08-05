@@ -30,7 +30,7 @@ func TestMicroCompact_LargeResultGetsSummarized(t *testing.T) {
 	mc := &mockCompleter{output: "PostgreSQL unreachable on localhost:5432"}
 	content := strings.Repeat("log line\n", 300) + "connection refused on localhost:5432"
 
-	summary, ok, _ := microCompactResult(context.Background(), mc, "bash", content)
+	summary, ok, _ := microCompactResult(context.Background(), mc, "bash", content, "")
 	if !ok {
 		t.Fatal("expected micro-compact to succeed")
 	}
@@ -43,7 +43,7 @@ func TestMicroCompact_LargeResultGetsSummarized(t *testing.T) {
 }
 
 func TestMicroCompact_NilCompleterReturnsFalse(t *testing.T) {
-	_, ok, _ := microCompactResult(context.Background(), nil, "bash", "content")
+	_, ok, _ := microCompactResult(context.Background(), nil, "bash", "content", "")
 	if ok {
 		t.Error("expected false with nil completer")
 	}
@@ -80,7 +80,7 @@ func TestMicroCompact_Tier2Integration_WithCompleter(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, "")
 
 	// Should have made at most microCompactMaxPerPass LLM calls
 	if mc.calls > microCompactMaxPerPass {
@@ -130,7 +130,7 @@ func TestMicroCompact_Tier2Integration_NilCompleter(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, nil)
+	compressOldToolResults(context.Background(), messages, 3, 300, nil, "")
 
 	// No micro-compact markers should exist
 	for _, msg := range messages {
@@ -175,7 +175,7 @@ func TestMicroCompact_SkipsAlreadySummarized(t *testing.T) {
 		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, "")
 
 	// Should NOT have called the completer for the already-summarized result
 	if mc.calls != 0 {
@@ -201,7 +201,7 @@ func TestMicroCompact_SmallResultSkipsLLM(t *testing.T) {
 		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, "")
 
 	if mc.calls != 0 {
 		t.Errorf("expected 0 LLM calls for small results, got %d", mc.calls)
@@ -237,7 +237,7 @@ func TestMicroCompact_FailingCompleterCapsAttempts(t *testing.T) {
 		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, fc)
+	compressOldToolResults(context.Background(), messages, 3, 300, fc, "")
 
 	// Should cap at microCompactMaxPerPass attempts, even though all failed
 	if fc.calls > microCompactMaxPerPass {
@@ -286,7 +286,7 @@ func TestMicroCompact_SkipsThinkTool(t *testing.T) {
 	}}, messages[1:]...)
 	_ = toolCallMap // buildToolCallMap will find it from the injected message
 
-	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, "")
 
 	if mc.calls != 0 {
 		t.Errorf("expected 0 LLM calls for think tool, got %d", mc.calls)
@@ -325,7 +325,7 @@ func TestMicroCompact_SkipsCloudDelegate(t *testing.T) {
 		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, "")
 
 	if mc.calls != 0 {
 		t.Errorf("expected 0 LLM calls for cloud_delegate, got %d", mc.calls)
@@ -375,7 +375,7 @@ func TestMicroCompact_SkipsBrowserSnapshot(t *testing.T) {
 		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, "")
 
 	if mc.calls != 0 {
 		t.Errorf("expected 0 LLM calls for browser_snapshot, got %d", mc.calls)
@@ -462,7 +462,7 @@ func TestMicroCompact_SkipsBrowserNavigate(t *testing.T) {
 		messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent("ok")})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 300, mc)
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, "")
 
 	if mc.calls != 0 {
 		t.Errorf("expected 0 LLM calls for browser_navigate, got %d", mc.calls)
@@ -475,7 +475,7 @@ func TestMicroCompact_ReturnsUsage(t *testing.T) {
 		usage:  client.Usage{InputTokens: 200, OutputTokens: 30, CostUSD: 0.0005},
 	}
 	content := strings.Repeat("log line\n", 300) + "connection refused"
-	_, ok, usage := microCompactResult(context.Background(), mc, "bash", content)
+	_, ok, usage := microCompactResult(context.Background(), mc, "bash", content, "")
 	if !ok {
 		t.Fatal("expected micro-compact to succeed")
 	}
@@ -489,7 +489,7 @@ func TestMicroCompact_ReturnsUsage(t *testing.T) {
 func TestMicroCompact_TagsHelperCacheSource(t *testing.T) {
 	mc := &mockCompleter{output: "summary text"}
 	content := strings.Repeat("data ", 1000)
-	_, _, _ = microCompactResult(context.Background(), mc, "bash", content)
+	_, _, _ = microCompactResult(context.Background(), mc, "bash", content, "")
 	if mc.calls == 0 {
 		t.Fatal("microCompactResult did not invoke the completer")
 	}
@@ -498,5 +498,85 @@ func TestMicroCompact_TagsHelperCacheSource(t *testing.T) {
 	}
 	if got := mc.lastReq.ResponseCachePolicy; got != executionprofile.ResponseCacheOff {
 		t.Errorf("microCompactResult ResponseCachePolicy = %q, want off", got)
+	}
+}
+
+func TestMicroCompact_TaskContextInPrompt(t *testing.T) {
+	mc := &mockCompleter{output: "summary"}
+	task := "Fix the flaky TestFoo in internal/agent and open a PR"
+
+	_, ok, _ := microCompactResult(context.Background(), mc, "bash", strings.Repeat("output\n", 400), task)
+	if !ok {
+		t.Fatal("expected micro-compact to succeed")
+	}
+	prompt := mc.lastReq.Messages[0].Content.Text()
+	if !strings.Contains(prompt, "Current task") {
+		t.Errorf("prompt missing the task-context label:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, task) {
+		t.Errorf("prompt does not carry the task text:\n%s", prompt)
+	}
+}
+
+func TestMicroCompact_EmptyTaskContextOmitsLabel(t *testing.T) {
+	mc := &mockCompleter{output: "summary"}
+
+	_, ok, _ := microCompactResult(context.Background(), mc, "bash", "content", "  ")
+	if !ok {
+		t.Fatal("expected micro-compact to succeed")
+	}
+	if prompt := mc.lastReq.Messages[0].Content.Text(); strings.Contains(prompt, "Current task") {
+		t.Errorf("blank task context must not emit the label:\n%s", prompt)
+	}
+}
+
+func TestMicroCompact_LongTaskContextClipped(t *testing.T) {
+	mc := &mockCompleter{output: "summary"}
+	// A pasted wall-of-text request must not ride into every micro-compact
+	// call at full length; the head (where the ask lives) is kept.
+	task := "LEAD-OF-TASK " + strings.Repeat("填", microCompactTaskContextMaxRunes*2)
+
+	_, ok, _ := microCompactResult(context.Background(), mc, "bash", "content", task)
+	if !ok {
+		t.Fatal("expected micro-compact to succeed")
+	}
+	prompt := mc.lastReq.Messages[0].Content.Text()
+	if !strings.Contains(prompt, "LEAD-OF-TASK") {
+		t.Errorf("clip must keep the head of the task text:\n%s", prompt)
+	}
+	if strings.Contains(prompt, task) {
+		t.Error("full oversized task text must not appear in the prompt")
+	}
+}
+
+// TestCompressOldToolResults_ThreadsTaskContext pins the plumbing: the task
+// context handed to compressOldToolResults must reach the micro-compact
+// prompt of a Tier-2 eligible result.
+func TestCompressOldToolResults_ThreadsTaskContext(t *testing.T) {
+	mc := &mockCompleter{output: "summary"}
+	task := "Migrate the billing pipeline to the new usage schema"
+
+	var messages []client.Message
+	messages = append(messages, client.Message{Role: "user", Content: client.NewTextContent(task)})
+	for i := 0; i < 6; i++ {
+		content := "short recent result"
+		if i == 0 {
+			content = strings.Repeat("tool output with details\n", 200) // > microCompactMinChars
+		}
+		messages = append(messages,
+			client.Message{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolResultBlock("tc"+string(rune('a'+i)), content, false),
+			})},
+			client.Message{Role: "assistant", Content: client.NewTextContent("ok")},
+		)
+	}
+
+	compressOldToolResults(context.Background(), messages, 3, 300, mc, task)
+
+	if mc.calls != 1 {
+		t.Fatalf("expected exactly 1 micro-compact call, got %d", mc.calls)
+	}
+	if prompt := mc.lastReq.Messages[0].Content.Text(); !strings.Contains(prompt, task) {
+		t.Errorf("task context did not reach the micro-compact prompt:\n%s", prompt)
 	}
 }
