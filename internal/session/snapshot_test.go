@@ -1,10 +1,12 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -58,6 +60,72 @@ func TestStore_SaveCompactionSnapshot_WritesAndRoundTrips(t *testing.T) {
 	if snap.CreatedAt.IsZero() {
 		t.Error("CreatedAt must be stamped")
 	}
+}
+
+func TestStore_SaveCompactionSnapshot_StripsAllImagesWithoutMutatingHistory(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	const payload = "snapshot-must-not-persist-this-base64"
+	imageBlock := client.ContentBlock{
+		Type:   "image",
+		Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: payload},
+	}
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "text", Text: "look at this"},
+			imageBlock,
+		})},
+		{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolResultBlockWithImages("tool-1", "screenshot", []client.ContentBlock{imageBlock}, false),
+		})},
+	}
+
+	if err := s.SaveCompactionSnapshot("sess-images", "proactive", msgs, 1); err != nil {
+		t.Fatalf("SaveCompactionSnapshot: %v", err)
+	}
+	// Snapshot sanitization owns replacement slices; the live history remains
+	// available to the active vision turn.
+	if got := countSnapshotImages(msgs); got != 2 {
+		t.Fatalf("input history mutated: image count = %d, want 2", got)
+	}
+
+	files := snapshotFiles(t, dir, "sess-images")
+	raw, err := os.ReadFile(filepath.Join(dir, compactionSnapshotDirName, "sess-images", files[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(payload)) {
+		t.Fatal("snapshot retained inline image payload")
+	}
+	var snap CompactionSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if got := countSnapshotImages(snap.Messages); got != 0 {
+		t.Fatalf("snapshot image count = %d, want 0", got)
+	}
+	if !bytes.Contains(raw, []byte(snapshotImagePlaceholder)) {
+		t.Fatal("snapshot should retain a text marker where image evidence was omitted")
+	}
+}
+
+func countSnapshotImages(messages []client.Message) int {
+	count := 0
+	var countBlocks func([]client.ContentBlock)
+	countBlocks = func(blocks []client.ContentBlock) {
+		for _, block := range blocks {
+			if block.Type == "image" {
+				count++
+			}
+			if nested, ok := block.ToolContent.([]client.ContentBlock); ok {
+				countBlocks(nested)
+			}
+		}
+	}
+	for _, message := range messages {
+		countBlocks(message.Content.Blocks())
+	}
+	return count
 }
 
 func TestStore_SaveCompactionSnapshot_PinsOldestAndPrunesRest(t *testing.T) {
@@ -187,6 +255,59 @@ func TestNewStore_OrphanSweepRunsOncePerDir(t *testing.T) {
 	NewStore(dir)
 	if _, err := os.Stat(orphan); err != nil {
 		t.Error("second NewStore over the same dir must NOT re-run the orphan sweep")
+	}
+}
+
+func TestSweepStaleCompactionSnapshotsRemovesOnlyExpiredSnapshotFiles(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, compactionSnapshotDirName)
+	oldOnlyDir := filepath.Join(root, "sess-old-only")
+	mixedDir := filepath.Join(root, "sess-mixed")
+	for _, snapshotDir := range []string{oldOnlyDir, mixedDir} {
+		if err := os.MkdirAll(snapshotDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldJSON := filepath.Join(oldOnlyDir, "0001-proactive.json")
+	oldTmp := filepath.Join(mixedDir, "0002-preflight.json.tmp")
+	freshJSON := filepath.Join(mixedDir, "0003-reactive.json")
+	unexpected := filepath.Join(mixedDir, "keep.txt")
+	for _, path := range []string{oldJSON, oldTmp, freshJSON, unexpected} {
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-48 * time.Hour)
+	for _, path := range []string{oldJSON, oldTmp, unexpected} {
+		if err := os.Chtimes(path, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removed, err := SweepStaleCompactionSnapshots(dir, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if _, err := os.Stat(oldOnlyDir); err != nil {
+		t.Fatalf("empty snapshot directory must be retained to avoid racing writers: %v", err)
+	}
+	for _, path := range []string{freshJSON, unexpected} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("sweep removed retained file %s: %v", path, err)
+		}
+	}
+}
+
+func TestSweepStaleCompactionSnapshotsDisabledOrMissingIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	for _, age := range []time.Duration{0, 24 * time.Hour} {
+		removed, err := SweepStaleCompactionSnapshots(dir, age)
+		if err != nil || removed != 0 {
+			t.Fatalf("age %v: removed=%d err=%v, want no-op", age, removed, err)
+		}
 	}
 }
 
