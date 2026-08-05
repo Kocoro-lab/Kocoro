@@ -119,7 +119,7 @@ agent:
 
 `effort_tier` is the preferred user-facing reasoning control: **Light** (`low`), **Balanced** (`high`), **Deep** (`xhigh`), and **Max** (`max`), plus **Default** (`""`). Cloud translates those stable product tiers to each provider's native value. GPT-5.6 uses `low` / `medium` / `xhigh` / `max`; Anthropic uses `low` / `high` / `xhigh` / `max`. Claude Haiku does not advertise effort support and stays at the model default.
 
-`service_tier` is a process-global developer selector for OpenAI processing. `default` requests Standard processing and `fast` requests Fast processing; `""` leaves the provider default untouched. Kocoro Desktop exposes it only alongside an exact OpenAI model. It is intentionally not merged from project/local config and is not available in named-agent config. A named agent's exact model override clears the global processing lane, while sealed Koe/computer execution profiles provide their own lane independently.
+`service_tier` is a process-global developer selector for OpenAI processing. `default` requests Standard processing and `fast` requests Fast processing; `""` leaves the provider default untouched. Kocoro Desktop exposes it only alongside an exact OpenAI model. It is intentionally not merged from project/local config and is not available in named-agent config. A named agent's model tier or exact model override clears the global processing lane, while sealed Koe/computer execution profiles provide their own lane independently.
 
 ## Tool Settings
 

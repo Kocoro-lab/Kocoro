@@ -451,6 +451,45 @@ func TestWireFixture_Tool_PerRequestSSE(t *testing.T) {
 	assertSemanticEqual(t, completed, parseJSONMap(t, []byte(frames[1][1])))
 }
 
+// TestWireFixture_Usage_PerRequestSSE pins the live usage payload. The
+// capability advertises that web_search_calls is present even when its value
+// is zero, so consumers do not need transport-specific missing-field rules.
+func TestWireFixture_Usage_PerRequestSSE(t *testing.T) {
+	fixture := loadWireFixture(t, "sse_event.usage.json")
+	rec := httptest.NewRecorder()
+	h := &sseEventHandler{
+		w:       rec,
+		flusher: rec,
+		ctx:     context.Background(),
+	}
+	h.OnUsage(agent.TurnUsage{
+		InputTokens:    1200,
+		OutputTokens:   180,
+		TotalTokens:    1380,
+		CostUSD:        0.0123,
+		LLMCalls:       1,
+		WebSearchCalls: 0,
+		Model:          "gpt-5.6-luna",
+	})
+
+	frames := parseSSEFrames(t, rec.Body.String())
+	if len(frames) != 1 || frames[0][0] != "usage" {
+		t.Fatalf("usage SSE frames = %#v, want one usage frame", frames)
+	}
+	produced := parseJSONMap(t, []byte(frames[0][1]))
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		WebSearchCalls int `json:"web_search_calls"`
+	}
+	if err := json.Unmarshal([]byte(frames[0][1]), &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.WebSearchCalls != 0 {
+		t.Fatalf("consumer decoded web_search_calls = %d, want 0", consumer.WebSearchCalls)
+	}
+}
+
 // TestWireFixture_Done_PerRequestSSE pins the `event: done` payload.
 // handleMessageSSE marshals *RunAgentResult directly (mustJSON(result)), so
 // serializing the producer type IS the production path; running a full
@@ -853,6 +892,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	}
 	if !has(CapScheduleSessionFilterV1) {
 		t.Fatalf("capabilities lost %q: %v", CapScheduleSessionFilterV1, *status.Capabilities)
+	}
+	if !has(CapWebSearchUsageV1) {
+		t.Fatalf("capabilities lost %q: %v", CapWebSearchUsageV1, *status.Capabilities)
 	}
 	if !has(CapComputerUseTopologyV1) {
 		t.Fatalf("capabilities lost %q: %v", CapComputerUseTopologyV1, *status.Capabilities)
@@ -1857,7 +1899,7 @@ func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
 		SessionID: fixture["session_id"].(string),
 		Agent:     fixture["agent"].(string),
 		Usage: RunAgentUsage{
-			InputTokens: 8120, OutputTokens: 240, TotalTokens: 8360, CostUSD: 0.021,
+			InputTokens: 8120, OutputTokens: 240, TotalTokens: 8360, CostUSD: 0.021, WebSearchCalls: 1,
 		},
 		ExecutionRun: &executionprofile.Run{
 			LogicalTaskID: "burst-4f2a:t01",
@@ -1876,12 +1918,14 @@ func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
 	// ledger recording; pin the key fields it routes on.
 	var done struct {
 		Reply        string                `json:"reply"`
+		Usage        RunAgentUsage         `json:"usage"`
 		ExecutionRun *executionprofile.Run `json:"execution_run"`
 	}
 	if err := json.Unmarshal(raw, &done); err != nil {
 		t.Fatalf("consumer decode failed: %v", err)
 	}
-	if done.ExecutionRun == nil ||
+	if done.Usage.WebSearchCalls != 1 ||
+		done.ExecutionRun == nil ||
 		done.ExecutionRun.RunID != "burst-4f2a:t01.r01" ||
 		!done.ExecutionRun.Profile.IsFast() ||
 		done.ExecutionRun.Profile.ResolutionReason != "cloud_profile_resolved" {

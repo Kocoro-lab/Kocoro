@@ -2,6 +2,16 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Added
+
+- **Hosted-search usage wire capability** — `web_search_usage_v1` guarantees that live usage and terminal run payloads include `web_search_calls`, including an explicit zero when no hosted search ran.
+
+### Changed
+
+- **Semantic skill discovery is opt-in** — small-model skill prefetch is disabled by default to avoid adding a speculative model call to ordinary turns. Skill metadata listing and explicit `use_skill` remain available; set `agent.skill_discovery: true` to restore semantic prefetch.
+
 ## v0.4.0 — 2026-08-01 — Computer Use v1 + Koe Fast/Full execution
 
 **Computer use v1.** Native macOS GUI control is rebuilt around Accessibility-first observation with a process-wide lease/barrier coordinator, a Desktop-only control plane (Pause / Resume / Take Over / Stop), physical-interference detection, a separate point-of-risk confirmation for consequential actions, and provider-native execution profiles minted by Cloud. The model-visible surface is now exactly one contract per run: `computer_use`, or a provider-native adapter when a trusted profile selects one.

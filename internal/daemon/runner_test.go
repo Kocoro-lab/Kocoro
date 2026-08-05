@@ -1689,6 +1689,19 @@ func TestEffectiveRunModelIntent_AgentTierClearsInheritedSpecificModel(t *testin
 	}
 }
 
+func TestEffectiveRunModelIntent_RequestTierPreservesExactModel(t *testing.T) {
+	runCfg := &config.Config{ModelTier: "medium"}
+	runCfg.Agent.Model = "pinned-global-model"
+
+	got := effectiveRunModelIntent(runCfg, nil, RunAgentRequest{ModelOverride: "small"})
+	if got.ModelTier != "small" {
+		t.Errorf("ModelTier = %q, want small", got.ModelTier)
+	}
+	if got.SpecificModel != "pinned-global-model" {
+		t.Errorf("SpecificModel = %q, want pinned-global-model", got.SpecificModel)
+	}
+}
+
 // TestApplyAgentModelOverlayToLoop_SpecificModelBeatsTier locks in the
 // priority chain documented on applyAgentModelOverlayToLoop: SetModelTier
 // must run BEFORE SetSpecificModel so an explicit `model:` pin wins. If the

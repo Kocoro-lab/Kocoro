@@ -95,7 +95,7 @@ type RunAgentRequest struct {
 	PinnedRouteKey          string                           `json:"-"`                           // internal: returned verbatim by ComputeRouteKey so it survives the post-@mention recompute. Sticky schedules pin their dedicated agent:<name>:schedule:<id> key here; json:"-" so HTTP clients cannot pin an arbitrary route.
 	ScheduleID              string                           `json:"-"`                           // internal: owning schedule for scheduler-created sessions. Persisted onto session metadata; HTTP clients cannot forge the association.
 	Ephemeral               bool                             `json:"-"`                           // caller owns persistence + events
-	ModelOverride           string                           `json:"-"`                           // overrides agent model tier
+	ModelOverride           string                           `json:"-"`                           // internal tier override; an exact model pin remains authoritative
 	BypassRouting           bool                             `json:"-"`                           // skip route lock (heartbeat runs)
 	SessionHistory          []client.Message                 `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
 	OmitHistory             bool                             `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
@@ -1626,7 +1626,7 @@ type RunAgentUsage struct {
 	OutputTokens   int     `json:"output_tokens"`
 	TotalTokens    int     `json:"total_tokens"`
 	CostUSD        float64 `json:"cost_usd"`
-	WebSearchCalls int     `json:"web_search_calls,omitempty"`
+	WebSearchCalls int     `json:"web_search_calls"`
 }
 
 // computeReportedUsage builds the per-run usage block emitted to lifecycle
@@ -2005,10 +2005,11 @@ func resumeRoutedColdStart(sessMgr *session.Manager, routeKey string) (bool, err
 // applyAgentModelOverlayToLoop applies the loop-facing fields of the per-agent
 // model overlay onto the AgentLoop. Called per-turn so reload picks up edits.
 //
-// A concrete named-agent tier is authoritative over inherited global routing,
-// while a named-agent exact model remains the final override. Idle timeout
-// fields live in runCfg, not on the loop, and are handled inline at the call
-// site.
+// A concrete named-agent tier is a complete provider-neutral routing choice:
+// it replaces both an inherited exact model and its OpenAI processing lane.
+// A named-agent exact model remains the final override and also clears the
+// global-only processing lane. Idle timeout fields live in runCfg, not on the
+// loop, and are handled inline at the call site.
 func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelConfig) {
 	if loop == nil || ac == nil {
 		return
@@ -2080,6 +2081,8 @@ func effectiveRunModelIntent(
 		}
 	}
 	if req.ModelOverride != "" {
+		// This heartbeat-only tier hint sits below an exact agent.model pin. It
+		// must not silently discard that higher-precedence route authority.
 		intent.ModelTier = req.ModelOverride
 	}
 	return intent
@@ -2393,6 +2396,8 @@ func lockAgentExecutionConfig(loop *agent.AgentLoop, req *RunAgentRequest) {
 		return
 	}
 	if req.ModelOverride != "" {
+		// Preserve the exact model already locked onto the loop; ModelOverride
+		// only supplies the lower-precedence tier used by heartbeat runs.
 		loop.SetModelTier(req.ModelOverride)
 	}
 	if req.ResumeInterrupted && req.ExecutionConfig != nil {

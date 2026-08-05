@@ -134,6 +134,33 @@ func TestFallbackPreambleFromToolCalls(t *testing.T) {
 	}
 }
 
+func TestLooksLikeToolContinuationPreamble(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{name: "review example", text: "Now let me read the file with the tool I just loaded.", want: true},
+		{name: "search intent", text: "I'll now search the official documentation.", want: true},
+		{name: "Chinese intent", text: "接下来我会读取官方页面。", want: true},
+		{name: "Japanese intent", text: "次に公式ページを開く。", want: true},
+		{name: "complete answer", text: "The official documentation says the feature is available.", want: false},
+		{name: "explanation opener without tool action", text: "Now let me explain the result.", want: false},
+		{name: "action substring in already", text: "Let me explain the already final result.", want: false},
+		{name: "action substring in official", text: "I will now explain the official result.", want: false},
+		{name: "answer with next-step paragraph", text: "The answer is 42.\n\nNext, let me check another source.", want: false},
+		{name: "oversized narration", text: "Let me read " + strings.Repeat("x", 400), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := looksLikeToolContinuationPreamble(tt.text); got != tt.want {
+				t.Fatalf("looksLikeToolContinuationPreamble(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFallbackPreambleFromToolCallsCapsLongDescription(t *testing.T) {
 	registry := NewToolRegistry()
 	registry.Register(preambleTestTool{name: "file_read", source: SourceLocal, required: []string{"description"}})

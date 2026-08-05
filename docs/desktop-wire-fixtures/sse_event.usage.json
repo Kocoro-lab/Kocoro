@@ -1,0 +1,9 @@
+{
+  "input_tokens": 1200,
+  "output_tokens": 180,
+  "total_tokens": 1380,
+  "cost_usd": 0.0123,
+  "llm_calls": 1,
+  "web_search_calls": 0,
+  "model": "gpt-5.6-luna"
+}

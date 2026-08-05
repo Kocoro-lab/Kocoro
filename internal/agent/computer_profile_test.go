@@ -412,6 +412,11 @@ func TestAnthropicComputerSelectionResolvesNativeProfile(t *testing.T) {
 	if continuation.ResponseCachePolicy != "" || continuation.ParallelToolCalls {
 		t.Fatalf("native continuation leaked fast-only policy: %+v", continuation)
 	}
+	for _, msg := range continuation.Messages {
+		if strings.Contains(msg.Content.Text(), "## Fast Task") {
+			t.Fatal("computer profile continuation received Koe Fast guidance")
+		}
+	}
 	schema, ok := findToolSchema(continuation, "computer")
 	if !ok {
 		t.Fatal("native computer schema missing from continuation")

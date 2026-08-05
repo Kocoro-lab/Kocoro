@@ -5349,11 +5349,16 @@ iterationLoop:
 				continue
 			}
 
-			// tool_search loaded schemas but the model stopped with text without
-			// using hosted search or calling a loaded tool — nudge it to continue.
+			// tool_search loaded schemas but the model stopped with text. A
+			// positive hosted-search count proves retrieval happened, not that the
+			// text is a final answer, so future-tool narration still continues.
+			// Missing/zero usage retains the conservative behavior for older Cloud
+			// versions that do not report hosted-search usage.
 			if toolSearchFired {
 				toolSearchFired = false
-				if resp.Usage.WebSearchCalls == 0 {
+				if resp.Usage.WebSearchCalls == 0 ||
+					resp.FinishReason == "tool_use" ||
+					looksLikeToolContinuationPreamble(resp.OutputText) {
 					reanchorActiveTask(MetaBoundaryToolSearchLoaded)
 					// tool_search nudge path — preserve the model's pre-load
 					// reasoning so the next iteration sees the same trajectory.
