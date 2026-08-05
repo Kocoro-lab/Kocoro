@@ -7,6 +7,25 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
+// CompactionSummaryPrefix is the stable model-visible marker used to
+// distinguish a shaped history from an ordinary history containing adjacent
+// user messages.
+const CompactionSummaryPrefix = "Previous context summary: "
+
+// SyntheticSourceIndex marks a message created by shaping rather than retained
+// from the input history.
+const SyntheticSourceIndex = -1
+
+// ShapedHistory carries the exact input origin of every output message. Agent
+// loop metadata (injected/delta flags, timestamps, and the current-user offset)
+// must follow these origins; subtracting the net dropped count is incorrect for
+// the protected prefix and for boundary-orphan removal.
+type ShapedHistory struct {
+	Messages      []client.Message
+	SourceIndices []int
+	Applied       bool
+}
+
 const (
 	// charsPerToken is the conservative estimation ratio.
 	// 3.5 chars/token handles mixed English/code/CJK better than 4.
@@ -207,12 +226,26 @@ func CompactTriggerTokens(contextWindow int) int {
 // anything, so the original slice is returned unchanged instead — callers can
 // detect the no-op via len() and must NOT treat it as an applied compaction.
 func ShapeHistory(messages []client.Message, summary string, contextWindow int, overheadTokens int) []client.Message {
+	return ShapeHistoryTracked(messages, summary, contextWindow, overheadTokens).Messages
+}
+
+// ShapeHistoryTracked is ShapeHistory plus an exact output-to-input index map.
+// The mapping is part of the compaction state transition contract: callers
+// must use it to move parallel per-message metadata onto the shaped slice.
+func ShapeHistoryTracked(messages []client.Message, summary string, contextWindow int, overheadTokens int) ShapedHistory {
+	identity := func() ShapedHistory {
+		sources := make([]int, len(messages))
+		for i := range sources {
+			sources[i] = i
+		}
+		return ShapedHistory{Messages: messages, SourceIndices: sources}
+	}
 	if overheadTokens < 0 {
 		overheadTokens = 0
 	}
 	// Skip shaping if too few messages to meaningfully shape (need system + first user + at least minKeepLast pairs)
 	if len(messages) <= 3+minKeepLast*2 {
-		return messages
+		return identity()
 	}
 	// Skip if both message count is low AND calibrated tokens fit under the
 	// compaction target. Judging against compactTargetTokens (not the raw
@@ -220,7 +253,7 @@ func ShapeHistory(messages []client.Message, summary string, contextWindow int, 
 	// when the trigger says "over the line", this gate must not say "fits".
 	if len(messages) <= 3+defaultKeepLast*2 &&
 		(contextWindow <= 0 || EstimateTokens(messages)+overheadTokens < compactTargetTokens(contextWindow)) {
-		return messages
+		return identity()
 	}
 
 	// Extract system message (index 0) and first user message
@@ -232,12 +265,13 @@ func ShapeHistory(messages []client.Message, summary string, contextWindow int, 
 
 	keepLast := defaultKeepLast
 	for keepLast >= minKeepLast {
-		shaped := buildShaped(system, firstUser, summary, rest, keepLast)
-		if contextWindow <= 0 || EstimateTokens(shaped)+overheadTokens < compactLandingTokens(contextWindow) {
-			if len(shaped) >= len(messages) {
+		shaped := buildShapedTracked(system, firstUser, summary, rest, keepLast)
+		if contextWindow <= 0 || EstimateTokens(shaped.Messages)+overheadTokens < compactLandingTokens(contextWindow) {
+			if len(shaped.Messages) >= len(messages) {
 				// Fits, but nothing was dropped (summary-only insertion).
-				return messages
+				return identity()
 			}
+			shaped.Applied = true
 			return shaped
 		}
 		keepLast--
@@ -248,10 +282,11 @@ func ShapeHistory(messages []client.Message, summary string, contextWindow int, 
 	// current constants the ≤ 3+minKeepLast*2 early return above already
 	// excludes every history the floor could fail to shrink, so this guard
 	// is defence-in-depth for future constant changes, not live logic.
-	floor := buildShaped(system, firstUser, summary, rest, minKeepLast)
-	if len(floor) >= len(messages) {
-		return messages
+	floor := buildShapedTracked(system, firstUser, summary, rest, minKeepLast)
+	if len(floor.Messages) >= len(messages) {
+		return identity()
 	}
+	floor.Applied = true
 	return floor
 }
 
@@ -319,6 +354,10 @@ func ForceShapeHistory(messages []client.Message, summary string, contextWindow 
 // load-bearing as the conversation primer. Boundary tool-pair stripping
 // only touches blocks whose pair is genuinely missing — not roles.
 func buildShaped(system, firstUser client.Message, summary string, rest []client.Message, keepLast int) []client.Message {
+	return buildShapedTracked(system, firstUser, summary, rest, keepLast).Messages
+}
+
+func buildShapedTracked(system, firstUser client.Message, summary string, rest []client.Message, keepLast int) ShapedHistory {
 	keepMsgs := keepLast * 2 // turn pairs = user + assistant
 	if keepMsgs > len(rest) {
 		keepMsgs = len(rest)
@@ -327,17 +366,25 @@ func buildShaped(system, firstUser client.Message, summary string, rest []client
 	recent := rest[len(rest)-keepMsgs:]
 
 	result := make([]client.Message, 0, 3+len(recent))
+	sources := make([]int, 0, 3+len(recent))
 	result = append(result, system, firstUser)
+	sources = append(sources, 0, 1)
 
 	if summary != "" {
 		result = append(result, client.Message{
 			Role:    "user",
-			Content: client.NewTextContent("Previous context summary: " + summary),
+			Content: client.NewTextContent(CompactionSummaryPrefix + summary),
 		})
+		sources = append(sources, SyntheticSourceIndex)
 	}
 
 	result = append(result, recent...)
-	return stripOrphanedToolPairs(result)
+	recentStart := 2 + len(rest) - keepMsgs
+	for i := range recent {
+		sources = append(sources, recentStart+i)
+	}
+	result, sources = stripOrphanedToolPairsTracked(result, sources)
+	return ShapedHistory{Messages: result, SourceIndices: sources}
 }
 
 // TruncateOversizedLastUserMessage rune-safely head+tail truncates the

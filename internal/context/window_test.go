@@ -1,6 +1,7 @@
 package context
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -383,6 +384,53 @@ func TestShapeHistory(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestShapeHistoryTracked_MapsRetainedMessagesExactly(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("system")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 50; i++ {
+		role := "assistant"
+		if i%2 == 1 {
+			role = "user"
+		}
+		messages = append(messages, client.Message{
+			Role: role, Content: client.NewTextContent(fmt.Sprintf("message-%02d", i)),
+		})
+	}
+	// The default 20-pair suffix begins at input index 12. Make that exact
+	// boundary an orphan-only assistant message so shaping removes it and the
+	// provenance slice must remove the same source position.
+	messages[12] = client.Message{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+		{Type: "tool_use", ID: "orphan-at-shape-boundary", Name: "read"},
+	})}
+
+	got := ShapeHistoryTracked(messages, "summary", 0, 0)
+	if !got.Applied {
+		t.Fatal("expected tracked shape to apply")
+	}
+	if len(got.Messages) != len(got.SourceIndices) {
+		t.Fatalf("messages/sources length mismatch: %d/%d", len(got.Messages), len(got.SourceIndices))
+	}
+	if got.SourceIndices[0] != 0 || got.SourceIndices[1] != 1 || got.SourceIndices[2] != SyntheticSourceIndex {
+		t.Fatalf("unexpected protected-prefix sources: %v", got.SourceIndices[:3])
+	}
+	for _, oldIdx := range got.SourceIndices {
+		if oldIdx == 12 {
+			t.Fatal("orphan-only boundary message retained in provenance")
+		}
+	}
+	for newIdx, oldIdx := range got.SourceIndices {
+		if oldIdx == SyntheticSourceIndex {
+			continue
+		}
+		if got.Messages[newIdx].Content.Text() != messages[oldIdx].Content.Text() {
+			t.Fatalf("source mismatch at new=%d old=%d: got %q, want %q",
+				newIdx, oldIdx, got.Messages[newIdx].Content.Text(), messages[oldIdx].Content.Text())
+		}
+	}
 }
 
 // TestTruncateOversizedLastUserMessage covers the short-session single-input

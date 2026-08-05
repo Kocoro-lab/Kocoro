@@ -6,6 +6,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textarea"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -122,6 +123,21 @@ func TestPermissions_Remove(t *testing.T) {
 func TestStatus_ShowsInfo(t *testing.T) {
 	m := newCommandTestModel(t)
 	m.version = "v0.1.42"
+	sess := m.sessions.Current()
+	sess.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("one")},
+		{Role: "assistant", Content: client.NewTextContent("two")},
+		{Role: "user", Content: client.NewTextContent("three")},
+		{Role: "assistant", Content: client.NewTextContent("four")},
+	}
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: len(sess.Messages),
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("primer")},
+			{Role: "assistant", Content: client.NewTextContent("summary")},
+		},
+	}
 
 	m.handleSlashCommand("/status")
 
@@ -132,7 +148,7 @@ func TestStatus_ShowsInfo(t *testing.T) {
 	for _, b := range m.output {
 		combined += b.rendered + "\n"
 	}
-	for _, want := range []string{"v0.1.42", "medium", "http://test"} {
+	for _, want := range []string{"v0.1.42", "medium", "http://test", "4 archived, 2 live messages"} {
 		if !strings.Contains(combined, want) {
 			t.Errorf("expected output to contain %q", want)
 		}

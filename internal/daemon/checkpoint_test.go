@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
@@ -321,6 +323,8 @@ func TestApplyTurnState_PersistsCompactionCheckpointWithoutReplacingArchive(t *t
 
 func TestCompactionCheckpoint_SecondRunDoesNotResummarizeArchive(t *testing.T) {
 	var summaryCalls atomic.Int32
+	var mainMu sync.Mutex
+	var mainRequests [][]client.Message
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req client.CompletionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -338,20 +342,25 @@ func TestCompactionCheckpoint_SecondRunDoesNotResummarizeArchive(t *testing.T) {
 Continue the deterministic checkpoint test.
 ## User corrections & decisions
 Keep the transcript lossless and reuse one stable summary.
-</summary>`
+			</summary>`
+		} else {
+			mainMu.Lock()
+			mainRequests = append(mainRequests, req.Messages)
+			mainMu.Unlock()
 		}
 		_ = json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
 	sess := &session.Session{}
+	primer := strings.Repeat("stable history payload ", 350)
 	for i := 0; i < 15; i++ {
 		role := "user"
 		if i%2 == 1 {
 			role = "assistant"
 		}
 		sess.Messages = append(sess.Messages, client.Message{
-			Role: role, Content: client.NewTextContent(strings.Repeat("stable history payload ", 350)),
+			Role: role, Content: client.NewTextContent(primer),
 		})
 		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "web"})
 	}
@@ -391,6 +400,22 @@ Keep the transcript lossless and reuse one stable summary.
 
 	if got := summaryCalls.Load(); got != firstSummaryCalls {
 		t.Fatalf("second run re-summarized the lossless archive: summary calls %d -> %d", firstSummaryCalls, got)
+	}
+	mainMu.Lock()
+	if len(mainRequests) == 0 {
+		mainMu.Unlock()
+		t.Fatal("second run sent no main request")
+	}
+	lastMain := append([]client.Message(nil), mainRequests[len(mainRequests)-1]...)
+	mainMu.Unlock()
+	if len(lastMain) < 4 {
+		t.Fatalf("second-run request too short: %#v", lastMain)
+	}
+	if got := lastMain[1].Content.Text(); got != primer {
+		t.Fatalf("second run lost the original first user: got %q, want %q", got, primer)
+	}
+	if got := lastMain[2].Content.Text(); !strings.HasPrefix(got, ctxwin.CompactionSummaryPrefix) {
+		t.Fatalf("second run lost the compacted summary: %q", got)
 	}
 	checkpointAfter, err := json.Marshal(sess.CompactionCheckpoint)
 	if err != nil {

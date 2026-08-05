@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 )
 
 // TestAgentLoop_CompactionAndMemoryPersist verifies the full compaction chain:
@@ -2164,6 +2165,153 @@ func TestAgentLoop_ReactiveEvidenceFloorShapesDespiteLowEstimate(t *testing.T) {
 	}
 	if err != nil {
 		t.Errorf("Run should succeed once the shaped retry goes through: %v", err)
+	}
+}
+
+func TestRemapCompactionMetadata_DroppedIndicesCannotCollideWithPrefix(t *testing.T) {
+	stamp := time.Unix(123, 0)
+	sources := []int{0, 1, ctxwin.SyntheticSourceIndex, 8, 9}
+	newOffset, injected, delta, timestamps := remapCompactionMetadata(
+		sources,
+		9,
+		map[int]bool{
+			6: true, // old idx-dropped arithmetic would collide with first user
+			8: true, // retained tail message
+		},
+		map[int]bool{
+			7: true, // old arithmetic would collide with synthetic summary
+			9: true, // retained current user
+		},
+		map[int]time.Time{6: stamp, 8: stamp, 9: stamp},
+	)
+
+	if injected[1] || delta[2] {
+		t.Fatalf("dropped metadata leaked onto protected prefix: injected=%v delta=%v", injected, delta)
+	}
+	if !injected[3] || !delta[4] {
+		t.Fatalf("retained tail metadata was lost: injected=%v delta=%v", injected, delta)
+	}
+	if newOffset != 4 {
+		t.Fatalf("current user offset = %d, want 4", newOffset)
+	}
+	if _, ok := timestamps[1]; ok {
+		t.Fatalf("dropped timestamp leaked onto first user: %v", timestamps)
+	}
+	if timestamps[3] != stamp || timestamps[4] != stamp {
+		t.Fatalf("retained timestamps were not remapped: %v", timestamps)
+	}
+}
+
+func TestCompactionChangesLiveState_DistinguishesNoopFromRewrite(t *testing.T) {
+	current := []client.Message{
+		{Role: "system", Content: client.NewTextContent("system")},
+		{Role: "user", Content: client.NewTextContent("primer")},
+	}
+	identity := ctxwin.ShapedHistory{
+		Messages:      append([]client.Message(nil), current...),
+		SourceIndices: []int{0, 1},
+	}
+	if compactionChangesLiveState(current, identity) {
+		t.Fatal("byte-identical shape must be a true no-op")
+	}
+
+	rewritten := identity
+	rewritten.Messages = append([]client.Message(nil), current...)
+	rewritten.Messages[1] = client.Message{Role: "user", Content: client.NewTextContent("compressed primer")}
+	if !compactionChangesLiveState(current, rewritten) {
+		t.Fatal("same-count tool/content compression must count as a live-state transition")
+	}
+
+	shorter := ctxwin.ShapedHistory{Messages: current[:1], SourceIndices: []int{0}, Applied: true}
+	if !compactionChangesLiveState(current, shorter) {
+		t.Fatal("message-dropping shape must count as a live-state transition")
+	}
+}
+
+func TestCompactionMetadata_RemainsExactAcrossSequentialShapes(t *testing.T) {
+	current := []client.Message{
+		{Role: "system", Content: client.NewTextContent("system")},
+		{Role: "user", Content: client.NewTextContent("primer")},
+	}
+	for i := 0; i < 60; i++ {
+		role := "assistant"
+		if i%2 == 1 {
+			role = "user"
+		}
+		current = append(current, client.Message{Role: role, Content: client.NewTextContent(fmt.Sprintf("first-%02d", i))})
+	}
+	injected := map[int]bool{len(current) - 2: true}
+	delta := map[int]bool{len(current) - 1: true}
+	timestamps := map[int]time.Time{len(current) - 1: time.Unix(1, 0)}
+	newOffset := len(current) - 1
+
+	first := ctxwin.ShapeHistoryTracked(current, "summary-one", 0, 0)
+	if !first.Applied {
+		t.Fatal("first shape did not apply")
+	}
+	newOffset, injected, delta, timestamps = remapCompactionMetadata(
+		first.SourceIndices, newOffset, injected, delta, timestamps)
+	current = first.Messages
+
+	// Grow a fresh tail and compact the already-compacted live state again.
+	for i := 0; i < 50; i++ {
+		role := "assistant"
+		if i%2 == 1 {
+			role = "user"
+		}
+		current = append(current, client.Message{Role: role, Content: client.NewTextContent(fmt.Sprintf("second-%02d", i))})
+	}
+	newOffset = len(current) - 1
+	injected[len(current)-2] = true
+	delta[len(current)-1] = true
+	timestamps[len(current)-1] = time.Unix(2, 0)
+
+	second := ctxwin.ShapeHistoryTracked(current, "summary-two", 0, 0)
+	if !second.Applied {
+		t.Fatal("second shape did not apply")
+	}
+	newOffset, injected, delta, timestamps = remapCompactionMetadata(
+		second.SourceIndices, newOffset, injected, delta, timestamps)
+
+	if injected[1] || delta[1] || injected[2] || delta[2] {
+		t.Fatalf("sequential remap contaminated primer/summary: injected=%v delta=%v", injected, delta)
+	}
+	if got := second.Messages[2].Content.Text(); got != ctxwin.CompactionSummaryPrefix+"summary-two" {
+		t.Fatalf("second summary = %q", got)
+	}
+	if newOffset < 3 || !delta[newOffset] || timestamps[newOffset] != time.Unix(2, 0) {
+		t.Fatalf("latest tail metadata lost after second shape: offset=%d delta=%v timestamps=%v", newOffset, delta, timestamps)
+	}
+}
+
+func TestResumeInterrupted_PreservesCompactedPrimerAndSummary(t *testing.T) {
+	var captured []client.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		captured = append([]client.Message(nil), req.Messages...)
+		json.NewEncoder(w).Encode(nativeResponse("continued", "end_turn", nil, 100, 10))
+	}))
+	defer server.Close()
+
+	history := []client.Message{
+		{Role: "user", Content: client.NewTextContent("original primer")},
+		{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "saved state")},
+		{Role: "assistant", Content: client.NewTextContent("saved partial reply")},
+	}
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), NewToolRegistry(), "medium", "", 3, 2000, 200, nil, nil, nil)
+	loop.SetSkillDiscovery(false)
+	if _, _, err := loop.ResumeInterrupted(context.Background(), "continue from checkpoint", history); err != nil {
+		t.Fatalf("ResumeInterrupted: %v", err)
+	}
+	if len(captured) < 5 {
+		t.Fatalf("captured request too short: %#v", captured)
+	}
+	if captured[1].Content.Text() != "original primer" ||
+		captured[2].Content.Text() != ctxwin.CompactionSummaryPrefix+"saved state" {
+		t.Fatalf("resume rewrote compacted prefix: %#v", captured[:3])
 	}
 }
 

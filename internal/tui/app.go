@@ -2560,12 +2560,15 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			agentName = m.agentOverride.Name
 		}
 		sessID := "(none)"
-		msgCount := 0
+		archiveMsgCount := 0
+		liveMsgCount := 0
 		tokenEst := 0
 		if sess != nil {
 			sessID = sess.ID
-			msgCount = len(sess.Messages)
-			tokenEst = ctxwin.EstimateTokens(sess.HistoryForLoop())
+			archiveMsgCount = len(sess.Messages)
+			liveHistory := sess.HistoryForLoop()
+			liveMsgCount = len(liveHistory)
+			tokenEst = ctxwin.EstimateTokens(liveHistory)
 		}
 		ctxWindow := m.cfg.Agent.ContextWindow
 		if ctxWindow <= 0 {
@@ -2582,11 +2585,11 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				"  Model:       %s\n"+
 				"  Endpoint:    %s\n"+
 				"  Agent:       %s\n"+
-				"  Session:     %s (%d messages)\n"+
+				"  Session:     %s (%d archived, %d live messages)\n"+
 				"  Context:     ~%s / %s tokens (%.1f%%)\n"+
 				"  Tools:       %d registered",
 			m.version, m.cfg.ModelTier, m.cfg.Endpoint, agentName,
-			sessID, msgCount,
+			sessID, archiveMsgCount, liveMsgCount,
 			formatTokenCount(tokenEst), formatTokenCount(ctxWindow), pct,
 			toolCount,
 		)))

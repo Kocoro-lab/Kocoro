@@ -2724,6 +2724,43 @@ func cloneMessages(messages []client.Message) []client.Message {
 	return out
 }
 
+func remapCompactionMetadata(
+	sourceIndices []int,
+	oldNewMsgOffset int,
+	oldInjected, oldDelta map[int]bool,
+	oldTimestamps map[int]time.Time,
+) (int, map[int]bool, map[int]bool, map[int]time.Time) {
+	newMsgOffset := -1
+	injected := make(map[int]bool)
+	delta := make(map[int]bool)
+	timestamps := make(map[int]time.Time)
+	for newIdx, oldIdx := range sourceIndices {
+		if oldIdx == ctxwin.SyntheticSourceIndex {
+			continue
+		}
+		if oldInjected[oldIdx] {
+			injected[newIdx] = true
+		}
+		if oldDelta[oldIdx] {
+			delta[newIdx] = true
+		}
+		if ts, ok := oldTimestamps[oldIdx]; ok {
+			timestamps[newIdx] = ts
+		}
+		if oldIdx == oldNewMsgOffset {
+			newMsgOffset = newIdx
+		}
+	}
+	return newMsgOffset, injected, delta, timestamps
+}
+
+func compactionChangesLiveState(current []client.Message, shaped ctxwin.ShapedHistory) bool {
+	if len(shaped.Messages) > len(current) {
+		return false
+	}
+	return !reflect.DeepEqual(shaped.Messages, current)
+}
+
 // reactiveSummaryInput injects the previous compaction summary ahead of the
 // current tail when reactive compaction needs to re-summarize shaped history.
 // The shaped history invariant is [system, first user, ...tail], so the
@@ -2734,7 +2771,7 @@ func reactiveSummaryInput(messages []client.Message, priorSummary string) []clie
 		return messages
 	}
 
-	summaryText := "Previous context summary: " + priorSummary
+	summaryText := ctxwin.CompactionSummaryPrefix + priorSummary
 	for _, msg := range messages {
 		if msg.Role == "user" && !msg.Content.HasBlocks() && msg.Content.Text() == summaryText {
 			return messages
@@ -3068,7 +3105,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	messages := make([]client.Message, 0)
 	messages = append(messages, client.Message{Role: "system", Content: client.NewTextContent(systemPrompt)})
 	if history != nil {
-		messages = append(messages, ctxwin.SanitizeHistory(history)...)
+		if ctxwin.IsCompactedHistory(history) {
+			messages = append(messages, ctxwin.SanitizeCompactedHistory(history)...)
+		} else {
+			messages = append(messages, ctxwin.SanitizeHistory(history)...)
+		}
 	}
 	var scaffoldedUserText string
 	var scaffoldUserPayloadText string
@@ -3254,6 +3295,40 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	activateCompactionCheckpoint := func() {
 		archiveTailOffset = len(messages)
 		liveCheckpointActive = true
+	}
+
+	// applyShapedHistory is the sole owner of a compaction state transition.
+	// ShapeHistoryTracked supplies exact origins for retained messages, so all
+	// parallel run-local metadata follows the message it belongs to. A net
+	// no-op never snapshots, activates a checkpoint, reanchors, or marks state
+	// dirty; callers retain control of their path-specific fallback behavior.
+	applyShapedHistory := func(shaped ctxwin.ShapedHistory, snapshotPhase, recordPhase string) (int, bool) {
+		before := len(messages)
+		// Preflight/reactive/force-stop shape a cloned history after local
+		// tool-result compression. Even when ShapeHistory itself returns a
+		// message-count no-op, that clone can still be materially smaller and
+		// must become the live checkpoint. Only an exact byte/state duplicate is
+		// a true no-op.
+		if !compactionChangesLiveState(messages, shaped) {
+			return 0, false
+		}
+		if len(shaped.Messages) != len(shaped.SourceIndices) {
+			a.recordCompactionFailure(recordPhase+"_provenance",
+				fmt.Errorf("shape result has %d messages but %d source indices", len(shaped.Messages), len(shaped.SourceIndices)))
+			return 0, false
+		}
+
+		preserveArchiveBeforeCompaction()
+		a.snapshotBeforeCompaction(snapshotPhase, messages)
+
+		messages = shaped.Messages
+		newMsgOffset, injectedIndices, deltaIndices, msgTimestamps = remapCompactionMetadata(
+			shaped.SourceIndices, newMsgOffset, injectedIndices, deltaIndices, msgTimestamps)
+
+		activateCompactionCheckpoint()
+		dropped := before - len(messages)
+		a.recordCompactionSuccess(recordPhase, fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
+		return dropped, true
 	}
 
 	// markInjected tags the message at the current end of the messages slice
@@ -3652,66 +3727,26 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 					fmt.Sprintf("force-stop turn estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
 						ctxwin.EstimateTokens(messages), a.estOverhead(), preflightCompactThreshold*100, a.contextWindow))
 			}
-			fsBefore := len(messages)
 			emergencyMessages := cloneMessages(messages)
 			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
-			preserveArchiveBeforeCompaction()
-			a.snapshotBeforeCompaction("force_stop", messages)
+			var shaped ctxwin.ShapedHistory
 			if sumErr == nil {
-				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
+				shaped = ctxwin.ShapeHistoryTracked(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
 			} else {
 				// Summary failed on the force-stop fallback path: emit telemetry
 				// (parity with main-loop preflight at line ~2279) so this last-resort
 				// degradation is visible. ShapeHistory without summary still drops
 				// middle messages. (See 2026-05-11 GPT review F3.)
 				a.recordCompactionFailure("force_stop_summary_failure", sumErr)
-				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow, a.estOverhead())
+				shaped = ctxwin.ShapeHistoryTracked(emergencyMessages, "", a.contextWindow, a.estOverhead())
 			}
-			activateCompactionCheckpoint()
-			if dropped := fsBefore - len(messages); dropped > 0 {
-				a.recordCompactionSuccess("force_stop_preflight",
-					fmt.Sprintf("msgs=%d→%d dropped=%d", fsBefore, len(messages), dropped))
-				// Rebase run-local indices — same bookkeeping as the main-loop
-				// preflight site above. Without this, captureRunMessages picks
-				// up a stale offset and the force-stop synthesis reply either
-				// fails to persist or carries the wrong metadata.
-				// (See 2026-05-11 GPT review F2.)
-				newMsgOffset -= dropped
-				if newMsgOffset < 1 {
-					newMsgOffset = 1
-				}
-				rebased := make(map[int]bool, len(injectedIndices))
-				for idx := range injectedIndices {
-					newIdx := idx - dropped
-					if newIdx >= newMsgOffset {
-						rebased[newIdx] = true
-					}
-				}
-				injectedIndices = rebased
-
-				rebasedDelta := make(map[int]bool, len(deltaIndices))
-				for idx := range deltaIndices {
-					newIdx := idx - dropped
-					if newIdx >= newMsgOffset {
-						rebasedDelta[newIdx] = true
-					}
-				}
-				deltaIndices = rebasedDelta
-
-				rebasedTS := make(map[int]time.Time, len(msgTimestamps))
-				for idx, ts := range msgTimestamps {
-					newIdx := idx - dropped
-					if newIdx >= newMsgOffset {
-						rebasedTS[newIdx] = ts
-					}
-				}
-				msgTimestamps = rebasedTS
+			if _, applied := applyShapedHistory(shaped, "force_stop", "force_stop_preflight"); applied {
+				captureRunMessages()
 			}
-			captureRunMessages()
 		}
 
 		req := client.CompletionRequest{
@@ -4226,8 +4261,8 @@ iterationLoop:
 				}
 				if compactionSummary != "" {
 					before := len(messages)
-					shaped := ctxwin.ShapeHistory(messages, compactionSummary, a.contextWindow, a.estOverhead())
-					if len(shaped) >= before {
+					shaped := ctxwin.ShapeHistoryTracked(messages, compactionSummary, a.contextWindow, a.estOverhead())
+					if !shaped.Applied {
 						// ShapeHistory declined (nothing would be dropped).
 						// Do NOT latch compactionApplied and do NOT reanchor:
 						// no history was rewritten, so telling the model
@@ -4250,54 +4285,13 @@ iterationLoop:
 								before, a.contextWindow, a.estOverhead())
 						}
 					} else {
-						preserveArchiveBeforeCompaction()
-						a.snapshotBeforeCompaction("proactive", messages)
-						messages = shaped
-						activateCompactionCheckpoint()
-						dropped := before - len(messages)
-						a.recordCompactionSuccess("proactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
-						// Adjust newMsgOffset: compaction drops middle messages
-						// but keeps the recent tail. Shift by the number dropped.
-						// Clamp to 1 (skip system prompt at index 0) so that
-						// captureRunMessages never includes the system message.
-						newMsgOffset -= dropped
-						if newMsgOffset < 1 {
-							newMsgOffset = 1
+						if _, applied := applyShapedHistory(shaped, "proactive", "proactive"); applied {
+							compactionApplied = true
+							restoreRecentReads(a.estOverhead())
+							reanchorActiveTask(MetaBoundaryPostCompaction)
+							captureRunMessages()
+							a.tracker.MarkDirty()
 						}
-						// Rebase injectedIndices and msgTimestamps: keys are absolute
-						// message indices that shifted downward after compaction.
-						rebased := make(map[int]bool, len(injectedIndices))
-						for idx := range injectedIndices {
-							newIdx := idx - dropped
-							if newIdx >= newMsgOffset {
-								rebased[newIdx] = true
-							}
-						}
-						injectedIndices = rebased
-
-						rebasedDelta := make(map[int]bool, len(deltaIndices))
-						for idx := range deltaIndices {
-							newIdx := idx - dropped
-							if newIdx >= newMsgOffset {
-								rebasedDelta[newIdx] = true
-							}
-						}
-						deltaIndices = rebasedDelta
-
-						rebasedTS := make(map[int]time.Time, len(msgTimestamps))
-						for idx, ts := range msgTimestamps {
-							newIdx := idx - dropped
-							if newIdx >= newMsgOffset {
-								rebasedTS[newIdx] = ts
-							}
-						}
-						msgTimestamps = rebasedTS
-
-						compactionApplied = true
-						restoreRecentReads(a.estOverhead())
-						reanchorActiveTask(MetaBoundaryPostCompaction)
-						captureRunMessages()
-						a.tracker.MarkDirty()
 					}
 				}
 			}
@@ -4438,55 +4432,21 @@ iterationLoop:
 					}
 				}
 			}
-			before := len(messages)
-			preserveArchiveBeforeCompaction()
-			a.snapshotBeforeCompaction("preflight", messages)
+			var shaped ctxwin.ShapedHistory
 			if sumErr == nil {
-				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
+				shaped = ctxwin.ShapeHistoryTracked(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
 			} else {
 				// Summary failed; ShapeHistory without summary still drops middle messages.
 				a.recordCompactionFailure("preflight_summary_failure", sumErr)
-				messages = ctxwin.ShapeHistory(emergencyMessages, "", a.contextWindow, a.estOverhead())
+				shaped = ctxwin.ShapeHistoryTracked(emergencyMessages, "", a.contextWindow, a.estOverhead())
 			}
-			activateCompactionCheckpoint()
-			if dropped := before - len(messages); dropped > 0 {
-				a.recordCompactionSuccess("preflight", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
-				newMsgOffset -= dropped
-				if newMsgOffset < 1 {
-					newMsgOffset = 1
-				}
-				rebased := make(map[int]bool, len(injectedIndices))
-				for idx := range injectedIndices {
-					newIdx := idx - dropped
-					if newIdx >= newMsgOffset {
-						rebased[newIdx] = true
-					}
-				}
-				injectedIndices = rebased
-
-				rebasedDelta := make(map[int]bool, len(deltaIndices))
-				for idx := range deltaIndices {
-					newIdx := idx - dropped
-					if newIdx >= newMsgOffset {
-						rebasedDelta[newIdx] = true
-					}
-				}
-				deltaIndices = rebasedDelta
-
-				rebasedTS := make(map[int]time.Time, len(msgTimestamps))
-				for idx, ts := range msgTimestamps {
-					newIdx := idx - dropped
-					if newIdx >= newMsgOffset {
-						rebasedTS[newIdx] = ts
-					}
-				}
-				msgTimestamps = rebasedTS
+			if _, applied := applyShapedHistory(shaped, "preflight", "preflight"); applied {
 				restoreRecentReads(a.estOverhead())
+				compactionApplied = true
+				reanchorActiveTask(MetaBoundaryPostCompaction)
+				captureRunMessages()
+				a.tracker.MarkDirty()
 			}
-			compactionApplied = true
-			reanchorActiveTask(MetaBoundaryPostCompaction)
-			captureRunMessages()
-			a.tracker.MarkDirty()
 		}
 
 		// Post-compaction safety net: ShapeHistory always preserves the
@@ -4812,7 +4772,6 @@ iterationLoop:
 						}
 					}
 
-					before := len(messages)
 					nextSummary := strings.TrimSpace(compactionSummary)
 
 					// The provider just rejected this history for length, so the
@@ -4843,8 +4802,8 @@ iterationLoop:
 						nextSummary = trimmed
 					}
 
-					shaped := ctxwin.ShapeHistory(softMessages, nextSummary, a.contextWindow, reactiveOverhead)
-					if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped)+reactiveOverhead >= a.contextWindow {
+					shaped := ctxwin.ShapeHistoryTracked(softMessages, nextSummary, a.contextWindow, reactiveOverhead)
+					if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped.Messages)+reactiveOverhead >= a.contextWindow {
 						fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
 						emergencyMessages := cloneMessages(messages)
 						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
@@ -4863,56 +4822,19 @@ iterationLoop:
 							nextSummary = trimmed
 						}
 
-						shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow, reactiveOverhead)
+						shaped = ctxwin.ShapeHistoryTracked(emergencyMessages, nextSummary, a.contextWindow, reactiveOverhead)
 					}
 
-					preserveArchiveBeforeCompaction()
-					a.snapshotBeforeCompaction("reactive", messages)
-					messages = shaped
-					activateCompactionCheckpoint()
+					_, checkpointApplied := applyShapedHistory(shaped, "reactive", "reactive")
 					compactionSummary = nextSummary
 					compactionSummaryIter = i
-					compactionApplied = true
+					compactionApplied = compactionApplied || checkpointApplied
 					reactiveCompacted = true // never reset — prevents infinite reactive loops
-					// Durable: the summary was expensive; checkpoint before we
-					// retry the LLM call so a crash in the retry does not force
-					// redoing the summary on next run.
-					a.tracker.MarkDirty()
-
-					// Rebase run-local indices — same bookkeeping as proactive compaction.
-					if len(messages) < before {
-						dropped := before - len(messages)
-						a.recordCompactionSuccess("reactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
-						newMsgOffset -= dropped
-						if newMsgOffset < 1 {
-							newMsgOffset = 1
-						}
-						rebased := make(map[int]bool, len(injectedIndices))
-						for idx := range injectedIndices {
-							newIdx := idx - dropped
-							if newIdx >= newMsgOffset {
-								rebased[newIdx] = true
-							}
-						}
-						injectedIndices = rebased
-
-						rebasedDelta := make(map[int]bool, len(deltaIndices))
-						for idx := range deltaIndices {
-							newIdx := idx - dropped
-							if newIdx >= newMsgOffset {
-								rebasedDelta[newIdx] = true
-							}
-						}
-						deltaIndices = rebasedDelta
-
-						rebasedTS := make(map[int]time.Time, len(msgTimestamps))
-						for idx, ts := range msgTimestamps {
-							newIdx := idx - dropped
-							if newIdx >= newMsgOffset {
-								rebasedTS[newIdx] = ts
-							}
-						}
-						msgTimestamps = rebasedTS
+					if checkpointApplied {
+						// Durable: the summary was expensive; checkpoint before we
+						// retry the LLM call so a crash in the retry does not force
+						// redoing the summary on next run.
+						a.tracker.MarkDirty()
 					}
 
 					// Deliberately NO file restoration here: the provider just
@@ -4923,8 +4845,10 @@ iterationLoop:
 					// retry keeps every token shaping recovered, and the
 					// NoRestore reanchor variant tells the model to re-read
 					// what it needs once the run survives.
-					reanchorActiveTask(MetaBoundaryPostCompactionNoRestore)
-					captureRunMessages()
+					if checkpointApplied {
+						reanchorActiveTask(MetaBoundaryPostCompactionNoRestore)
+						captureRunMessages()
+					}
 
 					// Rebuild request with compacted messages. The ordinary
 					// Responses cursor is deliberately NOT carried over: with
