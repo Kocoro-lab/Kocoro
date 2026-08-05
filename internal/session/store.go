@@ -193,6 +193,7 @@ func (s *Session) LastSeenModel() string {
 // omitted from JSON for smaller session files.
 type UsageSummary struct {
 	LLMCalls              int     `json:"llm_calls,omitempty"`
+	WebSearchCalls        int     `json:"web_search_calls,omitempty"`
 	InputTokens           int     `json:"input_tokens,omitempty"`
 	OutputTokens          int     `json:"output_tokens,omitempty"`
 	TotalTokens           int     `json:"total_tokens,omitempty"`
@@ -210,9 +211,10 @@ type UsageSummary struct {
 // UsageFromTurn converts LLM-only numeric values into a UsageSummary.
 // Left in place for callers that only have LLM data; new code should prefer
 // UsageFromAccumulated which carries both LLM and gateway-tool costs.
-func UsageFromTurn(llmCalls, inputTokens, outputTokens, totalTokens int, costUSD float64, cacheRead, cacheCreation, cacheCreation5m, cacheCreation1h int, model string) UsageSummary {
+func UsageFromTurn(llmCalls, webSearchCalls, inputTokens, outputTokens, totalTokens int, costUSD float64, cacheRead, cacheCreation, cacheCreation5m, cacheCreation1h int, model string) UsageSummary {
 	return UsageSummary{
 		LLMCalls:              llmCalls,
+		WebSearchCalls:        webSearchCalls,
 		InputTokens:           inputTokens,
 		OutputTokens:          outputTokens,
 		TotalTokens:           totalTokens,
@@ -229,12 +231,13 @@ func UsageFromTurn(llmCalls, inputTokens, outputTokens, totalTokens int, costUSD
 // tool costs as separate fields so totals stay unambiguous when a run
 // touched billed tools (x_search, web_search).
 func UsageFromAccumulated(
-	llmCalls, inputTokens, outputTokens, totalTokens int, costUSD float64,
+	llmCalls, webSearchCalls, inputTokens, outputTokens, totalTokens int, costUSD float64,
 	cacheRead, cacheCreation, cacheCreation5m, cacheCreation1h int, model string,
 	toolCalls int, toolCostUSD float64,
 ) UsageSummary {
 	return UsageSummary{
 		LLMCalls:              llmCalls,
+		WebSearchCalls:        webSearchCalls,
 		InputTokens:           inputTokens,
 		OutputTokens:          outputTokens,
 		TotalTokens:           totalTokens,
@@ -252,6 +255,7 @@ func UsageFromAccumulated(
 // Add accumulates another UsageSummary into u.
 func (u *UsageSummary) Add(o UsageSummary) {
 	u.LLMCalls += o.LLMCalls
+	u.WebSearchCalls += o.WebSearchCalls
 	u.InputTokens += o.InputTokens
 	u.OutputTokens += o.OutputTokens
 	u.TotalTokens += o.TotalTokens

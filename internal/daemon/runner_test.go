@@ -2135,16 +2135,18 @@ func TestComputeReportedUsage(t *testing.T) {
 		// The partial result must carry those tokens (the GPT review's
 		// motivating scenario).
 		turn := &agent.TurnUsage{
-			InputTokens:  10,
-			OutputTokens: 20,
-			TotalTokens:  30,
-			CostUSD:      0.0001,
+			InputTokens:    10,
+			OutputTokens:   20,
+			TotalTokens:    30,
+			CostUSD:        0.0001,
+			WebSearchCalls: 1,
 		}
 		want := RunAgentUsage{
-			InputTokens:  10,
-			OutputTokens: 20,
-			TotalTokens:  30,
-			CostUSD:      0.0001,
+			InputTokens:    10,
+			OutputTokens:   20,
+			TotalTokens:    30,
+			CostUSD:        0.0001,
+			WebSearchCalls: 1,
 		}
 		got := computeReportedUsage(turn, nullEventHandler{})
 		if got != want {
@@ -2161,11 +2163,12 @@ func TestComputeReportedUsage(t *testing.T) {
 		handler := fakeUsageHandler{
 			snapshot: agent.AccumulatedUsage{
 				LLM: agent.TurnUsage{
-					InputTokens:  100,
-					OutputTokens: 200,
-					TotalTokens:  300,
-					CostUSD:      0.01,
-					LLMCalls:     2,
+					InputTokens:    100,
+					OutputTokens:   200,
+					TotalTokens:    300,
+					CostUSD:        0.01,
+					LLMCalls:       2,
+					WebSearchCalls: 2,
 				},
 				ToolCostUSD: 0.001,
 			},
@@ -2173,14 +2176,27 @@ func TestComputeReportedUsage(t *testing.T) {
 		// Loop-level usage is also non-zero; accumulator should still win.
 		turn := &agent.TurnUsage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11, CostUSD: 0.0002}
 		want := RunAgentUsage{
-			InputTokens:  100,
-			OutputTokens: 200,
-			TotalTokens:  300,
-			CostUSD:      0.011, // 0.01 LLM + 0.001 tool
+			InputTokens:    100,
+			OutputTokens:   200,
+			TotalTokens:    300,
+			CostUSD:        0.011, // 0.01 LLM + 0.001 tool
+			WebSearchCalls: 2,
 		}
 		got := computeReportedUsage(turn, handler)
 		if got != want {
 			t.Errorf("got %+v, want %+v (accumulator must override loop-level usage)", got, want)
+		}
+	})
+
+	t.Run("search_only_accumulator_is_reported", func(t *testing.T) {
+		handler := fakeUsageHandler{
+			snapshot: agent.AccumulatedUsage{
+				LLM: agent.TurnUsage{WebSearchCalls: 1},
+			},
+		}
+		want := RunAgentUsage{WebSearchCalls: 1}
+		if got := computeReportedUsage(nil, handler); got != want {
+			t.Errorf("got %+v, want %+v", got, want)
 		}
 	})
 

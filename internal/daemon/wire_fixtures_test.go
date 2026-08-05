@@ -470,10 +470,11 @@ func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 		SessionID: fixture["session_id"].(string),
 		Agent:     fixture["agent"].(string),
 		Usage: RunAgentUsage{
-			InputTokens:  18432,
-			OutputTokens: 956,
-			TotalTokens:  19388,
-			CostUSD:      0.0712,
+			InputTokens:    18432,
+			OutputTokens:   956,
+			TotalTokens:    19388,
+			CostUSD:        0.0712,
+			WebSearchCalls: 1,
 		},
 	}
 	raw := []byte(mustJSON(result))
@@ -487,16 +488,17 @@ func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 		SessionID            string   `json:"session_id"`
 		Agent                string   `json:"agent"`
 		Usage                struct {
-			InputTokens  int     `json:"input_tokens"`
-			OutputTokens int     `json:"output_tokens"`
-			TotalTokens  int     `json:"total_tokens"`
-			CostUSD      float64 `json:"cost_usd"`
+			InputTokens    int     `json:"input_tokens"`
+			OutputTokens   int     `json:"output_tokens"`
+			TotalTokens    int     `json:"total_tokens"`
+			CostUSD        float64 `json:"cost_usd"`
+			WebSearchCalls int     `json:"web_search_calls"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &done); err != nil {
 		t.Fatalf("consumer decode failed: %v", err)
 	}
-	if done.Reply == "" || done.Usage.TotalTokens != 19388 {
+	if done.Reply == "" || done.Usage.TotalTokens != 19388 || done.Usage.WebSearchCalls != 1 {
 		t.Fatalf("consumer decode lost fields: %+v", done)
 	}
 }

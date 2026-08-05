@@ -89,6 +89,7 @@ func LLMUsageDelta(u client.Usage, model string) TurnUsage {
 		TotalTokens:           u.TotalTokens,
 		CostUSD:               u.CostUSD,
 		LLMCalls:              1,
+		WebSearchCalls:        u.WebSearchCalls,
 		Model:                 model,
 		CacheReadTokens:       u.CacheReadTokens,
 		CacheCreationTokens:   u.CacheCreationTokens,
@@ -121,6 +122,7 @@ func (a *UsageAccumulator) Add(u TurnUsage) {
 	a.llm.CacheCreation5mTokens += u.CacheCreation5mTokens
 	a.llm.CacheCreation1hTokens += u.CacheCreation1hTokens
 	a.llm.LLMCalls += u.LLMCalls
+	a.llm.WebSearchCalls += u.WebSearchCalls
 	if u.Model != "" {
 		a.llm.Model = u.Model
 	}

@@ -3721,12 +3721,13 @@ func (h *sseEventHandler) OnUsage(usage agent.TurnUsage) {
 	h.usage.Add(usage)
 	// Also emit as SSE event so clients can render live cost meters.
 	data := mustJSON(map[string]interface{}{
-		"input_tokens":  usage.InputTokens,
-		"output_tokens": usage.OutputTokens,
-		"total_tokens":  usage.TotalTokens,
-		"cost_usd":      usage.CostUSD,
-		"llm_calls":     usage.LLMCalls,
-		"model":         usage.Model,
+		"input_tokens":     usage.InputTokens,
+		"output_tokens":    usage.OutputTokens,
+		"total_tokens":     usage.TotalTokens,
+		"cost_usd":         usage.CostUSD,
+		"llm_calls":        usage.LLMCalls,
+		"web_search_calls": usage.WebSearchCalls,
+		"model":            usage.Model,
 	})
 	fmt.Fprintf(h.w, "event: usage\ndata: %s\n\n", data)
 	h.flusher.Flush()

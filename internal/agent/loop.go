@@ -591,6 +591,7 @@ type TurnUsage struct {
 	TotalTokens           int
 	CostUSD               float64
 	LLMCalls              int
+	WebSearchCalls        int
 	Model                 string // actual model from gateway response
 	CacheReadTokens       int
 	CacheCreationTokens   int
@@ -614,6 +615,7 @@ func (u *TurnUsage) Add(r client.Usage) {
 	u.CacheCreation5mTokens += delta.CacheCreation5mTokens
 	u.CacheCreation1hTokens += delta.CacheCreation1hTokens
 	u.LLMCalls += delta.LLMCalls
+	u.WebSearchCalls += delta.WebSearchCalls
 
 	// Cache telemetry: track capability and miss streaks
 	if delta.CacheCreationTokens > 0 || delta.CacheReadTokens > 0 {

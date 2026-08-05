@@ -101,9 +101,9 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		sess.Messages = shaped
 		sess.MessageMeta = newMeta
 		acc := usage.Snapshot()
-		if llm := acc.LLM; llm.LLMCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 {
+		if llm := acc.LLM; llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 {
 			m.sessions.AddUsage(sess.ID, session.UsageFromAccumulated(
-				llm.LLMCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
+				llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
 				llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
 				acc.ToolCalls, acc.ToolCostUSD,
 			))
