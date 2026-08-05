@@ -86,12 +86,7 @@ func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 		mutated = true
 	}
 
-	var messageArrays [][]any
 	if rawMessages, ok := top["messages"].([]any); ok {
-		messageArrays = append(messageArrays, rawMessages)
-	}
-
-	for _, rawMessages := range messageArrays {
 		for _, rawMsg := range rawMessages {
 			msg, ok := rawMsg.(map[string]any)
 			if !ok {

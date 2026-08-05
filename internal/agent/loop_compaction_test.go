@@ -2323,6 +2323,56 @@ func TestResumeInterrupted_PreservesCompactedPrimerAndSummary(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_EmptySummaryCheckpointPreservesPrimerOnNextTurn(t *testing.T) {
+	var captured []client.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		captured = append([]client.Message(nil), req.Messages...)
+		json.NewEncoder(w).Encode(nativeResponse("continued", "end_turn", nil, 100, 10))
+	}))
+	defer server.Close()
+
+	archive := []client.Message{{Role: "system", Content: client.NewTextContent("old system")}}
+	for i := 0; i < 30; i++ {
+		userText := fmt.Sprintf("request-%d", i)
+		if i == 0 {
+			userText = "original primer"
+		}
+		archive = append(archive,
+			client.Message{Role: "user", Content: client.NewTextContent(userText)},
+			client.Message{Role: "assistant", Content: client.NewTextContent(fmt.Sprintf("reply-%d", i))},
+		)
+	}
+	shaped := ctxwin.ShapeHistory(archive, "", 128000, 0)
+	if len(shaped) >= len(archive) || len(shaped) < 3 {
+		t.Fatalf("precondition: empty-summary history was not shaped: %d -> %d", len(archive), len(shaped))
+	}
+	history := shaped[1:] // persisted checkpoints omit the per-run system prompt
+
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), NewToolRegistry(), "medium", "", 3, 128000, 200, nil, nil, nil)
+	loop.SetSkillDiscovery(false)
+	if _, _, err := loop.Run(context.Background(), "continue after degraded compaction", nil, history); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	primerIndex, markerIndex := -1, -1
+	for i, msg := range captured {
+		switch msg.Content.Text() {
+		case "original primer":
+			primerIndex = i
+		case ctxwin.CompactionSummaryPrefix + "(summary unavailable)":
+			markerIndex = i
+		}
+	}
+	if primerIndex < 0 || markerIndex != primerIndex+1 {
+		t.Fatalf("next-turn request lost or rewrote degraded checkpoint prefix: primer=%d marker=%d messages=%#v",
+			primerIndex, markerIndex, captured)
+	}
+}
+
 // TestEstOverheadResets pins the defensive calibration resets: a tool-registry
 // swap (SwitchAgent) changes the schema mass the overhead measures, and a
 // session switch on a reused loop (SetSessionID) makes the sample unrelated.

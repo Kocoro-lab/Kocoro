@@ -178,7 +178,7 @@ func TestApplyTurnState_HardErrorAfterCheckpoint_NoDuplicate(t *testing.T) {
 	// more failed LLM call).
 	up.usage.LLM.InputTokens = 70 // +20 since checkpoint
 	up.usage.LLM.LLMCalls = 2
-	applyHardErrorTurnMessages(sess, loop, base, "web", "Sorry, something failed.", time.Now())
+	applyHardErrorTurnMessages(sess, loop, base, "Sorry, something failed.", time.Now())
 	applyTurnUsage(sess, up, base)
 
 	// Expected: 1 baseline + 2 turn + 1 error stub = 4 total. No duplicates.
@@ -541,7 +541,7 @@ func TestApplyHardErrorTurnMessages_KoeCheckpointIsTagStripped(t *testing.T) {
 		{Role: "assistant", Content: client.NewTextContent("detail\n" + tag)},
 	})
 
-	applyHardErrorTurnMessages(sess, loop, base, "koe", "Friendly failure.", time.Unix(1, 0))
+	applyHardErrorTurnMessages(sess, loop, base, "Friendly failure.", time.Unix(1, 0))
 
 	cp := sess.CompactionCheckpoint
 	if cp == nil {
@@ -565,5 +565,23 @@ func TestApplyHardErrorTurnMessages_KoeCheckpointIsTagStripped(t *testing.T) {
 	}
 	if !strings.Contains(cp.Messages[1].Content.Text(), "detail") {
 		t.Fatalf("checkpoint lost reply body: %q", cp.Messages[1].Content.Text())
+	}
+}
+
+func TestApplyHardErrorTurnMessages_UsesNormalizedBaselineSource(t *testing.T) {
+	sess := &session.Session{
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("older")}},
+		MessageMeta: []session.MessageMeta{{Source: "unknown"}},
+	}
+	base := captureTurnBaseline(sess, "unknown", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("ask")},
+	})
+
+	applyHardErrorTurnMessages(sess, loop, base, "Friendly failure.", time.Unix(1, 0))
+
+	if got := sess.MessageMeta[len(sess.MessageMeta)-1].Source; got != "unknown" {
+		t.Fatalf("hard-error source = %q, want normalized baseline source %q", got, "unknown")
 	}
 }

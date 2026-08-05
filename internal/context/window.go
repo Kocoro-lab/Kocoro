@@ -2,6 +2,7 @@ package context
 
 import (
 	"math"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -11,6 +12,12 @@ import (
 // distinguish a shaped history from an ordinary history containing adjacent
 // user messages.
 const CompactionSummaryPrefix = "Previous context summary: "
+
+// compactionSummaryUnavailable keeps a shaped history structurally marked
+// when summarization fails or returns blank output. The marker is load-bearing:
+// the next Run uses it to preserve the primer and leading retained user
+// messages instead of applying ordinary keep-later role merging.
+const compactionSummaryUnavailable = "(summary unavailable)"
 
 // SyntheticSourceIndex marks a message created by shaping rather than retained
 // from the input history.
@@ -311,12 +318,9 @@ func ForceShapeHistory(messages []client.Message, summary string, contextWindow 
 	rest := messages[2:]
 
 	// Largest keepLast that still nets a reduction: buildShaped keeps
-	// keepLast*2 tail messages and adds the summary message (when present),
-	// so require keepLast*2 ≤ len(rest) − (1 + summaryLen).
-	minDrop := 1
-	if summary != "" {
-		minDrop = 2
-	}
+	// keepLast*2 tail messages and always adds the compaction marker, so require
+	// keepLast*2 ≤ len(rest) − 2 (one dropped message plus the inserted marker).
+	minDrop := 2
 	keepLast := (len(rest) - minDrop) / 2
 	if keepLast > defaultKeepLast {
 		keepLast = defaultKeepLast
@@ -370,13 +374,14 @@ func buildShapedTracked(system, firstUser client.Message, summary string, rest [
 	result = append(result, system, firstUser)
 	sources = append(sources, 0, 1)
 
-	if summary != "" {
-		result = append(result, client.Message{
-			Role:    "user",
-			Content: client.NewTextContent(CompactionSummaryPrefix + summary),
-		})
-		sources = append(sources, SyntheticSourceIndex)
+	if strings.TrimSpace(summary) == "" {
+		summary = compactionSummaryUnavailable
 	}
+	result = append(result, client.Message{
+		Role:    "user",
+		Content: client.NewTextContent(CompactionSummaryPrefix + summary),
+	})
+	sources = append(sources, SyntheticSourceIndex)
 
 	result = append(result, recent...)
 	recentStart := 2 + len(rest) - keepMsgs

@@ -922,13 +922,14 @@ func TestHistoryForLoop_CompactionCheckpointUsesRawArchiveIndex(t *testing.T) {
 			SchemaVersion:       CompactionCheckpointSchemaVersion,
 			ArchiveThroughIndex: 4, // raw index, including the injected message
 			Messages: []client.Message{
-				{Role: "user", Content: client.NewTextContent("stable compacted summary")},
+				{Role: "user", Content: client.NewTextContent("original primer")},
+				{Role: "user", Content: client.NewTextContent("Previous context summary: stable compacted summary")},
 			},
 		},
 	}
 
 	got := sess.HistoryForLoop()
-	want := []string{"stable compacted summary", "new user after checkpoint", "new reply after checkpoint"}
+	want := []string{"original primer", "Previous context summary: stable compacted summary", "new user after checkpoint", "new reply after checkpoint"}
 	if len(got) != len(want) {
 		t.Fatalf("got %d live messages, want %d: %#v", len(got), len(want), got)
 	}
@@ -973,6 +974,28 @@ func TestHistoryForLoop_InvalidCheckpointFallsBackToArchive(t *testing.T) {
 	_ = plain.HistoryForLoop()
 	if strings.Contains(logs.String(), "compaction checkpoint") {
 		t.Fatalf("nil checkpoint logged as invalid: %q", logs.String())
+	}
+
+	// Structurally valid legacy/malformed checkpoints still feed their live
+	// view forward, but must be attributable when the compaction marker is
+	// absent — otherwise the next-turn sanitizer failure aliases to normal use.
+	logs.Reset()
+	markerless := &Session{
+		ID:       "markerless-checkpoint-session",
+		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("archive")}},
+		CompactionCheckpoint: &CompactionCheckpoint{
+			SchemaVersion:       CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 1,
+			Messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("primer")},
+				{Role: "user", Content: client.NewTextContent("retained user without marker")},
+			},
+		},
+	}
+	_ = markerless.HistoryForLoop()
+	if text := logs.String(); !strings.Contains(text, "missing the compacted-history marker") ||
+		!strings.Contains(text, `session="markerless-checkpoint-session"`) {
+		t.Fatalf("markerless checkpoint invariant violation was silent: %q", text)
 	}
 }
 

@@ -4033,7 +4033,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			//       batches that never got their own save.
 			//   (c) usage was already folded by a checkpoint — AddUsage
 			//       would double-count, so use baseline+current instead.
-			applyHardErrorTurnMessages(sess, loop, turnBase, req.Source, userErr, time.Now())
+			applyHardErrorTurnMessages(sess, loop, turnBase, userErr, time.Now())
 			applyTurnUsage(sess, turnUsage, turnBase)
 			// Persist tool-result budget state so dedup/replacement bookkeeping
 			// from this crashed turn survives resume; mid-turn checkpoints
@@ -5003,7 +5003,7 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 // The order is intentional: ArchiveThroughIndex must stop before the synthetic
 // error message, which was never part of the compacted model-live state.
 func applyHardErrorTurnMessages(sess *session.Session, loop *agent.AgentLoop,
-	b turnBaseline, source, userErr string, replyTime time.Time) {
+	b turnBaseline, userErr string, replyTime time.Time) {
 	applyTurnMessages(sess, loop, b)
 	applyCompactionCheckpoint(sess, loop)
 	if isKoeSource(b.source) {
@@ -5013,7 +5013,7 @@ func applyHardErrorTurnMessages(sess *session.Session, loop *agent.AgentLoop,
 		client.Message{Role: "assistant", Content: client.NewTextContent(userErr)},
 	)
 	sess.MessageMeta = append(sess.MessageMeta,
-		session.MessageMeta{Source: source, Timestamp: session.TimePtr(replyTime)},
+		session.MessageMeta{Source: b.source, Timestamp: session.TimePtr(replyTime)},
 	)
 }
 

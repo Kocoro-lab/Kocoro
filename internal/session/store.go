@@ -328,6 +328,10 @@ func (s *Session) HistoryForLoop() []client.Message {
 			s.ID, cp.SchemaVersion, len(cp.Messages), cp.ArchiveThroughIndex, len(s.Messages))
 		return FilterInjected(s.Messages, s.MessageMeta)
 	}
+	if !ctxwin.IsCompactedHistory(cp.Messages) {
+		log.Printf("session: compaction checkpoint is structurally valid but missing the compacted-history marker (session=%q messages=%d archive_through_index=%d); next-turn sanitization may degrade the primer",
+			s.ID, len(cp.Messages), cp.ArchiveThroughIndex)
+	}
 
 	through := cp.ArchiveThroughIndex
 	tailMeta := s.MessageMeta
