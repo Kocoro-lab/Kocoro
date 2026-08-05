@@ -1138,6 +1138,7 @@ type Usage struct {
 	OutputTokens          int     `json:"output_tokens"`
 	TotalTokens           int     `json:"total_tokens"`
 	CostUSD               float64 `json:"cost_usd"`
+	WebSearchCalls        int     `json:"web_search_calls,omitempty"`
 	CacheReadTokens       int     `json:"cache_read_tokens,omitempty"`
 	CacheCreationTokens   int     `json:"cache_creation_tokens,omitempty"`
 	CacheCreation5mTokens int     `json:"cache_creation_5m_tokens,omitempty"`

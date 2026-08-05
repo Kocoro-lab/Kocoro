@@ -1930,6 +1930,44 @@ func TestAgentLoop_ToolSearchLoadsBrowserFamilyCoreAndReanchorsTask(t *testing.T
 	}
 }
 
+func TestAgentLoop_HostedWebSearchCompletesAfterToolSearch(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("tool_search", `{"query":"select:web_search"}`), 10, 5))
+		case 2:
+			resp := nativeResponse("Current answer with sources.", "end_turn", nil, 10, 5)
+			resp.Usage.WebSearchCalls = 1
+			json.NewEncoder(w).Encode(resp)
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(&bulkyMockMCPTool{name: "web_search"})
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+
+	result, _, err := loop.Run(context.Background(), "Find the latest answer.", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Current answer with sources." {
+		t.Fatalf("result = %q, want hosted-search answer", result)
+	}
+	if callCount != 2 {
+		t.Fatalf("completion requests = %d, want 2", callCount)
+	}
+}
+
 func TestAgentLoop_TerminalComputerUseFailureBlocksBrowserFallbackInTurn(
 	t *testing.T,
 ) {

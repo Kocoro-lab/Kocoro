@@ -5346,16 +5346,18 @@ iterationLoop:
 				continue
 			}
 
-			// tool_search loaded schemas but the model stopped with text instead
-			// of calling the loaded tools — nudge it to continue.
+			// tool_search loaded schemas but the model stopped with text without
+			// using hosted search or calling a loaded tool — nudge it to continue.
 			if toolSearchFired {
 				toolSearchFired = false
-				reanchorActiveTask(MetaBoundaryToolSearchLoaded)
-				// tool_search nudge path — preserve the model's pre-load
-				// reasoning so the next iteration sees the same trajectory.
-				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
-				stampMessage()
-				continue
+				if resp.Usage.WebSearchCalls == 0 {
+					reanchorActiveTask(MetaBoundaryToolSearchLoaded)
+					// tool_search nudge path — preserve the model's pre-load
+					// reasoning so the next iteration sees the same trajectory.
+					messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
+					stampMessage()
+					continue
+				}
 			}
 
 			// Only render text for the final response — intermediate text
