@@ -99,7 +99,7 @@ func TestCompleteStreamPrefersResponsesForOrdinaryRequests(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprintln(w, `data: {"type":"done","provider":"openai","model":"gpt-test","output_text":"done","usage":{}}`)
+		fmt.Fprintln(w, `data: {"type":"done","provider":"openai","model":"gpt-test","output_text":"done","usage":{"web_search_calls":1}}`)
 		fmt.Fprintln(w, `data: [DONE]`)
 	}))
 	defer server.Close()
@@ -114,6 +114,9 @@ func TestCompleteStreamPrefersResponsesForOrdinaryRequests(t *testing.T) {
 	}
 	if response.OutputText != "done" {
 		t.Fatalf("output = %q, want done", response.OutputText)
+	}
+	if response.Usage.WebSearchCalls != 1 {
+		t.Fatalf("web_search_calls = %d, want 1", response.Usage.WebSearchCalls)
 	}
 	if got.PreferredAPISurface != "responses" || !got.Stream {
 		t.Fatalf("stream request = %+v, want Responses preference and stream=true", got)

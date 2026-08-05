@@ -563,12 +563,13 @@ func (h *remoteRunEventHandler) OnUsage(usage agent.TurnUsage) {
 		Type:      "usage",
 		SessionID: h.sessionID,
 		Payload: rawJSON(map[string]any{
-			"input_tokens":  usage.InputTokens,
-			"output_tokens": usage.OutputTokens,
-			"total_tokens":  usage.TotalTokens,
-			"cost_usd":      usage.CostUSD,
-			"llm_calls":     usage.LLMCalls,
-			"model":         usage.Model,
+			"input_tokens":     usage.InputTokens,
+			"output_tokens":    usage.OutputTokens,
+			"total_tokens":     usage.TotalTokens,
+			"cost_usd":         usage.CostUSD,
+			"llm_calls":        usage.LLMCalls,
+			"web_search_calls": usage.WebSearchCalls,
+			"model":            usage.Model,
 		}),
 	})
 }

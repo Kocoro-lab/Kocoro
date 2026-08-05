@@ -95,7 +95,7 @@ type RunAgentRequest struct {
 	PinnedRouteKey          string                           `json:"-"`                           // internal: returned verbatim by ComputeRouteKey so it survives the post-@mention recompute. Sticky schedules pin their dedicated agent:<name>:schedule:<id> key here; json:"-" so HTTP clients cannot pin an arbitrary route.
 	ScheduleID              string                           `json:"-"`                           // internal: owning schedule for scheduler-created sessions. Persisted onto session metadata; HTTP clients cannot forge the association.
 	Ephemeral               bool                             `json:"-"`                           // caller owns persistence + events
-	ModelOverride           string                           `json:"-"`                           // overrides agent model tier
+	ModelOverride           string                           `json:"-"`                           // internal tier override; an exact model pin remains authoritative
 	BypassRouting           bool                             `json:"-"`                           // skip route lock (heartbeat runs)
 	SessionHistory          []client.Message                 `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
 	OmitHistory             bool                             `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
@@ -1622,10 +1622,11 @@ func terminalIdempotencyState(outcomeKnown bool, runErr error, deliverableCount 
 
 // RunAgentUsage tracks token and cost information for a single agent run.
 type RunAgentUsage struct {
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	TotalTokens  int     `json:"total_tokens"`
-	CostUSD      float64 `json:"cost_usd"`
+	InputTokens    int     `json:"input_tokens"`
+	OutputTokens   int     `json:"output_tokens"`
+	TotalTokens    int     `json:"total_tokens"`
+	CostUSD        float64 `json:"cost_usd"`
+	WebSearchCalls int     `json:"web_search_calls"`
 }
 
 // computeReportedUsage builds the per-run usage block emitted to lifecycle
@@ -1646,21 +1647,23 @@ func computeReportedUsage(usage *agent.TurnUsage, handler agent.EventHandler) Ru
 	var reported RunAgentUsage
 	if usage != nil {
 		reported = RunAgentUsage{
-			InputTokens:  usage.InputTokens,
-			OutputTokens: usage.OutputTokens,
-			TotalTokens:  usage.TotalTokens,
-			CostUSD:      usage.CostUSD,
+			InputTokens:    usage.InputTokens,
+			OutputTokens:   usage.OutputTokens,
+			TotalTokens:    usage.TotalTokens,
+			CostUSD:        usage.CostUSD,
+			WebSearchCalls: usage.WebSearchCalls,
 		}
 	}
 	if up, ok := handler.(agent.UsageProvider); ok {
 		acc := up.Usage()
 		llm := acc.LLM
-		if llm.LLMCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 || acc.ToolCostUSD > 0 {
+		if llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 || acc.ToolCostUSD > 0 {
 			reported = RunAgentUsage{
-				InputTokens:  llm.InputTokens,
-				OutputTokens: llm.OutputTokens,
-				TotalTokens:  llm.TotalTokens,
-				CostUSD:      llm.CostUSD + acc.ToolCostUSD,
+				InputTokens:    llm.InputTokens,
+				OutputTokens:   llm.OutputTokens,
+				TotalTokens:    llm.TotalTokens,
+				CostUSD:        llm.CostUSD + acc.ToolCostUSD,
+				WebSearchCalls: llm.WebSearchCalls,
 			}
 		}
 	}
@@ -2002,19 +2005,19 @@ func resumeRoutedColdStart(sessMgr *session.Manager, routeKey string) (bool, err
 // applyAgentModelOverlayToLoop applies the loop-facing fields of the per-agent
 // model overlay onto the AgentLoop. Called per-turn so reload picks up edits.
 //
-// SetModelTier and SetSpecificModel write to independent fields on the loop
-// (modelTier vs specificModel). Call order does NOT decide precedence; the
-// request-time resolver in loop.go:messagesForLLM picks specificModel when
-// non-empty and falls back to modelTier otherwise. Both setters are applied
-// so an operator can later switch between specific-pin and tier without
-// unsetting the other. Idle timeout fields live in runCfg, not on the loop,
-// and are handled inline at the call site.
+// A concrete named-agent tier is a complete provider-neutral routing choice:
+// it replaces both an inherited exact model and its OpenAI processing lane.
+// A named-agent exact model remains the final override and also clears the
+// global-only processing lane. Idle timeout fields live in runCfg, not on the
+// loop, and are handled inline at the call site.
 func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelConfig) {
 	if loop == nil || ac == nil {
 		return
 	}
 	if ac.ModelTier != nil && *ac.ModelTier != "" {
 		loop.SetModelTier(*ac.ModelTier)
+		loop.SetSpecificModel("")
+		loop.SetServiceTier("")
 	}
 	// Per-agent effort override. nil OR "" = inherit the global tier already
 	// applied on the loop (Desktop's "Inherit" segment sends the field absent;
@@ -2071,12 +2074,15 @@ func effectiveRunModelIntent(
 		model := agentOverride.Config.Agent
 		if model.ModelTier != nil && *model.ModelTier != "" {
 			intent.ModelTier = *model.ModelTier
+			intent.SpecificModel = ""
 		}
 		if model.Model != nil {
 			intent.SpecificModel = *model.Model
 		}
 	}
 	if req.ModelOverride != "" {
+		// This heartbeat-only tier hint sits below an exact agent.model pin. It
+		// must not silently discard that higher-precedence route authority.
 		intent.ModelTier = req.ModelOverride
 	}
 	return intent
@@ -2390,6 +2396,8 @@ func lockAgentExecutionConfig(loop *agent.AgentLoop, req *RunAgentRequest) {
 		return
 	}
 	if req.ModelOverride != "" {
+		// Preserve the exact model already locked onto the loop; ModelOverride
+		// only supplies the lower-precedence tier used by heartbeat runs.
 		loop.SetModelTier(req.ModelOverride)
 	}
 	if req.ResumeInterrupted && req.ExecutionConfig != nil {
@@ -4865,17 +4873,18 @@ func RunSlashWorkflow(ctx context.Context, deps *ServerDeps, req RunAgentRequest
 		}
 	}
 
-	// RunAgentUsage has exactly four fields (runner.go:394-399): InputTokens,
-	// OutputTokens, TotalTokens, CostUSD. There is no Model field.
+	// RunAgentUsage intentionally omits Model; provider routing remains an
+	// internal detail while usage and hosted-search counts are observable.
 	return &RunAgentResult{
 		Reply:     res.FinalText,
 		SessionID: sess.ID,
 		Agent:     agentName,
 		Usage: RunAgentUsage{
-			InputTokens:  res.Usage.InputTokens,
-			OutputTokens: res.Usage.OutputTokens,
-			TotalTokens:  res.Usage.TotalTokens,
-			CostUSD:      res.Usage.CostUSD,
+			InputTokens:    res.Usage.InputTokens,
+			OutputTokens:   res.Usage.OutputTokens,
+			TotalTokens:    res.Usage.TotalTokens,
+			CostUSD:        res.Usage.CostUSD,
+			WebSearchCalls: res.Usage.WebSearchCalls,
 		},
 	}, nil
 }
@@ -5008,7 +5017,7 @@ func applyTurnUsage(sess *session.Session, up usageProvider, b turnBaseline) {
 	}
 	acc := up.Usage()
 	llm := acc.LLM
-	hasTurnUsage := llm.LLMCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 ||
+	hasTurnUsage := llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 ||
 		llm.CostUSD > 0 || acc.ToolCostUSD > 0
 	if !b.hadUsage && !hasTurnUsage {
 		return
@@ -5016,7 +5025,7 @@ func applyTurnUsage(sess *session.Session, up usageProvider, b turnBaseline) {
 	total := b.usage
 	if hasTurnUsage {
 		total.Add(session.UsageFromAccumulated(
-			llm.LLMCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
+			llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
 			llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
 			acc.ToolCalls, acc.ToolCostUSD,
 		))

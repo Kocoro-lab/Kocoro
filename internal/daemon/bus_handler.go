@@ -118,6 +118,7 @@ func (h *busEventHandler) OnUsage(u agent.TurnUsage) {
 		"cache_write_tokens": u.CacheCreationTokens,
 		"cost_usd":           u.CostUSD,
 		"llm_calls":          u.LLMCalls,
+		"web_search_calls":   u.WebSearchCalls,
 		"model":              u.Model,
 		"session_id":         h.sessionID,
 		"ts":                 nowISO(),

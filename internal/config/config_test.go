@@ -111,6 +111,27 @@ func TestValidateConfig_AgentServiceTier(t *testing.T) {
 	}
 }
 
+func TestAgentConfigSkillDiscoveryEnabled(t *testing.T) {
+	enabled := true
+	disabled := false
+	tests := []struct {
+		name string
+		cfg  AgentConfig
+		want bool
+	}{
+		{name: "default disabled", cfg: AgentConfig{}, want: false},
+		{name: "explicit disabled", cfg: AgentConfig{SkillDiscovery: &disabled}, want: false},
+		{name: "explicit enabled", cfg: AgentConfig{SkillDiscovery: &enabled}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.SkillDiscoveryEnabled(); got != tt.want {
+				t.Fatalf("SkillDiscoveryEnabled() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAppendAllowedCommand(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")

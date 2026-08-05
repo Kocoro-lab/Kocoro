@@ -284,6 +284,7 @@ func TestBusEventHandlerOnUsageEmitsSnapshot(t *testing.T) {
 	u := agent.TurnUsage{
 		InputTokens:         1200,
 		OutputTokens:        450,
+		WebSearchCalls:      2,
 		CostUSD:             0.012,
 		LLMCalls:            3,
 		Model:               "claude-sonnet-4-6",
@@ -307,6 +308,7 @@ func TestBusEventHandlerOnUsageEmitsSnapshot(t *testing.T) {
 		CacheWriteTokens int     `json:"cache_write_tokens"`
 		CostUSD          float64 `json:"cost_usd"`
 		LLMCalls         int     `json:"llm_calls"`
+		WebSearchCalls   int     `json:"web_search_calls"`
 		Model            string  `json:"model"`
 		SessionID        string  `json:"session_id"`
 		TS               string  `json:"ts"`
@@ -320,6 +322,9 @@ func TestBusEventHandlerOnUsageEmitsSnapshot(t *testing.T) {
 	}
 	if p.LLMCalls != 3 {
 		t.Fatalf("llm_calls = %d, want 3", p.LLMCalls)
+	}
+	if p.WebSearchCalls != 2 {
+		t.Fatalf("web_search_calls = %d, want 2", p.WebSearchCalls)
 	}
 	if p.Model != "claude-sonnet-4-6" {
 		t.Fatalf("model = %q", p.Model)

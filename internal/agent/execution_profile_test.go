@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -57,6 +58,11 @@ func TestAgentLoopExecutionProfileWireAndFullConfigPreservation(t *testing.T) {
 		if req.ExecutionProfileID != "" || req.ParallelToolCalls {
 			t.Fatalf("full request leaked fast selectors: %+v", req)
 		}
+		for _, msg := range req.Messages {
+			if strings.Contains(msg.Content.Text(), "## Fast Task") {
+				t.Fatal("full request received Fast task guidance")
+			}
+		}
 		if req.ResponseCachePolicy != "" {
 			t.Fatalf("full response cache policy = %q, want omitted", req.ResponseCachePolicy)
 		}
@@ -96,6 +102,16 @@ func TestAgentLoopExecutionProfileWireAndFullConfigPreservation(t *testing.T) {
 		if req.ExecutionProfileID != "kfp1_agent-test" || !req.ParallelToolCalls ||
 			req.ResponseCachePolicy != executionprofile.ResponseCacheOff {
 			t.Fatalf("fast profile wire = %+v", req)
+		}
+		foundFastGuidance := false
+		for _, msg := range req.Messages {
+			if strings.Contains(msg.Content.Text(), "## Fast Task") {
+				foundFastGuidance = true
+				break
+			}
+		}
+		if !foundFastGuidance {
+			t.Fatal("fast request missing Fast task guidance")
 		}
 		if loop.toolRefSupported {
 			t.Fatal("Fast harness must use the deterministic deferred-tool protocol")

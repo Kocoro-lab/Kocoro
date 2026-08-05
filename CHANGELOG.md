@@ -4,8 +4,13 @@ All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format 
 
 ## Unreleased
 
+### Added
+
+- **Hosted-search usage wire capability** — `web_search_usage_v1` guarantees that live usage and terminal run payloads include `web_search_calls`, including an explicit zero when no hosted search ran.
+
 ### Changed
 
+- **Semantic skill discovery is opt-in** — small-model skill prefetch is disabled by default to avoid adding a speculative model call to ordinary turns. Skill metadata listing and explicit `use_skill` remain available; set `agent.skill_discovery: true` to restore semantic prefetch.
 - **Bounded compaction snapshots** — pre-compaction rollback JSON now omits inline image payloads, defaults to one newest snapshot per session instead of three, and removes snapshot files older than 14 days during daemon startup. Operators that need the previous oldest-pinned multi-snapshot behavior can raise `agent.compaction_snapshot_retention`; set `agent.compaction_snapshot_max_age_days: 0` to disable age cleanup.
 
 ## v0.4.0 — 2026-08-01 — Computer Use v1 + Koe Fast/Full execution

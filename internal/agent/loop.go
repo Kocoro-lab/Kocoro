@@ -591,6 +591,7 @@ type TurnUsage struct {
 	TotalTokens           int
 	CostUSD               float64
 	LLMCalls              int
+	WebSearchCalls        int
 	Model                 string // actual model from gateway response
 	CacheReadTokens       int
 	CacheCreationTokens   int
@@ -614,6 +615,7 @@ func (u *TurnUsage) Add(r client.Usage) {
 	u.CacheCreation5mTokens += delta.CacheCreation5mTokens
 	u.CacheCreation1hTokens += delta.CacheCreation1hTokens
 	u.LLMCalls += delta.LLMCalls
+	u.WebSearchCalls += delta.WebSearchCalls
 
 	// Cache telemetry: track capability and miss streaks
 	if delta.CacheCreationTokens > 0 || delta.CacheReadTokens > 0 {
@@ -645,6 +647,7 @@ func (a *AgentLoop) reportLLMUsage(u client.Usage, model string) {
 	}
 	delta := LLMUsageDelta(u, model)
 	if delta.TotalTokens == 0 && delta.CostUSD == 0 &&
+		delta.WebSearchCalls == 0 &&
 		delta.CacheReadTokens == 0 && delta.CacheCreationTokens == 0 &&
 		delta.CacheCreation5mTokens == 0 && delta.CacheCreation1hTokens == 0 {
 		return
@@ -973,7 +976,7 @@ type AgentLoop struct {
 	executionEvidence     executionprofile.Evidence
 	sideEffectReplayKeys  map[string]struct{}
 	executionEvidenceMu   sync.Mutex
-	skillDiscovery        bool // call small-tier model on first turn to identify relevant skills (default true)
+	skillDiscovery        bool // opt-in small-tier model call to identify relevant skills
 	memoryPreflight       MemoryPreflightFunc
 	preCompactionSnapshot PreCompactionSnapshotFunc
 	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
@@ -1081,7 +1084,7 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 		auditor:                auditor,
 		hookRunner:             hookRunner,
 		workingSet:             NewWorkingSet(),
-		skillDiscovery:         true,
+		skillDiscovery:         false,
 		readTracker:            NewReadTracker(),
 		toolResultReplacements: NewToolResultReplacementState(nil),
 		observationWindow:      defaultObservationWindow,
@@ -2463,8 +2466,8 @@ func (a *AgentLoop) SetTimeBasedCompactConfig(cfg TimeBasedCompactConfig) {
 }
 
 // SetSkillDiscovery enables or disables the first-turn skill discovery call.
-// When enabled (default), a small-tier model identifies relevant skills and
-// injects a hint before the main LLM call.
+// When enabled, a small-tier model identifies relevant skills and injects a
+// hint before the main LLM call. Metadata listing remains active either way.
 func (a *AgentLoop) SetSkillDiscovery(enabled bool) {
 	a.skillDiscovery = enabled
 }
@@ -3021,6 +3024,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		ModelID:             modelID,
 		OutputFormat:        a.outputFormat,
 		QuestionUIAvailable: QuestionAskerFrom(ctx) != nil,
+		FastMode:            a.executionProfileID != "",
 	})
 
 	// Append cloud delegation guidance and cloud-specific contrast example
@@ -5345,16 +5349,23 @@ iterationLoop:
 				continue
 			}
 
-			// tool_search loaded schemas but the model stopped with text instead
-			// of calling the loaded tools — nudge it to continue.
+			// tool_search loaded schemas but the model stopped with text. A
+			// positive hosted-search count proves retrieval happened, not that the
+			// text is a final answer, so future-tool narration still continues.
+			// Missing/zero usage retains the conservative behavior for older Cloud
+			// versions that do not report hosted-search usage.
 			if toolSearchFired {
 				toolSearchFired = false
-				reanchorActiveTask(MetaBoundaryToolSearchLoaded)
-				// tool_search nudge path — preserve the model's pre-load
-				// reasoning so the next iteration sees the same trajectory.
-				messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
-				stampMessage()
-				continue
+				if resp.Usage.WebSearchCalls == 0 ||
+					resp.FinishReason == "tool_use" ||
+					looksLikeToolContinuationPreamble(resp.OutputText) {
+					reanchorActiveTask(MetaBoundaryToolSearchLoaded)
+					// tool_search nudge path — preserve the model's pre-load
+					// reasoning so the next iteration sees the same trajectory.
+					messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
+					stampMessage()
+					continue
+				}
 			}
 
 			// Only render text for the final response — intermediate text

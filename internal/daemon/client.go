@@ -252,8 +252,12 @@ const (
 	CapKoeFastProfileV1 = "koe_fast_profile_v1"
 	// CapAgentServiceTierV1 means global agent.service_tier is validated,
 	// checkpointed, and forwarded on ordinary completion requests while sealed
-	// Koe/computer profiles and named exact-model overrides remain isolated.
+	// Koe/computer profiles and named-agent model overrides remain isolated.
 	CapAgentServiceTierV1 = "agent_service_tier_v1"
+	// CapWebSearchUsageV1 means usage events and terminal run usage always
+	// include web_search_calls, including an explicit zero when no hosted
+	// search ran. Older clients may ignore the additive field.
+	CapWebSearchUsageV1 = "web_search_usage_v1"
 	// CapProjectEntityV1 — daemon supports the persisted Project ENTITY (distinct
 	// from CapSessionProjectsV1, which is the CWD/folder-derived grouping): the
 	// /projects CRUD surface (incl. per-project instructions/memory + theme
@@ -333,6 +337,7 @@ var Capabilities = []string{
 	CapComputerUseRiskConfirmationV1,
 	CapKoeFastProfileV1,
 	CapAgentServiceTierV1,
+	CapWebSearchUsageV1,
 	CapSkillInstallRecommendationV1,
 }
 

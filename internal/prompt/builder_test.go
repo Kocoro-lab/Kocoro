@@ -897,6 +897,39 @@ func TestBuildSystemPrompt_OutputFormatPlain(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_FastModeGuidanceIsVolatile(t *testing.T) {
+	fast := BuildSystemPrompt(PromptOptions{BasePrompt: "Base.", FastMode: true})
+	for _, want := range []string{
+		"## Fast Task",
+		"fewest tool rounds",
+		"Do not repeat a successful search, fetch, read, or other call",
+		"reasoning about facts that do not change over time",
+		"Facts already in the conversation also suffice unless they are time-sensitive",
+		"Search only when the user requests current or external facts",
+		"issue one broad search query, not multiple queries in advance",
+		"a second search in that situation is incorrect",
+		"A second search is allowed only when the first result failed",
+		"These unsuccessful or incomplete results do not consume the normal search budget",
+		"Never search again merely to confirm the same facts",
+		"call the directly available web_search without tool_search",
+		"Do not substitute web_fetch on a search-results page",
+		"target primary or established sources",
+		"use the allowed extra search for an authoritative citation",
+	} {
+		if !strings.Contains(fast.VolatileContext, want) {
+			t.Errorf("FastMode volatile context missing %q", want)
+		}
+	}
+	if strings.Contains(fast.System, "## Fast Task") || strings.Contains(fast.StableContext, "## Fast Task") {
+		t.Fatal("FastMode guidance must not invalidate cacheable prompt prefixes")
+	}
+
+	normal := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+	if strings.Contains(normal.VolatileContext, "## Fast Task") {
+		t.Fatal("normal mode must not receive FastMode guidance")
+	}
+}
+
 func TestFormatGuidanceKoe(t *testing.T) {
 	g := formatGuidance("koe")
 	for _, want := range []string{"native voice", "complete", "kocoro desktop", "outcome", "markdown", "deliverable"} {

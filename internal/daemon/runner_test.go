@@ -1654,6 +1654,8 @@ func TestPlaywrightTurnStartProbeAction(t *testing.T) {
 // large/medium/small.
 func TestApplyAgentModelOverlayToLoop_ModelTier(t *testing.T) {
 	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetSpecificModel("inherited-global-model")
+	loop.SetServiceTier("fast")
 	if got := loop.ModelTier(); got != "medium" {
 		t.Fatalf("precondition: baseline ModelTier = %q, want %q", got, "medium")
 	}
@@ -1661,6 +1663,42 @@ func TestApplyAgentModelOverlayToLoop_ModelTier(t *testing.T) {
 	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ModelTier: &tier})
 	if got := loop.ModelTier(); got != "large" {
 		t.Errorf("after overlay: ModelTier = %q, want %q", got, "large")
+	}
+	if got := loop.SpecificModel(); got != "" {
+		t.Errorf("after overlay: SpecificModel = %q, want empty", got)
+	}
+	if got := loop.ServiceTier(); got != "" {
+		t.Errorf("after overlay: ServiceTier = %q, want empty", got)
+	}
+}
+
+func TestEffectiveRunModelIntent_AgentTierClearsInheritedSpecificModel(t *testing.T) {
+	runCfg := &config.Config{ModelTier: "medium"}
+	runCfg.Agent.Model = "inherited-global-model"
+	tier := "large"
+	agentOverride := &agents.Agent{Config: &agents.AgentConfig{
+		Agent: &agents.AgentModelConfig{ModelTier: &tier},
+	}}
+
+	got := effectiveRunModelIntent(runCfg, agentOverride, RunAgentRequest{})
+	if got.ModelTier != "large" {
+		t.Errorf("ModelTier = %q, want large", got.ModelTier)
+	}
+	if got.SpecificModel != "" {
+		t.Errorf("SpecificModel = %q, want empty", got.SpecificModel)
+	}
+}
+
+func TestEffectiveRunModelIntent_RequestTierPreservesExactModel(t *testing.T) {
+	runCfg := &config.Config{ModelTier: "medium"}
+	runCfg.Agent.Model = "pinned-global-model"
+
+	got := effectiveRunModelIntent(runCfg, nil, RunAgentRequest{ModelOverride: "small"})
+	if got.ModelTier != "small" {
+		t.Errorf("ModelTier = %q, want small", got.ModelTier)
+	}
+	if got.SpecificModel != "pinned-global-model" {
+		t.Errorf("SpecificModel = %q, want pinned-global-model", got.SpecificModel)
 	}
 }
 
@@ -2110,16 +2148,18 @@ func TestComputeReportedUsage(t *testing.T) {
 		// The partial result must carry those tokens (the GPT review's
 		// motivating scenario).
 		turn := &agent.TurnUsage{
-			InputTokens:  10,
-			OutputTokens: 20,
-			TotalTokens:  30,
-			CostUSD:      0.0001,
+			InputTokens:    10,
+			OutputTokens:   20,
+			TotalTokens:    30,
+			CostUSD:        0.0001,
+			WebSearchCalls: 1,
 		}
 		want := RunAgentUsage{
-			InputTokens:  10,
-			OutputTokens: 20,
-			TotalTokens:  30,
-			CostUSD:      0.0001,
+			InputTokens:    10,
+			OutputTokens:   20,
+			TotalTokens:    30,
+			CostUSD:        0.0001,
+			WebSearchCalls: 1,
 		}
 		got := computeReportedUsage(turn, nullEventHandler{})
 		if got != want {
@@ -2136,11 +2176,12 @@ func TestComputeReportedUsage(t *testing.T) {
 		handler := fakeUsageHandler{
 			snapshot: agent.AccumulatedUsage{
 				LLM: agent.TurnUsage{
-					InputTokens:  100,
-					OutputTokens: 200,
-					TotalTokens:  300,
-					CostUSD:      0.01,
-					LLMCalls:     2,
+					InputTokens:    100,
+					OutputTokens:   200,
+					TotalTokens:    300,
+					CostUSD:        0.01,
+					LLMCalls:       2,
+					WebSearchCalls: 2,
 				},
 				ToolCostUSD: 0.001,
 			},
@@ -2148,14 +2189,27 @@ func TestComputeReportedUsage(t *testing.T) {
 		// Loop-level usage is also non-zero; accumulator should still win.
 		turn := &agent.TurnUsage{InputTokens: 5, OutputTokens: 6, TotalTokens: 11, CostUSD: 0.0002}
 		want := RunAgentUsage{
-			InputTokens:  100,
-			OutputTokens: 200,
-			TotalTokens:  300,
-			CostUSD:      0.011, // 0.01 LLM + 0.001 tool
+			InputTokens:    100,
+			OutputTokens:   200,
+			TotalTokens:    300,
+			CostUSD:        0.011, // 0.01 LLM + 0.001 tool
+			WebSearchCalls: 2,
 		}
 		got := computeReportedUsage(turn, handler)
 		if got != want {
 			t.Errorf("got %+v, want %+v (accumulator must override loop-level usage)", got, want)
+		}
+	})
+
+	t.Run("search_only_accumulator_is_reported", func(t *testing.T) {
+		handler := fakeUsageHandler{
+			snapshot: agent.AccumulatedUsage{
+				LLM: agent.TurnUsage{WebSearchCalls: 1},
+			},
+		}
+		want := RunAgentUsage{WebSearchCalls: 1}
+		if got := computeReportedUsage(nil, handler); got != want {
+			t.Errorf("got %+v, want %+v", got, want)
 		}
 	})
 

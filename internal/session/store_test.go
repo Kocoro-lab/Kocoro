@@ -589,6 +589,7 @@ func TestStore_SaveLoadWithUsageSummary(t *testing.T) {
 		CWD:   "/tmp",
 		Usage: &UsageSummary{
 			LLMCalls:              3,
+			WebSearchCalls:        2,
 			InputTokens:           150,
 			OutputTokens:          45,
 			TotalTokens:           195,
@@ -617,6 +618,9 @@ func TestStore_SaveLoadWithUsageSummary(t *testing.T) {
 	}
 	if loaded.Usage.CacheCreation5mTokens != 100 || loaded.Usage.CacheCreation1hTokens != 200 {
 		t.Fatalf("expected split cache creation 100/200, got %d/%d", loaded.Usage.CacheCreation5mTokens, loaded.Usage.CacheCreation1hTokens)
+	}
+	if loaded.Usage.WebSearchCalls != 2 {
+		t.Fatalf("expected 2 web search calls, got %d", loaded.Usage.WebSearchCalls)
 	}
 }
 
