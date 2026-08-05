@@ -926,10 +926,15 @@ func TestAgentLoop_ReactiveCompaction_UsesEmergencyFallbackWhenSoftStillOverBudg
 			summaryCalls++
 		}
 	}
-	if summaryCalls != 2 {
-		t.Fatalf("expected soft + emergency summary calls, got %d (%v)", summaryCalls, gotCalls)
+	// Two compaction attempts (soft, then emergency), each costing TWO
+	// small-tier calls: this 450K-byte transcript sits above the summarize
+	// budget, so every attempt runs foldOversizedTranscript — one chunk-fold
+	// call plus the final structured pass. Under the pre-2026-08-05 budget the
+	// same transcript fit in a single call and this was 2 total.
+	if summaryCalls != 4 {
+		t.Fatalf("expected soft + emergency attempts at two folded calls each, got %d (%v)", summaryCalls, gotCalls)
 	}
-	if len(gotCalls) != 4 || gotCalls[0] != "context_error" || gotCalls[1] != "summary" || gotCalls[2] != "summary" || gotCalls[3] != "retry_success" {
+	if len(gotCalls) != 6 || gotCalls[0] != "context_error" || gotCalls[len(gotCalls)-1] != "retry_success" {
 		t.Fatalf("unexpected call order: %v", gotCalls)
 	}
 }
@@ -1712,7 +1717,10 @@ func TestAgentLoop_ReactiveCompaction_RecoversFromOversizedTranscript(t *testing
 	// Mirrors internal/context/summarize.go's summarizeInputCapChars constant;
 	// kept as a local literal because the source-of-truth constant is unexported.
 	// If you bump the cap there, bump this assertion too.
-	const summarizeInputCapCharsLocal = 540_000
+	// Sized from the real budget: a mirrored literal goes stale the moment
+	// the summarize budget moves, which is exactly what happened when the byte
+	// cap was re-derived from a measured tokens-per-byte floor (2026-08-05).
+	const summarizeInputCapCharsLocal = ctxwin.SummarizeInputCapBytes
 
 	memoryDir := t.TempDir()
 

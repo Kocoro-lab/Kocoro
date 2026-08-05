@@ -178,13 +178,7 @@ func TestApplyTurnState_HardErrorAfterCheckpoint_NoDuplicate(t *testing.T) {
 	// more failed LLM call).
 	up.usage.LLM.InputTokens = 70 // +20 since checkpoint
 	up.usage.LLM.LLMCalls = 2
-	applyTurnMessages(sess, loop, base)
-	sess.Messages = append(sess.Messages,
-		client.Message{Role: "assistant", Content: client.NewTextContent("Sorry, something failed.")},
-	)
-	sess.MessageMeta = append(sess.MessageMeta,
-		session.MessageMeta{Source: "web", Timestamp: session.TimePtr(time.Now())},
-	)
+	applyHardErrorTurnMessages(sess, loop, base, "web", "Sorry, something failed.", time.Now())
 	applyTurnUsage(sess, up, base)
 
 	// Expected: 1 baseline + 2 turn + 1 error stub = 4 total. No duplicates.
@@ -468,5 +462,108 @@ func TestSessionInProgress_FlagCycles(t *testing.T) {
 	sess.InProgress = false
 	if sess.InProgress {
 		t.Fatal("toggle off didn't clear")
+	}
+}
+
+// Enters through applyTurnState — the helper that backs the mid-turn
+// checkpoint — rather than calling stripSpokenSummaryForKoeTurn directly. The
+// unit is already covered; what this pins is the wiring: that the save path
+// reads the Koe source off turnBaseline and cleans BOTH durable copies. A
+// process that dies right after this checkpoint leaves whatever it wrote, and
+// the checkpoint is what the next run reloads as live context.
+func TestApplyTurnState_KoeCheckpointIsTagStripped(t *testing.T) {
+	const tag = "<spoken_summary>said aloud.</spoken_summary>"
+	sess := &session.Session{
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("older")}},
+		MessageMeta: []session.MessageMeta{{Source: "koe"}},
+	}
+	base := captureTurnBaseline(sess, "koe", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("ask")},
+		{Role: "assistant", Content: client.NewTextContent("answer\n" + tag)},
+	})
+	agent.SetCompactionCheckpointMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("Previous context summary: …")},
+		{Role: "assistant", Content: client.NewTextContent("answer\n" + tag)},
+	})
+
+	applyTurnState(sess, loop, nil, base)
+
+	for i, m := range sess.Messages {
+		if strings.Contains(m.Content.Text(), "spoken_summary") {
+			t.Errorf("archive[%d] kept the raw tag: %q", i, m.Content.Text())
+		}
+	}
+	cp := sess.CompactionCheckpoint
+	if cp == nil {
+		t.Fatal("no checkpoint persisted")
+	}
+	for i, m := range cp.Messages {
+		if strings.Contains(m.Content.Text(), "spoken_summary") {
+			t.Errorf("checkpoint[%d] kept the raw tag — it would reach the model next turn: %q", i, m.Content.Text())
+		}
+	}
+	if got := cp.Messages[1].Content.Text(); !strings.Contains(got, "answer") {
+		t.Errorf("checkpoint lost the reply body: %q", got)
+	}
+
+	// A non-Koe source must not be touched by this path.
+	web := &session.Session{Messages: []client.Message{{Role: "user", Content: client.NewTextContent("older")}}}
+	webBase := captureTurnBaseline(web, "web", false)
+	webLoop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(webLoop, []client.Message{
+		{Role: "assistant", Content: client.NewTextContent("literal " + tag + " in a web transcript")},
+	})
+	applyTurnState(web, webLoop, nil, webBase)
+	if !strings.Contains(web.Messages[1].Content.Text(), "spoken_summary") {
+		t.Error("non-Koe transcript was rewritten by the Koe strip")
+	}
+}
+
+// The hard-error save differs from applyTurnState: it binds the checkpoint
+// before appending a synthetic friendly-error message. Exercise that exact
+// ordering and the Koe cleanup through the same helper the runner calls.
+func TestApplyHardErrorTurnMessages_KoeCheckpointIsTagStripped(t *testing.T) {
+	const tag = "<spoken_summary>hard-error reply was spoken.</spoken_summary>"
+	sess := &session.Session{
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("older")}},
+		MessageMeta: []session.MessageMeta{{Source: "koe"}},
+	}
+	base := captureTurnBaseline(sess, "koe", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("ask")},
+		{Role: "assistant", Content: client.NewTextContent("detail\n" + tag)},
+	})
+	agent.SetCompactionCheckpointMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "saved state")},
+		{Role: "assistant", Content: client.NewTextContent("detail\n" + tag)},
+	})
+
+	applyHardErrorTurnMessages(sess, loop, base, "koe", "Friendly failure.", time.Unix(1, 0))
+
+	cp := sess.CompactionCheckpoint
+	if cp == nil {
+		t.Fatal("hard-error path persisted no checkpoint")
+	}
+	if cp.ArchiveThroughIndex != len(sess.Messages)-1 {
+		t.Fatalf("checkpoint index = %d, want %d before friendly error", cp.ArchiveThroughIndex, len(sess.Messages)-1)
+	}
+	if got := sess.Messages[len(sess.Messages)-1].Content.Text(); got != "Friendly failure." {
+		t.Fatalf("last archive message = %q, want friendly error", got)
+	}
+	for i, msg := range sess.Messages {
+		if strings.Contains(msg.Content.Text(), "spoken_summary") {
+			t.Errorf("archive[%d] kept raw Koe markup: %q", i, msg.Content.Text())
+		}
+	}
+	for i, msg := range cp.Messages {
+		if strings.Contains(msg.Content.Text(), "spoken_summary") {
+			t.Errorf("checkpoint[%d] kept raw Koe markup: %q", i, msg.Content.Text())
+		}
+	}
+	if !strings.Contains(cp.Messages[1].Content.Text(), "detail") {
+		t.Fatalf("checkpoint lost reply body: %q", cp.Messages[1].Content.Text())
 	}
 }

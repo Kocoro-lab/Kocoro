@@ -1,13 +1,16 @@
 package sync
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 )
 
 // stripThinkingFromSessionJSON returns a copy of the session JSON body with
 // `thinking` and `redacted_thinking` content blocks removed from every
-// assistant message's content array in both the lossless transcript and the
-// optional compaction checkpoint. Other fields and message order are kept.
+// assistant message's content array, and the derived compaction checkpoint
+// dropped entirely. Other fields and message order are kept.
 //
 // Why on the upload path: thinking content can contain sensitive intermediate
 // reasoning (private deliberations the user never sees). The local session
@@ -41,22 +44,53 @@ func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 		return body, nil
 	}
 
+	// UseNumber, not a plain Unmarshal: decoding into map[string]any turns every
+	// JSON number into float64, whose 53-bit mantissa silently truncates the
+	// integers real payloads carry — unix nanosecond timestamps (19 digits),
+	// 64-bit row IDs, byte sizes — inside persisted tool inputs. Same hazard and
+	// same fix as normalizeToolInput (see
+	// TestNormalizeToolInput_PreservesLargeIntegerPrecision). This matters more
+	// now that dropping a compaction checkpoint re-marshals sessions that carry
+	// no thinking blocks at all, which previously returned the original bytes
+	// untouched.
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 	var top map[string]any
-	if err := json.Unmarshal(body, &top); err != nil {
+	if err := dec.Decode(&top); err != nil {
 		return body, err
+	}
+	// A streaming Decoder stops at the first complete value, so it would accept
+	// a truncated-then-concatenated file and silently re-marshal only the head —
+	// where json.Unmarshal used to reject it and leave the bytes alone. The
+	// loader hands us raw os.ReadFile output with no upstream validation, so
+	// restore the strictness explicitly (same shape as rejectDuplicateJSONMembers).
+	if token, err := dec.Token(); err != io.EOF {
+		if err != nil {
+			return body, err
+		}
+		return body, fmt.Errorf("unexpected trailing JSON value beginning with %v", token)
+	}
+
+	// The compaction checkpoint is DROPPED rather than stripped. It is derived
+	// state — a compacted view of messages that are already in this payload —
+	// so uploading it roughly doubles a compacted session's bytes while adding
+	// nothing the cloud resume path can use. That matters because the size gate
+	// a few lines downstream (BuildBatches → SingleSessionMaxBytes) marks an
+	// oversize session `size_limit_exceeded`, which backoff.go treats as
+	// PERMANENT: a long session that used to sync would silently stop syncing
+	// forever the first time it compacted. Dropping also removes a second copy
+	// of the same content from the disclosure surface for free.
+	mutated := false
+	if _, ok := top["compaction_checkpoint"]; ok {
+		delete(top, "compaction_checkpoint")
+		mutated = true
 	}
 
 	var messageArrays [][]any
 	if rawMessages, ok := top["messages"].([]any); ok {
 		messageArrays = append(messageArrays, rawMessages)
 	}
-	if checkpoint, ok := top["compaction_checkpoint"].(map[string]any); ok {
-		if rawMessages, ok := checkpoint["messages"].([]any); ok {
-			messageArrays = append(messageArrays, rawMessages)
-		}
-	}
 
-	mutated := false
 	for _, rawMessages := range messageArrays {
 		for _, rawMsg := range rawMessages {
 			msg, ok := rawMsg.(map[string]any)

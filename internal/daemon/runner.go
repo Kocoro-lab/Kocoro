@@ -4033,14 +4033,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			//       batches that never got their own save.
 			//   (c) usage was already folded by a checkpoint — AddUsage
 			//       would double-count, so use baseline+current instead.
-			applyTurnMessages(sess, loop, turnBase)
-			applyCompactionCheckpoint(sess, loop)
-			sess.Messages = append(sess.Messages,
-				client.Message{Role: "assistant", Content: client.NewTextContent(userErr)},
-			)
-			sess.MessageMeta = append(sess.MessageMeta,
-				session.MessageMeta{Source: req.Source, Timestamp: session.TimePtr(time.Now())},
-			)
+			applyHardErrorTurnMessages(sess, loop, turnBase, req.Source, userErr, time.Now())
 			applyTurnUsage(sess, turnUsage, turnBase)
 			// Persist tool-result budget state so dedup/replacement bookkeeping
 			// from this crashed turn survives resume; mid-turn checkpoints
@@ -4187,7 +4180,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(replyTime)},
 			)
 		}
-		applyCompactionCheckpoint(sess, loop)
 		// Koe: the normal path rebuilt the transcript from the loop's run messages,
 		// which still carry the head <spoken_summary> tag; strip it from EVERY
 		// assistant message this run persisted (a run that absorbed injected
@@ -4195,8 +4187,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// Desktop history / FTS / next-turn reload never see the raw tag. Scoped to
 		// this run's slice; no-op on the flat-text fallback above (already used the
 		// cleaned result).
+		applyCompactionCheckpoint(sess, loop)
 		if isKoeSource(req.Source) {
-			stripSpokenSummaryFromAssistants(sess.Messages[turnBase.msgCount:])
+			stripSpokenSummaryForKoeTurn(sess, turnBase.msgCount)
 		}
 		applyTurnUsage(sess, turnUsage, turnBase) // idempotent: baseline + current
 		// Persist tool-result budget state. Mid-turn checkpoints (applyTurnState)
@@ -5004,6 +4997,48 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 	}
 }
 
+// applyHardErrorTurnMessages rebuilds the durable archive from the turn
+// baseline, binds any new live checkpoint to that archive, cleans Koe-only
+// spoken markup from both copies, and only then appends the friendly error.
+// The order is intentional: ArchiveThroughIndex must stop before the synthetic
+// error message, which was never part of the compacted model-live state.
+func applyHardErrorTurnMessages(sess *session.Session, loop *agent.AgentLoop,
+	b turnBaseline, source, userErr string, replyTime time.Time) {
+	applyTurnMessages(sess, loop, b)
+	applyCompactionCheckpoint(sess, loop)
+	if isKoeSource(b.source) {
+		stripSpokenSummaryForKoeTurn(sess, b.msgCount)
+	}
+	sess.Messages = append(sess.Messages,
+		client.Message{Role: "assistant", Content: client.NewTextContent(userErr)},
+	)
+	sess.MessageMeta = append(sess.MessageMeta,
+		session.MessageMeta{Source: source, Timestamp: session.TimePtr(replyTime)},
+	)
+}
+
+// stripSpokenSummaryForKoeTurn removes the head <spoken_summary> tag from
+// everything this Koe run made durable: the archive slice it appended AND the
+// compaction checkpoint.
+//
+// Both, not just the archive. The checkpoint is a separate copy taken from the
+// loop, so stripping sess.Messages cannot reach it — and the checkpoint is
+// precisely what the NEXT turn reloads as live context, which is one of the
+// three consumers ("Desktop history / FTS / next-turn reload") the strip
+// exists to protect. Covering the whole checkpoint rather than a tail slice is
+// safe because stripping an already-clean message is a no-op.
+func stripSpokenSummaryForKoeTurn(sess *session.Session, fromIdx int) {
+	if sess == nil {
+		return
+	}
+	if fromIdx >= 0 && fromIdx <= len(sess.Messages) {
+		stripSpokenSummaryFromAssistants(sess.Messages[fromIdx:])
+	}
+	if sess.CompactionCheckpoint != nil {
+		stripSpokenSummaryFromAssistants(sess.CompactionCheckpoint.Messages)
+	}
+}
+
 // applyCompactionCheckpoint persists an applied compaction as a durable live
 // context transition. The full transcript in sess.Messages remains the
 // lossless archive; ArchiveThroughIndex binds the compacted view to that raw
@@ -5067,6 +5102,12 @@ func applyTurnState(sess *session.Session, loop *agent.AgentLoop,
 	up usageProvider, b turnBaseline) {
 	applyTurnMessages(sess, loop, b)
 	applyCompactionCheckpoint(sess, loop)
+	// Every durable rebuild cleans Koe markup, not just the end-of-run one:
+	// this helper backs the mid-turn checkpoint, so a crash after it leaves the
+	// raw tag in both the archive and the checkpoint the next run reloads.
+	if isKoeSource(b.source) {
+		stripSpokenSummaryForKoeTurn(sess, b.msgCount)
+	}
 	applyTurnUsage(sess, up, b)
 	sess.ToolResultReplacements = loop.ToolResultReplacements()
 	sess.ToolResultSeen = loop.ToolResultSeen()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -942,7 +943,13 @@ func TestHistoryForLoop_CompactionCheckpointUsesRawArchiveIndex(t *testing.T) {
 }
 
 func TestHistoryForLoop_InvalidCheckpointFallsBackToArchive(t *testing.T) {
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
 	sess := &Session{
+		ID:       "invalid-checkpoint-session",
 		Messages: []client.Message{{Role: "user", Content: client.NewTextContent("archive")}},
 		CompactionCheckpoint: &CompactionCheckpoint{
 			SchemaVersion:       CompactionCheckpointSchemaVersion,
@@ -953,6 +960,19 @@ func TestHistoryForLoop_InvalidCheckpointFallsBackToArchive(t *testing.T) {
 	got := sess.HistoryForLoop()
 	if len(got) != 1 || got[0].Content.Text() != "archive" {
 		t.Fatalf("invalid checkpoint should fail open to archive, got %#v", got)
+	}
+	if text := logs.String(); !strings.Contains(text, "ignoring invalid compaction checkpoint") ||
+		!strings.Contains(text, `session="invalid-checkpoint-session"`) ||
+		!strings.Contains(text, "archive_through_index=99") {
+		t.Fatalf("invalid checkpoint fallback was silent: %q", text)
+	}
+
+	// No checkpoint is the normal, pre-compaction state and must stay quiet.
+	logs.Reset()
+	plain := &Session{Messages: []client.Message{{Role: "user", Content: client.NewTextContent("plain")}}}
+	_ = plain.HistoryForLoop()
+	if strings.Contains(logs.String(), "compaction checkpoint") {
+		t.Fatalf("nil checkpoint logged as invalid: %q", logs.String())
 	}
 }
 

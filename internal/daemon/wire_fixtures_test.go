@@ -1221,6 +1221,90 @@ func TestWireFixture_SkillRecommendationContinuationAndDismiss(t *testing.T) {
 	assertSemanticEqual(t, dismissFixture, parseJSONMap(t, dismissResponse.Body.Bytes()))
 }
 
+func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.session.response.json")
+	dir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: dir, SessionCache: NewSessionCache(dir)}
+	defer deps.SessionCache.CloseAll()
+	mgr := deps.SessionCache.GetOrCreate("")
+	sess := mgr.NewSessionWithID(fixture["id"].(string))
+	sess.Title = fixture["title"].(string)
+	sess.CWD = fixture["cwd"].(string)
+	sess.Source = "desktop"
+	sess.CreatedAt = time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	sess.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("ARCHIVE_ONLY_OLD_TASK")},
+		{Role: "assistant", Content: client.NewTextContent("ARCHIVE_ONLY_OLD_REPLY")},
+		{Role: "user", Content: client.NewTextContent("live tail question")},
+	}
+	firstTime := time.Date(2026, 8, 5, 0, 0, 1, 0, time.UTC)
+	secondTime := time.Date(2026, 8, 5, 0, 0, 2, 0, time.UTC)
+	tailTime := time.Date(2026, 8, 5, 0, 0, 3, 0, time.UTC)
+	sess.MessageMeta = []session.MessageMeta{
+		{Source: "desktop", Timestamp: &firstTime},
+		{Source: "desktop", Timestamp: &secondTime},
+		{Source: "desktop", Timestamp: &tailTime},
+	}
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: 2,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("stable original primer")},
+			{Role: "user", Content: client.NewTextContent("Previous context summary: stable state")},
+			{Role: "assistant", Content: client.NewTextContent("compacted recent reply")},
+		},
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("save fixture session: %v", err)
+	}
+
+	srv := NewServer(0, &Client{}, deps, "test")
+	rec := httptest.NewRecorder()
+	path := "/sessions/" + sess.ID
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d body=%s", path, rec.Code, rec.Body.String())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	normalizeRFC3339(t, produced, fixture, "updated_at")
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode pins the additive checkpoint while keeping the
+	// default detail's top-level messages as the lossless archive.
+	var detail struct {
+		ID       string `json:"id"`
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+		MessageMeta []struct {
+			Source    string `json:"source"`
+			Timestamp string `json:"timestamp"`
+		} `json:"message_meta"`
+		CompactionCheckpoint *struct {
+			SchemaVersion       int `json:"schema_version"`
+			ArchiveThroughIndex int `json:"archive_through_index"`
+			Messages            []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		} `json:"compaction_checkpoint"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	cp := detail.CompactionCheckpoint
+	if detail.ID != sess.ID || len(detail.Messages) != 3 || len(detail.MessageMeta) != 3 ||
+		cp == nil || cp.SchemaVersion != 1 || cp.ArchiveThroughIndex != 2 || len(cp.Messages) != 3 {
+		t.Fatalf("consumer decode lost default detail fields: %+v", detail)
+	}
+	if string(detail.Messages[0].Content) != `"ARCHIVE_ONLY_OLD_TASK"` ||
+		string(cp.Messages[1].Content) != `"Previous context summary: stable state"` {
+		t.Fatalf("archive/live checkpoint semantics drifted: archive=%s checkpoint=%s",
+			detail.Messages[0].Content, cp.Messages[1].Content)
+	}
+}
+
 func TestWireFixture_HTTPRemoteSessionTimeline(t *testing.T) {
 	fixture := loadWireFixture(t, "http_get.session.remote_timeline.response.json")
 	dir := t.TempDir()

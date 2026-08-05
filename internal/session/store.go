@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -318,8 +319,13 @@ func (s *Session) HistoryForLoop() []client.Message {
 		return nil
 	}
 	cp := s.CompactionCheckpoint
-	if cp == nil || cp.SchemaVersion != CompactionCheckpointSchemaVersion || len(cp.Messages) == 0 ||
+	if cp == nil {
+		return FilterInjected(s.Messages, s.MessageMeta)
+	}
+	if cp.SchemaVersion != CompactionCheckpointSchemaVersion || len(cp.Messages) == 0 ||
 		cp.ArchiveThroughIndex < 0 || cp.ArchiveThroughIndex > len(s.Messages) {
+		log.Printf("session: ignoring invalid compaction checkpoint (session=%q schema=%d messages=%d archive_through_index=%d archive_messages=%d); falling back to archive",
+			s.ID, cp.SchemaVersion, len(cp.Messages), cp.ArchiveThroughIndex, len(s.Messages))
 		return FilterInjected(s.Messages, s.MessageMeta)
 	}
 

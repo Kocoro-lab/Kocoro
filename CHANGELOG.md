@@ -8,6 +8,13 @@ All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format 
 
 - **Hosted-search usage wire capability** — `web_search_usage_v1` guarantees that live usage and terminal run payloads include `web_search_calls`, including an explicit zero when no hosted search ran.
 
+### Fixed
+
+- **Compaction could permanently wedge a long session** — the summarize call's input was bounded in bytes (540,000, documented as "≈180K tokens"), but a transcript dominated by JSON tool results bills ~2.5 bytes/token, so the call arrived at ~214K tokens against the small tier's 200K window and returned a hard 400. Because compaction is the only way for an oversized session to shrink, every subsequent turn failed the same way and the context grew ~2K tokens per attempt instead of recovering. The budget is now expressed in tokens (`summarizeInputCapTokens=150_000`) and converted through a measured worst-case ratio. `maxSummaryFoldChunks` rises 6 → 9 so the smaller per-chunk budget does not shrink how far back a fold can summarize. Failed summarize calls now log what they sent, and successful ones warn when billed tokens fall below the safety floor — so the next density drift is visible in the daemon log instead of only in Cloud's request records.
+- **Heartbeats bypassed compacted live context** — named-agent heartbeat runs seeded their ephemeral loop from the lossless archive, clearing the copied checkpoint and replaying the oversized history compaction had replaced. They now use the same `HistoryForLoop()` view as ordinary turns, which also keeps transient system-injected corrections out of periodic checks without mutating the durable archive or checkpoint.
+- **Koe replies leaked `<spoken_summary>` markup into the next turn** — the tag strip ran only over the archive slice, missing the compaction checkpoint that a compacted Koe session actually reloads as live context.
+- **Compacted sessions could stop syncing forever** — the upload payload carried both the lossless transcript and the derived checkpoint, roughly doubling its size; crossing `SingleSessionMaxBytes` marks a session `size_limit_exceeded`, which is a permanent failure. The checkpoint is now dropped from the upload entirely (the cloud resume path does not read it), which also removes a second copy of the same content from the disclosure surface.
+
 ### Changed
 
 - **Semantic skill discovery is opt-in** — small-model skill prefetch is disabled by default to avoid adding a speculative model call to ordinary turns. Skill metadata listing and explicit `use_skill` remain available; set `agent.skill_discovery: true` to restore semantic prefetch.

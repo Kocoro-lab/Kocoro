@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
 // The model authors <spoken_summary> at the END of its reply (result-last), so
@@ -68,8 +69,8 @@ func TestSplitSpokenSummary_EmptyInner(t *testing.T) {
 
 func TestStripStraySpokenTags(t *testing.T) {
 	cases := map[string]string{
-		"progress <spoken_summary>foo": "progress foo",
-		"a</spoken_summary>b":          "ab",
+		"progress <spoken_summary>foo":       "progress foo",
+		"a</spoken_summary>b":                "ab",
 		"<spoken_summary>x</spoken_summary>": "x",
 		"no tags here":                       "no tags here",
 	}
@@ -207,5 +208,42 @@ func TestStripSpokenSummaryFromAssistants(t *testing.T) {
 	}
 	if msgs[0].Content.Text() != "first question" {
 		t.Fatalf("user message was touched: %q", msgs[0].Content.Text())
+	}
+}
+
+// The compaction checkpoint is the next turn's live context, and it is a
+// separate copy from sess.Messages — so a Koe turn that compacted must strip
+// BOTH or the raw tag reaches the model on the following turn.
+func TestStripSpokenSummaryForKoeTurn_CoversCheckpoint(t *testing.T) {
+	tagged := func(body string) client.Message {
+		return client.Message{Role: "assistant",
+			Content: client.NewTextContent(body + "\n<spoken_summary>said aloud.</spoken_summary>")}
+	}
+	sess := &session.Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("older turn")},
+			tagged("this run's answer"),
+		},
+		CompactionCheckpoint: &session.CompactionCheckpoint{
+			SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+			ArchiveThroughIndex: 2,
+			Messages: []client.Message{
+				{Role: "user", Content: client.NewTextContent("Previous context summary: …")},
+				tagged("checkpointed answer"),
+			},
+		},
+	}
+
+	stripSpokenSummaryForKoeTurn(sess, 1)
+
+	if strings.Contains(sess.Messages[1].Content.Text(), "spoken_summary") {
+		t.Errorf("archive still tagged: %q", sess.Messages[1].Content.Text())
+	}
+	cp := sess.CompactionCheckpoint.Messages[1].Content.Text()
+	if strings.Contains(cp, "spoken_summary") {
+		t.Errorf("checkpoint still tagged — the tag would reach the model next turn: %q", cp)
+	}
+	if !strings.Contains(cp, "checkpointed answer") {
+		t.Errorf("checkpoint lost its body: %q", cp)
 	}
 }

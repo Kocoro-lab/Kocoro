@@ -145,7 +145,7 @@ func TestSplitTranscriptChunks_OversizedMessageGetsOwnChunk(t *testing.T) {
 }
 
 // buildOversizedHistory produces a history whose transcript exceeds
-// summarizeInputCapChars, with a distinctive identifier buried in the FIRST
+// summarizeInputCapBytes, with a distinctive identifier buried in the FIRST
 // (earliest) portion — exactly what head+tail truncation loses today.
 func buildOversizedHistory() []client.Message {
 	filler := strings.Repeat("long conversation filler content for the summarizer ", 400) // ~21K chars
@@ -163,8 +163,8 @@ func buildOversizedHistory() []client.Message {
 
 func TestGenerateSummary_ChunkedFoldCoversEarlyContent(t *testing.T) {
 	messages := buildOversizedHistory()
-	if l := len(buildTranscript(messages)); l <= summarizeInputCapChars {
-		t.Fatalf("test workload too small: transcript %d chars must exceed cap %d", l, summarizeInputCapChars)
+	if l := len(buildTranscript(messages)); l <= summarizeInputCapBytes {
+		t.Fatalf("test workload too small: transcript %d chars must exceed cap %d", l, summarizeInputCapBytes)
 	}
 
 	c := &promptAwareCompleter{
@@ -184,7 +184,7 @@ Continue the steps; early decision preserved: deadbeefcafe1234.</summary>`,
 	// Every rolling call must fit the small-tier input cap.
 	for i, r := range c.reqs {
 		for _, m := range r.Messages {
-			if l := len(m.Content.Text()); l > summarizeInputCapChars {
+			if l := len(m.Content.Text()); l > summarizeInputCapBytes {
 				t.Errorf("call %d message exceeds input cap: %d chars", i, l)
 			}
 		}

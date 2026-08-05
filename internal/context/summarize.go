@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"unicode/utf8"
@@ -12,17 +13,76 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
-// summarizeInputCapChars limits the transcript length sent to the small-tier
-// summarizer. ~540K chars ≈ 180K tokens at the 3 chars/token estimate
-// used by buildTranscript, leaving 20K headroom under Haiku 4.5's 200K context
-// window. This is a defense-in-depth: the reactive path already runs
-// compressOldToolResults before calling GenerateSummary, but that pass is
-// deliberately gentle (keepRecent=8, maxResultChars=300) and can leave a
-// transcript over the small-tier cap when recent tool results are large.
+// summarizeInputCapTokens is the transcript budget for one small-tier
+// summarize call, expressed in TOKENS because that is the limit the API
+// actually enforces.
+//   - Workload: compaction of a tool-heavy session, where the transcript is
+//     dominated by JSON tool results — the densest content this pipeline sees.
+//   - Symptom when it binds: the transcript is head+tail elided (single-shot)
+//     or split into more fold chunks, so the summary covers the middle less
+//     precisely. Cheap compared to the alternative below.
+//   - Override: raise together with the small tier's context window. The
+//     budget must stay far enough under that window to also cover
+//     summarizePrompt, the fold path's running summary, and MaxTokens.
 //
-// Without this guard, an oversized transcript fed to the summarizer can fail
-// with "prompt is too long" and cascade into the parent request.
-const summarizeInputCapChars = 540_000
+// 150K against the small tier's 200K window leaves ~50K for all of that.
+const summarizeInputCapTokens = 150_000
+
+// conservativeBytesPerToken converts a byte length into a deliberately HIGH
+// token estimate. Measured 2026-08-05 against the live small tier by diffing
+// input_tokens across two requests differing only by a known blob:
+//
+//	json fixture   2.60 bytes/token   ← densest measured
+//	chinese prose  2.71
+//	go source      3.43
+//	english prose  4.78
+//
+// 2.5 sits below every measured value, so the estimate never runs low.
+//
+// Do NOT substitute EstimateTokens here. Its charsPerToken=3.5 is tuned to be
+// representative, not conservative, and on dense content it under-counts by
+// ~25% — which is exactly how the 2026-08-05 production incident happened: a
+// 540,000-byte cap was documented as "≈180K tokens" and billed 213,719 against
+// a 200K window, so every compaction attempt 400'd and the session could never
+// recover (it grew ~2K tokens per failed turn instead).
+const conservativeBytesPerToken = 2.5
+
+// summarizeInputCapBytes is the byte ceiling derived from the token budget.
+// Slicing needs a byte offset, so the budget is converted once here rather
+// than re-derived at each call site.
+const summarizeInputCapBytes = int(float64(summarizeInputCapTokens) * conservativeBytesPerToken)
+
+// SummarizeInputCapBytes exposes the ceiling so sibling layers and their tests
+// size payloads against the real budget instead of mirroring a literal that
+// silently goes stale when the budget moves (same rationale as
+// CompactAbsoluteBufferTokens).
+const SummarizeInputCapBytes = summarizeInputCapBytes
+
+// estimateSummarizeTokens returns the conservative token estimate for s. Used
+// for the safety gate and the drift warning, never for cost accounting.
+func estimateSummarizeTokens(s string) int {
+	return int(math.Ceil(float64(len(s)) / conservativeBytesPerToken))
+}
+
+// warnIfDenserThanSafetyFloor compares the bytes actually sent against the
+// tokens actually billed. conservativeBytesPerToken is a floor derived from
+// measurement, not a guarantee: a future model, tokenizer, or content type can
+// sit below it, and the only symptom would be summarize calls silently 400ing
+// again. One stderr line at the moment of drift is what turns that into a
+// diagnosable event instead of another timing-correlation investigation.
+func warnIfDenserThanSafetyFloor(sentBytes int, usage client.Usage) {
+	billed := usage.InputTokens + usage.CacheReadTokens + usage.CacheCreationTokens
+	if sentBytes <= 0 || billed <= 0 {
+		return
+	}
+	ratio := float64(sentBytes) / float64(billed)
+	if ratio >= conservativeBytesPerToken {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"[context] summarize input denser than the safety floor: bytes=%d billed_tokens=%d ratio=%.2f floor=%.2f — lower summarizeInputCapTokens\n",
+		sentBytes, billed, ratio, conservativeBytesPerToken)
+}
 
 // capTranscriptForSummarize returns s unchanged if it fits, or a head+tail
 // concatenation otherwise. Truncation marker is human-readable so the
@@ -36,7 +96,8 @@ const summarizeInputCapChars = 540_000
 // byte all-Chinese transcript producing 2 U+FFFD chars under the previous
 // impl. (See 2026-05-08 review Finding 3.)
 func capTranscriptForSummarize(s string) string {
-	if len(s) <= summarizeInputCapChars {
+	// Gate in tokens (the limit the API enforces); slice in bytes.
+	if estimateSummarizeTokens(s) <= summarizeInputCapTokens {
 		return s
 	}
 	const marker = "\n\n[... transcript truncated for size — middle elided ...]\n\n"
@@ -45,7 +106,7 @@ func capTranscriptForSummarize(s string) string {
 	// (Boundary adjustments below only shrink head/tail further, so the
 	// inequality stays tight in the byte-aligned case and slack-by-up-to-3
 	// in the multi-byte case — never crosses the cap.)
-	half := (summarizeInputCapChars - len(marker)) / 2
+	half := (summarizeInputCapBytes - len(marker)) / 2
 
 	// Adjust head boundary down to a rune start. utf8.RuneStart returns
 	// true at byte offsets that begin a UTF-8 codepoint; since we truncate
@@ -58,7 +119,7 @@ func capTranscriptForSummarize(s string) string {
 
 	// Adjust tail boundary up to a rune start. Walking *forwards* keeps
 	// the result strictly within `half` bytes; combined with the head
-	// adjustment, total result length is ≤ summarizeInputCapChars.
+	// adjustment, total result length is ≤ summarizeInputCapBytes.
 	tailStart := len(s) - half
 	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
 		tailStart++
@@ -154,7 +215,7 @@ func GenerateSummary(ctx context.Context, c Completer, messages []client.Message
 	// Oversized transcript: sequentially fold earlier chunks into a running
 	// summary instead of silently dropping the middle (head+tail). A failed
 	// fold keeps the head+tail transcript — degrade, never lose the summary.
-	if len(raw) > summarizeInputCapChars {
+	if estimateSummarizeTokens(raw) > summarizeInputCapTokens {
 		if folded, fu, ok := foldOversizedTranscript(ctx, c, messages); ok {
 			transcript = folded
 			foldUsage = fu
@@ -174,10 +235,18 @@ func GenerateSummary(ctx context.Context, c Completer, messages []client.Message
 		CacheSource: "helper",
 	}
 
+	sentBytes := len(summarizePrompt) + len(transcript)
 	resp, err := c.Complete(ctx, req)
 	if err != nil {
+		// The size we sent is the first thing anyone needs when this call is
+		// the one that 400'd — and a rejected call reports no usage, so the
+		// ratio check below can never fire on exactly the failure it guards.
+		fmt.Fprintf(os.Stderr,
+			"[context] summarize call failed: sent_bytes=%d est_tokens=%d budget=%d: %v\n",
+			sentBytes, estimateSummarizeTokens(transcript), summarizeInputCapTokens, err)
 		return "", foldUsage, fmt.Errorf("summarization failed: %w", err)
 	}
+	warnIfDenserThanSafetyFloor(sentBytes, resp.Usage)
 	usage := addUsage(foldUsage, resp.Usage)
 	summary := extractSummary(resp.OutputText)
 
