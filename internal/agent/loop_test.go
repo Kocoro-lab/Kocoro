@@ -2517,7 +2517,7 @@ func TestCompressOldToolResultsXML(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, 3, 100, nil)
+	compressOldToolResults(context.Background(), messages, 3, 100, nil, "")
 
 	// First 2 assistant messages (indices 2,3) should be compressed (tier 2: head+tail truncated)
 	for _, idx := range []int{2, 3} {

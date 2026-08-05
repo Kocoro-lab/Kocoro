@@ -48,14 +48,14 @@ func TestCompressOldToolResults_IdempotentBytesAfterFirstPass(t *testing.T) {
 
 	// Pass 1 legitimately rewrites bytes (raw -> compressed). Snapshot AFTER
 	// it as the reference; passes 2..N must equal it byte-for-byte.
-	compressOldToolResults(context.Background(), messages, 8, 300, nil)
+	compressOldToolResults(context.Background(), messages, 8, 300, nil, "")
 	want, err := json.Marshal(messages)
 	if err != nil {
 		t.Fatalf("marshal pass1: %v", err)
 	}
 
 	for pass := 2; pass <= 5; pass++ {
-		compressOldToolResults(context.Background(), messages, 8, 300, nil)
+		compressOldToolResults(context.Background(), messages, 8, 300, nil, "")
 		got, err := json.Marshal(messages)
 		if err != nil {
 			t.Fatalf("marshal pass%d: %v", pass, err)
@@ -129,7 +129,7 @@ func TestCompressOldToolResults_Tier2BlockSurvivesTier1Zone(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, 8, 300, nil)
+	compressOldToolResults(context.Background(), messages, 8, 300, nil, "")
 
 	blocks := messages[2].Content.Blocks()
 	if len(blocks) == 0 || blocks[0].Type != "tool_result" {

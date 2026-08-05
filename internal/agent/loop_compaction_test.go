@@ -349,7 +349,7 @@ func TestCompressOldToolResults_TieredBehavior(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, keepRecent, 300, nil)
+	compressOldToolResults(context.Background(), messages, keepRecent, 300, nil, "")
 
 	for i := 0; i < numTools; i++ {
 		msgIdx := 2 + i*2
@@ -437,7 +437,7 @@ func TestCompressOldToolResults_Tier2FloorForReadTools(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, 8, 300, nil)
+	compressOldToolResults(context.Background(), messages, 8, 300, nil, "")
 
 	// Check the oldest file_read/grep results (tools 0-4, dist 25-21 from end)
 	// These should be Tier 2 (truncated with head+tail), NOT Tier 1 (snipped).
@@ -504,7 +504,7 @@ func TestCompressOldToolResults_EmergencyMode(t *testing.T) {
 		})
 	}
 
-	compressOldToolResults(context.Background(), messages, 1, 100, nil)
+	compressOldToolResults(context.Background(), messages, 1, 100, nil, "")
 
 	// Only the last tool result should be full
 	for i := 0; i < 5; i++ {

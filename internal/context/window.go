@@ -88,8 +88,37 @@ func ShouldCompact(inputTokens, outputTokens, contextWindow int) bool {
 // trigger every iteration yet never shrink below the trigger — paying a
 // summary per Run for nothing.
 func compactTargetTokens(contextWindow int) int {
-	return int(float64(contextWindow) * compactThreshold)
+	fractional := int(float64(contextWindow) * compactThreshold)
+	absolute := contextWindow - compactAbsoluteBufferTokens
+	if absolute > fractional {
+		return absolute
+	}
+	return fractional
 }
+
+// CompactAbsoluteBufferTokens re-exports the buffer for sibling layers that
+// complement their own fractional thresholds the same way (the preflight
+// backstop in internal/agent).
+const CompactAbsoluteBufferTokens = compactAbsoluteBufferTokens
+
+// compactAbsoluteBufferTokens is the flat reserve the absolute trigger keeps
+// free below the context window. It does NOT guarantee the model's full
+// output ceiling fits (current tiers cap output at 64K–128K, above this
+// buffer): the request-fit property is guaranteed Cloud-side, where the
+// llm-service clamps max_tokens to the remaining context headroom before
+// calling the provider — and every path that can reach the absolute branch
+// goes through Cloud (Ollama windows clamp to ≤200K, below the crossover). What the buffer trades is output-ceiling headroom —
+// between the trigger and the window a response's ceiling may be clamped
+// below the model max — against usable window.
+// Workload that justifies it: the 1M-context families the default tiers route
+// to, where the fractional 90% trigger alone forfeits ~100K usable tokens
+// (leading agent harnesses budget absolutely for this reason). Symptom
+// when it binds: sessions on 1M windows run ~40K tokens closer to the limit
+// before compacting, leaning harder on the calibrated estimator; on windows
+// ≤ ~600K the fractional floor wins and behavior is unchanged. Override:
+// edit this constant (raising it returns headroom to the old fractional
+// behavior).
+const compactAbsoluteBufferTokens = 60_000
 
 // compactRetargetFraction is where a compaction aims to LAND — deliberately
 // below the compactThreshold trigger so one compaction buys real headroom
@@ -110,9 +139,30 @@ func compactTargetTokens(contextWindow int) int {
 // budgets a single user message inside the target; do not unify.
 const compactRetargetFraction = 0.80
 
-// compactLandingTokens is the acceptance budget for shaped candidates.
+// compactLandingTokens is the acceptance budget for shaped candidates. It
+// tracks the trigger's shape: fractional on small windows, window − 3×buffer
+// on large ones — a two-buffer (120K) hysteresis band when the absolute
+// trigger governs. The band must absorb the post-compaction file-restoration
+// payload (restoreTotalTokenCap ≈ 50K, budgeted against the trigger line)
+// AND still leave more than one large turn pair of slack, or one moderate
+// tool result after restoration immediately re-arms the compaction that was
+// just paid for (the exact incident compactRetargetFraction's comment cites).
+// window − 2×buffer looked symmetric but left restoration ~10K from the
+// trigger. Pinned by TestRestoreCapFitsAbsoluteHysteresisBand.
 func compactLandingTokens(contextWindow int) int {
-	return int(float64(contextWindow) * compactRetargetFraction)
+	fractional := int(float64(contextWindow) * compactRetargetFraction)
+	absolute := contextWindow - 3*compactAbsoluteBufferTokens
+	if absolute > fractional {
+		return absolute
+	}
+	return fractional
+}
+
+// CompactLandingTokens exposes the landing line so sibling layers can size
+// payloads relative to the real hysteresis band (trigger − landing) instead
+// of hard-coding assumptions about it.
+func CompactLandingTokens(contextWindow int) int {
+	return compactLandingTokens(contextWindow)
 }
 
 // CompactTriggerTokens exposes the compaction trigger line to callers that

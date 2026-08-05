@@ -36,8 +36,12 @@ const (
 	// restoreTotalTokenCap caps the whole restoration payload (≈50K tokens).
 	//   - Symptom when it binds: fewer than restoreMaxFiles files restored.
 	//   - Override: raise only with a matching context-window increase; the
-	//     compaction just freed (trigger − landing) × window tokens and the
-	//     payload must stay well inside that.
+	//     compaction just freed (trigger − landing) tokens of hysteresis band
+	//     and the payload must stay well inside that. On the absolute-buffer
+	//     regime (≥ ~900K windows) the band is two buffers (120K), so 50K
+	//     leaves more than one large turn pair of slack — the relation is
+	//     pinned by TestRestoreCapFitsAbsoluteHysteresisBand so the constants
+	//     cannot drift apart again.
 	restoreTotalTokenCap = 50_000
 	// restoreMinBudgetTokens is the floor below which restoration declines
 	// entirely: shaping landed so close to the trigger line (e.g. minKeepLast

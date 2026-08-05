@@ -63,6 +63,22 @@ func shouldPreflightCompact(messages []client.Message, contextWindow int, overhe
 		overheadTokens = 0
 	}
 	threshold := int(float64(contextWindow) * preflightCompactThreshold)
+	// Complement the fractional line the same way the main trigger does:
+	// on 1M windows 0.95×window (950K) sat only 10K above the absolute
+	// trigger (940K), eroding the backstop margin the 5% was chosen for.
+	// The reserve floors at defaultMaxOutputTokens (not buffer/2 = 30K):
+	// current model tiers cap output at 64K–128K, so any line this close
+	// to the window relies on the Cloud llm-service clamping max_tokens to
+	// the remaining context headroom (anthropic_provider adjusted_max) —
+	// the reserve keeps at least the fallback output ceiling un-clamped.
+	// 1M: 968K, comfortably above the 940K trigger; small windows keep 0.95.
+	reserve := ctxwin.CompactAbsoluteBufferTokens / 2
+	if reserve < defaultMaxOutputTokens {
+		reserve = defaultMaxOutputTokens
+	}
+	if absolute := contextWindow - reserve; absolute > threshold {
+		threshold = absolute
+	}
 	return ctxwin.EstimateTokens(messages)+overheadTokens >= threshold
 }
 
@@ -959,6 +975,7 @@ type AgentLoop struct {
 	executionEvidenceMu   sync.Mutex
 	skillDiscovery        bool // call small-tier model on first turn to identify relevant skills (default true)
 	memoryPreflight       MemoryPreflightFunc
+	preCompactionSnapshot PreCompactionSnapshotFunc
 	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
 	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
@@ -1621,6 +1638,35 @@ func isSHA256Digest(value string) bool {
 // The result is injected into the current prompt only; it is never persisted.
 func (a *AgentLoop) SetMemoryPreflight(fn MemoryPreflightFunc) {
 	a.memoryPreflight = fn
+}
+
+// PreCompactionSnapshotFunc receives the full message history immediately
+// before an applied compaction replaces it — the last moment the droppable
+// middle exists anywhere but disk spill files. Called synchronously; the
+// slice must not be retained after return. Implementations must swallow
+// their own errors: snapshotting is recovery material and must never block
+// or fail a compaction.
+type PreCompactionSnapshotFunc func(phase string, messages []client.Message)
+
+// SetPreCompactionSnapshot installs the pre-compaction history snapshotter
+// (gap #6 rollback path). The daemon wires this per-request to
+// session.Manager.SaveCompactionSnapshot with the resolved session id; nil
+// (TUI/CLI default) disables snapshotting. Reset on SwitchAgent and session
+// change so a closure bound to a stale session id can never fire.
+func (a *AgentLoop) SetPreCompactionSnapshot(fn PreCompactionSnapshotFunc) {
+	a.preCompactionSnapshot = fn
+}
+
+// snapshotBeforeCompaction invokes the injected snapshotter, if any. The
+// private-memory strip lives HERE, not at the call sites, so a future fifth
+// compaction path cannot reintroduce the leak: the preflight-injected
+// <private_memory> block is deliberately never persisted anywhere
+// (RunMessages excludes it, every GenerateSummary input is stripped), and a
+// snapshot written to disk must honor the same invariant.
+func (a *AgentLoop) snapshotBeforeCompaction(phase string, messages []client.Message) {
+	if a.preCompactionSnapshot != nil {
+		a.preCompactionSnapshot(phase, stripPrivateMemoryForSummary(messages))
+	}
 }
 
 // SetReadTracker injects an externally-owned ReadTracker so file_read dedup
@@ -2398,6 +2444,9 @@ func (a *AgentLoop) SwitchAgent(basePrompt string, memoryDir string, reg *ToolRe
 	// would over-compact the new agent's first iterations.
 	a.estOverheadTokens.Store(0)
 	a.estOverheadModel.Store("")
+	// The snapshotter closure captures a session id at wiring time; the new
+	// agent's runner must re-inject rather than inherit a stale binding.
+	a.preCompactionSnapshot = nil
 }
 
 // SetSkills updates the agent's skill catalog without touching other fields.
@@ -2429,6 +2478,9 @@ func (a *AgentLoop) SetSessionID(id string) {
 		// first iterations.
 		a.estOverheadTokens.Store(0)
 		a.estOverheadModel.Store("")
+		// Same reasoning as calibration: a snapshotter wired for the previous
+		// session id would file this session's snapshots under the wrong key.
+		a.preCompactionSnapshot = nil
 	}
 	a.sessionID = id
 }
@@ -3521,11 +3573,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			}
 			fsBefore := len(messages)
 			emergencyMessages := cloneMessages(messages)
-			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
+			a.snapshotBeforeCompaction("force_stop", messages)
 			if sumErr == nil {
 				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
 			} else {
@@ -4113,6 +4166,7 @@ iterationLoop:
 								before, a.contextWindow, a.estOverhead())
 						}
 					} else {
+						a.snapshotBeforeCompaction("proactive", messages)
 						messages = shaped
 						dropped := before - len(messages)
 						a.recordCompactionSuccess("proactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
@@ -4278,7 +4332,7 @@ iterationLoop:
 			// the way to the minKeepLast floor — reusing a stale summary there
 			// would drop those turns with no summary coverage.
 			emergencyMessages := cloneMessages(messages)
-			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 			var summary string
 			var sumErr error
 			if compactionSummaryIter == i && strings.TrimSpace(compactionSummary) != "" {
@@ -4297,6 +4351,7 @@ iterationLoop:
 				}
 			}
 			before := len(messages)
+			a.snapshotBeforeCompaction("preflight", messages)
 			if sumErr == nil {
 				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
 			} else {
@@ -4682,7 +4737,7 @@ iterationLoop:
 					}
 
 					softMessages := cloneMessages(messages)
-					compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client)
+					compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client, latestUserText)
 					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(softMessages), nextSummary))
 					restoreLLM()
@@ -4701,7 +4756,7 @@ iterationLoop:
 					if a.contextWindow > 0 && ctxwin.EstimateTokens(shaped)+reactiveOverhead >= a.contextWindow {
 						fmt.Fprintf(os.Stderr, "[context] reactive soft path still over budget, using emergency fallback\n")
 						emergencyMessages := cloneMessages(messages)
-						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil)
+						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 
 						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 						summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(emergencyMessages), nextSummary))
@@ -4720,6 +4775,7 @@ iterationLoop:
 						shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow, reactiveOverhead)
 					}
 
+					a.snapshotBeforeCompaction("reactive", messages)
 					messages = shaped
 					compactionSummary = nextSummary
 					compactionSummaryIter = i
@@ -7738,7 +7794,10 @@ func isTier2FloorTool(name string) bool {
 	return strings.HasPrefix(name, "browser_")
 }
 
-func compressOldToolResults(ctx context.Context, messages []client.Message, keepRecent int, maxChars int, completer ctxwin.Completer) {
+// taskContext is the current user request (clipped inside microCompactResult);
+// it steers Tier-2 semantic summaries toward task-relevant details and is
+// unused on mechanical paths (nil completer).
+func compressOldToolResults(ctx context.Context, messages []client.Message, keepRecent int, maxChars int, completer ctxwin.Completer, taskContext string) {
 	const tier1Threshold = 20
 
 	// Pre-scan: build tool_use_id → name+args map for tier-1 metadata.
@@ -7800,7 +7859,7 @@ func compressOldToolResults(ctx context.Context, messages []client.Message, keep
 		} else if distFromEnd >= keepRecent {
 			// Tier 2: LLM summary for large results, else head+tail truncation.
 			oldContent := msg.Content
-			messages[idx].Content = compressTier2(ctx, msg, maxChars, completer, toolCallMap, &mcCount)
+			messages[idx].Content = compressTier2(ctx, msg, maxChars, completer, toolCallMap, &mcCount, taskContext)
 			client.LogCacheCompactEvent("tier2", idx, oldContent, messages[idx].Content)
 		}
 	}
@@ -7846,9 +7905,9 @@ func hasTier2FloorTool(msg client.Message, toolCallMap map[string]toolCallInfo) 
 // For results > microCompactMinChars that haven't been summarized yet and the
 // per-pass cap hasn't been hit, it tries LLM summarization. Otherwise falls
 // back to mechanical head+tail truncation.
-func compressTier2(ctx context.Context, msg client.Message, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int) client.MessageContent {
+func compressTier2(ctx context.Context, msg client.Message, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int, taskContext string) client.MessageContent {
 	if msg.Role == "user" && msg.Content.HasBlocks() {
-		return compressTier2Blocks(ctx, msg.Content, maxChars, completer, toolCallMap, mcCount)
+		return compressTier2Blocks(ctx, msg.Content, maxChars, completer, toolCallMap, mcCount, taskContext)
 	}
 	// XML text format
 	text := msg.Content.Text()
@@ -7867,7 +7926,7 @@ func compressTier2(ctx context.Context, msg client.Message, maxChars int, comple
 // mechanical truncation, or no-op for already-small content — the block is
 // marked CompressedTier = 2 so subsequent Tier 2 AND Tier 1 passes treat it
 // as terminal. See docs/issues/cache-message-prefix-invalidation.md.
-func compressTier2Blocks(ctx context.Context, mc client.MessageContent, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int) client.MessageContent {
+func compressTier2Blocks(ctx context.Context, mc client.MessageContent, maxChars int, completer ctxwin.Completer, toolCallMap map[string]toolCallInfo, mcCount *int, taskContext string) client.MessageContent {
 	blocks := mc.Blocks()
 	var newBlocks []client.ContentBlock
 	for _, b := range blocks {
@@ -7890,7 +7949,7 @@ func compressTier2Blocks(ctx context.Context, mc client.MessageContent, maxChars
 		}
 		if completer != nil && charLen > microCompactMinChars && !isMicroCompacted(content) && *mcCount < microCompactMaxPerPass && !isMicroCompactSkipTool(toolName) {
 			*mcCount++ // count attempts, not just successes — caps latency
-			if summary, ok, mcUsage := microCompactResult(ctx, completer, toolName, content); ok {
+			if summary, ok, mcUsage := microCompactResult(ctx, completer, toolName, content, taskContext); ok {
 				EmitUsage(ctx, TurnUsage{
 					InputTokens:           mcUsage.InputTokens,
 					OutputTokens:          mcUsage.OutputTokens,

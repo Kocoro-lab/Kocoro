@@ -3836,6 +3836,22 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if cal := sess.CompactionCalibration; cal != nil {
 		loop.SetEstOverheadState(cal.OverheadTokens, cal.Model, cal.ToolsFingerprint)
 	}
+	// Pre-compaction snapshot: persist the full history under this session id
+	// right before an applied compaction replaces it — the rollback material
+	// for junk summaries and lost identifiers. Wired after SetSessionID /
+	// SwitchAgent (both reset the snapshotter) so the closure's session id
+	// can never go stale. Errors are logged, never surfaced: snapshotting
+	// must not block or fail a compaction.
+	if cfg != nil && cfg.Agent.CompactionSnapshotRetention > 0 {
+		retention := cfg.Agent.CompactionSnapshotRetention
+		snapSessionID := sess.ID
+		snapMgr := sessMgr
+		loop.SetPreCompactionSnapshot(func(phase string, msgs []client.Message) {
+			if err := snapMgr.SaveCompactionSnapshot(snapSessionID, phase, msgs, retention); err != nil {
+				log.Printf("daemon: compaction snapshot failed (session=%s phase=%s): %v", snapSessionID, phase, err)
+			}
+		})
+	}
 	// Inject the per-session ReadTracker so file_read dedup history persists
 	// across the per-message AgentLoop instances created here. nil-safe: an
 	// unset cache returns a fresh tracker, which keeps the pre-fix behavior.

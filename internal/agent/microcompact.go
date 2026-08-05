@@ -46,21 +46,46 @@ func isMicroCompactSkipTool(name string) bool {
 	return strings.HasPrefix(name, "browser_")
 }
 
-const microCompactPrompt = `Summarize this tool result in 1-2 sentences. Preserve exact error strings, file paths, URLs, IDs, and numbers when present. Focus on the final outcome or conclusion.
+const microCompactPrompt = `Summarize this tool result in 1-2 sentences. Preserve exact error strings, file paths, URLs, IDs, and numbers when present. Focus on the final outcome or conclusion.%s
 
 Tool: %s
 Result:
 %s`
 
+// microCompactTaskContextMaxRunes bounds the current-task line carried into
+// each micro-compact prompt. Workload that justifies it: latestUserText can be
+// a multi-thousand-rune pasted spec, and riding it verbatim into every Tier-2
+// summarization call multiplies small-tier input cost with no summarization
+// benefit. Symptom when it binds: the task line is head-clipped, so guidance
+// buried in the tail of a very long request is invisible to the summarizer
+// (the ask virtually always leads). Override path: edit this constant.
+const microCompactTaskContextMaxRunes = 240
+
+// clipTaskContext trims and head-clips the task text for prompt embedding.
+func clipTaskContext(task string) string {
+	task = strings.TrimSpace(task)
+	r := []rune(task)
+	if len(r) <= microCompactTaskContextMaxRunes {
+		return task
+	}
+	return string(r[:microCompactTaskContextMaxRunes]) + "…"
+}
+
 // microCompactResult uses the small LLM tier to produce a 1-2 sentence semantic
-// summary of a tool result. Returns ("", false) if summarization fails or is
+// summary of a tool result. taskContext (the current user request, clipped) lets
+// the summarizer prioritize details relevant to the active task; empty adds
+// nothing to the prompt. Returns ("", false) if summarization fails or is
 // skipped, signaling the caller to fall back to mechanical truncation.
-func microCompactResult(ctx context.Context, c ctxwin.Completer, toolName, content string) (string, bool, client.Usage) {
+func microCompactResult(ctx context.Context, c ctxwin.Completer, toolName, content, taskContext string) (string, bool, client.Usage) {
 	if c == nil {
 		return "", false, client.Usage{}
 	}
 
-	prompt := fmt.Sprintf(microCompactPrompt, toolName, content)
+	taskSection := ""
+	if t := clipTaskContext(taskContext); t != "" {
+		taskSection = "\nCurrent task (prefer details relevant to it): " + t
+	}
+	prompt := fmt.Sprintf(microCompactPrompt, taskSection, toolName, content)
 
 	resp, err := c.Complete(ctx, client.CompletionRequest{
 		Messages: []client.Message{
