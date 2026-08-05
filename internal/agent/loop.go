@@ -959,6 +959,7 @@ type AgentLoop struct {
 	executionEvidenceMu   sync.Mutex
 	skillDiscovery        bool // call small-tier model on first turn to identify relevant skills (default true)
 	memoryPreflight       MemoryPreflightFunc
+	preCompactionSnapshot PreCompactionSnapshotFunc
 	sentSkillNames        map[string]bool // delta tracking: skills already announced to the LLM (persists across Run() calls)
 	readTracker           *ReadTracker    // per-loop: current-turn reads reset each Run; file_read dedup history persists across session Runs
 	// toolResultReplacements stores stable query-time replacements for large
@@ -1621,6 +1622,30 @@ func isSHA256Digest(value string) bool {
 // The result is injected into the current prompt only; it is never persisted.
 func (a *AgentLoop) SetMemoryPreflight(fn MemoryPreflightFunc) {
 	a.memoryPreflight = fn
+}
+
+// PreCompactionSnapshotFunc receives the full message history immediately
+// before an applied compaction replaces it — the last moment the droppable
+// middle exists anywhere but disk spill files. Called synchronously; the
+// slice must not be retained after return. Implementations must swallow
+// their own errors: snapshotting is recovery material and must never block
+// or fail a compaction.
+type PreCompactionSnapshotFunc func(phase string, messages []client.Message)
+
+// SetPreCompactionSnapshot installs the pre-compaction history snapshotter
+// (gap #6 rollback path). The daemon wires this per-request to
+// session.Manager.SaveCompactionSnapshot with the resolved session id; nil
+// (TUI/CLI default) disables snapshotting. Reset on SwitchAgent and session
+// change so a closure bound to a stale session id can never fire.
+func (a *AgentLoop) SetPreCompactionSnapshot(fn PreCompactionSnapshotFunc) {
+	a.preCompactionSnapshot = fn
+}
+
+// snapshotBeforeCompaction invokes the injected snapshotter, if any.
+func (a *AgentLoop) snapshotBeforeCompaction(phase string, messages []client.Message) {
+	if a.preCompactionSnapshot != nil {
+		a.preCompactionSnapshot(phase, messages)
+	}
 }
 
 // SetReadTracker injects an externally-owned ReadTracker so file_read dedup
@@ -2398,6 +2423,9 @@ func (a *AgentLoop) SwitchAgent(basePrompt string, memoryDir string, reg *ToolRe
 	// would over-compact the new agent's first iterations.
 	a.estOverheadTokens.Store(0)
 	a.estOverheadModel.Store("")
+	// The snapshotter closure captures a session id at wiring time; the new
+	// agent's runner must re-inject rather than inherit a stale binding.
+	a.preCompactionSnapshot = nil
 }
 
 // SetSkills updates the agent's skill catalog without touching other fields.
@@ -2429,6 +2457,9 @@ func (a *AgentLoop) SetSessionID(id string) {
 		// first iterations.
 		a.estOverheadTokens.Store(0)
 		a.estOverheadModel.Store("")
+		// Same reasoning as calibration: a snapshotter wired for the previous
+		// session id would file this session's snapshots under the wrong key.
+		a.preCompactionSnapshot = nil
 	}
 	a.sessionID = id
 }
@@ -3526,6 +3557,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
+			a.snapshotBeforeCompaction("force_stop", messages)
 			if sumErr == nil {
 				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
 			} else {
@@ -4113,6 +4145,7 @@ iterationLoop:
 								before, a.contextWindow, a.estOverhead())
 						}
 					} else {
+						a.snapshotBeforeCompaction("proactive", messages)
 						messages = shaped
 						dropped := before - len(messages)
 						a.recordCompactionSuccess("proactive", fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
@@ -4297,6 +4330,7 @@ iterationLoop:
 				}
 			}
 			before := len(messages)
+			a.snapshotBeforeCompaction("preflight", messages)
 			if sumErr == nil {
 				messages = ctxwin.ShapeHistory(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
 			} else {
@@ -4720,6 +4754,7 @@ iterationLoop:
 						shaped = ctxwin.ShapeHistory(emergencyMessages, nextSummary, a.contextWindow, reactiveOverhead)
 					}
 
+					a.snapshotBeforeCompaction("reactive", messages)
 					messages = shaped
 					compactionSummary = nextSummary
 					compactionSummaryIter = i

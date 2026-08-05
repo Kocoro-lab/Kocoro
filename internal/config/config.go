@@ -210,6 +210,14 @@ type AgentConfig struct {
 	// in place (markers preserved) without any automatic execution.
 	InterruptedResumeEnabled *bool `mapstructure:"interrupted_resume_enabled" yaml:"interrupted_resume_enabled,omitempty" json:"interrupted_resume_enabled,omitempty"`
 	SkillDiscovery           *bool `mapstructure:"skill_discovery" yaml:"skill_discovery,omitempty" json:"skill_discovery,omitempty"`
+	// CompactionSnapshotRetention is how many pre-compaction history snapshots
+	// are kept per session (sessions-dir/.compaction-snapshots/<id>/). Each
+	// applied compaction irreversibly replaces the persisted history; the
+	// snapshot is the rollback material for junk summaries and lost
+	// identifiers. Default 3 covers a long session's recent compactions while
+	// bounding disk (snapshots are full-history JSON). When it binds, older
+	// pre-compaction states are unrecoverable. 0 disables snapshotting.
+	CompactionSnapshotRetention int `mapstructure:"compaction_snapshot_retention" yaml:"compaction_snapshot_retention" json:"compaction_snapshot_retention"`
 
 	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When true
 	// (the Phase C default since 2026-05-15), bash invocations that pass the
@@ -462,6 +470,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.idle_hard_timeout_secs", 540)  // 60s headroom under the 600s HTTP transport ceiling so cancel can propagate + cleanup runs before transport bails. Set to 0 in yaml to opt out (startup WARN logs).
 	viper.SetDefault("agent.stream_idle_timeout_secs", 90) // per-chunk gap watchdog inside CompleteStream. 0 disables (legacy scanner path).
 	viper.SetDefault("agent.interrupted_resume_max_attempts", 3)
+	viper.SetDefault("agent.compaction_snapshot_retention", 3)
 	viper.SetDefault("agent.interrupted_resume_max_age_hours", 4) // staleness window for auto-resume; see Config.Agent.InterruptedResumeMaxAgeHours
 	viper.SetDefault("agent.interrupted_resume_enabled", true)
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.

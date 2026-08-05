@@ -32,7 +32,8 @@
         "enabled": false,
         "gap_threshold_minutes": 0,
         "keep_recent": 0
-      }
+      },
+      "compaction_snapshot_retention": 0
     },
     "api_key": "***",
     "auto_update_check": false,
