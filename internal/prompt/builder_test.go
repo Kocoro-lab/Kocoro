@@ -897,6 +897,29 @@ func TestBuildSystemPrompt_OutputFormatPlain(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_FastModeGuidanceIsVolatile(t *testing.T) {
+	fast := BuildSystemPrompt(PromptOptions{BasePrompt: "Base.", FastMode: true})
+	for _, want := range []string{
+		"## Fast Task",
+		"fewest tool rounds",
+		"Do not repeat a successful search, fetch, read, or other call",
+		"budget one broad search at most",
+		"exceed that budget only when a required fact, requested source, or important citation is still missing",
+	} {
+		if !strings.Contains(fast.VolatileContext, want) {
+			t.Errorf("FastMode volatile context missing %q", want)
+		}
+	}
+	if strings.Contains(fast.System, "## Fast Task") || strings.Contains(fast.StableContext, "## Fast Task") {
+		t.Fatal("FastMode guidance must not invalidate cacheable prompt prefixes")
+	}
+
+	normal := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+	if strings.Contains(normal.VolatileContext, "## Fast Task") {
+		t.Fatal("normal mode must not receive FastMode guidance")
+	}
+}
+
 func TestFormatGuidanceKoe(t *testing.T) {
 	g := formatGuidance("koe")
 	for _, want := range []string{"native voice", "complete", "kocoro desktop", "outcome", "markdown", "deliverable"} {

@@ -3021,6 +3021,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		ModelID:             modelID,
 		OutputFormat:        a.outputFormat,
 		QuestionUIAvailable: QuestionAskerFrom(ctx) != nil,
+		FastMode:            a.executionProfileID != "",
 	})
 
 	// Append cloud delegation guidance and cloud-specific contrast example

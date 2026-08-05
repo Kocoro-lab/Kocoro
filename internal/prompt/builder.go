@@ -87,6 +87,10 @@ type PromptOptions struct {
 	// It is rendered only in VolatileContext so attended/unattended source
 	// differences never perturb the cacheable system prompt.
 	QuestionUIAvailable bool
+	// FastMode adds outcome-first stopping guidance for the reserved fast
+	// execution profile. It stays volatile so toggling the profile does not
+	// invalidate the shared system or per-session stable prompt prefixes.
+	FastMode bool
 }
 
 // PromptParts separates the system prompt into cacheable and volatile sections.
@@ -484,6 +488,11 @@ func buildVolatileContext(opts PromptOptions) string {
 	// Output formatting guidance
 	sb.WriteString("\n\n## Output Format\n")
 	sb.WriteString(formatGuidance(opts.OutputFormat))
+
+	if opts.FastMode {
+		sb.WriteString("\n\n## Fast Task\n")
+		sb.WriteString("Use the fewest tool rounds that can answer correctly. After each result, stop and answer once the core request and required evidence are satisfied. Do not repeat a successful search, fetch, read, or other call for wording or optional detail. For an ordinary lookup, budget one broad search at most; exceed that budget only when a required fact, requested source, or important citation is still missing.")
+	}
 
 	// Memory — stays volatile: memory_append can mutate MEMORY.md during a
 	// turn, so the block must be re-read and re-sent each Run(). Instructions
