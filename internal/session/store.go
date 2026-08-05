@@ -437,6 +437,7 @@ func NewStore(dir string) *Store {
 	os.MkdirAll(dir, 0700)
 	sweepStaleTempFiles(dir)
 	s := &Store{dir: dir}
+	s.SweepOrphanCompactionSnapshots()
 	idx, err := OpenIndex(dir)
 	if err == nil {
 		s.index = idx
@@ -1120,6 +1121,10 @@ func (s *Store) Delete(id string) error {
 		return err
 	}
 	s.removeInterruptedMarker(id)
+	// Pre-compaction snapshots are the most content-rich copy of the session
+	// (full pre-drop history); deleting the session must not leave them
+	// behind. Best-effort: the session file itself is already gone.
+	os.RemoveAll(filepath.Join(s.dir, compactionSnapshotDirName, id))
 
 	if s.index != nil {
 		s.index.DeleteSession(id) // best-effort

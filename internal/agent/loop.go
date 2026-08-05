@@ -63,6 +63,14 @@ func shouldPreflightCompact(messages []client.Message, contextWindow int, overhe
 		overheadTokens = 0
 	}
 	threshold := int(float64(contextWindow) * preflightCompactThreshold)
+	// Complement the fractional line the same way the main trigger does:
+	// on 1M windows 0.95×window (950K) sat only 10K above the absolute
+	// trigger (940K), eroding the backstop margin the 5% was chosen for.
+	// window − buffer/2 keeps the preflight line midway between the
+	// absolute trigger and the window (1M: 970K); small windows keep 0.95.
+	if absolute := contextWindow - ctxwin.CompactAbsoluteBufferTokens/2; absolute > threshold {
+		threshold = absolute
+	}
 	return ctxwin.EstimateTokens(messages)+overheadTokens >= threshold
 }
 
@@ -1641,10 +1649,15 @@ func (a *AgentLoop) SetPreCompactionSnapshot(fn PreCompactionSnapshotFunc) {
 	a.preCompactionSnapshot = fn
 }
 
-// snapshotBeforeCompaction invokes the injected snapshotter, if any.
+// snapshotBeforeCompaction invokes the injected snapshotter, if any. The
+// private-memory strip lives HERE, not at the call sites, so a future fifth
+// compaction path cannot reintroduce the leak: the preflight-injected
+// <private_memory> block is deliberately never persisted anywhere
+// (RunMessages excludes it, every GenerateSummary input is stripped), and a
+// snapshot written to disk must honor the same invariant.
 func (a *AgentLoop) snapshotBeforeCompaction(phase string, messages []client.Message) {
 	if a.preCompactionSnapshot != nil {
-		a.preCompactionSnapshot(phase, messages)
+		a.preCompactionSnapshot(phase, stripPrivateMemoryForSummary(messages))
 	}
 }
 

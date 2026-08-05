@@ -162,6 +162,40 @@ func TestAgentLoop_ReactiveCompactionSnapshotsHistory(t *testing.T) {
 	}
 }
 
+// TestSnapshotBeforeCompaction_StripsPrivateMemory: the preflight-injected
+// <private_memory> block is deliberately never persisted anywhere — the
+// snapshot written to disk must honor the same invariant. The strip lives
+// inside snapshotBeforeCompaction so no compaction call site can bypass it.
+func TestSnapshotBeforeCompaction_StripsPrivateMemory(t *testing.T) {
+	reg := NewToolRegistry()
+	loop := NewAgentLoop(nil, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+
+	var captured []client.Message
+	loop.SetPreCompactionSnapshot(func(_ string, msgs []client.Message) {
+		captured = msgs
+	})
+
+	secret := privateMemoryOpenMarker + "\nrecalled fact about a third party\n" + privateMemoryCloseMarker
+	messages := []client.Message{
+		{Role: "user", Content: client.NewTextContent(secret + "\nwhat did we decide?")},
+		{Role: "assistant", Content: client.NewTextContent("working on it")},
+	}
+	loop.snapshotBeforeCompaction("proactive", messages)
+
+	if captured == nil {
+		t.Fatal("snapshotter was not invoked")
+	}
+	for i, m := range captured {
+		if strings.Contains(m.Content.Text(), privateMemoryOpenMarker) ||
+			strings.Contains(m.Content.Text(), "third party") {
+			t.Errorf("message %d leaked private memory into the snapshot:\n%s", i, m.Content.Text())
+		}
+	}
+	if !strings.Contains(captured[0].Content.Text(), "what did we decide?") {
+		t.Error("strip must keep the user's own text")
+	}
+}
+
 // TestAgentLoop_SwitchAgentResetsSnapshotter: a snapshotter closure captures a
 // session id at wiring time; agent/session switches must drop it so a stale
 // closure can never write snapshots under the wrong session.

@@ -60,7 +60,7 @@ func TestStore_SaveCompactionSnapshot_WritesAndRoundTrips(t *testing.T) {
 	}
 }
 
-func TestStore_SaveCompactionSnapshot_PrunesOldest(t *testing.T) {
+func TestStore_SaveCompactionSnapshot_PinsOldestAndPrunesRest(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(dir)
 
@@ -75,16 +75,98 @@ func TestStore_SaveCompactionSnapshot_PrunesOldest(t *testing.T) {
 	if len(files) != 3 {
 		t.Fatalf("expected retention to keep 3 snapshots, got %d: %v", len(files), files)
 	}
-	// The oldest ("proactive") must be gone; the newest ("force_stop") kept.
 	joined := ""
 	for _, f := range files {
 		joined += f + " "
 	}
+	// The OLDEST snapshot is pinned — it is the only one whose tool results
+	// predate every micro-compact pass. Rotation evicts from the second-
+	// oldest up, so "preflight" goes and "proactive"+newest two stay.
+	if !contains(files, "proactive") {
+		t.Errorf("oldest (pre-first-compaction) snapshot must be pinned: %s", joined)
+	}
 	if !contains(files, "force_stop") {
 		t.Errorf("newest snapshot missing: %s", joined)
 	}
-	if contains(files, "proactive") {
-		t.Errorf("oldest snapshot must be pruned: %s", joined)
+	if contains(files, "preflight") {
+		t.Errorf("second-oldest snapshot must be evicted: %s", joined)
+	}
+}
+
+func TestStore_SaveCompactionSnapshot_SanitizesPhaseAndSweepsTmp(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("x")}}
+
+	if err := s.SaveCompactionSnapshot("sess-p", "../Evil Phase", msgs, 3); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	files := snapshotFiles(t, dir, "sess-p")
+	if len(files) != 1 || !contains(files, "unknown") {
+		t.Fatalf("unsafe phase must collapse to 'unknown' in the filename, got %v", files)
+	}
+
+	// A stray .tmp (crash between write and rename) is removed by the next
+	// save's prune pass — nothing else ever sweeps this directory.
+	stray := filepath.Join(dir, compactionSnapshotDirName, "sess-p", "stale.json.tmp")
+	if err := os.WriteFile(stray, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCompactionSnapshot("sess-p", "proactive", msgs, 3); err != nil {
+		t.Fatalf("save 2: %v", err)
+	}
+	if _, err := os.Stat(stray); !os.IsNotExist(err) {
+		t.Error("stray .tmp must be swept by the prune pass")
+	}
+}
+
+func TestStore_Delete_RemovesCompactionSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+
+	sess := &Session{ID: "sess-del", Title: "t"}
+	if err := s.Save(sess); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("full pre-drop history")}}
+	if err := s.SaveCompactionSnapshot("sess-del", "proactive", msgs, 3); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	if err := s.Delete("sess-del"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	snapDir := filepath.Join(dir, compactionSnapshotDirName, "sess-del")
+	if _, err := os.Stat(snapDir); !os.IsNotExist(err) {
+		t.Error("deleting a session must remove its snapshot directory — it is the most content-rich copy of the history")
+	}
+}
+
+func TestNewStore_SweepsOrphanCompactionSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+
+	live := &Session{ID: "sess-live", Title: "t"}
+	if err := s.Save(live); err != nil {
+		t.Fatal(err)
+	}
+	msgs := []client.Message{{Role: "user", Content: client.NewTextContent("x")}}
+	if err := s.SaveCompactionSnapshot("sess-live", "proactive", msgs, 3); err != nil {
+		t.Fatal(err)
+	}
+	// Orphan: snapshot dir with no session JSON (deleted out of band).
+	orphan := filepath.Join(dir, compactionSnapshotDirName, "sess-gone")
+	if err := os.MkdirAll(orphan, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	NewStore(dir) // fresh store: startup sweep runs
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Error("orphan snapshot dir must be swept at store startup")
+	}
+	if files := snapshotFiles(t, dir, "sess-live"); len(files) != 1 {
+		t.Errorf("live session's snapshots must survive the sweep, got %v", files)
 	}
 }
 

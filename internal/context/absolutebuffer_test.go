@@ -31,8 +31,10 @@ func TestCompactLandingTokens_TracksTriggerWithHysteresis(t *testing.T) {
 			t.Errorf("window %d: landing %d must stay below trigger %d (hysteresis band)", w, landing, trigger)
 		}
 	}
-	// On the 1M family the band equals one buffer: landing = window - 2*buffer.
-	if got, want := compactLandingTokens(1_000_000), 1_000_000-2*compactAbsoluteBufferTokens; got != want {
+	// On the 1M family the band is two buffers: landing = window - 3*buffer.
+	// One buffer proved too tight — the ~50K restoration payload budgets
+	// against the trigger and left ~10K of re-trigger slack.
+	if got, want := compactLandingTokens(1_000_000), 1_000_000-3*compactAbsoluteBufferTokens; got != want {
 		t.Errorf("1M landing = %d, want %d", got, want)
 	}
 	if got, want := compactLandingTokens(200_000), 160_000; got != want {

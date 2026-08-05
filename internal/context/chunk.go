@@ -65,10 +65,19 @@ func splitTranscriptChunks(messages []client.Message, capChars int) [][]client.M
 		}
 		unit := []client.Message{m}
 		unitLen := msgLen(m)
-		if m.Role == "assistant" && hasToolUseBlock(m) && i+1 < len(messages) && hasToolResultBlock(messages[i+1]) {
-			unit = append(unit, messages[i+1])
-			unitLen += msgLen(messages[i+1])
-			i++
+		// Pair a tool_use with its tool_result, skipping any system messages
+		// between them — buildTranscript drops system messages anyway, and a
+		// system message must not break the atomic unit.
+		if m.Role == "assistant" && hasToolUseBlock(m) {
+			next := i + 1
+			for next < len(messages) && messages[next].Role == "system" {
+				next++
+			}
+			if next < len(messages) && hasToolResultBlock(messages[next]) {
+				unit = append(unit, messages[next])
+				unitLen += msgLen(messages[next])
+				i = next
+			}
 		}
 		if currentLen > 0 && currentLen+unitLen > capChars {
 			flush()
@@ -113,6 +122,14 @@ func foldOversizedTranscript(ctx context.Context, c Completer, messages []client
 		rolling = "[earliest part of the conversation elided for size]"
 		chunks = chunks[len(chunks)-maxSummaryFoldChunks:]
 	}
+	// One line up front plus one per chunk: the fold is up to 6× the input
+	// volume of the single-shot path and fires on exactly the biggest
+	// sessions, so a slow fold must be attributable (and countable for the
+	// gap #2 re-open telemetry) instead of looking like a hang. The fold
+	// runs inside one PhaseAwaitingLLM window — on very large transcripts
+	// the sequential calls can approach agent.idle_hard_timeout_secs; the
+	// per-chunk lines below are the operator's signal to raise it.
+	fmt.Fprintf(os.Stderr, "[context] transcript fold engaged: %d chunks\n", len(chunks))
 
 	for i, ch := range chunks[:len(chunks)-1] {
 		prior := rolling
@@ -141,6 +158,7 @@ func foldOversizedTranscript(ctx context.Context, c Completer, messages []client
 			fmt.Fprintf(os.Stderr, "[context] transcript fold chunk %d/%d returned empty, falling back to head+tail\n", i+1, len(chunks))
 			return "", usage, false
 		}
+		fmt.Fprintf(os.Stderr, "[context] transcript fold chunk %d/%d done\n", i+1, len(chunks))
 	}
 
 	final := "[Running summary of the earlier part of this conversation]\n" + rolling +

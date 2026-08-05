@@ -94,6 +94,40 @@ func TestSplitTranscriptChunks_NeverStartsChunkAtToolResult(t *testing.T) {
 	}
 }
 
+func TestSplitTranscriptChunks_SystemMessageDoesNotBreakToolPair(t *testing.T) {
+	big := strings.Repeat("x", 3_000)
+	var messages []client.Message
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("tu-%d", i)
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolUseBlock(id, "bash", json.RawMessage(`{"cmd":"ls"}`)),
+			})},
+			// A system message between the call and its result must not
+			// defeat the atomic unit — buildTranscript drops it anyway.
+			client.Message{Role: "system", Content: client.NewTextContent("interleaved system note")},
+			client.Message{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolResultBlock(id, big, false),
+			})},
+		)
+	}
+
+	chunks := splitTranscriptChunks(messages, 5_000)
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+	for i, ch := range chunks[1:] {
+		first := ch[0]
+		if first.Role == "user" && first.Content.HasBlocks() {
+			for _, b := range first.Content.Blocks() {
+				if b.Type == "tool_result" {
+					t.Errorf("chunk %d starts at a tool_result — an interleaved system message broke the pair", i+1)
+				}
+			}
+		}
+	}
+}
+
 func TestSplitTranscriptChunks_OversizedMessageGetsOwnChunk(t *testing.T) {
 	messages := []client.Message{
 		{Role: "user", Content: client.NewTextContent("small")},

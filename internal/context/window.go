@@ -96,6 +96,11 @@ func compactTargetTokens(contextWindow int) int {
 	return fractional
 }
 
+// CompactAbsoluteBufferTokens re-exports the buffer for sibling layers that
+// complement their own fractional thresholds the same way (the preflight
+// backstop in internal/agent).
+const CompactAbsoluteBufferTokens = compactAbsoluteBufferTokens
+
 // compactAbsoluteBufferTokens is the flat reserve the absolute trigger keeps
 // free below the context window: room for the response (max_tokens tiers top
 // out well under 32K) plus estimator-error and next-turn-tool-result margin.
@@ -129,17 +134,29 @@ const compactAbsoluteBufferTokens = 60_000
 const compactRetargetFraction = 0.80
 
 // compactLandingTokens is the acceptance budget for shaped candidates. It
-// tracks the trigger's shape: fractional on small windows, window − 2×buffer
-// on large ones — so the hysteresis band stays one buffer wide when the
-// absolute trigger governs, instead of ballooning to (trigger − 0.80×window)
-// and summarizing away far more history than the band requires.
+// tracks the trigger's shape: fractional on small windows, window − 3×buffer
+// on large ones — a two-buffer (120K) hysteresis band when the absolute
+// trigger governs. The band must absorb the post-compaction file-restoration
+// payload (restoreTotalTokenCap ≈ 50K, budgeted against the trigger line)
+// AND still leave more than one large turn pair of slack, or one moderate
+// tool result after restoration immediately re-arms the compaction that was
+// just paid for (the exact incident compactRetargetFraction's comment cites).
+// window − 2×buffer looked symmetric but left restoration ~10K from the
+// trigger. Pinned by TestRestoreCapFitsAbsoluteHysteresisBand.
 func compactLandingTokens(contextWindow int) int {
 	fractional := int(float64(contextWindow) * compactRetargetFraction)
-	absolute := contextWindow - 2*compactAbsoluteBufferTokens
+	absolute := contextWindow - 3*compactAbsoluteBufferTokens
 	if absolute > fractional {
 		return absolute
 	}
 	return fractional
+}
+
+// CompactLandingTokens exposes the landing line so sibling layers can size
+// payloads relative to the real hysteresis band (trigger − landing) instead
+// of hard-coding assumptions about it.
+func CompactLandingTokens(contextWindow int) int {
+	return compactLandingTokens(contextWindow)
 }
 
 // CompactTriggerTokens exposes the compaction trigger line to callers that
