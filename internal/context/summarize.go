@@ -148,7 +148,20 @@ func buildTranscript(messages []client.Message) string {
 // extraction keeps the existing semantics — callers treat "" as a failure
 // with their own backoff.
 func GenerateSummary(ctx context.Context, c Completer, messages []client.Message) (string, client.Usage, error) {
-	transcript := capTranscriptForSummarize(buildTranscript(messages))
+	raw := buildTranscript(messages)
+	transcript := capTranscriptForSummarize(raw)
+	var foldUsage client.Usage
+	// Oversized transcript: sequentially fold earlier chunks into a running
+	// summary instead of silently dropping the middle (head+tail). A failed
+	// fold keeps the head+tail transcript — degrade, never lose the summary.
+	if len(raw) > summarizeInputCapChars {
+		if folded, fu, ok := foldOversizedTranscript(ctx, c, messages); ok {
+			transcript = folded
+			foldUsage = fu
+		} else {
+			foldUsage = fu // partial fold calls were still billed
+		}
+	}
 	identifiers := identifiersAtRisk(messages)
 	req := client.CompletionRequest{
 		Messages: []client.Message{
@@ -163,9 +176,9 @@ func GenerateSummary(ctx context.Context, c Completer, messages []client.Message
 
 	resp, err := c.Complete(ctx, req)
 	if err != nil {
-		return "", client.Usage{}, fmt.Errorf("summarization failed: %w", err)
+		return "", foldUsage, fmt.Errorf("summarization failed: %w", err)
 	}
-	usage := resp.Usage
+	usage := addUsage(foldUsage, resp.Usage)
 	summary := extractSummary(resp.OutputText)
 
 	// The audit only makes sense at compaction scale: a history ShapeHistory
