@@ -173,6 +173,23 @@ func TestNewStore_SweepsOrphanCompactionSnapshots(t *testing.T) {
 	}
 }
 
+func TestNewStore_OrphanSweepRunsOncePerDir(t *testing.T) {
+	dir := t.TempDir()
+	NewStore(dir) // consumes this dir's once-per-process sweep slot
+
+	// An orphan planted AFTER the first construction must survive a second
+	// NewStore over the same dir — the per-route Store churn that motivated
+	// the gate must not re-run the sweep concurrently with live sessions.
+	orphan := filepath.Join(dir, compactionSnapshotDirName, "sess-late-orphan")
+	if err := os.MkdirAll(orphan, 0700); err != nil {
+		t.Fatal(err)
+	}
+	NewStore(dir)
+	if _, err := os.Stat(orphan); err != nil {
+		t.Error("second NewStore over the same dir must NOT re-run the orphan sweep")
+	}
+}
+
 func TestStore_SaveCompactionSnapshot_RetentionOneKeepsNewest(t *testing.T) {
 	dir := t.TempDir()
 	s := NewStore(dir)

@@ -215,8 +215,10 @@ type AgentConfig struct {
 	// applied compaction irreversibly replaces the persisted history; the
 	// snapshot is the rollback material for junk summaries and lost
 	// identifiers. Default 3 covers a long session's recent compactions while
-	// bounding disk (snapshots are full-history JSON). When it binds, older
-	// pre-compaction states are unrecoverable. 0 disables snapshotting.
+	// bounding disk (snapshots are full-history JSON). When it binds (>=2),
+	// the MIDDLE snapshots are evicted — the oldest is pinned as the only
+	// pre-micro-compaction copy and the newest are kept; retention 1 keeps
+	// only the newest, no pin. 0 disables snapshotting.
 	CompactionSnapshotRetention int `mapstructure:"compaction_snapshot_retention" yaml:"compaction_snapshot_retention" json:"compaction_snapshot_retention"`
 
 	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When true

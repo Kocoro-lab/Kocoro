@@ -106,7 +106,8 @@ const CompactAbsoluteBufferTokens = compactAbsoluteBufferTokens
 // output ceiling fits (current tiers cap output at 64K–128K, above this
 // buffer): the request-fit property is guaranteed Cloud-side, where the
 // llm-service clamps max_tokens to the remaining context headroom before
-// calling the provider. What the buffer trades is output-ceiling headroom —
+// calling the provider — and every path that can reach the absolute branch
+// goes through Cloud (Ollama windows clamp to ≤200K, below the crossover). What the buffer trades is output-ceiling headroom —
 // between the trigger and the window a response's ceiling may be clamped
 // below the model max — against usable window.
 // Workload that justifies it: the 1M-context families the default tiers route
