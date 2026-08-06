@@ -50,6 +50,14 @@ func TestValidateConfig_IdleTimeouts(t *testing.T) {
 	}
 }
 
+func TestShannonDirIgnoresStateDirectoryEnvironment(t *testing.T) {
+	environmentDir := filepath.Join(t.TempDir(), "environment-state")
+	t.Setenv("SHANNON_STATE_DIR", environmentDir)
+	if got := ShannonDir(); got == environmentDir {
+		t.Fatalf("ShannonDir() accepted process-global SHANNON_STATE_DIR=%q", environmentDir)
+	}
+}
+
 func TestValidateConfig_AgentModelTierKeyword(t *testing.T) {
 	mk := func(model string) *Config {
 		c := &Config{}

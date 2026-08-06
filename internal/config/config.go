@@ -402,6 +402,9 @@ type MarketplaceConfig struct {
 }
 
 func ShannonDir() string {
+	if override := shannonDirProcessOverride(); override != "" {
+		return override
+	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""

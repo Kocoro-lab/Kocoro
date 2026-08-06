@@ -91,7 +91,7 @@ func TestResolveDefaultRevertsToImplicit(t *testing.T) {
 	// this a user could switch TO a specialist by voice but never back to default.
 	agents := []AgentSummary{{Slug: "investment-analyst", DisplayName: "investment-analyst"}}
 	r := NewAgentResolver(agents, NoopSemanticMatcher{})
-	for _, ref := range []string{"default", "默认", "the default agent", "默认 agent"} {
+	for _, ref := range []string{"default", "默认", "the default agent", "默认 agent", "Kocoro", "Kocoro agent"} {
 		got := r.Resolve(ref)
 		if got.Status != ResolveResolved || got.Slug != "" {
 			t.Errorf("Resolve(%q) = %+v, want Resolved/\"\" (implicit default)", ref, got)

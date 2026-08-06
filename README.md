@@ -875,6 +875,10 @@ go vet ./...                 # lint
 
 Koe voice tests link cgo audio deps on macOS; install them with `brew install opus opusfile pkg-config` and set `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find the Homebrew files.
 
+Paid live daemon and Koe tests use a hidden state-isolated child process so they
+can run beside Kocoro Desktop. See [Live E2E testing](docs/live-e2e-testing.md)
+for the containment boundary, credential warning, commands, and coverage gaps.
+
 ## Known Limitations
 
 - **Vision**: screenshots are captured, resized, and sent as base64 image content blocks. On daemon runs, the Sonnet parent delegates one complete desktop goal to `computer_use`; only that call lazily starts a private OpenAI Responses trajectory with native Computer Use. Provider coordinates stay bound to the exact screenshot bytes and map into AppKit logical points. Anthropic-native execution and generic model-visible GUI fallbacks are not admitted on this path. Vision models may blend what they see with training knowledge — verify critical details.

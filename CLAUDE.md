@@ -21,7 +21,7 @@ Go CLI tool (`shan`) — the runtime for Shannon AI agents. Production stack is 
 ```
 cmd/
   root.go              # entry, --agent, one-shot, mcp serve
-  daemon.go            # shan daemon start/stop/status
+  daemon.go            # shan daemon start/stop/status; hidden state-isolated live-E2E entrypoint
   schedule.go          # shan schedule CRUD
   update.go            # /update command
   koe.go               # shan koe — voice front-brain (OpenAI Realtime + Desktop control + via-daemon mint); --mic-device/--speaker-device pass CoreAudio device UIDs (from koe.mic_device/speaker_device) that the VPIO backend binds, empty = system default; --barge-in (from koe.barge_in) enables reversible native-S2S floor control by setting KOE_VPIO_BARGE_IN=1 + KOE_NATIVE_FLOOR=1 + KOE_INTERRUPT_RESPONSE=0 via applyBargeInEnv (vpio-only, no-op on gate); koe.persona_source ("global" distill default | "custom" → koe.custom_persona as the persona prefix — the daemon appends the Fast/Full execution-mode schema instructions after it, so custom is no longer byte-verbatim) selects the spoken persona (daemon buildKoePersona)
@@ -391,13 +391,15 @@ Koe tests link cgo audio deps. On macOS, install them with `brew install opus op
 
 Schedule tests use temp dirs — never write to real `~/Library/LaunchAgents/`. Launchd plist coverage lives with daemon tests.
 
+Koe live E2E uses the hidden, foreground-only daemon isolation flags documented in `docs/live-e2e-testing.md`. It isolates filesystem state and port ownership, suppresses Cloud/background automation, and leaves OS credential stores and agent tool capabilities shared with the user account.
+
 ## Building & Releasing
 
 - GoReleaser: `.goreleaser.yaml`
 - npm: `@kocoro/kocoro` (previously `@kocoro/shanclaw`, deprecated post-v0.1.7)
 - **Versioning: PATCH-only by default** — do NOT bump minor/major unless explicitly asked
 - Release: `git tag -a vX.Y.Z` → `git push origin vX.Y.Z` → CI publishes
-- `docs/` is gitignored by default — only `docs/cache-strategy.md` and `docs/cache-debug.md` tracked; add new via explicit `!docs/<file>.md` in `.gitignore`
+- `docs/` is gitignored by default — tracked documents are explicitly allowlisted in `.gitignore`; add new docs there before committing
 
 ## Local Tools
 

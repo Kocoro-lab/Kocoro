@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -125,5 +127,48 @@ func TestMintEphemeralRequest(t *testing.T) {
 	}
 	if ek != "ek_test123" {
 		t.Errorf("ek = %q, want ek_test123", ek)
+	}
+}
+
+func TestExchangeSDPRequest(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if got := r.Header.Get("Authorization"); got != "Bearer ephemeral-key" {
+			t.Errorf("Authorization = %q", got)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != "offer-sdp" {
+			t.Errorf("offer = %q", body)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("answer-sdp"))
+	}))
+	defer srv.Close()
+
+	answer, err := exchangeSDP(context.Background(), srv.URL, "ephemeral-key", []byte("offer-sdp"))
+	if err != nil {
+		t.Fatalf("exchangeSDP: %v", err)
+	}
+	if answer != "answer-sdp" || calls.Load() != 1 {
+		t.Fatalf("answer=%q calls=%d, want one successful create call", answer, calls.Load())
+	}
+}
+
+func TestExchangeSDPDoesNotReplayFailedCreate(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("x-request-id", "req_test_503")
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	_, err := exchangeSDP(context.Background(), srv.URL, "ephemeral-key", []byte("offer-sdp"))
+	if err == nil || !strings.Contains(err.Error(), "HTTP 503") || !strings.Contains(err.Error(), "req_test_503") {
+		t.Fatalf("exchangeSDP error=%v, want HTTP 503 with request ID", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls=%d, want no replay for a failed create call", calls.Load())
 	}
 }

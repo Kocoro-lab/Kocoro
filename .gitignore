@@ -24,6 +24,7 @@ docs/*
 !docs/config-reference.md
 !docs/agents-reference.md
 !docs/session-sync-launchd.md
+!docs/live-e2e-testing.md
 !docs/desktop-calendar-rpc-fixtures
 !docs/desktop-wire-fixtures
 internal/tools/axserver/.build/
