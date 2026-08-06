@@ -49,7 +49,8 @@ run_offline_lane() {
     -run '^Test(RunAgent_IdempotencyKeyReturnsCompletedRunWithoutSecondLLMCall|RunAgent_FailedIdempotentRequestNeverReplaysAutomatically|TerminalIdempotencyState_SoftFailureWithoutDeliverableFailsClosed|TerminalIdempotencyState_DeliverableIsDurableSuccessEvidence|CompletedIdempotentResultReplaysDeliveryReceiptAndStatus)$' \
     -count=1 -v
   run_check harness_self_test go test ./test/e2e \
-    -run '^TestOffline_AgentLabComparisonHarness$' -count=1 -v
+    -run '^TestOffline_(AgentLabComparisonHarness|AgentLabScriptsParse|ProviderQualificationRejectsUndersizedReleaseSample)$' \
+    -count=1 -v
 }
 
 run_routing_lane() {
