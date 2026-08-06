@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+
+	tea "github.com/charmbracelet/bubbletea"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -466,6 +468,17 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 		t.Fatal("refusal must render the Busy line, not the too-short line")
 	}
 
+	// Direction 1c: after Esc during a run — state is back to input but the
+	// run GOROUTINE is still unwinding (appending, checkpointing, saving) —
+	// /compact must still be refused via runInFlight.
+	m.state = stateInput
+	m.runInFlight = true
+	m.handleSlashCommand("/compact")
+	if m.cancelRun != nil || m.compactInFlight {
+		t.Fatal("/compact must not start under a winding-down run")
+	}
+	m.runInFlight = false
+
 	// Direction 1b: /compact also refused while a (possibly Esc-cancelled but
 	// still alive) compact worker holds the flag.
 	m.state = stateInput
@@ -474,40 +487,99 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 	if m.cancelRun != nil {
 		t.Fatal("a second compact must not start while a worker is alive")
 	}
+	if !strings.Contains(renderedOutput(), "try again in a moment") {
+		t.Fatal("the flag-case refusal must use the compacting message, not the run message")
+	}
 
 	// Direction 2: a new local run refused while a compact is in flight —
 	// including after Esc returned the UI to input (the worker is still
-	// alive; only its compactDoneMsg releases the flag).
+	// alive; only its compactDoneMsg releases the flag). The early refusal
+	// fires before the echo, so the transcript gains nothing and the raw
+	// composer text (placeholder form) survives.
 	m.state = stateInput
 	msgsBefore := len(sess.Messages)
+	outputBefore := len(m.output)
 	m.textarea.SetValue("hello")
 	updated, _ := m.handleSubmit()
 	m = updated.(*Model)
 	if m.cancelRun != nil {
 		t.Fatal("a run must not start under an in-flight compact")
 	}
-	if len(sess.Messages) != msgsBefore+0 && len(sess.Messages) != msgsBefore+1 {
-		t.Fatalf("refused submit must not run: messages grew %d -> %d", msgsBefore, len(sess.Messages))
+	if len(sess.Messages) != msgsBefore {
+		t.Fatalf("refused submit must not touch the session: messages grew %d -> %d", msgsBefore, len(sess.Messages))
 	}
 	if got := m.textarea.Value(); got != "hello" {
 		t.Fatalf("refused submit must restore the composer input, got %q", got)
+	}
+	echoed := false
+	for _, o := range m.output[outputBefore:] {
+		if strings.Contains(o.rendered, "hello") {
+			echoed = true
+		}
+	}
+	if echoed {
+		t.Fatal("refused submit must not echo the turn into the transcript")
 	}
 	if !strings.Contains(renderedOutput(), "try again in a moment") {
 		t.Fatal("refusal must tell the user why")
 	}
 
 	// Direction 2b: custom slash commands are a second door into runAgentLoop
-	// and must be refused the same way.
+	// and must be refused the same way, restoring the full command text.
 	m.customCommands["mytask"] = "do the thing"
-	m.handleSlashCommand("/mytask")
+	m.textarea.Reset()
+	m.handleSlashCommand("/mytask some args")
 	if m.cancelRun != nil {
 		t.Fatal("a custom-command run must not start under an in-flight compact")
 	}
+	if got := m.textarea.Value(); got != "/mytask some args" {
+		t.Fatalf("custom-command refusal must restore the command text, got %q", got)
+	}
 
-	// Release: the compactDoneMsg handler is the single release point.
+	// Release: the compactDoneMsg handler is the single release point. (A
+	// matching gen exercises the failure-print branch; the Esc-drop branch is
+	// covered by TestEscDuringCompact_InvalidatesGeneration.)
 	updated, _ = m.Update(compactDoneMsg{gen: m.compactGen, err: context.Canceled})
 	m = updated.(*Model)
 	if m.compactInFlight {
 		t.Fatal("compactDoneMsg must release the flag")
+	}
+}
+
+// Busy must win over the length message: with a too-short session and an
+// active run, /compact reports Busy (and must not read HistoryForLoop while
+// the run goroutine may be appending).
+func TestCompactBusyCheckPrecedesLengthCheck(t *testing.T) {
+	m := newCommandTestModel(t) // 0-message session, well under MinShapeable
+	m.state = stateProcessing
+	m.handleSlashCommand("/compact")
+	var out strings.Builder
+	for _, o := range m.output {
+		out.WriteString(o.rendered)
+	}
+	if !strings.Contains(out.String(), "Busy") || strings.Contains(out.String(), "too short") {
+		t.Fatalf("busy must win over too-short: %q", out.String())
+	}
+}
+
+// Esc must NOT release the run-side flag — only agentDoneMsg does. Releasing
+// on Esc would re-open the mirror race (/compact starting under a
+// winding-down run's session writes).
+func TestEscDoesNotReleaseRunInFlight(t *testing.T) {
+	m := newCommandTestModel(t)
+	m.state = stateProcessing
+	m.runInFlight = true
+	m.cancelRun = func() {}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	m = updated.(*Model)
+	if !m.runInFlight {
+		t.Fatal("Esc must not release runInFlight; only agentDoneMsg does")
+	}
+
+	updated, _ = m.Update(agentDoneMsg{})
+	m = updated.(*Model)
+	if m.runInFlight {
+		t.Fatal("agentDoneMsg must release runInFlight")
 	}
 }

@@ -201,9 +201,16 @@ type Model struct {
 	compactGen int
 	// compactInFlight makes /compact and agent runs mutually exclusive: the
 	// worker reads unsynchronized live-loop state, so a run must not start
-	// under it (and vice versa). Set at the /compact submit site; cleared in
-	// the compactDoneMsg handler and both cancel branches.
+	// under it (and vice versa). Set at the /compact submit site; released
+	// ONLY by the compactDoneMsg handler (the worker's lifetime owns it —
+	// after Esc the goroutine is still alive).
 	compactInFlight bool
+	// runInFlight is the mirror flag: the run GOROUTINE's lifetime, not
+	// m.state — after Esc the loop still unwinds, appends to sess.Messages,
+	// writes the checkpoint, and Saves. Set where runAgentLoop/runRemote
+	// start; released ONLY by the agentDoneMsg handler, never the cancel
+	// branches. /compact refuses while it is held.
+	runInFlight bool
 	textarea            textarea.Model
 	viewport            viewport.Model // scrollable conversation history (alt-screen)
 	output              []outputBlock
@@ -1375,6 +1382,11 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case agentDoneMsg:
+		// Single release point for the run-side exclusion flag: the goroutine
+		// is provably finished when its done message arrives. The cancel
+		// branches deliberately do NOT clear it — after Esc the loop still
+		// unwinds and persists.
+		m.runInFlight = false
 		// Backstop: a lost compaction_finished event must not stick the
 		// spinner label past the run.
 		m.compacting = false
@@ -1941,6 +1953,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Refuse a run-starting submit BEFORE the echo and paste expansion: the
+	// transcript must not show a turn that was never sent, and the composer
+	// must get back the raw [Pasted text #N] form (expansion clears the
+	// stash). Slash commands pass through — the two run-starting slash paths
+	// are guarded at their dispatch sites; /help etc. keep working.
+	if !strings.HasPrefix(input, "/") && m.refuseWhileCompacting(input) {
+		return m, m.rerenderOutput()
+	}
+
 	m.appendOutput(renderUserMessage(input, m.width))
 
 	// Expand [Pasted text #N] placeholders to their stashed full text for the
@@ -1984,9 +2005,6 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	}
 
 	// Local agent loop
-	if m.refuseWhileCompacting(input) {
-		return m, m.rerenderOutput()
-	}
 	m.state = stateProcessing
 	m.lastToolResults = nil
 	// Reset any live preview before the new run streams into it: a previous
@@ -2019,6 +2037,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelRun = cancel
+	m.runInFlight = true
 	m.injectCh = make(chan agent.InjectedMessage, 10)
 	return func() tea.Msg {
 		// Handler is hoisted so post-run code can query its accumulated usage.
@@ -2748,9 +2767,13 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 	case "/compact":
 		// Busy check first: it must win over the length message, and
 		// HistoryForLoop must not be read while a run goroutine may be
-		// appending to sess.Messages. compactInFlight covers the window
-		// where an Esc returned the UI to input but the worker is alive.
-		if m.state != stateInput || m.compactInFlight {
+		// appending to sess.Messages. The two flags cover the windows where
+		// Esc returned the UI to input but a goroutine is still alive.
+		if m.compactInFlight {
+			m.appendOutput("Compacting context — try again in a moment")
+			break
+		}
+		if m.state != stateInput || m.runInFlight {
 			m.appendOutput("Busy — wait for the current run to finish before /compact")
 			break
 		}
@@ -2784,7 +2807,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				args = strings.Join(parts[1:], " ")
 			}
 			expandedPrompt := strings.ReplaceAll(promptContent, "$ARGUMENTS", args)
-			if m.refuseWhileCompacting("") {
+			if m.refuseWhileCompacting(input) {
 				return m, m.rerenderOutput()
 			}
 			// Send as a regular user message through the agent loop
@@ -2874,6 +2897,7 @@ func (m *Model) runRemote(query string, ctx map[string]any, strategy string) tea
 		sess.Title = session.Title(query)
 		sess.TitleAuto = true
 	}
+	m.runInFlight = true
 	return func() tea.Msg {
 		taskReq := client.TaskRequest{
 			Query:            query,

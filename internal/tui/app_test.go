@@ -148,6 +148,7 @@ func TestEscDuringCompact_InvalidatesGeneration(t *testing.T) {
 	m := newCommandTestModel(t)
 	m.state = stateProcessing
 	m.compactGen = 5
+	m.compactInFlight = true
 	cancelled := false
 	m.cancelRun = func() { cancelled = true }
 
@@ -158,6 +159,9 @@ func TestEscDuringCompact_InvalidatesGeneration(t *testing.T) {
 	}
 	if m.compactGen != 6 {
 		t.Fatalf("Esc must bump compactGen: got %d", m.compactGen)
+	}
+	if !m.compactInFlight {
+		t.Fatal("Esc must NOT release compactInFlight — the worker is still alive; only compactDoneMsg releases it")
 	}
 
 	outputLen := len(m.output)
