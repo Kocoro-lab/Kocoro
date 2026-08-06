@@ -2639,8 +2639,16 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "/research":
+		if m.refuseWhileCompacting(input) {
+			return m, m.rerenderOutput()
+		}
+		m.compactGen++ // a stale /compact result must not resolve under this task
 		return m.handleResearch(parts[1:])
 	case "/swarm":
+		if m.refuseWhileCompacting(input) {
+			return m, m.rerenderOutput()
+		}
+		m.compactGen++ // a stale /compact result must not resolve under this task
 		return m.handleSwarm(parts[1:])
 	case "/search":
 		if len(parts) < 2 {
@@ -2846,10 +2854,6 @@ func (m *Model) runDoctor() tea.Cmd {
 }
 
 func (m *Model) handleResearch(args []string) (tea.Model, tea.Cmd) {
-	if m.refuseWhileCompacting(strings.TrimSpace("/research " + strings.Join(args, " "))) {
-		return m, m.rerenderOutput()
-	}
-	m.compactGen++ // a stale /compact result must not resolve under this task
 	strategy := "standard"
 	query := strings.Join(args, " ")
 
@@ -2877,10 +2881,6 @@ func (m *Model) handleResearch(args []string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleSwarm(args []string) (tea.Model, tea.Cmd) {
-	if m.refuseWhileCompacting(strings.TrimSpace("/swarm " + strings.Join(args, " "))) {
-		return m, m.rerenderOutput()
-	}
-	m.compactGen++ // a stale /compact result must not resolve under this task
 	query := strings.Join(args, " ")
 	if query == "" {
 		m.appendOutput("Usage: /swarm <query>")
@@ -2900,7 +2900,9 @@ func (m *Model) handleSwarm(args []string) (tea.Model, tea.Cmd) {
 func (m *Model) runRemote(query string, ctx map[string]any, strategy string) tea.Cmd {
 	// Incremented before ANY branch that can emit agentDoneMsg — the
 	// nil-gateway return below produces one too, and an unpaired decrement
-	// would release the run guard under a live run.
+	// would release the run guard under a live run. The caller MUST hand the
+	// returned Cmd to the runtime: only its agentDoneMsg decrements, so a
+	// discarded Cmd leaks the guard permanently (see the field contract).
 	m.runInFlight++
 	if m.gateway == nil {
 		return func() tea.Msg {

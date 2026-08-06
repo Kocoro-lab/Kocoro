@@ -493,6 +493,7 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 	m.gateway = client.NewGatewayClient("http://127.0.0.1:1", "")
 	m.compactInFlight = true
 	m.textarea.Reset()
+	mark = len(m.output)
 	m.handleSlashCommand("/research anything")
 	if m.runInFlight != 0 {
 		t.Fatal("/research must be refused under an in-flight compact")
@@ -500,10 +501,54 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 	if got := m.textarea.Value(); got != "/research anything" {
 		t.Fatalf("the remote-door refusal must restore the typed command, got %q", got)
 	}
+	if !strings.Contains(outputSince(mark), "try again in a moment") {
+		t.Fatal("the remote-door refusal must use the compacting message")
+	}
 	m.compactInFlight = false
 	m.handleSlashCommand("/research anything") // control: unrefused → guard taken
 	if m.runInFlight != 1 {
 		t.Fatalf("control: an unrefused /research must take the run guard, got %d", m.runInFlight)
+	}
+	// Release through the handler, not by hand — the other half of the
+	// increment/decrement pairing.
+	updated0, _ := m.Update(agentDoneMsg{})
+	m = updated0.(*Model)
+	if m.runInFlight != 0 {
+		t.Fatalf("agentDoneMsg must release the remote increment, got %d", m.runInFlight)
+	}
+
+	// The W1 regression scenario end-to-end: nil gateway (ollama) + a live
+	// local run — the error path must decrement only its OWN increment,
+	// never the live run's.
+	m.gateway = nil
+	m.runInFlight = 1 // run A live
+	_, remoteCmd := m.handleResearch([]string{"anything"})
+	if m.runInFlight != 2 {
+		t.Fatalf("runRemote must take the guard before the nil-gateway return, got %d", m.runInFlight)
+	}
+	drained := false
+	var drain func(c tea.Cmd)
+	drain = func(c tea.Cmd) {
+		if c == nil {
+			return
+		}
+		switch msg := c().(type) {
+		case tea.BatchMsg:
+			for _, sub := range msg {
+				drain(sub)
+			}
+		case agentDoneMsg:
+			drained = true
+			updated1, _ := m.Update(msg)
+			m = updated1.(*Model)
+		}
+	}
+	drain(remoteCmd)
+	if !drained {
+		t.Fatal("nil-gateway path must emit an agentDoneMsg")
+	}
+	if m.runInFlight != 1 {
+		t.Fatalf("the nil-gateway done message must not release run A: %d", m.runInFlight)
 	}
 	m.runInFlight = 0
 
@@ -628,6 +673,10 @@ func TestEscDoesNotReleaseRunInFlight(t *testing.T) {
 	m = updated.(*Model)
 	if m.runInFlight != 1 {
 		t.Fatalf("first done must not release the guard under a live second run: %d", m.runInFlight)
+	}
+	m.handleSlashCommand("/compact") // the named consequence, not just the counter
+	if m.compactInFlight {
+		t.Fatal("/compact must stay refused under the live second run")
 	}
 	updated, _ = m.Update(agentDoneMsg{}) // run B finishes
 	m = updated.(*Model)
