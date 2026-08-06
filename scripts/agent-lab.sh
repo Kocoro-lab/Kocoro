@@ -77,6 +77,13 @@ run_selector_lane() {
     check_statuses+=("2")
     return
   fi
+  local daemon_url="${KOE_DAEMON_URL:-http://127.0.0.1:7533}"
+  if ! curl -fsS --max-time 5 "$daemon_url/status" -o "$output_dir/daemon-status.json"; then
+    echo "Koe selector preflight failed: daemon status is unavailable at $daemon_url/status" >&2
+    check_names+=("selector_daemon_preflight")
+    check_statuses+=("2")
+    return
+  fi
   run_check selector_agentloop_live env \
     KOE_SELECTOR_AGENTLOOP_E2E=1 \
     PKG_CONFIG_PATH="$pkg_config_path" \
