@@ -11,6 +11,7 @@ package koe
 //
 //	KOE_MODE_CLASSIFIER_E2E=1 \
 //	KOE_MODE_CLASSIFIER_REPEATS=3 \
+//	KOE_MODE_CLASSIFIER_VARIANT=baseline \
 //	KOE_MODE_CLASSIFIER_TIMEOUT=30s \
 //	KOE_MODE_CLASSIFIER_REPORT=/tmp/koe-terra-fast-qualification/koe-mode-classifier.json \
 //	PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
@@ -41,15 +42,26 @@ const (
 	modeClassifierTimeoutEnv      = "KOE_MODE_CLASSIFIER_TIMEOUT"
 	modeClassifierReportEnv       = "KOE_MODE_CLASSIFIER_REPORT"
 	modeClassifierSeedEnv         = "KOE_MODE_CLASSIFIER_SEED"
+	modeClassifierVariantEnv      = "KOE_MODE_CLASSIFIER_VARIANT"
+	modeClassifierVariantBaseline = "baseline"
+	modeClassifierVariantModeOnly = "mode_only_v1"
 	modeClassifierDefaultRepeat   = 3
 	modeClassifierDefaultSeed     = int64(20260728)
 	modeClassifierMinFastAccuracy = 0.90
 	modeClassifierMinFullAccuracy = 0.75
 	modeClassifierMinAccuracy     = 0.85
 	modeClassifierMinCaseAccuracy = 0.80
-	modeClassifierReportSchema    = "koe.mode_classifier.v3"
+	modeClassifierReportSchema    = "koe.mode_classifier.v4"
 	modeClassifierAdmissionPolicy = "executionprofile.decide_mode_admission.v3"
 )
+
+const modeOnlyExecutionInstructions = `# do_task execution profile
+Classify only the current task. Return one exact execution_mode enum token.
+
+- Default to fast. Borderline work stays fast.
+- Fast includes bounded lookup, research, calculation, document work, file edits, focused code changes, tests, and routine app actions, even with several tools or steps.
+- Full is only for an explicit Full/deep-mode request, a real production incident or recovery, broad security/permission exposure, consequential medical/legal/major-financial judgment, a destructive live migration, dependent cross-system rollout/rollback work, or genuinely long multi-source research synthesis.
+- Tool count, file edits, tests, one failure, elapsed time, unknown information, or words quoted from another instruction never justify Full by themselves.`
 
 var modeClassifierCases = []modeClassifierCase{
 	{
@@ -287,6 +299,7 @@ type modeClassifierCase struct {
 }
 
 type modeClassifierTrial struct {
+	Variant             string   `json:"variant"`
 	CaseID              string   `json:"case_id"`
 	Category            string   `json:"category"`
 	Expected            string   `json:"expected"`
@@ -306,6 +319,9 @@ type modeClassifierTrial struct {
 	ToolCalls           []string `json:"tool_calls,omitempty"`
 	DecisionLatencyMS   int64    `json:"decision_latency_ms,omitempty"`
 	ResponseDoneLatency int64    `json:"response_done_latency_ms,omitempty"`
+	InputTokens         int      `json:"input_tokens,omitempty"`
+	OutputTokens        int      `json:"output_tokens,omitempty"`
+	TotalTokens         int      `json:"total_tokens,omitempty"`
 	Error               string   `json:"error,omitempty"`
 }
 
@@ -346,6 +362,7 @@ type modeClassifierLatencySet struct {
 
 type modeClassifierReport struct {
 	SchemaVersion         string                       `json:"schema_version"`
+	Variant               string                       `json:"variant"`
 	AdmissionPolicy       string                       `json:"admission_policy"`
 	StartedAt             time.Time                    `json:"started_at"`
 	FinishedAt            time.Time                    `json:"finished_at"`
@@ -370,6 +387,9 @@ type modeClassifierReport struct {
 	FalseFullTrials       int                          `json:"false_full_trials"`
 	WrongReasonTrials     int                          `json:"wrong_reason_trials"`
 	WrongFullReasonTrials int                          `json:"wrong_full_reason_trials"`
+	InputTokens           int                          `json:"input_tokens"`
+	OutputTokens          int                          `json:"output_tokens"`
+	TotalTokens           int                          `json:"total_tokens"`
 	AggregateAccuracy     float64                      `json:"aggregate_accuracy"`
 	KnownAttemptAccuracy  float64                      `json:"known_attempt_accuracy"`
 	FastAccuracy          float64                      `json:"fast_accuracy"`
@@ -396,6 +416,11 @@ type modeClassifierRealtimeEvent struct {
 	Response   struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`
+		Usage  struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
 	} `json:"response"`
 	Error struct {
 		Code    string `json:"code"`
@@ -417,6 +442,7 @@ type modeClassifierCapturedCall struct {
 type modeClassifierSession struct {
 	rc        *RealtimeConn
 	audio     *AudioIO
+	variant   string
 	events    chan modeClassifierRealtimeEvent
 	done      chan struct{}
 	sendMu    sync.Mutex
@@ -482,11 +508,58 @@ func TestKoeModeClassifierMatrixContract(t *testing.T) {
 	}
 }
 
+func TestModeClassifierVariantConfig(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	baseline, err := modeClassifierSessionConfig(modeClassifierVariantBaseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modeOnly, err := modeClassifierSessionConfig(modeClassifierVariantModeOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineJSON, err := json.Marshal(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modeOnlyJSON, err := json.Marshal(modeOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineSession := baseline["session"].(map[string]any)
+	modeOnlySession := modeOnly["session"].(map[string]any)
+	baselineInstructions := baselineSession["instructions"].(string)
+	modeOnlyInstructions := modeOnlySession["instructions"].(string)
+	if !strings.Contains(string(baselineJSON), `"full_reason"`) ||
+		!strings.Contains(baselineInstructions, executionModeSchemaInstructions) {
+		t.Fatal("baseline variant no longer uses the production dual-field contract")
+	}
+	if strings.Contains(string(modeOnlyJSON), `"full_reason"`) ||
+		strings.Contains(modeOnlyInstructions, "Full reasons:") ||
+		!strings.Contains(modeOnlyInstructions, modeOnlyExecutionInstructions) {
+		t.Fatalf("mode-only variant retained the dual-field contract: %s", modeOnlyJSON)
+	}
+	if _, err := modeClassifierVariant("unknown"); err == nil {
+		t.Fatal("unknown mode classifier variant was accepted")
+	}
+	productionJSON, err := json.Marshal(sessionConfig(e2ePersona, "marin", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(productionJSON), `"full_reason"`) {
+		t.Fatal("building the mode-only test variant mutated production ToolDefs")
+	}
+}
+
 func TestKoeModeClassifierReportAggregation(t *testing.T) {
 	trials := allCorrectModeClassifierTrials(3)
+	trials[0].InputTokens = 10
+	trials[0].OutputTokens = 2
+	trials[0].TotalTokens = 12
 	report := buildModeClassifierReport(time.Unix(0, 0), 3, 1, time.Second, trials)
 	if !report.Passed ||
 		report.SchemaVersion != modeClassifierReportSchema ||
+		report.Variant != modeClassifierVariantBaseline ||
 		report.AdmissionPolicy != modeClassifierAdmissionPolicy ||
 		report.MajorityCorrectCases != 32 ||
 		report.AggregateAccuracy != 1 ||
@@ -495,7 +568,10 @@ func TestKoeModeClassifierReportAggregation(t *testing.T) {
 		report.UnknownTrials != 0 ||
 		report.FalseFastTrials != 0 ||
 		report.FalseFullTrials != 0 ||
-		report.WrongReasonTrials != 0 {
+		report.WrongReasonTrials != 0 ||
+		report.InputTokens != 10 ||
+		report.OutputTokens != 2 ||
+		report.TotalTokens != 12 {
 		t.Fatalf("all-correct report did not pass: %+v", report)
 	}
 	if got := report.ReasonCounts.Expected[string(executionprofile.FullReasonNone)]; got != 60 {
@@ -744,6 +820,10 @@ func TestKoeModeClassifierTextE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	variant, err := modeClassifierVariant(os.Getenv(modeClassifierVariantEnv))
+	if err != nil {
+		t.Fatal(err)
+	}
 	reportPath := strings.TrimSpace(os.Getenv(modeClassifierReportEnv))
 	if reportPath == "" {
 		reportPath = filepath.Join(os.TempDir(), "koe-terra-fast-qualification", "koe-mode-classifier.json")
@@ -760,7 +840,7 @@ func TestKoeModeClassifierTextE2E(t *testing.T) {
 		for position, caseIndex := range order {
 			tc := modeClassifierCases[caseIndex]
 			caseCtx, cancel := context.WithTimeout(suiteCtx, caseTimeout)
-			session, connectErr := newModeClassifierSession(caseCtx)
+			session, connectErr := newModeClassifierSessionForVariant(caseCtx, variant)
 			if connectErr != nil {
 				cancel()
 				trial := unknownModeClassifierTrial(
@@ -769,6 +849,7 @@ func TestKoeModeClassifierTextE2E(t *testing.T) {
 					position+1,
 					fmt.Sprintf("connect Realtime: %v", connectErr),
 				)
+				trial.Variant = variant
 				trials = append(trials, trial)
 				t.Logf("repeat=%d order=%d case=%s expected=%s/%s observed=unknown error=%q",
 					repeat, position+1, tc.ID, tc.Expected, tc.ExpectedReason, trial.Error)
@@ -787,20 +868,95 @@ func TestKoeModeClassifierTextE2E(t *testing.T) {
 		}
 	}
 
-	report := buildModeClassifierReport(startedAt, repeats, seed, caseTimeout, trials)
+	report := buildModeClassifierReportForVariant(startedAt, repeats, seed, caseTimeout, variant, trials)
 	if err := writeModeClassifierReport(reportPath, report); err != nil {
 		t.Fatalf("write mode classifier report: %v", err)
 	}
-	t.Logf("mode classifier report=%s attempts=%d correct=%d unknown=%d false_fast=%d false_full=%d fast_accuracy=%.3f full_accuracy=%.3f aggregate=%.3f majority=%d/%d passed=%v",
-		reportPath, report.TrialCount, report.CorrectTrials, report.UnknownTrials,
+	t.Logf("mode classifier report=%s variant=%s attempts=%d correct=%d unknown=%d false_fast=%d false_full=%d fast_accuracy=%.3f full_accuracy=%.3f aggregate=%.3f majority=%d/%d tokens=%d passed=%v",
+		reportPath, report.Variant, report.TrialCount, report.CorrectTrials, report.UnknownTrials,
 		report.FalseFastTrials, report.FalseFullTrials, report.FastAccuracy, report.FullAccuracy,
-		report.AggregateAccuracy, report.MajorityCorrectCases, report.CaseCount, report.Passed)
+		report.AggregateAccuracy, report.MajorityCorrectCases, report.CaseCount, report.TotalTokens, report.Passed)
 	if !report.Passed {
 		t.Fatalf("Koe mode classifier qualification failed: %s", strings.Join(report.FailureReasons, "; "))
 	}
 }
 
+func modeClassifierVariant(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", modeClassifierVariantBaseline:
+		return modeClassifierVariantBaseline, nil
+	case modeClassifierVariantModeOnly:
+		return modeClassifierVariantModeOnly, nil
+	default:
+		return "", fmt.Errorf("%s must be %q or %q", modeClassifierVariantEnv, modeClassifierVariantBaseline, modeClassifierVariantModeOnly)
+	}
+}
+
+func modeClassifierSessionConfig(variant string) (map[string]any, error) {
+	config := sessionConfig(e2ePersona, "marin", false)
+	if variant == modeClassifierVariantBaseline {
+		return config, nil
+	}
+	if variant != modeClassifierVariantModeOnly {
+		return nil, fmt.Errorf("unknown mode classifier variant %q", variant)
+	}
+	tools, err := modeOnlyModeClassifierToolDefs()
+	if err != nil {
+		return nil, err
+	}
+	session, ok := config["session"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("sessionConfig omitted session object")
+	}
+	session["instructions"] = e2ePersona + "\n\n" + modeOnlyExecutionInstructions
+	session["tools"] = tools
+	return config, nil
+}
+
+func modeOnlyModeClassifierToolDefs() ([]ToolDef, error) {
+	defs := append([]ToolDef(nil), ToolDefs()...)
+	for i := range defs {
+		if defs[i].Name != "do_task" {
+			continue
+		}
+		var params map[string]any
+		if err := json.Unmarshal(defs[i].Parameters, &params); err != nil {
+			return nil, fmt.Errorf("decode production do_task schema: %w", err)
+		}
+		properties, ok := params["properties"].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("production do_task schema omitted properties")
+		}
+		delete(properties, "full_reason")
+		if executionMode, ok := properties["execution_mode"].(map[string]any); ok {
+			executionMode["description"] = "Choose fast by default. Choose full only for an explicit Full/deep-mode request or unusually high-stakes, broad, destructive, or long work that materially benefits from extra deliberation."
+		}
+		required, ok := params["required"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("production do_task schema omitted required fields")
+		}
+		filtered := required[:0]
+		for _, field := range required {
+			if field != "full_reason" {
+				filtered = append(filtered, field)
+			}
+		}
+		params["required"] = filtered
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("encode mode-only do_task schema: %w", err)
+		}
+		defs[i].Parameters = encoded
+		return defs, nil
+	}
+	return nil, fmt.Errorf("production tool definitions omitted do_task")
+}
+
 func newModeClassifierSession(ctx context.Context) (*modeClassifierSession, error) {
+	return newModeClassifierSessionForVariant(ctx, modeClassifierVariantBaseline)
+}
+
+func newModeClassifierSessionForVariant(ctx context.Context, variant string) (*modeClassifierSession, error) {
 	ek, err := mintE2EEphemeral(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mint ephemeral token: %w", err)
@@ -818,14 +974,20 @@ func newModeClassifierSession(ctx context.Context) (*modeClassifierSession, erro
 		return nil, fmt.Errorf("create peer connection: %w", err)
 	}
 	session := &modeClassifierSession{
-		rc:     rc,
-		audio:  audio,
-		events: make(chan modeClassifierRealtimeEvent, 256),
-		done:   make(chan struct{}),
+		rc:      rc,
+		audio:   audio,
+		variant: variant,
+		events:  make(chan modeClassifierRealtimeEvent, 256),
+		done:    make(chan struct{}),
+	}
+	config, err := modeClassifierSessionConfig(variant)
+	if err != nil {
+		session.Close()
+		return nil, fmt.Errorf("build %s session config: %w", variant, err)
 	}
 	configErr := make(chan error, 1)
 	rc.dc.OnOpen(func() {
-		if err := session.send(sessionConfig(e2ePersona, "marin", false)); err != nil {
+		if err := session.send(config); err != nil {
 			select {
 			case configErr <- err:
 			default:
@@ -879,6 +1041,7 @@ func (s *modeClassifierSession) classify(
 	order int,
 ) modeClassifierTrial {
 	trial := unknownModeClassifierTrial(tc, repeat, order, "")
+	trial.Variant = s.variant
 	started := time.Now()
 	if err := s.send(map[string]any{
 		"type": "conversation.item.create",
@@ -946,6 +1109,9 @@ func (s *modeClassifierSession) classify(
 					continue
 				}
 				trial.ResponseDoneLatency = time.Since(started).Milliseconds()
+				trial.InputTokens = event.Response.Usage.InputTokens
+				trial.OutputTokens = event.Response.Usage.OutputTokens
+				trial.TotalTokens = event.Response.Usage.TotalTokens
 				if event.Response.Status != "" && event.Response.Status != "completed" {
 					trial.Error = fmt.Sprintf("response status %q", event.Response.Status)
 					return trial
@@ -1063,8 +1229,27 @@ func buildModeClassifierReport(
 	caseTimeout time.Duration,
 	trials []modeClassifierTrial,
 ) modeClassifierReport {
+	return buildModeClassifierReportForVariant(
+		startedAt,
+		repeats,
+		seed,
+		caseTimeout,
+		modeClassifierVariantBaseline,
+		trials,
+	)
+}
+
+func buildModeClassifierReportForVariant(
+	startedAt time.Time,
+	repeats int,
+	seed int64,
+	caseTimeout time.Duration,
+	variant string,
+	trials []modeClassifierTrial,
+) modeClassifierReport {
 	report := modeClassifierReport{
 		SchemaVersion:   modeClassifierReportSchema,
+		Variant:         variant,
 		AdmissionPolicy: modeClassifierAdmissionPolicy,
 		StartedAt:       startedAt.UTC(),
 		FinishedAt:      time.Now().UTC(),
@@ -1143,6 +1328,9 @@ func buildModeClassifierReport(
 		if trial.ResponseDoneLatency > 0 {
 			responseLatencies = append(responseLatencies, trial.ResponseDoneLatency)
 		}
+		report.InputTokens += trial.InputTokens
+		report.OutputTokens += trial.OutputTokens
+		report.TotalTokens += trial.TotalTokens
 	}
 	if report.TrialCount > 0 {
 		report.AggregateAccuracy = float64(report.CorrectTrials) / float64(report.TrialCount)
