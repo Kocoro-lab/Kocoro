@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 lane="${AGENT_LAB_LANE:-offline}"
@@ -8,9 +9,9 @@ pkg_config_path="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
 mkdir -p "$output_dir"
 
 case "$lane" in
-  offline|routing_live|selector_live|provider_live|provider_release) ;;
+  offline|routing_live|selector_live|provider_live|provider_release|product_release) ;;
   *)
-    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, or provider_release" >&2
+    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, provider_release, or product_release" >&2
     exit 2
     ;;
 esac
@@ -52,7 +53,7 @@ run_offline_lane() {
     -run '^Test(RunAgent_IdempotencyKeyReturnsCompletedRunWithoutSecondLLMCall|RunAgent_FailedIdempotentRequestNeverReplaysAutomatically|TerminalIdempotencyState_SoftFailureWithoutDeliverableFailsClosed|TerminalIdempotencyState_DeliverableIsDurableSuccessEvidence|CompletedIdempotentResultReplaysDeliveryReceiptAndStatus)$' \
     -count=1 -v
   run_check harness_self_test go test ./test/e2e \
-    -run '^TestOffline_(AgentLabComparisonHarness|AgentLabScriptsParse|ProviderQualificationRejectsUndersizedReleaseSample)$' \
+    -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|ProviderQualificationRejectsUndersizedReleaseSample|ProductReleaseRejectsMissingEvidenceBeforePaidWork)$' \
     -count=1 -v
 }
 
@@ -114,6 +115,45 @@ run_provider_lane() {
     "$output_dir/provider"
 }
 
+run_product_evidence_lane() {
+  if [[ "${KOCORO_PRODUCT_RELEASE_E2E:-}" != "1" ]]; then
+    echo "Set KOCORO_PRODUCT_RELEASE_E2E=1 to authorize whole-product release qualification." >&2
+    check_names+=("product_release_evidence")
+    check_statuses+=("2")
+    return 1
+  fi
+  if [[ -z "${KOCORO_AUDIO_HIL_REPORT:-}" || -z "${KOCORO_EXTERNAL_WRITE_RECOVERY_REPORT:-}" ]]; then
+    echo "Set KOCORO_AUDIO_HIL_REPORT and KOCORO_EXTERNAL_WRITE_RECOVERY_REPORT to fresh physical evidence reports." >&2
+    check_names+=("product_release_evidence")
+    check_statuses+=("2")
+    return 1
+  fi
+  if [[ "$source_dirty" == "true" ]]; then
+    echo "product_release requires a clean ShanClaw source tree." >&2
+    check_names+=("product_release_evidence")
+    check_statuses+=("2")
+    return 1
+  fi
+  run_check product_release_evidence python3 \
+    "$repo_dir/scripts/validate-product-release-evidence.py" \
+    --audio "$KOCORO_AUDIO_HIL_REPORT" \
+    --external-write "$KOCORO_EXTERNAL_WRITE_RECOVERY_REPORT" \
+    --expected-shan-commit "$source_commit" \
+    --output "$output_dir/product-release-evidence.json"
+  local evidence_index=$((${#check_statuses[@]} - 1))
+  [[ "${check_statuses[$evidence_index]}" -eq 0 ]]
+}
+
+run_release_source_preflight() {
+  if [[ "$source_dirty" == "true" ]]; then
+    echo "$lane requires a clean ShanClaw source tree." >&2
+    check_names+=("release_source_clean")
+    check_statuses+=("2")
+    return 1
+  fi
+  return 0
+}
+
 cd "$repo_dir" || exit 2
 case "$lane" in
   offline)
@@ -129,10 +169,20 @@ case "$lane" in
     run_provider_lane smoke
     ;;
   provider_release)
-    run_offline_lane
-    run_routing_lane
-    run_selector_lane
-    run_provider_lane release
+    if run_release_source_preflight; then
+      run_offline_lane
+      run_routing_lane
+      run_selector_lane
+      run_provider_lane release
+    fi
+    ;;
+  product_release)
+    if run_product_evidence_lane; then
+      run_offline_lane
+      run_routing_lane
+      run_selector_lane
+      run_provider_lane release
+    fi
     ;;
 esac
 
@@ -150,10 +200,22 @@ RUN_ID="$run_id" LANE="$lane" STARTED_AT="$started_at" FINISHED_AT="$finished_at
 SOURCE_COMMIT="$source_commit" SOURCE_DIRTY="$source_dirty" \
 OUTPUT_DIR="$output_dir" OVERALL_STATUS="$overall_status" \
 python3 -c '
-import json, os, pathlib, sys
+import hashlib, json, os, pathlib, sys
 checks = []
 for index in range(2, len(sys.argv), 2):
     checks.append({"name": sys.argv[index], "exit_status": int(sys.argv[index + 1])})
+product_evidence_passed = any(
+    check["name"] == "product_release_evidence" and check["exit_status"] == 0
+    for check in checks
+)
+output = pathlib.Path(os.environ["OUTPUT_DIR"])
+evidence_path = output / "product-release-evidence.json"
+evidence_artifact = None
+if evidence_path.is_file():
+    evidence_artifact = {
+        "path": evidence_path.name,
+        "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+    }
 manifest = {
     "schema_version": "kocoro.agent_lab_manifest.v1",
     "run_id": os.environ["RUN_ID"],
@@ -164,15 +226,20 @@ manifest = {
         "commit": os.environ["SOURCE_COMMIT"],
         "dirty": os.environ["SOURCE_DIRTY"] == "true",
     },
+    "qualification_scope": "whole_product" if os.environ["LANE"] == "product_release" else "agent_runtime",
+    "product_evidence_artifact": evidence_artifact,
     "checks": checks,
     "passed": os.environ["OVERALL_STATUS"] == "0",
-    "coverage_boundaries": [
-        "No physical microphone, acoustic echo, VAD, or human barge-in qualification.",
-        "No signed-in external-service write with post-commit process crash and receipt recovery.",
-        "Provider token usage is measured by live reports; provider USD and customer quota are not inferred.",
+    "coverage_boundaries": (
+        [] if os.environ["LANE"] == "product_release" and product_evidence_passed else [
+            "No physical microphone, acoustic echo, VAD, or human barge-in qualification.",
+            "No signed-in external-service write with post-commit process crash and receipt recovery.",
+        ]
+    ),
+    "measurement_notes": [
+        "Provider token usage, provider USD cost, and customer quota are separate measures.",
     ],
 }
-output = pathlib.Path(os.environ["OUTPUT_DIR"])
 (output / "manifest.json").write_text(
     json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )

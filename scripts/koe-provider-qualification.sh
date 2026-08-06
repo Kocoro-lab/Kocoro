@@ -44,6 +44,10 @@ source_dirty=false
 if [[ -n "$(git -C "$repo_dir" status --porcelain)" ]]; then
   source_dirty=true
 fi
+if [[ "$sample" == "release" && "$source_dirty" == "true" ]]; then
+  echo "Release provider qualification requires a clean source tree." >&2
+  exit 2
+fi
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 runner_status=0
