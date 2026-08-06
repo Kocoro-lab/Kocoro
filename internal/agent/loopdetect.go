@@ -19,6 +19,13 @@ const (
 
 const loopForceStopOutcomeCaveat = "Further tool calls are blocked for this run. The stop itself is not evidence of success. Preserve completed results; treat unverified completion or side effects as partial, blocked, or outcome unknown."
 
+const (
+	readOnlyStableNudgeAt    = 3
+	readOnlyStableBlockAfter = 5
+	pingPongNudgeAt          = 6
+	pingPongBlockAfter       = 8
+)
+
 func loopForceStopNote(detail string) string {
 	return strings.TrimSpace(detail) + " " + loopForceStopOutcomeCaveat
 }
@@ -390,6 +397,45 @@ func (ld *LoopDetector) RecordOutcome(name, argsJSON string, isError bool, errMs
 	}
 }
 
+// CheckBefore evaluates only patterns that can be proven from completed prior
+// outcomes. It is intentionally limited to read-only observations: mutating
+// calls have separate replay/idempotency admission, and predicting an unseen
+// read result too early would hide legitimate progress. A stable observation
+// gets one warning window before the sixth identical call is blocked.
+func (ld *LoopDetector) CheckBefore(name, argsJSON string, isReadOnly bool) (LoopAction, string) {
+	if !isReadOnly || dupExemptTools[name] || len(ld.history) == 0 {
+		return LoopContinue, ""
+	}
+	argsHash := hashArgs(argsJSON)
+	if count := stableReadOnlyActionTail(ld.history, name, argsHash); count >= readOnlyStableBlockAfter {
+		return LoopForceStop, fmt.Sprintf(
+			"Blocked %s before execution: the same read-only action returned an identical outcome %d times and exhausted its warning window.",
+			name, count)
+	}
+	if pingPongNoProgressCount(ld.history) >= pingPongBlockAfter &&
+		pingPongWouldContinue(ld.history, name, argsHash) {
+		return LoopForceStop, fmt.Sprintf(
+			"Blocked %s before execution: it would continue an outcome-stable two-action loop after %d completed calls.",
+			name, pingPongBlockAfter)
+	}
+	return LoopContinue, ""
+}
+
+// ShouldDisableSpeculation prevents a streamed read from executing before the
+// provider's full batch is available whenever the prior history is already in
+// a warned no-progress state. The normal batch admission can then veto every
+// sibling atomically before any tool starts.
+func (ld *LoopDetector) ShouldDisableSpeculation() bool {
+	if len(ld.history) == 0 {
+		return false
+	}
+	last := ld.history[len(ld.history)-1]
+	if stableReadOnlyActionTail(ld.history, last.Name, last.ArgsHash) >= readOnlyStableNudgeAt {
+		return true
+	}
+	return pingPongNoProgressCount(ld.history) >= pingPongNudgeAt
+}
+
 // Check evaluates all detectors for the named tool.
 // Returns the most severe action and an appropriate message.
 func (ld *LoopDetector) Check(name string) (LoopAction, string) {
@@ -509,11 +555,19 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		if ld.history[len(ld.history)-1].IsReadOnly && consecErrCount == 0 {
 			effectiveCount = consecSameOutcomeCount
 		}
-		if effectiveCount >= threshold+1 {
+		if ld.history[len(ld.history)-1].IsReadOnly && consecErrCount == 0 {
+			if effectiveCount >= readOnlyStableBlockAfter+1 {
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You called %s with identical arguments and outcomes %d times in a row without new evidence.", name, effectiveCount))
+			}
+			if effectiveCount == readOnlyStableNudgeAt {
+				return LoopNudge, fmt.Sprintf(
+					"You've called %s %d times consecutively without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, effectiveCount)
+			}
+		} else if effectiveCount >= threshold+1 {
 			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
 				"You called %s with identical arguments and outcomes %d times in a row without new evidence.", name, effectiveCount))
-		}
-		if effectiveCount >= threshold {
+		} else if effectiveCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
 				"You've called %s %d times consecutively without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, effectiveCount)
 		}
@@ -522,11 +576,13 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// 1a-post. Ping-pong no-progress: A -> B -> A -> B with stable outcomes
 	// on both sides. This catches loops that evade same-tool consecutive checks
 	// while preserving productive alternation whenever either observation
-	// changes. Six calls nudge; eight calls force a bounded synthesis turn.
-	if count := pingPongNoProgressCount(ld.history); count >= 8 {
+	// changes. Six calls nudge; pre-dispatch admission blocks the ninth call
+	// after one recovery window. Ten completed calls are a defensive fallback
+	// for callers that use the detector without admission.
+	if count := pingPongNoProgressCount(ld.history); count >= pingPongBlockAfter+2 {
 		return LoopForceStop, loopForceStopNote(fmt.Sprintf(
 			"You alternated between the same two tool actions %d times without a changed outcome.", count))
-	} else if count >= 6 {
+	} else if count == pingPongNudgeAt {
 		return LoopNudge, fmt.Sprintf(
 			"You've alternated between the same two tool actions %d times without a changed outcome. Use the evidence already returned or change strategy.", count)
 	}
@@ -578,7 +634,9 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
 				"You called %s with identical arguments and outcomes %d times without new evidence.", name, effectiveCount))
 		}
-		if effectiveCount >= threshold {
+		isReadOnlyLatest := ld.history[len(ld.history)-1].IsReadOnly && dupErrCount == 0
+		if (!isReadOnlyLatest && effectiveCount >= threshold) ||
+			(isReadOnlyLatest && effectiveCount == threshold && consecCount < effectiveCount) {
 			return LoopNudge, fmt.Sprintf(
 				"You've called %s %d times without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a fundamentally different approach.", name, effectiveCount)
 		}
@@ -802,6 +860,35 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	return LoopContinue, ""
 }
 
+func stableReadOnlyActionTail(history []ToolCallRecord, name, argsHash string) int {
+	if len(history) == 0 {
+		return 0
+	}
+	latestOutcome := ""
+	count := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		record := history[i]
+		if record.Name != name || record.ArgsHash != argsHash || !record.IsReadOnly || record.IsError || record.OutcomeSig == "" {
+			break
+		}
+		if latestOutcome == "" {
+			latestOutcome = record.OutcomeSig
+		} else if record.OutcomeSig != latestOutcome {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func pingPongWouldContinue(history []ToolCallRecord, name, argsHash string) bool {
+	if len(history) < 2 {
+		return false
+	}
+	expected := history[len(history)-2]
+	return expected.Name == name && expected.ArgsHash == argsHash
+}
+
 func pingPongNoProgressCount(history []ToolCallRecord) int {
 	if len(history) < 4 {
 		return 0
@@ -851,6 +938,19 @@ func pingPongNoProgressCount(history []ToolCallRecord) int {
 
 func sameToolAction(left, right ToolCallRecord) bool {
 	return left.Name == right.Name && left.ArgsHash == right.ArgsHash
+}
+
+func isLoopReadOnlyCall(tool Tool, name, argsJSON string) bool {
+	if tool == nil {
+		return false
+	}
+	if readOnly, ok := tool.(ReadOnlyChecker); ok && readOnly.IsReadOnlyCall(argsJSON) {
+		return true
+	}
+	if material, ok := tool.(MaterialSideEffectChecker); ok && !material.HasMaterialSideEffect(argsJSON) {
+		return true
+	}
+	return isReadMCPName(name) || name == "browser_snapshot"
 }
 
 // latestRecoveredAfterSameArgsErrors reports whether the latest same-name,

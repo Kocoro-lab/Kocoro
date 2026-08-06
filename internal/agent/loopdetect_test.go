@@ -1192,6 +1192,9 @@ func TestLoopDetector_BrowserSnapshotConsecutiveDupStillForceStops(t *testing.T)
 func TestLoopDetector_ReadOnlyPollingChangingOutcomeContinues(t *testing.T) {
 	ld := NewLoopDetector()
 	for _, outcome := range []string{"queued", "starting", "running-25", "running-60", "complete"} {
+		if action, msg := ld.CheckBefore("job_status", `{"id":"job-1"}`, true); action != LoopContinue {
+			t.Fatalf("changing read-only outcome must remain admissible, got %v: %s", action, msg)
+		}
 		ld.RecordOutcome("job_status", `{"id":"job-1"}`, false, "", "", outcome, true, false)
 		if action, msg := ld.Check("job_status"); action != LoopContinue {
 			t.Fatalf("changing read-only outcome must count as progress, got %v: %s", action, msg)
@@ -1201,14 +1204,24 @@ func TestLoopDetector_ReadOnlyPollingChangingOutcomeContinues(t *testing.T) {
 
 func TestLoopDetector_ReadOnlyPollingStableOutcomeStops(t *testing.T) {
 	ld := NewLoopDetector()
-	for call := 1; call <= 4; call++ {
+	for call := 1; call <= 6; call++ {
+		preAction, _ := ld.CheckBefore("job_status", `{"id":"job-1"}`, true)
+		if call == 6 {
+			if preAction != LoopForceStop {
+				t.Fatalf("sixth stable read-only call must be blocked before execution, got %v", preAction)
+			}
+			break
+		}
+		if preAction != LoopContinue {
+			t.Fatalf("call %d blocked before the recovery window completed: %v", call, preAction)
+		}
 		ld.RecordOutcome("job_status", `{"id":"job-1"}`, false, "", "", "running-0", true, false)
 		action, _ := ld.Check("job_status")
 		if call == 3 && action != LoopNudge {
 			t.Fatalf("stable read-only outcome call 3 must nudge, got %v", action)
 		}
-		if call == 4 && action != LoopForceStop {
-			t.Fatalf("stable read-only outcome call 4 must stop, got %v", action)
+		if (call == 4 || call == 5) && action != LoopContinue {
+			t.Fatalf("stable read-only outcome call %d must preserve one recovery window, got %v", call, action)
 		}
 	}
 }
@@ -1229,18 +1242,28 @@ func TestLoopDetector_MutatingDuplicateDoesNotTrustChangingReceipts(t *testing.T
 
 func TestLoopDetector_PingPongStableOutcomesEscalates(t *testing.T) {
 	ld := NewLoopDetector()
-	for call := 1; call <= 8; call++ {
+	for call := 1; call <= 9; call++ {
 		name, args, outcome := "job_status", `{"id":"job-1"}`, "running"
 		if call%2 == 0 {
 			name, args, outcome = "job_log", `{"id":"job-1","tail":20}`, "no new lines"
+		}
+		preAction, _ := ld.CheckBefore(name, args, true)
+		if call == 9 {
+			if preAction != LoopForceStop {
+				t.Fatalf("ninth ping-pong call must be blocked before execution, got %v", preAction)
+			}
+			break
+		}
+		if preAction != LoopContinue {
+			t.Fatalf("ping-pong call %d blocked before the recovery window completed: %v", call, preAction)
 		}
 		ld.RecordOutcome(name, args, false, "", "", outcome, true, false)
 		action, _ := ld.Check(name)
 		if call == 6 && action != LoopNudge {
 			t.Fatalf("six stable ping-pong calls must nudge, got %v", action)
 		}
-		if call == 8 && action != LoopForceStop {
-			t.Fatalf("eight stable ping-pong calls must stop, got %v", action)
+		if call == 8 && action != LoopContinue {
+			t.Fatalf("eighth stable ping-pong call must preserve the recovery turn, got %v", action)
 		}
 	}
 }
@@ -1251,6 +1274,9 @@ func TestLoopDetector_PingPongChangingOutcomeContinues(t *testing.T) {
 		name, args, outcome := "job_status", `{"id":"job-1"}`, fmt.Sprintf("progress-%d", call)
 		if call%2 == 0 {
 			name, args, outcome = "job_log", `{"id":"job-1","tail":20}`, fmt.Sprintf("line-%d", call)
+		}
+		if action, msg := ld.CheckBefore(name, args, true); action != LoopContinue {
+			t.Fatalf("changing ping-pong outcomes must remain admissible, call=%d action=%v msg=%s", call, action, msg)
 		}
 		ld.RecordOutcome(name, args, false, "", "", outcome, true, false)
 		if action, msg := ld.Check(name); action != LoopContinue {

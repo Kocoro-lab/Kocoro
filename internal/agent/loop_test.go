@@ -5372,6 +5372,97 @@ func TestAgentLoopReadOnlyPollingChangingOutcomeReachesCompletion(t *testing.T) 
 	}
 }
 
+func TestAgentLoopCriticalReadLoopBlocksWholeBatchBeforeExecution(t *testing.T) {
+	llmCallCount := 0
+	var recoveryRequest client.CompletionRequest
+	var recoveryDecodeErr error
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCallCount++
+		if llmCallCount == 7 {
+			if recoveryDecodeErr = json.NewDecoder(r.Body).Decode(&recoveryRequest); recoveryDecodeErr != nil {
+				http.Error(w, "invalid recovery request", http.StatusBadRequest)
+				return
+			}
+		}
+		switch {
+		case llmCallCount <= 5:
+			json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("job_status", `{"id":"job-atomic"}`, fmt.Sprintf("status_%d", llmCallCount)), 10, 5))
+		case llmCallCount == 6 || llmCallCount == 7:
+			json.NewEncoder(w).Encode(multiToolResponse("", []client.FunctionCall{
+				{ID: fmt.Sprintf("side_%d", llmCallCount), Name: "side_effect_probe", Arguments: json.RawMessage(`{"value":"must-not-run"}`)},
+				{ID: fmt.Sprintf("status_%d", llmCallCount), Name: "job_status", Arguments: json.RawMessage(`{"id":"job-atomic"}`)},
+			}, 10, 5))
+		default:
+			json.NewEncoder(w).Encode(nativeResponse("partial: loop blocked before further execution", "end_turn", nil, 10, 5))
+		}
+	}))
+	defer server.Close()
+
+	statusTool := &changingReadOnlyTool{name: "job_status", results: []string{"running"}}
+	sideEffectTool := &mockTool{name: "side_effect_probe"}
+	registry := NewToolRegistry()
+	registry.Register(statusTool)
+	registry.Register(sideEffectTool)
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), registry, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(false)
+	loop.SetHandler(&mockHandler{approveResult: true})
+
+	result, _, err := loop.Run(context.Background(), "monitor without spinning", nil, nil)
+	if err != nil {
+		t.Fatalf("atomic loop run failed: %v", err)
+	}
+	if result != "partial: loop blocked before further execution" {
+		t.Fatalf("unexpected synthesis result: %q", result)
+	}
+	if statusTool.runs != 5 {
+		t.Fatalf("critical sixth and recovery calls must not execute; status runs=%d", statusTool.runs)
+	}
+	if sideEffectTool.runs.Load() != 0 {
+		t.Fatalf("unrelated earlier sibling executed despite batch veto: runs=%d", sideEffectTool.runs.Load())
+	}
+	if llmCallCount != 8 {
+		t.Fatalf("expected 5 observations + 2 blocked recovery responses + synthesis, got %d LLM calls", llmCallCount)
+	}
+	if recoveryDecodeErr != nil {
+		t.Fatalf("decode recovery request: %v", recoveryDecodeErr)
+	}
+	toolNames := map[string]bool{}
+	for _, schema := range recoveryRequest.Tools {
+		toolNames[schemaName(schema)] = true
+	}
+	if !toolNames["job_status"] || !toolNames["side_effect_probe"] {
+		t.Fatalf("recovery response did not retain normal tools: %v", toolNames)
+	}
+}
+
+func TestStreamToolStarterDisablesSpeculationAfterLoopWarning(t *testing.T) {
+	detector := NewLoopDetector()
+	for range readOnlyStableNudgeAt {
+		detector.RecordOutcome("job_status", `{"id":"job-stream"}`, false, "", "", "running", true, false)
+	}
+	tool := &changingReadOnlyTool{name: "job_status", results: []string{"running"}}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(nil, registry, "medium", "", 25, 2000, 200, nil, nil, nil)
+	starter := newStreamToolStarter(
+		context.Background(),
+		loop,
+		registry,
+		registry.Schemas(),
+		nil,
+		detector,
+	)
+	starter.Start(client.FunctionCall{
+		ID:        "streamed_status",
+		Name:      "job_status",
+		Arguments: json.RawMessage(`{"id":"job-stream"}`),
+	}, nil)
+	if tool.runs != 0 {
+		t.Fatalf("warned loop history must disable speculative execution, runs=%d", tool.runs)
+	}
+}
+
 // TestForceStopExit_DetectorPath_SynthesisPromptShape verifies that the
 // direct LoopForceStop path (3 identical-args tool calls → ConsecutiveDup
 // force-stop) feeds the synthesis turn a structured Task/Done/Pending

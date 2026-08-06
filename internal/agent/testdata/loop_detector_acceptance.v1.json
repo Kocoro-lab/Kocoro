@@ -67,8 +67,10 @@
     {
       "id": "loop_same_args_polling_without_progress",
       "class": "loop",
-      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 4, "first_force_stop_max": 4, "ideal_stop_after": 3, "max_wasted_calls": 1},
+      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 6, "first_force_stop_max": 6, "ideal_stop_after": 3, "max_wasted_calls": 3},
       "events": [
+        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
         {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
         {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
         {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
@@ -104,7 +106,7 @@
     {
       "id": "loop_ping_pong_without_progress",
       "class": "loop",
-      "expectation": {"first_nudge_min": 6, "first_nudge_max": 6, "first_force_stop_min": 8, "first_force_stop_max": 8, "ideal_stop_after": 6, "max_wasted_calls": 2},
+      "expectation": {"first_nudge_min": 6, "first_nudge_max": 6, "first_force_stop_min": 9, "first_force_stop_max": 9, "ideal_stop_after": 6, "max_wasted_calls": 3},
       "events": [
         {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
         {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
@@ -113,7 +115,8 @@
         {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
         {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
         {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true}
+        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
+        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true}
       ]
     },
     {

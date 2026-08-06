@@ -150,6 +150,14 @@ func replayLoopAcceptanceTrace(trace loopAcceptanceTrace) loopAcceptanceTraceRes
 	}
 	detector := NewLoopDetector()
 	for index, event := range trace.Events {
+		action, _ := detector.CheckBefore(event.Name, event.Args, event.IsReadOnly)
+		call := index + 1
+		if action == LoopForceStop {
+			if result.FirstForceStop == 0 {
+				result.FirstForceStop = call
+			}
+			continue
+		}
 		detector.RecordOutcome(
 			event.Name,
 			event.Args,
@@ -160,8 +168,7 @@ func replayLoopAcceptanceTrace(trace loopAcceptanceTrace) loopAcceptanceTraceRes
 			event.IsReadOnly,
 			event.IsNonActionable,
 		)
-		action, _ := detector.Check(event.Name)
-		call := index + 1
+		action, _ = detector.Check(event.Name)
 		if action == LoopNudge && result.FirstNudge == 0 {
 			result.FirstNudge = call
 		}

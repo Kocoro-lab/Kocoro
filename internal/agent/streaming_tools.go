@@ -22,12 +22,13 @@ type speculativeToolRun struct {
 // response remains authoritative: results are consumed only when it contains
 // the exact same call; unmatched work is cancelled and never enters history.
 type streamToolStarter struct {
-	mu      sync.Mutex
-	ctx     context.Context
-	loop    *AgentLoop
-	tools   *ToolRegistry
-	handler EventHandler
-	runs    map[string]*speculativeToolRun
+	mu       sync.Mutex
+	ctx      context.Context
+	loop     *AgentLoop
+	tools    *ToolRegistry
+	handler  EventHandler
+	detector *LoopDetector
+	runs     map[string]*speculativeToolRun
 	// advertised is the exact name set carried in the current completion
 	// request. Registry membership alone is insufficient for Deferred tools.
 	advertised map[string]bool
@@ -46,6 +47,7 @@ func newStreamToolStarter(
 	tools *ToolRegistry,
 	advertisedSchemas []client.Tool,
 	handler EventHandler,
+	detector *LoopDetector,
 ) *streamToolStarter {
 	advertised := make(map[string]bool, len(advertisedSchemas))
 	for _, schema := range advertisedSchemas {
@@ -58,8 +60,10 @@ func newStreamToolStarter(
 		loop:       loop,
 		tools:      tools,
 		handler:    handler,
+		detector:   detector,
 		runs:       make(map[string]*speculativeToolRun),
 		advertised: advertised,
+		barrier:    detector != nil && detector.ShouldDisableSpeculation(),
 	}
 }
 
@@ -88,6 +92,11 @@ func (s *streamToolStarter) eligible(fc client.FunctionCall, activeSkillFilter m
 	readOnly, ok := tool.(ReadOnlyChecker)
 	if !ok || !readOnly.IsReadOnlyCall(argsStr) || tool.RequiresApproval() {
 		return nil, "", false
+	}
+	if s.detector != nil {
+		if action, _ := s.detector.CheckBefore(fc.Name, argsStr, true); action == LoopForceStop {
+			return nil, "", false
+		}
 	}
 	// Hooks are allowed to deny or transform the execution environment. Keep
 	// their ordering exact by leaving those calls on the normal post-stream

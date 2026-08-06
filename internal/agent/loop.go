@@ -3544,6 +3544,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		latestUserText                   = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
 		cloudNudgeFired                  bool
 		cloudDelegateClaimed             bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
+		criticalLoopRecoveryUsed         bool   // first atomic loop veto gets one normal-tools recovery response
 		cloudResultContent               string // non-empty when a cloud deliverable should bypass LLM summarization
 		lastDiscoveryInput               string // dedup: skip discovery when user text hasn't changed between iterations
 		contextBloatStatusSent           bool
@@ -4628,7 +4629,7 @@ iterationLoop:
 				// On retries, skip streaming to avoid duplicate partial deltas.
 				if attempt == 0 && a.enableStreaming && a.handler != nil {
 					streamingText.Reset()
-					streamTools := newStreamToolStarter(ctx, a, effTools, req.Tools, a.handler)
+					streamTools := newStreamToolStarter(ctx, a, effTools, req.Tools, a.handler, detector)
 					resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
 						// A delta means the model received the request (incl. the
 						// drained system-event scaffold) and is responding — so the
@@ -5586,6 +5587,38 @@ iterationLoop:
 		if committedStreamTools != nil {
 			committedStreamTools.CancelUnmatched(toolCalls)
 		}
+		batchLoopBlocked := false
+		batchLoopMessage := ""
+		for _, fc := range toolCalls {
+			tool, ok := effTools.Get(fc.Name)
+			if !ok {
+				continue
+			}
+			if deferred[fc.Name] {
+				if _, loaded := loadedDeferred[fc.Name]; !loaded {
+					continue
+				}
+			}
+			if activeSkillFilter != nil && !IsSkillExempt(tool) && !activeSkillFilter[fc.Name] {
+				continue
+			}
+			argsStr := fc.ArgumentsString()
+			if _, valid := ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
+				continue
+			}
+			if action, msg := detector.CheckBefore(
+				fc.Name,
+				argsStr,
+				isLoopReadOnlyCall(tool, fc.Name, argsStr),
+			); action == LoopForceStop {
+				batchLoopBlocked = true
+				batchLoopMessage = msg
+				break
+			}
+		}
+		if batchLoopBlocked && committedStreamTools != nil {
+			committedStreamTools.CancelAll()
+		}
 		modelToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
 		normalizedToolText := modelToolText
 		if normalizedToolText == "" && !a.unattendedRun {
@@ -5639,6 +5672,19 @@ iterationLoop:
 
 		var worstAction LoopAction
 		var worstMsg string
+		if batchLoopBlocked {
+			worstAction = LoopNudge
+			worstMsg = batchLoopMessage + " No tool in this batch executed. Use a different action, answer from existing evidence, or report the blocker."
+			if criticalLoopRecoveryUsed {
+				worstAction = LoopForceStop
+				worstMsg = loopForceStopNote(batchLoopMessage + " The model repeated a critical loop after its recovery turn.")
+			} else {
+				criticalLoopRecoveryUsed = true
+			}
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus("tool_loop_batch_blocked", batchLoopMessage)
+			}
+		}
 
 		// ---- Phase 1 (serial): permission checks, pre-hooks, short-circuit resolution ----
 		// Builds list of approved tool calls. Denied/unknown results are stored
@@ -5650,6 +5696,7 @@ iterationLoop:
 			validated    bool
 			sideEffect   bool
 			loopReadOnly bool
+			loopVeto     bool
 			argsDigest   string
 			resolved     bool // true if already resolved (denied/unknown/hook-denied)
 			cacheKey     string
@@ -5677,6 +5724,21 @@ iterationLoop:
 			toolsUsed[fc.Name]++
 			argsStr := fc.ArgumentsString()
 			callMeta[idx].argsStr = argsStr
+			if batchLoopBlocked {
+				callMeta[idx].decision = "loop_blocked"
+				callMeta[idx].resolved = true
+				callMeta[idx].loopVeto = true
+				execResults[idx] = toolExecResult{
+					result: ToolResult{
+						Content:      "[tool loop blocked] " + batchLoopMessage + " No tool in this batch executed.",
+						IsError:      true,
+						InternalOnly: true,
+					},
+					name: fc.Name,
+				}
+				a.logAudit(fc.Name, argsStr, "tool batch blocked before execution", "loop_blocked", false, 0, nil)
+				continue
+			}
 
 			dedupKey := fc.Name + "\x00" + normalizeJSON(fc.Arguments)
 			if seenCalls[dedupKey] {
@@ -5921,15 +5983,7 @@ iterationLoop:
 				continue
 			}
 			callMeta[idx].validated = true
-			if readOnly, ok := tool.(ReadOnlyChecker); ok && readOnly.IsReadOnlyCall(argsStr) {
-				callMeta[idx].loopReadOnly = true
-			}
-			if material, ok := tool.(MaterialSideEffectChecker); ok && !material.HasMaterialSideEffect(argsStr) {
-				callMeta[idx].loopReadOnly = true
-			}
-			if isReadMCPName(fc.Name) || fc.Name == "browser_snapshot" {
-				callMeta[idx].loopReadOnly = true
-			}
+			callMeta[idx].loopReadOnly = isLoopReadOnlyCall(tool, fc.Name, argsStr)
 			if readOnly, ok := tool.(ReadOnlyChecker); !ok || !readOnly.IsReadOnlyCall(argsStr) {
 				callMeta[idx].sideEffect = true
 				callMeta[idx].argsDigest = toolArgumentsDigest(fc.Arguments)
@@ -6367,6 +6421,13 @@ iterationLoop:
 			// Reset cloud_delegate lock on failure so it can be retried
 			if fc.Name == "cloud_delegate" && result.IsError {
 				cloudDelegateClaimed = false
+			}
+
+			// A loop veto is admission evidence, not a tool outcome. Recording its
+			// synthetic error would reset the stable history that must detect a
+			// repeated critical action on the recovery turn.
+			if callMeta[idx].loopVeto {
+				continue
 			}
 
 			// Record in sliding-window loop detector
