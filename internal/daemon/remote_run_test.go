@@ -121,6 +121,58 @@ func TestRemoteRunEventHandlerAutoApproveSkipsBroker(t *testing.T) {
 	}
 }
 
+func TestRemoteRunUsageIncludesWebSearchCalls(t *testing.T) {
+	got := make(chan DaemonMessage, 1)
+	client := &Client{
+		envelopeSender: func(msg DaemonMessage) error {
+			got <- msg
+			return nil
+		},
+	}
+	srv := NewServer(0, client, &ServerDeps{}, "test")
+	handler := &remoteRunEventHandler{
+		server:    srv,
+		runID:     "run-usage",
+		sessionID: "sess-usage",
+		ctx:       context.Background(),
+	}
+
+	handler.OnUsage(agent.TurnUsage{
+		InputTokens:    1200,
+		OutputTokens:   180,
+		TotalTokens:    1380,
+		CostUSD:        0.0123,
+		LLMCalls:       1,
+		WebSearchCalls: 2,
+		Model:          "gpt-5.6-luna",
+	})
+
+	select {
+	case dm := <-got:
+		if dm.Type != MsgTypeRemoteRunEvent {
+			t.Fatalf("message type = %q, want %q", dm.Type, MsgTypeRemoteRunEvent)
+		}
+		var evt RemoteRunEvent
+		if err := json.Unmarshal(dm.Payload, &evt); err != nil {
+			t.Fatalf("invalid remote run event: %v", err)
+		}
+		if evt.Type != "usage" || evt.RunID != "run-usage" || evt.SessionID != "sess-usage" {
+			t.Fatalf("event = %#v, want run-usage usage event", evt)
+		}
+		var payload struct {
+			WebSearchCalls int `json:"web_search_calls"`
+		}
+		if err := json.Unmarshal(evt.Payload, &payload); err != nil {
+			t.Fatalf("invalid usage payload: %v", err)
+		}
+		if payload.WebSearchCalls != 2 {
+			t.Fatalf("web_search_calls = %d, want 2", payload.WebSearchCalls)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote run emitted no usage event")
+	}
+}
+
 // TestRemoteRunAutoApproveEmitsObservableNotice locks in the visibility fix:
 // when a remote run auto-approves a tool (auto_approve=true), the broker is
 // bypassed so no approval_requested reaches the controller. The daemon must

@@ -11,12 +11,20 @@ import (
 
 // maxSummaryFoldChunks bounds the small-tier calls one oversized-transcript
 // summarization may spend. Workload: multi-day IM threads whose transcript
-// exceeds summarizeInputCapChars several times over — a 6-chunk fold covers
-// ~3.2M chars of transcript, i.e. weeks of chat. Symptom when it binds: the
-// OLDEST chunks beyond the cap are elided with a marker instead of folded,
-// so the running summary starts later in the conversation (recent fidelity
-// is always preserved). Override: edit this constant.
-const maxSummaryFoldChunks = 6
+// exceeds summarizeInputCapBytes several times over — the fold covers
+// maxSummaryFoldChunks × summarizeInputCapBytes ≈ 3.4M bytes of transcript,
+// i.e. weeks of chat. Symptom when it binds: the OLDEST chunks beyond the cap
+// are elided with a marker instead of folded, so the running summary starts
+// later in the conversation (recent fidelity is always preserved).
+// Override: edit this constant — but note the calls are SEQUENTIAL inside one
+// PhaseAwaitingLLM window, so raising it eats into agent.idle_hard_timeout_secs.
+//
+// 9, not the original 6: coverage is chunk count × per-chunk budget, and the
+// per-chunk budget dropped from 540K to 375K bytes when it was re-derived from
+// a measured tokens-per-byte floor (2026-08-05). Holding the count at 6 would
+// have quietly cut fold coverage from ~3.2M to ~2.25M bytes — a summary-quality
+// regression on exactly the huge sessions this path exists for, with no signal.
+const maxSummaryFoldChunks = 9
 
 // rollingSummaryPrompt drives the sequential fold over transcript chunks
 // (ported from openclaw's summarizeChunks: each chunk call receives the
@@ -31,13 +39,14 @@ Rules:
 - Output ONLY the updated running summary text, no tags or commentary.`
 
 // splitTranscriptChunks splits messages into consecutive groups whose
-// serialized transcripts each stay near capChars. An assistant message
+// serialized transcripts each stay near capBytes (the byte form of
+// summarizeInputCapTokens). An assistant message
 // carrying tool_use blocks and the user message carrying its tool_result
 // form an atomic unit — a chunk boundary never separates them, so the
 // summarizer always sees a call next to its result. A single unit larger
-// than capChars gets its own chunk (the per-chunk transcript is still
+// than capBytes gets its own chunk (the per-chunk transcript is still
 // capped by capTranscriptForSummarize before any LLM call).
-func splitTranscriptChunks(messages []client.Message, capChars int) [][]client.Message {
+func splitTranscriptChunks(messages []client.Message, capBytes int) [][]client.Message {
 	var chunks [][]client.Message
 	var current []client.Message
 	currentLen := 0
@@ -79,12 +88,12 @@ func splitTranscriptChunks(messages []client.Message, capChars int) [][]client.M
 				i = next
 			}
 		}
-		if currentLen > 0 && currentLen+unitLen > capChars {
+		if currentLen > 0 && currentLen+unitLen > capBytes {
 			flush()
 		}
 		current = append(current, unit...)
 		currentLen += unitLen
-		if unitLen > capChars {
+		if unitLen > capBytes {
 			flush()
 		}
 	}
@@ -112,7 +121,7 @@ func hasToolResultBlock(m client.Message) bool {
 // summary. The returned usage covers the fold calls made either way.
 func foldOversizedTranscript(ctx context.Context, c Completer, messages []client.Message) (string, client.Usage, bool) {
 	var usage client.Usage
-	chunks := splitTranscriptChunks(messages, summarizeInputCapChars)
+	chunks := splitTranscriptChunks(messages, summarizeInputCapBytes)
 	if len(chunks) <= 1 {
 		return "", usage, false
 	}
@@ -122,9 +131,9 @@ func foldOversizedTranscript(ctx context.Context, c Completer, messages []client
 		rolling = "[earliest part of the conversation elided for size]"
 		chunks = chunks[len(chunks)-maxSummaryFoldChunks:]
 	}
-	// One line up front plus one per chunk: the fold is up to 6× the input
-	// volume of the single-shot path and fires on exactly the biggest
-	// sessions, so a slow fold must be attributable (and countable for the
+	// One line up front plus one per chunk: the fold is up to
+	// maxSummaryFoldChunks× the input volume of the single-shot path and fires
+	// on exactly the biggest sessions, so a slow fold must be attributable (and countable for the
 	// gap #2 re-open telemetry) instead of looking like a hang. The fold
 	// runs inside one PhaseAwaitingLLM window — on very large transcripts
 	// the sequential calls can approach agent.idle_hard_timeout_secs; the
@@ -149,9 +158,13 @@ func foldOversizedTranscript(ctx context.Context, c Completer, messages []client
 			CacheSource: "helper",
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[context] transcript fold chunk %d/%d failed (%v), falling back to head+tail\n", i+1, len(chunks), err)
+			// Include the size: a fold chunk that 400s is the same
+			// oversize-input failure the single-shot path reports, and the
+			// fallback below hides it behind a generic head+tail retry.
+			fmt.Fprintf(os.Stderr, "[context] transcript fold chunk %d/%d failed (sent_bytes=%d): %v, falling back to head+tail\n", i+1, len(chunks), len(rollingSummaryPrompt)+len(user), err)
 			return "", usage, false
 		}
+		warnIfDenserThanSafetyFloor(len(rollingSummaryPrompt)+len(user), resp.Usage)
 		usage = addUsage(usage, resp.Usage)
 		rolling = strings.TrimSpace(resp.OutputText)
 		if rolling == "" {

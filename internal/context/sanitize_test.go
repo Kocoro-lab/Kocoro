@@ -143,6 +143,29 @@ func TestSanitizeHistory_MergesConsecutiveUser(t *testing.T) {
 	}
 }
 
+func TestSanitizeCompactedHistory_PreservesPrimerSummaryAndLeadingTail(t *testing.T) {
+	msgs := []client.Message{
+		{Role: "user", Content: client.NewTextContent("original first request")},
+		{Role: "user", Content: client.NewTextContent("Previous context summary: stable decisions")},
+		// ShapeHistory can retain a user message at the front of its recent
+		// suffix. The compacted request already sent this exact prefix, so the
+		// next Run must not rewrite it while repairing the rest of history.
+		{Role: "user", Content: client.NewTextContent("retained recent request")},
+		{Role: "assistant", Content: client.NewTextContent("retained reply")},
+	}
+
+	got := SanitizeCompactedHistory(msgs)
+	if len(got) != len(msgs) {
+		t.Fatalf("compacted prefix changed length: got %d, want %d", len(got), len(msgs))
+	}
+	for i := range msgs {
+		if got[i].Role != msgs[i].Role || got[i].Content.Text() != msgs[i].Content.Text() {
+			t.Fatalf("message %d changed: got {%s %q}, want {%s %q}",
+				i, got[i].Role, got[i].Content.Text(), msgs[i].Role, msgs[i].Content.Text())
+		}
+	}
+}
+
 func TestSanitizeHistory_FullCorruptionScenario(t *testing.T) {
 	// Reproduce the exact little-v corruption pattern
 	msgs := []client.Message{

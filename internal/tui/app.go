@@ -1930,21 +1930,16 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 		sess.TitleAuto = true
 	}
 	userMsgTime := time.Now()
+	// Snapshot model-visible history before appending the new prompt. A durable
+	// compaction checkpoint replaces the archived prefix in live context while
+	// leaving sess.Messages intact for transcript rendering and search.
+	history := sess.HistoryForLoop()
 	sess.Messages = append(sess.Messages, client.Message{Role: "user", Content: client.NewTextContent(input)})
 	sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local", Timestamp: session.TimePtr(userMsgTime)})
 
 	m.spinnerIdx = 0
 	m.glyphIdx = 0
 	m.colorIdx = 0
-	// Pass everything except the just-appended user message as history,
-	// stripping any prior loop-injected guardrail nudges so they can't
-	// leak into this run's conversation snapshot.
-	priorMsgs := sess.Messages[:len(sess.Messages)-1]
-	priorMeta := sess.MessageMeta
-	if len(priorMeta) > len(priorMsgs) {
-		priorMeta = priorMeta[:len(priorMsgs)]
-	}
-	history := session.FilterInjected(priorMsgs, priorMeta)
 	return m, tea.Batch(m.runAgentLoop(input, history), spinnerTick(), spinnerFrameTick())
 }
 
@@ -1966,6 +1961,15 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID(sess.ID)
+			if m.cfg.Agent.CompactionSnapshotRetention > 0 {
+				retention := m.cfg.Agent.CompactionSnapshotRetention
+				sessionID := sess.ID
+				m.agentLoop.SetPreCompactionSnapshot(func(phase string, messages []client.Message) {
+					if err := m.sessions.SaveCompactionSnapshot(sessionID, phase, messages, retention); err != nil {
+						log.Printf("tui: compaction snapshot failed (session=%s phase=%s): %v", sessionID, phase, err)
+					}
+				})
+			}
 			m.agentLoop.SetToolResultBudgetState(sess.ToolResultReplacements, sess.ToolResultSeen)
 			m.agentLoop.SetWorkingSet(m.sessions.WorkingSet(sess.ID))
 			m.agentLoop.SetSessionCWD(effectiveCWD)
@@ -2027,6 +2031,13 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				sess.Messages = append(sess.Messages, client.Message{Role: "assistant", Content: client.NewTextContent(result)})
 				sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local", Timestamp: session.TimePtr(time.Now())})
 			}
+			if checkpoint := m.agentLoop.CompactionCheckpointMessages(); len(checkpoint) > 0 {
+				sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+					SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+					ArchiveThroughIndex: len(sess.Messages),
+					Messages:            checkpoint,
+				}
+			}
 			// Persist handler-accumulated usage (direct LLM + cloud_delegate +
 			// gateway tool billing) into the session's cumulative Usage
 			// summary. LLM and tool costs are stored in separate fields.
@@ -2035,9 +2046,9 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				sess.ToolResultSeen = m.agentLoop.ToolResultSeen()
 				acc := handler.Usage()
 				llm := acc.LLM
-				if llm.LLMCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 {
+				if llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || acc.ToolCalls > 0 || llm.InputTokens > 0 {
 					m.sessions.AddUsage(sess.ID, session.UsageFromAccumulated(
-						llm.LLMCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
+						llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
 						llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
 						acc.ToolCalls, acc.ToolCostUSD,
 					))
@@ -2549,12 +2560,15 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			agentName = m.agentOverride.Name
 		}
 		sessID := "(none)"
-		msgCount := 0
+		archiveMsgCount := 0
+		liveMsgCount := 0
 		tokenEst := 0
 		if sess != nil {
 			sessID = sess.ID
-			msgCount = len(sess.Messages)
-			tokenEst = ctxwin.EstimateTokens(sess.Messages)
+			archiveMsgCount = len(sess.Messages)
+			liveHistory := sess.HistoryForLoop()
+			liveMsgCount = len(liveHistory)
+			tokenEst = ctxwin.EstimateTokens(liveHistory)
 		}
 		ctxWindow := m.cfg.Agent.ContextWindow
 		if ctxWindow <= 0 {
@@ -2571,11 +2585,11 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				"  Model:       %s\n"+
 				"  Endpoint:    %s\n"+
 				"  Agent:       %s\n"+
-				"  Session:     %s (%d messages)\n"+
+				"  Session:     %s (%d archived, %d live messages)\n"+
 				"  Context:     ~%s / %s tokens (%.1f%%)\n"+
 				"  Tools:       %d registered",
 			m.version, m.cfg.ModelTier, m.cfg.Endpoint, agentName,
-			sessID, msgCount,
+			sessID, archiveMsgCount, liveMsgCount,
 			formatTokenCount(tokenEst), formatTokenCount(ctxWindow), pct,
 			toolCount,
 		)))
@@ -2649,7 +2663,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		}
 	case "/compact":
 		sess := m.sessions.Current()
-		if sess == nil || len(sess.Messages) < ctxwin.MinShapeable() {
+		if sess == nil || len(sess.HistoryForLoop()) < ctxwin.MinShapeable() {
 			m.appendOutput(fmt.Sprintf("Conversation too short to compact (need %d+ messages)", ctxwin.MinShapeable()))
 			break
 		}

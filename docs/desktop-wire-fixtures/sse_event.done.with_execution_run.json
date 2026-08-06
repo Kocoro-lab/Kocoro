@@ -6,7 +6,8 @@
     "input_tokens": 8120,
     "output_tokens": 240,
     "total_tokens": 8360,
-    "cost_usd": 0.021
+    "cost_usd": 0.021,
+    "web_search_calls": 1
   },
   "execution_run": {
     "logical_task_id": "burst-4f2a:t01",

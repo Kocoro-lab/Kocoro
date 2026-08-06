@@ -1,11 +1,19 @@
 package daemon
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
@@ -170,13 +178,7 @@ func TestApplyTurnState_HardErrorAfterCheckpoint_NoDuplicate(t *testing.T) {
 	// more failed LLM call).
 	up.usage.LLM.InputTokens = 70 // +20 since checkpoint
 	up.usage.LLM.LLMCalls = 2
-	applyTurnMessages(sess, loop, base)
-	sess.Messages = append(sess.Messages,
-		client.Message{Role: "assistant", Content: client.NewTextContent("Sorry, something failed.")},
-	)
-	sess.MessageMeta = append(sess.MessageMeta,
-		session.MessageMeta{Source: "web", Timestamp: session.TimePtr(time.Now())},
-	)
+	applyHardErrorTurnMessages(sess, loop, base, "Sorry, something failed.", time.Now())
 	applyTurnUsage(sess, up, base)
 
 	// Expected: 1 baseline + 2 turn + 1 error stub = 4 total. No duplicates.
@@ -257,6 +259,173 @@ func TestApplyTurnState_CopiesToolResultReplacements(t *testing.T) {
 	}
 }
 
+func TestApplyTurnState_PersistsCompactionCheckpointWithoutReplacingArchive(t *testing.T) {
+	sess := &session.Session{
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("old user")},
+			{Role: "assistant", Content: client.NewTextContent("old reply")},
+		},
+		MessageMeta: []session.MessageMeta{{Source: "web"}, {Source: "web"}},
+	}
+	base := captureTurnBaseline(sess, "web", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("new user")},
+		{Role: "assistant", Content: client.NewTextContent("new reply")},
+	})
+	agent.SetCompactionCheckpointMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("stable summary")},
+		{Role: "user", Content: client.NewTextContent("new user")},
+		{Role: "assistant", Content: client.NewTextContent("new reply")},
+	})
+
+	applyTurnState(sess, loop, nil, base)
+
+	if len(sess.Messages) != 4 {
+		t.Fatalf("archive was replaced instead of appended: %#v", sess.Messages)
+	}
+	wantArchive := []string{"old user", "old reply", "new user", "new reply"}
+	for i := range wantArchive {
+		if got := sess.Messages[i].Content.Text(); got != wantArchive[i] {
+			t.Fatalf("archive[%d] = %q, want %q", i, got, wantArchive[i])
+		}
+	}
+	cp := sess.CompactionCheckpoint
+	if cp == nil || cp.ArchiveThroughIndex != len(sess.Messages) || cp.SchemaVersion != session.CompactionCheckpointSchemaVersion {
+		t.Fatalf("checkpoint not bound to persisted archive: %#v", cp)
+	}
+	if got := sess.HistoryForLoop(); len(got) != 3 || got[0].Content.Text() != "stable summary" {
+		t.Fatalf("live history did not use checkpoint: %#v", got)
+	}
+
+	// A later run with no compaction must leave the existing checkpoint active.
+	fresh := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	nextBase := captureTurnBaseline(sess, "web", false)
+	agent.SetRunMessagesForTest(fresh, []client.Message{
+		{Role: "user", Content: client.NewTextContent("tail user")},
+		{Role: "assistant", Content: client.NewTextContent("tail reply")},
+	})
+	applyTurnState(sess, fresh, nil, nextBase)
+	if sess.CompactionCheckpoint != cp {
+		t.Fatal("non-compacting turn replaced the durable checkpoint")
+	}
+	got := sess.HistoryForLoop()
+	if len(got) != 5 || got[3].Content.Text() != "tail user" || got[4].Content.Text() != "tail reply" {
+		t.Fatalf("raw archive tail was not appended after checkpoint: %#v", got)
+	}
+}
+
+func TestCompactionCheckpoint_SecondRunDoesNotResummarizeArchive(t *testing.T) {
+	var summaryCalls atomic.Int32
+	var mainMu sync.Mutex
+	var mainRequests [][]client.Message
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		response := client.CompletionResponse{
+			OutputText:   "done",
+			FinishReason: "end_turn",
+			Usage:        client.Usage{InputTokens: 500, OutputTokens: 10, TotalTokens: 510},
+		}
+		if req.ModelTier == "small" {
+			summaryCalls.Add(1)
+			response.OutputText = `<summary>
+## Current task & next steps
+Continue the deterministic checkpoint test.
+## User corrections & decisions
+Keep the transcript lossless and reuse one stable summary.
+			</summary>`
+		} else {
+			mainMu.Lock()
+			mainRequests = append(mainRequests, req.Messages)
+			mainMu.Unlock()
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	sess := &session.Session{}
+	primer := strings.Repeat("stable history payload ", 350)
+	for i := 0; i < 15; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		sess.Messages = append(sess.Messages, client.Message{
+			Role: role, Content: client.NewTextContent(primer),
+		})
+		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "web"})
+	}
+
+	newLoop := func() *agent.AgentLoop {
+		loop := agent.NewAgentLoop(client.NewGatewayClient(server.URL, ""), agent.NewToolRegistry(), "medium", "", 3, 2000, 200, nil, nil, nil)
+		loop.SetContextWindowExplicit(30000)
+		loop.SetSkillDiscovery(false)
+		return loop
+	}
+
+	first := newLoop()
+	firstBase := captureTurnBaseline(sess, "web", false)
+	if _, _, err := first.Run(context.Background(), "first prompt", nil, sess.HistoryForLoop()); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	applyTurnState(sess, first, nil, firstBase)
+	if sess.CompactionCheckpoint == nil {
+		t.Fatal("first run crossed preflight threshold but persisted no checkpoint")
+	}
+	firstSummaryCalls := summaryCalls.Load()
+	if firstSummaryCalls == 0 {
+		t.Fatal("test did not trigger a summary on the first run")
+	}
+	checkpointJSON, err := json.Marshal(sess.CompactionCheckpoint)
+	if err != nil {
+		t.Fatalf("marshal first checkpoint: %v", err)
+	}
+	archiveAfterFirst := len(sess.Messages)
+
+	second := newLoop()
+	secondBase := captureTurnBaseline(sess, "web", false)
+	if _, _, err := second.Run(context.Background(), "short follow-up", nil, sess.HistoryForLoop()); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	applyTurnState(sess, second, nil, secondBase)
+
+	if got := summaryCalls.Load(); got != firstSummaryCalls {
+		t.Fatalf("second run re-summarized the lossless archive: summary calls %d -> %d", firstSummaryCalls, got)
+	}
+	mainMu.Lock()
+	if len(mainRequests) == 0 {
+		mainMu.Unlock()
+		t.Fatal("second run sent no main request")
+	}
+	lastMain := append([]client.Message(nil), mainRequests[len(mainRequests)-1]...)
+	mainMu.Unlock()
+	if len(lastMain) < 4 {
+		t.Fatalf("second-run request too short: %#v", lastMain)
+	}
+	if got := lastMain[1].Content.Text(); got != primer {
+		t.Fatalf("second run lost the original first user: got %q, want %q", got, primer)
+	}
+	if got := lastMain[2].Content.Text(); !strings.HasPrefix(got, ctxwin.CompactionSummaryPrefix) {
+		t.Fatalf("second run lost the compacted summary: %q", got)
+	}
+	checkpointAfter, err := json.Marshal(sess.CompactionCheckpoint)
+	if err != nil {
+		t.Fatalf("marshal checkpoint after second run: %v", err)
+	}
+	if string(checkpointAfter) != string(checkpointJSON) {
+		t.Fatalf("non-compacting second run rewrote stable checkpoint\nbefore=%s\nafter=%s", checkpointJSON, checkpointAfter)
+	}
+	if len(sess.Messages) <= archiveAfterFirst {
+		t.Fatalf("second run did not append to archive: before=%d after=%d", archiveAfterFirst, len(sess.Messages))
+	}
+	if live := sess.HistoryForLoop(); len(live) >= len(sess.Messages) {
+		t.Fatalf("live context did not remain compacted: live=%d archive=%d", len(live), len(sess.Messages))
+	}
+}
+
 // applyTurnState must persist the estimator calibration alongside the
 // tool-result budget state, and clear a stale persisted sample when the loop
 // holds none (e.g. the restore-time validation rejected it).
@@ -293,5 +462,126 @@ func TestSessionInProgress_FlagCycles(t *testing.T) {
 	sess.InProgress = false
 	if sess.InProgress {
 		t.Fatal("toggle off didn't clear")
+	}
+}
+
+// Enters through applyTurnState — the helper that backs the mid-turn
+// checkpoint — rather than calling stripSpokenSummaryForKoeTurn directly. The
+// unit is already covered; what this pins is the wiring: that the save path
+// reads the Koe source off turnBaseline and cleans BOTH durable copies. A
+// process that dies right after this checkpoint leaves whatever it wrote, and
+// the checkpoint is what the next run reloads as live context.
+func TestApplyTurnState_KoeCheckpointIsTagStripped(t *testing.T) {
+	const tag = "<spoken_summary>said aloud.</spoken_summary>"
+	sess := &session.Session{
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("older")}},
+		MessageMeta: []session.MessageMeta{{Source: "koe"}},
+	}
+	base := captureTurnBaseline(sess, "koe", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("ask")},
+		{Role: "assistant", Content: client.NewTextContent("answer\n" + tag)},
+	})
+	agent.SetCompactionCheckpointMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("Previous context summary: …")},
+		{Role: "assistant", Content: client.NewTextContent("answer\n" + tag)},
+	})
+
+	applyTurnState(sess, loop, nil, base)
+
+	for i, m := range sess.Messages {
+		if strings.Contains(m.Content.Text(), "spoken_summary") {
+			t.Errorf("archive[%d] kept the raw tag: %q", i, m.Content.Text())
+		}
+	}
+	cp := sess.CompactionCheckpoint
+	if cp == nil {
+		t.Fatal("no checkpoint persisted")
+	}
+	for i, m := range cp.Messages {
+		if strings.Contains(m.Content.Text(), "spoken_summary") {
+			t.Errorf("checkpoint[%d] kept the raw tag — it would reach the model next turn: %q", i, m.Content.Text())
+		}
+	}
+	if got := cp.Messages[1].Content.Text(); !strings.Contains(got, "answer") {
+		t.Errorf("checkpoint lost the reply body: %q", got)
+	}
+
+	// A non-Koe source must not be touched by this path.
+	web := &session.Session{Messages: []client.Message{{Role: "user", Content: client.NewTextContent("older")}}}
+	webBase := captureTurnBaseline(web, "web", false)
+	webLoop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(webLoop, []client.Message{
+		{Role: "assistant", Content: client.NewTextContent("literal " + tag + " in a web transcript")},
+	})
+	applyTurnState(web, webLoop, nil, webBase)
+	if !strings.Contains(web.Messages[1].Content.Text(), "spoken_summary") {
+		t.Error("non-Koe transcript was rewritten by the Koe strip")
+	}
+}
+
+// The hard-error save differs from applyTurnState: it binds the checkpoint
+// before appending a synthetic friendly-error message. Exercise that exact
+// ordering and the Koe cleanup through the same helper the runner calls.
+func TestApplyHardErrorTurnMessages_KoeCheckpointIsTagStripped(t *testing.T) {
+	const tag = "<spoken_summary>hard-error reply was spoken.</spoken_summary>"
+	sess := &session.Session{
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("older")}},
+		MessageMeta: []session.MessageMeta{{Source: "koe"}},
+	}
+	base := captureTurnBaseline(sess, "koe", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("ask")},
+		{Role: "assistant", Content: client.NewTextContent("detail\n" + tag)},
+	})
+	agent.SetCompactionCheckpointMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "saved state")},
+		{Role: "assistant", Content: client.NewTextContent("detail\n" + tag)},
+	})
+
+	applyHardErrorTurnMessages(sess, loop, base, "Friendly failure.", time.Unix(1, 0))
+
+	cp := sess.CompactionCheckpoint
+	if cp == nil {
+		t.Fatal("hard-error path persisted no checkpoint")
+	}
+	if cp.ArchiveThroughIndex != len(sess.Messages)-1 {
+		t.Fatalf("checkpoint index = %d, want %d before friendly error", cp.ArchiveThroughIndex, len(sess.Messages)-1)
+	}
+	if got := sess.Messages[len(sess.Messages)-1].Content.Text(); got != "Friendly failure." {
+		t.Fatalf("last archive message = %q, want friendly error", got)
+	}
+	for i, msg := range sess.Messages {
+		if strings.Contains(msg.Content.Text(), "spoken_summary") {
+			t.Errorf("archive[%d] kept raw Koe markup: %q", i, msg.Content.Text())
+		}
+	}
+	for i, msg := range cp.Messages {
+		if strings.Contains(msg.Content.Text(), "spoken_summary") {
+			t.Errorf("checkpoint[%d] kept raw Koe markup: %q", i, msg.Content.Text())
+		}
+	}
+	if !strings.Contains(cp.Messages[1].Content.Text(), "detail") {
+		t.Fatalf("checkpoint lost reply body: %q", cp.Messages[1].Content.Text())
+	}
+}
+
+func TestApplyHardErrorTurnMessages_UsesNormalizedBaselineSource(t *testing.T) {
+	sess := &session.Session{
+		Messages:    []client.Message{{Role: "user", Content: client.NewTextContent("older")}},
+		MessageMeta: []session.MessageMeta{{Source: "unknown"}},
+	}
+	base := captureTurnBaseline(sess, "unknown", false)
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "m", "", 1, 1, 1, nil, nil, nil)
+	agent.SetRunMessagesForTest(loop, []client.Message{
+		{Role: "user", Content: client.NewTextContent("ask")},
+	})
+
+	applyHardErrorTurnMessages(sess, loop, base, "Friendly failure.", time.Unix(1, 0))
+
+	if got := sess.MessageMeta[len(sess.MessageMeta)-1].Source; got != "unknown" {
+		t.Fatalf("hard-error source = %q, want normalized baseline source %q", got, "unknown")
 	}
 }

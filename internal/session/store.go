@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -78,24 +79,33 @@ type InterruptedTurn struct {
 }
 
 type Session struct {
-	SchemaVersion      int                          `json:"schema_version,omitempty"`
-	ID                 string                       `json:"id"`
-	CreatedAt          time.Time                    `json:"created_at"`
-	UpdatedAt          time.Time                    `json:"updated_at"`
-	Title              string                       `json:"title"`
-	CWD                string                       `json:"cwd"`
-	Messages           []client.Message             `json:"messages"`
-	RemoteTasks        []string                     `json:"remote_tasks,omitempty"`
-	MessageMeta        []MessageMeta                `json:"message_meta,omitempty"`
-	IdempotentRequests map[string]IdempotentRequest `json:"idempotent_requests,omitempty"`
-	Source             string                       `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still appears in older sessions)
-	Channel            string                       `json:"channel,omitempty"`           // source channel/group identifier
-	ScheduleID         string                       `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
-	RouteKey           string                       `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
-	ProjectID          string                       `json:"project_id,omitempty"`        // owning project entity (~/.shannon/projects/<id>); optional, empty = unfiled. Set once from RunAgentRequest.ProjectID or via PATCH /sessions/{id}.
-	SummaryCache       string                       `json:"summary_cache,omitempty"`     // cached summary Markdown
-	SummaryCacheKey    string                       `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
-	Usage              *UsageSummary                `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
+	SchemaVersion int              `json:"schema_version,omitempty"`
+	ID            string           `json:"id"`
+	CreatedAt     time.Time        `json:"created_at"`
+	UpdatedAt     time.Time        `json:"updated_at"`
+	Title         string           `json:"title"`
+	CWD           string           `json:"cwd"`
+	Messages      []client.Message `json:"messages"`
+	// CompactionCheckpoint is the durable model-visible context produced by an
+	// applied compaction. Messages remains the lossless archive used by history,
+	// search, share, sync, and audit; a fresh agent loop resumes from the
+	// checkpoint plus archive messages appended after ArchiveThroughIndex.
+	//
+	// ArchiveThroughIndex is an EXCLUSIVE index in the raw Messages slice. It is
+	// deliberately not an index into HistoryForLoop's filtered view: injected
+	// messages make those two index spaces differ.
+	CompactionCheckpoint *CompactionCheckpoint        `json:"compaction_checkpoint,omitempty"`
+	RemoteTasks          []string                     `json:"remote_tasks,omitempty"`
+	MessageMeta          []MessageMeta                `json:"message_meta,omitempty"`
+	IdempotentRequests   map[string]IdempotentRequest `json:"idempotent_requests,omitempty"`
+	Source               string                       `json:"source,omitempty"`            // "slack", "line", "kocoro", "webhook" (legacy "shanclaw" still appears in older sessions)
+	Channel              string                       `json:"channel,omitempty"`           // source channel/group identifier
+	ScheduleID           string                       `json:"schedule_id,omitempty"`       // owning schedule for scheduler-created sessions; retained after schedule deletion
+	RouteKey             string                       `json:"route_key,omitempty"`         // persisted daemon route binding for routed conversations
+	ProjectID            string                       `json:"project_id,omitempty"`        // owning project entity (~/.shannon/projects/<id>); optional, empty = unfiled. Set once from RunAgentRequest.ProjectID or via PATCH /sessions/{id}.
+	SummaryCache         string                       `json:"summary_cache,omitempty"`     // cached summary Markdown
+	SummaryCacheKey      string                       `json:"summary_cache_key,omitempty"` // invalidation key for cached summary
+	Usage                *UsageSummary                `json:"usage,omitempty"`             // cumulative LLM + tool cost/token totals
 	// ToolResultReplacements stores query-time tool_result replacement text
 	// keyed by tool_use_id. It is not model-visible by itself; agent loops
 	// apply it to a request-local message copy before LLM calls.
@@ -153,6 +163,18 @@ type Session struct {
 	PublishedShares []PublishedShareEntry `json:"published_shares,omitempty"`
 }
 
+// CompactionCheckpoint separates the lossless session archive from the
+// compacted live context sent to the model. Messages excludes the system prompt
+// and transient injected messages; the loop prepends the current system prompt
+// when it resumes.
+const CompactionCheckpointSchemaVersion = 1
+
+type CompactionCheckpoint struct {
+	SchemaVersion       int              `json:"schema_version"`
+	ArchiveThroughIndex int              `json:"archive_through_index"`
+	Messages            []client.Message `json:"messages"`
+}
+
 // CompactionCalibration is the persisted estimator-calibration sample:
 // (real prompt tokens − estimate at send time) of the last main completion,
 // plus the response model and the tool-registry fingerprint it was measured
@@ -193,6 +215,7 @@ func (s *Session) LastSeenModel() string {
 // omitted from JSON for smaller session files.
 type UsageSummary struct {
 	LLMCalls              int     `json:"llm_calls,omitempty"`
+	WebSearchCalls        int     `json:"web_search_calls,omitempty"`
 	InputTokens           int     `json:"input_tokens,omitempty"`
 	OutputTokens          int     `json:"output_tokens,omitempty"`
 	TotalTokens           int     `json:"total_tokens,omitempty"`
@@ -210,9 +233,10 @@ type UsageSummary struct {
 // UsageFromTurn converts LLM-only numeric values into a UsageSummary.
 // Left in place for callers that only have LLM data; new code should prefer
 // UsageFromAccumulated which carries both LLM and gateway-tool costs.
-func UsageFromTurn(llmCalls, inputTokens, outputTokens, totalTokens int, costUSD float64, cacheRead, cacheCreation, cacheCreation5m, cacheCreation1h int, model string) UsageSummary {
+func UsageFromTurn(llmCalls, webSearchCalls, inputTokens, outputTokens, totalTokens int, costUSD float64, cacheRead, cacheCreation, cacheCreation5m, cacheCreation1h int, model string) UsageSummary {
 	return UsageSummary{
 		LLMCalls:              llmCalls,
+		WebSearchCalls:        webSearchCalls,
 		InputTokens:           inputTokens,
 		OutputTokens:          outputTokens,
 		TotalTokens:           totalTokens,
@@ -229,12 +253,13 @@ func UsageFromTurn(llmCalls, inputTokens, outputTokens, totalTokens int, costUSD
 // tool costs as separate fields so totals stay unambiguous when a run
 // touched billed tools (x_search, web_search).
 func UsageFromAccumulated(
-	llmCalls, inputTokens, outputTokens, totalTokens int, costUSD float64,
+	llmCalls, webSearchCalls, inputTokens, outputTokens, totalTokens int, costUSD float64,
 	cacheRead, cacheCreation, cacheCreation5m, cacheCreation1h int, model string,
 	toolCalls int, toolCostUSD float64,
 ) UsageSummary {
 	return UsageSummary{
 		LLMCalls:              llmCalls,
+		WebSearchCalls:        webSearchCalls,
 		InputTokens:           inputTokens,
 		OutputTokens:          outputTokens,
 		TotalTokens:           totalTokens,
@@ -252,6 +277,7 @@ func UsageFromAccumulated(
 // Add accumulates another UsageSummary into u.
 func (u *UsageSummary) Add(o UsageSummary) {
 	u.LLMCalls += o.LLMCalls
+	u.WebSearchCalls += o.WebSearchCalls
 	u.InputTokens += o.InputTokens
 	u.OutputTokens += o.OutputTokens
 	u.TotalTokens += o.TotalTokens
@@ -289,7 +315,36 @@ func (s *Session) SourceAt(i int) string {
 // When the meta slice is missing or shorter than Messages (legacy sessions
 // predating the flag), unannotated messages are returned unchanged.
 func (s *Session) HistoryForLoop() []client.Message {
-	return FilterInjected(s.Messages, s.MessageMeta)
+	if s == nil {
+		return nil
+	}
+	cp := s.CompactionCheckpoint
+	if cp == nil {
+		return FilterInjected(s.Messages, s.MessageMeta)
+	}
+	if cp.SchemaVersion != CompactionCheckpointSchemaVersion || len(cp.Messages) == 0 ||
+		cp.ArchiveThroughIndex < 0 || cp.ArchiveThroughIndex > len(s.Messages) {
+		log.Printf("session: ignoring invalid compaction checkpoint (session=%q schema=%d messages=%d archive_through_index=%d archive_messages=%d); falling back to archive",
+			s.ID, cp.SchemaVersion, len(cp.Messages), cp.ArchiveThroughIndex, len(s.Messages))
+		return FilterInjected(s.Messages, s.MessageMeta)
+	}
+	if !ctxwin.IsCompactedHistory(cp.Messages) {
+		log.Printf("session: compaction checkpoint is structurally valid but missing the compacted-history marker (session=%q messages=%d archive_through_index=%d); next-turn sanitization may degrade the primer",
+			s.ID, len(cp.Messages), cp.ArchiveThroughIndex)
+	}
+
+	through := cp.ArchiveThroughIndex
+	tailMeta := s.MessageMeta
+	if len(tailMeta) > through {
+		tailMeta = tailMeta[through:]
+	} else {
+		tailMeta = nil
+	}
+	tail := FilterInjected(s.Messages[through:], tailMeta)
+	out := make([]client.Message, 0, len(cp.Messages)+len(tail))
+	out = append(out, cp.Messages...)
+	out = append(out, tail...)
+	return out
 }
 
 // FilterInjected returns msgs with any positions flagged SystemInjected in
@@ -1055,6 +1110,9 @@ func (s *Store) Load(id string) (*Session, error) {
 	// wire-shape that motivates this. The next Save() persists the cleaned
 	// shape, so disk copies repair themselves on first read after upgrade.
 	sess.Messages = ctxwin.DropMalformedThinking(sess.Messages)
+	if sess.CompactionCheckpoint != nil {
+		sess.CompactionCheckpoint.Messages = ctxwin.DropMalformedThinking(sess.CompactionCheckpoint.Messages)
+	}
 	return &sess, nil
 }
 

@@ -1,6 +1,7 @@
 package context
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -236,22 +237,29 @@ func TestShapeHistory(t *testing.T) {
 		}
 	})
 
-	t.Run("empty summary skips injection", func(t *testing.T) {
+	t.Run("empty summary emits durable unavailable marker", func(t *testing.T) {
 		system := client.Message{Role: "system", Content: client.NewTextContent("system prompt")}
 		turns := makeTurns(30)
 		all := append([]client.Message{system}, turns...)
 
 		got := ShapeHistory(all, "", 128000, 0)
+		if len(got) >= len(all) {
+			t.Fatalf("empty-summary fallback must still reduce history: got %d, original %d", len(got), len(all))
+		}
+		wantMarker := CompactionSummaryPrefix + compactionSummaryUnavailable
+		if len(got) < 3 || got[2].Role != "user" || got[2].Content.Text() != wantMarker {
+			t.Fatalf("empty summary marker = %#v, want user %q", got, wantMarker)
+		}
+		if !IsCompactedHistory(got) {
+			t.Fatal("empty-summary shape is not recognizable as compacted")
+		}
 
-		// With empty summary and large window, should still shape but no summary message
-		for _, m := range got {
-			if m.Role == "user" && m.Content.Text() != "" {
-				// Make sure no "Previous context summary" message exists
-				text := m.Content.Text()
-				if len(text) > 25 && text[:25] == "Previous context summary:" {
-					t.Error("should not inject empty summary")
-				}
-			}
+		// This is the next-turn sanitizer seam. Without the marker it applies
+		// ordinary keep-later merging to [primer, retained user] and drops the
+		// original first request at the exact moment the degraded path needs it.
+		sanitized := SanitizeCompactedHistory(got)
+		if len(sanitized) < 3 || sanitized[1].Content.Text() != "user msg A" || sanitized[2].Content.Text() != wantMarker {
+			t.Fatalf("next-turn sanitize lost compacted primer/marker: %#v", sanitized)
 		}
 	})
 
@@ -383,6 +391,53 @@ func TestShapeHistory(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestShapeHistoryTracked_MapsRetainedMessagesExactly(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("system")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 50; i++ {
+		role := "assistant"
+		if i%2 == 1 {
+			role = "user"
+		}
+		messages = append(messages, client.Message{
+			Role: role, Content: client.NewTextContent(fmt.Sprintf("message-%02d", i)),
+		})
+	}
+	// The default 20-pair suffix begins at input index 12. Make that exact
+	// boundary an orphan-only assistant message so shaping removes it and the
+	// provenance slice must remove the same source position.
+	messages[12] = client.Message{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+		{Type: "tool_use", ID: "orphan-at-shape-boundary", Name: "read"},
+	})}
+
+	got := ShapeHistoryTracked(messages, "summary", 0, 0)
+	if !got.Applied {
+		t.Fatal("expected tracked shape to apply")
+	}
+	if len(got.Messages) != len(got.SourceIndices) {
+		t.Fatalf("messages/sources length mismatch: %d/%d", len(got.Messages), len(got.SourceIndices))
+	}
+	if got.SourceIndices[0] != 0 || got.SourceIndices[1] != 1 || got.SourceIndices[2] != SyntheticSourceIndex {
+		t.Fatalf("unexpected protected-prefix sources: %v", got.SourceIndices[:3])
+	}
+	for _, oldIdx := range got.SourceIndices {
+		if oldIdx == 12 {
+			t.Fatal("orphan-only boundary message retained in provenance")
+		}
+	}
+	for newIdx, oldIdx := range got.SourceIndices {
+		if oldIdx == SyntheticSourceIndex {
+			continue
+		}
+		if got.Messages[newIdx].Content.Text() != messages[oldIdx].Content.Text() {
+			t.Fatalf("source mismatch at new=%d old=%d: got %q, want %q",
+				newIdx, oldIdx, got.Messages[newIdx].Content.Text(), messages[oldIdx].Content.Text())
+		}
+	}
 }
 
 // TestTruncateOversizedLastUserMessage covers the short-session single-input
@@ -853,11 +908,12 @@ func TestForceShapeHistory_CompactsWhenBudgetGateWouldSkip(t *testing.T) {
 	messages := []client.Message{
 		{Role: "system", Content: client.NewTextContent("sys")},
 		{Role: "user", Content: client.NewTextContent("first")},
+		{Role: "assistant", Content: client.NewTextContent("first reply")},
 	}
-	for i := 0; i < 8; i++ {
+	for i := 1; i < 8; i++ {
 		messages = append(messages,
-			client.Message{Role: "assistant", Content: client.NewTextContent("assistant reply")},
 			client.Message{Role: "user", Content: client.NewTextContent("follow up")},
+			client.Message{Role: "assistant", Content: client.NewTextContent("assistant reply")},
 		)
 	}
 	contextWindow := 1_000_000 // far under budget → standard gate skips
@@ -878,6 +934,27 @@ func TestForceShapeHistory_CompactsWhenBudgetGateWouldSkip(t *testing.T) {
 	}
 	if !found {
 		t.Error("forced shaping should insert the summary")
+	}
+}
+
+func TestForceShapeHistory_EmptySummaryAccountsForUnavailableMarker(t *testing.T) {
+	messages := []client.Message{
+		{Role: "system", Content: client.NewTextContent("sys")},
+		{Role: "user", Content: client.NewTextContent("first")},
+	}
+	for i := 0; i < 8; i++ {
+		messages = append(messages,
+			client.Message{Role: "assistant", Content: client.NewTextContent("assistant reply")},
+			client.Message{Role: "user", Content: client.NewTextContent("follow up")},
+		)
+	}
+
+	shaped := ForceShapeHistory(messages, "", 1_000_000, 0)
+	if len(shaped) >= len(messages) {
+		t.Fatalf("forced empty-summary fallback must net-reduce: got %d msgs, want < %d", len(shaped), len(messages))
+	}
+	if !IsCompactedHistory(shaped) {
+		t.Fatalf("forced empty-summary shape lacks durable marker: %#v", shaped)
 	}
 }
 

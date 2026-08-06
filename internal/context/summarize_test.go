@@ -518,8 +518,8 @@ func TestSummarizeForShareWithSource_CapsOversizedTranscript(t *testing.T) {
 		t.Fatalf("SummarizeForShareWithSource: %v", err)
 	}
 	body := mock.lastReq.Messages[1].Content.Text()
-	if len(body) > summarizeInputCapChars {
-		t.Errorf("share transcript len = %d, want <= %d (cap)", len(body), summarizeInputCapChars)
+	if len(body) > summarizeInputCapBytes {
+		t.Errorf("share transcript len = %d, want <= %d (cap)", len(body), summarizeInputCapBytes)
 	}
 	if !strings.Contains(body, "transcript truncated") {
 		t.Errorf("expected truncation marker in capped share transcript")
@@ -544,7 +544,7 @@ func TestSummarizeForShareWithSource_ErrorPropagates(t *testing.T) {
 // already over the small-tier (Haiku 4.5, 200K) cap, the summarizer 400s
 // with "prompt is too long", and the user sees a hard error. The fix is
 // an internal head+tail truncation that keeps the small-tier input under
-// summarizeInputCapChars regardless of how large the input is.
+// summarizeInputCapBytes regardless of how large the input is.
 func TestGenerateSummary_CapsOversizedTranscript(t *testing.T) {
 	// Build a transcript far over the small-tier 200K cap.
 	// 1.3M chars is ~371K tokens at 3.5 chars/token — well past Haiku 4.5's 200K.
@@ -566,9 +566,9 @@ func TestGenerateSummary_CapsOversizedTranscript(t *testing.T) {
 	// The transcript that actually went to the small-tier model must be
 	// at or under the cap, not the raw 1.3M chars.
 	sentBody := mock.lastReq.Messages[1].Content.Text()
-	if len(sentBody) > summarizeInputCapChars {
+	if len(sentBody) > summarizeInputCapBytes {
 		t.Errorf("sent transcript len = %d, want <= %d (cap)",
-			len(sentBody), summarizeInputCapChars)
+			len(sentBody), summarizeInputCapBytes)
 	}
 	if !strings.Contains(sentBody, "transcript truncated") {
 		head := sentBody
@@ -595,8 +595,8 @@ func TestCapTranscriptForSummarize_UTF8Safe(t *testing.T) {
 	if !utf8.ValidString(out) {
 		t.Errorf("output is not valid UTF-8 — head/tail truncation split a rune. len=%d", len(out))
 	}
-	if len(out) > summarizeInputCapChars {
-		t.Errorf("output len = %d, want <= %d (cap)", len(out), summarizeInputCapChars)
+	if len(out) > summarizeInputCapBytes {
+		t.Errorf("output len = %d, want <= %d (cap)", len(out), summarizeInputCapBytes)
 	}
 	if !strings.Contains(out, "transcript truncated") {
 		t.Errorf("expected truncation marker in capped output")
@@ -607,12 +607,12 @@ func TestCapTranscriptForSummarize_UTF8Safe(t *testing.T) {
 // at the byte boundary (input == cap → no truncation; input == cap+1 →
 // truncation fires).
 func TestCapTranscriptForSummarize_BoundaryAtCap(t *testing.T) {
-	atCap := strings.Repeat("a", summarizeInputCapChars)
+	atCap := strings.Repeat("a", summarizeInputCapBytes)
 	if got := capTranscriptForSummarize(atCap); got != atCap {
 		t.Errorf("input at cap was modified: in=%d out=%d", len(atCap), len(got))
 	}
 
-	overCap := strings.Repeat("a", summarizeInputCapChars+1)
+	overCap := strings.Repeat("a", summarizeInputCapBytes+1)
 	got := capTranscriptForSummarize(overCap)
 	if got == overCap {
 		t.Errorf("input over cap was NOT truncated: len=%d", len(got))

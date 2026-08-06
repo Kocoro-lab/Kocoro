@@ -94,9 +94,11 @@ agent:
   interrupted_resume_max_attempts: 3 # cap automatic daemon-start continuations for one durable checkpoint. The attempt is persisted before the LLM call; 0/unset uses the default 3, and operators may raise it for a known recoverable provider outage.
   interrupted_resume_max_age_hours: 4 # staleness window for auto-resume: checkpoints interrupted longer ago than this are abandoned (marker cleared, interrupted_turn_abandoned emitted) instead of resumed — a months-old interrupted turn carries a user intent whose context is gone and must not execute unattended on upgrade. 0/unset uses the default 4; raise for long planned outages.
   interrupted_resume_enabled: true # gate daemon-start auto-continuation entirely. false leaves interrupted checkpoints in place without any automatic execution.
+  compaction_snapshot_retention: 1 # prior live-context rollback JSON files kept per session; the full transcript is separate and unchanged. Inline images are omitted. 0 disables snapshots.
+  compaction_snapshot_max_age_days: 14 # daemon-start age sweep across default and named-agent snapshots. 0 disables age cleanup.
 
   # Skill matching
-  skill_discovery: true            # per-turn small-model skill matching prefetch (default: true)
+  skill_discovery: false           # opt-in small-model skill matching prefetch (default: false); metadata listing and use_skill remain available
 
   # Prompt suggestion (ghost text)
   prompt_suggestion:
@@ -119,7 +121,7 @@ agent:
 
 `effort_tier` is the preferred user-facing reasoning control: **Light** (`low`), **Balanced** (`high`), **Deep** (`xhigh`), and **Max** (`max`), plus **Default** (`""`). Cloud translates those stable product tiers to each provider's native value. GPT-5.6 uses `low` / `medium` / `xhigh` / `max`; Anthropic uses `low` / `high` / `xhigh` / `max`. Claude Haiku does not advertise effort support and stays at the model default.
 
-`service_tier` is a process-global developer selector for OpenAI processing. `default` requests Standard processing and `fast` requests Fast processing; `""` leaves the provider default untouched. Kocoro Desktop exposes it only alongside an exact OpenAI model. It is intentionally not merged from project/local config and is not available in named-agent config. A named agent's exact model override clears the global processing lane, while sealed Koe/computer execution profiles provide their own lane independently.
+`service_tier` is a process-global developer selector for OpenAI processing. `default` requests Standard processing and `fast` requests Fast processing; `""` leaves the provider default untouched. Kocoro Desktop exposes it only alongside an exact OpenAI model. It is intentionally not merged from project/local config and is not available in named-agent config. A named agent's model tier or exact model override clears the global processing lane, while sealed Koe/computer execution profiles provide their own lane independently.
 
 ## Tool Settings
 

@@ -225,7 +225,7 @@ func (m *Manager) tickGoalDriven(ctx context.Context, ah *agentHeartbeat, goals 
 		BypassRouting:  true,
 		ModelOverride:  ah.model,
 		CWD:            snapshot.CWD,
-		SessionHistory: snapshot.Messages,
+		SessionHistory: snapshot.HistoryForLoop(),
 	}
 
 	result, err := daemon.RunAgent(ctx, m.deps, req, collector)

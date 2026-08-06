@@ -54,6 +54,7 @@ type Server struct {
 	client     *Client
 	deps       *ServerDeps
 	server     *http.Server
+	isolated   bool
 	listenerMu sync.Mutex // protects listener
 	// toolRefreshMu serializes in-place re-registration of the live registry's
 	// gateway/integration tools (RebuildAuthSensitiveTools + RefreshIntegrationTools).
@@ -611,6 +612,13 @@ func (s *Server) SetCancelFunc(cancel context.CancelFunc) {
 	s.cancel = cancel
 }
 
+// SetIsolated disables daemon-wide background services while preserving the
+// real HTTP listener and request execution path. It is intended only for
+// state-isolated live E2E processes with temporary filesystem state.
+func (s *Server) SetIsolated(isolated bool) {
+	s.isolated = isolated
+}
+
 // SetOnReload sets a callback invoked after config reload to restart watchers/heartbeat.
 func (s *Server) SetOnReload(fn func()) {
 	s.onReload = fn
@@ -1044,21 +1052,21 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx = ctx
-	// Bind the process coordinator's activity sink only for the live server.
-	// Offline Handler() fixtures can inject an isolated coordinator without
-	// stealing the singleton sink from a concurrently running daemon.
-	s.SetComputerUseCoordinator(s.computerUseCoordinator)
-	cleanupComputerUseIntegrationFixture, err := startComputerUseIntegrationFixture(
-		s.computerUseCoordinator,
-	)
-	if err != nil {
-		return fmt.Errorf("daemon server computer-use integration fixture: %w", err)
+	preparationCleanup := func() {}
+	if !s.isolated {
+		var err error
+		preparationCleanup, err = s.prepareBackgroundServices()
+		if err != nil {
+			return err
+		}
 	}
-	defer cleanupComputerUseIntegrationFixture()
-	s.recoverMigrationOrphans()
+	defer preparationCleanup()
+
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-	go s.forwardRemoteEvents(ctx)
+	if !s.isolated {
+		go s.forwardRemoteEvents(ctx)
+	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", s.port))
 	if err != nil {
@@ -1068,8 +1076,55 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listener = ln
 	s.listenerMu.Unlock()
 	s.server = &http.Server{Handler: withLocalCORS(mux)}
+	backgroundCleanup := func() {}
+	if s.isolated {
+		// Preserve the unconditional pullDone invariant even though the isolated
+		// process never starts the sync worker.
+		close(s.pullDone)
+		log.Print(IsolationMarkerBackgroundDisabled)
+	} else {
+		backgroundCleanup = s.startBackgroundServices(ctx)
+	}
+	defer backgroundCleanup()
+
+	go func() {
+		<-ctx.Done()
+		// Stop the memory sidecar before HTTP shutdown so SIGTERM reaches the
+		// child process while the daemon is still alive to drain its exit.
+		if s.memSvc != nil {
+			_ = s.memSvc.Stop()
+		}
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		s.server.Shutdown(shutCtx)
+	}()
+
+	if err := s.server.Serve(ln); err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) prepareBackgroundServices() (func(), error) {
+	// Bind the process coordinator's activity sink only for the live server.
+	// Offline Handler() fixtures can inject an isolated coordinator without
+	// stealing the singleton sink from a concurrently running daemon.
+	s.SetComputerUseCoordinator(s.computerUseCoordinator)
+	cleanupComputerUseIntegrationFixture, err := startComputerUseIntegrationFixture(
+		s.computerUseCoordinator,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("daemon server computer-use integration fixture: %w", err)
+	}
+	s.recoverMigrationOrphans()
+	return cleanupComputerUseIntegrationFixture, nil
+}
+
+// startBackgroundServices owns every daemon-wide worker excluded from the
+// state-isolated live-E2E process. Keeping their startup in one method makes a
+// new worker opt in to the production lifecycle deliberately.
+func (s *Server) startBackgroundServices(ctx context.Context) func() {
 	expiryCtx, stopComputerUseExpiry := context.WithCancel(ctx)
-	defer stopComputerUseExpiry()
 	go s.runComputerUseExpiryLoop(expiryCtx)
 
 	// Spawn the gated session-sync ticker. It self-disables when sync is
@@ -1107,6 +1162,19 @@ func (s *Server) Start(ctx context.Context) error {
 			log.Printf("daemon: session scratch sweep removed %d stale dirs (older than %dd)", removed, days)
 		}
 	}()
+
+	// Compaction snapshots are manual rollback material, not permanent session
+	// history. Bound their lifetime independently of session deletion so an
+	// old but still-listed session cannot retain full-history copies forever.
+	days := 0
+	if s.deps != nil {
+		s.deps.mu.RLock()
+		if s.deps.Config != nil {
+			days = s.deps.Config.Agent.CompactionSnapshotMaxAgeDays
+		}
+		s.deps.mu.RUnlock()
+	}
+	s.startCompactionSnapshotSweep(days)
 
 	// One-time agent pull on startup: applies the cloud mirror to local disk
 	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
@@ -1157,22 +1225,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// with foreground traffic for model and tool capacity.
 	go s.resumeInterruptedTurns(ctx)
 
-	go func() {
-		<-ctx.Done()
-		// Stop the memory sidecar before HTTP shutdown so SIGTERM reaches the
-		// child process while the daemon is still alive to drain its exit.
-		if s.memSvc != nil {
-			_ = s.memSvc.Stop()
-		}
-		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		s.server.Shutdown(shutCtx)
-	}()
-
-	if err := s.server.Serve(ln); err != http.ErrServerClosed {
-		return err
-	}
-	return nil
+	return stopComputerUseExpiry
 }
 
 const (
@@ -3721,12 +3774,13 @@ func (h *sseEventHandler) OnUsage(usage agent.TurnUsage) {
 	h.usage.Add(usage)
 	// Also emit as SSE event so clients can render live cost meters.
 	data := mustJSON(map[string]interface{}{
-		"input_tokens":  usage.InputTokens,
-		"output_tokens": usage.OutputTokens,
-		"total_tokens":  usage.TotalTokens,
-		"cost_usd":      usage.CostUSD,
-		"llm_calls":     usage.LLMCalls,
-		"model":         usage.Model,
+		"input_tokens":     usage.InputTokens,
+		"output_tokens":    usage.OutputTokens,
+		"total_tokens":     usage.TotalTokens,
+		"cost_usd":         usage.CostUSD,
+		"llm_calls":        usage.LLMCalls,
+		"web_search_calls": usage.WebSearchCalls,
+		"model":            usage.Model,
 	})
 	fmt.Fprintf(h.w, "event: usage\ndata: %s\n\n", data)
 	h.flusher.Flush()

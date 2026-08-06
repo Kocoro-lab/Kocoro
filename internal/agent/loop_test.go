@@ -394,6 +394,19 @@ func (h *usageRecordingHandler) UsageDeltas() []TurnUsage {
 	return out
 }
 
+func TestAgentLoopReportLLMUsagePreservesSearchOnlyUsage(t *testing.T) {
+	handler := &usageRecordingHandler{}
+	loop := NewAgentLoop(nil, NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	loop.reportLLMUsage(client.Usage{WebSearchCalls: 1}, "")
+
+	deltas := handler.UsageDeltas()
+	if len(deltas) != 1 || deltas[0].WebSearchCalls != 1 {
+		t.Fatalf("usage deltas = %+v, want one hosted-search call", deltas)
+	}
+}
+
 func (h *usageRecordingHandler) StatusEvents() []recordedStatus {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1927,6 +1940,161 @@ func TestAgentLoop_ToolSearchLoadsBrowserFamilyCoreAndReanchorsTask(t *testing.T
 	}
 	if !foundReanchor {
 		t.Fatal("expected third request to include a deferred-tool reanchor message")
+	}
+}
+
+func TestAgentLoop_HostedWebSearchCompletesAfterToolSearch(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("tool_search", `{"query":"select:web_search"}`), 10, 5))
+		case 2:
+			resp := nativeResponse("Current answer with sources.", "end_turn", nil, 10, 5)
+			resp.Usage.WebSearchCalls = 1
+			json.NewEncoder(w).Encode(resp)
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(&bulkyMockMCPTool{name: "web_search"})
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+
+	result, _, err := loop.Run(context.Background(), "Find the latest answer.", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Current answer with sources." {
+		t.Fatalf("result = %q, want hosted-search answer", result)
+	}
+	if callCount != 2 {
+		t.Fatalf("completion requests = %d, want 2", callCount)
+	}
+}
+
+func TestAgentLoop_ZeroHostedSearchUsageContinuesAfterToolSearch(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("tool_search", `{"query":"select:web_search"}`), 10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("I found the search tool.", "end_turn", nil, 10, 5))
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse("Final answer after retry.", "end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(&bulkyMockMCPTool{name: "web_search"})
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, _, err := loop.Run(context.Background(), "Find the latest answer.", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Final answer after retry." || callCount != 3 {
+		t.Fatalf("result = %q calls = %d, want final retry answer after 3 calls", result, callCount)
+	}
+}
+
+func TestAgentLoop_HostedSearchPreambleContinuesAfterToolSearch(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("tool_search", `{"query":"select:web_search"}`), 10, 5))
+		case 2:
+			resp := nativeResponse("Now let me read the file with the tool I just loaded.", "end_turn", nil, 10, 5)
+			resp.Usage.WebSearchCalls = 1
+			json.NewEncoder(w).Encode(resp)
+		case 3:
+			json.NewEncoder(w).Encode(nativeResponse("Final answer with sources.", "end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(&bulkyMockMCPTool{name: "web_search"})
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+
+	result, usage, err := loop.Run(context.Background(), "Find the latest answer.", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Final answer with sources." || callCount != 3 {
+		t.Fatalf("result = %q calls = %d, want final sourced answer after 3 calls", result, callCount)
+	}
+	if usage.WebSearchCalls != 1 {
+		t.Fatalf("web search calls = %d, want 1", usage.WebSearchCalls)
+	}
+}
+
+type hostedSearchStreamingClient struct {
+	responses     []*client.CompletionResponse
+	completeCalls int
+	streamCalls   int
+}
+
+func (c *hostedSearchStreamingClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	c.completeCalls++
+	return nil, errors.New("unexpected non-streaming completion")
+}
+
+func (c *hostedSearchStreamingClient) CompleteStream(_ context.Context, _ client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	c.streamCalls++
+	if len(c.responses) == 0 {
+		return nil, errors.New("unexpected streaming completion")
+	}
+	resp := c.responses[0]
+	c.responses = c.responses[1:]
+	return resp, nil
+}
+
+func TestAgentLoop_StreamingHostedSearchCompletesAfterToolSearch(t *testing.T) {
+	searchSelection := nativeResponse("", "tool_use", toolCall("tool_search", `{"query":"select:web_search"}`), 10, 5)
+	answer := nativeResponse("Streaming answer with sources.", "end_turn", nil, 10, 5)
+	answer.Usage.WebSearchCalls = 1
+	llm := &hostedSearchStreamingClient{responses: []*client.CompletionResponse{&searchSelection, &answer}}
+
+	reg := NewToolRegistry()
+	reg.Register(&bulkyMockMCPTool{name: "web_search"})
+	loop := NewAgentLoop(llm, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(true)
+	loop.SetHandler(&preambleHandler{})
+
+	result, usage, err := loop.Run(context.Background(), "Find the latest answer.", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "Streaming answer with sources." {
+		t.Fatalf("result = %q, want streaming hosted-search answer", result)
+	}
+	if llm.streamCalls != 2 || llm.completeCalls != 0 {
+		t.Fatalf("stream calls = %d complete calls = %d, want 2 and 0", llm.streamCalls, llm.completeCalls)
+	}
+	if usage.WebSearchCalls != 1 {
+		t.Fatalf("web search calls = %d, want 1", usage.WebSearchCalls)
 	}
 }
 
@@ -4838,6 +5006,7 @@ func TestAgentLoop_SkillDiscovery(t *testing.T) {
 		testSkills = append(testSkills, &skills.Skill{Name: fmt.Sprintf("skill-%d", si), Description: fmt.Sprintf("test skill %d", si)})
 	}
 	loop.SetSkills(testSkills)
+	loop.SetSkillDiscovery(true)
 
 	_, _, err := loop.Run(context.Background(), "帮我创建一个 agent", nil, nil)
 	if err != nil {
@@ -4866,10 +5035,19 @@ func TestAgentLoop_SkillDiscovery(t *testing.T) {
 	}
 }
 
-func TestAgentLoop_SkillDiscoveryDisabled(t *testing.T) {
+func TestAgentLoop_SkillDiscoveryDisabledByDefault(t *testing.T) {
 	callCount := 0
+	listingSeen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
+		body, _ := io.ReadAll(r.Body)
+		var req client.CompletionRequest
+		json.Unmarshal(body, &req)
+		for _, msg := range req.Messages {
+			if strings.Contains(msg.Content.Text(), "## Available Skills") {
+				listingSeen = true
+			}
+		}
 		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 10, 5))
 	}))
 	defer server.Close()
@@ -4877,10 +5055,11 @@ func TestAgentLoop_SkillDiscoveryDisabled(t *testing.T) {
 	gw := client.NewGatewayClient(server.URL, "")
 	reg := NewToolRegistry()
 	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-	loop.SetSkills([]*skills.Skill{
-		{Name: "kocoro", Description: "platform management"},
-	})
-	loop.SetSkillDiscovery(false)
+	testSkills := make([]*skills.Skill, 0, 12)
+	for si := 1; si <= 12; si++ {
+		testSkills = append(testSkills, &skills.Skill{Name: fmt.Sprintf("skill-%d", si), Description: fmt.Sprintf("test skill %d", si)})
+	}
+	loop.SetSkills(testSkills)
 
 	_, _, err := loop.Run(context.Background(), "hello", nil, nil)
 	if err != nil {
@@ -4889,7 +5068,10 @@ func TestAgentLoop_SkillDiscoveryDisabled(t *testing.T) {
 
 	// Only 1 LLM call (the main one), no discovery call
 	if callCount != 1 {
-		t.Errorf("expected 1 LLM call (no discovery), got %d", callCount)
+		t.Errorf("expected 1 main LLM call with discovery disabled by default, got %d", callCount)
+	}
+	if !listingSeen {
+		t.Error("skill metadata listing should remain available when small-model discovery is disabled")
 	}
 }
 

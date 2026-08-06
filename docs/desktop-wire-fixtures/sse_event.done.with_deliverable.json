@@ -6,7 +6,8 @@
     "input_tokens": 9240,
     "output_tokens": 312,
     "total_tokens": 9552,
-    "cost_usd": 0.0318
+    "cost_usd": 0.0318,
+    "web_search_calls": 0
   },
   "deliverables": [
     {

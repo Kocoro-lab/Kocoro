@@ -1,13 +1,16 @@
 package sync
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 )
 
 // stripThinkingFromSessionJSON returns a copy of the session JSON body with
 // `thinking` and `redacted_thinking` content blocks removed from every
-// assistant message's content array. Other fields and the message order are
-// preserved verbatim.
+// assistant message's content array, and the derived compaction checkpoint
+// dropped entirely. Other fields and message order are kept.
 //
 // Why on the upload path: thinking content can contain sensitive intermediate
 // reasoning (private deliberations the user never sees). The local session
@@ -41,57 +44,85 @@ func stripThinkingFromSessionJSON(body []byte) ([]byte, error) {
 		return body, nil
 	}
 
+	// UseNumber, not a plain Unmarshal: decoding into map[string]any turns every
+	// JSON number into float64, whose 53-bit mantissa silently truncates the
+	// integers real payloads carry — unix nanosecond timestamps (19 digits),
+	// 64-bit row IDs, byte sizes — inside persisted tool inputs. Same hazard and
+	// same fix as normalizeToolInput (see
+	// TestNormalizeToolInput_PreservesLargeIntegerPrecision). This matters more
+	// now that dropping a compaction checkpoint re-marshals sessions that carry
+	// no thinking blocks at all, which previously returned the original bytes
+	// untouched.
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 	var top map[string]any
-	if err := json.Unmarshal(body, &top); err != nil {
+	if err := dec.Decode(&top); err != nil {
 		return body, err
 	}
-
-	rawMessages, ok := top["messages"].([]any)
-	if !ok {
-		// No messages array (or unexpected shape) — nothing to strip.
-		return body, nil
+	// A streaming Decoder stops at the first complete value, so it would accept
+	// a truncated-then-concatenated file and silently re-marshal only the head —
+	// where json.Unmarshal used to reject it and leave the bytes alone. The
+	// loader hands us raw os.ReadFile output with no upstream validation, so
+	// restore the strictness explicitly (same shape as rejectDuplicateJSONMembers).
+	if token, err := dec.Token(); err != io.EOF {
+		if err != nil {
+			return body, err
+		}
+		return body, fmt.Errorf("unexpected trailing JSON value beginning with %v", token)
 	}
 
+	// The compaction checkpoint is DROPPED rather than stripped. It is derived
+	// state — a compacted view of messages that are already in this payload —
+	// so uploading it roughly doubles a compacted session's bytes while adding
+	// nothing the cloud resume path can use. That matters because the size gate
+	// a few lines downstream (BuildBatches → SingleSessionMaxBytes) marks an
+	// oversize session `size_limit_exceeded`, which backoff.go treats as
+	// PERMANENT: a long session that used to sync would silently stop syncing
+	// forever the first time it compacted. Dropping also removes a second copy
+	// of the same content from the disclosure surface for free.
 	mutated := false
-	for _, rawMsg := range rawMessages {
-		msg, ok := rawMsg.(map[string]any)
-		if !ok {
-			continue
-		}
-		role, _ := msg["role"].(string)
-		if role != "assistant" {
-			continue
-		}
-		rawContent, ok := msg["content"].([]any)
-		if !ok {
-			// content is a plain string or missing → no thinking blocks to drop.
-			continue
-		}
+	if _, ok := top["compaction_checkpoint"]; ok {
+		delete(top, "compaction_checkpoint")
+		mutated = true
+	}
 
-		filtered := make([]any, 0, len(rawContent))
-		dropped := false
-		for _, rawBlock := range rawContent {
-			block, ok := rawBlock.(map[string]any)
+	if rawMessages, ok := top["messages"].([]any); ok {
+		for _, rawMsg := range rawMessages {
+			msg, ok := rawMsg.(map[string]any)
 			if !ok {
-				// Non-object entry (shouldn't happen for assistant content,
-				// but pass through defensively rather than silently drop).
+				continue
+			}
+			role, _ := msg["role"].(string)
+			if role != "assistant" {
+				continue
+			}
+			rawContent, ok := msg["content"].([]any)
+			if !ok {
+				// content is a plain string or missing → no thinking blocks to drop.
+				continue
+			}
+
+			filtered := make([]any, 0, len(rawContent))
+			dropped := false
+			for _, rawBlock := range rawContent {
+				block, ok := rawBlock.(map[string]any)
+				if !ok {
+					// Non-object entry (shouldn't happen for assistant content,
+					// but pass through defensively rather than silently drop).
+					filtered = append(filtered, rawBlock)
+					continue
+				}
+				blockType, _ := block["type"].(string)
+				if blockType == "thinking" || blockType == "redacted_thinking" {
+					dropped = true
+					continue
+				}
 				filtered = append(filtered, rawBlock)
-				continue
 			}
-			blockType, _ := block["type"].(string)
-			if blockType == "thinking" || blockType == "redacted_thinking" {
-				dropped = true
-				continue
+			if dropped {
+				msg["content"] = filtered
+				mutated = true
 			}
-			filtered = append(filtered, rawBlock)
-		}
-		if dropped {
-			// `msg` is the map[string]any reference already held inside
-			// rawMessages[i] — mutating msg["content"] in place is enough;
-			// no need to re-assign the slice element. Same for the outer
-			// `top["messages"]` (already pointing at rawMessages).
-			msg["content"] = filtered
-			mutated = true
 		}
 	}
 

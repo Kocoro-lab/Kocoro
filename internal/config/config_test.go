@@ -50,6 +50,14 @@ func TestValidateConfig_IdleTimeouts(t *testing.T) {
 	}
 }
 
+func TestShannonDirIgnoresStateDirectoryEnvironment(t *testing.T) {
+	environmentDir := filepath.Join(t.TempDir(), "environment-state")
+	t.Setenv("SHANNON_STATE_DIR", environmentDir)
+	if got := ShannonDir(); got == environmentDir {
+		t.Fatalf("ShannonDir() accepted process-global SHANNON_STATE_DIR=%q", environmentDir)
+	}
+}
+
 func TestValidateConfig_AgentModelTierKeyword(t *testing.T) {
 	mk := func(model string) *Config {
 		c := &Config{}
@@ -106,6 +114,27 @@ func TestValidateConfig_AgentServiceTier(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatalf("validateConfig() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAgentConfigSkillDiscoveryEnabled(t *testing.T) {
+	enabled := true
+	disabled := false
+	tests := []struct {
+		name string
+		cfg  AgentConfig
+		want bool
+	}{
+		{name: "default disabled", cfg: AgentConfig{}, want: false},
+		{name: "explicit disabled", cfg: AgentConfig{SkillDiscovery: &disabled}, want: false},
+		{name: "explicit enabled", cfg: AgentConfig{SkillDiscovery: &enabled}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.SkillDiscoveryEnabled(); got != tt.want {
+				t.Fatalf("SkillDiscoveryEnabled() = %t, want %t", got, tt.want)
 			}
 		})
 	}
@@ -594,6 +623,25 @@ func TestPromptSuggestionConfig_Defaults(t *testing.T) {
 	}
 	if cfg.Agent.PromptSuggestion.MinTurns != 2 {
 		t.Errorf("MinTurns default = %d, want 2", cfg.Agent.PromptSuggestion.MinTurns)
+	}
+}
+
+func TestCompactionSnapshotConfig_Defaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".shannon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Agent.CompactionSnapshotRetention != 1 {
+		t.Errorf("CompactionSnapshotRetention = %d, want 1", cfg.Agent.CompactionSnapshotRetention)
+	}
+	if cfg.Agent.CompactionSnapshotMaxAgeDays != 14 {
+		t.Errorf("CompactionSnapshotMaxAgeDays = %d, want 14", cfg.Agent.CompactionSnapshotMaxAgeDays)
 	}
 }
 

@@ -15,3 +15,9 @@ func SetRunMessagesForTest(a *AgentLoop, msgs []client.Message) {
 	a.runMsgInjected = make([]bool, len(msgs))
 	a.runMsgTimestamps = make([]time.Time, len(msgs))
 }
+
+// SetCompactionCheckpointMessagesForTest injects a compacted live-state
+// snapshot for downstream persistence tests without running a full compaction.
+func SetCompactionCheckpointMessagesForTest(a *AgentLoop, msgs []client.Message) {
+	a.compactionCheckpointMessages = msgs
+}

@@ -451,6 +451,45 @@ func TestWireFixture_Tool_PerRequestSSE(t *testing.T) {
 	assertSemanticEqual(t, completed, parseJSONMap(t, []byte(frames[1][1])))
 }
 
+// TestWireFixture_Usage_PerRequestSSE pins the live usage payload. The
+// capability advertises that web_search_calls is present even when its value
+// is zero, so consumers do not need transport-specific missing-field rules.
+func TestWireFixture_Usage_PerRequestSSE(t *testing.T) {
+	fixture := loadWireFixture(t, "sse_event.usage.json")
+	rec := httptest.NewRecorder()
+	h := &sseEventHandler{
+		w:       rec,
+		flusher: rec,
+		ctx:     context.Background(),
+	}
+	h.OnUsage(agent.TurnUsage{
+		InputTokens:    1200,
+		OutputTokens:   180,
+		TotalTokens:    1380,
+		CostUSD:        0.0123,
+		LLMCalls:       1,
+		WebSearchCalls: 0,
+		Model:          "gpt-5.6-luna",
+	})
+
+	frames := parseSSEFrames(t, rec.Body.String())
+	if len(frames) != 1 || frames[0][0] != "usage" {
+		t.Fatalf("usage SSE frames = %#v, want one usage frame", frames)
+	}
+	produced := parseJSONMap(t, []byte(frames[0][1]))
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		WebSearchCalls int `json:"web_search_calls"`
+	}
+	if err := json.Unmarshal([]byte(frames[0][1]), &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.WebSearchCalls != 0 {
+		t.Fatalf("consumer decoded web_search_calls = %d, want 0", consumer.WebSearchCalls)
+	}
+}
+
 // TestWireFixture_Done_PerRequestSSE pins the `event: done` payload.
 // handleMessageSSE marshals *RunAgentResult directly (mustJSON(result)), so
 // serializing the producer type IS the production path; running a full
@@ -470,10 +509,11 @@ func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 		SessionID: fixture["session_id"].(string),
 		Agent:     fixture["agent"].(string),
 		Usage: RunAgentUsage{
-			InputTokens:  18432,
-			OutputTokens: 956,
-			TotalTokens:  19388,
-			CostUSD:      0.0712,
+			InputTokens:    18432,
+			OutputTokens:   956,
+			TotalTokens:    19388,
+			CostUSD:        0.0712,
+			WebSearchCalls: 1,
 		},
 	}
 	raw := []byte(mustJSON(result))
@@ -487,16 +527,17 @@ func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 		SessionID            string   `json:"session_id"`
 		Agent                string   `json:"agent"`
 		Usage                struct {
-			InputTokens  int     `json:"input_tokens"`
-			OutputTokens int     `json:"output_tokens"`
-			TotalTokens  int     `json:"total_tokens"`
-			CostUSD      float64 `json:"cost_usd"`
+			InputTokens    int     `json:"input_tokens"`
+			OutputTokens   int     `json:"output_tokens"`
+			TotalTokens    int     `json:"total_tokens"`
+			CostUSD        float64 `json:"cost_usd"`
+			WebSearchCalls int     `json:"web_search_calls"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &done); err != nil {
 		t.Fatalf("consumer decode failed: %v", err)
 	}
-	if done.Reply == "" || done.Usage.TotalTokens != 19388 {
+	if done.Reply == "" || done.Usage.TotalTokens != 19388 || done.Usage.WebSearchCalls != 1 {
 		t.Fatalf("consumer decode lost fields: %+v", done)
 	}
 }
@@ -852,6 +893,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	if !has(CapScheduleSessionFilterV1) {
 		t.Fatalf("capabilities lost %q: %v", CapScheduleSessionFilterV1, *status.Capabilities)
 	}
+	if !has(CapWebSearchUsageV1) {
+		t.Fatalf("capabilities lost %q: %v", CapWebSearchUsageV1, *status.Capabilities)
+	}
 	if !has(CapComputerUseTopologyV1) {
 		t.Fatalf("capabilities lost %q: %v", CapComputerUseTopologyV1, *status.Capabilities)
 	}
@@ -1175,6 +1219,90 @@ func TestWireFixture_SkillRecommendationContinuationAndDismiss(t *testing.T) {
 		t.Fatalf("dismiss status=%d body=%s", dismissResponse.Code, dismissResponse.Body.String())
 	}
 	assertSemanticEqual(t, dismissFixture, parseJSONMap(t, dismissResponse.Body.Bytes()))
+}
+
+func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
+	fixture := loadWireFixture(t, "http_get.session.response.json")
+	dir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: dir, SessionCache: NewSessionCache(dir)}
+	defer deps.SessionCache.CloseAll()
+	mgr := deps.SessionCache.GetOrCreate("")
+	sess := mgr.NewSessionWithID(fixture["id"].(string))
+	sess.Title = fixture["title"].(string)
+	sess.CWD = fixture["cwd"].(string)
+	sess.Source = "desktop"
+	sess.CreatedAt = time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	sess.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("ARCHIVE_ONLY_OLD_TASK")},
+		{Role: "assistant", Content: client.NewTextContent("ARCHIVE_ONLY_OLD_REPLY")},
+		{Role: "user", Content: client.NewTextContent("live tail question")},
+	}
+	firstTime := time.Date(2026, 8, 5, 0, 0, 1, 0, time.UTC)
+	secondTime := time.Date(2026, 8, 5, 0, 0, 2, 0, time.UTC)
+	tailTime := time.Date(2026, 8, 5, 0, 0, 3, 0, time.UTC)
+	sess.MessageMeta = []session.MessageMeta{
+		{Source: "desktop", Timestamp: &firstTime},
+		{Source: "desktop", Timestamp: &secondTime},
+		{Source: "desktop", Timestamp: &tailTime},
+	}
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: 2,
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("stable original primer")},
+			{Role: "user", Content: client.NewTextContent("Previous context summary: stable state")},
+			{Role: "assistant", Content: client.NewTextContent("compacted recent reply")},
+		},
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("save fixture session: %v", err)
+	}
+
+	srv := NewServer(0, &Client{}, deps, "test")
+	rec := httptest.NewRecorder()
+	path := "/sessions/" + sess.ID
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d body=%s", path, rec.Code, rec.Body.String())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	normalizeRFC3339(t, produced, fixture, "updated_at")
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode pins the additive checkpoint while keeping the
+	// default detail's top-level messages as the lossless archive.
+	var detail struct {
+		ID       string `json:"id"`
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+		MessageMeta []struct {
+			Source    string `json:"source"`
+			Timestamp string `json:"timestamp"`
+		} `json:"message_meta"`
+		CompactionCheckpoint *struct {
+			SchemaVersion       int `json:"schema_version"`
+			ArchiveThroughIndex int `json:"archive_through_index"`
+			Messages            []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		} `json:"compaction_checkpoint"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	cp := detail.CompactionCheckpoint
+	if detail.ID != sess.ID || len(detail.Messages) != 3 || len(detail.MessageMeta) != 3 ||
+		cp == nil || cp.SchemaVersion != 1 || cp.ArchiveThroughIndex != 2 || len(cp.Messages) != 3 {
+		t.Fatalf("consumer decode lost default detail fields: %+v", detail)
+	}
+	if string(detail.Messages[0].Content) != `"ARCHIVE_ONLY_OLD_TASK"` ||
+		string(cp.Messages[1].Content) != `"Previous context summary: stable state"` {
+		t.Fatalf("archive/live checkpoint semantics drifted: archive=%s checkpoint=%s",
+			detail.Messages[0].Content, cp.Messages[1].Content)
+	}
 }
 
 func TestWireFixture_HTTPRemoteSessionTimeline(t *testing.T) {
@@ -1855,7 +1983,7 @@ func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
 		SessionID: fixture["session_id"].(string),
 		Agent:     fixture["agent"].(string),
 		Usage: RunAgentUsage{
-			InputTokens: 8120, OutputTokens: 240, TotalTokens: 8360, CostUSD: 0.021,
+			InputTokens: 8120, OutputTokens: 240, TotalTokens: 8360, CostUSD: 0.021, WebSearchCalls: 1,
 		},
 		ExecutionRun: &executionprofile.Run{
 			LogicalTaskID: "burst-4f2a:t01",
@@ -1874,12 +2002,14 @@ func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
 	// ledger recording; pin the key fields it routes on.
 	var done struct {
 		Reply        string                `json:"reply"`
+		Usage        RunAgentUsage         `json:"usage"`
 		ExecutionRun *executionprofile.Run `json:"execution_run"`
 	}
 	if err := json.Unmarshal(raw, &done); err != nil {
 		t.Fatalf("consumer decode failed: %v", err)
 	}
-	if done.ExecutionRun == nil ||
+	if done.Usage.WebSearchCalls != 1 ||
+		done.ExecutionRun == nil ||
 		done.ExecutionRun.RunID != "burst-4f2a:t01.r01" ||
 		!done.ExecutionRun.Profile.IsFast() ||
 		done.ExecutionRun.Profile.ResolutionReason != "cloud_profile_resolved" {

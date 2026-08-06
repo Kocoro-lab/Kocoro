@@ -43,11 +43,34 @@ var daemonCmd = &cobra.Command{
 	Short: "Background daemon for channel messaging",
 }
 
+const defaultDaemonPort = 7533
+
+func defaultDaemonURL(path string) string {
+	return fmt.Sprintf("http://127.0.0.1:%d%s", defaultDaemonPort, path)
+}
+
 var daemonStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the daemon (connects to Shannon Cloud for channel messages)",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		detach, _ := cmd.Flags().GetBool("detach")
+		force, _ := cmd.Flags().GetBool("force")
+		isolated, _ := cmd.Flags().GetBool("isolated")
+		port, _ := cmd.Flags().GetInt("port")
+		stateDir, _ := cmd.Flags().GetString("state-dir")
+		rpcSockPath, _ := cmd.Flags().GetString("rpc-socket")
+		rpcPidfilePath, _ := cmd.Flags().GetString("rpc-pidfile")
+		if err := validateDaemonStartMode(
+			isolated, detach, force, port, stateDir,
+			rpcSockPath, rpcPidfilePath,
+		); err != nil {
+			return err
+		}
+		if isolated {
+			if err := config.SetShannonDirOverrideForProcess(stateDir); err != nil {
+				return fmt.Errorf("daemon: configure isolated state: %w", err)
+			}
+		}
 		if detach {
 			return daemonStartDetached()
 		}
@@ -60,12 +83,11 @@ var daemonStartCmd = &cobra.Command{
 		projectsDir := filepath.Join(shanDir, "projects")
 		pidPath := filepath.Join(shanDir, "daemon.pid")
 
-		force, _ := cmd.Flags().GetBool("force")
 		if force {
 			stopExistingDaemon(pidPath)
 		}
 
-		if daemon.IsDaemonServiceLoaded() {
+		if !isolated && daemon.IsDaemonServiceLoaded() {
 			log.Println("Warning: daemon is managed by launchd. Use 'shan daemon stop' to remove launchd management.")
 		}
 
@@ -107,7 +129,9 @@ var daemonStartCmd = &cobra.Command{
 		// Clean up orphaned Chrome CDP from a previous hard kill. Must run AFTER
 		// AcquirePIDFile — holding the lock guarantees no other daemon is alive,
 		// so any Chrome CDP we find is truly orphaned (not owned by a peer).
-		mcp.CleanupOrphanedCDPChrome()
+		if !isolated {
+			mcp.CleanupOrphanedCDPChrome()
+		}
 
 		// Apply configured Chrome profile override before any CDP launch.
 		mcp.SetCDPChromeProfile(cfg.Daemon.ChromeProfile)
@@ -125,7 +149,9 @@ var daemonStartCmd = &cobra.Command{
 		}
 		// Orphan sweep is startup-only — reload paths must not sweep because they
 		// would kill live Chrome owned by in-flight runs.
-		tools.CleanupOrphanedChromedp()
+		if !isolated {
+			tools.CleanupOrphanedChromedp()
+		}
 		baselineReg, reg, skillsPtr, mcpMgr, cleanup, startMCP, serverErr := tools.RegisterAllWithBaselineAsync(gw, cfg)
 		if serverErr != nil {
 			log.Printf("Warning: %v", serverErr)
@@ -287,7 +313,9 @@ var daemonStartCmd = &cobra.Command{
 		go func() {
 			<-sigCh
 			log.Println("daemon: shutting down...")
-			mcp.StopCDPChrome()
+			if !isolated {
+				mcp.StopCDPChrome()
+			}
 			cancel()
 		}()
 
@@ -319,78 +347,10 @@ var daemonStartCmd = &cobra.Command{
 			deps.ShutdownCleanup()
 		}()
 
-		supervisor := mcp.NewSupervisor(mcpMgr)
-		supervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
-		supervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
-			if serverName == "playwright" {
-				tools.CleanupPlaywrightReconnect(ctx, mcpMgr)
-			}
-		})
-		supervisor.SetOnChange(func(server string, oldState, newState mcp.HealthState) {
-			_, _, depsSup := deps.Snapshot()
-			if depsSup != supervisor {
-				return
-			}
-			// Read cached layers from deps (refreshed on any config reload)
-			bl, gwOv, po, mgr := deps.RebuildLayers()
-			newReg := tools.RebuildRegistryForHealth(bl, gwOv, po, supervisor.HealthStates(), mgr, supervisor)
-			deps.WriteLock()
-			deps.Registry = newReg
-			deps.WriteUnlock()
-			log.Printf("MCP registry rebuilt: %d tools", len(newReg.All()))
-		})
-
-		deps.WriteLock()
-		deps.Supervisor = supervisor
-		deps.WriteUnlock()
-
-		supervisor.Start(ctx)
-
-		// Force initial registry rebuild to attach the supervisor to MCPTools.
-		// CompleteRegistration creates tools before the supervisor exists, so
-		// they lack on-demand reconnect. This rebuild replaces them with
-		// supervisor-aware instances from the cached tool list.
-		{
-			bl, gwOv, po, mgr := deps.RebuildLayers()
-			initReg := tools.RebuildRegistryForHealth(bl, gwOv, po, supervisor.HealthStates(), mgr, supervisor)
-			deps.WriteLock()
-			deps.Registry = initReg
-			deps.WriteUnlock()
-			log.Printf("MCP registry initialized with supervisor: %d tools", len(initReg.All()))
-		}
-
-		// Kick off MCP connections in the background. The HTTP listener (set
-		// up below) is ready immediately; tools become available as each
-		// server's handshake completes (Intercom OAuth: up to 300s). On
-		// success we trigger a supervisor probe so OnChange rebuilds the
-		// registry with newly-discovered tools.
-		if startMCP != nil {
-			capturedSupervisor := supervisor
-			capturedAuditor := auditor
-			capturedMgr := mcpMgr
-			go startMCP(ctx, func(name string, connErr error) {
-				_, _, depsSup := deps.Snapshot()
-				if depsSup != capturedSupervisor {
-					return // deps swapped by a config reload — drop stale result.
-				}
-				if connErr != nil {
-					log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
-					if capturedAuditor != nil {
-						capturedAuditor.Log(audit.AuditEntry{
-							Timestamp:     time.Now(),
-							ToolName:      "mcp_connect",
-							InputSummary:  "mcp_servers." + name,
-							OutputSummary: connErr.Error(),
-							Decision:      "error",
-							Approved:      false,
-						})
-					}
-					return
-				}
-				log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
-				capturedSupervisor.ProbeNow(name)
-				tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
-			})
+		if isolated {
+			log.Print(daemon.IsolationMarkerMCPDisabled)
+		} else {
+			startDaemonMCPServices(ctx, deps, mcpMgr, startMCP, auditor)
 		}
 
 		if !cfg.Daemon.AutoApprove {
@@ -592,7 +552,8 @@ var daemonStartCmd = &cobra.Command{
 		broker = daemon.NewApprovalBroker(wsClient.SendApprovalRequest)
 		wsClient.SetApprovalBroker(broker)
 
-		localServer := daemon.NewServer(7533, wsClient, deps, Version)
+		localServer := daemon.NewServer(port, wsClient, deps, Version)
+		localServer.SetIsolated(isolated)
 		localServer.SetCancelFunc(cancel)
 		localServer.SetApprovalResolvedNotifier(wsClient.SendApprovalResolved)
 		wsClient.SetEventBus(localServer.EventBus())
@@ -653,87 +614,12 @@ var daemonStartCmd = &cobra.Command{
 			log.Printf("daemon: keychain unavailable (%v) — falling back to legacy cfg.APIKey path", kcErr)
 		}
 
-		// Start file watcher and heartbeat manager.
-		var triggerMu sync.Mutex
-		var fileWatcher *watcher.Watcher
-		var hbManager *heartbeat.Manager
-
-		watchRunFn := func(watchCtx context.Context, agentName, prompt string) {
-			req := daemon.RunAgentRequest{
-				Agent:  agentName,
-				Source: "watcher",
-				Text:   prompt,
-			}
-			handler := &autoApproveHandler{}
-			result, err := daemon.RunAgent(watchCtx, deps, req, handler)
-			if err != nil {
-				log.Printf("daemon: watcher agent %q error: %v", agentName, err)
-				return
-			}
-			log.Printf("daemon: watcher agent %q reply (%d tokens): %s", agentName, result.Usage.TotalTokens, truncateReply(result.Reply, 200))
-		}
-		agentWatches := collectAgentWatches(agentsDir)
-		if len(agentWatches) > 0 {
-			fw, err := watcher.New(agentWatches, watchRunFn)
-			if err != nil {
-				log.Printf("daemon: watcher init failed: %v", err)
-			} else {
-				fw.Start(ctx)
-				fileWatcher = fw
-				log.Printf("daemon: file watcher started (%d agents)", len(agentWatches))
-			}
-		}
-
-		hbMgr, err := heartbeat.New(agentsDir, deps)
-		if err != nil {
-			log.Printf("daemon: heartbeat init failed: %v", err)
+		var automation *daemonAutomation
+		if isolated {
+			log.Print(daemon.IsolationMarkerAutomationDisabled)
 		} else {
-			hbMgr.Start(ctx)
-			hbManager = hbMgr
-			log.Printf("daemon: heartbeat manager started")
+			automation = startDaemonAutomation(ctx, deps, agentsDir, scheduleManager, localServer)
 		}
-
-		// Start internal cron scheduler (evaluates schedules each minute).
-		cronScheduler := daemon.NewScheduler(scheduleManager, deps)
-		go cronScheduler.Start(ctx)
-		log.Println("daemon: cron scheduler started")
-
-		localServer.SetOnReload(func() {
-			triggerMu.Lock()
-			defer triggerMu.Unlock()
-
-			// Close old watcher/heartbeat.
-			if fileWatcher != nil {
-				fileWatcher.Close()
-				fileWatcher = nil
-			}
-			if hbManager != nil {
-				hbManager.Close()
-				hbManager = nil
-			}
-
-			// Rebuild from fresh agent configs.
-			newWatches := collectAgentWatches(agentsDir)
-			if len(newWatches) > 0 {
-				fw, err := watcher.New(newWatches, watchRunFn)
-				if err != nil {
-					log.Printf("daemon: reload watcher init failed: %v", err)
-				} else {
-					fw.Start(ctx)
-					fileWatcher = fw
-					log.Printf("daemon: file watcher restarted (%d agents)", len(newWatches))
-				}
-			}
-
-			newHb, err := heartbeat.New(agentsDir, deps)
-			if err != nil {
-				log.Printf("daemon: reload heartbeat init failed: %v", err)
-			} else {
-				newHb.Start(ctx)
-				hbManager = newHb
-				log.Printf("daemon: heartbeat manager restarted")
-			}
-		})
 
 		// Wire the WS broker's bus hooks the same way NewServer wires
 		// s.approvalBroker — both paths publish identical event payloads.
@@ -750,7 +636,7 @@ var daemonStartCmd = &cobra.Command{
 		case err := <-serverErrCh:
 			return fmt.Errorf("daemon: local server failed to start: %w", err)
 		default:
-			log.Printf("daemon: local server listening on http://127.0.0.1:7533")
+			log.Printf("daemon: local server listening on http://127.0.0.1:%d", localServer.Port())
 		}
 
 		// Calendar RPC v0.5.1: Unix domain socket reverse channel to Kocoro
@@ -759,8 +645,6 @@ var daemonStartCmd = &cobra.Command{
 		// spec §7.1, listen failures are fatal — non-zero exit so Desktop's
 		// DaemonManager surfaces the error to the user instead of silently
 		// retrying. See docs/desktop-calendar-rpc.md §4.1 + §4.1.1.
-		rpcSockPath, _ := cmd.Flags().GetString("rpc-socket")
-		rpcPidfilePath, _ := cmd.Flags().GetString("rpc-pidfile")
 		switch {
 		case rpcSockPath == "" && rpcPidfilePath == "":
 			// Neither flag set — running standalone (npm CLI / dev / TUI parent).
@@ -817,8 +701,12 @@ var daemonStartCmd = &cobra.Command{
 			return fmt.Errorf("daemon: --rpc-socket and --rpc-pidfile must be set together (got --rpc-socket=%q --rpc-pidfile=%q)", rpcSockPath, rpcPidfilePath)
 		}
 
-		log.Printf("daemon: WS endpoint %s", wsEndpoint)
-		if authMgr != nil {
+		if !isolated {
+			log.Printf("daemon: WS endpoint %s", wsEndpoint)
+		}
+		if isolated {
+			log.Print(daemon.IsolationMarkerCloudWSSuppressed)
+		} else if authMgr != nil {
 			// AuthManager owns WS lifecycle. Bootstrap reads any existing
 			// Keychain key + validates via /auth/me; if valid it starts
 			// the WS, otherwise daemon stays idle until /local/auth/login.
@@ -838,16 +726,9 @@ var daemonStartCmd = &cobra.Command{
 			wsCtl.Stop()
 		}
 
-		triggerMu.Lock()
-		if fileWatcher != nil {
-			fileWatcher.Close()
-			fileWatcher = nil
+		if automation != nil {
+			automation.close()
 		}
-		if hbManager != nil {
-			hbManager.Close()
-			hbManager = nil
-		}
-		triggerMu.Unlock()
 
 		sessionCache.CloseAll()
 		return nil
@@ -866,6 +747,37 @@ func acquireDaemonPIDFile(shannonDir string) (*daemon.PIDFile, error) {
 		return nil, fmt.Errorf("create daemon state directory: %w", err)
 	}
 	return daemon.AcquirePIDFile(filepath.Join(shannonDir, "daemon.pid"))
+}
+
+func validateDaemonStartMode(isolated, detach, force bool, port int, stateDir, rpcSocket, rpcPIDFile string) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("daemon: --port must be between 1 and 65535")
+	}
+	if !isolated {
+		if port != defaultDaemonPort {
+			return fmt.Errorf("daemon: a non-default --port requires --isolated")
+		}
+		if stateDir != "" {
+			return fmt.Errorf("daemon: --state-dir requires --isolated")
+		}
+		return nil
+	}
+	if detach {
+		return fmt.Errorf("daemon: --isolated cannot be combined with --detach")
+	}
+	if force {
+		return fmt.Errorf("daemon: --isolated cannot be combined with --force")
+	}
+	if port == defaultDaemonPort {
+		return fmt.Errorf("daemon: --isolated requires an explicit non-default --port")
+	}
+	if stateDir == "" || !filepath.IsAbs(stateDir) {
+		return fmt.Errorf("daemon: --isolated requires an absolute --state-dir")
+	}
+	if rpcSocket != "" || rpcPIDFile != "" {
+		return fmt.Errorf("daemon: --isolated cannot enable Desktop RPC")
+	}
+	return nil
 }
 
 var daemonStopCmd = &cobra.Command{
@@ -894,7 +806,7 @@ var daemonStopCmd = &cobra.Command{
 		}
 
 		// Try graceful HTTP shutdown first.
-		resp, err := http.Post("http://127.0.0.1:7533/shutdown", "application/json", nil)
+		resp, err := http.Post(defaultDaemonURL("/shutdown"), "application/json", nil)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
@@ -1032,7 +944,7 @@ var daemonStatusCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		pidPath := filepath.Join(config.ShannonDir(), "daemon.pid")
 
-		resp, err := http.Get("http://127.0.0.1:7533/status")
+		resp, err := http.Get(defaultDaemonURL("/status"))
 		if err != nil {
 			// HTTP failed — check PID file to distinguish "not running" from "running but no HTTP server".
 			if pid, locked := daemon.IsLocked(pidPath); locked {
@@ -1380,7 +1292,7 @@ func (h *autoApproveHandler) OnApprovalNeeded(tool string, args string) bool {
 func stopExistingDaemon(pidPath string) {
 	// Try graceful HTTP shutdown.
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Post("http://127.0.0.1:7533/shutdown", "application/json", nil)
+	resp, err := client.Post(defaultDaemonURL("/shutdown"), "application/json", nil)
 	if err == nil {
 		resp.Body.Close()
 	}
@@ -1449,6 +1361,176 @@ func truncateReply(s string, n int) string {
 	return s[:n] + "..."
 }
 
+func startDaemonMCPServices(
+	ctx context.Context,
+	deps *daemon.ServerDeps,
+	mcpMgr *mcp.ClientManager,
+	startMCP tools.StartMCPFunc,
+	auditor *audit.AuditLogger,
+) {
+	supervisor := mcp.NewSupervisor(mcpMgr)
+	supervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
+	supervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
+		if serverName == "playwright" {
+			tools.CleanupPlaywrightReconnect(ctx, mcpMgr)
+		}
+	})
+	supervisor.SetOnChange(func(server string, oldState, newState mcp.HealthState) {
+		_, _, depsSup := deps.Snapshot()
+		if depsSup != supervisor {
+			return
+		}
+		bl, gwOv, po, mgr := deps.RebuildLayers()
+		newReg := tools.RebuildRegistryForHealth(bl, gwOv, po, supervisor.HealthStates(), mgr, supervisor)
+		deps.WriteLock()
+		deps.Registry = newReg
+		deps.WriteUnlock()
+		log.Printf("MCP registry rebuilt: %d tools", len(newReg.All()))
+	})
+
+	deps.WriteLock()
+	deps.Supervisor = supervisor
+	deps.WriteUnlock()
+
+	supervisor.Start(ctx)
+
+	// Registration creates tools before the supervisor exists. Rebuild once so
+	// the initial MCP tools get on-demand reconnect support.
+	bl, gwOv, po, mgr := deps.RebuildLayers()
+	initReg := tools.RebuildRegistryForHealth(bl, gwOv, po, supervisor.HealthStates(), mgr, supervisor)
+	deps.WriteLock()
+	deps.Registry = initReg
+	deps.WriteUnlock()
+	log.Printf("MCP registry initialized with supervisor: %d tools", len(initReg.All()))
+
+	if startMCP == nil {
+		return
+	}
+	go startMCP(ctx, func(name string, connErr error) {
+		_, _, depsSup := deps.Snapshot()
+		if depsSup != supervisor {
+			return
+		}
+		if connErr != nil {
+			log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
+			if auditor != nil {
+				auditor.Log(audit.AuditEntry{
+					Timestamp:     time.Now(),
+					ToolName:      "mcp_connect",
+					InputSummary:  "mcp_servers." + name,
+					OutputSummary: connErr.Error(),
+					Decision:      "error",
+					Approved:      false,
+				})
+			}
+			return
+		}
+		log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
+		supervisor.ProbeNow(name)
+		tools.PostConnectDisconnectIfDiscoveryOnly(mcpMgr, name)
+	})
+}
+
+type daemonAutomation struct {
+	mu               sync.Mutex
+	fileWatcher      *watcher.Watcher
+	heartbeatManager *heartbeat.Manager
+}
+
+func startDaemonAutomation(
+	ctx context.Context,
+	deps *daemon.ServerDeps,
+	agentsDir string,
+	scheduleManager *schedule.Manager,
+	localServer *daemon.Server,
+) *daemonAutomation {
+	automation := &daemonAutomation{}
+	watchRunFn := func(watchCtx context.Context, agentName, prompt string) {
+		req := daemon.RunAgentRequest{
+			Agent:  agentName,
+			Source: "watcher",
+			Text:   prompt,
+		}
+		result, err := daemon.RunAgent(watchCtx, deps, req, &autoApproveHandler{})
+		if err != nil {
+			log.Printf("daemon: watcher agent %q error: %v", agentName, err)
+			return
+		}
+		log.Printf("daemon: watcher agent %q reply (%d tokens): %s", agentName, result.Usage.TotalTokens, truncateReply(result.Reply, 200))
+	}
+
+	agentWatches := collectAgentWatches(agentsDir)
+	if len(agentWatches) > 0 {
+		fileWatcher, err := watcher.New(agentWatches, watchRunFn)
+		if err != nil {
+			log.Printf("daemon: watcher init failed: %v", err)
+		} else {
+			fileWatcher.Start(ctx)
+			automation.fileWatcher = fileWatcher
+			log.Printf("daemon: file watcher started (%d agents)", len(agentWatches))
+		}
+	}
+
+	heartbeatManager, err := heartbeat.New(agentsDir, deps)
+	if err != nil {
+		log.Printf("daemon: heartbeat init failed: %v", err)
+	} else {
+		heartbeatManager.Start(ctx)
+		automation.heartbeatManager = heartbeatManager
+		log.Printf("daemon: heartbeat manager started")
+	}
+
+	cronScheduler := daemon.NewScheduler(scheduleManager, deps)
+	go cronScheduler.Start(ctx)
+	log.Println("daemon: cron scheduler started")
+
+	localServer.SetOnReload(func() {
+		automation.mu.Lock()
+		defer automation.mu.Unlock()
+		automation.closeLocked()
+
+		newWatches := collectAgentWatches(agentsDir)
+		if len(newWatches) > 0 {
+			fileWatcher, err := watcher.New(newWatches, watchRunFn)
+			if err != nil {
+				log.Printf("daemon: reload watcher init failed: %v", err)
+			} else {
+				fileWatcher.Start(ctx)
+				automation.fileWatcher = fileWatcher
+				log.Printf("daemon: file watcher restarted (%d agents)", len(newWatches))
+			}
+		}
+
+		heartbeatManager, err := heartbeat.New(agentsDir, deps)
+		if err != nil {
+			log.Printf("daemon: reload heartbeat init failed: %v", err)
+		} else {
+			heartbeatManager.Start(ctx)
+			automation.heartbeatManager = heartbeatManager
+			log.Printf("daemon: heartbeat manager restarted")
+		}
+	})
+
+	return automation
+}
+
+func (a *daemonAutomation) close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.closeLocked()
+}
+
+func (a *daemonAutomation) closeLocked() {
+	if a.fileWatcher != nil {
+		a.fileWatcher.Close()
+		a.fileWatcher = nil
+	}
+	if a.heartbeatManager != nil {
+		a.heartbeatManager.Close()
+		a.heartbeatManager = nil
+	}
+}
+
 func collectAgentWatches(agentsDir string) map[string][]watcher.WatchEntry {
 	result := make(map[string][]watcher.WatchEntry)
 	entries, err := agents.ListAgents(agentsDir)
@@ -1473,6 +1555,14 @@ func collectAgentWatches(agentsDir string) map[string][]watcher.WatchEntry {
 func init() {
 	daemonStartCmd.Flags().Bool("force", false, "Stop any existing daemon before starting")
 	daemonStartCmd.Flags().BoolP("detach", "d", false, "Run as background service via launchd (macOS only)")
+	daemonStartCmd.Flags().Int("port", defaultDaemonPort, "Local HTTP port (non-default requires --isolated)")
+	daemonStartCmd.Flags().Bool("isolated", false, "Run a state-isolated daemon for live E2E testing")
+	daemonStartCmd.Flags().String("state-dir", "", "Absolute state directory for isolated live E2E testing")
+	for _, name := range []string{"isolated", "port", "state-dir"} {
+		if err := daemonStartCmd.Flags().MarkHidden(name); err != nil {
+			panic(err)
+		}
+	}
 	// Calendar RPC v0.5.1 §4.1: Unix socket reverse channel to Kocoro Desktop.
 	// Both flags must be set together — leaving either empty disables the
 	// listener (calendar tools won't be registered). Set by Kocoro Desktop's

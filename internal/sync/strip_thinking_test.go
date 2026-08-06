@@ -47,6 +47,38 @@ func TestStripThinkingFromSessionJSON_RemovesAssistantThinkingBlocks(t *testing.
 	}
 }
 
+func TestStripThinkingFromSessionJSON_RemovesCheckpointThinkingBlocks(t *testing.T) {
+	input := []byte(`{
+		"messages": [{"role":"assistant","content":[{"type":"text","text":"archive"}]}],
+		"compaction_checkpoint": {
+			"schema_version": 1,
+			"archive_through_index": 1,
+			"messages": [{"role":"assistant","content":[
+				{"type":"thinking","thinking":"PRIVATE_CHECKPOINT_REASONING","signature":"sig"},
+				{"type":"text","text":"checkpoint reply"},
+				{"type":"redacted_thinking","data":"PRIVATE_CHECKPOINT_BLOB"}
+			]}]
+		}
+	}`)
+	out, err := stripThinkingFromSessionJSON(input)
+	if err != nil {
+		t.Fatalf("strip failed: %v", err)
+	}
+	s := string(out)
+	if strings.Contains(s, "PRIVATE_CHECKPOINT_REASONING") || strings.Contains(s, "PRIVATE_CHECKPOINT_BLOB") {
+		t.Fatalf("checkpoint thinking leaked through sync strip: %s", s)
+	}
+	// The checkpoint is dropped wholesale rather than thinking-stripped, so
+	// "checkpoint reply" goes with it — it is a duplicate of archive content
+	// the cloud resume path does not read. Only the archive must survive.
+	if strings.Contains(s, "compaction_checkpoint") {
+		t.Fatalf("checkpoint survived the upload strip: %s", s)
+	}
+	if !strings.Contains(s, "archive") {
+		t.Fatalf("lossless archive content was lost: %s", s)
+	}
+}
+
 // TestStripThinkingFromSessionJSON_PreservesNonAssistantContent confirms we
 // don't accidentally touch user / system messages even if they (impossibly)
 // contained type:thinking entries.
@@ -195,5 +227,148 @@ func TestBuildBatches_StripsThinkingBeforeSizeCheck(t *testing.T) {
 	}
 	if _, marked := marker.Failed["s1"]; marked {
 		t.Errorf("session unexpectedly marked failed: %+v", marker.Failed["s1"])
+	}
+}
+
+// BuildBatches owns the externally visible size gate, so pin the checkpoint
+// removal there as well as in the JSON helper. A derived checkpoint can push an
+// otherwise-uploadable archive over SingleSessionMaxBytes; checking size first
+// would mark the session permanently failed even though the cloud never reads
+// the duplicate checkpoint.
+func TestBuildBatches_DropsCompactionCheckpointBeforeSizeCheck(t *testing.T) {
+	checkpointPad := strings.Repeat("DUPLICATE_CHECKPOINT_BLOAT_", 200)
+	body := []byte(`{
+		"id": "s1",
+		"messages": [
+			{"role": "user", "content": "hi"},
+			{"role": "assistant", "content": "archive reply"}
+		],
+		"compaction_checkpoint": {
+			"schema_version": 1,
+			"archive_through_index": 2,
+			"messages": [
+				{"role": "user", "content": "` + checkpointPad + `"}
+			]
+		}
+	}`)
+
+	now := time.Now().UTC()
+	cands := []Candidate{{SessionID: "s1", UpdatedAt: now}}
+	loader := func(_, _ string) ([]byte, error) { return body, nil }
+	cfg := DefaultConfig()
+	cfg.BatchMaxSessions = 5
+	cfg.BatchMaxBytes = 1 << 20
+	cfg.SingleSessionMaxBytes = 1024
+	marker := emptyMarker()
+
+	batches, err := BuildBatches(context.Background(), cands, loader, cfg, &marker, now)
+	if err != nil {
+		t.Fatalf("BuildBatches: %v", err)
+	}
+	if len(batches) != 1 || len(batches[0].Sessions) != 1 {
+		t.Fatalf("archive should fit after checkpoint removal: batches=%d failed=%+v", len(batches), marker.Failed)
+	}
+	payload := string(batches[0].Sessions[0].JSON)
+	if strings.Contains(payload, "compaction_checkpoint") || strings.Contains(payload, "DUPLICATE_CHECKPOINT_BLOAT_") {
+		t.Fatalf("derived checkpoint survived batch construction: %s", payload)
+	}
+	if !strings.Contains(payload, "archive reply") {
+		t.Fatalf("lossless archive was damaged: %s", payload)
+	}
+	if _, failed := marker.Failed["s1"]; failed {
+		t.Fatalf("session was permanently size-failed before checkpoint removal: %+v", marker.Failed["s1"])
+	}
+}
+
+// The compaction checkpoint is derived state — a compacted view of messages
+// already present in this payload. Uploading it roughly doubles a compacted
+// session's bytes, and the size gate downstream marks an oversize session
+// `size_limit_exceeded`, which backoff.go treats as PERMANENT. So it must be
+// dropped, not merely thinking-stripped.
+func TestStripThinkingFromSessionJSON_DropsCompactionCheckpoint(t *testing.T) {
+	body := []byte(`{
+	  "id": "s1",
+	  "messages": [
+	    {"role": "user", "content": "hi"},
+	    {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+	  ],
+	  "compaction_checkpoint": {
+	    "schema_version": 1,
+	    "archive_through_index": 2,
+	    "messages": [
+	      {"role": "user", "content": "Previous context summary: ..."},
+	      {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+	    ]
+	  }
+	}`)
+
+	out, err := stripThinkingFromSessionJSON(body)
+	if err != nil {
+		t.Fatalf("strip: %v", err)
+	}
+	if len(out) >= len(body) {
+		t.Errorf("payload did not shrink: %d bytes in, %d out", len(body), len(out))
+	}
+
+	var top map[string]any
+	if err := json.Unmarshal(out, &top); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	if _, present := top["compaction_checkpoint"]; present {
+		t.Error("compaction_checkpoint survived the upload strip")
+	}
+	msgs, ok := top["messages"].([]any)
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("lossless transcript was damaged: %v", top["messages"])
+	}
+	if top["id"] != "s1" {
+		t.Errorf("unrelated field lost: %v", top["id"])
+	}
+}
+
+// Dropping the checkpoint forces a re-marshal on sessions that carry no
+// thinking blocks at all — a path that previously returned the original bytes
+// untouched. Decoding into map[string]any turns JSON numbers into float64,
+// whose 53-bit mantissa truncates the integers real tool inputs carry (unix
+// nanosecond timestamps, 64-bit row IDs). Same hazard normalizeToolInput
+// guards against; the fix is json.Decoder.UseNumber().
+func TestStripThinkingFromSessionJSON_PreservesLargeIntegers(t *testing.T) {
+	const nanoTS = "1785920867066123456" // 19 digits, well past 2^53
+	const rowID = "9007199254740993"     // 2^53 + 1
+	body := []byte(`{
+	  "messages": [
+	    {"role": "assistant", "content": [
+	      {"type": "tool_use", "id": "t1", "name": "q",
+	       "input": {"since": ` + nanoTS + `, "row": ` + rowID + `}}
+	    ]}
+	  ],
+	  "compaction_checkpoint": {"schema_version": 1, "archive_through_index": 1, "messages": []}
+	}`)
+
+	out, err := stripThinkingFromSessionJSON(body)
+	if err != nil {
+		t.Fatalf("strip: %v", err)
+	}
+	if !strings.Contains(string(out), nanoTS) {
+		t.Errorf("nanosecond timestamp was truncated by the float64 roundtrip: %s", out)
+	}
+	if !strings.Contains(string(out), rowID) {
+		t.Errorf("64-bit row id was truncated by the float64 roundtrip: %s", out)
+	}
+}
+
+// A streaming Decoder stops at the first complete JSON value. Without an
+// explicit EOF check it would accept a concatenated/corrupt session file,
+// re-marshal only the leading object, and silently discard the rest — a
+// regression against json.Unmarshal, which rejects trailing data outright.
+func TestStripThinkingFromSessionJSON_RejectsTrailingJSON(t *testing.T) {
+	body := []byte(`{"messages":[],"compaction_checkpoint":{"schema_version":1}} {"unexpected":"tail"}`)
+
+	out, err := stripThinkingFromSessionJSON(body)
+	if err == nil {
+		t.Fatalf("expected trailing JSON to be rejected, got %s", out)
+	}
+	if string(out) != string(body) {
+		t.Errorf("original bytes must be returned untouched on error; got %s", out)
 	}
 }

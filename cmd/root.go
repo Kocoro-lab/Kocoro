@@ -414,7 +414,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		session.MessageMeta{Source: "local", Timestamp: session.TimePtr(time.Now())},
 	)
 	sessMgr.AddUsage(sess.ID, session.UsageFromAccumulated(
-		llm.LLMCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens, llm.CostUSD,
+		llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens, llm.CostUSD,
 		llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
 		totalUsage.ToolCalls, totalUsage.ToolCostUSD,
 	))

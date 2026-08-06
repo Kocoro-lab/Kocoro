@@ -620,6 +620,11 @@ func TestManager_Reset_ClearsHistoryInPlace(t *testing.T) {
 		{Role: "assistant", Content: client.NewTextContent("hi")},
 	}
 	sess.MessageMeta = []MessageMeta{{Source: "local"}, {Source: "local"}}
+	sess.CompactionCheckpoint = &CompactionCheckpoint{
+		SchemaVersion:       CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: 2,
+		Messages:            []client.Message{{Role: "user", Content: client.NewTextContent("summary")}},
+	}
 	sess.RemoteTasks = []string{"task-1"}
 	sess.SummaryCache = "cached summary"
 	sess.SummaryCacheKey = "key-1"
@@ -658,6 +663,9 @@ func TestManager_Reset_ClearsHistoryInPlace(t *testing.T) {
 	if len(cur.MessageMeta) != 0 {
 		t.Errorf("MessageMeta should be cleared, got %d", len(cur.MessageMeta))
 	}
+	if cur.CompactionCheckpoint != nil {
+		t.Errorf("CompactionCheckpoint should be cleared, got %#v", cur.CompactionCheckpoint)
+	}
 	if len(cur.RemoteTasks) != 0 {
 		t.Errorf("RemoteTasks should be cleared, got %d", len(cur.RemoteTasks))
 	}
@@ -678,6 +686,9 @@ func TestManager_Reset_ClearsHistoryInPlace(t *testing.T) {
 	if len(loaded.Messages) != 0 {
 		t.Errorf("persisted messages should be cleared, got %d", len(loaded.Messages))
 	}
+	if loaded.CompactionCheckpoint != nil {
+		t.Errorf("persisted CompactionCheckpoint should be cleared, got %#v", loaded.CompactionCheckpoint)
+	}
 	if loaded.Title != "Kept title" {
 		t.Errorf("persisted title should be preserved, got %q", loaded.Title)
 	}
@@ -694,6 +705,39 @@ func TestManager_Reset_NotFound(t *testing.T) {
 	err := m.Reset("does-not-exist")
 	if err == nil {
 		t.Fatal("expected error for missing session")
+	}
+}
+
+func TestManager_TruncateMessages_InvalidatesCompactionCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir)
+	defer m.Close()
+	sess := m.NewSession()
+	sess.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("one")},
+		{Role: "assistant", Content: client.NewTextContent("two")},
+	}
+	sess.MessageMeta = []MessageMeta{{Source: "local"}, {Source: "local"}}
+	sess.CompactionCheckpoint = &CompactionCheckpoint{
+		SchemaVersion:       CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: 2,
+		Messages:            []client.Message{{Role: "user", Content: client.NewTextContent("summary")}},
+	}
+	if err := m.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+	if err := m.TruncateMessages(sess.ID, 1); err != nil {
+		t.Fatalf("TruncateMessages: %v", err)
+	}
+	loaded, err := m.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.CompactionCheckpoint != nil {
+		t.Fatalf("checkpoint survived archive rewrite: %#v", loaded.CompactionCheckpoint)
+	}
+	if len(loaded.Messages) != 1 {
+		t.Fatalf("archive was not truncated: %d", len(loaded.Messages))
 	}
 }
 
@@ -734,7 +778,6 @@ func TestManager_Reset_ResetsWorkingSet(t *testing.T) {
 		t.Error("working set should be cleared after reset")
 	}
 }
-
 
 func TestIsValidSessionID(t *testing.T) {
 	cases := []struct {

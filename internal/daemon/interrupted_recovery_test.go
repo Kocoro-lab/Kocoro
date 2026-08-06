@@ -13,6 +13,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -476,14 +477,48 @@ func TestResumeInterruptedTurns_ContinuesCheckpointWithoutToolReplay(t *testing.
 	deps := runAgentContractTestDeps(t, ts.URL)
 	defer deps.SessionCache.CloseAll()
 	id := "recovery-session-001"
-	writeInterruptedSession(t, filepath.Join(deps.ShannonDir, "sessions"), id, &session.InterruptedTurn{
+	dir := filepath.Join(deps.ShannonDir, "sessions")
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{
 		Source: "heartbeat",
 	})
+
+	// Bind a live checkpoint to the interrupted archive. The archive carries a
+	// different tool result so the gateway assertion below proves the daemon
+	// resumed through Session.HistoryForLoop rather than merely finding the same
+	// tool_use_id in the lossless transcript.
+	seed := session.NewManager(dir)
+	seeded, err := seed.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seeded.Messages[2] = client.Message{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+		client.NewToolResultBlock("tool-1", "ARCHIVE_ONLY_TOOL_RESULT", false),
+	})}
+	seeded.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: len(seeded.Messages),
+		Messages: []client.Message{
+			{Role: "user", Content: client.NewTextContent("inspect the project")},
+			{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "resume from the saved tool result")},
+			{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolUseBlock("tool-1", "file_read", []byte(`{"path":"README.md"}`)),
+			})},
+			{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolResultBlock("tool-1", "saved file contents", false),
+			})},
+		},
+	}
+	if err := seed.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	srv := &Server{deps: deps}
 	srv.resumeInterruptedTurns(context.Background())
 
-	mgr := session.NewManager(filepath.Join(deps.ShannonDir, "sessions"))
+	mgr := session.NewManager(dir)
 	defer mgr.Close()
 	sess, err := mgr.Load(id)
 	if err != nil {
@@ -525,18 +560,31 @@ func TestResumeInterruptedTurns_ContinuesCheckpointWithoutToolReplay(t *testing.
 	if len(requests) == 0 {
 		t.Fatal("recovery did not call the gateway")
 	}
-	var sawSavedToolResult bool
+	var sawSavedToolResult, sawStableSummary, sawArchiveOnly bool
 	for _, request := range requests {
 		for _, msg := range request.Messages {
+			if strings.Contains(msg.Content.Text(), ctxwin.CompactionSummaryPrefix+"resume from the saved tool result") {
+				sawStableSummary = true
+			}
 			for _, block := range msg.Content.Blocks() {
-				if block.Type == "tool_result" && block.ToolUseID == "tool-1" {
+				toolResultText := client.ToolResultText(block)
+				if block.Type == "tool_result" && block.ToolUseID == "tool-1" && toolResultText == "saved file contents" {
 					sawSavedToolResult = true
+				}
+				if block.Type == "tool_result" && strings.Contains(toolResultText, "ARCHIVE_ONLY_TOOL_RESULT") {
+					sawArchiveOnly = true
 				}
 			}
 		}
 	}
 	if !sawSavedToolResult {
 		t.Fatal("gateway did not receive the checkpointed tool result")
+	}
+	if !sawStableSummary {
+		t.Fatal("gateway did not receive the durable compaction summary")
+	}
+	if sawArchiveOnly {
+		t.Fatal("gateway resumed from the lossless archive instead of the live checkpoint")
 	}
 }
 

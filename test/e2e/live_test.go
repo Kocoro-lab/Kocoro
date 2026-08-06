@@ -5,24 +5,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	daemonpkg "github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
 )
 
 // Live E2E tests require SHANNON_E2E_LIVE=1.
 // They make real LLM API calls and cost real tokens.
 //
-// Known limitation: daemon tests use the real ~/.shannon home and port 7533.
-// Do not run while a real daemon is active. Future improvement: temp HOME +
-// isolated port via env var override.
+// Daemon tests use a temporary state directory and random localhost port. The
+// isolated start mode suppresses Cloud WS, watchers, schedulers, MCP connects,
+// and process-global browser cleanup while preserving the real HTTP/agent path.
 
 func TestLive_OneShot_BasicQuery(t *testing.T) {
 	skipUnlessLive(t)
@@ -102,26 +106,11 @@ func TestLive_BundledAgent_Reviewer(t *testing.T) {
 
 func TestLive_Daemon_MessageAndEditRetry(t *testing.T) {
 	skipUnlessLive(t)
-	t.Skip("daemon tests use real ~/.shannon and port 7533 — skipped until daemon supports --port/--home isolation")
 	bin := testBinary(t)
-
-	// Start daemon
-	daemonCmd := exec.Command(bin, "daemon", "start")
-	daemonCmd.Stdout = os.Stderr
-	daemonCmd.Stderr = os.Stderr
-	if err := daemonCmd.Start(); err != nil {
-		t.Fatalf("daemon start: %v", err)
-	}
-	defer func() {
-		exec.Command(bin, "daemon", "stop").Run()
-		daemonCmd.Wait()
-	}()
-
-	// Wait for daemon to be ready
-	waitForDaemon(t, 10*time.Second)
+	daemon := startIsolatedLiveDaemon(t, bin)
 
 	// Send message
-	resp := httpPost(t, "http://localhost:7533/message", map[string]interface{}{
+	resp := httpPost(t, daemon.baseURL+"/message", map[string]interface{}{
 		"text": "what is 7+7",
 	})
 	sessionID, ok := resp["session_id"].(string)
@@ -134,14 +123,14 @@ func TestLive_Daemon_MessageAndEditRetry(t *testing.T) {
 	}
 
 	// GET session
-	sessResp := httpGet(t, fmt.Sprintf("http://localhost:7533/sessions/%s", sessionID))
+	sessResp := httpGet(t, fmt.Sprintf("%s/sessions/%s", daemon.baseURL, sessionID))
 	messages, ok := sessResp["messages"].([]interface{})
 	if !ok || len(messages) < 2 {
 		t.Fatalf("expected at least 2 messages, got: %v", sessResp)
 	}
 
 	// Edit & retry
-	editResp := httpPost(t, fmt.Sprintf("http://localhost:7533/sessions/%s/edit", sessionID), map[string]interface{}{
+	editResp := httpPost(t, fmt.Sprintf("%s/sessions/%s/edit", daemon.baseURL, sessionID), map[string]interface{}{
 		"message_index": 0,
 		"new_content":   "what is 9+9",
 	})
@@ -151,7 +140,7 @@ func TestLive_Daemon_MessageAndEditRetry(t *testing.T) {
 	}
 
 	// Verify truncation
-	sessResp2 := httpGet(t, fmt.Sprintf("http://localhost:7533/sessions/%s", sessionID))
+	sessResp2 := httpGet(t, fmt.Sprintf("%s/sessions/%s", daemon.baseURL, sessionID))
 	messages2, _ := sessResp2["messages"].([]interface{})
 	if len(messages2) != 2 {
 		t.Errorf("expected 2 messages after edit, got %d", len(messages2))
@@ -160,23 +149,10 @@ func TestLive_Daemon_MessageAndEditRetry(t *testing.T) {
 
 func TestLive_Daemon_AgentListIncludesBuiltins(t *testing.T) {
 	skipUnlessLive(t)
-	t.Skip("daemon tests use real ~/.shannon and port 7533 — skipped until daemon supports --port/--home isolation")
 	bin := testBinary(t)
+	daemon := startIsolatedLiveDaemon(t, bin)
 
-	daemonCmd := exec.Command(bin, "daemon", "start")
-	daemonCmd.Stdout = os.Stderr
-	daemonCmd.Stderr = os.Stderr
-	if err := daemonCmd.Start(); err != nil {
-		t.Fatalf("daemon start: %v", err)
-	}
-	defer func() {
-		exec.Command(bin, "daemon", "stop").Run()
-		daemonCmd.Wait()
-	}()
-
-	waitForDaemon(t, 10*time.Second)
-
-	resp := httpGet(t, "http://localhost:7533/agents")
+	resp := httpGet(t, daemon.baseURL+"/agents")
 	agentsList, ok := resp["agents"].([]interface{})
 	if !ok {
 		t.Fatalf("expected agents array: %v", resp)
@@ -210,11 +186,100 @@ func runShan(t *testing.T, bin string, args ...string) string {
 	return stdout.String()
 }
 
-func waitForDaemon(t *testing.T, timeout time.Duration) {
+type isolatedLiveDaemon struct {
+	baseURL string
+	cmd     *exec.Cmd
+	done    chan error
+	output  synchronizedBuffer
+}
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func startIsolatedLiveDaemon(t *testing.T, bin string) *isolatedLiveDaemon {
+	t.Helper()
+	port := 0
+	for port == 0 || port == 7533 {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve isolated daemon port: %v", err)
+		}
+		port = listener.Addr().(*net.TCPAddr).Port
+		if err := listener.Close(); err != nil {
+			t.Fatalf("release isolated daemon port: %v", err)
+		}
+	}
+
+	stateDir := t.TempDir()
+	daemon := &isolatedLiveDaemon{baseURL: fmt.Sprintf("http://127.0.0.1:%d", port)}
+	cmd := exec.Command(
+		bin, "daemon", "start", "--isolated",
+		"--state-dir", stateDir,
+		"--port", strconv.Itoa(port),
+	)
+	cmd.Stdout = &daemon.output
+	cmd.Stderr = &daemon.output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("daemon start: %v", err)
+	}
+	daemon.cmd = cmd
+	daemon.done = make(chan error, 1)
+	go func() { daemon.done <- cmd.Wait() }()
+	t.Cleanup(func() { daemon.stop(t) })
+	waitForDaemon(t, daemon, 15*time.Second)
+	waitForIsolationMarkers(t, daemon, 3*time.Second)
+	return daemon
+}
+
+func (d *isolatedLiveDaemon) stop(t *testing.T) {
+	t.Helper()
+	if d == nil || d.cmd == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, d.baseURL+"/shutdown", nil)
+	response, err := http.DefaultClient.Do(request)
+	if err == nil {
+		response.Body.Close()
+	}
+	cancel()
+	select {
+	case <-d.done:
+	case <-time.After(5 * time.Second):
+		if err := d.cmd.Process.Kill(); err != nil {
+			t.Errorf("kill isolated daemon pid=%d: %v", d.cmd.Process.Pid, err)
+		} else {
+			<-d.done
+		}
+	}
+	d.cmd = nil
+}
+
+func waitForDaemon(t *testing.T, daemon *isolatedLiveDaemon, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := http.Get("http://localhost:7533/health")
+		select {
+		case err := <-daemon.done:
+			daemon.cmd = nil
+			t.Fatalf("isolated daemon exited before readiness: %v\n%s", err, daemon.output.String())
+		default:
+		}
+		resp, err := http.Get(daemon.baseURL + "/health")
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
@@ -223,7 +288,33 @@ func waitForDaemon(t *testing.T, timeout time.Duration) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatal("daemon did not become ready within timeout")
+	t.Fatalf("isolated daemon did not become ready within timeout\n%s", daemon.output.String())
+}
+
+func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout time.Duration) {
+	t.Helper()
+	want := []string{
+		daemonpkg.IsolationMarkerMCPDisabled,
+		daemonpkg.IsolationMarkerAutomationDisabled,
+		daemonpkg.IsolationMarkerCloudWSSuppressed,
+		daemonpkg.IsolationMarkerBackgroundDisabled,
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		log := daemon.output.String()
+		complete := true
+		for _, marker := range want {
+			if !strings.Contains(log, marker) {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("isolated daemon did not confirm contained startup\n%s", daemon.output.String())
 }
 
 // TestLive_GenerateAndEditImage exercises the v0.1.4 generate_image +

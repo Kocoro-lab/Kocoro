@@ -10,6 +10,7 @@ func TestLLMUsageDelta_NormalizesSplitCacheCreation(t *testing.T) {
 	delta := LLMUsageDelta(client.Usage{
 		InputTokens:           120,
 		OutputTokens:          30,
+		WebSearchCalls:        2,
 		CacheReadTokens:       40,
 		CacheCreation5mTokens: 100,
 		CacheCreation1hTokens: 200,
@@ -30,6 +31,9 @@ func TestLLMUsageDelta_NormalizesSplitCacheCreation(t *testing.T) {
 	if delta.LLMCalls != 1 {
 		t.Fatalf("expected 1 LLM call, got %d", delta.LLMCalls)
 	}
+	if delta.WebSearchCalls != 2 {
+		t.Fatalf("expected 2 web search calls, got %d", delta.WebSearchCalls)
+	}
 }
 
 func TestUsageAccumulator_AccumulatesSplitCacheCreation(t *testing.T) {
@@ -37,6 +41,7 @@ func TestUsageAccumulator_AccumulatesSplitCacheCreation(t *testing.T) {
 	acc.Add(LLMUsageDelta(client.Usage{
 		InputTokens:           90,
 		OutputTokens:          10,
+		WebSearchCalls:        1,
 		CacheCreation5mTokens: 25,
 		CacheCreation1hTokens: 75,
 	}, "claude-test"))
@@ -50,6 +55,9 @@ func TestUsageAccumulator_AccumulatesSplitCacheCreation(t *testing.T) {
 	}
 	if snap.LLM.TotalTokens != 100 {
 		t.Fatalf("expected total tokens 100, got %d", snap.LLM.TotalTokens)
+	}
+	if snap.LLM.WebSearchCalls != 1 {
+		t.Fatalf("expected 1 web search call, got %d", snap.LLM.WebSearchCalls)
 	}
 }
 

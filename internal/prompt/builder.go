@@ -87,6 +87,10 @@ type PromptOptions struct {
 	// It is rendered only in VolatileContext so attended/unattended source
 	// differences never perturb the cacheable system prompt.
 	QuestionUIAvailable bool
+	// FastMode adds outcome-first stopping guidance for the reserved fast
+	// execution profile. It stays volatile so toggling the profile does not
+	// invalidate the shared system or per-session stable prompt prefixes.
+	FastMode bool
 }
 
 // PromptParts separates the system prompt into cacheable and volatile sections.
@@ -484,6 +488,11 @@ func buildVolatileContext(opts PromptOptions) string {
 	// Output formatting guidance
 	sb.WriteString("\n\n## Output Format\n")
 	sb.WriteString(formatGuidance(opts.OutputFormat))
+
+	if opts.FastMode {
+		sb.WriteString("\n\n## Fast Task\n")
+		sb.WriteString("Use the fewest tool rounds that can answer correctly. After each result, stop and answer once the core request and required evidence are satisfied. Do not repeat a successful search, fetch, read, or other call for wording or optional detail. Treat web_search as unavailable when the task can be completed from user-provided content, local files, existing tool results, calculation, or reasoning about facts that do not change over time; use those sources and do not search. Facts already in the conversation also suffice unless they are time-sensitive and may have changed since retrieval. Search only when the user requests current or external facts, names an online source, or a required fact is otherwise unavailable. For an ordinary lookup, issue one broad search query, not multiple queries in advance. If its result comes from a primary or established source and supplies the requested facts, stop searching and answer immediately; a second search in that situation is incorrect. A second search is allowed only when the first result failed, was empty or unusable, omitted a required fact or requested source, conflicted with another result, or the user explicitly requested independent sources. These unsuccessful or incomplete results do not consume the normal search budget. Never search again merely to confirm the same facts, improve wording, or collect optional citations. For current-information lookups, call the directly available web_search without tool_search. Make the broad query target primary or established sources; if the only evidence is a forum, aggregator, or search-results page, use the allowed extra search for an authoritative citation. Do not substitute web_fetch on a search-results page; use web_fetch only when the task starts from a specific URL or a search result lacks a required detail.")
+	}
 
 	// Memory — stays volatile: memory_append can mutate MEMORY.md during a
 	// turn, so the block must be re-read and re-sent each Run(). Instructions

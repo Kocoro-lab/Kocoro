@@ -136,25 +136,41 @@ func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
 	}
 	<-webrtc.GatheringCompletePromise(rc.pc)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openAICallsURL,
-		bytes.NewReader([]byte(rc.pc.LocalDescription().SDP)))
+	answer, err := exchangeSDP(ctx, openAICallsURL, ek, []byte(rc.pc.LocalDescription().SDP))
 	if err != nil {
 		return err
+	}
+	return rc.pc.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer, SDP: answer,
+	})
+}
+
+// exchangeSDP sends one create-call request. It deliberately does not replay a
+// failed POST: the Realtime calls API does not expose an idempotency contract, so
+// an error response cannot prove the provider did not already create a session.
+func exchangeSDP(ctx context.Context, url, ek string, offer []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(offer))
+	if err != nil {
+		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+ek)
 	req.Header.Set("Content-Type", "application/sdp")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer resp.Body.Close()
-	answer, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return fmt.Errorf("sdp exchange failed: HTTP %d: %s", resp.StatusCode, string(answer))
+	answer, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return "", fmt.Errorf("read SDP exchange response: %w", readErr)
 	}
-	return rc.pc.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeAnswer, SDP: string(answer),
-	})
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return string(answer), nil
+	}
+	if requestID := resp.Header.Get("x-request-id"); requestID != "" {
+		return "", fmt.Errorf("sdp exchange failed: HTTP %d request_id=%s: %s", resp.StatusCode, requestID, string(answer))
+	}
+	return "", fmt.Errorf("sdp exchange failed: HTTP %d: %s", resp.StatusCode, string(answer))
 }
 
 // sendTrackStats reconciles "gate passed N frames" with "track actually wrote M
