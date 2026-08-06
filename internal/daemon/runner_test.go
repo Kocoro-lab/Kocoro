@@ -1826,11 +1826,22 @@ func TestApplyKoeModeAdmissionUsesSelectedMode(t *testing.T) {
 			wantDecision: executionprofile.AdmissionModeSelectedFull,
 		},
 		{
-			name: "structured reason cannot override selected fast",
+			name: "recognized full reason makes selected fast fail closed",
 			req: RunAgentRequest{
 				Source: "koe", ExecutionMode: executionprofile.ModeFast,
 				RequestedExecutionMode: stringPtr("fast"),
 				FullReason:             executionprofile.FullReasonProductionIncident,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantReason:   executionprofile.FullReasonProductionIncident,
+			wantDecision: executionprofile.AdmissionFastReasonConflict,
+		},
+		{
+			name: "unknown reason does not upgrade selected fast",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr("fast"),
+				FullReason:             "lots_of_tools",
 			},
 			wantMode:     executionprofile.ModeFast,
 			wantDecision: executionprofile.AdmissionModeSelectedFast,

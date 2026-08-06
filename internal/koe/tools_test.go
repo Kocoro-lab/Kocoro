@@ -620,7 +620,7 @@ func TestPrepareDoTaskExecutionModeAndLineage(t *testing.T) {
 	}
 }
 
-func TestPrepareDoTaskModeIsAuthoritativeAndReasonIsTelemetry(t *testing.T) {
+func TestPrepareDoTaskFailsClosedOnContradictoryModeAndReason(t *testing.T) {
 	t.Setenv("KOE_TASK_LEDGER", "1")
 	state := NewCallState("burst-admission", "")
 	dispatcher := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
@@ -639,17 +639,32 @@ func TestPrepareDoTaskModeIsAuthoritativeAndReasonIsTelemetry(t *testing.T) {
 		t.Fatalf("selected Full was changed by missing diagnostic reason: %+v", selectedFull)
 	}
 
-	selectedFast, _, clarify, err := dispatcher.PrepareDoTask(
+	contradictoryFast, task, clarify, err := dispatcher.PrepareDoTask(
 		[]byte(`{"task":"Investigate the real production data-loss incident.","relationship":"new","execution_mode":"fast","full_reason":"production_incident_or_recovery"}`),
 		"en",
 		false,
 	)
-	if err != nil || clarify != nil {
-		t.Fatalf("prepare selected Fast: req=%+v clarify=%+v err=%v", selectedFast, clarify, err)
+	if err != nil || clarify != nil || task == nil {
+		t.Fatalf("prepare contradictory Fast: req=%+v task=%+v clarify=%+v err=%v", contradictoryFast, task, clarify, err)
 	}
-	if selectedFast.ExecutionMode != executionprofile.ModeFast ||
-		selectedFast.FullReason != executionprofile.FullReasonProductionIncident {
-		t.Fatalf("diagnostic reason overrode selected Fast: %+v", selectedFast)
+	if contradictoryFast.ExecutionMode != executionprofile.ModeFull ||
+		contradictoryFast.RequestedExecutionMode == nil ||
+		*contradictoryFast.RequestedExecutionMode != "fast" ||
+		contradictoryFast.FullReason != executionprofile.FullReasonProductionIncident {
+		t.Fatalf("contradictory Fast did not fail closed: %+v", contradictoryFast)
+	}
+
+	unknownReasonFast, task, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"Summarize the current note.","relationship":"new","execution_mode":"fast","full_reason":"lots_of_tools"}`),
+		"en",
+		false,
+	)
+	if err != nil || clarify != nil || task == nil {
+		t.Fatalf("prepare Fast with unknown reason: req=%+v task=%+v clarify=%+v err=%v", unknownReasonFast, task, clarify, err)
+	}
+	if unknownReasonFast.ExecutionMode != executionprofile.ModeFast ||
+		unknownReasonFast.FullReason != executionprofile.FullReasonNone {
+		t.Fatalf("unknown reason changed selected Fast: %+v", unknownReasonFast)
 	}
 }
 

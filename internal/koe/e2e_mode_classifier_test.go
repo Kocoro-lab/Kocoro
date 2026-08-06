@@ -48,7 +48,7 @@ const (
 	modeClassifierMinAccuracy     = 0.85
 	modeClassifierMinCaseAccuracy = 0.80
 	modeClassifierReportSchema    = "koe.mode_classifier.v3"
-	modeClassifierAdmissionPolicy = "executionprofile.decide_mode_admission.v2"
+	modeClassifierAdmissionPolicy = "executionprofile.decide_mode_admission.v3"
 )
 
 var modeClassifierCases = []modeClassifierCase{
