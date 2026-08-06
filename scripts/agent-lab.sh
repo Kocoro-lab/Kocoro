@@ -70,11 +70,18 @@ run_selector_lane() {
     check_statuses+=("2")
     return
   fi
+  local repeats="${KOE_SELECTOR_AGENTLOOP_REPEATS:-3}"
+  if [[ ! "$repeats" =~ ^[0-9]+$ || "$repeats" -lt 3 ]]; then
+    echo "KOE_SELECTOR_AGENTLOOP_REPEATS must be an integer >= 3 for release qualification." >&2
+    check_names+=("selector_agentloop_live")
+    check_statuses+=("2")
+    return
+  fi
   run_check selector_agentloop_live env \
     KOE_SELECTOR_AGENTLOOP_E2E=1 \
     PKG_CONFIG_PATH="$pkg_config_path" \
     go test ./internal/koe -run '^TestKoeSelectorToAgentLoopTextE2E$' \
-    -count=1 -v -timeout=5m
+    -count="$repeats" -v -timeout=10m
 }
 
 cd "$repo_dir" || exit 2

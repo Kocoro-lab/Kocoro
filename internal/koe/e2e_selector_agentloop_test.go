@@ -46,6 +46,7 @@ const (
 
 type selectorAgentLoopArgs struct {
 	Task          string `json:"task"`
+	Agent         string `json:"agent"`
 	ExecutionMode string `json:"execution_mode"`
 	FullReason    string `json:"full_reason"`
 }
@@ -136,7 +137,11 @@ func TestKoeSelectorToAgentLoopTextE2E(t *testing.T) {
 				t.Fatalf("PrepareDoTask: %v", err)
 			}
 			if clarify != nil {
-				t.Fatalf("PrepareDoTask unexpectedly requested clarification: %+v", clarify)
+				t.Fatalf(
+					"PrepareDoTask unexpectedly requested clarification: %+v; selector_args=%s",
+					clarify,
+					rawArgs,
+				)
 			}
 			if task == nil {
 				t.Fatal("PrepareDoTask did not create a task-ledger entry")
