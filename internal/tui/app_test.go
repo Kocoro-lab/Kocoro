@@ -97,3 +97,23 @@ func TestTUI_AgentOverlayNilOverrideIsNoop(t *testing.T) {
 		t.Errorf("nil override clobbered seed: got %q, want %q", got, "medium")
 	}
 }
+
+// compaction_started/finished run-status events drive a transient spinner
+// label; any terminal run message clears it as a backstop so a lost
+// finished event cannot stick the indicator.
+func TestCompactionStatusTogglesSpinnerFlag(t *testing.T) {
+	m := newCommandTestModel(t)
+	m.state = stateProcessing
+
+	updated, _ := m.Update(compactionStatusMsg{active: true})
+	m = updated.(*Model)
+	if !m.compacting {
+		t.Fatal("compaction_started must set the compacting flag")
+	}
+
+	updated, _ = m.Update(compactionStatusMsg{active: false})
+	m = updated.(*Model)
+	if m.compacting {
+		t.Fatal("compaction_finished must clear the compacting flag")
+	}
+}

@@ -241,6 +241,15 @@ func clipWithMarker(s string, maxBytes int) string {
 // headroom: the payload must keep the calibrated estimate under the
 // compaction trigger line (it deliberately MAY consume part of the 90/80
 // hysteresis band — see CompactTriggerTokens).
+// BuildPostCompactionFileRestore exposes the restoration payload to external
+// compaction drivers (TUI /compact) so a manual compaction keeps the same
+// file-content recovery the in-loop proactive/preflight paths have. Same
+// budget discipline: the payload must keep the estimate under the trigger
+// line, or restoration declines.
+func (a *AgentLoop) BuildPostCompactionFileRestore(shaped []client.Message, overheadTokens int) (client.Message, bool) {
+	return a.buildPostCompactionFileRestore(shaped, overheadTokens)
+}
+
 func (a *AgentLoop) buildPostCompactionFileRestore(shaped []client.Message, overheadTokens int) (client.Message, bool) {
 	rt := a.readTracker
 	if rt == nil || a.contextWindow <= 0 {

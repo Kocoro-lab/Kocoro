@@ -22,6 +22,30 @@ type compactDoneMsg struct {
 	err          error
 }
 
+// compactTimeout bounds the whole /compact pass: PersistLearnings plus a
+// summarize that may fold an oversized transcript into up to
+// maxSummaryFoldChunks sequential small-tier calls. A 60s shared budget
+// aborted exactly the sessions large enough to need /compact.
+const compactTimeout = 5 * time.Minute
+
+// compactWindowAndOverhead resolves the context window and estimator
+// calibration for /compact from the live loop when one exists — its window
+// tracks response.model auto-detection and its calibration carries the
+// tools-schema mass — falling back to config, then the 128K legacy default.
+func (m *Model) compactWindowAndOverhead() (window, overheadTokens int) {
+	if m.agentLoop != nil {
+		window, _ = m.agentLoop.ContextWindow()
+		overheadTokens, _, _ = m.agentLoop.EstOverheadState()
+	}
+	if window <= 0 {
+		window = m.cfg.Agent.ContextWindow
+	}
+	if window <= 0 {
+		window = 128000
+	}
+	return window, overheadTokens
+}
+
 // runCompact performs context compaction: persist learnings → summarize → shape history.
 func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 	return func() compactDoneMsg {
@@ -41,7 +65,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 
 		beforeTokens := ctxwin.EstimateTokens(messages)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), compactTimeout)
 		defer cancel()
 		var usage agent.UsageAccumulator
 
@@ -76,14 +100,11 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		// ShapeHistory expects [system] + [first user] + ... but TUI sessions
 		// don't persist the system prompt. Prepend a placeholder so the array
 		// layout matches, then strip it from the result.
-		ctxWindow := m.cfg.Agent.ContextWindow
-		if ctxWindow <= 0 {
-			ctxWindow = 128000
-		}
+		ctxWindow, overheadTokens := m.compactWindowAndOverhead()
 		withSystem := make([]client.Message, 0, 1+len(messages))
 		withSystem = append(withSystem, client.Message{Role: "system", Content: client.NewTextContent("(compaction placeholder)")})
 		withSystem = append(withSystem, messages...)
-		shaped := ctxwin.ForceShapeHistory(withSystem, summary, ctxWindow, 0)
+		shaped := ctxwin.ForceShapeHistory(withSystem, summary, ctxWindow, overheadTokens)
 		if len(shaped) >= len(withSystem) {
 			// ForceShapeHistory contract: no net reduction possible. Bail
 			// before replacing the live checkpoint or reporting a compression
@@ -94,6 +115,22 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		// Strip the placeholder system message from shaped result
 		if len(shaped) > 0 && shaped[0].Role == "system" {
 			shaped = shaped[1:]
+		}
+
+		// Restore recently read files into the compacted view, mirroring the
+		// daemon's proactive/preflight paths: the summary paraphrases file
+		// content whose exact text is still on disk, and the loop's
+		// ReadTracker (long-lived in the TUI) knows what was read. Manual
+		// compaction skips the task reanchor — the user's next prompt is the
+		// anchor here.
+		restoreBuilder := m.fileRestoreBuilder
+		if restoreBuilder == nil && m.agentLoop != nil {
+			restoreBuilder = m.agentLoop.BuildPostCompactionFileRestore
+		}
+		if restoreBuilder != nil {
+			if restoreMsg, ok := restoreBuilder(shaped, overheadTokens); ok {
+				shaped = append(shaped, restoreMsg)
+			}
 		}
 
 		// Preserve the exact prior live state as best-effort rollback material,
@@ -140,6 +177,29 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			summary:      displaySummary,
 		}
 	}
+}
+
+// persistMidTurnCompactionCheckpoint durably saves an applied compaction's
+// checkpoint while the run is still in flight (wired to the loop's
+// CheckpointFunc). Run messages still land at run end; ArchiveThroughIndex
+// therefore points at the archive as it stands now — the checkpoint messages
+// already carry the shaped current-run state, so a crash before run end
+// resumes on checkpoint + empty tail, which is self-consistent.
+func (m *Model) persistMidTurnCompactionCheckpoint(sess *session.Session, checkpoint []client.Message) error {
+	if sess == nil || len(checkpoint) == 0 {
+		return nil
+	}
+	prior := sess.CompactionCheckpoint
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: len(sess.Messages),
+		Messages:            checkpoint,
+	}
+	if err := m.sessions.Save(); err != nil {
+		sess.CompactionCheckpoint = prior
+		return err
+	}
+	return nil
 }
 
 func formatCompactResult(msg compactDoneMsg) string {

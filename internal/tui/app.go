@@ -184,6 +184,13 @@ type Model struct {
 	toolRegistry        *agent.ToolRegistry
 	toolCleanup         func()
 	agentLoop           *agent.AgentLoop
+	// compacting mirrors the loop's compaction_started/finished run-status
+	// events so the processing spinner can label the pause. Cleared on
+	// finished AND on run completion (backstop for a lost finished event).
+	compacting bool
+	// fileRestoreBuilder overrides the /compact restoration source in tests;
+	// nil means the live agentLoop's BuildPostCompactionFileRestore.
+	fileRestoreBuilder func([]client.Message, int) (client.Message, bool)
 	textarea            textarea.Model
 	viewport            viewport.Model // scrollable conversation history (alt-screen)
 	output              []outputBlock
@@ -1340,7 +1347,14 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case compactionStatusMsg:
+		m.compacting = msg.active
+		return m, nil
+
 	case agentDoneMsg:
+		// Backstop: a lost compaction_finished event must not stick the
+		// spinner label past the run.
+		m.compacting = false
 		// If already back to stateInput (Esc was pressed), ignore this message.
 		// The Esc handler already showed [Cancelled] and transitioned state.
 		if m.state != stateProcessing {
@@ -1776,6 +1790,11 @@ func (m *Model) bottomRegion() string {
 			status = glyphStyle.Render(glyph) + lipgloss.NewStyle().Foreground(colorDim).Render(" "+label)
 		} else {
 			spinnerText := m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)]
+			if m.compacting {
+				// The loop is between compaction_started/finished: the pause
+				// is summary work, not model thinking — label it as such.
+				spinnerText = "Tidying context"
+			}
 			status = glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx)
 		}
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
@@ -1961,6 +1980,13 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID(sess.ID)
+			// Mid-turn durability for applied compactions: the summary was
+			// expensive, and only persisting at run end loses it to a crash
+			// during the remaining iterations. Run messages still land at run
+			// end; only the checkpoint (and archive index) is saved here.
+			m.agentLoop.SetCheckpointFunc(func(context.Context) error {
+				return m.persistMidTurnCompactionCheckpoint(sess, m.agentLoop.CompactionCheckpointMessages())
+			})
 			if m.cfg.Agent.CompactionSnapshotRetention > 0 {
 				retention := m.cfg.Agent.CompactionSnapshotRetention
 				sessionID := sess.ID
@@ -1988,6 +2014,7 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID("")
+			m.agentLoop.SetCheckpointFunc(nil)
 			m.agentLoop.SetToolResultBudgetState(nil, nil)
 			m.agentLoop.SetWorkingSet(nil)
 		}
@@ -3055,6 +3082,25 @@ func (h *tuiEventHandler) OnToolResult(name string, args string, toolUseID strin
 func (h *tuiEventHandler) OnText(text string) {
 	// Final-answer rendering happens in agentDoneMsg (app.go ~line 1037) which
 	// uses the markdown renderer. Rendering here would double the output.
+}
+
+// compactionStatusMsg mirrors the loop's compaction_started/finished
+// run-status events into the bubbletea update loop.
+type compactionStatusMsg struct{ active bool }
+
+// OnRunStatus makes the TUI a RunStatusHandler. Only the compaction bracket
+// codes drive UI today (the transient "Tidying context" spinner label);
+// other codes are informational and already visible via their own channels.
+func (h *tuiEventHandler) OnRunStatus(code, detail string) {
+	if h.model.program == nil {
+		return
+	}
+	switch code {
+	case string(runstatus.CodeCompactionStarted):
+		h.model.program.Send(compactionStatusMsg{active: true})
+	case string(runstatus.CodeCompactionFinished):
+		h.model.program.Send(compactionStatusMsg{active: false})
+	}
 }
 
 // OnPreamble renders mid-turn agent narration (preamble emitted alongside
