@@ -114,6 +114,8 @@ Emits once per `OnUsage` boundary (typically once per LLM call, not per token). 
 | `context_bloat` | Tool-result content has dominated context; an inline nudge was added asking the model to summarize or stop. |
 | `context_window_autodetect` | The configured context window was overridden after the provider's `response.model` revealed a different family (e.g. 200K → 1M). |
 | `compaction_failed` | A compaction attempt failed; detail encodes the phase tag. |
+| `compaction_started` | A compaction pass began; detail is the phase (`proactive`/`preflight`/`reactive`/`force_stop`/`manual`). UI clients may show a transient "tidying context" indicator. |
+| `compaction_finished` | The compaction pass ended (applied, no-op, or failed alike — always pairs with `compaction_started`). UI clients remove the indicator; any later session event should also clear it as a backstop. |
 | `interrupted_turn_resuming` | Startup recovery discovered a durable mid-turn checkpoint and is waiting to validate it under the session route lock. The model is called only after that atomic claim succeeds. |
 | `interrupted_turn_resumed` | The checkpointed turn completed successfully after restart. |
 | `interrupted_turn_resume_failed` | A recovery attempt failed. Below the configured attempt limit, the durable marker remains eligible for a later daemon restart. |

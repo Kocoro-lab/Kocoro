@@ -2398,3 +2398,117 @@ func TestEstOverheadResets(t *testing.T) {
 		t.Errorf("SwitchAgent must reset calibration, got %d", got)
 	}
 }
+
+// TestAgentLoop_CompactionEmitsStartedFinishedStatus pins the transient UI
+// contract for compaction: every pass that enters the compaction path emits
+// compaction_started before its LLM work and a pairing compaction_finished
+// when the pass leaves — regardless of whether shaping applied — so a client
+// showing a "tidying context" indicator on started always gets the removal
+// signal. Uses the warm-cache workload that reliably drives the proactive
+// gate (real usage 2000/2000 window).
+func TestAgentLoop_CompactionEmitsStartedFinishedStatus(t *testing.T) {
+	memoryDir := t.TempDir()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := readBody(r.Body)
+		defer r.Body.Close()
+
+		var req struct {
+			ModelTier string `json:"model_tier"`
+			Messages  []struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			} `json:"messages"`
+		}
+		json.Unmarshal(raw, &req)
+
+		if req.ModelTier == "small" {
+			json.NewEncoder(w).Encode(nativeResponse(
+				"## Current task & next steps\nSummarised.", "end_turn", nil, 50, 30))
+			return
+		}
+
+		msgCount := len(req.Messages)
+		resp := client.CompletionResponse{
+			Model:        "test-model",
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				Name:      "think",
+				Arguments: json.RawMessage(fmt.Sprintf(`{"thought":"step with %d msgs"}`, msgCount)),
+			}},
+			Usage: client.Usage{
+				InputTokens:     200,
+				OutputTokens:    50,
+				TotalTokens:     250,
+				CacheReadTokens: 1800,
+			},
+			RequestID: "req-test",
+		}
+		if msgCount >= 12 {
+			resp.FinishReason = "end_turn"
+			resp.ToolCalls = nil
+			resp.OutputText = "Done after compaction."
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&thinkTool{})
+
+	handler := &usageRecordingHandler{}
+
+	loop := NewAgentLoop(gw, reg, "medium", "", 20, 2000, 200, nil, nil, nil)
+	loop.SetContextWindow(2000)
+	loop.SetMemoryDir(memoryDir)
+	loop.SetHandler(handler)
+
+	_, _, err := loop.Run(context.Background(),
+		"Run through several reasoning steps so message count grows past MinShapeable.",
+		nil, nil)
+	if err != nil {
+		t.Logf("Run error (iteration limit is acceptable): %v", err)
+	}
+
+	handler.mu.Lock()
+	events := make([]recordedStatus, len(handler.statusEvents))
+	copy(events, handler.statusEvents)
+	handler.mu.Unlock()
+
+	var started, finished []int
+	for idx, ev := range events {
+		switch ev.code {
+		case "compaction_started":
+			started = append(started, idx)
+			if ev.detail == "" {
+				t.Errorf("compaction_started event %d has empty phase detail", idx)
+			}
+		case "compaction_finished":
+			finished = append(finished, idx)
+		}
+	}
+
+	if len(started) == 0 {
+		t.Fatalf("no compaction_started emitted; events: %#v", events)
+	}
+	if len(started) != len(finished) {
+		t.Fatalf("started/finished not paired: %d started vs %d finished; events: %#v",
+			len(started), len(finished), events)
+	}
+	for i := range started {
+		if finished[i] < started[i] {
+			t.Fatalf("finished[%d]=%d precedes started[%d]=%d; events: %#v",
+				i, finished[i], i, started[i], events)
+		}
+	}
+	foundProactive := false
+	for _, idx := range started {
+		if events[idx].detail == "proactive" {
+			foundProactive = true
+		}
+	}
+	if !foundProactive {
+		t.Errorf("expected a compaction_started with phase=proactive; events: %#v", events)
+	}
+}

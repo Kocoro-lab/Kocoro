@@ -106,6 +106,18 @@ func emitCompactionFailureStatus(handler any, phase string, err error) {
 		fmt.Sprintf("%s: %v", phase, err))
 }
 
+// emitCompactionStatus surfaces the boundaries of one compaction pass as
+// transient run-status events (compaction_started / compaction_finished with
+// the phase as detail) so UI clients can show a "tidying context" indicator
+// while the summary calls run and remove it when the pass leaves. Every
+// started MUST be paired with a finished on all exits of the pass — success,
+// shaping no-op, and summary failure alike — or the indicator sticks.
+func (a *AgentLoop) emitCompactionStatus(code runstatus.Code, phase string) {
+	if rs, ok := a.handler.(RunStatusHandler); ok {
+		rs.OnRunStatus(string(code), phase)
+	}
+}
+
 // shortSessionTruncate is the original short-session fallback wrapper:
 // only fires when len(messages) is below MinShapeable so ShapeHistory
 // cannot help. Kept for the early preflight call sites (main_preflight,
@@ -3732,6 +3744,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// MinShapeable gate matches the main-loop site — without enough
 		// messages, ShapeHistory is a no-op and the summary call wastes tokens.
 		if shouldPreflightCompact(messages, a.contextWindow, a.estOverhead()) && len(messages) > ctxwin.MinShapeable() {
+			a.emitCompactionStatus(runstatus.CodeCompactionStarted, "force_stop")
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
 					fmt.Sprintf("force-stop turn estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
@@ -3757,6 +3770,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			if _, applied := applyShapedHistory(shaped, "force_stop", "force_stop_preflight"); applied {
 				captureRunMessages()
 			}
+			a.emitCompactionStatus(runstatus.CodeCompactionFinished, "force_stop")
 		}
 
 		req := client.CompletionRequest{
@@ -4227,6 +4241,7 @@ iterationLoop:
 			}
 			if shouldCompact {
 				a.tracker.Enter(PhaseCompacting)
+				a.emitCompactionStatus(runstatus.CodeCompactionStarted, "proactive")
 				if compactionSummary == "" {
 					// Write-before-compact: persist durable learnings to MEMORY.md
 					// before messages are discarded by compaction.
@@ -4304,6 +4319,7 @@ iterationLoop:
 						}
 					}
 				}
+				a.emitCompactionStatus(runstatus.CodeCompactionFinished, "proactive")
 			}
 		}
 
@@ -4408,6 +4424,7 @@ iterationLoop:
 		// repeatedly burn calls until lastPromptTokens drops back under 90%.
 		if shouldPreflightCompact(messages, a.contextWindow, a.estOverhead()) && !compactionApplied && !reactiveCompacted && len(messages) > ctxwin.MinShapeable() {
 			a.tracker.Enter(PhaseCompacting)
+			a.emitCompactionStatus(runstatus.CodeCompactionStarted, "preflight")
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
 					fmt.Sprintf("estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
@@ -4457,6 +4474,7 @@ iterationLoop:
 				captureRunMessages()
 				a.tracker.MarkDirty()
 			}
+			a.emitCompactionStatus(runstatus.CodeCompactionFinished, "preflight")
 		}
 
 		// Post-compaction safety net: ShapeHistory always preserves the
@@ -4770,6 +4788,7 @@ iterationLoop:
 					// remain idle-watched; everything else (ShapeHistory, local
 					// I/O) is intentionally not idle-counted.
 					a.tracker.Enter(PhaseCompacting)
+					a.emitCompactionStatus(runstatus.CodeCompactionStarted, "reactive")
 
 					// Write-before-compact: persist durable learnings before discarding history.
 					if a.memoryDir != "" {
@@ -4859,6 +4878,10 @@ iterationLoop:
 						reanchorActiveTask(MetaBoundaryPostCompactionNoRestore)
 						captureRunMessages()
 					}
+					// Emitted here — after all shaping/summary work, before the
+					// request rebuild — so every exit of the pass (including the
+					// rebuild's error return) has already paired with started.
+					a.emitCompactionStatus(runstatus.CodeCompactionFinished, "reactive")
 
 					// Rebuild request with compacted messages. The ordinary
 					// Responses cursor is deliberately NOT carried over: with
