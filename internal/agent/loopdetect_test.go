@@ -1056,11 +1056,26 @@ func TestLoopDetector_BrowserSnapshotInterleavedRepeatable(t *testing.T) {
 	// of 8 same-name calls — must stay Continue.
 	for i := range 5 {
 		ld.Record("browser_snapshot", `{}`, false, "", "", false)
+		action, msg := ld.Check("browser_snapshot")
+		if action != LoopContinue {
+			t.Fatalf("interleaved browser_snapshot call %d should Continue, got %v: %s", i+1, action, msg)
+		}
 		ld.Record("browser_click", fmt.Sprintf(`{"ref":"e%d"}`, i), false, "", "", false)
+		action, msg = ld.Check("browser_click")
+		if action != LoopContinue {
+			t.Fatalf("interleaved browser_click call %d should Continue, got %v: %s", i+1, action, msg)
+		}
 	}
-	action, msg := ld.Check("browser_click")
-	if action != LoopContinue {
-		t.Fatalf("interleaved browser_snapshot/browser_click should Continue, got %v: %s", action, msg)
+}
+
+func TestLoopDetector_BrowserSnapshotConsecutiveDuplicatesStillStop(t *testing.T) {
+	ld := NewLoopDetector()
+	for range 4 {
+		ld.Record("browser_snapshot", `{}`, false, "", "", false)
+	}
+	action, msg := ld.Check("browser_snapshot")
+	if action != LoopForceStop {
+		t.Fatalf("four consecutive browser snapshots should force-stop, got %v: %s", action, msg)
 	}
 }
 

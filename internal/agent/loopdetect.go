@@ -154,6 +154,15 @@ var dupExemptTools = map[string]bool{
 	"use_skill": true,
 }
 
+// windowDupExemptTools contains observation tools whose identical arguments
+// do not imply identical state when another action occurred between calls.
+// Consecutive duplicates remain protected by the stricter detector above, so
+// snapshot-only polling still stops while snapshot → click → snapshot remains
+// a valid state-observation workflow.
+var windowDupExemptTools = map[string]bool{
+	"browser_snapshot": true,
+}
+
 // isRepeatableToolName reports whether a tool naturally repeats across a
 // workflow and should be exempt from the generic NoProgress detectors. It
 // checks the configured repeatable set plus a "browser_" prefix so playwright
@@ -507,7 +516,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			}
 		}
 	}
-	if !dupExemptTools[name] && !exactRecovered {
+	if !dupExemptTools[name] && !windowDupExemptTools[name] && !exactRecovered {
 		threshold := ld.exactDupThreshold
 		if dupCount > 0 && dupErrCount == dupCount {
 			threshold = ld.exactDupThreshold * 2 // all-errors budget
