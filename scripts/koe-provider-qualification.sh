@@ -13,15 +13,18 @@ mkdir -p "$output_dir"
 sample="${KOE_PROVIDER_SAMPLE:-smoke}"
 repetitions="${KOE_PROVIDER_REPETITIONS:-1}"
 seed="${KOE_PROVIDER_SEED:-20260728}"
-pause_ms="${KOE_PROVIDER_PAUSE_MS:-0}"
 case "$sample" in
   smoke)
     smoke=1
     default_cost=5
+    default_pause_ms=0
     ;;
   release)
     smoke=0
     default_cost=25
+    # Smooth hundreds of paid calls without materially extending the run.
+    # Override with KOE_PROVIDER_PAUSE_MS when a provider publishes a tighter limit.
+    default_pause_ms=250
     if [[ ! "$repetitions" =~ ^[0-9]+$ || "$repetitions" -lt 30 ]]; then
       echo "Release provider qualification requires KOE_PROVIDER_REPETITIONS >= 30." >&2
       exit 2
@@ -32,6 +35,7 @@ case "$sample" in
     exit 2
     ;;
 esac
+pause_ms="${KOE_PROVIDER_PAUSE_MS:-$default_pause_ms}"
 if [[ ! "$repetitions" =~ ^[0-9]+$ || "$repetitions" -lt 1 || "$repetitions" -gt 50 ]]; then
   echo "KOE_PROVIDER_REPETITIONS must be an integer from 1 through 50." >&2
   exit 2

@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -398,6 +399,7 @@ type APIError struct {
 	StatusCode int
 	Code       string
 	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -405,6 +407,66 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("API returned %d: %s", e.StatusCode, e.Body)
 	}
 	return fmt.Sprintf("API returned %d", e.StatusCode)
+}
+
+const maxAPIRetryAfter = 60 * time.Second
+
+var retryAfterMessagePattern = regexp.MustCompile(
+	`(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s|seconds?)`,
+)
+
+func boundedAPIRetryAfter(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	if delay > maxAPIRetryAfter {
+		return maxAPIRetryAfter
+	}
+	return delay
+}
+
+func parseAPIRetryAfterHeader(raw string, now time.Time) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseFloat(raw, 64); err == nil && seconds >= 0 {
+		return boundedAPIRetryAfter(time.Duration(seconds * float64(time.Second)))
+	}
+	deadline, err := http.ParseTime(raw)
+	if err != nil {
+		return 0
+	}
+	return boundedAPIRetryAfter(deadline.Sub(now))
+}
+
+func parseAPIRetryAfterMessage(body string) time.Duration {
+	match := retryAfterMessagePattern.FindStringSubmatch(body)
+	if len(match) != 3 {
+		return 0
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil || value < 0 {
+		return 0
+	}
+	delay := time.Duration(value * float64(time.Second))
+	if strings.EqualFold(match[2], "ms") {
+		delay = time.Duration(value * float64(time.Millisecond))
+	}
+	return boundedAPIRetryAfter(delay)
+}
+
+func apiErrorFromHTTPResponse(resp *http.Response) *APIError {
+	body := readResponseBody(resp)
+	retryAfter := parseAPIRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
+	if bodyDelay := parseAPIRetryAfterMessage(body); bodyDelay > retryAfter {
+		retryAfter = bodyDelay
+	}
+	return &APIError{
+		StatusCode: resp.StatusCode,
+		Body:       body,
+		RetryAfter: retryAfter,
+	}
 }
 
 // ErrStreamIdleTimeout is returned by CompleteStream when no SSE chunk has
@@ -1515,7 +1577,7 @@ func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*C
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+		return nil, apiErrorFromHTTPResponse(resp)
 	}
 
 	raw, err := io.ReadAll(resp.Body)
@@ -1654,7 +1716,7 @@ func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionReques
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+		return nil, apiErrorFromHTTPResponse(resp)
 	}
 
 	var result *CompletionResponse
@@ -1859,6 +1921,7 @@ func parseSSEAPIError(line string) *APIError {
 		StatusCode: status,
 		Code:       event.Error.Code,
 		Body:       body,
+		RetryAfter: parseAPIRetryAfterMessage(body),
 	}
 }
 
@@ -1887,6 +1950,7 @@ func parseJSONAPIError(payload []byte) *APIError {
 		StatusCode: status,
 		Code:       event.Error.Code,
 		Body:       body,
+		RetryAfter: parseAPIRetryAfterMessage(body),
 	}
 }
 

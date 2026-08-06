@@ -1454,7 +1454,7 @@ func TestKoeFastQualificationLive_AgentLoop(t *testing.T) {
 		if err := writeKoeQualificationReport(partialPath, partial); err != nil {
 			t.Fatalf("write content-free partial report: %v", err)
 		}
-		if result.CompletionCalls > 0 && !result.CostObserved {
+		if koeQualificationMissingCostRequiresAbort(result) {
 			t.Fatalf(
 				"qualification cost observation missing: completed=%d scheduled=%d partial=%s",
 				completed,
@@ -1533,6 +1533,50 @@ func TestKoeFastQualificationLive_AgentLoop(t *testing.T) {
 			report.DuplicateSideEffectFailures,
 			report.CostFailureCount,
 		)
+	}
+}
+
+func koeQualificationMissingCostRequiresAbort(
+	result koeQualificationRunReport,
+) bool {
+	return result.CompletionCalls > 0 &&
+		!result.CostObserved &&
+		result.RuntimeErrorClass == ""
+}
+
+func TestKoeQualificationMissingCostAbortPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		result koeQualificationRunReport
+		want   bool
+	}{
+		{
+			name: "healthy completion must carry cost",
+			result: koeQualificationRunReport{
+				CompletionCalls: 1,
+			},
+			want: true,
+		},
+		{
+			name: "provider failure is recorded and batch continues",
+			result: koeQualificationRunReport{
+				CompletionCalls:   3,
+				RuntimeErrorClass: "http_error",
+			},
+		},
+		{
+			name: "pre-dispatch failure has no expected cost",
+			result: koeQualificationRunReport{
+				RuntimeErrorClass: "resolver_http_error",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := koeQualificationMissingCostRequiresAbort(tt.result); got != tt.want {
+				t.Fatalf("abort = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 

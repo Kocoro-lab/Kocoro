@@ -3,9 +3,79 @@ package agent
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
+
+func TestLLMRetryDelayHonorsRateLimitCooldown(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		attempt int
+		want    time.Duration
+	}{
+		{
+			name:    "ordinary transient keeps short exponential delay",
+			err:     &client.APIError{StatusCode: 503},
+			attempt: 1,
+			want:    2 * time.Second,
+		},
+		{
+			name:    "rate limit gets a useful local floor",
+			err:     &client.APIError{StatusCode: 429},
+			attempt: 0,
+			want:    5 * time.Second,
+		},
+		{
+			name: "provider hint wins",
+			err: fmt.Errorf("wrapped: %w", &client.APIError{
+				StatusCode: 429,
+				RetryAfter: 17 * time.Second,
+			}),
+			attempt: 1,
+			want:    17 * time.Second,
+		},
+		{
+			name: "provider hint is bounded",
+			err: &client.APIError{
+				StatusCode: 429,
+				RetryAfter: 5 * time.Minute,
+			},
+			want: 60 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := llmRetryDelay(tt.err, tt.attempt); got != tt.want {
+				t.Fatalf("llmRetryDelay() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldFallbackToNonStreaming(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "rate limit", err: &client.APIError{StatusCode: 429}},
+		{name: "server error", err: &client.APIError{StatusCode: 503}},
+		{name: "bad request", err: &client.APIError{StatusCode: 400}},
+		{name: "legacy endpoint missing", err: &client.APIError{StatusCode: 404}, want: true},
+		{name: "legacy method unsupported", err: &client.APIError{StatusCode: 405}, want: true},
+		{name: "stream transport failure", err: fmt.Errorf("stream read error: unexpected EOF"), want: true},
+		{name: "stream idle timeout", err: client.ErrStreamIdleTimeout},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldFallbackToNonStreaming(tt.err); got != tt.want {
+				t.Fatalf("fallback = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestIsRetryableLLMError(t *testing.T) {
 	tests := []struct {

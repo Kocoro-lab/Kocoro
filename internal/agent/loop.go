@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -4677,8 +4678,11 @@ iterationLoop:
 						setRunStatus(runstatus.CodeDeadlineExceeded, true)
 						return partial, usage, fmt.Errorf("stream aborted: %w", err)
 					}
-					// Fall back to non-streaming if gateway doesn't support it
-					if err != nil {
+					// Fall back only when streaming itself is unavailable or the
+					// stream transport broke. Provider/API failures (notably 429)
+					// belong to the bounded retry loop; immediately reissuing the
+					// same request non-streaming amplifies an active rate limit.
+					if err != nil && shouldFallbackToNonStreaming(err) {
 						streamTools.CancelAll()
 						// Telemetry (NOT a fix): a streaming call that drops here
 						// re-issues as a non-stream request. If the gateway opened a
@@ -4692,12 +4696,14 @@ iterationLoop:
 						fmt.Fprintf(os.Stderr, "[agent] stream->nonstream fallback iter=%d continuation=%d session_id=%q cache_source=%q skip_cache_write=%t stream_err_type=%T stream_err=%q\n",
 							i, continuationCount, req.SessionID, req.CacheSource, req.SkipCacheWrite, err, err.Error())
 						resp, err = a.client.Complete(ctx, req)
-					} else if resp != nil {
+					} else if err == nil && resp != nil {
 						committedStreamTools = streamTools
 						committedStreamTools.CancelUnmatched(resp.AllToolCalls())
-					} else {
+					} else if err == nil {
 						streamTools.CancelAll()
 						err = errors.New("streaming completion returned no response")
+					} else {
+						streamTools.CancelAll()
 					}
 				} else {
 					resp, err = a.client.Complete(ctx, req)
@@ -4965,7 +4971,7 @@ iterationLoop:
 					setRunStatus(runstatus.CodeFromError(err), false)
 					return "", usage, fmt.Errorf("LLM call failed: %w", err)
 				}
-				backoff := time.Duration(1<<attempt) * time.Second // 1s, 2s, 4s
+				backoff := llmRetryDelay(err, attempt)
 				reason := classifyLLMError(err)
 				retryCount++
 				reanchorActiveTask(MetaBoundaryRetryAfterError)
@@ -6782,7 +6788,7 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
 		if !isRetryableLLMError(err) || attempt >= maxRetries-1 {
 			return nil, fmt.Errorf("LLM call failed: %w", err)
 		}
-		backoff := time.Duration(1<<attempt) * time.Second
+		backoff := llmRetryDelay(err, attempt)
 		fmt.Fprintf(os.Stderr, "[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n", attempt+1, maxRetries, backoff, err)
 		if a.handler != nil {
 			a.handler.OnCloudAgent("", "retry", fmt.Sprintf("Retrying request (attempt %d/%d)…", attempt+1, maxRetries))
@@ -6870,6 +6876,56 @@ func isRetryableLLMError(err error) bool {
 	// is. ErrStreamIdleTimeout is a transport shape but the veto above keeps it
 	// non-retryable — retrying a silent idle timeout just re-hangs.
 	return client.TransportErrorShape(err)
+}
+
+func shouldFallbackToNonStreaming(err error) bool {
+	if err == nil || errors.Is(err, client.ErrStreamIdleTimeout) {
+		return false
+	}
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		return true
+	}
+	switch apiErr.StatusCode {
+	case http.StatusNotFound,
+		http.StatusMethodNotAllowed,
+		http.StatusUnsupportedMediaType,
+		http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	llmRateLimitRetryBase = 5 * time.Second
+	llmRetryDelayMax      = 60 * time.Second
+)
+
+// llmRetryDelay keeps ordinary transient retries short, while giving 429s
+// enough time to clear instead of exhausting all attempts in three seconds.
+// A bounded provider Retry-After hint wins over the local schedule.
+func llmRetryDelay(err error, attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 6 {
+		attempt = 6
+	}
+	delay := time.Duration(1<<attempt) * time.Second
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode == http.StatusTooManyRequests {
+			delay = time.Duration(1<<attempt) * llmRateLimitRetryBase
+		}
+		if apiErr.RetryAfter > delay {
+			delay = apiErr.RetryAfter
+		}
+	}
+	if delay > llmRetryDelayMax {
+		return llmRetryDelayMax
+	}
+	return delay
 }
 
 // classifyLLMError returns a human-readable reason for an LLM error.

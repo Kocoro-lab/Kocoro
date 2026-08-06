@@ -725,6 +725,39 @@ func TestCompleteReturnsTypedJSONAPIErrorAfterHeaderFlush(t *testing.T) {
 	}
 }
 
+func TestCompleteCarriesBoundedRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	gateway := NewGatewayClient(server.URL, "")
+	_, err := gateway.Complete(
+		context.Background(),
+		CompletionRequest{Messages: []Message{{Role: "user", Content: NewTextContent("hi")}}},
+	)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Complete error = %T %v, want *APIError", err, err)
+	}
+	if apiErr.StatusCode != http.StatusTooManyRequests || apiErr.RetryAfter != 7*time.Second {
+		t.Fatalf("rate-limit error = %+v", apiErr)
+	}
+}
+
+func TestParseAPIRetryAfterMessage(t *testing.T) {
+	if got := parseAPIRetryAfterMessage("Please try again in 11.054s."); got != 11*time.Second+54*time.Millisecond {
+		t.Fatalf("seconds delay = %v", got)
+	}
+	if got := parseAPIRetryAfterMessage("try again in 250ms"); got != 250*time.Millisecond {
+		t.Fatalf("millisecond delay = %v", got)
+	}
+	if got := parseAPIRetryAfterMessage("try again later"); got != 0 {
+		t.Fatalf("invalid delay = %v", got)
+	}
+}
+
 func TestCompleteStreamReturnsTypedSSEAPIError(t *testing.T) {
 	for _, timeout := range []time.Duration{0, time.Second} {
 		t.Run(timeout.String(), func(t *testing.T) {
