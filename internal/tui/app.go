@@ -191,10 +191,19 @@ type Model struct {
 	// fileRestoreBuilder overrides the /compact restoration source in tests;
 	// nil means the live agentLoop's BuildPostCompactionFileRestore.
 	fileRestoreBuilder func([]client.Message, int) (client.Message, bool)
+	// compactTestHookAfterSummary runs between the summary call and the
+	// post-LLM cancellation check; tests use it to land a cancel exactly at
+	// the checkpoint-guard site. nil in production.
+	compactTestHookAfterSummary func()
 	// compactGen invalidates in-flight /compact results: bumped when a compact
 	// pass starts AND when an agent run starts, so a compactDoneMsg from an
 	// Esc-cancelled pass cannot flip UI state under newer work.
 	compactGen int
+	// compactInFlight makes /compact and agent runs mutually exclusive: the
+	// worker reads unsynchronized live-loop state, so a run must not start
+	// under it (and vice versa). Set at the /compact submit site; cleared in
+	// the compactDoneMsg handler and both cancel branches.
+	compactInFlight bool
 	textarea            textarea.Model
 	viewport            viewport.Model // scrollable conversation history (alt-screen)
 	output              []outputBlock
@@ -998,6 +1007,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				// Invalidate any in-flight /compact (same rationale as the Esc branch).
 				m.compactGen++
+				m.compactInFlight = false
 				if m.state == stateApproval {
 					select {
 					case m.approvalCh <- false:
@@ -1038,6 +1048,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// cannot print "Compact failed: context canceled" on top of
 				// the [Cancelled] line below.
 				m.compactGen++
+				m.compactInFlight = false
 				// Unblock approval goroutine if waiting
 				if m.state == stateApproval {
 					select {
@@ -1585,6 +1596,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.rerenderOutput()
 
 	case compactDoneMsg:
+		m.compactInFlight = false
 		if msg.gen != m.compactGen {
 			// Result of an Esc-cancelled pass arriving under newer work —
 			// dropping it keeps it from flipping the newer run's UI state.
@@ -1594,7 +1606,10 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateInput
 		if msg.err != nil {
 			m.appendOutput(fmt.Sprintf("Compact failed: %v", msg.err))
-		} else if err := m.applyCompactResult(msg); err != nil {
+		} else if err := m.applyCompactResult(msg); errors.Is(err, errCompactSessionChanged) {
+			// Not a failure: the user moved on; the pass is simply discarded.
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorDim).Render("  Compact result discarded (session changed)"))
+		} else if err != nil {
 			m.appendOutput(fmt.Sprintf("Compact failed: %v", err))
 		} else {
 			m.appendOutput(formatCompactResult(msg))
@@ -1952,6 +1967,10 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	}
 
 	// Local agent loop
+	if m.compactInFlight {
+		m.appendOutput("Compacting context — try again in a moment")
+		return m, m.rerenderOutput()
+	}
 	m.state = stateProcessing
 	m.lastToolResults = nil
 	// Reset any live preview before the new run streams into it: a previous
@@ -2720,6 +2739,10 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		if len(parts) > 1 {
 			customInstructions = strings.Join(parts[1:], " ")
 		}
+		if m.state != stateInput {
+			m.appendOutput("Busy — wait for the current run to finish before /compact")
+			break
+		}
 		m.appendOutput("Compacting context...")
 		m.state = stateProcessing
 		m.processingStartTime = time.Now()
@@ -2727,6 +2750,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		// fold can actually be abandoned mid-flight.
 		ctx, cancel := context.WithCancel(context.Background())
 		m.cancelRun = cancel
+		m.compactInFlight = true
 		m.compactGen++
 		compactFn := m.runCompact(ctx, customInstructions, m.compactGen)
 		return m, tea.Batch(func() tea.Msg { return compactFn() }, spinnerTick(), spinnerFrameTick())

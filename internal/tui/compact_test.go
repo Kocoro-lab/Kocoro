@@ -161,6 +161,9 @@ func TestCompact_FailedSaveRollsBackCheckpoint(t *testing.T) {
 		t.Fatalf("worker phase must succeed: %v", result.err)
 	}
 
+	if os.Geteuid() == 0 {
+		t.Skip("chmod-based write denial is a no-op under root")
+	}
 	// Drop write permission so the atomic session write in the apply phase fails.
 	if err := os.Chmod(sessDir, 0o555); err != nil {
 		t.Fatalf("chmod: %v", err)
@@ -295,8 +298,17 @@ func TestCompact_SkipsRestoreWhenTailEndsWithUser(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("runCompact: %v", result.err)
 	}
-	if n := len(result.shaped); n == 0 || strings.Contains(result.shaped[n-1].Content.Text(), "restored-content") {
-		t.Fatalf("restore block must be skipped on a user-ending tail: %#v", result.shaped[n-1].Content.Text())
+	if len(result.shaped) == 0 {
+		t.Fatal("shaped payload is empty")
+	}
+	last := result.shaped[len(result.shaped)-1]
+	// Precondition: the fixture must actually produce a user-ending tail, or
+	// this test passes vacuously and no longer covers the guard.
+	if last.Role != "user" {
+		t.Fatalf("fixture no longer yields a user-ending tail (got role %q); rework the fixture", last.Role)
+	}
+	if strings.Contains(last.Content.Text(), "restored-content") {
+		t.Fatalf("restore block must be skipped on a user-ending tail: %q", last.Content.Text())
 	}
 }
 
@@ -392,19 +404,55 @@ func TestCompact_CancelledContextDoesNotPersistCheckpoint(t *testing.T) {
 		t.Fatalf("cancelled pass must not persist a checkpoint: %#v", sess.CompactionCheckpoint)
 	}
 
-	// Site 2: cancel lands mid-flight, from inside the gateway handler.
+	// Site 2: cancel lands AFTER a successful summary, exactly at the
+	// post-LLM guard before shaping/restore — the deterministic seam for the
+	// check the first site never reaches.
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cancel2()
-		_ = json.NewEncoder(w).Encode(client.CompletionResponse{OutputText: "ignored"})
+		_ = json.NewEncoder(w).Encode(client.CompletionResponse{
+			OutputText: "<summary>\n## Current task & next steps\nkeep going.\n</summary>",
+			Usage:      client.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		})
 	}))
 	defer server.Close()
 	m.gateway = client.NewGatewayClient(server.URL, "")
+	m.compactTestHookAfterSummary = cancel2
 	result = m.runCompact(ctx2, "", 4)()
 	if result.err == nil {
-		t.Fatal("mid-flight cancellation must surface an error")
+		t.Fatal("post-summary cancellation must surface an error")
+	}
+	if len(result.shaped) != 0 {
+		t.Fatal("post-summary cancellation must not produce a checkpoint payload")
 	}
 	if sess.CompactionCheckpoint != nil {
-		t.Fatalf("mid-flight cancellation must not persist a checkpoint: %#v", sess.CompactionCheckpoint)
+		t.Fatalf("cancellation must not persist a checkpoint: %#v", sess.CompactionCheckpoint)
+	}
+}
+
+// /compact and agent runs are mutually exclusive in both directions: the
+// worker reads unsynchronized live-loop state, and an abandoned pass would
+// otherwise bill for up to the full compact timeout with no cancel owner.
+func TestCompactRunMutualExclusion(t *testing.T) {
+	m := newCommandTestModel(t)
+
+	// Direction 1: /compact refused while a run is processing.
+	m.state = stateProcessing
+	outputLen := len(m.output)
+	m.handleSlashCommand("/compact")
+	if m.compactInFlight {
+		t.Fatal("/compact must be refused while a run is active")
+	}
+	if len(m.output) == outputLen {
+		t.Fatal("refusal must tell the user why")
+	}
+
+	// Direction 2: a new local run refused while a compact is in flight.
+	m.state = stateProcessing
+	m.compactInFlight = true
+	m.textarea.SetValue("hello")
+	updated, _ := m.handleSubmit()
+	m = updated.(*Model)
+	if m.cancelRun != nil {
+		t.Fatal("a run must not start under an in-flight compact")
 	}
 }

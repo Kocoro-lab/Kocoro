@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -139,6 +140,9 @@ func (m *Model) runCompact(ctx context.Context, customInstructions string, gen i
 		if err != nil {
 			return done(compactDoneMsg{err: fmt.Errorf("summarization failed: %w", err)})
 		}
+		if m.compactTestHookAfterSummary != nil {
+			m.compactTestHookAfterSummary()
+		}
 
 		// Step 3: shape history.
 		// ShapeHistory expects [system] + [first user] + ... but TUI sessions
@@ -217,15 +221,27 @@ func (m *Model) runCompact(ctx context.Context, customInstructions string, gen i
 // snapshot, checkpoint swap, usage accounting, and the durable save with
 // rollback. Runs on the UI goroutine from the compactDoneMsg handler, after
 // the generation check, so it cannot interleave with a newer run's writes.
+// errCompactSessionChanged marks a discarded-but-not-failed apply: the user
+// switched sessions while the pass ran. Rendered as an informational line.
+var errCompactSessionChanged = errors.New("session changed while compacting; result discarded")
+
 func (m *Model) applyCompactResult(msg compactDoneMsg) error {
 	sess := m.sessions.Current()
 	if sess == nil || sess.ID != msg.sessionID {
-		return fmt.Errorf("session changed while compacting; result discarded")
+		return errCompactSessionChanged
+	}
+	// Defence-in-depth: the load-time validation in store.go would fail open
+	// on an out-of-range index, but the invariant should hold locally too.
+	if msg.archiveThrough > len(sess.Messages) {
+		return fmt.Errorf("compact result stale: archive index %d beyond %d messages", msg.archiveThrough, len(sess.Messages))
 	}
 	// Preserve the exact prior live state as best-effort rollback material,
 	// then replace only the live checkpoint. The transcript and its metadata
 	// remain lossless and index-stable for resume/search/share/audit.
 	if retention := m.cfg.Agent.CompactionSnapshotRetention; retention > 0 {
+		// "manual" here is the snapshot-directory phase label, a separate
+		// namespace from run_status details (which have no manual phase —
+		// TUI /compact emits no status events).
 		if err := m.sessions.SaveCompactionSnapshot(sess.ID, "manual", msg.preCompact, retention); err != nil {
 			log.Printf("tui: manual compaction snapshot failed (session=%s): %v", sess.ID, err)
 		}
