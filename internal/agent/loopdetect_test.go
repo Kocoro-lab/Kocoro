@@ -472,6 +472,42 @@ func TestLoopDetector_WebFamily_ResultSigDedup(t *testing.T) {
 	}
 }
 
+func TestLoopDetector_SearchArgumentChurnStableResultBlocksBeforeEighthCall(t *testing.T) {
+	ld := NewLoopDetector()
+	fillers := []string{"today", "latest", "top", "current", "major", "breaking", "headlines"}
+	for call, filler := range fillers {
+		args := fmt.Sprintf(`{"query":"world climate %s March 2 2026"}`, filler)
+		if action, msg := ld.CheckBefore("web_search", args, true); action != LoopContinue {
+			t.Fatalf("search call %d blocked before its recovery window: %v %s", call+1, action, msg)
+		}
+		ld.RecordOutcome("web_search", args, false, "", "reuters.com,bbc.com", "same results", true, false)
+	}
+
+	action, msg := ld.CheckBefore(
+		"web_search",
+		`{"query":"world climate news update March 2 2026"}`,
+		true,
+	)
+	if action != LoopForceStop {
+		t.Fatalf("eighth same-topic stable-result search must be blocked before execution, got %v: %s", action, msg)
+	}
+}
+
+func TestLoopDetector_SearchArgumentChurnChangingResultsContinues(t *testing.T) {
+	ld := NewLoopDetector()
+	fillers := []string{"today", "latest", "top", "current", "major", "breaking", "headlines", "update"}
+	for call, filler := range fillers {
+		args := fmt.Sprintf(`{"query":"world climate %s March 2 2026"}`, filler)
+		if action, msg := ld.CheckBefore("web_search", args, true); action != LoopContinue {
+			t.Fatalf("changing-result search call %d must remain admissible: %v %s", call+1, action, msg)
+		}
+		ld.RecordOutcome("web_search", args, false, "", fmt.Sprintf("source-%d.example", call), fmt.Sprintf("result-%d", call), true, false)
+		if action, msg := ld.Check("web_search"); action == LoopForceStop {
+			t.Fatalf("changing-result search call %d force-stopped: %s", call+1, msg)
+		}
+	}
+}
+
 func TestLoopDetector_WebFamily_AlternatingSearchFetchStillNudges(t *testing.T) {
 	ld := NewLoopDetector()
 

@@ -132,20 +132,20 @@
     {
       "id": "loop_varied_world_news_queries",
       "class": "loop",
-      "expectation": {"first_nudge_min": 3, "first_nudge_max": 5, "first_force_stop_min": 6, "first_force_stop_max": 12, "ideal_stop_after": 5, "max_wasted_calls": 7},
+      "expectation": {"first_nudge_min": 3, "first_nudge_max": 5, "first_force_stop_min": 8, "first_force_stop_max": 8, "ideal_stop_after": 5, "max_wasted_calls": 3},
       "events": [
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 major headlines\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines Reuters AP BBC\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters AP BBC Al Jazeera CNN\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 latest updates\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 breaking\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP\"}", "result_sig": "reuters.com,bbc.com"},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 BBC CNN Al Jazeera\"}", "result_sig": "reuters.com,bbc.com"}
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 major headlines\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines Reuters AP BBC\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters AP BBC Al Jazeera CNN\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 latest updates\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 breaking\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 BBC CNN Al Jazeera\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true}
       ]
     }
   ]

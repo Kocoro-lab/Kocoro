@@ -24,6 +24,8 @@ const (
 	readOnlyStableBlockAfter = 5
 	pingPongNudgeAt          = 6
 	pingPongBlockAfter       = 8
+	webStableNudgeAt         = 5
+	webStableBlockAfter      = 7
 )
 
 func loopForceStopNote(detail string) string {
@@ -57,11 +59,12 @@ type ToolCallRecord struct {
 //   - ConsecutiveDuplicate: back-to-back identical calls (catches web_search→web_search)
 //   - ExactDuplicate: same name+argsHash spread across window (catches read→edit→read→edit→read)
 //   - SameToolError: same tool returns errors N+ times in window
-//   - FamilyNoProgress: tools in the same family, counted by topic similarity
-//     (3 same-topic → nudge, 5 → stronger nudge, 7 → force stop)
-//     Fallback: same-tool count when topic tracking unavailable (5 → nudge, 7 → force stop)
+//   - FamilyNoProgress: tools in the same family, counted by topic or result
+//     similarity (stable web results → nudge at 5 and block call 8 before
+//     dispatch; same-topic calls with changing results use the broader 5/8/12 budget)
+//     Fallback: same-tool count when topic tracking unavailable (8 → nudge, 12 → force stop)
 //   - SearchEscalation: trailing unproductive search-family calls
-//     (5 unproductive → nudge, 8 unproductive → force stop)
+//     (7 unproductive → nudge, 12 unproductive → force stop)
 //   - NoProgress: same tool called M+ times regardless of args (skip visual/search tools,
 //     semi-repeatable tools like bash get a higher threshold)
 //
@@ -418,6 +421,13 @@ func (ld *LoopDetector) CheckBefore(name, argsJSON string, isReadOnly bool) (Loo
 			"Blocked %s before execution: it would continue an outcome-stable two-action loop after %d completed calls.",
 			name, pingPongBlockAfter)
 	}
+	if toolFamily(name) == "web" {
+		if count := stableWebResultTail(ld.history); count >= webStableBlockAfter {
+			return LoopForceStop, fmt.Sprintf(
+				"Blocked %s before execution: %d consecutive web calls returned the same sources despite changed arguments.",
+				name, count)
+		}
+	}
 	return LoopContinue, ""
 }
 
@@ -433,7 +443,11 @@ func (ld *LoopDetector) ShouldDisableSpeculation() bool {
 	if stableReadOnlyActionTail(ld.history, last.Name, last.ArgsHash) >= readOnlyStableNudgeAt {
 		return true
 	}
-	return pingPongNoProgressCount(ld.history) >= pingPongNudgeAt
+	if pingPongNoProgressCount(ld.history) >= pingPongNudgeAt {
+		return true
+	}
+	return toolFamily(last.Name) == "web" &&
+		stableWebResultTail(ld.history) >= webStableNudgeAt
 }
 
 // Check evaluates all detectors for the named tool.
@@ -710,6 +724,12 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		if sameResultCount > progressCount {
 			progressCount = sameResultCount
 		}
+		if family == "web" {
+			if stableCount := stableWebResultTail(ld.history); stableCount >= webStableBlockAfter+1 {
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You made %d consecutive web calls with changed arguments, but they returned the same sources.", stableCount))
+			}
+		}
 
 		// For repeatable tools (browser_*, screenshot, computer_use, accessibility, computer),
 		// a stable result_sig is a weak "no progress" signal: SPA workflows and
@@ -874,6 +894,28 @@ func stableReadOnlyActionTail(history []ToolCallRecord, name, argsHash string) i
 		if latestOutcome == "" {
 			latestOutcome = record.OutcomeSig
 		} else if record.OutcomeSig != latestOutcome {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func stableWebResultTail(history []ToolCallRecord) int {
+	if len(history) == 0 {
+		return 0
+	}
+	latestResult := ""
+	count := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		record := history[i]
+		if toolFamily(record.Name) != "web" ||
+			!record.IsReadOnly || record.IsError || record.ResultSig == "" {
+			break
+		}
+		if latestResult == "" {
+			latestResult = record.ResultSig
+		} else if record.ResultSig != latestResult {
 			break
 		}
 		count++
