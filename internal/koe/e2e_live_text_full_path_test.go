@@ -3,19 +3,21 @@
 package koe
 
 // Paid live text E2E for the complete Koe delegation and result-delivery path.
-// Unlike the narrower selector and result-summary tests, this keeps both live
-// boundaries in one run: OpenAI Realtime selects do_task, the production event
-// handler delegates to the running daemon and its real provider, ResultMailbox
-// returns the completed result to the same Realtime session, and the test
-// verifies the final spoken transcript plus the persisted daemon session.
+// Unlike the narrower selector and result-summary tests, this starts an isolated
+// daemon built from the current worktree and keeps both live boundaries in one
+// run: OpenAI Realtime selects do_task, the production event handler delegates
+// to the daemon and its real provider, ResultMailbox returns the completed
+// result to the same Realtime session, and the test verifies the final spoken
+// transcript plus the persisted daemon session. Text/audio and Fast/Full are
+// exercised as one matrix without touching the Desktop-owned daemon on :7533.
 //
 // It intentionally has its own gate so KOE_E2E=1 does not add a real daemon
 // agent turn to the existing live Realtime suite.
 //
 //	KOE_LIVE_TEXT_FULL_PATH_E2E=1 \
 //	PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
-//	go test ./internal/koe -run '^TestKoeLiveTextFullPathE2E$' \
-//	  -count=1 -v -timeout=5m
+//	go test ./internal/koe -run '^TestKoeLiveFullPathMatrixE2E$' \
+//	  -count=1 -v -timeout=12m
 
 import (
 	"context"
@@ -29,14 +31,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/pion/webrtc/v4"
 )
 
 const (
-	liveTextFullPathGate   = "KOE_LIVE_TEXT_FULL_PATH_E2E"
-	liveTextFullPathMarker = "323"
-	liveTextFullPathPrompt = "这是一项需要实际执行的真实任务：计算 17 × 19，只用一句简短中文告诉我结果。"
+	liveTextFullPathGate = "KOE_LIVE_TEXT_FULL_PATH_E2E"
+	liveFastMarker       = "323"
+	liveFullMarker       = "437"
 )
+
+type liveFullPathInput string
+
+const (
+	liveInputText  liveFullPathInput = "text"
+	liveInputAudio liveFullPathInput = "audio"
+)
+
+type liveFullPathScenario struct {
+	name       string
+	input      liveFullPathInput
+	prompt     string
+	marker     string
+	left       []string
+	right      []string
+	wantMode   executionprofile.Mode
+	wantReason executionprofile.FullReason
+}
 
 type liveTextFullPathDaemonStatus struct {
 	Version      string   `json:"version"`
@@ -68,7 +90,8 @@ type liveTextFullPathDoTaskArgs struct {
 }
 
 type liveTextFullPathProbe struct {
-	mu sync.Mutex
+	mu     sync.Mutex
+	marker string
 
 	doTaskCallIDs          []string
 	doTaskArgs             []liveTextFullPathDoTaskArgs
@@ -89,8 +112,9 @@ type liveTextFullPathProbe struct {
 	taskResultDoneAt time.Time
 }
 
-func newLiveTextFullPathProbe() *liveTextFullPathProbe {
+func newLiveTextFullPathProbe(marker string) *liveTextFullPathProbe {
 	return &liveTextFullPathProbe{
+		marker:                 marker,
 		functionOutputs:        make(map[string]int),
 		functionOutputStatuses: make(map[string][]string),
 		taskResultResponseIDs:  make(map[string]struct{}),
@@ -242,7 +266,7 @@ func (p *liveTextFullPathProbe) completed() bool {
 		if status != "completed" {
 			continue
 		}
-		if strings.Contains(strings.Join(p.transcripts[responseID], " "), liveTextFullPathMarker) {
+		if strings.Contains(strings.Join(p.transcripts[responseID], " "), p.marker) {
 			return true
 		}
 	}
@@ -272,22 +296,87 @@ func (p *liveTextFullPathProbe) snapshot() liveTextFullPathProbe {
 	}
 }
 
-func TestKoeLiveTextFullPathE2E(t *testing.T) {
+func TestKoeLiveFullPathMatrixE2E(t *testing.T) {
 	if os.Getenv(liveTextFullPathGate) != "1" {
 		t.Skip("paid live Realtime + daemon/provider E2E: set " + liveTextFullPathGate + "=1")
 	}
 	t.Setenv("KOE_TASK_LEDGER", "1")
 	t.Setenv("KOE_RESULT_DELIVERY", "1")
+	daemon := startLiveIsolatedDaemon(t)
 
+	statusCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	status := requireLiveTextFullPathDaemon(t, statusCtx, daemon.url)
+	defer cancel()
+	if status.Version != daemon.version {
+		t.Fatalf("isolated daemon version=%q, want current-worktree build %q", status.Version, daemon.version)
+	}
+	if status.IsConnected {
+		t.Fatal("isolated daemon unexpectedly opened the Cloud WS channel")
+	}
+	t.Logf("[daemon] version=%s pid=%d port=%d connected=%t state=%s", status.Version, daemon.cmd.Process.Pid, daemon.port, status.IsConnected, daemon.stateDir)
+
+	scenarios := []liveFullPathScenario{
+		{
+			name: "fast_text", input: liveInputText,
+			prompt: "这是一项需要实际执行的真实任务：计算 17 × 19，只用一句简短中文告诉我结果。",
+			marker: liveFastMarker, left: []string{"17", "seventeen"}, right: []string{"19", "nineteen"},
+			wantMode: executionprofile.ModeFast, wantReason: executionprofile.FullReasonNone,
+		},
+		{
+			name: "full_text", input: liveInputText,
+			prompt: "请明确使用 Full 模式执行这项真实任务：计算 19 × 23，只用一句简短中文告诉我结果。",
+			marker: liveFullMarker, left: []string{"19", "nineteen"}, right: []string{"23", "twenty-three", "twenty three"},
+			wantMode: executionprofile.ModeFull, wantReason: executionprofile.FullReasonExplicitFullRequest,
+		},
+		{
+			name: "fast_audio", input: liveInputAudio,
+			prompt: "Do this real task now: calculate seventeen times nineteen, and answer with one short sentence.",
+			marker: liveFastMarker, left: []string{"17", "seventeen"}, right: []string{"19", "nineteen"},
+			wantMode: executionprofile.ModeFast, wantReason: executionprofile.FullReasonNone,
+		},
+		{
+			name: "full_audio", input: liveInputAudio,
+			prompt: "Use Full mode for this real task: calculate nineteen times twenty-three, and answer with one short sentence.",
+			marker: liveFullMarker, left: []string{"19", "nineteen"}, right: []string{"23", "twenty-three", "twenty three"},
+			wantMode: executionprofile.ModeFull, wantReason: executionprofile.FullReasonExplicitFullRequest,
+		},
+	}
+
+	sessionIDs := make(map[string]string, len(scenarios))
+	for _, scenario := range scenarios {
+		scenario := scenario
+		t.Run(scenario.name, func(t *testing.T) {
+			sessionIDs[scenario.name] = runLiveFullPathScenario(t, daemon.url, status, scenario)
+		})
+	}
+
+	oldPID, newPID := daemon.crashAndRestart(t)
+	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer recoveryCancel()
+	restarted := requireLiveTextFullPathDaemon(t, recoveryCtx, daemon.url)
+	if restarted.Version != daemon.version {
+		t.Fatalf("restarted isolated daemon version=%q, want %q", restarted.Version, daemon.version)
+	}
+	for _, scenario := range scenarios {
+		sessionID := sessionIDs[scenario.name]
+		if sessionID == "" {
+			continue
+		}
+		requireLiveTextFullPathSession(t, recoveryCtx, daemon.url, sessionID, scenario)
+	}
+	t.Logf("RECOVERY: crash-restarted isolated daemon old_pid=%d new_pid=%d persisted_sessions=%d", oldPID, newPID, len(sessionIDs))
+}
+
+func runLiveFullPathScenario(t *testing.T, daemonURL string, status liveTextFullPathDaemonStatus, scenario liveFullPathScenario) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	daemonURL := strings.TrimSpace(os.Getenv("KOE_DAEMON_URL"))
-	if daemonURL == "" {
-		daemonURL = "http://127.0.0.1:7533"
+	var pcm []int16
+	if scenario.input == liveInputAudio {
+		pcm = synthSpokenWAV(t, scenario.prompt)
+		t.Logf("[wav] %d samples (%.2fs @ 48k mono)", len(pcm), float64(len(pcm))/48000)
 	}
-	status := requireLiveTextFullPathDaemon(t, ctx, daemonURL)
-	t.Logf("[daemon] version=%s connected=%t", status.Version, status.IsConnected)
 
 	daemonClient := NewDaemonClient(daemonURL)
 	ephemeralKey, err := daemonClient.MintViaDaemon(ctx, e2eModelName())
@@ -309,7 +398,7 @@ func TestKoeLiveTextFullPathE2E(t *testing.T) {
 		audio.Stop()
 	}()
 
-	probe := newLiveTextFullPathProbe()
+	probe := newLiveTextFullPathProbe(scenario.marker)
 	state := NewCallState(fmt.Sprintf("live-text-full-path-%d", time.Now().UnixNano()), "")
 	mailbox := NewResultMailbox()
 	mailbox.BeginBurst(state.BurstID())
@@ -331,7 +420,13 @@ func TestKoeLiveTextFullPathE2E(t *testing.T) {
 	go handler.runResponseSender(ctx)
 
 	configured := make(chan struct{})
-	var configuredOnce sync.Once
+	connected := make(chan struct{})
+	var configuredOnce, connectedOnce sync.Once
+	rc.pc.OnConnectionStateChange(func(connectionState webrtc.PeerConnectionState) {
+		if connectionState == webrtc.PeerConnectionStateConnected {
+			connectedOnce.Do(func() { close(connected) })
+		}
+	})
 	rc.dc.OnOpen(func() {
 		if err := send(sessionConfig(e2ePersona, "marin", false)); err != nil {
 			probe.mu.Lock()
@@ -352,14 +447,32 @@ func TestKoeLiveTextFullPathE2E(t *testing.T) {
 	if err := rc.dialOpenAI(ctx, ephemeralKey); err != nil {
 		t.Fatalf("dial OpenAI Realtime: %v", err)
 	}
+	if scenario.input == liveInputAudio {
+		go rc.pumpSendTrack(ctx)
+	}
+	select {
+	case <-connected:
+	case <-ctx.Done():
+		t.Fatalf("wait for WebRTC connection: %v", ctx.Err())
+	}
 	select {
 	case <-configured:
 	case <-ctx.Done():
 		t.Fatalf("wait for session.updated: %v", ctx.Err())
 	}
 
-	if err := sendLiveTextFullPathTurn(handler, send, liveTextFullPathPrompt); err != nil {
-		t.Fatalf("send text input: %v", err)
+	probe.mu.Lock()
+	probe.startedAt = time.Now()
+	probe.mu.Unlock()
+	switch scenario.input {
+	case liveInputText:
+		if err := sendLiveTextFullPathTurn(handler, send, scenario.prompt); err != nil {
+			t.Fatalf("send text input: %v", err)
+		}
+	case liveInputAudio:
+		feedWAV(ctx, audio, pcm)
+	default:
+		t.Fatalf("unknown live input mode %q", scenario.input)
 	}
 
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -395,6 +508,9 @@ func TestKoeLiveTextFullPathE2E(t *testing.T) {
 		t.Fatalf("do_task calls=%v, want exactly one non-empty call_id", snapshot.doTaskCallIDs)
 	}
 	callID := snapshot.doTaskCallIDs[0]
+	if len(snapshot.doTaskArgs) != 1 || snapshot.doTaskArgs[0].ExecutionMode != string(scenario.wantMode) || snapshot.doTaskArgs[0].FullReason != string(scenario.wantReason) {
+		t.Fatalf("do_task profile args=%+v, want mode=%s reason=%s", snapshot.doTaskArgs, scenario.wantMode, scenario.wantReason)
+	}
 	if got := snapshot.functionOutputs[callID]; got != 1 {
 		t.Fatalf("function_call_output count for %q=%d, want 1", callID, got)
 	}
@@ -402,7 +518,7 @@ func TestKoeLiveTextFullPathE2E(t *testing.T) {
 		t.Fatalf("result batches=%d, want 1: %+v", len(snapshot.resultBatches), snapshot.resultBatches)
 	}
 	result := snapshot.resultBatches[0]
-	if result.Status != "ok" || result.SessionID == "" || !strings.Contains(result.Reply, liveTextFullPathMarker) {
+	if result.Status != "ok" || result.SessionID == "" || !strings.Contains(result.Reply, scenario.marker) {
 		t.Fatalf("unexpected daemon result: %+v", result)
 	}
 	if snapshot.taskResultRequests != 1 || len(snapshot.taskResultResponseIDs) != 1 || len(snapshot.taskResultDoneStatuses) != 1 {
@@ -415,9 +531,19 @@ func TestKoeLiveTextFullPathE2E(t *testing.T) {
 	if pending := mailbox.pending(); pending != 0 {
 		t.Fatalf("result mailbox pending=%d after completed response.done, want 0", pending)
 	}
-	daemonUsage := requireLiveTextFullPathSession(t, ctx, daemonURL, result.SessionID)
+	tasks := state.AllTasks()
+	if len(tasks) != 1 || tasks[0].State != TaskCompleted {
+		t.Fatalf("voice task ledger=%+v, want one completed task", tasks)
+	}
+	executionRun := tasks[0].CurrentExecutionRun()
+	if executionRun.Profile.RequestedMode != scenario.wantMode || executionRun.Profile.EffectiveMode != scenario.wantMode {
+		t.Fatalf("voice execution profile=%+v, want requested/effective %s", executionRun.Profile, scenario.wantMode)
+	}
+	daemonUsage := requireLiveTextFullPathSession(t, ctx, daemonURL, result.SessionID, scenario)
 
-	t.Logf("VERDICT: daemon=%s call_id=%s session=%s selector_ms=%d daemon_ms=%d result_voice_ms=%d total_ms=%d",
+	t.Logf("VERDICT: input=%s mode=%s daemon=%s call_id=%s session=%s selector_ms=%d daemon_ms=%d result_voice_ms=%d total_ms=%d",
+		scenario.input,
+		scenario.wantMode,
 		status.Version,
 		callID,
 		result.SessionID,
@@ -429,6 +555,7 @@ func TestKoeLiveTextFullPathE2E(t *testing.T) {
 	t.Logf("USAGE: daemon_model=%s daemon_calls=%d daemon_input=%d daemon_output=%d daemon_total=%d daemon_cost_usd=%.8f web_search_calls=%d realtime=%+v",
 		daemonUsage.Model, daemonUsage.LLMCalls, daemonUsage.InputTokens, daemonUsage.OutputTokens,
 		daemonUsage.TotalTokens, daemonUsage.CostUSD, daemonUsage.WebSearchCalls, snapshot.realtimeUsages)
+	return result.SessionID
 }
 
 func sendLiveTextFullPathTurn(handler *eventHandler, send func(any) error, text string) error {
@@ -481,16 +608,13 @@ func requireLiveTextFullPathDaemon(t *testing.T, ctx context.Context, daemonURL 
 	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
 		t.Fatalf("decode daemon status: %v", err)
 	}
-	if !status.IsConnected {
-		t.Fatalf("daemon %s is not connected to Cloud", status.Version)
-	}
 	if !containsString(status.Capabilities, "koe_fast_profile_v1") {
 		t.Fatalf("daemon %s lacks koe_fast_profile_v1", status.Version)
 	}
 	return status
 }
 
-func requireLiveTextFullPathSession(t *testing.T, ctx context.Context, daemonURL, sessionID string) liveTextFullPathDaemonUsage {
+func requireLiveTextFullPathSession(t *testing.T, ctx context.Context, daemonURL, sessionID string, scenario liveFullPathScenario) liveTextFullPathDaemonUsage {
 	t.Helper()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(daemonURL, "/")+"/sessions/"+sessionID, nil)
 	if err != nil {
@@ -506,11 +630,9 @@ func requireLiveTextFullPathSession(t *testing.T, ctx context.Context, daemonURL
 		t.Fatalf("load daemon session %s HTTP %d: %s", sessionID, response.StatusCode, body)
 	}
 	var session struct {
-		Usage    liveTextFullPathDaemonUsage `json:"usage"`
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
+		Usage         liveTextFullPathDaemonUsage `json:"usage"`
+		ExecutionRuns []executionprofile.Run      `json:"execution_runs"`
+		Messages      []client.Message            `json:"messages"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&session); err != nil {
 		t.Fatalf("decode daemon session %s: %v", sessionID, err)
@@ -520,24 +642,38 @@ func requireLiveTextFullPathSession(t *testing.T, ctx context.Context, daemonURL
 	}
 	var sawUserTask, sawAssistantResult bool
 	for _, message := range session.Messages {
+		content := message.Content.Text()
 		switch message.Role {
 		case "user":
-			sawUserTask = sawUserTask || (strings.Contains(message.Content, "17") && strings.Contains(message.Content, "19"))
+			sawUserTask = sawUserTask || (containsAnyFold(content, scenario.left) && containsAnyFold(content, scenario.right))
 		case "assistant":
-			sawAssistantResult = sawAssistantResult || strings.Contains(message.Content, liveTextFullPathMarker)
+			sawAssistantResult = sawAssistantResult || strings.Contains(content, scenario.marker)
 		}
 	}
 	if !sawUserTask || !sawAssistantResult {
 		t.Fatalf("daemon session %s did not persist the arithmetic task and its verified result", sessionID)
 	}
-	if session.Usage.LLMCalls != 1 || session.Usage.TotalTokens == 0 {
-		t.Fatalf("daemon session %s usage=%+v, want one metered provider call", sessionID, session.Usage)
+	if session.Usage.LLMCalls < 1 || session.Usage.TotalTokens == 0 {
+		t.Fatalf("daemon session %s usage=%+v, want metered provider work", sessionID, session.Usage)
+	}
+	if scenario.wantMode == executionprofile.ModeFast && session.Usage.LLMCalls != 1 {
+		t.Fatalf("daemon Fast session %s calls=%d, want exactly 1", sessionID, session.Usage.LLMCalls)
+	}
+	if scenario.wantMode == executionprofile.ModeFull && session.Usage.LLMCalls > 4 {
+		t.Fatalf("daemon Full session %s calls=%d, want a bounded run of at most 4", sessionID, session.Usage.LLMCalls)
+	}
+	if len(session.ExecutionRuns) != 1 {
+		t.Fatalf("daemon session %s execution_runs=%d, want 1", sessionID, len(session.ExecutionRuns))
+	}
+	profile := session.ExecutionRuns[0].Profile
+	if profile.RequestedMode != scenario.wantMode || profile.EffectiveMode != scenario.wantMode {
+		t.Fatalf("daemon session %s profile=%+v, want requested/effective %s", sessionID, profile, scenario.wantMode)
 	}
 	return session.Usage
 }
 
 func TestKoeLiveTextFullPathHarnessContract(t *testing.T) {
-	probe := newLiveTextFullPathProbe()
+	probe := newLiveTextFullPathProbe(liveFastMarker)
 	probe.observeInbound([]byte(`{"type":"response.function_call_arguments.done","name":"do_task","call_id":"call-1"}`))
 	probe.observeOutbound(map[string]any{
 		"type": "conversation.item.create",
@@ -547,7 +683,7 @@ func TestKoeLiveTextFullPathHarnessContract(t *testing.T) {
 		"type": "conversation.item.create",
 		"item": map[string]any{
 			"type": "message", "role": "system",
-			"content": []map[string]any{{"type": "input_text", "text": "result\n" + `{"type":"kocoro.task_results.v1","results":[{"status":"ok","reply":"` + liveTextFullPathMarker + `","session_id":"session-1"}]}`}},
+			"content": []map[string]any{{"type": "input_text", "text": "result\n" + `{"type":"kocoro.task_results.v1","results":[{"status":"ok","reply":"` + liveFastMarker + `","session_id":"session-1"}]}`}},
 		},
 	})
 	probe.observeOutbound(map[string]any{
@@ -556,7 +692,7 @@ func TestKoeLiveTextFullPathHarnessContract(t *testing.T) {
 	})
 	probe.observeInbound([]byte(`{"type":"response.done","response":{"id":"selector","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
 	probe.observeInbound([]byte(`{"type":"response.created","response":{"id":"result","metadata":{"koe_purpose":"task_result"}}}`))
-	probe.observeInbound([]byte(`{"type":"response.output_audio_transcript.done","response_id":"result","transcript":"` + liveTextFullPathMarker + `"}`))
+	probe.observeInbound([]byte(`{"type":"response.output_audio_transcript.done","response_id":"result","transcript":"` + liveFastMarker + `"}`))
 	probe.observeInbound([]byte(`{"type":"response.done","response":{"id":"result","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`))
 
 	if !probe.completed() {
@@ -579,6 +715,16 @@ func durationMillis(start, end time.Time) int64 {
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyFold(value string, candidates []string) bool {
+	value = strings.ToLower(value)
+	for _, candidate := range candidates {
+		if strings.Contains(value, strings.ToLower(candidate)) {
 			return true
 		}
 	}

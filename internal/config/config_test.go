@@ -50,6 +50,21 @@ func TestValidateConfig_IdleTimeouts(t *testing.T) {
 	}
 }
 
+func TestShannonDirUsesAbsoluteStateOverride(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "isolated-state")
+	t.Setenv("SHANNON_STATE_DIR", dir)
+	if got := ShannonDir(); got != dir {
+		t.Fatalf("ShannonDir() = %q, want isolated override %q", got, dir)
+	}
+}
+
+func TestShannonDirRejectsRelativeStateOverride(t *testing.T) {
+	t.Setenv("SHANNON_STATE_DIR", "relative-state")
+	if got := ShannonDir(); got != "" {
+		t.Fatalf("ShannonDir() = %q, want empty for relative override", got)
+	}
+}
+
 func TestValidateConfig_AgentModelTierKeyword(t *testing.T) {
 	mk := func(model string) *Config {
 		c := &Config{}

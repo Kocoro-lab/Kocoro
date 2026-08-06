@@ -3,9 +3,51 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestValidateDaemonStartModeRequiresContainedIsolation(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	tests := []struct {
+		name       string
+		isolated   bool
+		detach     bool
+		force      bool
+		port       int
+		stateDir   string
+		rpcSocket  string
+		rpcPIDFile string
+		wantErr    string
+	}{
+		{name: "normal default", port: 7533},
+		{name: "normal alternate port", port: 17533, wantErr: "requires --isolated"},
+		{name: "isolated", isolated: true, port: 17533, stateDir: stateDir},
+		{name: "default port", isolated: true, port: 7533, stateDir: stateDir, wantErr: "non-default --port"},
+		{name: "ephemeral port", isolated: true, port: 0, stateDir: stateDir, wantErr: "--port"},
+		{name: "missing state", isolated: true, port: 17533, wantErr: "SHANNON_STATE_DIR"},
+		{name: "relative state", isolated: true, port: 17533, stateDir: "relative", wantErr: "SHANNON_STATE_DIR"},
+		{name: "detach", isolated: true, detach: true, port: 17533, stateDir: stateDir, wantErr: "--detach"},
+		{name: "force", isolated: true, force: true, port: 17533, stateDir: stateDir, wantErr: "--force"},
+		{name: "rpc", isolated: true, port: 17533, stateDir: stateDir, rpcSocket: "/tmp/rpc.sock", rpcPIDFile: "/tmp/rpc.pid", wantErr: "Desktop RPC"},
+		{name: "port too high", port: 65536, wantErr: "--port"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDaemonStartMode(tc.isolated, tc.detach, tc.force, tc.port, tc.stateDir, tc.rpcSocket, tc.rpcPIDFile)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateDaemonStartMode() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validateDaemonStartMode() error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
 
 // TestPrintMemoryStatus_Shapes smoke-tests the three wire shapes the
 // daemonStatusCmd needs to render without panicking:
