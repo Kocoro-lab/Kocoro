@@ -191,6 +191,10 @@ type Model struct {
 	// fileRestoreBuilder overrides the /compact restoration source in tests;
 	// nil means the live agentLoop's BuildPostCompactionFileRestore.
 	fileRestoreBuilder func([]client.Message, int) (client.Message, bool)
+	// compactGen invalidates in-flight /compact results: bumped when a compact
+	// pass starts AND when an agent run starts, so a compactDoneMsg from an
+	// Esc-cancelled pass cannot flip UI state under newer work.
+	compactGen int
 	textarea            textarea.Model
 	viewport            viewport.Model // scrollable conversation history (alt-screen)
 	output              []outputBlock
@@ -1575,6 +1579,12 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.rerenderOutput()
 
 	case compactDoneMsg:
+		if msg.gen != m.compactGen {
+			// Result of an Esc-cancelled pass arriving under newer work —
+			// dropping it keeps it from flipping the newer run's UI state.
+			return m, nil
+		}
+		m.cancelRun = nil
 		m.state = stateInput
 		if msg.err != nil {
 			m.appendOutput(fmt.Sprintf("Compact failed: %v", msg.err))
@@ -1959,6 +1969,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.spinnerIdx = 0
 	m.glyphIdx = 0
 	m.colorIdx = 0
+	m.compactGen++ // a stale /compact result must not resolve under this run
 	return m, tea.Batch(m.runAgentLoop(input, history), spinnerTick(), spinnerFrameTick())
 }
 
@@ -2701,7 +2712,12 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.appendOutput("Compacting context...")
 		m.state = stateProcessing
 		m.processingStartTime = time.Now()
-		compactFn := m.runCompact(customInstructions)
+		// Esc/Ctrl+C route through m.cancelRun like agent runs, so a long
+		// fold can actually be abandoned mid-flight.
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancelRun = cancel
+		m.compactGen++
+		compactFn := m.runCompact(ctx, customInstructions, m.compactGen)
 		return m, tea.Batch(func() tea.Msg { return compactFn() }, spinnerTick(), spinnerFrameTick())
 	default:
 		// Check custom commands

@@ -20,22 +20,45 @@ type compactDoneMsg struct {
 	afterTokens  int
 	summary      string
 	err          error
+	// gen is the Model.compactGen captured when this pass started. The Update
+	// handler drops the message when it no longer matches — an Esc-cancelled
+	// pass must not flip the UI state (or print a stale result) under a newer
+	// run started meanwhile.
+	gen int
 }
 
-// compactTimeout bounds the whole /compact pass: PersistLearnings plus a
-// summarize that may fold an oversized transcript into up to
+// defaultCompactTimeout bounds the whole /compact pass: PersistLearnings plus
+// a summarize that may fold an oversized transcript into up to
 // maxSummaryFoldChunks sequential small-tier calls. A 60s shared budget
-// aborted exactly the sessions large enough to need /compact.
-const compactTimeout = 5 * time.Minute
+// aborted exactly the sessions large enough to need /compact. Overridable via
+// agent.compact_timeout_secs for slow gateways.
+const defaultCompactTimeout = 5 * time.Minute
+
+// compactTimeout resolves the /compact deadline from config, falling back to
+// the 5-minute default when unset or non-positive.
+func (m *Model) compactTimeout() time.Duration {
+	if secs := m.cfg.Agent.CompactTimeoutSecs; secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return defaultCompactTimeout
+}
 
 // compactWindowAndOverhead resolves the context window and estimator
 // calibration for /compact from the live loop when one exists — its window
 // tracks response.model auto-detection and its calibration carries the
 // tools-schema mass — falling back to config, then the 128K legacy default.
+//
+// The returned overhead also includes the loop's last system-prompt estimate:
+// /compact shapes a history whose system slot is a tiny placeholder, while
+// the calibration is measured against requests whose estimate already carries
+// the real prompt — without this, shaping and restoration budgets would treat
+// the whole system prompt as free headroom. 0 before the first Run, which
+// degrades to the prior behavior.
 func (m *Model) compactWindowAndOverhead() (window, overheadTokens int) {
 	if m.agentLoop != nil {
 		window, _ = m.agentLoop.ContextWindow()
 		overheadTokens, _, _ = m.agentLoop.EstOverheadState()
+		overheadTokens += m.agentLoop.LastSystemPromptEstimate()
 	}
 	if window <= 0 {
 		window = m.cfg.Agent.ContextWindow
@@ -47,11 +70,17 @@ func (m *Model) compactWindowAndOverhead() (window, overheadTokens int) {
 }
 
 // runCompact performs context compaction: persist learnings → summarize → shape history.
-func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
+// ctx comes from the submit site so Esc/Ctrl+C cancel the LLM calls via
+// m.cancelRun; gen tags the result for the staleness guard in Update.
+func (m *Model) runCompact(ctx context.Context, customInstructions string, gen int) func() compactDoneMsg {
 	return func() compactDoneMsg {
+		done := func(msg compactDoneMsg) compactDoneMsg {
+			msg.gen = gen
+			return msg
+		}
 		sess := m.sessions.Current()
 		if sess == nil {
-			return compactDoneMsg{err: fmt.Errorf("no active session")}
+			return done(compactDoneMsg{err: fmt.Errorf("no active session")})
 		}
 		messages := sess.HistoryForLoop()
 		// Captured next to the history snapshot it must agree with. Reading it
@@ -60,13 +89,18 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		// implicit cross-file invariant.
 		archiveThrough := len(sess.Messages)
 		if len(messages) < ctxwin.MinShapeable() {
-			return compactDoneMsg{err: fmt.Errorf("conversation too short to compact (need %d+ messages, have %d)", ctxwin.MinShapeable(), len(messages))}
+			return done(compactDoneMsg{err: fmt.Errorf("conversation too short to compact (need %d+ messages, have %d)", ctxwin.MinShapeable(), len(messages))})
 		}
 
 		beforeTokens := ctxwin.EstimateTokens(messages)
 
-		ctx, cancel := context.WithTimeout(context.Background(), compactTimeout)
+		ctx, cancel := context.WithTimeout(ctx, m.compactTimeout())
 		defer cancel()
+		// Fast-fail before any paid call: an already-cancelled pass (Esc
+		// raced the submit) must not start LLM work.
+		if err := ctx.Err(); err != nil {
+			return done(compactDoneMsg{err: err})
+		}
 		var usage agent.UsageAccumulator
 
 		// Step 1: persist learnings to MEMORY.md
@@ -93,7 +127,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			usage.Add(agent.LLMUsageDelta(sumUsage, ""))
 		}
 		if err != nil {
-			return compactDoneMsg{err: fmt.Errorf("summarization failed: %w", err)}
+			return done(compactDoneMsg{err: fmt.Errorf("summarization failed: %w", err)})
 		}
 
 		// Step 3: shape history.
@@ -109,7 +143,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			// ForceShapeHistory contract: no net reduction possible. Bail
 			// before replacing the live checkpoint or reporting a compression
 			// that freed nothing.
-			return compactDoneMsg{err: fmt.Errorf("nothing to compact: %d messages already at minimum shape", len(messages))}
+			return done(compactDoneMsg{err: fmt.Errorf("nothing to compact: %d messages already at minimum shape", len(messages))})
 		}
 
 		// Strip the placeholder system message from shaped result
@@ -131,6 +165,12 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			if restoreMsg, ok := restoreBuilder(shaped, overheadTokens); ok {
 				shaped = append(shaped, restoreMsg)
 			}
+		}
+
+		// A cancellation that lands after the LLM calls must not go on to
+		// replace the checkpoint: the user asked to abandon the pass.
+		if err := ctx.Err(); err != nil {
+			return done(compactDoneMsg{err: err})
 		}
 
 		// Preserve the exact prior live state as best-effort rollback material,
@@ -160,7 +200,7 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		}
 		if err := m.sessions.Save(); err != nil {
 			sess.CompactionCheckpoint = priorCheckpoint
-			return compactDoneMsg{err: fmt.Errorf("save compaction checkpoint: %w", err)}
+			return done(compactDoneMsg{err: fmt.Errorf("save compaction checkpoint: %w", err)})
 		}
 
 		afterTokens := ctxwin.EstimateTokens(shaped)
@@ -171,11 +211,11 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			displaySummary = string(r[:200]) + "..."
 		}
 
-		return compactDoneMsg{
+		return done(compactDoneMsg{
 			beforeTokens: beforeTokens,
 			afterTokens:  afterTokens,
 			summary:      displaySummary,
-		}
+		})
 	}
 }
 

@@ -224,6 +224,12 @@ type AgentConfig struct {
 	// default and named-agent sessions. The daemon sweeps once at startup; age
 	// expiry overrides the oldest-snapshot pin. 0 disables the age sweep.
 	CompactionSnapshotMaxAgeDays int `mapstructure:"compaction_snapshot_max_age_days" yaml:"compaction_snapshot_max_age_days" json:"compaction_snapshot_max_age_days"`
+	// CompactTimeoutSecs bounds one manual TUI /compact pass: persist-learnings
+	// plus a summarize that may fold an oversized transcript into up to nine
+	// sequential small-tier calls. When it binds, /compact fails with a
+	// context-deadline error on exactly the sessions large enough to fold —
+	// raise it on slow gateways. 0 or unset uses the 300s default.
+	CompactTimeoutSecs int `mapstructure:"compact_timeout_secs" yaml:"compact_timeout_secs" json:"compact_timeout_secs"`
 
 	// BashConcurrencyEnabled gates BashTool.IsConcurrencySafeCall. When true
 	// (the Phase C default since 2026-05-15), bash invocations that pass the
@@ -483,6 +489,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.stream_idle_timeout_secs", 90) // per-chunk gap watchdog inside CompleteStream. 0 disables (legacy scanner path).
 	viper.SetDefault("agent.interrupted_resume_max_attempts", 3)
 	viper.SetDefault("agent.compaction_snapshot_retention", 1)
+	viper.SetDefault("agent.compact_timeout_secs", 300)
 	viper.SetDefault("agent.compaction_snapshot_max_age_days", 14)
 	viper.SetDefault("agent.interrupted_resume_max_age_hours", 4) // staleness window for auto-resume; see Config.Agent.InterruptedResumeMaxAgeHours
 	viper.SetDefault("agent.interrupted_resume_enabled", true)

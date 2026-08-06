@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +19,7 @@ import (
 func TestCompact_TooShort(t *testing.T) {
 	m := newCommandTestModel(t)
 	// Session has 0 messages — too short
-	result := m.runCompact("")()
+	result := m.runCompact(context.Background(), "", 0)()
 	if result.err == nil {
 		t.Error("expected error for too-short conversation")
 	}
@@ -84,7 +85,7 @@ Keep the transcript lossless.
 	originalMessages := append([]client.Message(nil), sess.Messages...)
 	originalMeta := append([]session.MessageMeta(nil), sess.MessageMeta...)
 
-	result := m.runCompact("")()
+	result := m.runCompact(context.Background(), "", 0)()
 	if result.err != nil {
 		t.Fatalf("runCompact: %v", result.err)
 	}
@@ -153,7 +154,7 @@ func TestCompact_FailedSaveRollsBackCheckpoint(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(sessDir, 0o755) })
 
-	result := m.runCompact("")()
+	result := m.runCompact(context.Background(), "", 0)()
 
 	if result.err == nil {
 		t.Fatal("expected the failed save to surface as an error")
@@ -193,14 +194,23 @@ func TestCompactWindowAndOverhead_PrefersLoopState(t *testing.T) {
 	if overhead != 1234 {
 		t.Fatalf("loop calibration must flow into /compact: got %d, want 1234", overhead)
 	}
+
+	// The shaped history's system slot is a placeholder, so the real system
+	// prompt's estimate must ride on top of the calibration or shaping and
+	// restoration budgets treat the whole prompt as free headroom.
+	agent.SetLastSystemPromptEstimateForTest(loop, 500)
+	_, overhead = m.compactWindowAndOverhead()
+	if overhead != 1234+500 {
+		t.Fatalf("system prompt estimate must add to overhead: got %d, want 1734", overhead)
+	}
 }
 
 // PersistLearnings + GenerateSummary can fold an oversized transcript into up
 // to maxSummaryFoldChunks sequential small-tier calls; a 60s shared budget
 // aborted exactly the sessions large enough to need /compact.
 func TestCompactTimeoutCoversSequentialFold(t *testing.T) {
-	if compactTimeout < 5*time.Minute {
-		t.Fatalf("compactTimeout=%v cannot cover sequential fold calls", compactTimeout)
+	if defaultCompactTimeout < 5*time.Minute {
+		t.Fatalf("defaultCompactTimeout=%v cannot cover sequential fold calls", defaultCompactTimeout)
 	}
 }
 
@@ -232,7 +242,7 @@ func TestCompact_AppendsFileRestoreBlock(t *testing.T) {
 		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
 	}
 
-	result := m.runCompact("")()
+	result := m.runCompact(context.Background(), "", 0)()
 	if result.err != nil {
 		t.Fatalf("runCompact: %v", result.err)
 	}
@@ -292,5 +302,45 @@ func TestPersistMidTurnCompactionCheckpoint(t *testing.T) {
 	}
 	if sess.CompactionCheckpoint != prior {
 		t.Fatalf("failed save must roll back the checkpoint: %#v", sess.CompactionCheckpoint)
+	}
+}
+
+// The timeout is operator-configurable for slow gateways; unset falls back
+// to the 5-minute default that covers a full sequential fold.
+func TestCompactTimeout_ConfigOverride(t *testing.T) {
+	m := newCommandTestModel(t)
+	if got := m.compactTimeout(); got != defaultCompactTimeout {
+		t.Fatalf("unset config: got %v, want %v", got, defaultCompactTimeout)
+	}
+	m.cfg.Agent.CompactTimeoutSecs = 7
+	if got := m.compactTimeout(); got != 7*time.Second {
+		t.Fatalf("configured: got %v, want 7s", got)
+	}
+}
+
+// A cancelled context must abort the pass without touching the checkpoint,
+// even when cancellation lands between the LLM calls and the save.
+func TestCompact_CancelledContextDoesNotPersistCheckpoint(t *testing.T) {
+	m := newCommandTestModel(t)
+	sess := m.sessions.Current()
+	for i := 0; i < 12; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		sess.Messages = append(sess.Messages, client.Message{Role: role, Content: client.NewTextContent(strings.Repeat("history ", 100))})
+		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := m.runCompact(ctx, "", 3)()
+	if result.err == nil {
+		t.Fatal("cancelled pass must surface an error")
+	}
+	if result.gen != 3 {
+		t.Fatalf("result must carry its generation: got %d", result.gen)
+	}
+	if sess.CompactionCheckpoint != nil {
+		t.Fatalf("cancelled pass must not persist a checkpoint: %#v", sess.CompactionCheckpoint)
 	}
 }

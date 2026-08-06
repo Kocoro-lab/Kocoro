@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -115,5 +116,25 @@ func TestCompactionStatusTogglesSpinnerFlag(t *testing.T) {
 	m = updated.(*Model)
 	if m.compacting {
 		t.Fatal("compaction_finished must clear the compacting flag")
+	}
+}
+
+// A compactDoneMsg from an Esc-cancelled pass must not flip UI state (or
+// print stale output) under a newer run started meanwhile.
+func TestCompactDoneMsg_StaleGenerationIgnored(t *testing.T) {
+	m := newCommandTestModel(t)
+	m.state = stateProcessing
+	m.compactGen = 2 // a newer compact or agent run has started since gen 1
+
+	updated, _ := m.Update(compactDoneMsg{gen: 1, err: context.Canceled})
+	m = updated.(*Model)
+	if m.state != stateProcessing {
+		t.Fatal("stale compact result flipped the UI state of newer work")
+	}
+
+	updated, _ = m.Update(compactDoneMsg{gen: 2, err: context.Canceled})
+	m = updated.(*Model)
+	if m.state != stateInput {
+		t.Fatal("current-generation compact result must resolve normally")
 	}
 }

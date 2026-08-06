@@ -868,6 +868,14 @@ type AgentLoop struct {
 	// (tokenizers and schema overheads differ per provider). Always stores a
 	// string; same concurrency exposure as estOverheadTokens.
 	estOverheadModel atomic.Value
+	// lastSystemPromptEst is the token estimate of the most recent Run's final
+	// system prompt. External compaction drivers (TUI /compact) shape a
+	// history that carries only a tiny placeholder system message, while the
+	// calibration overhead is measured against requests whose estimate already
+	// includes the real prompt — so those drivers must add this on top of the
+	// overhead or their budgets over-allocate by the whole prompt. 0 until the
+	// first Run. Atomic for the same daemon-concurrency exposure as above.
+	lastSystemPromptEst atomic.Int64
 	memoryDir        string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
 	projectEntityDir string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
 	stickyContext    string             // session-scoped facts injected verbatim into system prompt; never truncated
@@ -3113,6 +3121,9 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		h := sha256.Sum256([]byte(systemPrompt))
 		systemStableHash = hex.EncodeToString(h[:8])
 	}
+	a.lastSystemPromptEst.Store(int64(ctxwin.EstimateTokens([]client.Message{
+		{Role: "system", Content: client.NewTextContent(systemPrompt)},
+	})))
 
 	messages := make([]client.Message, 0)
 	messages = append(messages, client.Message{Role: "system", Content: client.NewTextContent(systemPrompt)})
