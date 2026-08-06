@@ -53,6 +53,32 @@ func TestLoopDetector_ConsecutiveDup_ForceStop(t *testing.T) {
 	}
 }
 
+func TestLoopDetector_ForceStopDoesNotClaimCompletion(t *testing.T) {
+	ld := NewLoopDetector()
+	for range 4 {
+		ld.Record("web_search", `{"q":"same"}`, false, "", "same-result", false)
+	}
+	action, message := ld.Check("web_search")
+	if action != LoopForceStop {
+		t.Fatalf("expected force stop, got %v (%q)", action, message)
+	}
+	for _, marker := range []string{
+		"not evidence of success",
+		"partial",
+		"blocked",
+		"outcome unknown",
+	} {
+		if !strings.Contains(message, marker) {
+			t.Errorf("force-stop note missing %q: %s", marker, message)
+		}
+	}
+	for _, forbidden := range []string{"provide your answer now", "Return your collected results now"} {
+		if strings.Contains(message, forbidden) {
+			t.Errorf("force-stop note still directs unsupported completion with %q: %s", forbidden, message)
+		}
+	}
+}
+
 // TestLoopDetector_ValidationError_ForceStopAt3 covers the deterministic
 // validation-error short-circuit: same tool + same args + result content
 // prefixed with "[validation error]" three times in a row force-stops

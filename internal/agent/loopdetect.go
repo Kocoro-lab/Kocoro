@@ -17,6 +17,12 @@ const (
 	LoopForceStop                   // force final response without tools
 )
 
+const loopForceStopOutcomeCaveat = "Further tool calls are blocked for this run. The stop itself is not evidence of success. Preserve completed results; treat unverified completion or side effects as partial, blocked, or outcome unknown."
+
+func loopForceStopNote(detail string) string {
+	return strings.TrimSpace(detail) + " " + loopForceStopOutcomeCaveat
+}
+
 // ToolCallRecord tracks a single tool invocation for loop detection.
 type ToolCallRecord struct {
 	Name            string
@@ -67,7 +73,7 @@ type LoopDetector struct {
 	sameToolErrThreshold int
 	noProgressThreshold  int
 
-	repeatableTools          map[string]bool
+	repeatableTools         map[string]bool
 	semiRepeatableTools     map[string]bool // higher NoProgress threshold (e.g. bash)
 	semiRepeatableThreshold int             // nudge threshold for semi-repeatable tools
 	// Note: force-stop = threshold*2 = 24 exceeds historySize (20), so the
@@ -294,9 +300,9 @@ func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
 		history:                 make([]ToolCallRecord, 0, 20),
 		historySize:             20,
-		consecDupThreshold:      3, // v2: 2 → 3 (was over-strict for re-search/re-fetch)
-		exactDupThreshold:       5, // v2: 3 → 5 (refactor read→edit→read iteration is common)
-		sameToolErrThreshold:    6, // v2: 4 → 6 (cross-args retry needs more headroom)
+		consecDupThreshold:      3,  // v2: 2 → 3 (was over-strict for re-search/re-fetch)
+		exactDupThreshold:       5,  // v2: 3 → 5 (refactor read→edit→read iteration is common)
+		sameToolErrThreshold:    6,  // v2: 4 → 6 (cross-args retry needs more headroom)
 		noProgressThreshold:     12, // v2: 8 → 12 (legitimate research uses many same-tool calls)
 		repeatableTools:         repeatableGUITools,
 		semiRepeatableTools:     semiRepeatableProdTools,
@@ -383,7 +389,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		if n >= 2 &&
 			h[n-1].Name == "think" && h[n-1].IsEmptyThinkInput &&
 			h[n-2].Name == "think" && h[n-2].IsEmptyThinkInput {
-			return LoopForceStop, "Two consecutive `think` calls had empty input. Your reasoning likely already lives in the native thinking block — produce your answer or call a different tool now."
+			return LoopForceStop, loopForceStopNote("Two consecutive `think` calls had empty input. Further empty reasoning calls cannot add evidence.")
 		}
 	}
 
@@ -459,10 +465,10 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// (which is calibrated for flaky retries, not parameter-shape
 	// mistakes) and force-stop immediately.
 	if !dupExemptTools[name] && consecValidationErrCount >= 3 && consecValidationErrCount == consecCount {
-		return LoopForceStop, fmt.Sprintf(
+		return LoopForceStop, loopForceStopNote(fmt.Sprintf(
 			"Tool %s rejected your arguments %d times in a row with the same validation error: %q. "+
-				"Retrying with identical arguments will not succeed — fix the arguments or ask the user for guidance.",
-			name, consecCount, ld.history[len(ld.history)-1].ErrorSig)
+				"Retrying with identical arguments cannot succeed.",
+			name, consecCount, ld.history[len(ld.history)-1].ErrorSig))
 	}
 
 	if !dupExemptTools[name] && consecCount > 0 && !recovered {
@@ -471,8 +477,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			threshold = ld.consecDupThreshold * 2 // Rule 2: all-errors budget
 		}
 		if consecCount >= threshold+1 {
-			return LoopForceStop, fmt.Sprintf(
-				"You have called %s with identical arguments %d times in a row. Stop retrying and provide your answer now.", name, consecCount)
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You called %s with identical arguments %d times in a row without new evidence.", name, consecCount))
 		}
 		if consecCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
@@ -507,8 +513,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			threshold = ld.exactDupThreshold * 2 // all-errors budget
 		}
 		if dupCount >= threshold*2 {
-			return LoopForceStop, fmt.Sprintf(
-				"You have called %s with identical arguments %d times. Stop retrying and provide your answer now.", name, dupCount)
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You called %s with identical arguments %d times without new evidence.", name, dupCount))
 		}
 		if dupCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
@@ -526,8 +532,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		}
 	}
 	if errCount >= ld.sameToolErrThreshold*2 {
-		return LoopForceStop, fmt.Sprintf(
-			"Tool %s has failed %d times. Stop using it and provide your answer now.", name, errCount)
+		return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+			"Tool %s failed %d times and no reliable recovery is available in this run.", name, errCount))
 	}
 	if errCount >= ld.sameToolErrThreshold {
 		return LoopNudge, fmt.Sprintf(
@@ -609,7 +615,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 
 		if repeatableResultOnly {
 			if progressCount >= 15 {
-				return LoopForceStop, familyNoProgressMessage(family, progressCount, familyCount, 2)
+				return LoopForceStop, loopForceStopNote(familyNoProgressMessage(family, progressCount, familyCount, 2))
 			}
 			// Below 15: silent. No nudge tier — see rationale above.
 		} else {
@@ -617,7 +623,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			// (3 different queries on the same topic) is a legitimate pattern;
 			// the old thresholds nudged the model immediately on a 3rd query.
 			if progressCount >= 12 {
-				return LoopForceStop, familyNoProgressMessage(family, progressCount, familyCount, 2)
+				return LoopForceStop, loopForceStopNote(familyNoProgressMessage(family, progressCount, familyCount, 2))
 			}
 			if progressCount >= 8 {
 				return LoopNudge, familyNoProgressMessage(family, progressCount, familyCount, 1)
@@ -644,8 +650,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			// where there's no URL or web topic to dedupe by). Real research
 			// sessions can hit a single tool 6-10 times legitimately.
 			if sameToolInFamily >= 12 {
-				return LoopForceStop, fmt.Sprintf(
-					"You have called %s %d times without meaningful progress. Provide your answer now.", name, sameToolInFamily)
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You called %s %d times without meaningful progress.", name, sameToolInFamily))
 			}
 			if sameToolInFamily >= 8 {
 				return LoopNudge, fmt.Sprintf(
@@ -673,8 +679,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		// (e.g. "find this obscure error string") legitimately need many
 		// query variants before finding a hit.
 		if unproductiveStreak >= 12 {
-			return LoopForceStop, fmt.Sprintf(
-				"You have made %d consecutive unproductive search calls. Stop searching and use what you have, or ask the user for guidance.", unproductiveStreak)
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You made %d consecutive unproductive search calls without finding useful evidence.", unproductiveStreak))
 		}
 		if unproductiveStreak >= 7 {
 			return LoopNudge, fmt.Sprintf(
@@ -712,8 +718,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		batchGated := ld.batchTolerant[name] && count > 0 && len(seen)*2 >= count
 		if !batchGated {
 			if count >= threshold*2 {
-				return LoopForceStop, fmt.Sprintf(
-					"You have called %s %d times without meaningful progress. Provide your answer now.", name, count)
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You called %s %d times without meaningful progress.", name, count))
 			}
 			if count >= threshold {
 				return LoopNudge, fmt.Sprintf(
@@ -806,7 +812,7 @@ func familyNoProgressMessage(family string, progressCount, familyCount, stage in
 	case "search", "web":
 		switch stage {
 		case 2:
-			return fmt.Sprintf("You have made %d web calls with %d on the same topic. Return your collected results now.", familyCount, progressCount)
+			return fmt.Sprintf("You made %d web calls with %d on the same topic without obtaining new evidence.", familyCount, progressCount)
 		case 1:
 			return fmt.Sprintf("You've searched the same topic %d times. Summarize what you've found and present it to the user. Do not search again.", progressCount)
 		default:
@@ -815,7 +821,7 @@ func familyNoProgressMessage(family string, progressCount, familyCount, stage in
 	case "browser", "gui":
 		switch stage {
 		case 2:
-			return fmt.Sprintf("You have repeated the same UI action %d times across %d browser-family calls without the page state advancing. Report the current state to the user now.", progressCount, familyCount)
+			return fmt.Sprintf("You repeated the same UI action %d times across %d browser-family calls without the page state advancing.", progressCount, familyCount)
 		case 1:
 			return fmt.Sprintf("You've repeated the same UI action %d times without progress. Stop clicking — summarize the current page state for the user and wait for direction.", progressCount)
 		default:
@@ -824,7 +830,7 @@ func familyNoProgressMessage(family string, progressCount, familyCount, stage in
 	default:
 		switch stage {
 		case 2:
-			return fmt.Sprintf("You have called tools in the same family %d times (%d on the same target) without progress. Provide your answer now.", familyCount, progressCount)
+			return fmt.Sprintf("You called tools in the same family %d times (%d on the same target) without progress.", familyCount, progressCount)
 		case 1:
 			return fmt.Sprintf("You've repeated the same action %d times without progress. Summarize what you have and report back to the user.", progressCount)
 		default:

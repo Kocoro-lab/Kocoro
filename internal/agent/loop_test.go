@@ -5363,13 +5363,17 @@ func TestForceStopExit_DetectorPath_SynthesisPromptShape(t *testing.T) {
 		t.Fatalf("synthesis request body was not captured (expected 4 LLM calls, got %d)", llmCallCount)
 	}
 
-	// The synthesis request must carry the structured report prompt
-	// AND the detector verdict (escaped in JSON, so check a plain substring).
+	// The synthesis request must carry the outcome/evidence report contract
+	// and the detector verdict (escaped in JSON, so check plain substrings).
 	wantMarkers := []string{
+		`**Outcome**`,
 		`**Task**`,
+		`**Evidence**`,
 		`**Done**`,
-		`**Pending**`,
-		`**Partial answer**`,
+		`**Pending / blocked**`,
+		`**Answer**`,
+		`outcome unknown`,
+		`not evidence that the task succeeded`,
 		`Do not request any more tools.`,
 		`identical arguments`, // from ConsecutiveDup's message
 	}
@@ -5431,10 +5435,13 @@ func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
 	}
 
 	wantMarkers := []string{
+		`**Outcome**`,
 		`**Task**`,
+		`**Evidence**`,
 		`**Done**`,
-		`**Pending**`,
-		`**Partial answer**`,
+		`**Pending / blocked**`,
+		`**Answer**`,
+		`outcome unknown`,
 		`nudges exceeded`, // from the escalation path's detector note
 	}
 	for _, marker := range wantMarkers {

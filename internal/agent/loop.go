@@ -3852,51 +3852,44 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		return text, nil
 	}
 
-	// buildMaxIterReason produces the report-style user message for the
-	// maxIter synthesis turn. Different shape from the loop-detector force
-	// stop: that asks the model to "give final answer now", this asks it to
-	// summarize what happened and output a partial best-effort response.
-	// Captures iterationCount/toolsUsed/lastToolName so values reflect the
-	// state at the moment the cap was hit, not when the closure was defined.
-	buildMaxIterReason := func() string {
+	// buildBoundedOutcomeReason is the single synthesis contract for every
+	// abnormal tool-loop exit. A stop signal is not completion evidence, so the
+	// final text must distinguish verified work from partial, blocked, and
+	// outcome-unknown states. Keeping this wording in one place prevents the
+	// detector and max-iteration paths from drifting into different claims.
+	buildBoundedOutcomeReason := func(header string) string {
 		return fmt.Sprintf(
-			"You've reached the iteration safety cap (N=%d turns).\n"+
-				"Tools used: %s. Last tool: %s.\n"+
-				"Do not request any more tools.\n\n"+
-				"Report in this structure. Skip sections if not applicable:\n\n"+
+			"%s\n"+
+				"Iteration count: %d. Tools used: %s. Last tool: %s.\n"+
+				"Do not request any more tools. This stop is not evidence that the task succeeded.\n\n"+
+				"Report in this structure. Skip empty detail sections, but always include Outcome:\n\n"+
+				"**Outcome** — exactly one of: completed, partial, blocked, or outcome unknown. Use completed only when tool results explicitly prove every required result.\n"+
 				"**Task** — What the user asked (1 line).\n"+
-				"**Done** — What you accomplished so far (bullets, with concrete findings).\n"+
-				"**Pending** — What's still missing (bullets).\n"+
-				"**Partial answer** — Your best-effort response given what you've gathered.\n\n"+
-				"If the user's question is simple and you already have the answer from "+
-				"tool results, just answer it directly — skip the structure.",
-			iterationCount, topTools(toolsUsed, 5), lastToolName,
+				"**Evidence** — The concrete tool results that support the outcome.\n"+
+				"**Done** — What was verified as accomplished.\n"+
+				"**Pending / blocked** — What is missing and why.\n"+
+				"**Answer** — The best supported answer or deliverable.\n\n"+
+				"If an external side effect may have been dispatched but its result is not confirmed, use outcome unknown. Do not claim it happened, claim it did not happen, or retry it. "+
+				"For a simple task already proven by tool results, answer concisely while keeping the Outcome line.",
+			header, iterationCount, topTools(toolsUsed, 5), lastToolName,
 		)
 	}
 
-	// buildForceStopReason produces the same structured report prompt as
-	// buildMaxIterReason but names the specific detector verdict that
-	// triggered the stop. Two call sites feed it: the direct LoopForceStop
-	// path (line ~2700) and the maxNudges escalation path (line ~2710).
-	// Both paths previously passed a terse detector note to runForceStopTurn
-	// and got only a generic "I hit the loop limit…" fallback when the
-	// synthesis LLM call returned empty text — users never saw a summary of
-	// what the agent had already accomplished. This closure restores the
-	// same UX shape PR #81 added for maxIter.
+	// buildMaxIterReason captures live loop values at the safety cap.
+	buildMaxIterReason := func() string {
+		return buildBoundedOutcomeReason(fmt.Sprintf(
+			"The iteration safety cap was reached (N=%d turns).",
+			iterationCount,
+		))
+	}
+
+	// buildForceStopReason names the specific detector verdict while reusing
+	// the same outcome contract as the iteration-cap path.
 	buildForceStopReason := func(detectorNote string) string {
-		return fmt.Sprintf(
-			"The loop detector stopped further tool calls because: %s\n"+
-				"Iteration count: %d. Tools used: %s. Last tool: %s.\n"+
-				"Do not request any more tools.\n\n"+
-				"Report in this structure. Skip sections if not applicable:\n\n"+
-				"**Task** — What the user asked (1 line).\n"+
-				"**Done** — What you accomplished so far (bullets, with concrete findings).\n"+
-				"**Pending** — What's still missing (bullets).\n"+
-				"**Partial answer** — Your best-effort response given what you've gathered.\n\n"+
-				"If the user's question is simple and you already have the answer from "+
-				"tool results, just answer it directly — skip the structure.",
-			detectorNote, iterationCount, topTools(toolsUsed, 5), lastToolName,
-		)
+		return buildBoundedOutcomeReason(fmt.Sprintf(
+			"The loop detector stopped further tool calls because: %s",
+			detectorNote,
+		))
 	}
 
 	// auditDetectorForceStop emits a single `event:"force_stop"` audit
@@ -6511,15 +6504,10 @@ iterationLoop:
 		}
 		cloudResultContent = "" // reset if mixed with other tools
 
-		// Handle loop detection results. Both the direct force-stop and
-		// the maxNudges escalation now pass the detector verdict through
-		// buildForceStopReason so the synthesis turn produces a
-		// Task/Done/Pending/Partial-answer report instead of generic
-		// "give final answer now" prose — matching the UX shape PR #81
-		// introduced for the maxIter path. Fallback text (used when the
-		// synthesis LLM call itself returns empty) honestly names what
-		// happened ("synthesis produced no output") instead of claiming a
-		// specific failure mode.
+		// Handle loop detection results. Both direct force-stop and maxNudges
+		// escalation use the same Outcome/Evidence synthesis contract. Fallback
+		// text (used when synthesis returns empty) names that failure without
+		// inventing a task outcome.
 		forceStopFallback := fmt.Sprintf(
 			"The loop detector stopped the run after %d turns; synthesis produced no output.",
 			iterationCount,
