@@ -521,6 +521,7 @@ func TestToolDefsLedgerSchema(t *testing.T) {
 			"diagnostic telemetry",
 			"imperfect label",
 			"exact enum token",
+			"kocoro is the assistant identity",
 		} {
 			if !strings.Contains(strings.ToLower(params), want) {
 				t.Fatalf("%s do_task schema missing %q: %s", name, want, params)
@@ -549,6 +550,28 @@ func TestToolDefsLedgerSchema(t *testing.T) {
 		if strings.Contains(strings.ToLower(params), "missing or unknown values are treated as full") {
 			t.Fatalf("%s do_task schema contains contradictory unknown-value fallback: %s", name, params)
 		}
+	}
+}
+
+func TestPrepareDoTaskTreatsKocoroAsDefaultAgent(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	dispatcher := NewDispatcher(
+		NewDaemonClient(""),
+		NewAgentResolver(nil, NoopSemanticMatcher{}),
+		NewCallState("burst-kocoro-default", ""),
+		nil,
+	)
+
+	req, task, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"calculate 17 times 19","agent":"Kocoro","relationship":"new","task_id":null,"execution_mode":"fast","full_reason":"none"}`),
+		"en",
+		false,
+	)
+	if err != nil || clarify != nil || task == nil {
+		t.Fatalf("PrepareDoTask: req=%+v task=%+v clarify=%+v err=%v", req, task, clarify, err)
+	}
+	if req.Agent != "" {
+		t.Fatalf("PrepareDoTask agent=%q, want implicit default", req.Agent)
 	}
 }
 

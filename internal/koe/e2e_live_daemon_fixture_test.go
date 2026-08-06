@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -17,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/daemon"
 )
 
 type liveIsolatedDaemon struct {
@@ -91,9 +92,12 @@ func (d *liveIsolatedDaemon) start(t *testing.T) {
 		t.Fatal("isolated daemon is already running")
 	}
 	d.logs = lockedBuffer{}
-	cmd := exec.Command(d.binary, "daemon", "start", "--isolated", "--port", strconv.Itoa(d.port))
+	cmd := exec.Command(
+		d.binary, "daemon", "start", "--isolated",
+		"--state-dir", d.stateDir,
+		"--port", strconv.Itoa(d.port),
+	)
 	cmd.Dir = d.root
-	cmd.Env = withLiveKoeEnv(os.Environ(), "SHANNON_STATE_DIR", d.stateDir)
 	cmd.Stdout = &d.logs
 	cmd.Stderr = &d.logs
 	if err := cmd.Start(); err != nil {
@@ -203,10 +207,10 @@ func (d *liveIsolatedDaemon) waitReadyLocked(t *testing.T) {
 func (d *liveIsolatedDaemon) waitContainedLocked(t *testing.T) {
 	t.Helper()
 	want := []string{
-		"isolated mode — MCP connections and health supervision disabled",
-		"isolated mode — Cloud WS, watchers, heartbeat, and scheduler disabled",
-		"isolated mode — Cloud WS connection suppressed",
-		"isolated server background services disabled",
+		daemon.IsolationMarkerMCPDisabled,
+		daemon.IsolationMarkerAutomationDisabled,
+		daemon.IsolationMarkerCloudWSSuppressed,
+		daemon.IsolationMarkerBackgroundDisabled,
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -262,29 +266,19 @@ func liveKoeBuildIdentity(t *testing.T, root string) string {
 
 func reserveLiveKoePort(t *testing.T) int {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve isolated daemon port: %v", err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatalf("release isolated daemon port reservation: %v", err)
-	}
-	if port == 7533 {
-		return reserveLiveKoePort(t)
-	}
-	return port
-}
-
-func withLiveKoeEnv(environment []string, key, value string) []string {
-	prefix := key + "="
-	out := make([]string, 0, len(environment)+1)
-	for _, entry := range environment {
-		if !strings.HasPrefix(entry, prefix) {
-			out = append(out, entry)
+	for {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve isolated daemon port: %v", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		if err := listener.Close(); err != nil {
+			t.Fatalf("release isolated daemon port reservation: %v", err)
+		}
+		if port != 7533 {
+			return port
 		}
 	}
-	return append(out, prefix+value)
 }
 
 func tailLiveKoeLog(log string, limit int) string {

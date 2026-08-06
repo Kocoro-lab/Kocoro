@@ -130,22 +130,16 @@ func TestMintEphemeralRequest(t *testing.T) {
 	}
 }
 
-func TestExchangeSDPRetriesTransientHTTPStatus(t *testing.T) {
-	t.Setenv("KOE_SDP_EXCHANGE_MAX_ATTEMPTS", "3")
-	t.Setenv("KOE_SDP_RETRY_BACKOFF_MS", "1")
+func TestExchangeSDPRequest(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		call := calls.Add(1)
+		calls.Add(1)
 		if got := r.Header.Get("Authorization"); got != "Bearer ephemeral-key" {
 			t.Errorf("Authorization = %q", got)
 		}
 		body, _ := io.ReadAll(r.Body)
 		if string(body) != "offer-sdp" {
 			t.Errorf("offer = %q", body)
-		}
-		if call < 3 {
-			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
-			return
 		}
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("answer-sdp"))
@@ -156,26 +150,25 @@ func TestExchangeSDPRetriesTransientHTTPStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exchangeSDP: %v", err)
 	}
-	if answer != "answer-sdp" || calls.Load() != 3 {
-		t.Fatalf("answer=%q calls=%d, want answer-sdp after 3 calls", answer, calls.Load())
+	if answer != "answer-sdp" || calls.Load() != 1 {
+		t.Fatalf("answer=%q calls=%d, want one successful create call", answer, calls.Load())
 	}
 }
 
-func TestExchangeSDPDoesNotRetryNonTransientStatus(t *testing.T) {
-	t.Setenv("KOE_SDP_EXCHANGE_MAX_ATTEMPTS", "3")
-	t.Setenv("KOE_SDP_RETRY_BACKOFF_MS", "1")
+func TestExchangeSDPDoesNotReplayFailedCreate(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
-		http.Error(w, "invalid offer", http.StatusBadRequest)
+		w.Header().Set("x-request-id", "req_test_503")
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
 
 	_, err := exchangeSDP(context.Background(), srv.URL, "ephemeral-key", []byte("offer-sdp"))
-	if err == nil || !strings.Contains(err.Error(), "HTTP 400") {
-		t.Fatalf("exchangeSDP error=%v, want HTTP 400", err)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 503") || !strings.Contains(err.Error(), "req_test_503") {
+		t.Fatalf("exchangeSDP error=%v, want HTTP 503 with request ID", err)
 	}
 	if calls.Load() != 1 {
-		t.Fatalf("calls=%d, want no retry for HTTP 400", calls.Load())
+		t.Fatalf("calls=%d, want no replay for a failed create call", calls.Load())
 	}
 }

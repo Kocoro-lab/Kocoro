@@ -21,13 +21,14 @@ func TestValidateDaemonStartModeRequiresContainedIsolation(t *testing.T) {
 		rpcPIDFile string
 		wantErr    string
 	}{
-		{name: "normal default", port: 7533},
+		{name: "normal default", port: defaultDaemonPort},
 		{name: "normal alternate port", port: 17533, wantErr: "requires --isolated"},
+		{name: "normal state directory", port: defaultDaemonPort, stateDir: stateDir, wantErr: "--state-dir requires --isolated"},
 		{name: "isolated", isolated: true, port: 17533, stateDir: stateDir},
-		{name: "default port", isolated: true, port: 7533, stateDir: stateDir, wantErr: "non-default --port"},
+		{name: "default port", isolated: true, port: defaultDaemonPort, stateDir: stateDir, wantErr: "non-default --port"},
 		{name: "ephemeral port", isolated: true, port: 0, stateDir: stateDir, wantErr: "--port"},
-		{name: "missing state", isolated: true, port: 17533, wantErr: "SHANNON_STATE_DIR"},
-		{name: "relative state", isolated: true, port: 17533, stateDir: "relative", wantErr: "SHANNON_STATE_DIR"},
+		{name: "missing state", isolated: true, port: 17533, wantErr: "--state-dir"},
+		{name: "relative state", isolated: true, port: 17533, stateDir: "relative", wantErr: "--state-dir"},
 		{name: "detach", isolated: true, detach: true, port: 17533, stateDir: stateDir, wantErr: "--detach"},
 		{name: "force", isolated: true, force: true, port: 17533, stateDir: stateDir, wantErr: "--force"},
 		{name: "rpc", isolated: true, port: 17533, stateDir: stateDir, rpcSocket: "/tmp/rpc.sock", rpcPIDFile: "/tmp/rpc.pid", wantErr: "Desktop RPC"},
@@ -46,6 +47,18 @@ func TestValidateDaemonStartModeRequiresContainedIsolation(t *testing.T) {
 				t.Fatalf("validateDaemonStartMode() error = %v, want substring %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestDaemonLiveE2EFlagsAreHidden(t *testing.T) {
+	for _, name := range []string{"isolated", "port", "state-dir"} {
+		flag := daemonStartCmd.Flags().Lookup(name)
+		if flag == nil {
+			t.Fatalf("daemon start flag --%s is not registered", name)
+		}
+		if !flag.Hidden {
+			t.Errorf("daemon start flag --%s is public, want hidden test-harness control", name)
+		}
 	}
 }
 

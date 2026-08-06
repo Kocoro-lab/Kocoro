@@ -64,11 +64,11 @@ func (r *AgentResolver) Resolve(ref string) ResolveResult {
 		}
 	}
 
-	// "default" / "默认" = the implicit default agent (empty slug). It is not a
-	// named registry entry, so without this a user can switch TO a specialist by
-	// voice but never back to the default. The exact-slug loop above still wins if
-	// a real agent is literally named "default".
-	if norm == "default" || norm == "默认" {
+	// "default" / "默认" / "Kocoro" = the implicit default agent (empty slug).
+	// Realtime occasionally fills agent="Kocoro" because that is its own voice
+	// identity; treating it as an unknown specialist would turn an actionable
+	// request into a clarification. Exact real slugs still win above.
+	if norm == "default" || norm == "默认" || norm == "kocoro" {
 		return ResolveResult{Status: ResolveResolved, Slug: ""}
 	}
 

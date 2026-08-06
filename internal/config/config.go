@@ -402,11 +402,8 @@ type MarketplaceConfig struct {
 }
 
 func ShannonDir() string {
-	if override := strings.TrimSpace(os.Getenv("SHANNON_STATE_DIR")); override != "" {
-		if filepath.IsAbs(override) {
-			return filepath.Clean(override)
-		}
-		return ""
+	if override := shannonDirProcessOverride(); override != "" {
+		return override
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

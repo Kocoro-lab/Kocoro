@@ -614,7 +614,7 @@ func (s *Server) SetCancelFunc(cancel context.CancelFunc) {
 
 // SetIsolated disables daemon-wide background services while preserving the
 // real HTTP listener and request execution path. It is intended only for
-// side-effect-contained live E2E processes with temporary state.
+// state-isolated live E2E processes with temporary filesystem state.
 func (s *Server) SetIsolated(isolated bool) {
 	s.isolated = isolated
 }
@@ -1052,22 +1052,16 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Start(ctx context.Context) error {
 	s.ctx = ctx
-	cleanupComputerUseIntegrationFixture := func() {}
+	preparationCleanup := func() {}
 	if !s.isolated {
-		// Bind the process coordinator's activity sink only for the live server.
-		// Offline Handler() fixtures can inject an isolated coordinator without
-		// stealing the singleton sink from a concurrently running daemon.
-		s.SetComputerUseCoordinator(s.computerUseCoordinator)
 		var err error
-		cleanupComputerUseIntegrationFixture, err = startComputerUseIntegrationFixture(
-			s.computerUseCoordinator,
-		)
+		preparationCleanup, err = s.prepareBackgroundServices()
 		if err != nil {
-			return fmt.Errorf("daemon server computer-use integration fixture: %w", err)
+			return err
 		}
-		s.recoverMigrationOrphans()
 	}
-	defer cleanupComputerUseIntegrationFixture()
+	defer preparationCleanup()
+
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 	if !s.isolated {
@@ -1082,111 +1076,16 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listener = ln
 	s.listenerMu.Unlock()
 	s.server = &http.Server{Handler: withLocalCORS(mux)}
-	if !s.isolated {
-		expiryCtx, stopComputerUseExpiry := context.WithCancel(ctx)
-		defer stopComputerUseExpiry()
-		go s.runComputerUseExpiryLoop(expiryCtx)
-
-		// Spawn the gated session-sync ticker. It self-disables when sync is
-		// not enabled, so it's always safe to start unconditionally here.
-		go s.runSyncLoop(ctx)
-
-		// Serialized, debounced worker that pushes agent changes to Cloud.
-		go s.agentSyncWorker(ctx)
-
-		// Warm the default ClawHub browse page ONCE at startup so the first open of
-		// the marketplace tab has a stale fallback and doesn't surface the
-		// intermittent "registry unreachable" (注册表不可达) 503 on the default view
-		// during a clawhub.ai blip. Deliberately one-shot, not a poll loop: during
-		// active browsing the user's own requests keep the cache warm, and the
-		// 30-min view-agnostic golden slot covers idle gaps — so an unused
-		// (air-gapped / IM-only) daemon makes at most this single request. Gated by
-		// skills.marketplace.clawhub_warm_on_startup (default true).
-		go s.warmClawHubOnce(ctx)
-
-		// Reclaim stale per-session artifact scratch dirs. Interactive sessions
-		// keep their scratch across session switches (artifacts must outlive
-		// OnSessionClose — see the cloud-only cleanup rationale in runner.go), so
-		// age at startup is the reclaim mechanism. viper.GetInt returns 0 when
-		// config.Load hasn't run (hermetic unit tests) and sweepSessionScratch
-		// treats maxAge<=0 as a no-op; `daemon.scratch_max_age_days` (default 14)
-		// tunes the window, 0 disables.
-		go func() {
-			days := viper.GetInt("daemon.scratch_max_age_days")
-			if days <= 0 {
-				return
-			}
-			if removed, err := sweepSessionScratch(s.deps.ShannonDir, time.Duration(days)*24*time.Hour); err != nil {
-				log.Printf("daemon: session scratch sweep failed: %v", err)
-			} else if removed > 0 {
-				log.Printf("daemon: session scratch sweep removed %d stale dirs (older than %dd)", removed, days)
-			}
-		}()
-
-		// Compaction snapshots are manual rollback material, not permanent session
-		// history. Bound their lifetime independently of session deletion so an
-		// old but still-listed session cannot retain full-history copies forever.
-		days := 0
-		if s.deps != nil {
-			s.deps.mu.RLock()
-			if s.deps.Config != nil {
-				days = s.deps.Config.Agent.CompactionSnapshotMaxAgeDays
-			}
-			s.deps.mu.RUnlock()
-		}
-		s.startCompactionSnapshotSweep(days)
-
-		// One-time agent pull on startup: applies the cloud mirror to local disk
-		// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
-		// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
-		// when this finishes (success, failure, or unconfigured) so agentSyncWorker
-		// never blocks forever waiting on the gate before its first push.
-		go func() {
-			gw := s.cloudGateway()
-			if gw == nil {
-				s.runStartupAgentSync(nil) // unconfigured
-				return
-			}
-			s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
-				return gw.PullAgents(ctx)
-			})
-		}()
-
-		// Memory feature (Phase 2.3). Service is constructed once and Start runs
-		// the cold-path gates synchronously then spawns the supervisor goroutine.
-		// Failure modes (provider=disabled, tlm missing, cloud misconfigured) all
-		// resolve to Status=Disabled/Unavailable; the memory tool falls back.
-		memCfg := memory.LoadConfig(viper.GetViper())
-		memCfg.APIKey = memory.ResolveAPIKey(viper.GetViper())
-		memCfg.Endpoint = memory.ResolveEndpoint(viper.GetViper())
-		// When shan runs inside the Desktop app bundle, prefer the embedded tlm
-		// binary over PATH unless the operator explicitly set memory.tlm_path.
-		if memCfg.TLMPath == "" {
-			if bundlePath := memory.BundleRelativeTLMPath(); bundlePath != "" {
-				memCfg.TLMPath = bundlePath
-			}
-		}
-		var memAudit memory.AuditLogger
-		if s.deps != nil && s.deps.Auditor != nil {
-			memAudit = memoryAuditAdapter{logger: s.deps.Auditor}
-		}
-		s.memSvc = memory.NewService(memCfg, memAudit)
-		if s.deps != nil {
-			s.deps.MemSvc = s.memSvc
-		}
-		go func() {
-			if err := s.memSvc.Start(ctx); err != nil {
-				log.Printf("daemon memory: start error: %v", err)
-			}
-		}()
-
-		// Continue durable mid-turn checkpoints after the process is fully
-		// configured. The worker is sequential to avoid a restart burst competing
-		// with foreground traffic for model and tool capacity.
-		go s.resumeInterruptedTurns(ctx)
+	backgroundCleanup := func() {}
+	if s.isolated {
+		// Preserve the unconditional pullDone invariant even though the isolated
+		// process never starts the sync worker.
+		close(s.pullDone)
+		log.Print(IsolationMarkerBackgroundDisabled)
 	} else {
-		log.Printf("daemon: isolated server background services disabled")
+		backgroundCleanup = s.startBackgroundServices(ctx)
 	}
+	defer backgroundCleanup()
 
 	go func() {
 		<-ctx.Done()
@@ -1204,6 +1103,129 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Server) prepareBackgroundServices() (func(), error) {
+	// Bind the process coordinator's activity sink only for the live server.
+	// Offline Handler() fixtures can inject an isolated coordinator without
+	// stealing the singleton sink from a concurrently running daemon.
+	s.SetComputerUseCoordinator(s.computerUseCoordinator)
+	cleanupComputerUseIntegrationFixture, err := startComputerUseIntegrationFixture(
+		s.computerUseCoordinator,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("daemon server computer-use integration fixture: %w", err)
+	}
+	s.recoverMigrationOrphans()
+	return cleanupComputerUseIntegrationFixture, nil
+}
+
+// startBackgroundServices owns every daemon-wide worker excluded from the
+// state-isolated live-E2E process. Keeping their startup in one method makes a
+// new worker opt in to the production lifecycle deliberately.
+func (s *Server) startBackgroundServices(ctx context.Context) func() {
+	expiryCtx, stopComputerUseExpiry := context.WithCancel(ctx)
+	go s.runComputerUseExpiryLoop(expiryCtx)
+
+	// Spawn the gated session-sync ticker. It self-disables when sync is
+	// not enabled, so it's always safe to start unconditionally here.
+	go s.runSyncLoop(ctx)
+
+	// Serialized, debounced worker that pushes agent changes to Cloud.
+	go s.agentSyncWorker(ctx)
+
+	// Warm the default ClawHub browse page ONCE at startup so the first open of
+	// the marketplace tab has a stale fallback and doesn't surface the
+	// intermittent "registry unreachable" (注册表不可达) 503 on the default view
+	// during a clawhub.ai blip. Deliberately one-shot, not a poll loop: during
+	// active browsing the user's own requests keep the cache warm, and the
+	// 30-min view-agnostic golden slot covers idle gaps — so an unused
+	// (air-gapped / IM-only) daemon makes at most this single request. Gated by
+	// skills.marketplace.clawhub_warm_on_startup (default true).
+	go s.warmClawHubOnce(ctx)
+
+	// Reclaim stale per-session artifact scratch dirs. Interactive sessions
+	// keep their scratch across session switches (artifacts must outlive
+	// OnSessionClose — see the cloud-only cleanup rationale in runner.go), so
+	// age at startup is the reclaim mechanism. viper.GetInt returns 0 when
+	// config.Load hasn't run (hermetic unit tests) and sweepSessionScratch
+	// treats maxAge<=0 as a no-op; `daemon.scratch_max_age_days` (default 14)
+	// tunes the window, 0 disables.
+	go func() {
+		days := viper.GetInt("daemon.scratch_max_age_days")
+		if days <= 0 {
+			return
+		}
+		if removed, err := sweepSessionScratch(s.deps.ShannonDir, time.Duration(days)*24*time.Hour); err != nil {
+			log.Printf("daemon: session scratch sweep failed: %v", err)
+		} else if removed > 0 {
+			log.Printf("daemon: session scratch sweep removed %d stale dirs (older than %dd)", removed, days)
+		}
+	}()
+
+	// Compaction snapshots are manual rollback material, not permanent session
+	// history. Bound their lifetime independently of session deletion so an
+	// old but still-listed session cannot retain full-history copies forever.
+	days := 0
+	if s.deps != nil {
+		s.deps.mu.RLock()
+		if s.deps.Config != nil {
+			days = s.deps.Config.Agent.CompactionSnapshotMaxAgeDays
+		}
+		s.deps.mu.RUnlock()
+	}
+	s.startCompactionSnapshotSweep(days)
+
+	// One-time agent pull on startup: applies the cloud mirror to local disk
+	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
+	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
+	// when this finishes (success, failure, or unconfigured) so agentSyncWorker
+	// never blocks forever waiting on the gate before its first push.
+	go func() {
+		gw := s.cloudGateway()
+		if gw == nil {
+			s.runStartupAgentSync(nil) // unconfigured
+			return
+		}
+		s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
+			return gw.PullAgents(ctx)
+		})
+	}()
+
+	// Memory feature (Phase 2.3). Service is constructed once and Start runs
+	// the cold-path gates synchronously then spawns the supervisor goroutine.
+	// Failure modes (provider=disabled, tlm missing, cloud misconfigured) all
+	// resolve to Status=Disabled/Unavailable; the memory tool falls back.
+	memCfg := memory.LoadConfig(viper.GetViper())
+	memCfg.APIKey = memory.ResolveAPIKey(viper.GetViper())
+	memCfg.Endpoint = memory.ResolveEndpoint(viper.GetViper())
+	// When shan runs inside the Desktop app bundle, prefer the embedded tlm
+	// binary over PATH unless the operator explicitly set memory.tlm_path.
+	if memCfg.TLMPath == "" {
+		if bundlePath := memory.BundleRelativeTLMPath(); bundlePath != "" {
+			memCfg.TLMPath = bundlePath
+		}
+	}
+	var memAudit memory.AuditLogger
+	if s.deps != nil && s.deps.Auditor != nil {
+		memAudit = memoryAuditAdapter{logger: s.deps.Auditor}
+	}
+	s.memSvc = memory.NewService(memCfg, memAudit)
+	if s.deps != nil {
+		s.deps.MemSvc = s.memSvc
+	}
+	go func() {
+		if err := s.memSvc.Start(ctx); err != nil {
+			log.Printf("daemon memory: start error: %v", err)
+		}
+	}()
+
+	// Continue durable mid-turn checkpoints after the process is fully
+	// configured. The worker is sequential to avoid a restart burst competing
+	// with foreground traffic for model and tool capacity.
+	go s.resumeInterruptedTurns(ctx)
+
+	return stopComputerUseExpiry
 }
 
 const (

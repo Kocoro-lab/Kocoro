@@ -208,6 +208,8 @@ Koe tests link cgo audio deps. On macOS, install them with `brew install opus op
 
 Schedule tests use temp directories and do not write to the real LaunchAgents directory. Run live E2E before releases.
 
+Koe live E2E uses the hidden, foreground-only daemon isolation flags documented in `docs/live-e2e-testing.md`. It isolates filesystem state and port ownership, suppresses Cloud/background automation, and leaves OS credential stores and agent tool capabilities shared with the user account.
+
 ## Build And Release
 
 - GoReleaser builds releases.

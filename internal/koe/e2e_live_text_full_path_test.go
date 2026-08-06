@@ -351,9 +351,9 @@ func TestKoeLiveFullPathMatrixE2E(t *testing.T) {
 	}
 
 	oldPID, newPID := daemon.crashAndRestart(t)
-	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer recoveryCancel()
-	restarted := requireLiveTextFullPathDaemon(t, recoveryCtx, daemon.url)
+	readbackCtx, readbackCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer readbackCancel()
+	restarted := requireLiveTextFullPathDaemon(t, readbackCtx, daemon.url)
 	if restarted.Version != daemon.version {
 		t.Fatalf("restarted isolated daemon version=%q, want %q", restarted.Version, daemon.version)
 	}
@@ -362,9 +362,9 @@ func TestKoeLiveFullPathMatrixE2E(t *testing.T) {
 		if sessionID == "" {
 			continue
 		}
-		requireLiveTextFullPathSession(t, recoveryCtx, daemon.url, sessionID, scenario)
+		requireLiveTextFullPathSession(t, readbackCtx, daemon.url, sessionID, scenario)
 	}
-	t.Logf("RECOVERY: crash-restarted isolated daemon old_pid=%d new_pid=%d persisted_sessions=%d", oldPID, newPID, len(sessionIDs))
+	t.Logf("PERSISTENCE_READBACK: restarted isolated daemon old_pid=%d new_pid=%d persisted_sessions=%d", oldPID, newPID, len(sessionIDs))
 }
 
 func runLiveFullPathScenario(t *testing.T, daemonURL string, status liveTextFullPathDaemonStatus, scenario liveFullPathScenario) string {
@@ -382,6 +382,10 @@ func runLiveFullPathScenario(t *testing.T, daemonURL string, status liveTextFull
 	ephemeralKey, err := daemonClient.MintViaDaemon(ctx, e2eModelName())
 	if err != nil {
 		t.Fatalf("mint Realtime token through daemon: %v", err)
+	}
+	agents, err := daemonClient.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("list daemon agents: %v", err)
 	}
 	audio, err := NewAudioIO()
 	if err != nil {
@@ -402,7 +406,7 @@ func runLiveFullPathScenario(t *testing.T, daemonURL string, status liveTextFull
 	state := NewCallState(fmt.Sprintf("live-text-full-path-%d", time.Now().UnixNano()), "")
 	mailbox := NewResultMailbox()
 	mailbox.BeginBurst(state.BurstID())
-	dispatcher := NewDispatcher(daemonClient, NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	dispatcher := NewDispatcher(daemonClient, NewAgentResolver(agents, NoopSemanticMatcher{}), state, nil)
 
 	var sendMu sync.Mutex
 	send := func(value any) error {

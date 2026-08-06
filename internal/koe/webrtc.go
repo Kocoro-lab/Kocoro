@@ -19,10 +19,8 @@ import (
 )
 
 const (
-	openAIMintURL              = "https://api.openai.com/v1/realtime/client_secrets"
-	openAICallsURL             = "https://api.openai.com/v1/realtime/calls"
-	defaultSDPExchangeAttempts = 3
-	defaultSDPRetryBackoffMS   = 250
+	openAIMintURL  = "https://api.openai.com/v1/realtime/client_secrets"
+	openAICallsURL = "https://api.openai.com/v1/realtime/calls"
 )
 
 // mintEphemeral mints an OpenAI Realtime ephemeral client secret with a dev key.
@@ -147,56 +145,32 @@ func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
 	})
 }
 
-// exchangeSDP retries only explicit transient HTTP responses. Transport errors
-// remain terminal because a failed POST does not prove the server did not create
-// a session. KOE_SDP_EXCHANGE_MAX_ATTEMPTS and KOE_SDP_RETRY_BACKOFF_MS let
-// operators tune the bounded setup retry when provider conditions require it.
+// exchangeSDP sends one create-call request. It deliberately does not replay a
+// failed POST: the Realtime calls API does not expose an idempotency contract, so
+// an error response cannot prove the provider did not already create a session.
 func exchangeSDP(ctx context.Context, url, ek string, offer []byte) (string, error) {
-	attempts := koeEnvInt("KOE_SDP_EXCHANGE_MAX_ATTEMPTS", defaultSDPExchangeAttempts)
-	backoff := time.Duration(koeEnvInt("KOE_SDP_RETRY_BACKOFF_MS", defaultSDPRetryBackoffMS)) * time.Millisecond
-	for attempt := 1; attempt <= attempts; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(offer))
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("Authorization", "Bearer "+ek)
-		req.Header.Set("Content-Type", "application/sdp")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-		answer, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return "", fmt.Errorf("read SDP exchange response: %w", readErr)
-		}
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-			return string(answer), nil
-		}
-		if !retryableSDPStatus(resp.StatusCode) || attempt == attempts {
-			return "", fmt.Errorf("sdp exchange failed: HTTP %d: %s", resp.StatusCode, string(answer))
-		}
-		delay := time.Duration(attempt) * backoff
-		log.Printf("koe: SDP exchange HTTP %d; retrying attempt=%d/%d in %s", resp.StatusCode, attempt+1, attempts, delay)
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return "", ctx.Err()
-		case <-timer.C:
-		}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(offer))
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("sdp exchange failed without an attempt")
-}
-
-func retryableSDPStatus(status int) bool {
-	switch status {
-	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
-		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	default:
-		return false
+	req.Header.Set("Authorization", "Bearer "+ek)
+	req.Header.Set("Content-Type", "application/sdp")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
 	}
+	answer, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return "", fmt.Errorf("read SDP exchange response: %w", readErr)
+	}
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return string(answer), nil
+	}
+	if requestID := resp.Header.Get("x-request-id"); requestID != "" {
+		return "", fmt.Errorf("sdp exchange failed: HTTP %d request_id=%s: %s", resp.StatusCode, requestID, string(answer))
+	}
+	return "", fmt.Errorf("sdp exchange failed: HTTP %d: %s", resp.StatusCode, string(answer))
 }
 
 // sendTrackStats reconciles "gate passed N frames" with "track actually wrote M

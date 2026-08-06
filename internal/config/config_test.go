@@ -50,18 +50,11 @@ func TestValidateConfig_IdleTimeouts(t *testing.T) {
 	}
 }
 
-func TestShannonDirUsesAbsoluteStateOverride(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "isolated-state")
-	t.Setenv("SHANNON_STATE_DIR", dir)
-	if got := ShannonDir(); got != dir {
-		t.Fatalf("ShannonDir() = %q, want isolated override %q", got, dir)
-	}
-}
-
-func TestShannonDirRejectsRelativeStateOverride(t *testing.T) {
-	t.Setenv("SHANNON_STATE_DIR", "relative-state")
-	if got := ShannonDir(); got != "" {
-		t.Fatalf("ShannonDir() = %q, want empty for relative override", got)
+func TestShannonDirIgnoresStateDirectoryEnvironment(t *testing.T) {
+	environmentDir := filepath.Join(t.TempDir(), "environment-state")
+	t.Setenv("SHANNON_STATE_DIR", environmentDir)
+	if got := ShannonDir(); got == environmentDir {
+		t.Fatalf("ShannonDir() accepted process-global SHANNON_STATE_DIR=%q", environmentDir)
 	}
 }
 

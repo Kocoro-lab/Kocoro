@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	daemonpkg "github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
 )
 
@@ -211,21 +212,25 @@ func (b *synchronizedBuffer) String() string {
 
 func startIsolatedLiveDaemon(t *testing.T, bin string) *isolatedLiveDaemon {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve isolated daemon port: %v", err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatalf("release isolated daemon port: %v", err)
-	}
-	if port == 7533 {
-		return startIsolatedLiveDaemon(t, bin)
+	port := 0
+	for port == 0 || port == 7533 {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve isolated daemon port: %v", err)
+		}
+		port = listener.Addr().(*net.TCPAddr).Port
+		if err := listener.Close(); err != nil {
+			t.Fatalf("release isolated daemon port: %v", err)
+		}
 	}
 
+	stateDir := t.TempDir()
 	daemon := &isolatedLiveDaemon{baseURL: fmt.Sprintf("http://127.0.0.1:%d", port)}
-	cmd := exec.Command(bin, "daemon", "start", "--isolated", "--port", strconv.Itoa(port))
-	cmd.Env = replaceLiveEnv(os.Environ(), "SHANNON_STATE_DIR", t.TempDir())
+	cmd := exec.Command(
+		bin, "daemon", "start", "--isolated",
+		"--state-dir", stateDir,
+		"--port", strconv.Itoa(port),
+	)
 	cmd.Stdout = &daemon.output
 	cmd.Stderr = &daemon.output
 	if err := cmd.Start(); err != nil {
@@ -289,10 +294,10 @@ func waitForDaemon(t *testing.T, daemon *isolatedLiveDaemon, timeout time.Durati
 func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout time.Duration) {
 	t.Helper()
 	want := []string{
-		"isolated mode — MCP connections and health supervision disabled",
-		"isolated mode — Cloud WS, watchers, heartbeat, and scheduler disabled",
-		"isolated mode — Cloud WS connection suppressed",
-		"isolated server background services disabled",
+		daemonpkg.IsolationMarkerMCPDisabled,
+		daemonpkg.IsolationMarkerAutomationDisabled,
+		daemonpkg.IsolationMarkerCloudWSSuppressed,
+		daemonpkg.IsolationMarkerBackgroundDisabled,
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -310,17 +315,6 @@ func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout t
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("isolated daemon did not confirm contained startup\n%s", daemon.output.String())
-}
-
-func replaceLiveEnv(environment []string, key, value string) []string {
-	prefix := key + "="
-	out := make([]string, 0, len(environment)+1)
-	for _, entry := range environment {
-		if !strings.HasPrefix(entry, prefix) {
-			out = append(out, entry)
-		}
-	}
-	return append(out, prefix+value)
 }
 
 // TestLive_GenerateAndEditImage exercises the v0.1.4 generate_image +
