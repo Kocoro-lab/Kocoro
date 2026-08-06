@@ -73,8 +73,27 @@ func TestStatefulGUIObservationsBypassFallbackReadCache(t *testing.T) {
 
 	ordinary := statefulReadCacheProbe{name: "ordinary_read"}
 	traits := resolveFallbackReadStateTraits(ordinary, `{}`)
+	if traits.Cacheable || len(traits.Reads) != 0 {
+		t.Fatalf("dynamic read-only fallback entered cross-iteration cache: %+v", traits)
+	}
+
+	stable := stableReadCacheProbe{statefulReadCacheProbe{name: "stable_read"}}
+	traits = resolveFallbackReadStateTraits(stable, `{}`)
 	if !traits.Cacheable || len(traits.Reads) != 1 {
-		t.Fatalf("ordinary read-only fallback unexpectedly disabled: %+v", traits)
+		t.Fatalf("explicitly stable read did not enter cross-iteration cache: %+v", traits)
+	}
+}
+
+func TestEnforceCrossIterationCacheContractRejectsDynamicNamedReads(t *testing.T) {
+	for _, name := range []string{"browser_snapshot", "file_read"} {
+		traits := enforceCrossIterationCacheContract(
+			statefulReadCacheProbe{name: name},
+			`{}`,
+			resolveCallStateTraits(name, `{}`),
+		)
+		if traits.Cacheable {
+			t.Fatalf("%s remained cacheable without explicit stability contract", name)
+		}
 	}
 }
 
@@ -93,3 +112,9 @@ func (statefulReadCacheProbe) Run(context.Context, string) (ToolResult, error) {
 func (statefulReadCacheProbe) RequiresApproval() bool { return false }
 
 func (statefulReadCacheProbe) IsReadOnlyCall(string) bool { return true }
+
+type stableReadCacheProbe struct {
+	statefulReadCacheProbe
+}
+
+func (stableReadCacheProbe) CacheAcrossIterations(string) bool { return true }

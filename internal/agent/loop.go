@@ -5644,15 +5644,16 @@ iterationLoop:
 		// Builds list of approved tool calls. Denied/unknown results are stored
 		// in execResults at their original index so Phase 3 can emit everything in order.
 		type perCallMeta struct {
-			argsStr     string
-			decision    string
-			wasApproved bool
-			validated   bool
-			sideEffect  bool
-			argsDigest  string
-			resolved    bool // true if already resolved (denied/unknown/hook-denied)
-			cacheKey    string
-			stateTraits CallStateTraits
+			argsStr      string
+			decision     string
+			wasApproved  bool
+			validated    bool
+			sideEffect   bool
+			loopReadOnly bool
+			argsDigest   string
+			resolved     bool // true if already resolved (denied/unknown/hook-denied)
+			cacheKey     string
+			stateTraits  CallStateTraits
 		}
 		callMeta := make([]perCallMeta, len(toolCalls))
 		execResults := make([]toolExecResult, len(toolCalls))
@@ -5920,6 +5921,15 @@ iterationLoop:
 				continue
 			}
 			callMeta[idx].validated = true
+			if readOnly, ok := tool.(ReadOnlyChecker); ok && readOnly.IsReadOnlyCall(argsStr) {
+				callMeta[idx].loopReadOnly = true
+			}
+			if material, ok := tool.(MaterialSideEffectChecker); ok && !material.HasMaterialSideEffect(argsStr) {
+				callMeta[idx].loopReadOnly = true
+			}
+			if isReadMCPName(fc.Name) || fc.Name == "browser_snapshot" {
+				callMeta[idx].loopReadOnly = true
+			}
 			if readOnly, ok := tool.(ReadOnlyChecker); !ok || !readOnly.IsReadOnlyCall(argsStr) {
 				callMeta[idx].sideEffect = true
 				callMeta[idx].argsDigest = toolArgumentsDigest(fc.Arguments)
@@ -5959,6 +5969,7 @@ iterationLoop:
 			}
 
 			stateTraits := resolveCallStateTraits(fc.Name, argsStr)
+			stateTraits = enforceCrossIterationCacheContract(tool, argsStr, stateTraits)
 			if !stateTraits.Cacheable && len(stateTraits.Reads) == 0 && len(stateTraits.Writes) == 0 && !stateTraits.UnknownWrite {
 				stateTraits = resolveFallbackReadStateTraits(tool, argsStr)
 			}
@@ -6368,7 +6379,16 @@ iterationLoop:
 				resultSig = extractResultSignature(result.Content)
 			}
 			nonActionable := isNonActionableSearch(fc.Name, result)
-			detector.Record(fc.Name, argsStr, result.IsError, errMsg, resultSig, nonActionable)
+			detector.RecordOutcome(
+				fc.Name,
+				argsStr,
+				result.IsError,
+				errMsg,
+				resultSig,
+				toolOutcomeSignature(result.Content),
+				callMeta[idx].loopReadOnly,
+				nonActionable,
+			)
 
 			// Check for stuck loops (escalate to worst action seen)
 			action, msg := detector.Check(fc.Name)

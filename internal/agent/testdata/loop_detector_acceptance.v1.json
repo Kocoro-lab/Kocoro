@@ -53,6 +53,29 @@
       ]
     },
     {
+      "id": "productive_same_args_polling_with_progress",
+      "class": "productive",
+      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "events": [
+        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "queued", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "starting", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "running-25", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "running-60", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "complete", "is_read_only": true}
+      ]
+    },
+    {
+      "id": "loop_same_args_polling_without_progress",
+      "class": "loop",
+      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 4, "first_force_stop_max": 4, "ideal_stop_after": 3, "max_wasted_calls": 1},
+      "events": [
+        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
+        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true}
+      ]
+    },
+    {
       "id": "loop_identical_polling",
       "class": "loop",
       "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 4, "first_force_stop_max": 4, "ideal_stop_after": 3, "max_wasted_calls": 1},

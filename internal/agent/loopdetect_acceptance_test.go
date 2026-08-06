@@ -37,6 +37,8 @@ type loopAcceptanceEvent struct {
 	IsError         bool   `json:"is_error,omitempty"`
 	Error           string `json:"error,omitempty"`
 	ResultSig       string `json:"result_sig,omitempty"`
+	OutcomeSig      string `json:"outcome_sig,omitempty"`
+	IsReadOnly      bool   `json:"is_read_only,omitempty"`
 	IsNonActionable bool   `json:"is_non_actionable,omitempty"`
 }
 
@@ -148,12 +150,14 @@ func replayLoopAcceptanceTrace(trace loopAcceptanceTrace) loopAcceptanceTraceRes
 	}
 	detector := NewLoopDetector()
 	for index, event := range trace.Events {
-		detector.Record(
+		detector.RecordOutcome(
 			event.Name,
 			event.Args,
 			event.IsError,
 			event.Error,
 			event.ResultSig,
+			event.OutcomeSig,
+			event.IsReadOnly,
 			event.IsNonActionable,
 		)
 		action, _ := detector.Check(event.Name)

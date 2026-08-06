@@ -28,6 +28,15 @@ type CallStateTraits struct {
 	Cacheable    bool
 }
 
+// CrossIterationCacheable is an explicit referential-transparency contract.
+// Read-only and safe-to-run are insufficient: job status, browser snapshots,
+// files, calendars, and remote records can change without an in-loop write.
+// Tools must opt in only when identical arguments are guaranteed to return an
+// equivalent result for the entire AgentLoop run.
+type CrossIterationCacheable interface {
+	CacheAcrossIterations(argsJSON string) bool
+}
+
 type stateVersionTracker struct {
 	versions map[string]int
 }
@@ -145,10 +154,25 @@ func resolveFallbackReadStateTraits(tool Tool, argsJSON string) CallStateTraits 
 	if !ok || !readOnly.IsReadOnlyCall(argsJSON) {
 		return CallStateTraits{}
 	}
+	cacheable, ok := tool.(CrossIterationCacheable)
+	if !ok || !cacheable.CacheAcrossIterations(argsJSON) {
+		return CallStateTraits{}
+	}
 	return CallStateTraits{
 		Reads:     []StateRef{processSessionStateRef()},
 		Cacheable: true,
 	}
+}
+
+func enforceCrossIterationCacheContract(tool Tool, argsJSON string, traits CallStateTraits) CallStateTraits {
+	if !traits.Cacheable {
+		return traits
+	}
+	cacheable, ok := tool.(CrossIterationCacheable)
+	if !ok || !cacheable.CacheAcrossIterations(argsJSON) {
+		traits.Cacheable = false
+	}
+	return traits
 }
 
 func buildStateAwareCacheKey(toolName string, args json.RawMessage, traits CallStateTraits, tracker *stateVersionTracker) string {

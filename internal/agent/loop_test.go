@@ -1278,6 +1278,7 @@ func (m *mockCountingTool) RequiresApproval() bool { return false }
 func (m *mockCountingTool) IsReadOnlyCall(string) bool {
 	return true
 }
+func (m *mockCountingTool) CacheAcrossIterations(string) bool { return true }
 
 type mockComputerUseRecoveryTool struct {
 	runs int
@@ -5309,6 +5310,65 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 	}
 	if !sawSystemReason {
 		t.Error("expected a [system] reason message injected by runForceStopTurn, none found")
+	}
+}
+
+type changingReadOnlyTool struct {
+	name    string
+	results []string
+	runs    int
+}
+
+func (t *changingReadOnlyTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        t.name,
+		Description: "return changing job status",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}
+}
+
+func (t *changingReadOnlyTool) Run(context.Context, string) (ToolResult, error) {
+	index := t.runs
+	t.runs++
+	if index >= len(t.results) {
+		index = len(t.results) - 1
+	}
+	return ToolResult{Content: t.results[index]}, nil
+}
+
+func (*changingReadOnlyTool) RequiresApproval() bool            { return false }
+func (*changingReadOnlyTool) IsReadOnlyCall(string) bool        { return true }
+func (*changingReadOnlyTool) HasMaterialSideEffect(string) bool { return false }
+
+func TestAgentLoopReadOnlyPollingChangingOutcomeReachesCompletion(t *testing.T) {
+	llmCallCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCallCount++
+		if llmCallCount <= 5 {
+			json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("job_status", `{"id":"job-1"}`, fmt.Sprintf("status_%d", llmCallCount)), 10, 5))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("job complete", "end_turn", nil, 10, 5))
+	}))
+	defer server.Close()
+
+	tool := &changingReadOnlyTool{
+		name:    "job_status",
+		results: []string{"queued", "starting", "running 25%", "running 60%", "complete"},
+	}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), registry, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(false)
+	loop.SetHandler(&mockHandler{approveResult: true})
+
+	result, _, err := loop.Run(context.Background(), "wait for the job", nil, nil)
+	if err != nil {
+		t.Fatalf("polling run failed: %v", err)
+	}
+	if result != "job complete" || tool.runs != 5 || llmCallCount != 6 {
+		t.Fatalf("changing outcomes must reach normal completion: result=%q tool_runs=%d llm_calls=%d", result, tool.runs, llmCallCount)
 	}
 }
 

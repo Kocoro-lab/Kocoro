@@ -1189,6 +1189,44 @@ func TestLoopDetector_BrowserSnapshotConsecutiveDupStillForceStops(t *testing.T)
 	}
 }
 
+func TestLoopDetector_ReadOnlyPollingChangingOutcomeContinues(t *testing.T) {
+	ld := NewLoopDetector()
+	for _, outcome := range []string{"queued", "starting", "running-25", "running-60", "complete"} {
+		ld.RecordOutcome("job_status", `{"id":"job-1"}`, false, "", "", outcome, true, false)
+		if action, msg := ld.Check("job_status"); action != LoopContinue {
+			t.Fatalf("changing read-only outcome must count as progress, got %v: %s", action, msg)
+		}
+	}
+}
+
+func TestLoopDetector_ReadOnlyPollingStableOutcomeStops(t *testing.T) {
+	ld := NewLoopDetector()
+	for call := 1; call <= 4; call++ {
+		ld.RecordOutcome("job_status", `{"id":"job-1"}`, false, "", "", "running-0", true, false)
+		action, _ := ld.Check("job_status")
+		if call == 3 && action != LoopNudge {
+			t.Fatalf("stable read-only outcome call 3 must nudge, got %v", action)
+		}
+		if call == 4 && action != LoopForceStop {
+			t.Fatalf("stable read-only outcome call 4 must stop, got %v", action)
+		}
+	}
+}
+
+func TestLoopDetector_MutatingDuplicateDoesNotTrustChangingReceipts(t *testing.T) {
+	ld := NewLoopDetector()
+	for call, receipt := range []string{"message-1", "message-2", "message-3", "message-4"} {
+		ld.RecordOutcome("send_message", `{"to":"user","text":"hello"}`, false, "", "", receipt, false, false)
+		action, _ := ld.Check("send_message")
+		if call == 2 && action != LoopNudge {
+			t.Fatalf("third duplicate mutation must nudge despite volatile receipt, got %v", action)
+		}
+		if call == 3 && action != LoopForceStop {
+			t.Fatalf("fourth duplicate mutation must stop despite volatile receipt, got %v", action)
+		}
+	}
+}
+
 // TestIsReadMCPName locks the read-verb whitelist used to populate
 // the loop detector's batchTolerant set. Read-only MCP tools must match
 // (eligible for uniqueness-gated NoProgress relief); write-capable tools

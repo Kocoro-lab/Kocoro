@@ -29,6 +29,8 @@ type ToolCallRecord struct {
 	ArgsHash        string // hex-encoded hash of raw args
 	TopicHash       string // hex-encoded hash of normalized args (web tools)
 	ResultSig       string // domain signature from results (web tools)
+	OutcomeSig      string // stable signature of the complete tool outcome
+	IsReadOnly      bool   // identical read args may still make progress when outcomes change
 	IsError         bool
 	ErrorSig        string // first 100 chars of error for grouping
 	IsNonActionable bool   // search returned no useful results (no matches, binary noise, errors)
@@ -322,6 +324,14 @@ func NewLoopDetector() *LoopDetector {
 
 // Record adds a tool call to the sliding window.
 func (ld *LoopDetector) Record(name, argsJSON string, isError bool, errMsg string, resultSig string, isNonActionable bool) {
+	ld.RecordOutcome(name, argsJSON, isError, errMsg, resultSig, "[legacy-static-outcome]", false, isNonActionable)
+}
+
+// RecordOutcome adds a tool call together with the execution outcome used to
+// distinguish a stuck observation loop from legitimate polling. Mutating calls
+// deliberately remain argument-based: repeating the same write is dangerous
+// even when a provider returns fresh ids or timestamps for every attempt.
+func (ld *LoopDetector) RecordOutcome(name, argsJSON string, isError bool, errMsg string, resultSig string, outcomeSig string, isReadOnly bool, isNonActionable bool) {
 	topicHash := ""
 	if toolFamily(name) != "" {
 		normalized := normalizeWebQuery(argsJSON)
@@ -334,6 +344,8 @@ func (ld *LoopDetector) Record(name, argsJSON string, isError bool, errMsg strin
 		ArgsHash:          hashArgs(argsJSON),
 		TopicHash:         topicHash,
 		ResultSig:         resultSig,
+		OutcomeSig:        outcomeSig,
+		IsReadOnly:        isReadOnly,
 		IsError:           isError,
 		ErrorSig:          truncateErrSig(errMsg, 100),
 		IsNonActionable:   isNonActionable,
@@ -446,11 +458,19 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	consecCount := 0
 	consecErrCount := 0
 	consecValidationErrCount := 0
+	consecSameOutcomeCount := 0
+	latestOutcome := ld.history[len(ld.history)-1].OutcomeSig
+	outcomeTailOpen := latestOutcome != ""
 	for i := len(ld.history) - 1; i >= 0; i-- {
 		if ld.history[i].Name != name || ld.history[i].ArgsHash != latestHash {
 			break
 		}
 		consecCount++
+		if outcomeTailOpen && ld.history[i].OutcomeSig == latestOutcome {
+			consecSameOutcomeCount++
+		} else {
+			outcomeTailOpen = false
+		}
 		if ld.history[i].IsError {
 			consecErrCount++
 			if isValidationErrorSig(ld.history[i].ErrorSig) {
@@ -485,13 +505,17 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		if consecErrCount == consecCount {
 			threshold = ld.consecDupThreshold * 2 // Rule 2: all-errors budget
 		}
-		if consecCount >= threshold+1 {
-			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
-				"You called %s with identical arguments %d times in a row without new evidence.", name, consecCount))
+		effectiveCount := consecCount
+		if ld.history[len(ld.history)-1].IsReadOnly && consecErrCount == 0 {
+			effectiveCount = consecSameOutcomeCount
 		}
-		if consecCount >= threshold {
+		if effectiveCount >= threshold+1 {
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You called %s with identical arguments and outcomes %d times in a row without new evidence.", name, effectiveCount))
+		}
+		if effectiveCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
-				"You've called %s %d times consecutively with identical arguments. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, consecCount)
+				"You've called %s %d times consecutively without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, effectiveCount)
 		}
 	}
 
@@ -516,18 +540,35 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			}
 		}
 	}
+	dupSameOutcomeCount := 0
+	if latestOutcome != "" {
+		for i := len(ld.history) - 1; i >= 0; i-- {
+			rec := ld.history[i]
+			if rec.Name != name || rec.ArgsHash != latestHash {
+				continue
+			}
+			if rec.OutcomeSig != latestOutcome {
+				break
+			}
+			dupSameOutcomeCount++
+		}
+	}
 	if !dupExemptTools[name] && !windowDupExemptTools[name] && !exactRecovered {
 		threshold := ld.exactDupThreshold
 		if dupCount > 0 && dupErrCount == dupCount {
 			threshold = ld.exactDupThreshold * 2 // all-errors budget
 		}
-		if dupCount >= threshold*2 {
-			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
-				"You called %s with identical arguments %d times without new evidence.", name, dupCount))
+		effectiveCount := dupCount
+		if ld.history[len(ld.history)-1].IsReadOnly && dupErrCount == 0 {
+			effectiveCount = dupSameOutcomeCount
 		}
-		if dupCount >= threshold {
+		if effectiveCount >= threshold*2 {
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You called %s with identical arguments and outcomes %d times without new evidence.", name, effectiveCount))
+		}
+		if effectiveCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
-				"You've called %s %d times with identical arguments. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a fundamentally different approach.", name, dupCount)
+				"You've called %s %d times without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a fundamentally different approach.", name, effectiveCount)
 		}
 	}
 

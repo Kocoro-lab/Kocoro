@@ -39,6 +39,9 @@ run_offline_lane() {
   run_check loop_detector_corpus env \
     AGENT_LOOP_HARNESS_REPORT="$output_dir/loop-detector.json" \
     go test ./internal/agent -run '^TestLoopDetectorAcceptanceCorpus$' -count=1 -v
+  run_check loop_runtime_progress go test ./internal/agent \
+    -run '^TestAgentLoopReadOnlyPollingChangingOutcomeReachesCompletion$' \
+    -count=1 -v
   run_check mcp_dispatch_faults go test ./internal/tools \
     -run '^TestMCPTool_Run_(WriteToolNotReplayedAfterPostDispatchTransportError|IdempotentToolReplayedAfterTransportError|NoRetryOnNonTransportError|NoRetryOnPerCallTimeoutError|NoRetryAfterCtxCancel)$' \
     -count=1 -v

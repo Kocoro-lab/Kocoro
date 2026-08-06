@@ -167,9 +167,15 @@ func TestAgentLoop_SnapshotExcludesInjectedMessages(t *testing.T) {
 // secretly add them back: whatever the caller puts in history is exactly what
 // the snapshot exposes for those positions.
 func TestAgentLoop_SnapshotDoesNotLeakHistoryContent(t *testing.T) {
+	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-			toolCall("capture_snapshot", `{}`), 10, 5))
+		callCount++
+		if callCount == 1 {
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("capture_snapshot", `{}`), 10, 5))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("done", "end_turn", nil, 10, 5))
 	}))
 	defer server.Close()
 
