@@ -519,6 +519,18 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		}
 	}
 
+	// 1a-post. Ping-pong no-progress: A -> B -> A -> B with stable outcomes
+	// on both sides. This catches loops that evade same-tool consecutive checks
+	// while preserving productive alternation whenever either observation
+	// changes. Six calls nudge; eight calls force a bounded synthesis turn.
+	if count := pingPongNoProgressCount(ld.history); count >= 8 {
+		return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+			"You alternated between the same two tool actions %d times without a changed outcome.", count))
+	} else if count >= 6 {
+		return LoopNudge, fmt.Sprintf(
+			"You've alternated between the same two tool actions %d times without a changed outcome. Use the evidence already returned or change strategy.", count)
+	}
+
 	// 1b. Window-based exact duplicate — catches spread-out repeats
 	// like read→edit→read→edit→read (same args appearing 3+ times in window).
 	// Rule 1 (tail-success skip) also applies here: skip if model just recovered.
@@ -788,6 +800,57 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// threshold — see plan 2026-05-14-thinking-blocks-alignment.md
 	// post-mortem). Removed 2026-05.
 	return LoopContinue, ""
+}
+
+func pingPongNoProgressCount(history []ToolCallRecord) int {
+	if len(history) < 4 {
+		return 0
+	}
+	last := history[len(history)-1]
+	previous := history[len(history)-2]
+	if sameToolAction(last, previous) {
+		return 0
+	}
+
+	outcomeSet := [2]bool{}
+	outcomes := [2]string{}
+	count := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		record := history[i]
+		slot := count % 2
+		expected := last
+		if slot == 1 {
+			expected = previous
+		}
+		if !sameToolAction(record, expected) {
+			break
+		}
+		// Alternating failures use the existing error recovery budgets, which
+		// deliberately allow flaky calls more room than successful no-progress
+		// observations. Do not let the ping-pong path bypass that policy.
+		if record.IsError {
+			return 0
+		}
+		if record.IsReadOnly && !record.IsError {
+			if record.OutcomeSig == "" {
+				return 0
+			}
+			if outcomeSet[slot] && outcomes[slot] != record.OutcomeSig {
+				return 0
+			}
+			outcomeSet[slot] = true
+			outcomes[slot] = record.OutcomeSig
+		}
+		count++
+	}
+	if count < 4 || count%2 != 0 {
+		return 0
+	}
+	return count
+}
+
+func sameToolAction(left, right ToolCallRecord) bool {
+	return left.Name == right.Name && left.ArgsHash == right.ArgsHash
 }
 
 // latestRecoveredAfterSameArgsErrors reports whether the latest same-name,

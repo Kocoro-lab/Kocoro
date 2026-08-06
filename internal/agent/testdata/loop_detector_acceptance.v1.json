@@ -87,6 +87,36 @@
       ]
     },
     {
+      "id": "productive_alternating_observations_with_progress",
+      "class": "productive",
+      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "events": [
+        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "queued", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "booting", "is_read_only": true},
+        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "running-25", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "loaded model", "is_read_only": true},
+        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "running-70", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "writing output", "is_read_only": true},
+        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "complete", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "done", "is_read_only": true}
+      ]
+    },
+    {
+      "id": "loop_ping_pong_without_progress",
+      "class": "loop",
+      "expectation": {"first_nudge_min": 6, "first_nudge_max": 6, "first_force_stop_min": 8, "first_force_stop_max": 8, "ideal_stop_after": 6, "max_wasted_calls": 2},
+      "events": [
+        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
+        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
+        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
+        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
+        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true}
+      ]
+    },
+    {
       "id": "loop_repeated_validation_error",
       "class": "loop",
       "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 3, "first_force_stop_max": 3, "ideal_stop_after": 3, "max_wasted_calls": 0},

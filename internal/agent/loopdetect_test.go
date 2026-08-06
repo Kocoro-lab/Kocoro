@@ -1227,6 +1227,38 @@ func TestLoopDetector_MutatingDuplicateDoesNotTrustChangingReceipts(t *testing.T
 	}
 }
 
+func TestLoopDetector_PingPongStableOutcomesEscalates(t *testing.T) {
+	ld := NewLoopDetector()
+	for call := 1; call <= 8; call++ {
+		name, args, outcome := "job_status", `{"id":"job-1"}`, "running"
+		if call%2 == 0 {
+			name, args, outcome = "job_log", `{"id":"job-1","tail":20}`, "no new lines"
+		}
+		ld.RecordOutcome(name, args, false, "", "", outcome, true, false)
+		action, _ := ld.Check(name)
+		if call == 6 && action != LoopNudge {
+			t.Fatalf("six stable ping-pong calls must nudge, got %v", action)
+		}
+		if call == 8 && action != LoopForceStop {
+			t.Fatalf("eight stable ping-pong calls must stop, got %v", action)
+		}
+	}
+}
+
+func TestLoopDetector_PingPongChangingOutcomeContinues(t *testing.T) {
+	ld := NewLoopDetector()
+	for call := 1; call <= 10; call++ {
+		name, args, outcome := "job_status", `{"id":"job-1"}`, fmt.Sprintf("progress-%d", call)
+		if call%2 == 0 {
+			name, args, outcome = "job_log", `{"id":"job-1","tail":20}`, fmt.Sprintf("line-%d", call)
+		}
+		ld.RecordOutcome(name, args, false, "", "", outcome, true, false)
+		if action, msg := ld.Check(name); action != LoopContinue {
+			t.Fatalf("changing ping-pong outcomes must continue, call=%d action=%v msg=%s", call, action, msg)
+		}
+	}
+}
+
 // TestIsReadMCPName locks the read-verb whitelist used to populate
 // the loop detector's batchTolerant set. Read-only MCP tools must match
 // (eligible for uniqueness-gated NoProgress relief); write-capable tools
