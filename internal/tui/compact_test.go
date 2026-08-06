@@ -522,31 +522,16 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 	// never the live run's.
 	m.gateway = nil
 	m.runInFlight = 1 // run A live
-	_, remoteCmd := m.handleResearch([]string{"anything"})
+	remoteCmd := m.runRemote("anything", nil, "standard")
 	if m.runInFlight != 2 {
 		t.Fatalf("runRemote must take the guard before the nil-gateway return, got %d", m.runInFlight)
 	}
-	drained := false
-	var drain func(c tea.Cmd)
-	drain = func(c tea.Cmd) {
-		if c == nil {
-			return
-		}
-		switch msg := c().(type) {
-		case tea.BatchMsg:
-			for _, sub := range msg {
-				drain(sub)
-			}
-		case agentDoneMsg:
-			drained = true
-			updated1, _ := m.Update(msg)
-			m = updated1.(*Model)
-		}
-	}
-	drain(remoteCmd)
-	if !drained {
+	doneMsg, ok := remoteCmd().(agentDoneMsg)
+	if !ok {
 		t.Fatal("nil-gateway path must emit an agentDoneMsg")
 	}
+	updated1, _ := m.Update(doneMsg)
+	m = updated1.(*Model)
 	if m.runInFlight != 1 {
 		t.Fatalf("the nil-gateway done message must not release run A: %d", m.runInFlight)
 	}
@@ -641,6 +626,18 @@ func TestCompactBusyCheckPrecedesLengthCheck(t *testing.T) {
 // winding-down run's session writes).
 func TestEscDoesNotReleaseRunInFlight(t *testing.T) {
 	m := newCommandTestModel(t)
+	// Seed past MinShapeable: with an empty session the length bail also
+	// leaves compactInFlight false, so the refusal assertions below could
+	// not fail against the bool regression they exist to catch.
+	sess := m.sessions.Current()
+	for i := 0; i < 12; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		sess.Messages = append(sess.Messages, client.Message{Role: role, Content: client.NewTextContent(strings.Repeat("history ", 100))})
+		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
+	}
 	m.state = stateProcessing
 	m.runInFlight = 1
 	m.cancelRun = func() {}
@@ -674,9 +671,17 @@ func TestEscDoesNotReleaseRunInFlight(t *testing.T) {
 	if m.runInFlight != 1 {
 		t.Fatalf("first done must not release the guard under a live second run: %d", m.runInFlight)
 	}
+	overlapMark := len(m.output)
 	m.handleSlashCommand("/compact") // the named consequence, not just the counter
 	if m.compactInFlight {
 		t.Fatal("/compact must stay refused under the live second run")
+	}
+	var overlapOut strings.Builder
+	for _, o := range m.output[overlapMark:] {
+		overlapOut.WriteString(o.rendered)
+	}
+	if !strings.Contains(overlapOut.String(), "Busy") {
+		t.Fatal("the overlap refusal must be the Busy line, not a length bail")
 	}
 	updated, _ = m.Update(agentDoneMsg{}) // run B finishes
 	m = updated.(*Model)
