@@ -16,6 +16,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	DefaultAgentMaxIterations = 40
+	DefaultAgentMaxTokens     = 0
+)
+
 // ConfigSource tracks which file a config value came from.
 type ConfigSource struct {
 	File  string
@@ -461,7 +466,7 @@ func Load() (*Config, error) {
 	// agent.max_iterations: bumped 25 → 40 — typical "refactor 12 files" or
 	// "batch-process 20 attachments" tasks routinely need >25 iterations.
 	// User-configurable per agent; this is just the default.
-	viper.SetDefault("agent.max_iterations", 40)
+	viper.SetDefault("agent.max_iterations", DefaultAgentMaxIterations)
 	viper.SetDefault("agent.system_event_cap", 20)
 	viper.SetDefault("agent.reply_route_index_cap", 256)
 	viper.SetDefault("agent.temperature", 0)
@@ -471,7 +476,7 @@ func Load() (*Config, error) {
 	// The legacy 32000 constant capped Sonnet 4.6 / Opus 4.6 / Haiku 4.5
 	// at half their physical 64K output limit; the model-aware default
 	// lifts that cap without forcing users to learn this knob.
-	viper.SetDefault("agent.max_tokens", 0)
+	viper.SetDefault("agent.max_tokens", DefaultAgentMaxTokens)
 	viper.SetDefault("agent.thinking", true)
 	viper.SetDefault("agent.thinking_mode", "adaptive")
 	viper.SetDefault("agent.thinking_budget", 10000)

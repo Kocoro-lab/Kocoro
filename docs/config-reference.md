@@ -71,9 +71,9 @@ Per-server fields: `command` + `args` (stdio), `type: http` + `url` (HTTP), `env
 
 ```yaml
 agent:
-  max_iterations: 25               # max tool calls per turn (default: 25)
+  max_iterations: 40               # max model/tool iterations per turn (default: 40; GUI workflows get at least 75)
   temperature: 0                   # LLM temperature (default: 0)
-  max_tokens: 32000                # max output tokens (default: 32000)
+  max_tokens: 0                    # max output tokens (default: 0 = resolve from the selected model)
   model: ""                        # specific model override (empty = use model_tier)
   model_tier: ""                   # tier override (medium | large); empty = inherit global model_tier. "small" reserved for daemon-internal calls — do not pin via UI.
   reasoning_effort: ""             # "low" / "medium" / "high" (empty = model default)
