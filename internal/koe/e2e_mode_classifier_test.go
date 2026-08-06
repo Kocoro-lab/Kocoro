@@ -19,12 +19,15 @@ package koe
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,22 +40,24 @@ import (
 )
 
 const (
-	modeClassifierGate            = "KOE_MODE_CLASSIFIER_E2E"
-	modeClassifierRepeatsEnv      = "KOE_MODE_CLASSIFIER_REPEATS"
-	modeClassifierTimeoutEnv      = "KOE_MODE_CLASSIFIER_TIMEOUT"
-	modeClassifierReportEnv       = "KOE_MODE_CLASSIFIER_REPORT"
-	modeClassifierSeedEnv         = "KOE_MODE_CLASSIFIER_SEED"
-	modeClassifierVariantEnv      = "KOE_MODE_CLASSIFIER_VARIANT"
-	modeClassifierVariantBaseline = "baseline"
-	modeClassifierVariantModeOnly = "mode_only_v1"
-	modeClassifierDefaultRepeat   = 3
-	modeClassifierDefaultSeed     = int64(20260728)
-	modeClassifierMinFastAccuracy = 0.90
-	modeClassifierMinFullAccuracy = 0.75
-	modeClassifierMinAccuracy     = 0.85
-	modeClassifierMinCaseAccuracy = 0.80
-	modeClassifierReportSchema    = "koe.mode_classifier.v4"
-	modeClassifierAdmissionPolicy = "executionprofile.decide_mode_admission.v3"
+	modeClassifierGate                    = "KOE_MODE_CLASSIFIER_E2E"
+	modeClassifierRepeatsEnv              = "KOE_MODE_CLASSIFIER_REPEATS"
+	modeClassifierTimeoutEnv              = "KOE_MODE_CLASSIFIER_TIMEOUT"
+	modeClassifierReportEnv               = "KOE_MODE_CLASSIFIER_REPORT"
+	modeClassifierSeedEnv                 = "KOE_MODE_CLASSIFIER_SEED"
+	modeClassifierVariantEnv              = "KOE_MODE_CLASSIFIER_VARIANT"
+	modeClassifierVariantBaseline         = "baseline"
+	modeClassifierVariantInstructionsOnly = "instructions_only_v1"
+	modeClassifierVariantSchemaOnly       = "schema_only_v1"
+	modeClassifierVariantModeOnly         = "mode_only_v1"
+	modeClassifierDefaultRepeat           = 3
+	modeClassifierDefaultSeed             = int64(20260728)
+	modeClassifierMinFastAccuracy         = 0.90
+	modeClassifierMinFullAccuracy         = 0.75
+	modeClassifierMinAccuracy             = 0.85
+	modeClassifierMinCaseAccuracy         = 0.80
+	modeClassifierReportSchema            = "koe.mode_classifier.v5"
+	modeClassifierAdmissionPolicy         = "executionprofile.decide_mode_admission.v3"
 )
 
 const modeOnlyExecutionInstructions = `# do_task execution profile
@@ -62,6 +67,13 @@ Classify only the current task. Return one exact execution_mode enum token.
 - Fast includes bounded lookup, research, calculation, document work, file edits, focused code changes, tests, and routine app actions, even with several tools or steps.
 - Full is only for an explicit Full/deep-mode request, a real production incident or recovery, broad security/permission exposure, consequential medical/legal/major-financial judgment, a destructive live migration, dependent cross-system rollout/rollback work, or genuinely long multi-source research synthesis.
 - Tool count, file edits, tests, one failure, elapsed time, unknown information, or words quoted from another instruction never justify Full by themselves.`
+
+const compactDualFieldExecutionInstructions = `# do_task execution profile
+Classify only the current task. Always include execution_mode and full_reason. Use full_reason=none for Fast; for Full use the single best matching enum reason.
+
+- Default to Fast. Bounded lookup, research, calculation, document work, file edits, focused code changes, tests, and routine app actions stay Fast even with several tools or steps.
+- Full is only for an explicit Full/deep-mode request, a real production incident or recovery, broad security/permission exposure, consequential medical/legal/major-financial judgment, a destructive live migration, dependent cross-system rollout/rollback work, or genuinely long multi-source research synthesis.
+- Tool count, file edits, tests, one failure, elapsed time, unknown information, or quoted instructions never justify Full by themselves.`
 
 var modeClassifierCases = []modeClassifierCase{
 	{
@@ -299,30 +311,50 @@ type modeClassifierCase struct {
 }
 
 type modeClassifierTrial struct {
-	Variant             string   `json:"variant"`
-	CaseID              string   `json:"case_id"`
-	Category            string   `json:"category"`
-	Expected            string   `json:"expected"`
-	ExpectedReason      string   `json:"expected_reason"`
-	SelectorMode        string   `json:"selector_mode,omitempty"`
-	SelectorFullReason  string   `json:"selector_full_reason,omitempty"`
-	Observed            string   `json:"observed"`
-	ObservedFullReason  string   `json:"observed_full_reason"`
-	AdmissionDecision   string   `json:"admission_decision,omitempty"`
-	Correct             bool     `json:"correct"`
-	ReasonCorrect       bool     `json:"reason_correct"`
-	Repeat              int      `json:"repeat"`
-	Order               int      `json:"order"`
-	ResponseID          string   `json:"response_id,omitempty"`
-	CallID              string   `json:"call_id,omitempty"`
-	DelegatedTask       string   `json:"delegated_task,omitempty"`
-	ToolCalls           []string `json:"tool_calls,omitempty"`
-	DecisionLatencyMS   int64    `json:"decision_latency_ms,omitempty"`
-	ResponseDoneLatency int64    `json:"response_done_latency_ms,omitempty"`
-	InputTokens         int      `json:"input_tokens,omitempty"`
-	OutputTokens        int      `json:"output_tokens,omitempty"`
-	TotalTokens         int      `json:"total_tokens,omitempty"`
-	Error               string   `json:"error,omitempty"`
+	Variant             string    `json:"variant"`
+	CaseID              string    `json:"case_id"`
+	Category            string    `json:"category"`
+	Expected            string    `json:"expected"`
+	ExpectedReason      string    `json:"expected_reason"`
+	SelectorMode        string    `json:"selector_mode,omitempty"`
+	SelectorFullReason  string    `json:"selector_full_reason,omitempty"`
+	Observed            string    `json:"observed"`
+	ObservedFullReason  string    `json:"observed_full_reason"`
+	AdmissionDecision   string    `json:"admission_decision,omitempty"`
+	Correct             bool      `json:"correct"`
+	ReasonCorrect       bool      `json:"reason_correct"`
+	Repeat              int       `json:"repeat"`
+	Order               int       `json:"order"`
+	PairOrder           int       `json:"pair_order,omitempty"`
+	VariantOrder        int       `json:"variant_order,omitempty"`
+	ExecutionIndex      int       `json:"execution_index,omitempty"`
+	StartedAt           time.Time `json:"started_at,omitempty"`
+	FinishedAt          time.Time `json:"finished_at,omitempty"`
+	ResponseID          string    `json:"response_id,omitempty"`
+	CallID              string    `json:"call_id,omitempty"`
+	DelegatedTask       string    `json:"delegated_task,omitempty"`
+	ToolCalls           []string  `json:"tool_calls,omitempty"`
+	DecisionLatencyMS   int64     `json:"decision_latency_ms,omitempty"`
+	ResponseDoneLatency int64     `json:"response_done_latency_ms,omitempty"`
+	InputTokens         int       `json:"input_tokens,omitempty"`
+	OutputTokens        int       `json:"output_tokens,omitempty"`
+	TotalTokens         int       `json:"total_tokens,omitempty"`
+	Error               string    `json:"error,omitempty"`
+}
+
+type modeClassifierProvenance struct {
+	RunID               string   `json:"run_id"`
+	SourceCommit        string   `json:"source_commit,omitempty"`
+	SourceDirty         bool     `json:"source_dirty"`
+	GoVersion           string   `json:"go_version"`
+	RuntimeOS           string   `json:"runtime_os"`
+	RuntimeArch         string   `json:"runtime_arch"`
+	CaseSetSHA256       string   `json:"case_set_sha256"`
+	PersonaSHA256       string   `json:"persona_sha256"`
+	InstructionsSHA256  string   `json:"instructions_sha256"`
+	ToolSchemaSHA256    string   `json:"tool_schema_sha256"`
+	SessionConfigSHA256 string   `json:"session_config_sha256"`
+	ChangedDimensions   []string `json:"changed_dimensions"`
 }
 
 type modeClassifierCaseSummary struct {
@@ -367,6 +399,7 @@ type modeClassifierReport struct {
 	StartedAt             time.Time                    `json:"started_at"`
 	FinishedAt            time.Time                    `json:"finished_at"`
 	Model                 string                       `json:"model"`
+	Provenance            modeClassifierProvenance     `json:"provenance"`
 	LedgerSchema          bool                         `json:"ledger_schema"`
 	Repeats               int                          `json:"repeats"`
 	Seed                  int64                        `json:"seed"`
@@ -518,6 +551,14 @@ func TestModeClassifierVariantConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	instructionsOnly, err := modeClassifierSessionConfig(modeClassifierVariantInstructionsOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schemaOnly, err := modeClassifierSessionConfig(modeClassifierVariantSchemaOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
 	baselineJSON, err := json.Marshal(baseline)
 	if err != nil {
 		t.Fatal(err)
@@ -528,6 +569,8 @@ func TestModeClassifierVariantConfig(t *testing.T) {
 	}
 	baselineSession := baseline["session"].(map[string]any)
 	modeOnlySession := modeOnly["session"].(map[string]any)
+	instructionsOnlySession := instructionsOnly["session"].(map[string]any)
+	schemaOnlySession := schemaOnly["session"].(map[string]any)
 	baselineInstructions := baselineSession["instructions"].(string)
 	modeOnlyInstructions := modeOnlySession["instructions"].(string)
 	if !strings.Contains(string(baselineJSON), `"full_reason"`) ||
@@ -538,6 +581,22 @@ func TestModeClassifierVariantConfig(t *testing.T) {
 		strings.Contains(modeOnlyInstructions, "Full reasons:") ||
 		!strings.Contains(modeOnlyInstructions, modeOnlyExecutionInstructions) {
 		t.Fatalf("mode-only variant retained the dual-field contract: %s", modeOnlyJSON)
+	}
+	instructionsOnlyJSON, err := json.Marshal(instructionsOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(instructionsOnlyJSON), `"full_reason"`) ||
+		instructionsOnlySession["instructions"] != e2ePersona+"\n\n"+compactDualFieldExecutionInstructions {
+		t.Fatalf("instructions-only variant changed more than instructions: %s", instructionsOnlyJSON)
+	}
+	schemaOnlyJSON, err := json.Marshal(schemaOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(schemaOnlyJSON), `"full_reason"`) ||
+		schemaOnlySession["instructions"] != baselineInstructions {
+		t.Fatalf("schema-only variant changed more than the tool schema: %s", schemaOnlyJSON)
 	}
 	if _, err := modeClassifierVariant("unknown"); err == nil {
 		t.Fatal("unknown mode classifier variant was accepted")
@@ -571,8 +630,28 @@ func TestKoeModeClassifierReportAggregation(t *testing.T) {
 		report.WrongReasonTrials != 0 ||
 		report.InputTokens != 10 ||
 		report.OutputTokens != 2 ||
-		report.TotalTokens != 12 {
+		report.TotalTokens != 12 ||
+		report.Provenance.CaseSetSHA256 == "" ||
+		report.Provenance.PersonaSHA256 == "" ||
+		report.Provenance.InstructionsSHA256 == "" ||
+		report.Provenance.ToolSchemaSHA256 == "" ||
+		report.Provenance.SessionConfigSHA256 == "" ||
+		len(report.Provenance.ChangedDimensions) != 0 {
 		t.Fatalf("all-correct report did not pass: %+v", report)
+	}
+	candidateReport := buildModeClassifierReportForVariant(
+		time.Unix(0, 0),
+		3,
+		1,
+		time.Second,
+		modeClassifierVariantInstructionsOnly,
+		allCorrectModeClassifierTrials(3),
+	)
+	if len(candidateReport.Provenance.ChangedDimensions) != 1 ||
+		candidateReport.Provenance.ChangedDimensions[0] != "instructions" ||
+		candidateReport.Provenance.ToolSchemaSHA256 != report.Provenance.ToolSchemaSHA256 ||
+		candidateReport.Provenance.InstructionsSHA256 == report.Provenance.InstructionsSHA256 {
+		t.Fatalf("instructions-only provenance is not isolated: %+v", candidateReport.Provenance)
 	}
 	if got := report.ReasonCounts.Expected[string(executionprofile.FullReasonNone)]; got != 60 {
 		t.Fatalf("all-correct expected none reason count=%d, want 60", got)
@@ -885,10 +964,21 @@ func modeClassifierVariant(value string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", modeClassifierVariantBaseline:
 		return modeClassifierVariantBaseline, nil
+	case modeClassifierVariantInstructionsOnly:
+		return modeClassifierVariantInstructionsOnly, nil
+	case modeClassifierVariantSchemaOnly:
+		return modeClassifierVariantSchemaOnly, nil
 	case modeClassifierVariantModeOnly:
 		return modeClassifierVariantModeOnly, nil
 	default:
-		return "", fmt.Errorf("%s must be %q or %q", modeClassifierVariantEnv, modeClassifierVariantBaseline, modeClassifierVariantModeOnly)
+		return "", fmt.Errorf(
+			"%s must be %q, %q, %q, or %q",
+			modeClassifierVariantEnv,
+			modeClassifierVariantBaseline,
+			modeClassifierVariantInstructionsOnly,
+			modeClassifierVariantSchemaOnly,
+			modeClassifierVariantModeOnly,
+		)
 	}
 }
 
@@ -897,20 +987,27 @@ func modeClassifierSessionConfig(variant string) (map[string]any, error) {
 	if variant == modeClassifierVariantBaseline {
 		return config, nil
 	}
-	if variant != modeClassifierVariantModeOnly {
-		return nil, fmt.Errorf("unknown mode classifier variant %q", variant)
-	}
-	tools, err := modeOnlyModeClassifierToolDefs()
-	if err != nil {
-		return nil, err
-	}
 	session, ok := config["session"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("sessionConfig omitted session object")
 	}
-	session["instructions"] = e2ePersona + "\n\n" + modeOnlyExecutionInstructions
-	session["tools"] = tools
-	return config, nil
+	switch variant {
+	case modeClassifierVariantInstructionsOnly:
+		session["instructions"] = e2ePersona + "\n\n" + compactDualFieldExecutionInstructions
+		return config, nil
+	case modeClassifierVariantSchemaOnly, modeClassifierVariantModeOnly:
+		tools, err := modeOnlyModeClassifierToolDefs()
+		if err != nil {
+			return nil, err
+		}
+		session["tools"] = tools
+		if variant == modeClassifierVariantModeOnly {
+			session["instructions"] = e2ePersona + "\n\n" + modeOnlyExecutionInstructions
+		}
+		return config, nil
+	default:
+		return nil, fmt.Errorf("unknown mode classifier variant %q", variant)
+	}
 }
 
 func modeOnlyModeClassifierToolDefs() ([]ToolDef, error) {
@@ -1039,10 +1136,14 @@ func (s *modeClassifierSession) classify(
 	tc modeClassifierCase,
 	repeat int,
 	order int,
-) modeClassifierTrial {
-	trial := unknownModeClassifierTrial(tc, repeat, order, "")
+) (trial modeClassifierTrial) {
+	trial = unknownModeClassifierTrial(tc, repeat, order, "")
 	trial.Variant = s.variant
 	started := time.Now()
+	trial.StartedAt = started.UTC()
+	defer func() {
+		trial.FinishedAt = time.Now().UTC()
+	}()
 	if err := s.send(map[string]any{
 		"type": "conversation.item.create",
 		"item": map[string]any{
@@ -1254,6 +1355,7 @@ func buildModeClassifierReportForVariant(
 		StartedAt:       startedAt.UTC(),
 		FinishedAt:      time.Now().UTC(),
 		Model:           e2eModelName(),
+		Provenance:      modeClassifierBuildProvenance(startedAt, seed, variant),
 		LedgerSchema:    TaskLedgerEnabled(),
 		Repeats:         repeats,
 		Seed:            seed,
@@ -1455,6 +1557,94 @@ func buildModeClassifierReportForVariant(
 	}
 	report.Passed = len(report.FailureReasons) == 0
 	return report
+}
+
+func modeClassifierBuildProvenance(
+	startedAt time.Time,
+	seed int64,
+	variant string,
+) modeClassifierProvenance {
+	provenance := modeClassifierProvenance{
+		RunID: fmt.Sprintf(
+			"%s-%s-%d",
+			variant,
+			startedAt.UTC().Format("20060102T150405.000000000Z"),
+			seed,
+		),
+		GoVersion:         runtime.Version(),
+		RuntimeOS:         runtime.GOOS,
+		RuntimeArch:       runtime.GOARCH,
+		CaseSetSHA256:     modeClassifierHashJSON(modeClassifierCases),
+		PersonaSHA256:     modeClassifierHashBytes([]byte(e2ePersona)),
+		ChangedDimensions: modeClassifierChangedDimensions(variant),
+	}
+	if runID := strings.TrimSpace(os.Getenv("KOE_AGENT_LAB_RUN_ID")); runID != "" {
+		provenance.RunID = runID
+	}
+	if sourceCommit := strings.TrimSpace(os.Getenv("KOE_AGENT_LAB_SOURCE_COMMIT")); sourceCommit != "" {
+		provenance.SourceCommit = sourceCommit
+	}
+	if sourceDirty := strings.TrimSpace(os.Getenv("KOE_AGENT_LAB_SOURCE_DIRTY")); sourceDirty != "" {
+		provenance.SourceDirty = sourceDirty == "true"
+	}
+	if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range buildInfo.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if provenance.SourceCommit == "" {
+					provenance.SourceCommit = setting.Value
+				}
+			case "vcs.modified":
+				if strings.TrimSpace(os.Getenv("KOE_AGENT_LAB_SOURCE_DIRTY")) == "" {
+					provenance.SourceDirty = setting.Value == "true"
+				}
+			}
+		}
+	}
+	config, err := modeClassifierSessionConfig(variant)
+	if err != nil {
+		return provenance
+	}
+	provenance.SessionConfigSHA256 = modeClassifierHashJSON(config)
+	session, ok := config["session"].(map[string]any)
+	if !ok {
+		return provenance
+	}
+	if instructions, ok := session["instructions"].(string); ok {
+		provenance.InstructionsSHA256 = modeClassifierHashBytes([]byte(instructions))
+	}
+	if tools, found := session["tools"]; found {
+		provenance.ToolSchemaSHA256 = modeClassifierHashJSON(tools)
+	}
+	return provenance
+}
+
+func modeClassifierChangedDimensions(variant string) []string {
+	switch variant {
+	case modeClassifierVariantBaseline:
+		return []string{}
+	case modeClassifierVariantInstructionsOnly:
+		return []string{"instructions"}
+	case modeClassifierVariantSchemaOnly:
+		return []string{"tool_schema"}
+	case modeClassifierVariantModeOnly:
+		return []string{"instructions", "tool_schema"}
+	default:
+		return []string{"unknown"}
+	}
+}
+
+func modeClassifierHashJSON(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return modeClassifierHashBytes(encoded)
+}
+
+func modeClassifierHashBytes(value []byte) string {
+	sum := sha256.Sum256(value)
+	return fmt.Sprintf("sha256:%x", sum)
 }
 
 func modeClassifierReportValue(value, fallback string) string {

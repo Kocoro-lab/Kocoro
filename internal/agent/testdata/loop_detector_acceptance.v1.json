@@ -1,0 +1,96 @@
+{
+  "schema_version": "agent.loop_detector_acceptance.v1",
+  "suite": "release_regression_corpus",
+  "traces": [
+    {
+      "id": "productive_multi_source_research",
+      "class": "productive",
+      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "events": [
+        {"name": "web_search", "args": "{\"query\":\"golang concurrency patterns\"}", "result_sig": "go.dev/concurrency"},
+        {"name": "web_search", "args": "{\"query\":\"python machine learning tutorial\"}", "result_sig": "python.org/ml"},
+        {"name": "web_search", "args": "{\"query\":\"rust ownership explained\"}", "result_sig": "rust-lang.org/ownership"},
+        {"name": "web_search", "args": "{\"query\":\"javascript async await\"}", "result_sig": "mdn/async"},
+        {"name": "web_fetch", "args": "{\"url\":\"https://go.dev/doc/effective_go\"}", "result_sig": "effective-go"},
+        {"name": "web_fetch", "args": "{\"url\":\"https://docs.python.org/3/tutorial/\"}", "result_sig": "python-tutorial"},
+        {"name": "web_fetch", "args": "{\"url\":\"https://doc.rust-lang.org/book/\"}", "result_sig": "rust-book"}
+      ]
+    },
+    {
+      "id": "productive_browser_multistep",
+      "class": "productive",
+      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "events": [
+        {"name": "browser_snapshot", "args": "{}"},
+        {"name": "browser_click", "args": "{\"ref\":\"e0\"}"},
+        {"name": "browser_snapshot", "args": "{}"},
+        {"name": "browser_click", "args": "{\"ref\":\"e1\"}"},
+        {"name": "browser_snapshot", "args": "{}"},
+        {"name": "browser_click", "args": "{\"ref\":\"e2\"}"},
+        {"name": "browser_snapshot", "args": "{}"},
+        {"name": "browser_click", "args": "{\"ref\":\"e3\"}"},
+        {"name": "browser_snapshot", "args": "{}"},
+        {"name": "browser_click", "args": "{\"ref\":\"e4\"}"}
+      ]
+    },
+    {
+      "id": "productive_distinct_http_batch",
+      "class": "productive",
+      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "events": [
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-01\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-02\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-03\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-04\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-05\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-06\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-07\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-08\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-09\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-10\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-11\"}"},
+        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-12\"}"}
+      ]
+    },
+    {
+      "id": "loop_identical_polling",
+      "class": "loop",
+      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 4, "first_force_stop_max": 4, "ideal_stop_after": 3, "max_wasted_calls": 1},
+      "events": [
+        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"},
+        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"},
+        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"},
+        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"}
+      ]
+    },
+    {
+      "id": "loop_repeated_validation_error",
+      "class": "loop",
+      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 3, "first_force_stop_max": 3, "ideal_stop_after": 3, "max_wasted_calls": 0},
+      "events": [
+        {"name": "file_write", "args": "{\"path\":\"notes.txt\"}", "is_error": true, "error": "[validation error] content is required"},
+        {"name": "file_write", "args": "{\"path\":\"notes.txt\"}", "is_error": true, "error": "[validation error] content is required"},
+        {"name": "file_write", "args": "{\"path\":\"notes.txt\"}", "is_error": true, "error": "[validation error] content is required"}
+      ]
+    },
+    {
+      "id": "loop_varied_world_news_queries",
+      "class": "loop",
+      "expectation": {"first_nudge_min": 3, "first_nudge_max": 5, "first_force_stop_min": 6, "first_force_stop_max": 12, "ideal_stop_after": 5, "max_wasted_calls": 7},
+      "events": [
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 major headlines\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines Reuters AP BBC\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters AP BBC Al Jazeera CNN\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 latest updates\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 breaking\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP\"}", "result_sig": "reuters.com,bbc.com"},
+        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 BBC CNN Al Jazeera\"}", "result_sig": "reuters.com,bbc.com"}
+      ]
+    }
+  ]
+}
