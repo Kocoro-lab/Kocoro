@@ -15,6 +15,7 @@ seed="${KOE_MODE_CLASSIFIER_SEED:-20260728}"
 case_timeout="${KOE_MODE_CLASSIFIER_TIMEOUT:-30s}"
 candidate="${KOE_MODE_CLASSIFIER_CANDIDATE:-instructions_only_v1}"
 pkg_config_path="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
+daemon_url="${KOE_DAEMON_URL:-http://127.0.0.1:7533}"
 case "$candidate" in
   instructions_only_v1|schema_only_v1|mode_only_v1) ;;
   *)
@@ -22,6 +23,10 @@ case "$candidate" in
     exit 2
     ;;
 esac
+if ! curl -fsS --max-time 5 "$daemon_url/status" -o "$output_dir/daemon-status.json"; then
+  echo "Koe mode A/B preflight failed: daemon status is unavailable at $daemon_url/status" >&2
+  exit 2
+fi
 run_id="koe-mode-ab-$(date -u +%Y%m%dT%H%M%SZ)-$seed"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 source_commit="$(git -C "$repo_dir" rev-parse HEAD)"
@@ -83,6 +88,7 @@ manifest = {
         "comparison_gate": int(os.environ["COMPARISON_STATUS"]),
     },
     "artifacts": [
+        "daemon-status.json",
         "baseline.json",
         os.environ["CANDIDATE"] + ".json",
         "comparison.json",

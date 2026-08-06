@@ -65,11 +65,15 @@ func TestKoeModeClassifierPairedTextE2E(t *testing.T) {
 	defer suiteCancel()
 
 	executionIndex := 0
+	abortReason := ""
+
+runPairs:
 	for repeat := 1; repeat <= repeats; repeat++ {
 		caseOrder := rand.New(rand.NewSource(seed + int64(repeat))).Perm(len(modeClassifierCases))
 		for pairOrder, caseIndex := range caseOrder {
 			tc := modeClassifierCases[caseIndex]
 			variants := modeClassifierPairedVariantOrder(seed, repeat, pairOrder, candidate)
+			pairInfrastructureFailures := 0
 			for variantOrder, variant := range variants {
 				executionIndex++
 				trialStarted := time.Now().UTC()
@@ -77,6 +81,7 @@ func TestKoeModeClassifierPairedTextE2E(t *testing.T) {
 				session, connectErr := newModeClassifierSessionForVariant(caseCtx, variant)
 				var trial modeClassifierTrial
 				if connectErr != nil {
+					pairInfrastructureFailures++
 					trial = unknownModeClassifierTrial(
 						tc,
 						repeat,
@@ -115,6 +120,15 @@ func TestKoeModeClassifierPairedTextE2E(t *testing.T) {
 					trial.Error,
 				)
 			}
+			if pairInfrastructureFailures == len(variants) {
+				abortReason = fmt.Sprintf(
+					"both variants failed infrastructure setup at repeat=%d pair=%d case=%s",
+					repeat,
+					pairOrder+1,
+					tc.ID,
+				)
+				break runPairs
+			}
 		}
 	}
 
@@ -128,6 +142,12 @@ func TestKoeModeClassifierPairedTextE2E(t *testing.T) {
 			variant,
 			variantTrials[variant],
 		)
+		if abortReason != "" {
+			report.Aborted = true
+			report.AbortReason = abortReason
+			report.FailureReasons = append(report.FailureReasons, abortReason)
+			report.Passed = false
+		}
 		path := filepath.Join(outputDir, variant+".json")
 		if err := writeModeClassifierReport(path, report); err != nil {
 			t.Fatalf("write %s mode classifier report: %v", variant, err)
@@ -146,6 +166,9 @@ func TestKoeModeClassifierPairedTextE2E(t *testing.T) {
 			report.TotalTokens,
 			report.Passed,
 		)
+	}
+	if abortReason != "" {
+		t.Fatalf("paired qualification aborted: %s", abortReason)
 	}
 	if unknownTotal != 0 {
 		t.Fatalf("paired qualification produced %d unknown trials", unknownTotal)

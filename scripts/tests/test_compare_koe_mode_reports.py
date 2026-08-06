@@ -48,6 +48,7 @@ def make_report(variant: str, changed_dimensions: list[str]) -> dict:
         "variant": variant,
         "seed": 7,
         "repeats": 3,
+        "planned_trial_count": len(trials),
         "model": "test-model",
         "trials": trials,
         "cases": [
@@ -131,6 +132,23 @@ class CompareModeReportsTest(unittest.TestCase):
         self.candidate["trials"].append(dict(self.candidate["trials"][0]))
         with self.assertRaisesRegex(ValueError, "duplicate trial"):
             MODULE.compare(self.control, self.candidate)
+
+    def test_unknown_pair_invalidates_behavior_without_becoming_false_fast(self) -> None:
+        for report in (self.control, self.candidate):
+            trial = next(
+                item
+                for item in report["trials"]
+                if item["case_id"] == "critical_incident"
+            )
+            trial["observed"] = "unknown"
+            trial["correct"] = False
+            report["unknown_trials"] = 1
+            report["passed"] = False
+        result = MODULE.compare(self.control, self.candidate)
+        self.assertFalse(result["adopt"])
+        self.assertFalse(result["protocol"]["behavior_comparison_valid"])
+        self.assertEqual(result["critical_false_fast_trials"], [])
+        self.assertEqual(result["paired_statistics"]["paired_known_trial_count"], 5)
 
 
 if __name__ == "__main__":

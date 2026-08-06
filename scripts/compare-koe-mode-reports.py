@@ -31,6 +31,7 @@ def load_report(path: Path) -> dict:
         "variant",
         "seed",
         "repeats",
+        "planned_trial_count",
         "trials",
         "cases",
         "passed",
@@ -156,17 +157,25 @@ def compare(control: dict, candidate: dict) -> dict:
     token_deltas: list[float] = []
     execution_pair_failures: list[str] = []
     critical_false_fast: list[str] = []
+    known_keys = []
     for key in keys:
         control_trial = control_trials[key]
         candidate_trial = candidate_trials[key]
+        both_known = (
+            control_trial.get("observed") != "unknown"
+            and candidate_trial.get("observed") != "unknown"
+        )
+        if both_known:
+            known_keys.append(key)
         control_correct = bool(control_trial["correct"])
         candidate_correct = bool(candidate_trial["correct"])
-        if control_correct and not candidate_correct:
+        if both_known and control_correct and not candidate_correct:
             control_only += 1
-        elif candidate_correct and not control_correct:
+        elif both_known and candidate_correct and not control_correct:
             candidate_only += 1
-        accuracy_deltas.append(float(candidate_correct) - float(control_correct))
-        if (
+        if both_known:
+            accuracy_deltas.append(float(candidate_correct) - float(control_correct))
+        if both_known and (
             control_trial.get("decision_latency_ms", 0) > 0
             and candidate_trial.get("decision_latency_ms", 0) > 0
         ):
@@ -174,16 +183,17 @@ def compare(control: dict, candidate: dict) -> dict:
                 candidate_trial["decision_latency_ms"]
                 - control_trial["decision_latency_ms"]
             )
-        token_deltas.append(
-            candidate_trial.get("total_tokens", 0)
-            - control_trial.get("total_tokens", 0)
-        )
+        if both_known:
+            token_deltas.append(
+                candidate_trial.get("total_tokens", 0)
+                - control_trial.get("total_tokens", 0)
+            )
         if not paired_execution_valid(control_trial, candidate_trial):
             execution_pair_failures.append(f"{key[0]}#{key[1]}")
         if (
             candidate_trial["category"] in CRITICAL_CATEGORIES
             and candidate_trial["expected"] == "full"
-            and candidate_trial["observed"] != "full"
+            and candidate_trial["observed"] == "fast"
         ):
             critical_false_fast.append(f"{key[0]}#{key[1]}")
 
@@ -192,12 +202,23 @@ def compare(control: dict, candidate: dict) -> dict:
     changed_dimensions = candidate["provenance"]["changed_dimensions"]
     control_cases = {item["id"]: item for item in control["cases"]}
     candidate_cases = {item["id"]: item for item in candidate["cases"]}
-    majority_regressions = sorted(
-        case_id
-        for case_id, control_case in control_cases.items()
-        if control_case["majority_correct"]
-        and not candidate_cases.get(case_id, {}).get("majority_correct", False)
+    complete_pair_coverage = (
+        len(keys) == control["planned_trial_count"]
+        and len(keys) == candidate["planned_trial_count"]
     )
+    no_unknown = (
+        control.get("unknown_trials", 0) == 0
+        and candidate.get("unknown_trials", 0) == 0
+    )
+    behavior_comparison_valid = complete_pair_coverage and no_unknown
+    majority_regressions = []
+    if behavior_comparison_valid:
+        majority_regressions = sorted(
+            case_id
+            for case_id, control_case in control_cases.items()
+            if control_case["majority_correct"]
+            and not candidate_cases.get(case_id, {}).get("majority_correct", False)
+        )
 
     same_source = (
         bool(control["provenance"]["source_commit"])
@@ -214,6 +235,7 @@ def compare(control: dict, candidate: dict) -> dict:
     )
     checks = {
         "minimum_three_repeats": control["repeats"] >= 3,
+        "complete_pair_coverage": complete_pair_coverage,
         "interleaved_adjacent_pairs": not execution_pair_failures,
         "same_source_commit": same_source,
         "clean_source": not control["provenance"]["source_dirty"]
@@ -223,7 +245,7 @@ def compare(control: dict, candidate: dict) -> dict:
         "same_persona": same_persona,
         "single_changed_dimension": len(changed_dimensions) == 1,
         "candidate_behavior_gate_passed": bool(candidate["passed"]),
-        "no_unknown_trials": candidate.get("unknown_trials", 0) == 0,
+        "no_unknown_trials": no_unknown,
         "critical_false_fast_zero": not critical_false_fast,
         "fast_accuracy_not_worse": candidate["fast_accuracy"]
         >= control["fast_accuracy"],
@@ -247,6 +269,7 @@ def compare(control: dict, candidate: dict) -> dict:
             "same_source_commit": same_source,
             "same_case_set": same_case_set,
             "same_persona": same_persona,
+            "behavior_comparison_valid": behavior_comparison_valid,
         },
         "paired_statistics": {
             "control_only_correct": control_only,
@@ -255,7 +278,12 @@ def compare(control: dict, candidate: dict) -> dict:
             "mcnemar_exact_two_sided_p": exact_mcnemar_p(
                 control_only, candidate_only
             ),
-            "accuracy_delta_mean": sum(accuracy_deltas) / len(accuracy_deltas),
+            "paired_known_trial_count": len(known_keys),
+            "accuracy_delta_mean": (
+                sum(accuracy_deltas) / len(accuracy_deltas)
+                if accuracy_deltas
+                else 0.0
+            ),
             "accuracy_delta_bootstrap_95_ci": accuracy_ci,
             "decision_latency_delta_ms": {
                 "count": len(latency_deltas),

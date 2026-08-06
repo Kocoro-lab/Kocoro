@@ -410,6 +410,9 @@ type modeClassifierReport struct {
 	ExpectedFastCases     int                          `json:"expected_fast_cases"`
 	ExpectedFullCases     int                          `json:"expected_full_cases"`
 	TrialCount            int                          `json:"trial_count"`
+	PlannedTrialCount     int                          `json:"planned_trial_count"`
+	Aborted               bool                         `json:"aborted"`
+	AbortReason           string                       `json:"abort_reason,omitempty"`
 	ExpectedFastTrials    int                          `json:"expected_fast_trials"`
 	ExpectedFullTrials    int                          `json:"expected_full_trials"`
 	CorrectTrials         int                          `json:"correct_trials"`
@@ -1377,6 +1380,7 @@ func buildModeClassifierReportForVariant(
 		},
 		AdmissionDecisions: make(map[string]int),
 		TrialCount:         len(trials),
+		PlannedTrialCount:  repeats * len(modeClassifierCases),
 		Trials:             trials,
 	}
 	byCase := make(map[string][]modeClassifierTrial, len(modeClassifierCases))
@@ -1522,9 +1526,9 @@ func buildModeClassifierReportForVariant(
 	report.DecisionLatencyMS = modeClassifierLatencyStats(decisionLatencies)
 	report.ResponseDoneLatencyMS = modeClassifierLatencyStats(responseLatencies)
 
-	if report.TrialCount != repeats*len(modeClassifierCases) {
+	if report.TrialCount != report.PlannedTrialCount {
 		report.FailureReasons = append(report.FailureReasons,
-			fmt.Sprintf("completed %d/%d trials", report.TrialCount, repeats*len(modeClassifierCases)))
+			fmt.Sprintf("completed %d/%d trials", report.TrialCount, report.PlannedTrialCount))
 	}
 	if len(caseTrialCountFailures) != 0 {
 		report.FailureReasons = append(report.FailureReasons,
