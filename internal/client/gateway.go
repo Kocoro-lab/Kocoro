@@ -2301,14 +2301,24 @@ func (c *GatewayClient) CloudBaseURL() string { return c.baseURL }
 // exchange. Mirrors the Slack BYOA proxy above (status + raw body verbatim).
 // ---------------------------------------------------------------------------
 
-// IntegrationConnect starts an OAuth connect for the given provider via Cloud.
-// Returns Cloud's status + raw body verbatim (the body carries the oauth_url the
-// renderer must open, plus a connection_id).
-func (c *GatewayClient) IntegrationConnect(ctx context.Context, provider string) (int, []byte, error) {
+// IntegrationConnect starts a connect for the given provider via Cloud.
+// Returns Cloud's status + raw body verbatim. For OAuth providers the response
+// carries the oauth_url the renderer must open plus a connection_id; token-mode
+// providers (e.g. Shopify) take credentials in the forwarded JSON body and
+// return an active connection directly. The body may contain long-lived
+// credentials — never log it.
+func (c *GatewayClient) IntegrationConnect(ctx context.Context, provider string, body []byte) (int, []byte, error) {
 	endpoint := c.baseURL + "/api/v1/integrations/" + url.PathEscape(provider) + "/connect"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	var reqBody io.Reader
+	if len(body) > 0 {
+		reqBody = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, reqBody)
 	if err != nil {
 		return 0, nil, fmt.Errorf("create request: %w", err)
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if key := c.getAPIKey(); key != "" {
 		req.Header.Set("X-API-Key", key)
