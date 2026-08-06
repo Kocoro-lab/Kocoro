@@ -217,14 +217,14 @@ func (m *Model) runCompact(ctx context.Context, customInstructions string, gen i
 	}
 }
 
-// applyCompactResult commits a completed /compact pass: pre-replacement
-// snapshot, checkpoint swap, usage accounting, and the durable save with
-// rollback. Runs on the UI goroutine from the compactDoneMsg handler, after
-// the generation check, so it cannot interleave with a newer run's writes.
 // errCompactSessionChanged marks a discarded-but-not-failed apply: the user
 // switched sessions while the pass ran. Rendered as an informational line.
 var errCompactSessionChanged = errors.New("session changed while compacting; result discarded")
 
+// applyCompactResult commits a completed /compact pass: pre-replacement
+// snapshot, checkpoint swap, usage accounting, and the durable save with
+// rollback. Runs on the UI goroutine from the compactDoneMsg handler, after
+// the generation check, so it cannot interleave with a newer run's writes.
 func (m *Model) applyCompactResult(msg compactDoneMsg) error {
 	sess := m.sessions.Current()
 	if sess == nil || sess.ID != msg.sessionID {

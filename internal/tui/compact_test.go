@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -418,8 +419,10 @@ func TestCompact_CancelledContextDoesNotPersistCheckpoint(t *testing.T) {
 	m.gateway = client.NewGatewayClient(server.URL, "")
 	m.compactTestHookAfterSummary = cancel2
 	result = m.runCompact(ctx2, "", 4)()
-	if result.err == nil {
-		t.Fatal("post-summary cancellation must surface an error")
+	// errors.Is pins the exit to the post-LLM guard (which returns ctx.Err()
+	// unwrapped) — the "nothing to compact" bail would fail this assertion.
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from the post-summary guard, got %v", result.err)
 	}
 	if len(result.shaped) != 0 {
 		t.Fatal("post-summary cancellation must not produce a checkpoint payload")
@@ -434,25 +437,77 @@ func TestCompact_CancelledContextDoesNotPersistCheckpoint(t *testing.T) {
 // otherwise bill for up to the full compact timeout with no cancel owner.
 func TestCompactRunMutualExclusion(t *testing.T) {
 	m := newCommandTestModel(t)
+	// Seed past MinShapeable so /compact reaches the busy check instead of
+	// bailing on length — without this, direction 1 passes vacuously.
+	sess := m.sessions.Current()
+	for i := 0; i < 12; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		sess.Messages = append(sess.Messages, client.Message{Role: role, Content: client.NewTextContent(strings.Repeat("history ", 100))})
+		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
+	}
+	renderedOutput := func() string {
+		var b strings.Builder
+		for _, o := range m.output {
+			b.WriteString(o.rendered)
+		}
+		return b.String()
+	}
 
-	// Direction 1: /compact refused while a run is processing.
+	// Direction 1a: /compact refused while a run is processing.
 	m.state = stateProcessing
-	outputLen := len(m.output)
 	m.handleSlashCommand("/compact")
 	if m.compactInFlight {
 		t.Fatal("/compact must be refused while a run is active")
 	}
-	if len(m.output) == outputLen {
-		t.Fatal("refusal must tell the user why")
+	if !strings.Contains(renderedOutput(), "Busy") {
+		t.Fatal("refusal must render the Busy line, not the too-short line")
 	}
 
-	// Direction 2: a new local run refused while a compact is in flight.
-	m.state = stateProcessing
+	// Direction 1b: /compact also refused while a (possibly Esc-cancelled but
+	// still alive) compact worker holds the flag.
+	m.state = stateInput
 	m.compactInFlight = true
+	m.handleSlashCommand("/compact")
+	if m.cancelRun != nil {
+		t.Fatal("a second compact must not start while a worker is alive")
+	}
+
+	// Direction 2: a new local run refused while a compact is in flight —
+	// including after Esc returned the UI to input (the worker is still
+	// alive; only its compactDoneMsg releases the flag).
+	m.state = stateInput
+	msgsBefore := len(sess.Messages)
 	m.textarea.SetValue("hello")
 	updated, _ := m.handleSubmit()
 	m = updated.(*Model)
 	if m.cancelRun != nil {
 		t.Fatal("a run must not start under an in-flight compact")
+	}
+	if len(sess.Messages) != msgsBefore+0 && len(sess.Messages) != msgsBefore+1 {
+		t.Fatalf("refused submit must not run: messages grew %d -> %d", msgsBefore, len(sess.Messages))
+	}
+	if got := m.textarea.Value(); got != "hello" {
+		t.Fatalf("refused submit must restore the composer input, got %q", got)
+	}
+	if !strings.Contains(renderedOutput(), "try again in a moment") {
+		t.Fatal("refusal must tell the user why")
+	}
+
+	// Direction 2b: custom slash commands are a second door into runAgentLoop
+	// and must be refused the same way.
+	m.customCommands["mytask"] = "do the thing"
+	m.handleSlashCommand("/mytask")
+	if m.cancelRun != nil {
+		t.Fatal("a custom-command run must not start under an in-flight compact")
+	}
+
+	// Release: the compactDoneMsg handler is the single release point.
+	updated, _ = m.Update(compactDoneMsg{gen: m.compactGen, err: context.Canceled})
+	m = updated.(*Model)
+	if m.compactInFlight {
+		t.Fatal("compactDoneMsg must release the flag")
 	}
 }

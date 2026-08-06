@@ -1005,9 +1005,11 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cancelRun = nil
 					m.injectCh = nil
 				}
-				// Invalidate any in-flight /compact (same rationale as the Esc branch).
+				// Invalidate any in-flight /compact (same rationale as the Esc
+				// branch). compactInFlight is NOT cleared here: the worker
+				// goroutine is still alive and still reads live-loop state;
+				// only its compactDoneMsg releases the flag.
 				m.compactGen++
-				m.compactInFlight = false
 				if m.state == stateApproval {
 					select {
 					case m.approvalCh <- false:
@@ -1046,9 +1048,9 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				// Invalidate any in-flight /compact so its cancelled result
 				// cannot print "Compact failed: context canceled" on top of
-				// the [Cancelled] line below.
+				// the [Cancelled] line below. compactInFlight is NOT cleared:
+				// the worker is still alive until its compactDoneMsg arrives.
 				m.compactGen++
-				m.compactInFlight = false
 				// Unblock approval goroutine if waiting
 				if m.state == stateApproval {
 					select {
@@ -1914,6 +1916,21 @@ func renderUserMessage(text string, width int) string {
 	return style.Render("› " + text)
 }
 
+
+// refuseWhileCompacting blocks any run-starting path while a /compact worker
+// is alive (the worker reads unsynchronized live-loop state). Restores the
+// composer input so "try again in a moment" is actually actionable.
+func (m *Model) refuseWhileCompacting(restoreInput string) bool {
+	if !m.compactInFlight {
+		return false
+	}
+	m.appendOutput("Compacting context — try again in a moment")
+	if restoreInput != "" {
+		m.textarea.SetValue(restoreInput)
+	}
+	return true
+}
+
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.clearSuggestion() // a new turn stales any in-flight / shown suggestion
 	input := strings.TrimSpace(m.textarea.Value())
@@ -1967,8 +1984,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	}
 
 	// Local agent loop
-	if m.compactInFlight {
-		m.appendOutput("Compacting context — try again in a moment")
+	if m.refuseWhileCompacting(input) {
 		return m, m.rerenderOutput()
 	}
 	m.state = stateProcessing
@@ -2730,6 +2746,14 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "/compact":
+		// Busy check first: it must win over the length message, and
+		// HistoryForLoop must not be read while a run goroutine may be
+		// appending to sess.Messages. compactInFlight covers the window
+		// where an Esc returned the UI to input but the worker is alive.
+		if m.state != stateInput || m.compactInFlight {
+			m.appendOutput("Busy — wait for the current run to finish before /compact")
+			break
+		}
 		sess := m.sessions.Current()
 		if sess == nil || len(sess.HistoryForLoop()) < ctxwin.MinShapeable() {
 			m.appendOutput(fmt.Sprintf("Conversation too short to compact (need %d+ messages)", ctxwin.MinShapeable()))
@@ -2738,10 +2762,6 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		customInstructions := ""
 		if len(parts) > 1 {
 			customInstructions = strings.Join(parts[1:], " ")
-		}
-		if m.state != stateInput {
-			m.appendOutput("Busy — wait for the current run to finish before /compact")
-			break
 		}
 		m.appendOutput("Compacting context...")
 		m.state = stateProcessing
@@ -2764,7 +2784,11 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				args = strings.Join(parts[1:], " ")
 			}
 			expandedPrompt := strings.ReplaceAll(promptContent, "$ARGUMENTS", args)
+			if m.refuseWhileCompacting("") {
+				return m, m.rerenderOutput()
+			}
 			// Send as a regular user message through the agent loop
+			m.compactGen++ // a stale /compact result must not resolve under this run
 			m.state = stateProcessing
 			m.processingStartTime = time.Now()
 			m.spinnerIdx = 0
