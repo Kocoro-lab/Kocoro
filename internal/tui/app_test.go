@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
@@ -136,5 +138,32 @@ func TestCompactDoneMsg_StaleGenerationIgnored(t *testing.T) {
 	m = updated.(*Model)
 	if m.state != stateInput {
 		t.Fatal("current-generation compact result must resolve normally")
+	}
+}
+
+// Esc during /compact must invalidate the in-flight pass: the cancel branch
+// bumps the generation, so the pass's context.Canceled result is dropped and
+// cannot print "Compact failed" on top of the [Cancelled] line.
+func TestEscDuringCompact_InvalidatesGeneration(t *testing.T) {
+	m := newCommandTestModel(t)
+	m.state = stateProcessing
+	m.compactGen = 5
+	cancelled := false
+	m.cancelRun = func() { cancelled = true }
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	m = updated.(*Model)
+	if !cancelled {
+		t.Fatal("Esc must invoke the cancel func")
+	}
+	if m.compactGen != 6 {
+		t.Fatalf("Esc must bump compactGen: got %d", m.compactGen)
+	}
+
+	outputLen := len(m.output)
+	updated, _ = m.Update(compactDoneMsg{gen: 5, err: context.Canceled})
+	m = updated.(*Model)
+	if len(m.output) != outputLen {
+		t.Fatal("cancelled pass's failure line must be dropped, not printed over [Cancelled]")
 	}
 }

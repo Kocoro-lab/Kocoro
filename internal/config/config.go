@@ -1390,6 +1390,9 @@ func validateConfig(cfg *Config) error {
 	if !IsValidAgentServiceTier(cfg.Agent.ServiceTier) {
 		return fmt.Errorf("invalid agent.service_tier %q: use one of %s", cfg.Agent.ServiceTier, strings.Join(AgentServiceTierAllowedValues(), ", "))
 	}
+	if cfg.Agent.CompactTimeoutSecs < 0 {
+		return fmt.Errorf("agent.compact_timeout_secs must be >= 0 (0 uses the default)")
+	}
 	if cfg.Agent.IdleSoftTimeoutSecs < 0 {
 		return fmt.Errorf("agent.idle_soft_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Agent.IdleSoftTimeoutSecs)
 	}

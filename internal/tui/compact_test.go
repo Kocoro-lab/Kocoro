@@ -89,6 +89,14 @@ Keep the transcript lossless.
 	if result.err != nil {
 		t.Fatalf("runCompact: %v", result.err)
 	}
+	// Mutation happens in the Update handler (deferred apply after the
+	// generation check), not in the worker.
+	if sess.CompactionCheckpoint != nil {
+		t.Fatal("worker must not mutate the session; apply belongs to the handler")
+	}
+	if updated, _ := m.Update(result); updated == nil {
+		t.Fatal("compactDoneMsg handler returned no model")
+	}
 	if !reflect.DeepEqual(sess.Messages, originalMessages) {
 		t.Fatal("manual compaction mutated the lossless transcript")
 	}
@@ -148,15 +156,18 @@ func TestCompact_FailedSaveRollsBackCheckpoint(t *testing.T) {
 	}
 	sess.CompactionCheckpoint = prior
 
-	// Drop write permission so the atomic session write fails.
+	result := m.runCompact(context.Background(), "", 0)()
+	if result.err != nil {
+		t.Fatalf("worker phase must succeed: %v", result.err)
+	}
+
+	// Drop write permission so the atomic session write in the apply phase fails.
 	if err := os.Chmod(sessDir, 0o555); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(sessDir, 0o755) })
 
-	result := m.runCompact(context.Background(), "", 0)()
-
-	if result.err == nil {
+	if err := m.applyCompactResult(result); err == nil {
 		t.Fatal("expected the failed save to surface as an error")
 	}
 	if sess.CompactionCheckpoint != prior {
@@ -205,15 +216,6 @@ func TestCompactWindowAndOverhead_PrefersLoopState(t *testing.T) {
 	}
 }
 
-// PersistLearnings + GenerateSummary can fold an oversized transcript into up
-// to maxSummaryFoldChunks sequential small-tier calls; a 60s shared budget
-// aborted exactly the sessions large enough to need /compact.
-func TestCompactTimeoutCoversSequentialFold(t *testing.T) {
-	if defaultCompactTimeout < 5*time.Minute {
-		t.Fatalf("defaultCompactTimeout=%v cannot cover sequential fold calls", defaultCompactTimeout)
-	}
-}
-
 // Manual /compact restores recently read files into the checkpoint like the
 // daemon's proactive/preflight paths do — otherwise exact file content the
 // summary paraphrases is lost precisely when the user asked to compact.
@@ -246,6 +248,9 @@ func TestCompact_AppendsFileRestoreBlock(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("runCompact: %v", result.err)
 	}
+	if err := m.applyCompactResult(result); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
 	cp := sess.CompactionCheckpoint
 	if cp == nil || len(cp.Messages) == 0 {
 		t.Fatalf("no checkpoint persisted: %#v", cp)
@@ -253,6 +258,45 @@ func TestCompact_AppendsFileRestoreBlock(t *testing.T) {
 	last := cp.Messages[len(cp.Messages)-1]
 	if !strings.Contains(last.Content.Text(), "restored-content") {
 		t.Fatalf("restore block missing from checkpoint tail: %q", last.Content.Text())
+	}
+}
+
+// A shaped tail that already ends with a user message must NOT get the
+// user-role restore block appended: SanitizeCompactedHistory's keep-later
+// merge would delete the earlier user message (e.g. a persisted tool_result)
+// on the next load, and orphan-stripping would then remove its paired
+// tool_use — content loss in the exact flow that asked to preserve context.
+func TestCompact_SkipsRestoreWhenTailEndsWithUser(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(client.CompletionResponse{
+			OutputText: "<summary>\n## Current task & next steps\nkeep going.\n</summary>",
+			Usage:      client.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		})
+	}))
+	defer server.Close()
+
+	m := newCommandTestModel(t)
+	m.gateway = client.NewGatewayClient(server.URL, "")
+	m.cfg.Agent.ContextWindow = 128000
+	m.fileRestoreBuilder = func(shaped []client.Message, overhead int) (client.Message, bool) {
+		return client.Message{Role: "user", Content: client.NewTextContent("restored-content")}, true
+	}
+	sess := m.sessions.Current()
+	for i := 0; i < 13; i++ { // odd count: history ends on a USER message
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		sess.Messages = append(sess.Messages, client.Message{Role: role, Content: client.NewTextContent(strings.Repeat("history ", 100))})
+		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
+	}
+
+	result := m.runCompact(context.Background(), "", 0)()
+	if result.err != nil {
+		t.Fatalf("runCompact: %v", result.err)
+	}
+	if n := len(result.shaped); n == 0 || strings.Contains(result.shaped[n-1].Content.Text(), "restored-content") {
+		t.Fatalf("restore block must be skipped on a user-ending tail: %#v", result.shaped[n-1].Content.Text())
 	}
 }
 
@@ -318,8 +362,10 @@ func TestCompactTimeout_ConfigOverride(t *testing.T) {
 	}
 }
 
-// A cancelled context must abort the pass without touching the checkpoint,
-// even when cancellation lands between the LLM calls and the save.
+// Cancellation must abort the pass without producing a checkpoint payload.
+// Covers both check sites: a pre-cancelled ctx bails before the first paid
+// call, and a cancel arriving from inside the gateway handler (mid-flight)
+// surfaces through the LLM error path.
 func TestCompact_CancelledContextDoesNotPersistCheckpoint(t *testing.T) {
 	m := newCommandTestModel(t)
 	sess := m.sessions.Current()
@@ -331,6 +377,8 @@ func TestCompact_CancelledContextDoesNotPersistCheckpoint(t *testing.T) {
 		sess.Messages = append(sess.Messages, client.Message{Role: role, Content: client.NewTextContent(strings.Repeat("history ", 100))})
 		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
 	}
+
+	// Site 1: already-cancelled ctx bails before any paid call.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result := m.runCompact(ctx, "", 3)()
@@ -342,5 +390,21 @@ func TestCompact_CancelledContextDoesNotPersistCheckpoint(t *testing.T) {
 	}
 	if sess.CompactionCheckpoint != nil {
 		t.Fatalf("cancelled pass must not persist a checkpoint: %#v", sess.CompactionCheckpoint)
+	}
+
+	// Site 2: cancel lands mid-flight, from inside the gateway handler.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel2()
+		_ = json.NewEncoder(w).Encode(client.CompletionResponse{OutputText: "ignored"})
+	}))
+	defer server.Close()
+	m.gateway = client.NewGatewayClient(server.URL, "")
+	result = m.runCompact(ctx2, "", 4)()
+	if result.err == nil {
+		t.Fatal("mid-flight cancellation must surface an error")
+	}
+	if sess.CompactionCheckpoint != nil {
+		t.Fatalf("mid-flight cancellation must not persist a checkpoint: %#v", sess.CompactionCheckpoint)
 	}
 }

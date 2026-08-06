@@ -996,6 +996,8 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cancelRun = nil
 					m.injectCh = nil
 				}
+				// Invalidate any in-flight /compact (same rationale as the Esc branch).
+				m.compactGen++
 				if m.state == stateApproval {
 					select {
 					case m.approvalCh <- false:
@@ -1032,6 +1034,10 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cancelRun = nil
 					m.injectCh = nil
 				}
+				// Invalidate any in-flight /compact so its cancelled result
+				// cannot print "Compact failed: context canceled" on top of
+				// the [Cancelled] line below.
+				m.compactGen++
 				// Unblock approval goroutine if waiting
 				if m.state == stateApproval {
 					select {
@@ -1588,6 +1594,8 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateInput
 		if msg.err != nil {
 			m.appendOutput(fmt.Sprintf("Compact failed: %v", msg.err))
+		} else if err := m.applyCompactResult(msg); err != nil {
+			m.appendOutput(fmt.Sprintf("Compact failed: %v", err))
 		} else {
 			m.appendOutput(formatCompactResult(msg))
 		}
@@ -1998,6 +2006,9 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 			m.agentLoop.SetCheckpointFunc(func(context.Context) error {
 				return m.persistMidTurnCompactionCheckpoint(sess, m.agentLoop.CompactionCheckpointMessages())
 			})
+			// Same debounce as the daemon runner: without it every tool batch
+			// after the first applied compaction rewrites session.json.
+			m.agentLoop.SetCheckpointMinInterval(2 * time.Second)
 			if m.cfg.Agent.CompactionSnapshotRetention > 0 {
 				retention := m.cfg.Agent.CompactionSnapshotRetention
 				sessionID := sess.ID

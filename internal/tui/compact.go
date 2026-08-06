@@ -25,6 +25,16 @@ type compactDoneMsg struct {
 	// pass must not flip the UI state (or print a stale result) under a newer
 	// run started meanwhile.
 	gen int
+	// Deferred-apply payload: the worker goroutine computes but never mutates
+	// shared session state; the Update handler applies snapshot + checkpoint +
+	// usage + save AFTER the generation check, so a cancelled pass cannot race
+	// a newer run's writes. sessionID pins the apply to the session the pass
+	// read from.
+	sessionID      string
+	shaped         []client.Message
+	archiveThrough int
+	preCompact     []client.Message
+	usage          agent.AccumulatedUsage
 }
 
 // defaultCompactTimeout bounds the whole /compact pass: PersistLearnings plus
@@ -151,56 +161,31 @@ func (m *Model) runCompact(ctx context.Context, customInstructions string, gen i
 			shaped = shaped[1:]
 		}
 
+		// A cancellation that lands after the LLM calls must not proceed to
+		// the restore builder (it reads live loop state a newer run may be
+		// writing) or the checkpoint payload: the user abandoned the pass.
+		if err := ctx.Err(); err != nil {
+			return done(compactDoneMsg{err: err})
+		}
+
 		// Restore recently read files into the compacted view, mirroring the
 		// daemon's proactive/preflight paths: the summary paraphrases file
 		// content whose exact text is still on disk, and the loop's
 		// ReadTracker (long-lived in the TUI) knows what was read. Manual
 		// compaction skips the task reanchor — the user's next prompt is the
-		// anchor here.
+		// anchor here. Skipped when the shaped tail already ends with a user
+		// message (e.g. a tool_result after an Esc-cancelled model turn):
+		// SanitizeCompactedHistory's keep-later merge would delete that
+		// earlier user message on the next load, and orphan-stripping would
+		// then take its paired tool_use with it.
 		restoreBuilder := m.fileRestoreBuilder
 		if restoreBuilder == nil && m.agentLoop != nil {
 			restoreBuilder = m.agentLoop.BuildPostCompactionFileRestore
 		}
-		if restoreBuilder != nil {
+		if restoreBuilder != nil && (len(shaped) == 0 || shaped[len(shaped)-1].Role != "user") {
 			if restoreMsg, ok := restoreBuilder(shaped, overheadTokens); ok {
 				shaped = append(shaped, restoreMsg)
 			}
-		}
-
-		// A cancellation that lands after the LLM calls must not go on to
-		// replace the checkpoint: the user asked to abandon the pass.
-		if err := ctx.Err(); err != nil {
-			return done(compactDoneMsg{err: err})
-		}
-
-		// Preserve the exact prior live state as best-effort rollback material,
-		// then replace only the live checkpoint. The transcript and its metadata
-		// remain lossless and index-stable for resume/search/share/audit.
-		if retention := m.cfg.Agent.CompactionSnapshotRetention; retention > 0 {
-			if err := m.sessions.SaveCompactionSnapshot(sess.ID, "manual", messages, retention); err != nil {
-				log.Printf("tui: manual compaction snapshot failed (session=%s): %v", sess.ID, err)
-			}
-		}
-		// Roll back on a failed save. Without this the user is told compaction
-		// failed while the in-memory session already runs on the new checkpoint,
-		// and the next successful Save() persists it anyway.
-		priorCheckpoint := sess.CompactionCheckpoint
-		sess.CompactionCheckpoint = &session.CompactionCheckpoint{
-			SchemaVersion:       session.CompactionCheckpointSchemaVersion,
-			ArchiveThroughIndex: archiveThrough,
-			Messages:            agent.SanitizeMessagesForPersistence(shaped),
-		}
-		acc := usage.Snapshot()
-		if llm := acc.LLM; llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 {
-			m.sessions.AddUsage(sess.ID, session.UsageFromAccumulated(
-				llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
-				llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
-				acc.ToolCalls, acc.ToolCostUSD,
-			))
-		}
-		if err := m.sessions.Save(); err != nil {
-			sess.CompactionCheckpoint = priorCheckpoint
-			return done(compactDoneMsg{err: fmt.Errorf("save compaction checkpoint: %w", err)})
 		}
 
 		afterTokens := ctxwin.EstimateTokens(shaped)
@@ -211,12 +196,61 @@ func (m *Model) runCompact(ctx context.Context, customInstructions string, gen i
 			displaySummary = string(r[:200]) + "..."
 		}
 
+		// All mutation (snapshot, checkpoint, usage, save) happens in
+		// applyCompactResult on the UI goroutine, after the generation check —
+		// the worker returns a pure payload so a cancelled pass can never race
+		// a newer run's session writes.
 		return done(compactDoneMsg{
-			beforeTokens: beforeTokens,
-			afterTokens:  afterTokens,
-			summary:      displaySummary,
+			beforeTokens:   beforeTokens,
+			afterTokens:    afterTokens,
+			summary:        displaySummary,
+			sessionID:      sess.ID,
+			shaped:         agent.SanitizeMessagesForPersistence(shaped),
+			archiveThrough: archiveThrough,
+			preCompact:     messages,
+			usage:          usage.Snapshot(),
 		})
 	}
+}
+
+// applyCompactResult commits a completed /compact pass: pre-replacement
+// snapshot, checkpoint swap, usage accounting, and the durable save with
+// rollback. Runs on the UI goroutine from the compactDoneMsg handler, after
+// the generation check, so it cannot interleave with a newer run's writes.
+func (m *Model) applyCompactResult(msg compactDoneMsg) error {
+	sess := m.sessions.Current()
+	if sess == nil || sess.ID != msg.sessionID {
+		return fmt.Errorf("session changed while compacting; result discarded")
+	}
+	// Preserve the exact prior live state as best-effort rollback material,
+	// then replace only the live checkpoint. The transcript and its metadata
+	// remain lossless and index-stable for resume/search/share/audit.
+	if retention := m.cfg.Agent.CompactionSnapshotRetention; retention > 0 {
+		if err := m.sessions.SaveCompactionSnapshot(sess.ID, "manual", msg.preCompact, retention); err != nil {
+			log.Printf("tui: manual compaction snapshot failed (session=%s): %v", sess.ID, err)
+		}
+	}
+	// Roll back on a failed save. Without this the user is told compaction
+	// failed while the in-memory session already runs on the new checkpoint,
+	// and the next successful Save() persists it anyway.
+	priorCheckpoint := sess.CompactionCheckpoint
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: msg.archiveThrough,
+		Messages:            msg.shaped,
+	}
+	if llm := msg.usage.LLM; llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 {
+		m.sessions.AddUsage(sess.ID, session.UsageFromAccumulated(
+			llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
+			llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
+			msg.usage.ToolCalls, msg.usage.ToolCostUSD,
+		))
+	}
+	if err := m.sessions.Save(); err != nil {
+		sess.CompactionCheckpoint = priorCheckpoint
+		return fmt.Errorf("save compaction checkpoint: %w", err)
+	}
+	return nil
 }
 
 // persistMidTurnCompactionCheckpoint durably saves an applied compaction's
