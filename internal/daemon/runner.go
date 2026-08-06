@@ -5045,6 +5045,12 @@ func stripSpokenSummaryForKoeTurn(sess *session.Session, fromIdx int) {
 // index space so later un-compacted messages can be appended without mixing it
 // with FilterInjected's shorter index space. nil from the loop means this run
 // did not compact and the prior checkpoint must remain in force.
+//
+// ORDERING INVARIANT: every call site (mid-turn checkpoint, final save,
+// hard-error save) must run AFTER applyTurnState has appended this turn's
+// archival messages to sess.Messages — ArchiveThroughIndex snapshots
+// len(sess.Messages) at call time, and calling before the append would
+// resurrect this turn's raw messages behind the checkpoint on the next load.
 func applyCompactionCheckpoint(sess *session.Session, loop *agent.AgentLoop) {
 	messages := loop.CompactionCheckpointMessages()
 	if len(messages) == 0 {

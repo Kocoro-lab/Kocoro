@@ -35,6 +35,7 @@
     "message_idempotency_v1",
     "message_idempotency_receipt_v2",
     "question_v1",
+    "compaction_status_events_v1",
     "project_entity_v1",
     "computer_use_topology_v1",
     "computer_use_control_v1",

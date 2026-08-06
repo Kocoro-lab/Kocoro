@@ -299,3 +299,12 @@ func (a *AgentLoop) buildPostCompactionFileRestore(shaped []client.Message, over
 	fmt.Fprintf(os.Stderr, "[agent] post-compaction file restore: %d file(s), ~%d chars\n", files, len(text))
 	return client.Message{Role: "user", Content: client.NewTextContent(text)}, true
 }
+
+// BuildPostCompactionFileRestore exposes the restoration payload to external
+// compaction drivers (TUI /compact) so a manual compaction keeps the same
+// file-content recovery the in-loop proactive/preflight paths have. Same
+// budget discipline: the payload must keep the estimate under the trigger
+// line, or restoration declines.
+func (a *AgentLoop) BuildPostCompactionFileRestore(shaped []client.Message, overheadTokens int) (client.Message, bool) {
+	return a.buildPostCompactionFileRestore(shaped, overheadTokens)
+}

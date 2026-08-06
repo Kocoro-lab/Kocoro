@@ -176,14 +176,43 @@ type toolResultEntry struct {
 }
 
 type Model struct {
-	baseCfg             *config.Config
-	cfg                 *config.Config
-	gateway             *client.GatewayClient
-	llmClient           client.LLMClient
-	sessions            *session.Manager
-	toolRegistry        *agent.ToolRegistry
-	toolCleanup         func()
-	agentLoop           *agent.AgentLoop
+	baseCfg      *config.Config
+	cfg          *config.Config
+	gateway      *client.GatewayClient
+	llmClient    client.LLMClient
+	sessions     *session.Manager
+	toolRegistry *agent.ToolRegistry
+	toolCleanup  func()
+	agentLoop    *agent.AgentLoop
+	// compacting mirrors the loop's compaction_started/finished run-status
+	// events so the processing spinner can label the pause. Cleared on
+	// finished AND on run completion (backstop for a lost finished event).
+	compacting bool
+	// fileRestoreBuilder overrides the /compact restoration source in tests;
+	// nil means the live agentLoop's BuildPostCompactionFileRestore.
+	fileRestoreBuilder func([]client.Message, int) (client.Message, bool)
+	// compactTestHookAfterSummary runs between the summary call and the
+	// post-LLM cancellation check; tests use it to land a cancel exactly at
+	// the checkpoint-guard site. nil in production.
+	compactTestHookAfterSummary func()
+	// compactGen invalidates in-flight /compact results: bumped when a compact
+	// pass starts AND when an agent run starts, so a compactDoneMsg from an
+	// Esc-cancelled pass cannot flip UI state under newer work.
+	compactGen int
+	// compactInFlight makes /compact and agent runs mutually exclusive: the
+	// worker reads unsynchronized live-loop state, so a run must not start
+	// under it (and vice versa). Set at the /compact submit site; released
+	// ONLY by the compactDoneMsg handler (the worker's lifetime owns it —
+	// after Esc the goroutine is still alive).
+	compactInFlight bool
+	// runInFlight is the mirror guard: the run GOROUTINES' lifetimes, not
+	// m.state — after Esc a loop still unwinds, appends to sess.Messages,
+	// writes the checkpoint, and Saves. A COUNTER, not a bool: Esc-then-Enter
+	// legitimately overlaps two run goroutines (pre-existing TUI behavior),
+	// and the first one's done message must not unblock /compact under the
+	// second. Incremented where runAgentLoop/runRemote start; decremented
+	// ONLY by the agentDoneMsg handler, never the cancel branches.
+	runInFlight         int
 	textarea            textarea.Model
 	viewport            viewport.Model // scrollable conversation history (alt-screen)
 	output              []outputBlock
@@ -985,6 +1014,11 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cancelRun = nil
 					m.injectCh = nil
 				}
+				// Invalidate any in-flight /compact (same rationale as the Esc
+				// branch). compactInFlight is NOT cleared here: the worker
+				// goroutine is still alive and still reads live-loop state;
+				// only its compactDoneMsg releases the flag.
+				m.compactGen++
 				if m.state == stateApproval {
 					select {
 					case m.approvalCh <- false:
@@ -1021,6 +1055,11 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cancelRun = nil
 					m.injectCh = nil
 				}
+				// Invalidate any in-flight /compact so its cancelled result
+				// cannot print "Compact failed: context canceled" on top of
+				// the [Cancelled] line below. compactInFlight is NOT cleared:
+				// the worker is still alive until its compactDoneMsg arrives.
+				m.compactGen++
 				// Unblock approval goroutine if waiting
 				if m.state == stateApproval {
 					select {
@@ -1340,7 +1379,21 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case compactionStatusMsg:
+		m.compacting = msg.active
+		return m, nil
+
 	case agentDoneMsg:
+		// Single release point for the run-side exclusion guard: each
+		// goroutine is provably finished when its own done message arrives.
+		// The cancel branches deliberately do NOT decrement — after Esc the
+		// loop still unwinds and persists.
+		if m.runInFlight > 0 {
+			m.runInFlight--
+		}
+		// Backstop: a lost compaction_finished event must not stick the
+		// spinner label past the run.
+		m.compacting = false
 		// If already back to stateInput (Esc was pressed), ignore this message.
 		// The Esc handler already showed [Cancelled] and transitioned state.
 		if m.state != stateProcessing {
@@ -1561,9 +1614,21 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.rerenderOutput()
 
 	case compactDoneMsg:
+		m.compactInFlight = false
+		if msg.gen != m.compactGen {
+			// Result of an Esc-cancelled pass arriving under newer work —
+			// dropping it keeps it from flipping the newer run's UI state.
+			return m, nil
+		}
+		m.cancelRun = nil
 		m.state = stateInput
 		if msg.err != nil {
 			m.appendOutput(fmt.Sprintf("Compact failed: %v", msg.err))
+		} else if err := m.applyCompactResult(msg); errors.Is(err, errCompactSessionChanged) {
+			// Not a failure: the user moved on; the pass is simply discarded.
+			m.appendOutput(lipgloss.NewStyle().Foreground(colorDim).Render("  Compact result discarded (session changed)"))
+		} else if err != nil {
+			m.appendOutput(fmt.Sprintf("Compact failed: %v", err))
 		} else {
 			m.appendOutput(formatCompactResult(msg))
 		}
@@ -1776,6 +1841,11 @@ func (m *Model) bottomRegion() string {
 			status = glyphStyle.Render(glyph) + lipgloss.NewStyle().Foreground(colorDim).Render(" "+label)
 		} else {
 			spinnerText := m.spinnerTexts[m.spinnerIdx%len(m.spinnerTexts)]
+			if m.compacting {
+				// The loop is between compaction_started/finished: the pause
+				// is summary work, not model thinking — label it as such.
+				spinnerText = "Tidying context"
+			}
 			status = glyphStyle.Render(glyph) + " " + renderWaveText(spinnerText, m.glyphIdx)
 		}
 		elapsed := formatElapsed(time.Since(m.processingStartTime))
@@ -1862,6 +1932,21 @@ func renderUserMessage(text string, width int) string {
 	return style.Render("› " + text)
 }
 
+// refuseWhileCompacting blocks any run-starting path while a /compact worker
+// is alive (the worker reads unsynchronized live-loop state). Restores the
+// composer input so "try again in a moment" is actually actionable.
+func (m *Model) refuseWhileCompacting(restoreInput string) bool {
+	if !m.compactInFlight {
+		return false
+	}
+	m.appendOutput("Compacting context — try again in a moment")
+	if restoreInput != "" {
+		m.textarea.SetValue(restoreInput)
+		m.adjustTextareaHeight() // SetHeight(1) already ran at submit
+	}
+	return true
+}
+
 func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.clearSuggestion() // a new turn stales any in-flight / shown suggestion
 	input := strings.TrimSpace(m.textarea.Value())
@@ -1870,6 +1955,15 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 
 	if input == "" {
 		return m, nil
+	}
+
+	// Refuse a run-starting submit BEFORE the echo and paste expansion: the
+	// transcript must not show a turn that was never sent, and the composer
+	// must get back the raw [Pasted text #N] form (expansion clears the
+	// stash). Slash commands pass through — the two run-starting slash paths
+	// are guarded at their dispatch sites; /help etc. keep working.
+	if !strings.HasPrefix(input, "/") && m.refuseWhileCompacting(input) {
+		return m, m.rerenderOutput()
 	}
 
 	m.appendOutput(renderUserMessage(input, m.width))
@@ -1940,12 +2034,14 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 	m.spinnerIdx = 0
 	m.glyphIdx = 0
 	m.colorIdx = 0
+	m.compactGen++ // a stale /compact result must not resolve under this run
 	return m, tea.Batch(m.runAgentLoop(input, history), spinnerTick(), spinnerFrameTick())
 }
 
 func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelRun = cancel
+	m.runInFlight++
 	m.injectCh = make(chan agent.InjectedMessage, 10)
 	return func() tea.Msg {
 		// Handler is hoisted so post-run code can query its accumulated usage.
@@ -1961,6 +2057,16 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID(sess.ID)
+			// Mid-turn durability for applied compactions: the summary was
+			// expensive, and only persisting at run end loses it to a crash
+			// during the remaining iterations. Run messages still land at run
+			// end; only the checkpoint (and archive index) is saved here.
+			m.agentLoop.SetCheckpointFunc(func(context.Context) error {
+				return m.persistMidTurnCompactionCheckpoint(sess, m.agentLoop.CompactionCheckpointMessages())
+			})
+			// Same debounce as the daemon runner: without it every tool batch
+			// after the first applied compaction rewrites session.json.
+			m.agentLoop.SetCheckpointMinInterval(2 * time.Second)
 			if m.cfg.Agent.CompactionSnapshotRetention > 0 {
 				retention := m.cfg.Agent.CompactionSnapshotRetention
 				sessionID := sess.ID
@@ -1988,6 +2094,7 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 				}
 			}
 			m.agentLoop.SetSessionID("")
+			m.agentLoop.SetCheckpointFunc(nil)
 			m.agentLoop.SetToolResultBudgetState(nil, nil)
 			m.agentLoop.SetWorkingSet(nil)
 		}
@@ -2532,8 +2639,16 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "/research":
+		if m.refuseWhileCompacting(input) {
+			return m, m.rerenderOutput()
+		}
+		m.compactGen++ // a stale /compact result must not resolve under this task
 		return m.handleResearch(parts[1:])
 	case "/swarm":
+		if m.refuseWhileCompacting(input) {
+			return m, m.rerenderOutput()
+		}
+		m.compactGen++ // a stale /compact result must not resolve under this task
 		return m.handleSwarm(parts[1:])
 	case "/search":
 		if len(parts) < 2 {
@@ -2662,6 +2777,18 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "/compact":
+		// Busy check first: it must win over the length message, and
+		// HistoryForLoop must not be read while a run goroutine may be
+		// appending to sess.Messages. The two flags cover the windows where
+		// Esc returned the UI to input but a goroutine is still alive.
+		if m.compactInFlight {
+			m.appendOutput("Compacting context — try again in a moment")
+			break
+		}
+		if m.state != stateInput || m.runInFlight > 0 {
+			m.appendOutput("Busy — wait for the current run to finish before /compact")
+			break
+		}
 		sess := m.sessions.Current()
 		if sess == nil || len(sess.HistoryForLoop()) < ctxwin.MinShapeable() {
 			m.appendOutput(fmt.Sprintf("Conversation too short to compact (need %d+ messages)", ctxwin.MinShapeable()))
@@ -2674,7 +2801,13 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 		m.appendOutput("Compacting context...")
 		m.state = stateProcessing
 		m.processingStartTime = time.Now()
-		compactFn := m.runCompact(customInstructions)
+		// Esc/Ctrl+C route through m.cancelRun like agent runs, so a long
+		// fold can actually be abandoned mid-flight.
+		ctx, cancel := context.WithCancel(context.Background())
+		m.cancelRun = cancel
+		m.compactInFlight = true
+		m.compactGen++
+		compactFn := m.runCompact(ctx, customInstructions, m.compactGen)
 		return m, tea.Batch(func() tea.Msg { return compactFn() }, spinnerTick(), spinnerFrameTick())
 	default:
 		// Check custom commands
@@ -2686,7 +2819,11 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 				args = strings.Join(parts[1:], " ")
 			}
 			expandedPrompt := strings.ReplaceAll(promptContent, "$ARGUMENTS", args)
+			if m.refuseWhileCompacting(input) {
+				return m, m.rerenderOutput()
+			}
 			// Send as a regular user message through the agent loop
+			m.compactGen++ // a stale /compact result must not resolve under this run
 			m.state = stateProcessing
 			m.processingStartTime = time.Now()
 			m.spinnerIdx = 0
@@ -2761,6 +2898,12 @@ func (m *Model) handleSwarm(args []string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) runRemote(query string, ctx map[string]any, strategy string) tea.Cmd {
+	// Incremented before ANY branch that can emit agentDoneMsg — the
+	// nil-gateway return below produces one too, and an unpaired decrement
+	// would release the run guard under a live run. The caller MUST hand the
+	// returned Cmd to the runtime: only its agentDoneMsg decrements, so a
+	// discarded Cmd leaks the guard permanently (see the field contract).
+	m.runInFlight++
 	if m.gateway == nil {
 		return func() tea.Msg {
 			return agentDoneMsg{err: fmt.Errorf("remote tasks require gateway provider (not available with ollama)")}
@@ -3055,6 +3198,25 @@ func (h *tuiEventHandler) OnToolResult(name string, args string, toolUseID strin
 func (h *tuiEventHandler) OnText(text string) {
 	// Final-answer rendering happens in agentDoneMsg (app.go ~line 1037) which
 	// uses the markdown renderer. Rendering here would double the output.
+}
+
+// compactionStatusMsg mirrors the loop's compaction_started/finished
+// run-status events into the bubbletea update loop.
+type compactionStatusMsg struct{ active bool }
+
+// OnRunStatus makes the TUI a RunStatusHandler. Only the compaction bracket
+// codes drive UI today (the transient "Tidying context" spinner label);
+// other codes are informational and already visible via their own channels.
+func (h *tuiEventHandler) OnRunStatus(code, detail string) {
+	if h.model.program == nil {
+		return
+	}
+	switch code {
+	case string(runstatus.CodeCompactionStarted):
+		h.model.program.Send(compactionStatusMsg{active: true})
+	case string(runstatus.CodeCompactionFinished):
+		h.model.program.Send(compactionStatusMsg{active: false})
+	}
 }
 
 // OnPreamble renders mid-turn agent narration (preamble emitted alongside

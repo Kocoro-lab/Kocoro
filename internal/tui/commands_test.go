@@ -137,12 +137,14 @@ func TestStatus_ShowsInfo(t *testing.T) {
 		{Role: "user", Content: client.NewTextContent("three")},
 		{Role: "assistant", Content: client.NewTextContent("four")},
 	}
+	// The fixture must carry the compacted-history marker — HistoryForLoop
+	// rejects markerless checkpoints as not-produced-by-compaction.
 	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
 		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
 		ArchiveThroughIndex: len(sess.Messages),
 		Messages: []client.Message{
 			{Role: "user", Content: client.NewTextContent("primer")},
-			{Role: "assistant", Content: client.NewTextContent("summary")},
+			{Role: "user", Content: client.NewTextContent("Previous context summary: summary")},
 		},
 	}
 

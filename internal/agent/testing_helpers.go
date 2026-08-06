@@ -21,3 +21,9 @@ func SetRunMessagesForTest(a *AgentLoop, msgs []client.Message) {
 func SetCompactionCheckpointMessagesForTest(a *AgentLoop, msgs []client.Message) {
 	a.compactionCheckpointMessages = msgs
 }
+
+// SetLastSystemPromptEstimateForTest seeds the system-prompt estimate that
+// external compaction drivers add to their overhead, without running a turn.
+func SetLastSystemPromptEstimateForTest(a *AgentLoop, tokens int) {
+	a.lastSystemPromptEst.Store(int64(tokens))
+}

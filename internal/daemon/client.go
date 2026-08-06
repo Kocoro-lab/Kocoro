@@ -245,6 +245,12 @@ const (
 	// daemon omits it and never emits the events, so the ask-user tool stays a
 	// no-op there rather than surfacing an undecodable event family.
 	CapQuestionV1 = "question_v1"
+	// CapCompactionStatusEventsV1 — the daemon brackets every compaction pass
+	// with compaction_started/compaction_finished run_status codes. The
+	// indicator itself is event-driven (absence is benign in both deploy
+	// orders), but the token lets a client distinguish "older daemon without
+	// the protocol" from "this run simply never compacted".
+	CapCompactionStatusEventsV1 = "compaction_status_events_v1"
 	// CapKoeFastProfileV1 means source=koe POST /message accepts the semantic
 	// execution_mode contract, resolves fast through Cloud's trusted profile,
 	// pins it across checkpoints, and forks fast->full follow-ups before generic
@@ -328,6 +334,7 @@ var Capabilities = []string{
 	CapMessageIdempotencyV1,
 	CapMessageIdempotencyReceiptV2,
 	CapQuestionV1,
+	CapCompactionStatusEventsV1,
 	CapProjectEntityV1,
 	CapComputerUseTopologyV1,
 	CapComputerUseControlV1,

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -20,14 +21,77 @@ type compactDoneMsg struct {
 	afterTokens  int
 	summary      string
 	err          error
+	// gen is the Model.compactGen captured when this pass started. The Update
+	// handler drops the message when it no longer matches — an Esc-cancelled
+	// pass must not flip the UI state (or print a stale result) under a newer
+	// run started meanwhile.
+	gen int
+	// Deferred-apply payload: the worker goroutine computes but never mutates
+	// shared session state; the Update handler applies snapshot + checkpoint +
+	// usage + save AFTER the generation check, so a cancelled pass cannot race
+	// a newer run's writes. sessionID pins the apply to the session the pass
+	// read from.
+	sessionID      string
+	shaped         []client.Message
+	archiveThrough int
+	preCompact     []client.Message
+	usage          agent.AccumulatedUsage
+}
+
+// defaultCompactTimeout bounds the whole /compact pass: PersistLearnings plus
+// a summarize that may fold an oversized transcript into up to
+// maxSummaryFoldChunks sequential small-tier calls. A 60s shared budget
+// aborted exactly the sessions large enough to need /compact. Overridable via
+// agent.compact_timeout_secs for slow gateways.
+const defaultCompactTimeout = 5 * time.Minute
+
+// compactTimeout resolves the /compact deadline from config, falling back to
+// the 5-minute default when unset or non-positive.
+func (m *Model) compactTimeout() time.Duration {
+	if secs := m.cfg.Agent.CompactTimeoutSecs; secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return defaultCompactTimeout
+}
+
+// compactWindowAndOverhead resolves the context window and estimator
+// calibration for /compact from the live loop when one exists — its window
+// tracks response.model auto-detection and its calibration carries the
+// tools-schema mass — falling back to config, then the 128K legacy default.
+//
+// The returned overhead also includes the loop's last system-prompt estimate:
+// /compact shapes a history whose system slot is a tiny placeholder, while
+// the calibration is measured against requests whose estimate already carries
+// the real prompt — without this, shaping and restoration budgets would treat
+// the whole system prompt as free headroom. 0 before the first Run, which
+// degrades to the prior behavior.
+func (m *Model) compactWindowAndOverhead() (window, overheadTokens int) {
+	if m.agentLoop != nil {
+		window, _ = m.agentLoop.ContextWindow()
+		overheadTokens, _, _ = m.agentLoop.EstOverheadState()
+		overheadTokens += m.agentLoop.LastSystemPromptEstimate()
+	}
+	if window <= 0 {
+		window = m.cfg.Agent.ContextWindow
+	}
+	if window <= 0 {
+		window = 128000
+	}
+	return window, overheadTokens
 }
 
 // runCompact performs context compaction: persist learnings → summarize → shape history.
-func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
+// ctx comes from the submit site so Esc/Ctrl+C cancel the LLM calls via
+// m.cancelRun; gen tags the result for the staleness guard in Update.
+func (m *Model) runCompact(ctx context.Context, customInstructions string, gen int) func() compactDoneMsg {
 	return func() compactDoneMsg {
+		done := func(msg compactDoneMsg) compactDoneMsg {
+			msg.gen = gen
+			return msg
+		}
 		sess := m.sessions.Current()
 		if sess == nil {
-			return compactDoneMsg{err: fmt.Errorf("no active session")}
+			return done(compactDoneMsg{err: fmt.Errorf("no active session")})
 		}
 		messages := sess.HistoryForLoop()
 		// Captured next to the history snapshot it must agree with. Reading it
@@ -36,13 +100,18 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 		// implicit cross-file invariant.
 		archiveThrough := len(sess.Messages)
 		if len(messages) < ctxwin.MinShapeable() {
-			return compactDoneMsg{err: fmt.Errorf("conversation too short to compact (need %d+ messages, have %d)", ctxwin.MinShapeable(), len(messages))}
+			return done(compactDoneMsg{err: fmt.Errorf("conversation too short to compact (need %d+ messages, have %d)", ctxwin.MinShapeable(), len(messages))})
 		}
 
 		beforeTokens := ctxwin.EstimateTokens(messages)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, m.compactTimeout())
 		defer cancel()
+		// Fast-fail before any paid call: an already-cancelled pass (Esc
+		// raced the submit) must not start LLM work.
+		if err := ctx.Err(); err != nil {
+			return done(compactDoneMsg{err: err})
+		}
 		var usage agent.UsageAccumulator
 
 		// Step 1: persist learnings to MEMORY.md
@@ -69,26 +138,26 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			usage.Add(agent.LLMUsageDelta(sumUsage, ""))
 		}
 		if err != nil {
-			return compactDoneMsg{err: fmt.Errorf("summarization failed: %w", err)}
+			return done(compactDoneMsg{err: fmt.Errorf("summarization failed: %w", err)})
+		}
+		if m.compactTestHookAfterSummary != nil {
+			m.compactTestHookAfterSummary()
 		}
 
 		// Step 3: shape history.
 		// ShapeHistory expects [system] + [first user] + ... but TUI sessions
 		// don't persist the system prompt. Prepend a placeholder so the array
 		// layout matches, then strip it from the result.
-		ctxWindow := m.cfg.Agent.ContextWindow
-		if ctxWindow <= 0 {
-			ctxWindow = 128000
-		}
+		ctxWindow, overheadTokens := m.compactWindowAndOverhead()
 		withSystem := make([]client.Message, 0, 1+len(messages))
 		withSystem = append(withSystem, client.Message{Role: "system", Content: client.NewTextContent("(compaction placeholder)")})
 		withSystem = append(withSystem, messages...)
-		shaped := ctxwin.ForceShapeHistory(withSystem, summary, ctxWindow, 0)
+		shaped := ctxwin.ForceShapeHistory(withSystem, summary, ctxWindow, overheadTokens)
 		if len(shaped) >= len(withSystem) {
 			// ForceShapeHistory contract: no net reduction possible. Bail
 			// before replacing the live checkpoint or reporting a compression
 			// that freed nothing.
-			return compactDoneMsg{err: fmt.Errorf("nothing to compact: %d messages already at minimum shape", len(messages))}
+			return done(compactDoneMsg{err: fmt.Errorf("nothing to compact: %d messages already at minimum shape", len(messages))})
 		}
 
 		// Strip the placeholder system message from shaped result
@@ -96,34 +165,31 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			shaped = shaped[1:]
 		}
 
-		// Preserve the exact prior live state as best-effort rollback material,
-		// then replace only the live checkpoint. The transcript and its metadata
-		// remain lossless and index-stable for resume/search/share/audit.
-		if retention := m.cfg.Agent.CompactionSnapshotRetention; retention > 0 {
-			if err := m.sessions.SaveCompactionSnapshot(sess.ID, "manual", messages, retention); err != nil {
-				log.Printf("tui: manual compaction snapshot failed (session=%s): %v", sess.ID, err)
+		// A cancellation that lands after the LLM calls must not proceed to
+		// the restore builder (it reads live loop state a newer run may be
+		// writing) or the checkpoint payload: the user abandoned the pass.
+		if err := ctx.Err(); err != nil {
+			return done(compactDoneMsg{err: err})
+		}
+
+		// Restore recently read files into the compacted view, mirroring the
+		// daemon's proactive/preflight paths: the summary paraphrases file
+		// content whose exact text is still on disk, and the loop's
+		// ReadTracker (long-lived in the TUI) knows what was read. Manual
+		// compaction skips the task reanchor — the user's next prompt is the
+		// anchor here. Skipped when the shaped tail already ends with a user
+		// message (e.g. a tool_result after an Esc-cancelled model turn):
+		// SanitizeCompactedHistory's keep-later merge would delete that
+		// earlier user message on the next load, and orphan-stripping would
+		// then take its paired tool_use with it.
+		restoreBuilder := m.fileRestoreBuilder
+		if restoreBuilder == nil && m.agentLoop != nil {
+			restoreBuilder = m.agentLoop.BuildPostCompactionFileRestore
+		}
+		if restoreBuilder != nil && (len(shaped) == 0 || shaped[len(shaped)-1].Role != "user") {
+			if restoreMsg, ok := restoreBuilder(shaped, overheadTokens); ok {
+				shaped = append(shaped, restoreMsg)
 			}
-		}
-		// Roll back on a failed save. Without this the user is told compaction
-		// failed while the in-memory session already runs on the new checkpoint,
-		// and the next successful Save() persists it anyway.
-		priorCheckpoint := sess.CompactionCheckpoint
-		sess.CompactionCheckpoint = &session.CompactionCheckpoint{
-			SchemaVersion:       session.CompactionCheckpointSchemaVersion,
-			ArchiveThroughIndex: archiveThrough,
-			Messages:            agent.SanitizeMessagesForPersistence(shaped),
-		}
-		acc := usage.Snapshot()
-		if llm := acc.LLM; llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 {
-			m.sessions.AddUsage(sess.ID, session.UsageFromAccumulated(
-				llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
-				llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
-				acc.ToolCalls, acc.ToolCostUSD,
-			))
-		}
-		if err := m.sessions.Save(); err != nil {
-			sess.CompactionCheckpoint = priorCheckpoint
-			return compactDoneMsg{err: fmt.Errorf("save compaction checkpoint: %w", err)}
 		}
 
 		afterTokens := ctxwin.EstimateTokens(shaped)
@@ -134,12 +200,96 @@ func (m *Model) runCompact(customInstructions string) func() compactDoneMsg {
 			displaySummary = string(r[:200]) + "..."
 		}
 
-		return compactDoneMsg{
-			beforeTokens: beforeTokens,
-			afterTokens:  afterTokens,
-			summary:      displaySummary,
+		// All mutation (snapshot, checkpoint, usage, save) happens in
+		// applyCompactResult on the UI goroutine, after the generation check —
+		// the worker returns a pure payload so a cancelled pass can never race
+		// a newer run's session writes.
+		return done(compactDoneMsg{
+			beforeTokens:   beforeTokens,
+			afterTokens:    afterTokens,
+			summary:        displaySummary,
+			sessionID:      sess.ID,
+			shaped:         agent.SanitizeMessagesForPersistence(shaped),
+			archiveThrough: archiveThrough,
+			preCompact:     messages,
+			usage:          usage.Snapshot(),
+		})
+	}
+}
+
+// errCompactSessionChanged marks a discarded-but-not-failed apply: the user
+// switched sessions while the pass ran. Rendered as an informational line.
+var errCompactSessionChanged = errors.New("session changed while compacting; result discarded")
+
+// applyCompactResult commits a completed /compact pass: pre-replacement
+// snapshot, checkpoint swap, usage accounting, and the durable save with
+// rollback. Runs on the UI goroutine from the compactDoneMsg handler, after
+// the generation check, so it cannot interleave with a newer run's writes.
+func (m *Model) applyCompactResult(msg compactDoneMsg) error {
+	sess := m.sessions.Current()
+	if sess == nil || sess.ID != msg.sessionID {
+		return errCompactSessionChanged
+	}
+	// Defence-in-depth: the load-time validation in store.go would fail open
+	// on an out-of-range index, but the invariant should hold locally too.
+	if msg.archiveThrough > len(sess.Messages) {
+		return fmt.Errorf("compact result stale: archive index %d beyond %d messages", msg.archiveThrough, len(sess.Messages))
+	}
+	// Preserve the exact prior live state as best-effort rollback material,
+	// then replace only the live checkpoint. The transcript and its metadata
+	// remain lossless and index-stable for resume/search/share/audit.
+	if retention := m.cfg.Agent.CompactionSnapshotRetention; retention > 0 {
+		// "manual" here is the snapshot-directory phase label, a separate
+		// namespace from run_status details (which have no manual phase —
+		// TUI /compact emits no status events).
+		if err := m.sessions.SaveCompactionSnapshot(sess.ID, "manual", msg.preCompact, retention); err != nil {
+			log.Printf("tui: manual compaction snapshot failed (session=%s): %v", sess.ID, err)
 		}
 	}
+	// Roll back on a failed save. Without this the user is told compaction
+	// failed while the in-memory session already runs on the new checkpoint,
+	// and the next successful Save() persists it anyway.
+	priorCheckpoint := sess.CompactionCheckpoint
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: msg.archiveThrough,
+		Messages:            msg.shaped,
+	}
+	if llm := msg.usage.LLM; llm.LLMCalls > 0 || llm.WebSearchCalls > 0 || llm.TotalTokens > 0 || llm.CostUSD > 0 {
+		m.sessions.AddUsage(sess.ID, session.UsageFromAccumulated(
+			llm.LLMCalls, llm.WebSearchCalls, llm.InputTokens, llm.OutputTokens, llm.TotalTokens,
+			llm.CostUSD, llm.CacheReadTokens, llm.CacheCreationTokens, llm.CacheCreation5mTokens, llm.CacheCreation1hTokens, llm.Model,
+			msg.usage.ToolCalls, msg.usage.ToolCostUSD,
+		))
+	}
+	if err := m.sessions.Save(); err != nil {
+		sess.CompactionCheckpoint = priorCheckpoint
+		return fmt.Errorf("save compaction checkpoint: %w", err)
+	}
+	return nil
+}
+
+// persistMidTurnCompactionCheckpoint durably saves an applied compaction's
+// checkpoint while the run is still in flight (wired to the loop's
+// CheckpointFunc). Run messages still land at run end; ArchiveThroughIndex
+// therefore points at the archive as it stands now — the checkpoint messages
+// already carry the shaped current-run state, so a crash before run end
+// resumes on checkpoint + empty tail, which is self-consistent.
+func (m *Model) persistMidTurnCompactionCheckpoint(sess *session.Session, checkpoint []client.Message) error {
+	if sess == nil || len(checkpoint) == 0 {
+		return nil
+	}
+	prior := sess.CompactionCheckpoint
+	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
+		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: len(sess.Messages),
+		Messages:            checkpoint,
+	}
+	if err := m.sessions.Save(); err != nil {
+		sess.CompactionCheckpoint = prior
+		return err
+	}
+	return nil
 }
 
 func formatCompactResult(msg compactDoneMsg) string {
