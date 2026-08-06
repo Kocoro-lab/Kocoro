@@ -2846,7 +2846,7 @@ func (m *Model) runDoctor() tea.Cmd {
 }
 
 func (m *Model) handleResearch(args []string) (tea.Model, tea.Cmd) {
-	if m.refuseWhileCompacting("") {
+	if m.refuseWhileCompacting(strings.TrimSpace("/research " + strings.Join(args, " "))) {
 		return m, m.rerenderOutput()
 	}
 	m.compactGen++ // a stale /compact result must not resolve under this task
@@ -2877,7 +2877,7 @@ func (m *Model) handleResearch(args []string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleSwarm(args []string) (tea.Model, tea.Cmd) {
-	if m.refuseWhileCompacting("") {
+	if m.refuseWhileCompacting(strings.TrimSpace("/swarm " + strings.Join(args, " "))) {
 		return m, m.rerenderOutput()
 	}
 	m.compactGen++ // a stale /compact result must not resolve under this task
@@ -2898,6 +2898,10 @@ func (m *Model) handleSwarm(args []string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) runRemote(query string, ctx map[string]any, strategy string) tea.Cmd {
+	// Incremented before ANY branch that can emit agentDoneMsg — the
+	// nil-gateway return below produces one too, and an unpaired decrement
+	// would release the run guard under a live run.
+	m.runInFlight++
 	if m.gateway == nil {
 		return func() tea.Msg {
 			return agentDoneMsg{err: fmt.Errorf("remote tasks require gateway provider (not available with ollama)")}
@@ -2909,7 +2913,6 @@ func (m *Model) runRemote(query string, ctx map[string]any, strategy string) tea
 		sess.Title = session.Title(query)
 		sess.TitleAuto = true
 	}
-	m.runInFlight++
 	return func() tea.Msg {
 		taskReq := client.TaskRequest{
 			Query:            query,

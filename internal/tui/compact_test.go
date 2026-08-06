@@ -450,9 +450,12 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 		sess.Messages = append(sess.Messages, client.Message{Role: role, Content: client.NewTextContent(strings.Repeat("history ", 100))})
 		sess.MessageMeta = append(sess.MessageMeta, session.MessageMeta{Source: "local"})
 	}
-	renderedOutput := func() string {
+	// outputSince scopes assertions to lines appended after mark — the shared
+	// buffer accumulates across directions, so whole-buffer scans go vacuous
+	// once an earlier direction printed the same line.
+	outputSince := func(mark int) string {
 		var b strings.Builder
-		for _, o := range m.output {
+		for _, o := range m.output[mark:] {
 			b.WriteString(o.rendered)
 		}
 		return b.String()
@@ -460,11 +463,12 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 
 	// Direction 1a: /compact refused while a run is processing.
 	m.state = stateProcessing
+	mark := len(m.output)
 	m.handleSlashCommand("/compact")
 	if m.compactInFlight {
 		t.Fatal("/compact must be refused while a run is active")
 	}
-	if !strings.Contains(renderedOutput(), "Busy") {
+	if !strings.Contains(outputSince(mark), "Busy") {
 		t.Fatal("refusal must render the Busy line, not the too-short line")
 	}
 
@@ -473,36 +477,46 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 	// /compact must still be refused via runInFlight.
 	m.state = stateInput
 	m.runInFlight = 1
+	mark = len(m.output)
 	m.handleSlashCommand("/compact")
 	if m.cancelRun != nil || m.compactInFlight {
 		t.Fatal("/compact must not start under a winding-down run")
 	}
-	if !strings.Contains(renderedOutput(), "Busy") {
+	if !strings.Contains(outputSince(mark), "Busy") {
 		t.Fatal("the run-flag refusal must use the Busy line, not the compacting line")
 	}
 	m.runInFlight = 0
 
-	// Direction 1d: remote tasks (/research) are the same door — refused, and
-	// the compact result cannot resolve under them (gen bumped at their
-	// start).
+	// Direction 1d: remote tasks (/research) are the same door — refused
+	// under a compact. A real gateway makes this discriminating: the control
+	// case below proves an unrefused /research DOES take the run guard.
+	m.gateway = client.NewGatewayClient("http://127.0.0.1:1", "")
 	m.compactInFlight = true
-	genBefore := m.compactGen
+	m.textarea.Reset()
 	m.handleSlashCommand("/research anything")
 	if m.runInFlight != 0 {
 		t.Fatal("/research must be refused under an in-flight compact")
 	}
+	if got := m.textarea.Value(); got != "/research anything" {
+		t.Fatalf("the remote-door refusal must restore the typed command, got %q", got)
+	}
 	m.compactInFlight = false
-	_ = genBefore
+	m.handleSlashCommand("/research anything") // control: unrefused → guard taken
+	if m.runInFlight != 1 {
+		t.Fatalf("control: an unrefused /research must take the run guard, got %d", m.runInFlight)
+	}
+	m.runInFlight = 0
 
 	// Direction 1b: /compact also refused while a (possibly Esc-cancelled but
 	// still alive) compact worker holds the flag.
 	m.state = stateInput
 	m.compactInFlight = true
+	mark = len(m.output)
 	m.handleSlashCommand("/compact")
 	if m.cancelRun != nil {
 		t.Fatal("a second compact must not start while a worker is alive")
 	}
-	if !strings.Contains(renderedOutput(), "try again in a moment") {
+	if !strings.Contains(outputSince(mark), "try again in a moment") {
 		t.Fatal("the flag-case refusal must use the compacting message, not the run message")
 	}
 
@@ -535,7 +549,7 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 	if echoed {
 		t.Fatal("refused submit must not echo the turn into the transcript")
 	}
-	if !strings.Contains(renderedOutput(), "try again in a moment") {
+	if !strings.Contains(outputSince(outputBefore), "try again in a moment") {
 		t.Fatal("refusal must tell the user why")
 	}
 
@@ -593,10 +607,18 @@ func TestEscDoesNotReleaseRunInFlight(t *testing.T) {
 	}
 
 	// End-to-end U1 flow: right after the Esc, /compact must be refused by
-	// the still-held run guard.
+	// the still-held run guard, with the run-cause Busy line.
+	escMark := len(m.output)
 	m.handleSlashCommand("/compact")
 	if m.compactInFlight {
 		t.Fatal("/compact must be refused right after Esc while the run unwinds")
+	}
+	var escOut strings.Builder
+	for _, o := range m.output[escMark:] {
+		escOut.WriteString(o.rendered)
+	}
+	if !strings.Contains(escOut.String(), "Busy") {
+		t.Fatal("the post-Esc refusal must use the run-cause Busy line")
 	}
 
 	// Overlap safety: a second run starts (Esc-then-Enter); the FIRST run's
