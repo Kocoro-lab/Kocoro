@@ -876,11 +876,11 @@ type AgentLoop struct {
 	// overhead or their budgets over-allocate by the whole prompt. 0 until the
 	// first Run. Atomic for the same daemon-concurrency exposure as above.
 	lastSystemPromptEst atomic.Int64
-	memoryDir        string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
-	projectEntityDir string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
-	stickyContext    string             // session-scoped facts injected verbatim into system prompt; never truncated
-	outputFormat     string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
-	userFilePaths    []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
+	memoryDir           string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	projectEntityDir    string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
+	stickyContext       string             // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat        string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	userFilePaths       []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
 	// alwaysAllowTools is the per-agent persisted set loaded from the agent's
 	// permissions.always_allow_tools config. Sourced from
 	// internal/agents/loader.go AgentPermissionsConfig and injected by the

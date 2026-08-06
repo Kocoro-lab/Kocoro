@@ -176,14 +176,14 @@ type toolResultEntry struct {
 }
 
 type Model struct {
-	baseCfg             *config.Config
-	cfg                 *config.Config
-	gateway             *client.GatewayClient
-	llmClient           client.LLMClient
-	sessions            *session.Manager
-	toolRegistry        *agent.ToolRegistry
-	toolCleanup         func()
-	agentLoop           *agent.AgentLoop
+	baseCfg      *config.Config
+	cfg          *config.Config
+	gateway      *client.GatewayClient
+	llmClient    client.LLMClient
+	sessions     *session.Manager
+	toolRegistry *agent.ToolRegistry
+	toolCleanup  func()
+	agentLoop    *agent.AgentLoop
 	// compacting mirrors the loop's compaction_started/finished run-status
 	// events so the processing spinner can label the pause. Cleared on
 	// finished AND on run completion (backstop for a lost finished event).
@@ -205,12 +205,14 @@ type Model struct {
 	// ONLY by the compactDoneMsg handler (the worker's lifetime owns it —
 	// after Esc the goroutine is still alive).
 	compactInFlight bool
-	// runInFlight is the mirror flag: the run GOROUTINE's lifetime, not
-	// m.state — after Esc the loop still unwinds, appends to sess.Messages,
-	// writes the checkpoint, and Saves. Set where runAgentLoop/runRemote
-	// start; released ONLY by the agentDoneMsg handler, never the cancel
-	// branches. /compact refuses while it is held.
-	runInFlight bool
+	// runInFlight is the mirror guard: the run GOROUTINES' lifetimes, not
+	// m.state — after Esc a loop still unwinds, appends to sess.Messages,
+	// writes the checkpoint, and Saves. A COUNTER, not a bool: Esc-then-Enter
+	// legitimately overlaps two run goroutines (pre-existing TUI behavior),
+	// and the first one's done message must not unblock /compact under the
+	// second. Incremented where runAgentLoop/runRemote start; decremented
+	// ONLY by the agentDoneMsg handler, never the cancel branches.
+	runInFlight         int
 	textarea            textarea.Model
 	viewport            viewport.Model // scrollable conversation history (alt-screen)
 	output              []outputBlock
@@ -1382,11 +1384,13 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case agentDoneMsg:
-		// Single release point for the run-side exclusion flag: the goroutine
-		// is provably finished when its done message arrives. The cancel
-		// branches deliberately do NOT clear it — after Esc the loop still
-		// unwinds and persists.
-		m.runInFlight = false
+		// Single release point for the run-side exclusion guard: each
+		// goroutine is provably finished when its own done message arrives.
+		// The cancel branches deliberately do NOT decrement — after Esc the
+		// loop still unwinds and persists.
+		if m.runInFlight > 0 {
+			m.runInFlight--
+		}
 		// Backstop: a lost compaction_finished event must not stick the
 		// spinner label past the run.
 		m.compacting = false
@@ -1928,7 +1932,6 @@ func renderUserMessage(text string, width int) string {
 	return style.Render("› " + text)
 }
 
-
 // refuseWhileCompacting blocks any run-starting path while a /compact worker
 // is alive (the worker reads unsynchronized live-loop state). Restores the
 // composer input so "try again in a moment" is actually actionable.
@@ -1939,6 +1942,7 @@ func (m *Model) refuseWhileCompacting(restoreInput string) bool {
 	m.appendOutput("Compacting context — try again in a moment")
 	if restoreInput != "" {
 		m.textarea.SetValue(restoreInput)
+		m.adjustTextareaHeight() // SetHeight(1) already ran at submit
 	}
 	return true
 }
@@ -2037,7 +2041,7 @@ func (m *Model) handleSubmit() (tea.Model, tea.Cmd) {
 func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelRun = cancel
-	m.runInFlight = true
+	m.runInFlight++
 	m.injectCh = make(chan agent.InjectedMessage, 10)
 	return func() tea.Msg {
 		// Handler is hoisted so post-run code can query its accumulated usage.
@@ -2773,7 +2777,7 @@ func (m *Model) handleSlashCommand(input string) (tea.Model, tea.Cmd) {
 			m.appendOutput("Compacting context — try again in a moment")
 			break
 		}
-		if m.state != stateInput || m.runInFlight {
+		if m.state != stateInput || m.runInFlight > 0 {
 			m.appendOutput("Busy — wait for the current run to finish before /compact")
 			break
 		}
@@ -2842,6 +2846,10 @@ func (m *Model) runDoctor() tea.Cmd {
 }
 
 func (m *Model) handleResearch(args []string) (tea.Model, tea.Cmd) {
+	if m.refuseWhileCompacting("") {
+		return m, m.rerenderOutput()
+	}
+	m.compactGen++ // a stale /compact result must not resolve under this task
 	strategy := "standard"
 	query := strings.Join(args, " ")
 
@@ -2869,6 +2877,10 @@ func (m *Model) handleResearch(args []string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleSwarm(args []string) (tea.Model, tea.Cmd) {
+	if m.refuseWhileCompacting("") {
+		return m, m.rerenderOutput()
+	}
+	m.compactGen++ // a stale /compact result must not resolve under this task
 	query := strings.Join(args, " ")
 	if query == "" {
 		m.appendOutput("Usage: /swarm <query>")
@@ -2897,7 +2909,7 @@ func (m *Model) runRemote(query string, ctx map[string]any, strategy string) tea
 		sess.Title = session.Title(query)
 		sess.TitleAuto = true
 	}
-	m.runInFlight = true
+	m.runInFlight++
 	return func() tea.Msg {
 		taskReq := client.TaskRequest{
 			Query:            query,

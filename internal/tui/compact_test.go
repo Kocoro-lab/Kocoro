@@ -3,9 +3,9 @@ package tui
 import (
 	"context"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"encoding/json"
 	"errors"
+	tea "github.com/charmbracelet/bubbletea"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -472,12 +472,27 @@ func TestCompactRunMutualExclusion(t *testing.T) {
 	// run GOROUTINE is still unwinding (appending, checkpointing, saving) —
 	// /compact must still be refused via runInFlight.
 	m.state = stateInput
-	m.runInFlight = true
+	m.runInFlight = 1
 	m.handleSlashCommand("/compact")
 	if m.cancelRun != nil || m.compactInFlight {
 		t.Fatal("/compact must not start under a winding-down run")
 	}
-	m.runInFlight = false
+	if !strings.Contains(renderedOutput(), "Busy") {
+		t.Fatal("the run-flag refusal must use the Busy line, not the compacting line")
+	}
+	m.runInFlight = 0
+
+	// Direction 1d: remote tasks (/research) are the same door — refused, and
+	// the compact result cannot resolve under them (gen bumped at their
+	// start).
+	m.compactInFlight = true
+	genBefore := m.compactGen
+	m.handleSlashCommand("/research anything")
+	if m.runInFlight != 0 {
+		t.Fatal("/research must be refused under an in-flight compact")
+	}
+	m.compactInFlight = false
+	_ = genBefore
 
 	// Direction 1b: /compact also refused while a (possibly Esc-cancelled but
 	// still alive) compact worker holds the flag.
@@ -568,18 +583,33 @@ func TestCompactBusyCheckPrecedesLengthCheck(t *testing.T) {
 func TestEscDoesNotReleaseRunInFlight(t *testing.T) {
 	m := newCommandTestModel(t)
 	m.state = stateProcessing
-	m.runInFlight = true
+	m.runInFlight = 1
 	m.cancelRun = func() {}
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEscape})
 	m = updated.(*Model)
-	if !m.runInFlight {
+	if m.runInFlight != 1 {
 		t.Fatal("Esc must not release runInFlight; only agentDoneMsg does")
 	}
 
-	updated, _ = m.Update(agentDoneMsg{})
+	// End-to-end U1 flow: right after the Esc, /compact must be refused by
+	// the still-held run guard.
+	m.handleSlashCommand("/compact")
+	if m.compactInFlight {
+		t.Fatal("/compact must be refused right after Esc while the run unwinds")
+	}
+
+	// Overlap safety: a second run starts (Esc-then-Enter); the FIRST run's
+	// done message must not unblock /compact under the second.
+	m.runInFlight++                       // run B starts
+	updated, _ = m.Update(agentDoneMsg{}) // run A finishes
 	m = updated.(*Model)
-	if m.runInFlight {
-		t.Fatal("agentDoneMsg must release runInFlight")
+	if m.runInFlight != 1 {
+		t.Fatalf("first done must not release the guard under a live second run: %d", m.runInFlight)
+	}
+	updated, _ = m.Update(agentDoneMsg{}) // run B finishes
+	m = updated.(*Model)
+	if m.runInFlight != 0 {
+		t.Fatalf("all runs done must fully release: %d", m.runInFlight)
 	}
 }
