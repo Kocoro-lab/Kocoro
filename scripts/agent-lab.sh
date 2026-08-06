@@ -8,9 +8,9 @@ pkg_config_path="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
 mkdir -p "$output_dir"
 
 case "$lane" in
-  offline|routing_live|selector_live|provider_release) ;;
+  offline|routing_live|selector_live|provider_live|provider_release) ;;
   *)
-    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, or provider_release" >&2
+    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, or provider_release" >&2
     exit 2
     ;;
 esac
@@ -91,6 +91,25 @@ run_selector_lane() {
     -count="$repeats" -v -timeout=10m
 }
 
+run_provider_lane() {
+  local required_sample="${1:-smoke}"
+  if [[ "${KOE_PROVIDER_AGENTLOOP_E2E:-}" != "1" ]]; then
+    echo "Set KOE_PROVIDER_AGENTLOOP_E2E=1 to authorize paid provider qualification." >&2
+    check_names+=("provider_agentloop_live")
+    check_statuses+=("2")
+    return
+  fi
+  if [[ "$required_sample" == "release" && "${KOE_PROVIDER_SAMPLE:-}" != "release" ]]; then
+    echo "provider_release requires KOE_PROVIDER_SAMPLE=release and at least 30 repetitions." >&2
+    check_names+=("provider_agentloop_live")
+    check_statuses+=("2")
+    return
+  fi
+  run_check provider_agentloop_live \
+    "$repo_dir/scripts/koe-provider-qualification.sh" \
+    "$output_dir/provider"
+}
+
 cd "$repo_dir" || exit 2
 case "$lane" in
   offline)
@@ -102,10 +121,14 @@ case "$lane" in
   selector_live)
     run_selector_lane
     ;;
+  provider_live)
+    run_provider_lane smoke
+    ;;
   provider_release)
     run_offline_lane
     run_routing_lane
     run_selector_lane
+    run_provider_lane release
     ;;
 esac
 

@@ -19,7 +19,9 @@ import (
 
 	. "github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
@@ -1685,7 +1687,10 @@ func loadKoeQualificationRuntimeConfig(t *testing.T) koeQualificationRuntimeConf
 	}
 	endpoint := strings.TrimSpace(os.Getenv(koeQualificationEndpointEnv))
 	if endpoint == "" {
-		t.Fatal("KOE_FAST_QUALIFICATION_ENDPOINT is required when the live gate is enabled")
+		endpoint = koeQualificationEndpointFromUserConfig()
+	}
+	if endpoint == "" {
+		t.Fatal("live qualification needs KOE_FAST_QUALIFICATION_ENDPOINT or a configured user endpoint")
 	}
 	apiKey := strings.TrimSpace(os.Getenv(koeQualificationAPIKeyEnv))
 	if apiKey == "" {
@@ -1694,7 +1699,10 @@ func loadKoeQualificationRuntimeConfig(t *testing.T) koeQualificationRuntimeConf
 		apiKey = strings.TrimSpace(os.Getenv("TOOLSEARCH_CLOUD_API_KEY"))
 	}
 	if apiKey == "" {
-		t.Fatal("KOE_FAST_QUALIFICATION_API_KEY (or TOOLSEARCH_CLOUD_API_KEY) is required")
+		apiKey = koeQualificationAPIKeyFromCredentialStore()
+	}
+	if apiKey == "" {
+		t.Fatal("live qualification needs an explicit API key or a signed-in daemon credential")
 	}
 
 	repetitions := koeQualificationDefaultRepetitions
@@ -1769,6 +1777,48 @@ func loadKoeQualificationRuntimeConfig(t *testing.T) koeQualificationRuntimeConf
 		maxCostUSD:  maxCostUSD,
 		pause:       pause,
 	}
+}
+
+// The explicit paid gate above is the authority boundary. Once enabled, these
+// fallbacks reuse the same local endpoint and credential store as the daemon
+// without logging or persisting either value in qualification artifacts.
+func koeQualificationEndpointFromUserConfig() string {
+	data, err := os.ReadFile(filepath.Join(config.ShannonDir(), "config.yaml"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "endpoint:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "endpoint:"))
+		}
+	}
+	return ""
+}
+
+func koeQualificationAPIKeyFromCredentialStore() string {
+	if !keychain.Supported() {
+		return ""
+	}
+	store, err := keychain.NewOSStoreAt(config.ShannonDir(), nil)
+	if err != nil {
+		return ""
+	}
+	if uid, err := store.Read(
+		keychain.ServiceDaemonState,
+		keychain.AccountCurrentUser,
+	); err == nil && uid != "" {
+		if key, err := store.Read(
+			keychain.ServiceDaemonAPIKey,
+			uid,
+		); err == nil && key != "" {
+			return key
+		}
+	}
+	key, _ := store.Read(
+		keychain.ServiceDaemonAPIKey,
+		keychain.AccountLegacy,
+	)
+	return key
 }
 
 func waitKoeQualificationPause(
