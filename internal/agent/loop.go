@@ -372,6 +372,36 @@ func describeContentBlocks(blocks []client.ContentBlock) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
+// auditForceStopEmptySynthesis records one row per empty force-stop
+// synthesis response so triage can attribute "user only got the canned
+// fallback" to a concrete upstream shape: finish_reason (max_tokens vs
+// end_turn drives different fixes), token spend, latency, block shapes,
+// and the effort configuration the attempt ran with (attempt=initial keeps
+// the run's config; attempt=recovery is the degraded-effort retry).
+// Content-free: block-shape descriptors and counters only, never thinking
+// text. Motivated by the 2026-08-06 schedule incident (session
+// 2026-08-06-1e187cbe4b2e): a 232s synthesis turn returned no visible text
+// and nothing recorded why.
+func (a *AgentLoop) auditForceStopEmptySynthesis(attempt string, resp *client.CompletionResponse, req client.CompletionRequest, elapsed time.Duration) {
+	if a.auditor == nil {
+		return
+	}
+	thinking := "off"
+	if req.Thinking != nil {
+		thinking = req.Thinking.Type
+	}
+	a.auditor.Log(audit.AuditEntry{
+		Timestamp: time.Now(),
+		SessionID: a.sessionID,
+		Event:     "force_stop_empty_synthesis",
+		InputSummary: fmt.Sprintf("attempt=%s model=%s finish_reason=%s effort_tier=%s reasoning_effort=%s thinking=%s",
+			attempt, resp.Model, resp.FinishReason, req.EffortTier, req.ReasoningEffort, thinking),
+		OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d latency_ms=%d blocks=%s",
+			resp.Usage.InputTokens, resp.Usage.OutputTokens,
+			elapsed.Milliseconds(), describeContentBlocks(resp.ContentBlocks)),
+	})
+}
+
 type RunStatus struct {
 	// Partial reports that the run returned a usable partial result instead of a
 	// clean success. In that case FailureCode describes why the result is partial
@@ -1814,6 +1844,47 @@ func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText s
 		Role:    "assistant",
 		Content: client.NewBlockContent(blocks),
 	}
+}
+
+// stripUnexecutedAssistantCalls returns resp with every call-shaped element
+// removed: ordinary tool_use blocks, native OpenAI computer_call blocks, and
+// the FunctionCall/ToolCalls aliases. The force-stop synthesis turn never
+// executes calls, so persisting any of them would leave an unpaired call in
+// history that breaks the next turn's replay (tool_use → Anthropic 400;
+// computer_call → invalid provider trajectory). computer_call is deliberately
+// off the ordinary tool_use family (AllToolCalls/HasToolCalls never see it),
+// which is why responseWithOnlyToolCalls alone is not a sufficient sanitizer
+// here. Returns resp unchanged when there is nothing to strip.
+func stripUnexecutedAssistantCalls(resp *client.CompletionResponse) *client.CompletionResponse {
+	if resp == nil {
+		return nil
+	}
+	needsStrip := resp.FunctionCall != nil || len(resp.ToolCalls) > 0
+	if !needsStrip {
+		for _, b := range resp.ContentBlocks {
+			if b.Type == "tool_use" || b.Type == client.OpenAIComputerCallType {
+				needsStrip = true
+				break
+			}
+		}
+	}
+	if !needsStrip {
+		return resp
+	}
+	clone := *resp
+	clone.FunctionCall = nil
+	clone.ToolCalls = nil
+	if len(resp.ContentBlocks) > 0 {
+		blocks := make([]client.ContentBlock, 0, len(resp.ContentBlocks))
+		for _, b := range resp.ContentBlocks {
+			if b.Type == "tool_use" || b.Type == client.OpenAIComputerCallType {
+				continue
+			}
+			blocks = append(blocks, b)
+		}
+		clone.ContentBlocks = blocks
+	}
+	return &clone
 }
 
 // responseWithOnlyToolCalls produces the exact assistant trajectory for an
@@ -3493,6 +3564,15 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		}
 		emptyPostToolRetries        int // one recovery turn when tools ran but the model returned no visible final
 		emptyPostToolRecovery       bool
+		// forceStopEmptyRecoveryUsed caps the force-stop empty-synthesis
+		// recovery at one degraded-effort attempt per Run. Deliberately
+		// independent of emptyPostToolRetries (the main-loop empty-response
+		// retry): a single Run can consume both budgets, worst case two
+		// extra recovery turns (each turn's transport retries stay managed
+		// by completeWithRetry) — acceptable because the force-stop turn is
+		// the last chance to hand the user real content instead of the
+		// canned fallback line.
+		forceStopEmptyRecoveryUsed bool
 		computerUseOwnsTurn         bool
 		computerUseNeedsApps        bool
 		computerUseAlternateOnly    bool
@@ -3786,6 +3866,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			// repeated computer action cannot be silently discarded below.
 			req.ToolChoice = "none"
 		}
+		synthesisStart := time.Now()
 		finalResp, err := a.completeWithRetry(ctx, req)
 		if err != nil {
 			captureRunMessages()
@@ -3804,14 +3885,95 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		cacheTracker.Record(finalResp.Usage)
 		a.reportLLMUsage(finalResp.Usage, finalResp.Model)
 
+		// Empty-synthesis guard — parity with the normal final-response
+		// path (block recovery → bounded degraded retry → audit). This
+		// path previously read only OutputText and silently swapped in the
+		// generic fallback: an HTTP-success response whose visible text
+		// lived in ContentBlocks, or that was thinking-only, delivered the
+		// user nothing and recorded nothing (2026-08-06 schedule incident,
+		// session 2026-08-06-1e187cbe4b2e).
+		persistResp := finalResp
 		text := strings.TrimSpace(finalResp.OutputText)
+		if text == "" {
+			text = strings.TrimSpace(recoverVisibleTextFromBlocks(finalResp))
+		}
+		if text == "" {
+			a.auditForceStopEmptySynthesis("initial", finalResp, req, time.Since(synthesisStart))
+			// One recovery attempt with reasoning stripped: an empty
+			// synthesis on a reasoning-heavy config is most plausibly the
+			// thinking budget swallowing the answer, so the retry hands
+			// the whole output budget to visible text. Sealed profiles
+			// (kfp1 Koe fast / ep1 computer) own their model+reasoning
+			// configuration — never override them; they keep the
+			// single-attempt behavior. Budget semantics documented at the
+			// forceStopEmptyRecoveryUsed declaration.
+			sealed := a.executionProfileID != "" || a.executionProfile != nil || a.computerProfile.ProfileID != ""
+			if !sealed && !forceStopEmptyRecoveryUsed {
+				forceStopEmptyRecoveryUsed = true
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					rs.OnRunStatus("empty_response_retry",
+						"force-stop synthesis returned no visible text; retrying once with reasoning disabled")
+				}
+				retryReq := req
+				retryReq.Thinking = nil
+				retryReq.ReasoningEffort = ""
+				retryReq.EffortTier = "low"
+				retryStart := time.Now()
+				retryResp, retryErr := a.completeWithRetry(ctx, retryReq)
+				if retryErr != nil {
+					if ctx.Err() != nil {
+						// Cancellation keeps the first-attempt error
+						// classification; anything else degrades to the
+						// deterministic fallback below — the stop decision
+						// is already durable and a canned line beats
+						// failing the whole run on a recovery-only call.
+						captureRunMessages()
+						if errors.Is(retryErr, ErrHardIdleTimeout) {
+							setRunStatus(runstatus.CodeDeadlineExceeded, true)
+						} else {
+							setRunStatus(runstatus.CodeFromError(retryErr), false)
+						}
+						return "", retryErr
+					}
+					// Non-cancellation recovery failure: without this row
+					// the failure is invisible (a non-retryable 4xx leaves
+					// no completeWithRetry stderr line either). Class label
+					// only — never the response body.
+					if a.auditor != nil {
+						a.auditor.Log(audit.AuditEntry{
+							Timestamp: time.Now(),
+							SessionID: a.sessionID,
+							Event:     "force_stop_synthesis_recovery_failed",
+							InputSummary: fmt.Sprintf("error_class=%s",
+								classifyLLMError(retryErr)),
+							OutputSummary: fmt.Sprintf("latency_ms=%d",
+								time.Since(retryStart).Milliseconds()),
+						})
+					}
+				} else {
+					usage.Add(retryResp.Usage)
+					cacheTracker.Record(retryResp.Usage)
+					a.reportLLMUsage(retryResp.Usage, retryResp.Model)
+					persistResp = retryResp
+					text = strings.TrimSpace(retryResp.OutputText)
+					if text == "" {
+						text = strings.TrimSpace(recoverVisibleTextFromBlocks(retryResp))
+					}
+					if text == "" {
+						a.auditForceStopEmptySynthesis("recovery", retryResp, retryReq, time.Since(retryStart))
+					}
+				}
+			}
+		}
 		if text == "" {
 			text = fallback
 		}
-		messages = append(messages, client.Message{
-			Role:    "assistant",
-			Content: client.NewTextContent(text),
-		})
+		// Persist via buildAssistantMessage so thinking/redacted_thinking
+		// blocks survive session persistence (AGENTS.md Thinking Blocks).
+		// stripUnexecutedAssistantCalls removes hallucinated tool_use AND
+		// native computer_call blocks first — force-stop never executes
+		// calls, and an unpaired call in history breaks next-turn replay.
+		messages = append(messages, buildAssistantMessage(stripUnexecutedAssistantCalls(persistResp), text))
 		stampMessage()
 		captureRunMessages()
 		// Every force-stop exit is abnormal: the loop detector terminated
@@ -3821,7 +3983,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		if a.handler != nil {
 			a.handler.OnText(text)
 		}
-		if !finalResp.HasToolCalls() {
+		if !persistResp.HasToolCalls() {
 			a.clearLastSentOrdinaryContinuation(req.PreviousResponseID)
 		}
 		return text, nil
