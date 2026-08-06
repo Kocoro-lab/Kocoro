@@ -976,9 +976,12 @@ func TestHistoryForLoop_InvalidCheckpointFallsBackToArchive(t *testing.T) {
 		t.Fatalf("nil checkpoint logged as invalid: %q", logs.String())
 	}
 
-	// Structurally valid legacy/malformed checkpoints still feed their live
-	// view forward, but must be attributable when the compaction marker is
-	// absent — otherwise the next-turn sanitizer failure aliases to normal use.
+	// A checkpoint without the compacted-history marker cannot have been
+	// written by ShapeHistory (even a failed summary keeps the prefixed
+	// "(summary unavailable)" line), so it is treated like any other invalid
+	// checkpoint: fall back to the lossless archive instead of feeding a
+	// primer the next-turn sanitizer would silently degrade. The next turn
+	// re-compacts from the archive, so the state self-heals.
 	logs.Reset()
 	markerless := &Session{
 		ID:       "markerless-checkpoint-session",
@@ -992,10 +995,13 @@ func TestHistoryForLoop_InvalidCheckpointFallsBackToArchive(t *testing.T) {
 			},
 		},
 	}
-	_ = markerless.HistoryForLoop()
+	got = markerless.HistoryForLoop()
+	if len(got) != 1 || got[0].Content.Text() != "archive" {
+		t.Fatalf("markerless checkpoint should fail open to archive, got %#v", got)
+	}
 	if text := logs.String(); !strings.Contains(text, "missing the compacted-history marker") ||
 		!strings.Contains(text, `session="markerless-checkpoint-session"`) {
-		t.Fatalf("markerless checkpoint invariant violation was silent: %q", text)
+		t.Fatalf("markerless checkpoint fallback was silent: %q", text)
 	}
 }
 
