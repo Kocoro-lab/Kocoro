@@ -18,3 +18,8 @@ daemon-wide background workers.
 Never stop or replace the Desktop-owned daemon to run a live E2E test. Verify
 the isolated process through its own `/status` endpoint and terminate that exact
 child process during cleanup.
+
+Realtime SDP setup retries explicit transient HTTP responses up to three total
+attempts. Live test environments can tune this with
+`KOE_SDP_EXCHANGE_MAX_ATTEMPTS` and `KOE_SDP_RETRY_BACKOFF_MS`; non-transient
+HTTP responses and transport errors remain terminal.
