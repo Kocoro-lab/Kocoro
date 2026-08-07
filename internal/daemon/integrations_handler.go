@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -41,13 +44,16 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 // refreshIntegrationToolsAsync fires RefreshIntegrationTools in the background
 // so it never delays the HTTP response.
 //
-// A `connect` returns an oauth_url and the connection only goes active AFTER
-// the user completes OAuth in the browser — out of band from this daemon — so
-// this call populates tools immediately only for a re-connect of an
-// already-authorized provider. First-time activation reliably lands via the
-// explicit POST /integrations/refresh (Desktop calls it once the connection is
-// confirmed active), the sign-in refresh (OnAPIKeyChanged), or daemon restart.
-// `delete` is immediate: the provider's tools are dropped on the next refresh.
+// For an OAuth provider, `connect` returns an oauth_url and the connection
+// only goes active AFTER the user completes OAuth in the browser — out of band
+// from this daemon — so this call populates tools immediately only for a
+// re-connect of an already-authorized provider; first-time activation reliably
+// lands via the explicit POST /integrations/refresh (Desktop calls it once the
+// connection is confirmed active), the sign-in refresh (OnAPIKeyChanged), or
+// daemon restart. For a token-mode provider (Shopify) the connection is active
+// on the connect response itself, so this refresh registers its tools right
+// away. `delete` is immediate: the provider's tools are dropped on the next
+// refresh.
 func (s *Server) refreshIntegrationToolsAsync() {
 	go func() {
 		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
@@ -78,9 +84,22 @@ func (s *Server) integrationsCloudReady(w http.ResponseWriter) bool {
 	return true
 }
 
+// maxIntegrationConnectBodyBytes bounds the connect request body forwarded to
+// Cloud. Token-mode providers (Shopify) send a small {params:{shop,
+// access_token}} object well under 1 KiB; 64 KiB leaves generous headroom for
+// future provider params. When it binds, the handler returns 413 — bump this
+// constant if a provider ever needs more.
+const maxIntegrationConnectBodyBytes = 64 << 10
+
 // handleConnectIntegration proxies POST /integrations/{provider}/connect to
-// Cloud. Cloud starts the OAuth flow and returns 201 {connection_id, oauth_url}
-// the renderer opens to complete authorization.
+// Cloud, forwarding the client's JSON body verbatim. OAuth providers send no
+// body and get back {connection_id, oauth_url} the renderer opens to complete
+// authorization; token-mode providers (e.g. Shopify) send credentials in the
+// body and get back an active connection directly. The body may carry
+// long-lived credentials — never log or persist it. The response side is a
+// verbatim Cloud passthrough, so the end-to-end invariant also relies on the
+// Cloud contract keeping connect error bodies credential-free (never quoting
+// a rejected token back).
 func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request) {
 	if !s.integrationsCloudReady(w) {
 		return
@@ -90,7 +109,25 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "provider is required")
 		return
 	}
-	status, body, err := s.deps.GW.IntegrationConnect(r.Context(), provider)
+	bodyReader := http.MaxBytesReader(w, r.Body, maxIntegrationConnectBodyBytes)
+	defer bodyReader.Close()
+	reqBody, err := io.ReadAll(bodyReader)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "connect body exceeds 64 KiB cap")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	// A whitespace-only payload counts as absent so a renderer quirk (empty
+	// string, stray newline) cannot flip an OAuth connect onto the token-mode
+	// wire shape.
+	if len(bytes.TrimSpace(reqBody)) == 0 {
+		reqBody = nil
+	}
+	status, body, err := s.deps.GW.IntegrationConnect(r.Context(), provider, reqBody)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return

@@ -33,7 +33,10 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-const e2eModel = "gpt-realtime-2.1-mini"
+// Tracks defaultKoeConfig: the live suites are the pre-release gate, so they
+// must exercise the model users actually run. KOE_E2E_MODEL still points them
+// at another tier when comparing behavior across models.
+const e2eModel = "gpt-realtime-2.1"
 
 func e2eModelName() string {
 	if model := strings.TrimSpace(os.Getenv("KOE_E2E_MODEL")); model != "" {
