@@ -2729,16 +2729,6 @@ func injectPrivateMemoryContext(scaffolded, userPayload, privateContext string) 
 	return scaffolded + "\n\n" + privateContext
 }
 
-func isFirstConversationUserMessage(history []client.Message) bool {
-	for _, msg := range history {
-		switch msg.Role {
-		case "user", "assistant", "tool":
-			return false
-		}
-	}
-	return true
-}
-
 func cloneMessages(messages []client.Message) []client.Message {
 	out := make([]client.Message, len(messages))
 	copy(out, messages)
@@ -3174,7 +3164,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	}
 
 	if a.memoryPreflight != nil && !initialUserInjected {
-		trace := MemoryPreflightTrace{Attempted: true, ForceHelper: isFirstConversationUserMessage(history)}
+		// Keep implicit recall behind the deterministic/lexical gate on every
+		// turn. Forcing a helper-model call on the first message added a serial
+		// network round-trip to greetings and ordinary work before the answer
+		// model could start. Explicit memory cues and exact relationship patterns
+		// still reach the helper or deterministic path below.
+		trace := MemoryPreflightTrace{Attempted: true}
 		opts := MemoryPreflightOptions{ForceHelper: trace.ForceHelper, Trace: &trace}
 		if preflight := a.memoryPreflight(ctx, userMessage, opts); preflight != nil {
 			a.emitInternalUsage(preflight.Usage)
@@ -7406,31 +7401,37 @@ func (a *AgentLoop) logMemoryPreflightTrace(trace MemoryPreflightTrace) {
 		return
 	}
 	summary, err := json.Marshal(struct {
-		Attempted       bool   `json:"attempted"`
-		ForceHelper     bool   `json:"force_helper"`
-		HelperUsed      bool   `json:"helper_used"`
-		IntentSource    string `json:"intent_source,omitempty"`
-		IntentsCount    int    `json:"intents_count"`
-		Queried         bool   `json:"queried"`
-		ResultsCount    int    `json:"results_count"`
-		ContextReturned bool   `json:"context_returned"`
-		ContextInjected bool   `json:"context_injected"`
-		Outcome         string `json:"outcome,omitempty"`
-		ErrorClass      string `json:"error_class,omitempty"`
-		HTTPStatus      int    `json:"http_status,omitempty"`
+		Attempted        bool   `json:"attempted"`
+		ForceHelper      bool   `json:"force_helper"`
+		HelperUsed       bool   `json:"helper_used"`
+		HelperDurationMs int64  `json:"helper_duration_ms"`
+		IntentSource     string `json:"intent_source,omitempty"`
+		IntentsCount     int    `json:"intents_count"`
+		Queried          bool   `json:"queried"`
+		QueryDurationMs  int64  `json:"query_duration_ms"`
+		ResultsCount     int    `json:"results_count"`
+		ContextReturned  bool   `json:"context_returned"`
+		ContextInjected  bool   `json:"context_injected"`
+		TotalDurationMs  int64  `json:"total_duration_ms"`
+		Outcome          string `json:"outcome,omitempty"`
+		ErrorClass       string `json:"error_class,omitempty"`
+		HTTPStatus       int    `json:"http_status,omitempty"`
 	}{
-		Attempted:       trace.Attempted,
-		ForceHelper:     trace.ForceHelper,
-		HelperUsed:      trace.HelperUsed,
-		IntentSource:    trace.IntentSource,
-		IntentsCount:    trace.IntentsCount,
-		Queried:         trace.Queried,
-		ResultsCount:    trace.ResultsCount,
-		ContextReturned: trace.ContextReturned,
-		ContextInjected: trace.ContextInjected,
-		Outcome:         trace.Outcome,
-		ErrorClass:      trace.ErrorClass,
-		HTTPStatus:      trace.HTTPStatus,
+		Attempted:        trace.Attempted,
+		ForceHelper:      trace.ForceHelper,
+		HelperUsed:       trace.HelperUsed,
+		HelperDurationMs: trace.HelperDurationMs,
+		IntentSource:     trace.IntentSource,
+		IntentsCount:     trace.IntentsCount,
+		Queried:          trace.Queried,
+		QueryDurationMs:  trace.QueryDurationMs,
+		ResultsCount:     trace.ResultsCount,
+		ContextReturned:  trace.ContextReturned,
+		ContextInjected:  trace.ContextInjected,
+		TotalDurationMs:  trace.TotalDurationMs,
+		Outcome:          trace.Outcome,
+		ErrorClass:       trace.ErrorClass,
+		HTTPStatus:       trace.HTTPStatus,
 	})
 	if err != nil {
 		return
