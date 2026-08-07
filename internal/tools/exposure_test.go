@@ -44,6 +44,7 @@ func TestRegisteredLocalToolExposureMatrix(t *testing.T) {
 		"http":                agent.ToolExposureDirect,
 		"system_info":         agent.ToolExposureDirect,
 		"calculate":           agent.ToolExposureDirect,
+		"current_time":        agent.ToolExposureDirect,
 		"clipboard":           agent.ToolExposureDirect,
 		"notify":              agent.ToolExposureDirect,
 		"present_deliverable": agent.ToolExposureDirect,

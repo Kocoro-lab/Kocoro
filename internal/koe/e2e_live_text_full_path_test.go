@@ -40,6 +40,7 @@ const (
 	liveTextFullPathGate = "KOE_LIVE_TEXT_FULL_PATH_E2E"
 	liveFastMarker       = "323"
 	liveFullMarker       = "437"
+	liveTimeMarker       = "CLOCK_LOCAL_742"
 )
 
 type liveFullPathInput string
@@ -56,6 +57,7 @@ type liveFullPathScenario struct {
 	marker     string
 	left       []string
 	right      []string
+	wantTool   string
 	wantMode   executionprofile.Mode
 	wantReason executionprofile.FullReason
 }
@@ -320,24 +322,35 @@ func TestKoeLiveFullPathMatrixE2E(t *testing.T) {
 			name: "fast_text", input: liveInputText,
 			prompt: "这是一项需要实际执行的真实任务：计算 17 × 19，只用一句简短中文告诉我结果。",
 			marker: liveFastMarker, left: []string{"17", "seventeen"}, right: []string{"19", "nineteen"},
+			wantTool: "calculate",
+			wantMode: executionprofile.ModeFast, wantReason: executionprofile.FullReasonNone,
+		},
+		{
+			name: "fast_time_text", input: liveInputText,
+			prompt: "这是一项需要实际执行的真实任务：用本地时钟查询 Asia/Tokyo 当前准确日期、时间和星期，并在一句简短中文结果末尾原样附上 CLOCK_LOCAL_742。",
+			marker: liveTimeMarker, left: []string{"Asia/Tokyo"}, right: []string{liveTimeMarker},
+			wantTool: "current_time",
 			wantMode: executionprofile.ModeFast, wantReason: executionprofile.FullReasonNone,
 		},
 		{
 			name: "full_text", input: liveInputText,
 			prompt: "请明确使用 Full 模式执行这项真实任务：计算 19 × 23，只用一句简短中文告诉我结果。",
 			marker: liveFullMarker, left: []string{"19", "nineteen"}, right: []string{"23", "twenty-three", "twenty three"},
+			wantTool: "calculate",
 			wantMode: executionprofile.ModeFull, wantReason: executionprofile.FullReasonExplicitFullRequest,
 		},
 		{
 			name: "fast_audio", input: liveInputAudio,
 			prompt: "Do this real task now: calculate seventeen times nineteen, and answer with one short sentence.",
 			marker: liveFastMarker, left: []string{"17", "seventeen"}, right: []string{"19", "nineteen"},
+			wantTool: "calculate",
 			wantMode: executionprofile.ModeFast, wantReason: executionprofile.FullReasonNone,
 		},
 		{
 			name: "full_audio", input: liveInputAudio,
 			prompt: "Use Full mode for this real task: calculate nineteen times twenty-three, and answer with one short sentence.",
 			marker: liveFullMarker, left: []string{"19", "nineteen"}, right: []string{"23", "twenty-three", "twenty three"},
+			wantTool: "calculate",
 			wantMode: executionprofile.ModeFull, wantReason: executionprofile.FullReasonExplicitFullRequest,
 		},
 	}
@@ -644,12 +657,12 @@ func requireLiveTextFullPathSession(t *testing.T, ctx context.Context, daemonURL
 	if len(session.Messages) < 2 {
 		t.Fatalf("daemon session %s messages=%d, want at least 2", sessionID, len(session.Messages))
 	}
-	var sawUserTask, sawAssistantResult, sawCalculate bool
+	var sawUserTask, sawAssistantResult, sawExpectedTool bool
 	for _, message := range session.Messages {
 		content := message.Content.Text()
 		for _, block := range message.Content.Blocks() {
-			if block.Type == "tool_use" && block.Name == "calculate" {
-				sawCalculate = true
+			if block.Type == "tool_use" && block.Name == scenario.wantTool {
+				sawExpectedTool = true
 			}
 		}
 		switch message.Role {
@@ -660,19 +673,19 @@ func requireLiveTextFullPathSession(t *testing.T, ctx context.Context, daemonURL
 		}
 	}
 	if !sawUserTask || !sawAssistantResult {
-		t.Fatalf("daemon session %s did not persist the arithmetic task and its verified result", sessionID)
+		t.Fatalf("daemon session %s did not persist the utility task and its verified result", sessionID)
 	}
-	if !sawCalculate {
-		t.Fatalf("daemon session %s did not use the local calculate tool", sessionID)
+	if !sawExpectedTool {
+		t.Fatalf("daemon session %s did not use local tool %s", sessionID, scenario.wantTool)
 	}
 	if session.Usage.WebSearchCalls != 0 {
-		t.Fatalf("daemon session %s web_search_calls=%d, want 0 for local arithmetic", sessionID, session.Usage.WebSearchCalls)
+		t.Fatalf("daemon session %s web_search_calls=%d, want 0 for local utility", sessionID, session.Usage.WebSearchCalls)
 	}
 	if session.Usage.LLMCalls < 1 || session.Usage.TotalTokens == 0 {
 		t.Fatalf("daemon session %s usage=%+v, want metered provider work", sessionID, session.Usage)
 	}
 	if scenario.wantMode == executionprofile.ModeFast && session.Usage.LLMCalls != 2 {
-		t.Fatalf("daemon Fast session %s calls=%d, want calculate + final in exactly 2", sessionID, session.Usage.LLMCalls)
+		t.Fatalf("daemon Fast session %s calls=%d, want local utility + final in exactly 2", sessionID, session.Usage.LLMCalls)
 	}
 	if scenario.wantMode == executionprofile.ModeFull && session.Usage.LLMCalls > 4 {
 		t.Fatalf("daemon Full session %s calls=%d, want a bounded run of at most 4", sessionID, session.Usage.LLMCalls)

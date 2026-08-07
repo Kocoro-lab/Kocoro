@@ -419,7 +419,8 @@ func IsSkillExempt(t Tool) bool {
 // cancellable tools should opt in.
 //
 // Explicit opt-in list (see internal/tools/cancelable_optin.go):
-// file_read, glob, grep, directory_list, think, system_info,
+// file_read, glob, grep, directory_list, think, system_info, calculate,
+// current_time,
 // memory_recall, session_search, list_my_published_files, tool_search,
 // use_skill, schedule_list, ask_user_question, plus pdf/docx/xlsx/pptx text
 // extractors (subprocess-based, respond cleanly to ctx cancel).
@@ -472,6 +473,8 @@ var builtinCancelableMidTurn = map[string]struct{}{
 	"directory_list":          {},
 	"think":                   {},
 	"system_info":             {},
+	"calculate":               {},
+	"current_time":            {},
 	"memory_recall":           {},
 	"session_search":          {},
 	"list_my_published_files": {},
