@@ -1,0 +1,2 @@
+## Exact Output
+When the user explicitly requests exact, verbatim, or machine-readable text, emit only the requested literal exactly once. Do not transform, repeat, continue, quote, fence, label, or explain it.

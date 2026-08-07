@@ -44,6 +44,9 @@ var kocoroPromptWebPolicyV1 string
 //go:embed testdata/kocoro_prompt_variants/empty_result_policy_v1.txt
 var kocoroPromptEmptyResultPolicyV1 string
 
+//go:embed testdata/kocoro_prompt_variants/exact_output_policy_v1.txt
+var kocoroPromptExactOutputPolicyV1 string
+
 var kocoroPromptVariantNames = []string{
 	kocoroPromptVariantCurrent,
 	kocoroPromptVariantMinimal,
@@ -177,15 +180,18 @@ func kocoroPromptVariantTextForWorkload(name, workload string) string {
 	if name != kocoroPromptVariantConditional {
 		return text
 	}
+	blocks := []string{strings.TrimSpace(kocoroPromptExactOutputPolicyV1)}
 	switch workload {
 	case "stable_no_search", "current_search_once":
-		return text + "\n\n" + strings.TrimSpace(kocoroPromptWebPolicyV1)
+		blocks = append(blocks, strings.TrimSpace(kocoroPromptWebPolicyV1))
 	case "empty_search_stop":
-		return text + "\n\n" + strings.TrimSpace(kocoroPromptWebPolicyV1) +
-			"\n\n" + strings.TrimSpace(kocoroPromptEmptyResultPolicyV1)
-	default:
-		return text
+		blocks = append(
+			blocks,
+			strings.TrimSpace(kocoroPromptWebPolicyV1),
+			strings.TrimSpace(kocoroPromptEmptyResultPolicyV1),
+		)
 	}
+	return text + "\n\n" + strings.Join(blocks, "\n\n")
 }
 
 func TestKocoroPromptVariantFixtures(t *testing.T) {
@@ -211,7 +217,11 @@ func TestKocoroPromptVariantFixtures(t *testing.T) {
 		kocoroPromptVariantConditional,
 		"empty_search_stop",
 	)
-	for _, required := range []string{"## Browser and Web", "## Empty Results and Recovery"} {
+	for _, required := range []string{
+		"## Exact Output",
+		"## Browser and Web",
+		"## Empty Results and Recovery",
+	} {
 		if !strings.Contains(conditional, required) {
 			t.Fatalf("conditional prompt fixture missing %q", required)
 		}
@@ -900,7 +910,8 @@ func kocoroPromptVariantMetadataList() []kocoroPromptVariantMetadata {
 			item.Source = "embedded_fixture"
 			if name == kocoroPromptVariantConditional {
 				item.Source = "embedded_core_with_workload_conditional_fixtures"
-				text += "\n\n" + strings.TrimSpace(kocoroPromptWebPolicyV1) +
+				text += "\n\n" + strings.TrimSpace(kocoroPromptExactOutputPolicyV1) +
+					"\n\n" + strings.TrimSpace(kocoroPromptWebPolicyV1) +
 					"\n\n" + strings.TrimSpace(kocoroPromptEmptyResultPolicyV1)
 			}
 			item.FixtureChars = len([]rune(text))
