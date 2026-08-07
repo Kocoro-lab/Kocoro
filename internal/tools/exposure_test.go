@@ -43,6 +43,7 @@ func TestRegisteredLocalToolExposureMatrix(t *testing.T) {
 		"pptx_to_text":        agent.ToolExposureDirect,
 		"http":                agent.ToolExposureDirect,
 		"system_info":         agent.ToolExposureDirect,
+		"calculate":           agent.ToolExposureDirect,
 		"clipboard":           agent.ToolExposureDirect,
 		"notify":              agent.ToolExposureDirect,
 		"present_deliverable": agent.ToolExposureDirect,
