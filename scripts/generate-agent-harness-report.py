@@ -9,6 +9,7 @@ import hashlib
 import html
 import json
 import pathlib
+import re
 import subprocess
 
 
@@ -183,6 +184,7 @@ def main() -> None:
     parser.add_argument("--quality-report", type=pathlib.Path, required=True)
     parser.add_argument("--loop-report", type=pathlib.Path, required=True)
     parser.add_argument("--offline-gate-log", type=pathlib.Path)
+    parser.add_argument("--koe-runtime-log", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
 
@@ -192,7 +194,8 @@ def main() -> None:
     memory_report = read_json(args.memory_report)
     quality_report = read_json(args.quality_report)
     loop_report = read_json(args.loop_report)
-    artifact_paths = [args.prompt_audit, args.prompt_report, args.memory_report, args.quality_report, args.loop_report]
+    koe_runtime_log = args.koe_runtime_log.read_text(encoding="utf-8")
+    artifact_paths = [args.prompt_audit, args.prompt_report, args.memory_report, args.quality_report, args.loop_report, args.koe_runtime_log]
     offline_gate_log = ""
     if args.offline_gate_log:
         offline_gate_log = args.offline_gate_log.read_text(encoding="utf-8")
@@ -222,6 +225,17 @@ def main() -> None:
     require(quality_report.get("comparison_qualifying") is True, "quality report must qualify for comparison")
     require(quality_report.get("release_qualifying") is False, "3x quality report must not be labeled release-qualifying")
     require(loop_report.get("passed") is True and loop_report.get("trace_count") == 10, "loop detector corpus did not pass 10 traces")
+    for case in ("fast_text", "fast_time_text", "full_text", "fast_audio", "full_audio"):
+        require(f"--- PASS: TestKoeLiveFullPathMatrixE2E/{case}" in koe_runtime_log, f"Koe runtime log missing pass: {case}")
+    require("PERSISTENCE_READBACK:" in koe_runtime_log and "persisted_sessions=5" in koe_runtime_log, "Koe runtime log missing five-session restart readback")
+    koe_fast_text = re.search(
+        r"TestKoeLiveFullPathMatrixE2E/fast_text.*?VERDICT:.*?total_ms=(\d+).*?USAGE:.*?daemon_input=(\d+)",
+        koe_runtime_log,
+        re.DOTALL,
+    )
+    require(koe_fast_text is not None, "Koe runtime log missing Fast text latency/input evidence")
+    koe_matrix_total = re.search(r"--- PASS: TestKoeLiveFullPathMatrixE2E \(([\d.]+)s\)", koe_runtime_log)
+    require(koe_matrix_total is not None, "Koe runtime log missing matrix duration")
     offline_gate_names = [
         "TestOffline_AgentLabGeneralPurposePromptContract",
         "TestOffline_AgentLabLongReadTrajectoryReachesOutcome",
@@ -269,9 +283,9 @@ def main() -> None:
         "after_chars": 47_509,
         "after_tools": 22,
         "daemon_input_before": 33_874,
-        "daemon_input_after": 27_608,
+        "daemon_input_after": int(koe_fast_text.group(2)),
         "daemon_total_before_ms": 6_066,
-        "daemon_total_after_ms": 5_489,
+        "daemon_total_after_ms": int(koe_fast_text.group(1)),
         "bash_tokens_before": 1_890,
         "bash_tokens_after": 462,
         "working_set_count_cap": 16,
@@ -299,7 +313,7 @@ a{{color:var(--blue)}}code{{font-family:ui-monospace,SFMono-Regular,Menlo,monosp
 <main>
 <header id="verdict"><div class="eyebrow">artifact-backed review / experiment/kocoro-agent-lab / {esc(now)}</div><h1>运行骨架和通用质量样本通过；仍不是 release-ready。</h1><p class="lede">AgentLoop 的工具轨迹、长任务、compaction、重启与 Fast-only schema 收口都有生产 seam 证据；18-run 通用质量样本覆盖六个日常 domain，生产 builder 的 Kocoro / Koe prompts 也可逐字审阅。但 prompt 与 quality 都只有每 cell/case 3 次，明确 <code>release_qualifying=false</code>，不能据此估算稀有失败。</p><div class="verdict"><i></i><div><strong>Prompt 判定仍是 no candidate / no improvement</strong><br>{esc(prompt_report['selection_reason'])} <code>layered_conditional_v1</code> 只是 observed efficiency leader，不是可上线 winner。独立 quality gate 是 {quality_report['correct_runs']}/{quality_report['completed']} correctness，但同样只具 comparison 资格。Memory A/B 支持移除固定 preflight：两路均 24/24，主模型路径成本低 {memory_cost_reduction:.1f}%、平均延迟低 {memory_mean_reduction:.1f}%、中位延迟低 {memory_median_reduction:.1f}%；该结论仍限于 synthetic memory routing。</div></div></header>
 
-<section id="evidence"><div class="eyebrow">01 / immutable inputs</div><h2>证据来源与校验</h2><p class="sub">生成器对 prompt、memory、quality、loop schema，run/repetition 数、no-candidate 状态和 correctness 结果 fail closed。表中 SHA-256 对应本次嵌入的真实 artifact；离线 gate log 是本次重新执行的测试输出。</p><table><thead><tr><th>Artifact</th><th>SHA-256</th><th>大小</th></tr></thead><tbody>{provenance_rows(artifact_paths)}</tbody></table><div class="callout"><strong>Branch：</strong><code>{esc(branch_base)}</code> (origin/main) … <code>{esc(branch_head)}</code> (生成器 commit 时的 HEAD)。报告末尾嵌入除本 HTML 外的完整分支 diff。</div></section>
+<section id="evidence"><div class="eyebrow">01 / immutable inputs</div><h2>证据来源与校验</h2><p class="sub">生成器对 prompt、memory、quality、loop schema，run/repetition 数、no-candidate 状态、correctness 与 Koe 5-case runtime/restart 结果 fail closed。表中 SHA-256 对应本次嵌入的真实 artifact；离线 gate 与 Koe runtime log 都来自最终源码复验。</p><table><thead><tr><th>Artifact</th><th>SHA-256</th><th>大小</th></tr></thead><tbody>{provenance_rows(artifact_paths)}</tbody></table><div class="callout"><strong>Branch：</strong><code>{esc(branch_base)}</code> (origin/main) … <code>{esc(branch_head)}</code> (生成器 commit 时的 HEAD)。报告末尾嵌入除本 HTML 外的完整分支 diff。</div></section>
 
 <section id="runtime"><div class="eyebrow">02 / real AgentLoop seams</div><h2>运行轨迹、长任务、compaction 与恢复</h2><p class="sub">这里不以“测试数量”代替行为证据：live prompt benchmark 走生产 AgentLoop/provider 和确定性 in-memory tools；离线 gate 直接走 AgentLoop、checkpoint、CompactionCheckpointMessages、session Store round-trip、HistoryForLoop 与 ResumeInterrupted。</p><div class="grid"><div class="card"><strong class="ok">{correct_prompt_tool_runs} / 132</strong>live 工具轨迹正确<small>任务结果 {successful_prompt_tasks}/132；差异来自 minimal stress control 的 1 次答案失败</small></div><div class="card"><strong class="ok">0</strong>重复工具 / 重复副作用<small>132-run benchmark 的 observed executions</small></div><div class="card"><strong class="ok">10 / 10</strong>loop corpus<small>{loop_report['productive_count']} productive + {loop_report['loop_count']} genuine loops；false={loop_report['false_signals']}，missed={loop_report['missed_loops']}</small></div></div>
 <div class="trace"><time>14-step read</time><span class="rail"></span><p>14 个不同只读步骤完整结束；每步只执行一次，lossless RunMessages 保留全部 tool result。生产循环允许一次有界 progress/nudge provider turn，但没有误杀长轨迹。</p><time>compaction</time><span class="rail"></span><p>增长 usage 触发 proactive compaction；live checkpoint 比 archive 小且带 production marker，lossless archive 保持独立。</p><time>process restart</time><span class="rail"></span><p>checkpoint 写入真实 session Store，再加载并经 HistoryForLoop 选择 compacted live state；新 AgentLoop 可读回最终 STEP-14。</p><time>interruption</time><span class="rail"></span><p>第 6 步取消后，RunMessages 只含 6 个完成结果；ResumeInterrupted 从第 7 步继续到第 10 步，全部步骤最终各执行一次。</p></div>
@@ -309,14 +323,14 @@ a{{color:var(--blue)}}code{{font-family:ui-monospace,SFMono-Regular,Menlo,monosp
 
 <section id="tools"><div class="eyebrow">03 / provider-visible tool surface</div><h2>Fast 工具面收口：更小，但只对输入下降有因果证据</h2><p class="sub">最终实现是 run-local、Fast-only 的 long-tail defer。Full 与普通 CLI 不继承这套收口；Fast 仍通过 <code>tool_search</code> 发现并执行冷工具。WorkingSet 为 session-scoped，并以数量和 schema-token 双上限阻止长期会话重新膨胀。</p><div class="grid"><div class="card"><strong class="ok">{tool_surface['after_tools']} tools</strong>最终 Fast provider-visible 集合<small>{tool_surface['before_tools']} → {tool_surface['after_tools']}；tools JSON {tool_surface['before_chars']:,} → {tool_surface['after_chars']:,} chars（−{tool_chars_reduction:.1f}%）</small></div><div class="card"><strong class="ok">−{daemon_input_reduction:.1f}%</strong>隔离 daemon input tokens<small>{tool_surface['daemon_input_before']:,} → {tool_surface['daemon_input_after']:,}</small></div><div class="card"><strong>{tool_surface['working_set_count_cap']} / {tool_surface['working_set_token_cap']//1000}K</strong>WorkingSet cap<small>最多 {tool_surface['working_set_count_cap']} schemas 或约 {tool_surface['working_set_token_cap']:,} schema tokens</small></div></div>
 <table style="margin-top:14px"><thead><tr><th>证据</th><th>Before</th><th>After</th><th>可作出的结论</th></tr></thead><tbody><tr><th>Fast tools JSON</th><td>{tool_surface['before_chars']:,} chars / {tool_surface['before_tools']} tools</td><td>{tool_surface['after_chars']:,} chars / {tool_surface['after_tools']} tools</td><td>Fast provider request 的工具 schema 确实缩小；long-tail 仍可经 tool_search 加载</td></tr><tr><th>Bash schema estimate</th><td>{tool_surface['bash_tokens_before']:,} tokens</td><td>{tool_surface['bash_tokens_after']:,} tokens（−{bash_schema_reduction:.1f}%）</td><td><code>bash</code> 仍为 Direct；通过缩短 schema 降低常驻成本，不改变执行能力</td></tr><tr><th>隔离 daemon input</th><td>{tool_surface['daemon_input_before']:,} tokens</td><td>{tool_surface['daemon_input_after']:,} tokens</td><td>同一路径单样本观察到 −{daemon_input_reduction:.1f}%；这是输入量的直接度量</td></tr><tr><th>隔离 daemon total</th><td>{ms(tool_surface['daemon_total_before_ms'])}</td><td>{ms(tool_surface['daemon_total_after_ms'])}</td><td>单样本 {tool_surface['daemon_total_before_ms']:,}→{tool_surface['daemon_total_after_ms']:,} ms 只能描述，不能归因，也不能作为统计提速</td></tr></tbody></table>
-<div class="callout"><strong>5/5 isolated daemon matrix PASS。</strong>它证明最终 Fast/Full runtime/tool topology 在隔离 daemon 路径可完成；不等于真实麦克风、声学回声、VAD/barge-in 或签名 Desktop UI 验证。</div></section>
+<div class="callout"><strong>5/5 isolated daemon matrix PASS（{esc(koe_matrix_total.group(1))}s）。</strong>隔离 daemon 重启后读回 5 个 session。它证明最终 Fast/Full runtime/tool topology 在隔离 daemon 路径可完成；不等于真实麦克风、声学回声、VAD/barge-in 或签名 Desktop UI 验证。</div>{code_block('Koe 5-case isolated runtime 完整日志', koe_runtime_log)}</section>
 
 <section id="quality"><div class="eyebrow">04 / 18 real-provider runs, 3x per case</div><h2>General-purpose quality：六个 domain 全部通过，样本仍小</h2><p class="sub">真实配置 provider + production AgentLoop，response cache 强制 off。六个 deterministic product-contract validators 分别覆盖中文两句邮件、notes 忠实总结、deadline plan、voice-style 短答、bounded research 和 Deferred automation；不使用另一个 LLM judge 改写或打分。</p><div class="grid"><div class="card"><strong class="ok">{quality_report['correct_runs']} / {quality_report['completed']}</strong>observed correctness<small>6 cases × {quality_report['repetitions_per_case']} randomized repetitions</small></div><div class="card"><strong>{ms(quality_report['latency_p50_millis'])} / {ms(quality_report['latency_p95_millis'])} / {ms(quality_report['latency_p99_millis'])}</strong>P50 / P95 / P99<small>18-run sample；tail 主要由 tool cases 驱动</small></div><div class="card"><strong class="bad">release = false</strong>comparison only<small>每 case {quality_report['repetitions_per_case']} 次；release 要求 ≥{quality_report['minimum_release_repetitions']}</small></div></div>
 <h3>Per-domain results</h3><table><thead><tr><th>Domain</th><th>Correct</th><th>P50</th><th>P95</th><th>P99</th><th>Input tokens</th><th>Cost</th></tr></thead><tbody>{quality_rows(quality_report)}</tbody></table>
 <div class="callout"><strong>Failures：</strong>{esc(quality_report['failures'] or 'none observed')}。总 observed cost {usd(quality_report['reported_cost_usd'])}，tokens {quality_report['total_tokens']:,}。18/18 是这六个合同在本次样本中的结果，不是开放式“人类偏好质量”或 release 可靠性证明。</div>
 {code_block('General-purpose quality 18-run 原始 JSON', json.dumps(quality_report, ensure_ascii=False, indent=2))}</section>
 
-<section id="prompt"><div class="eyebrow">05 / 132 live runs, 3x per cell</div><h2>Prompt benchmark：完整 tail、paired 与 no-candidate 结论</h2><p class="sub">11 workloads × 4 variants × 3 matched repetitions；同一 AgentLoop、工具、Luna Fast 模式和 workload，仅替换 system instructions。三次 repetition 达到 comparison 门槛但远低于每 workload 30 次的 release 门槛。<code>minimal_v1</code> 是不可上线的 stress control。</p><div class="grid"><div class="card"><strong class="warn">{prompt_report['winner_status']}</strong>选择器结论<small>{esc(prompt_report['selection_reason'])}</small></div><div class="card"><strong class="bad">release = false</strong>不是 release-ready<small>minimum release repetitions = {prompt_report['minimum_release_repetitions']}</small></div><div class="card"><strong>{usd(prompt_report['reported_cost_usd'])}</strong>observed provider cost<small>{prompt_report['completed']} completed；randomized matched blocks</small></div></div>
+<section id="prompt"><div class="eyebrow">05 / 132 live runs, 3x per cell</div><h2>Prompt benchmark：完整 tail、paired 与 no-candidate 结论</h2><p class="sub">11 workloads × 4 variants × 3 matched repetitions；同一 AgentLoop、工具、Luna Fast 模式和 workload，仅替换 system instructions。三次 repetition 达到 comparison 门槛但远低于每 workload 30 次的 release 门槛。<code>minimal_v1</code> 是不可上线的 stress control。</p><div class="grid"><div class="card"><strong class="warn">{prompt_report['winner_status']}</strong>选择器结论<small>{esc(prompt_report['selection_reason'])}</small></div><div class="card"><strong class="bad">release = false</strong>不是 release-ready<small>minimum release repetitions = {prompt_report['minimum_release_repetitions']}</small></div><div class="card"><strong>{prompt_report['completed']}/{prompt_report['scheduled']}</strong>real-provider runs completed<small>{usd(prompt_report['reported_cost_usd'])} observed cost；randomized matched blocks</small></div></div>
 <h3>Aggregate latency / correctness</h3><table><thead><tr><th>Variant</th><th>任务</th><th>工具</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th><th>均值 input</th><th>成本</th></tr></thead><tbody>{prompt_rows(prompt_report)}</tbody></table>
 <p class="sub">P99 在 33-run variant 上等于或接近最慢 observation，必须和 max、slowest runs 一起读。<code>layered_v1</code> 虽然 P50 最快，但 P95/P99/Max 最差；<code>minimal_v1</code> 尾部较短，却在 <code>current_search_once</code> repetition 2 产生任务错误。</p>
 <h3>Matched-pair delta（candidate − current）</h3><table><thead><tr><th>Candidate</th><th>Pairs</th><th>胜 / 负 / 平</th><th>胜率</th><th>Δ P50</th><th>Δ P95</th><th>Δ P99</th><th>Δ Min / Max</th></tr></thead><tbody>{paired_rows(prompt_report)}</tbody></table>
