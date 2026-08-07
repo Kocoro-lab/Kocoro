@@ -195,6 +195,8 @@ type koeQualificationRunReport struct {
 	PromptVariant                 string   `json:"prompt_variant,omitempty"`
 	Outcome                       string   `json:"outcome"`
 	TaskSuccess                   bool     `json:"task_success"`
+	ExpectedOutput                string   `json:"expected_output,omitempty"`
+	ObservedOutput                string   `json:"observed_output,omitempty"`
 	ToolCorrectness               bool     `json:"tool_correctness"`
 	RouteExact                    bool     `json:"route_exact"`
 	ProviderExact                 bool     `json:"provider_exact"`
@@ -2122,6 +2124,8 @@ func runKoeQualificationJob(
 		Repetition:                    job.Repetition,
 		PromptVariant:                 job.PromptVariant,
 		TaskSuccess:                   runErr == nil && taskSuccess,
+		ExpectedOutput:                workload.receipt,
+		ObservedOutput:                strings.TrimSpace(resultText),
 		ToolCorrectness:               toolCorrectness,
 		RouteExact:                    routeExact,
 		ProviderExact:                 providerExact,
