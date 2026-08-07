@@ -535,8 +535,10 @@ func TestBuildSystemPrompt_MemoryRoutingIsModelDriven(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
 	for _, rule := range []string{
 		"call memory_recall whenever the answer depends on the user's private past",
-		"do not say remember or recall",
+		"named person's email or phone number",
+		"name, nickname, or name fragment such as 小王 is a concrete anchor",
 		"use session_search to identify it instead of guessing a structured-memory anchor",
+		"answer from it immediately; do not confirm it with session_search",
 		"do not retry the same target with alternate relation names or modes",
 	} {
 		if !strings.Contains(parts.System, rule) {

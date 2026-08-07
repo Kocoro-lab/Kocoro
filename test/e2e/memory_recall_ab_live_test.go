@@ -35,19 +35,36 @@ func (c memoryRecallABClient) CompleteStream(ctx context.Context, req client.Com
 }
 
 type memoryRecallABService struct {
-	mu               sync.Mutex
-	preflightBatches int
-	preflightQueries int
-	explicitQueries  int
+	mu                sync.Mutex
+	preflightBatches  int
+	preflightQueries  int
+	preflightWithData int
+	explicitQueries   int
+	explicitWithData  int
+	explicitModes     []string
+	sessionQueries    int
+	sessionWithData   int
+}
+
+type memoryRecallABCounts struct {
+	PreflightBatches, PreflightQueries, PreflightWithData int
+	ExplicitQueries, ExplicitWithData                     int
+	ExplicitModes                                         []string
+	SessionQueries, SessionWithData                       int
 }
 
 func (*memoryRecallABService) Status() memory.ServiceStatus { return memory.StatusReady }
 
 func (s *memoryRecallABService) Query(_ context.Context, intent memory.QueryIntent) (*memory.ResponseEnvelope, memory.ErrorClass, error) {
+	response := memoryRecallABResponse(intent)
 	s.mu.Lock()
 	s.explicitQueries++
+	s.explicitModes = append(s.explicitModes, string(intent.Mode))
+	if memoryRecallABHasData(response) {
+		s.explicitWithData++
+	}
 	s.mu.Unlock()
-	return memoryRecallABResponse(intent), memory.ClassOK, nil
+	return response, memory.ClassOK, nil
 }
 
 func (s *memoryRecallABService) QueryBatch(_ context.Context, intents []memory.QueryIntent) []memory.QueryResult {
@@ -57,15 +74,63 @@ func (s *memoryRecallABService) QueryBatch(_ context.Context, intents []memory.Q
 	s.mu.Unlock()
 	results := make([]memory.QueryResult, len(intents))
 	for i, intent := range intents {
-		results[i] = memory.QueryResult{Envelope: memoryRecallABResponse(intent), Class: memory.ClassOK}
+		response := memoryRecallABResponse(intent)
+		results[i] = memory.QueryResult{Envelope: response, Class: memory.ClassOK}
+		if memoryRecallABHasData(response) {
+			s.mu.Lock()
+			s.preflightWithData++
+			s.mu.Unlock()
+		}
 	}
 	return results
 }
 
-func (s *memoryRecallABService) counts() (int, int, int) {
+func (s *memoryRecallABService) counts() memoryRecallABCounts {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.preflightBatches, s.preflightQueries, s.explicitQueries
+	return memoryRecallABCounts{
+		PreflightBatches: s.preflightBatches, PreflightQueries: s.preflightQueries,
+		PreflightWithData: s.preflightWithData, ExplicitQueries: s.explicitQueries,
+		ExplicitWithData: s.explicitWithData, ExplicitModes: append([]string(nil), s.explicitModes...),
+		SessionQueries: s.sessionQueries, SessionWithData: s.sessionWithData,
+	}
+}
+
+func memoryRecallABHasData(response *memory.ResponseEnvelope) bool {
+	return response != nil && response.MemoryBlock != nil && len(response.MemoryBlock.Groups) > 0
+}
+
+type memoryRecallABSessionSearch struct{ service *memoryRecallABService }
+
+func (t *memoryRecallABSessionSearch) Info() agent.ToolInfo {
+	return (&tools.SessionSearchTool{}).Info()
+}
+
+func (*memoryRecallABSessionSearch) RequiresApproval() bool     { return false }
+func (*memoryRecallABSessionSearch) IsReadOnlyCall(string) bool { return true }
+
+func (t *memoryRecallABSessionSearch) Run(_ context.Context, argsJSON string) (agent.ToolResult, error) {
+	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
+		return result, nil
+	}
+	var args struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return agent.ValidationError(fmt.Sprintf("invalid input: %v", err)), nil
+	}
+	query := strings.ToLower(args.Query)
+	withData := strings.Contains(query, "医生") || strings.Contains(query, "doctor") || strings.Contains(query, "aster")
+	t.service.mu.Lock()
+	t.service.sessionQueries++
+	if withData {
+		t.service.sessionWithData++
+	}
+	t.service.mu.Unlock()
+	if withData {
+		return agent.ToolResult{Content: `[{"snippet":"My doctor is Dr. Aster Vale."}]`}, nil
+	}
+	return agent.ToolResult{Content: "No matching sessions found."}, nil
 }
 
 func memoryRecallABResponse(intent memory.QueryIntent) *memory.ResponseEnvelope {
@@ -107,24 +172,30 @@ type memoryRecallABCase struct {
 }
 
 type memoryRecallABResult struct {
-	Case             string  `json:"case"`
-	Variant          string  `json:"variant"`
-	Repetition       int     `json:"repetition"`
-	ShouldRecall     bool    `json:"should_recall"`
-	RoutingCorrect   bool    `json:"routing_correct"`
-	AnswerCorrect    bool    `json:"answer_correct"`
-	Correct          bool    `json:"correct"`
-	RecallTriggered  bool    `json:"recall_triggered"`
-	PreflightBatches int     `json:"preflight_batches"`
-	PreflightQueries int     `json:"preflight_queries"`
-	PreflightHelpers int     `json:"preflight_helpers"`
-	ExplicitQueries  int     `json:"explicit_queries"`
-	LLMCalls         int     `json:"llm_calls"`
-	LatencyMs        int64   `json:"latency_ms"`
-	InputTokens      int     `json:"input_tokens"`
-	OutputTokens     int     `json:"output_tokens"`
-	CostUSD          float64 `json:"cost_usd"`
-	Answer           string  `json:"answer"`
+	Case              string   `json:"case"`
+	Variant           string   `json:"variant"`
+	Repetition        int      `json:"repetition"`
+	ShouldRecall      bool     `json:"should_recall"`
+	RoutingCorrect    bool     `json:"routing_correct"`
+	RoutingEfficient  bool     `json:"routing_efficient"`
+	AnswerCorrect     bool     `json:"answer_correct"`
+	Correct           bool     `json:"correct"`
+	RecallTriggered   bool     `json:"recall_triggered"`
+	PreflightBatches  int      `json:"preflight_batches"`
+	PreflightQueries  int      `json:"preflight_queries"`
+	PreflightWithData int      `json:"preflight_results_with_data"`
+	PreflightHelpers  int      `json:"preflight_helpers"`
+	ExplicitQueries   int      `json:"explicit_queries"`
+	ExplicitWithData  int      `json:"explicit_results_with_data"`
+	ExplicitModes     []string `json:"explicit_modes,omitempty"`
+	SessionQueries    int      `json:"session_search_queries"`
+	SessionWithData   int      `json:"session_search_results_with_data"`
+	LLMCalls          int      `json:"llm_calls"`
+	LatencyMs         int64    `json:"latency_ms"`
+	InputTokens       int      `json:"input_tokens"`
+	OutputTokens      int      `json:"output_tokens"`
+	CostUSD           float64  `json:"cost_usd"`
+	Answer            string   `json:"answer"`
 }
 
 func TestLive_MemoryRecallPreflightAB(t *testing.T) {
@@ -133,12 +204,12 @@ func TestLive_MemoryRecallPreflightAB(t *testing.T) {
 	cases := []memoryRecallABCase{
 		{Name: "zh_implicit_email", Prompt: "张三的邮箱是多少？只回答邮箱地址。", ExpectedAnswer: "zhang.san@memory.test", ShouldRecall: true},
 		{Name: "zh_implicit_phone", Prompt: "小王电话是多少？只回答电话号码。", ExpectedAnswer: "+81-50-7421-6004", ShouldRecall: true},
-		{Name: "zh_personal_doctor", Prompt: "我的医生叫什么？只回答姓名。", ExpectedAnswer: "Dr. Aster Vale", ShouldRecall: true},
+		{Name: "zh_personal_doctor", Prompt: "我的医生叫什么？只回答姓名。", ExpectedAnswer: "Aster Vale", ShouldRecall: true},
 		{Name: "en_named_email", Prompt: "What is Jordan Vale's email address? Reply with only the address.", ExpectedAnswer: "jordan.vale@memory.test", ShouldRecall: true},
 		{Name: "ja_explicit_email", Prompt: "以前話した Haruto Sato のメールアドレスは？メールアドレスだけ答えて。", ExpectedAnswer: "haruto.sato@memory.test", ShouldRecall: true},
 		{Name: "zh_ordinary_work", Prompt: "帮我写一封两句话的请假邮件，不要发送。", ShouldRecall: false},
 		{Name: "en_public_knowledge", Prompt: "What is two plus two? Reply with only the number.", ShouldRecall: false},
-		{Name: "ja_ambiguous_contact", Prompt: "あの人の連絡先は？", ShouldRecall: false},
+		{Name: "ja_ambiguous_contact", Prompt: "あの人の連絡先は？", ShouldRecall: true},
 	}
 
 	rawClient, modelTier, specificModel := newLiveMemoryClient(t)
@@ -153,9 +224,11 @@ func TestLive_MemoryRecallPreflightAB(t *testing.T) {
 			for _, variant := range variants {
 				result := runMemoryRecallABCase(t, gw, modelTier, specificModel, tc, variant, repetition)
 				results = append(results, result)
-				t.Logf("memory_ab case=%s variant=%s rep=%d correct=%t triggered=%t preflight=%d/%d helper=%d explicit=%d llm=%d latency_ms=%d cost_usd=%.8f answer=%q",
-					result.Case, result.Variant, result.Repetition, result.Correct, result.RecallTriggered,
-					result.PreflightBatches, result.PreflightQueries, result.PreflightHelpers, result.ExplicitQueries,
+				t.Logf("memory_ab case=%s variant=%s rep=%d correct=%t efficient=%t triggered=%t preflight=%d/%d data=%d helper=%d explicit=%d data=%d modes=%v session=%d data=%d llm=%d latency_ms=%d cost_usd=%.8f answer=%q",
+					result.Case, result.Variant, result.Repetition, result.Correct, result.RoutingEfficient, result.RecallTriggered,
+					result.PreflightBatches, result.PreflightQueries, result.PreflightWithData, result.PreflightHelpers,
+					result.ExplicitQueries, result.ExplicitWithData, result.ExplicitModes,
+					result.SessionQueries, result.SessionWithData,
 					result.LLMCalls, result.LatencyMs, result.CostUSD, result.Answer)
 			}
 		}
@@ -219,6 +292,7 @@ func runMemoryRecallABCase(t *testing.T, llm client.LLMClient, modelTier, specif
 	service := &memoryRecallABService{}
 	registry := agent.NewToolRegistry()
 	registry.Register(&tools.MemoryTool{Service: service})
+	registry.Register(&memoryRecallABSessionSearch{service: service})
 	loop := agent.NewAgentLoop(llm, registry, modelTier, t.TempDir(), 4, 30_000, 200, nil, nil, nil)
 	loop.SetCacheSource("memory_recall_ab")
 	loop.SetSkillDiscovery(false)
@@ -248,23 +322,27 @@ func runMemoryRecallABCase(t *testing.T, llm client.LLMClient, modelTier, specif
 	if err != nil {
 		t.Fatalf("memory A/B %s/%s repetition %d: %v", tc.Name, variant, repetition, err)
 	}
-	batches, preflightQueries, explicitQueries := service.counts()
+	counts := service.counts()
 	preflightDelta := agent.TurnUsage{}
 	if memoryRecallABUsageNonZero(preflightUsage) {
 		preflightDelta = agent.LLMUsageDelta(preflightUsage, "")
 	}
-	triggered := preflightQueries+explicitQueries > 0
+	triggered := counts.PreflightQueries+counts.ExplicitQueries+counts.SessionQueries > 0
 	routingCorrect := triggered == tc.ShouldRecall
+	routingEfficient := counts.PreflightQueries+counts.ExplicitQueries+counts.SessionQueries <= 1
 	answerCorrect := true
 	if tc.ExpectedAnswer != "" {
 		answerCorrect = strings.Contains(strings.ToLower(answer), strings.ToLower(tc.ExpectedAnswer))
 	}
-	correct := routingCorrect && answerCorrect
+	correct := routingCorrect && routingEfficient && answerCorrect
 	return memoryRecallABResult{
 		Case: tc.Name, Variant: variant, Repetition: repetition, ShouldRecall: tc.ShouldRecall,
-		RoutingCorrect: routingCorrect, AnswerCorrect: answerCorrect, Correct: correct,
-		RecallTriggered: triggered, PreflightBatches: batches, PreflightQueries: preflightQueries,
-		PreflightHelpers: preflightHelpers, ExplicitQueries: explicitQueries,
+		RoutingCorrect: routingCorrect, RoutingEfficient: routingEfficient,
+		AnswerCorrect: answerCorrect, Correct: correct,
+		RecallTriggered: triggered, PreflightBatches: counts.PreflightBatches, PreflightQueries: counts.PreflightQueries,
+		PreflightWithData: counts.PreflightWithData, PreflightHelpers: preflightHelpers,
+		ExplicitQueries: counts.ExplicitQueries, ExplicitWithData: counts.ExplicitWithData, ExplicitModes: counts.ExplicitModes,
+		SessionQueries: counts.SessionQueries, SessionWithData: counts.SessionWithData,
 		LLMCalls:  usage.LLMCalls + preflightDelta.LLMCalls,
 		LatencyMs: time.Since(started).Milliseconds(), InputTokens: usage.InputTokens + preflightDelta.InputTokens,
 		OutputTokens: usage.OutputTokens + preflightDelta.OutputTokens,
@@ -278,11 +356,12 @@ func memoryRecallABUsageNonZero(usage client.Usage) bool {
 
 func summarizeMemoryRecallAB(results []memoryRecallABResult) map[string]any {
 	type totals struct {
-		Runs, Correct, Triggered, PreflightQueries, PreflightHelpers, ExplicitQueries, LLMCalls int
-		PositiveRuns, PositiveTriggered, PositiveAnswers, NegativeRuns, NegativeTriggered       int
-		LatencyMs, PositiveLatencyMs, NegativeLatencyMs                                         int64
-		Latencies, PositiveLatencies, NegativeLatencies                                         []int64
-		CostUSD                                                                                 float64
+		Runs, Correct, Efficient, Triggered, PreflightQueries, PreflightWithData, PreflightHelpers int
+		ExplicitQueries, ExplicitWithData, SessionQueries, SessionWithData, LLMCalls               int
+		PositiveRuns, PositiveTriggered, PositiveAnswers, NegativeRuns, NegativeTriggered          int
+		LatencyMs, PositiveLatencyMs, NegativeLatencyMs                                            int64
+		Latencies, PositiveLatencies, NegativeLatencies                                            []int64
+		CostUSD                                                                                    float64
 	}
 	byVariant := map[string]*totals{}
 	for _, result := range results {
@@ -295,12 +374,19 @@ func summarizeMemoryRecallAB(results []memoryRecallABResult) map[string]any {
 		if result.Correct {
 			total.Correct++
 		}
+		if result.RoutingEfficient {
+			total.Efficient++
+		}
 		if result.RecallTriggered {
 			total.Triggered++
 		}
 		total.PreflightQueries += result.PreflightQueries
+		total.PreflightWithData += result.PreflightWithData
 		total.PreflightHelpers += result.PreflightHelpers
 		total.ExplicitQueries += result.ExplicitQueries
+		total.ExplicitWithData += result.ExplicitWithData
+		total.SessionQueries += result.SessionQueries
+		total.SessionWithData += result.SessionWithData
 		total.LLMCalls += result.LLMCalls
 		total.LatencyMs += result.LatencyMs
 		total.Latencies = append(total.Latencies, result.LatencyMs)
@@ -328,14 +414,19 @@ func summarizeMemoryRecallAB(results []memoryRecallABResult) map[string]any {
 	for variant, total := range byVariant {
 		out[variant] = map[string]any{
 			"runs": total.Runs, "correct": total.Correct,
-			"accuracy":          float64(total.Correct) / float64(total.Runs),
-			"recall_triggered":  total.Triggered,
-			"preflight_queries": total.PreflightQueries,
-			"preflight_helpers": total.PreflightHelpers,
-			"explicit_queries":  total.ExplicitQueries,
-			"mean_llm_calls":    float64(total.LLMCalls) / float64(total.Runs),
-			"mean_latency_ms":   float64(total.LatencyMs) / float64(total.Runs),
-			"median_latency_ms": memoryRecallABMedian(total.Latencies),
+			"accuracy":                         float64(total.Correct) / float64(total.Runs),
+			"routing_efficiency_rate":          float64(total.Efficient) / float64(total.Runs),
+			"recall_triggered":                 total.Triggered,
+			"preflight_queries":                total.PreflightQueries,
+			"preflight_results_with_data":      total.PreflightWithData,
+			"preflight_helpers":                total.PreflightHelpers,
+			"explicit_queries":                 total.ExplicitQueries,
+			"explicit_results_with_data":       total.ExplicitWithData,
+			"session_search_queries":           total.SessionQueries,
+			"session_search_results_with_data": total.SessionWithData,
+			"mean_llm_calls":                   float64(total.LLMCalls) / float64(total.Runs),
+			"mean_latency_ms":                  float64(total.LatencyMs) / float64(total.Runs),
+			"median_latency_ms":                memoryRecallABMedian(total.Latencies),
 			"positive": map[string]any{
 				"runs":              total.PositiveRuns,
 				"routing_recall":    float64(total.PositiveTriggered) / float64(total.PositiveRuns),

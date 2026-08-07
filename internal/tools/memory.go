@@ -53,8 +53,8 @@ type memoryArgs struct {
 func (t *MemoryTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "memory_recall",
-		Description: "Read structured episodic memory results from the user's Kocoro hippocampus — past sessions consolidated through nightly memory replay into long-term records.\n" +
-			"Call once for each concrete anchor/target needed by the current request. If the target is unnamed or ambiguous, use session_search first. If the result has no_data_reason or no matching candidate, do not retry the same target with alternate relation spellings or modes in this turn.\n" +
+		Description: "Read structured episodic memory results from the user's Kocoro hippocampus — past sessions consolidated through nightly memory replay into long-term records. Use this first for private facts about a named person or project, including contact details; a user-supplied nickname or name fragment is a valid concrete anchor.\n" +
+			"Call once for each concrete anchor/target needed by the current request. If the result has a matching candidate, answer from it without a confirming session_search. If the target is unnamed or ambiguous, use session_search first. If the result has no_data_reason or no matching candidate, do not retry the same target with alternate relation spellings or modes in this turn.\n" +
 			"Modes:\n" +
 			"- direct_relation: one-hop predicate (e.g. \"what did X create?\"). Read `groups[].via_relations`.\n" +
 			"- path_query: multi-hop / possessive (e.g. \"what did X's collaborator create?\"). relation_constraints is the ordered path; inverse hops use `^-1`. Read `groups[].observed_path`.\n" +

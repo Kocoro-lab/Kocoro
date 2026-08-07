@@ -21,7 +21,7 @@ type sessionSearchArgs struct {
 func (t *SessionSearchTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "session_search",
-		Description: "Search through past session messages for keyword matches. Includes results from scheduled task runs — use this to check what a schedule found.",
+		Description: "Search raw past-session wording for keyword matches. Use this when the request has no identifying anchor, for verbatim conversation details, and for scheduled-run results. A user-supplied name, nickname, or name fragment is an identifying anchor: for that person's private facts such as email or phone, use memory_recall instead. Do not call session_search to confirm a matching memory_recall result.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

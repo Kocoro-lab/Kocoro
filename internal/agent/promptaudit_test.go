@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
 )
@@ -54,6 +58,53 @@ func TestSystemPromptAudit(t *testing.T) {
 		ModelID:        "medium",
 		OutputFormat:   "markdown",
 	})
+	if outputPath := strings.TrimSpace(os.Getenv("KOCORO_PROMPT_AUDIT_OUTPUT")); outputPath != "" {
+		full := prompt.BuildSystemPrompt(prompt.PromptOptions{
+			BasePrompt:     basePrompt,
+			LocalToolNames: tools,
+			MemoryDir:      "/Users/test/.shannon/agents/sample",
+			ModelID:        "medium",
+			OutputFormat:   "koe",
+		})
+		fast := prompt.BuildSystemPrompt(prompt.PromptOptions{
+			BasePrompt:     basePrompt,
+			LocalToolNames: tools,
+			MemoryDir:      "/Users/test/.shannon/agents/sample",
+			ModelID:        "medium",
+			OutputFormat:   "koe",
+			FastMode:       true,
+		})
+		artifact := map[string]any{
+			"schema_version": "kocoro.prompt_audit.v1",
+			"generated_at":   time.Now().UTC().Format(time.RFC3339Nano),
+			"assumptions": []string{
+				"Kocoro default persona with the production core rules and core contrast examples.",
+				"Representative production local-tool set; per-user MCP, gateway, instructions, memory, working directory, and sticky context are intentionally absent.",
+				"Koe Full and Fast share the same system prompt. Fast adds only volatile outcome-first guidance.",
+			},
+			"layers": map[string]string{
+				"default_persona":           defaultPersona,
+				"core_operational_rules":    coreOperationalRules,
+				"core_contrast_examples":    contrastExamplesCore,
+				"kocoro_base_prompt":        basePrompt,
+				"cloud_delegation_guidance": cloudDelegationGuidance,
+				"cloud_contrast_examples":   contrastExamplesCloud,
+			},
+			"koe_full": map[string]string{
+				"system":           full.System,
+				"stable_context":   full.StableContext,
+				"volatile_context": full.VolatileContext,
+			},
+			"koe_fast": map[string]string{
+				"system":           fast.System,
+				"stable_context":   fast.StableContext,
+				"volatile_context": fast.VolatileContext,
+			},
+		}
+		if err := writePromptAuditArtifact(outputPath, artifact); err != nil {
+			t.Fatalf("write prompt audit artifact: %v", err)
+		}
+	}
 
 	t.Logf("--- Assembled system prompt ---")
 	t.Logf("  System total:    %d chars / ~%.0f tokens", len(parts.System), tokensFromChars(len(parts.System)))
@@ -116,6 +167,22 @@ func TestSystemPromptAudit(t *testing.T) {
 		}
 	}
 	t.Logf("  total redundancy candidates: %d", flagged)
+}
+
+func writePromptAuditArtifact(path string, artifact any) error {
+	body, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func TestCoreOperationalRulesDoNotSuppressOperationalPreambles(t *testing.T) {
