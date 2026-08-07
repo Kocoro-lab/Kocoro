@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -95,7 +96,10 @@ const maxIntegrationConnectBodyBytes = 64 << 10
 // body and get back {connection_id, oauth_url} the renderer opens to complete
 // authorization; token-mode providers (e.g. Shopify) send credentials in the
 // body and get back an active connection directly. The body may carry
-// long-lived credentials — never log or persist it.
+// long-lived credentials — never log or persist it. The response side is a
+// verbatim Cloud passthrough, so the end-to-end invariant also relies on the
+// Cloud contract keeping connect error bodies credential-free (never quoting
+// a rejected token back).
 func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request) {
 	if !s.integrationsCloudReady(w) {
 		return
@@ -105,7 +109,9 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "provider is required")
 		return
 	}
-	reqBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxIntegrationConnectBodyBytes))
+	bodyReader := http.MaxBytesReader(w, r.Body, maxIntegrationConnectBodyBytes)
+	defer bodyReader.Close()
+	reqBody, err := io.ReadAll(bodyReader)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -114,6 +120,12 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 		}
 		writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
 		return
+	}
+	// A whitespace-only payload counts as absent so a renderer quirk (empty
+	// string, stray newline) cannot flip an OAuth connect onto the token-mode
+	// wire shape.
+	if len(bytes.TrimSpace(reqBody)) == 0 {
+		reqBody = nil
 	}
 	status, body, err := s.deps.GW.IntegrationConnect(r.Context(), provider, reqBody)
 	if err != nil {

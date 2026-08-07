@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -123,6 +124,23 @@ func TestHandleConnectIntegration_ForwardsBody(t *testing.T) {
 		}
 	})
 
+	t.Run("whitespace-only body treated as absent", func(t *testing.T) {
+		got = captured{}
+		req := httptest.NewRequest(http.MethodPost, "/integrations/figma/connect", strings.NewReader(" \n\t"))
+		req.SetPathValue("provider", "figma")
+		rr := httptest.NewRecorder()
+		s.handleConnectIntegration(rr, req)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (body: %s)", rr.Code, rr.Body.String())
+		}
+		if got.body != "" {
+			t.Errorf("cloud received unexpected body %q, want empty", got.body)
+		}
+		if got.contentType != "" {
+			t.Errorf("cloud received unexpected Content-Type %q, want empty", got.contentType)
+		}
+	})
+
 	t.Run("oversized body -> 413 before any cloud call", func(t *testing.T) {
 		got = captured{contentType: "sentinel"}
 		req := httptest.NewRequest(http.MethodPost, "/integrations/shopify/connect",
@@ -135,6 +153,76 @@ func TestHandleConnectIntegration_ForwardsBody(t *testing.T) {
 		}
 		if got.contentType != "sentinel" {
 			t.Error("cloud must not be called when the body exceeds the cap")
+		}
+	})
+}
+
+// TestHandleConnectIntegration_RefreshGate pins the 2xx guard on the
+// post-connect tool refresh: a token-mode success (connection active on the
+// connect response itself) must fire the async integration-tool refresh, and
+// a rejected credential must pass Cloud's error through untouched without
+// kicking a pointless registry refresh.
+func TestHandleConnectIntegration_RefreshGate(t *testing.T) {
+	newServer := func(connectStatus int, connectBody string, toolsFetched chan struct{}) (*Server, *httptest.Server) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/v1/integrations/tools" {
+				toolsFetched <- struct{}{}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`[]`))
+				return
+			}
+			w.WriteHeader(connectStatus)
+			w.Write([]byte(connectBody))
+		}))
+		cfg := &config.Config{}
+		cfg.Cloud.Enabled = true
+		cfg.APIKey = "test-key"
+		s := &Server{deps: &ServerDeps{
+			Config:   cfg,
+			Registry: agent.NewToolRegistry(),
+			GW:       client.NewGatewayClient(cloud.URL, "test-key"),
+		}}
+		return s, cloud
+	}
+	connectReq := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/integrations/shopify/connect",
+			strings.NewReader(`{"params":{"shop":"s.myshopify.com","access_token":"shpat_x"}}`))
+		req.SetPathValue("provider", "shopify")
+		return req
+	}
+
+	t.Run("2xx fires async tool refresh", func(t *testing.T) {
+		toolsFetched := make(chan struct{}, 1)
+		s, cloud := newServer(http.StatusCreated, `{"connection_id":"c1","status":"active"}`, toolsFetched)
+		defer cloud.Close()
+		rr := httptest.NewRecorder()
+		s.handleConnectIntegration(rr, connectReq())
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (body: %s)", rr.Code, rr.Body.String())
+		}
+		select {
+		case <-toolsFetched:
+		case <-time.After(3 * time.Second):
+			t.Error("tool refresh not fired after a 2xx connect")
+		}
+	})
+
+	t.Run("non-2xx passes through and skips refresh", func(t *testing.T) {
+		toolsFetched := make(chan struct{}, 1)
+		s, cloud := newServer(http.StatusUnauthorized, `{"error":"invalid access token"}`, toolsFetched)
+		defer cloud.Close()
+		rr := httptest.NewRecorder()
+		s.handleConnectIntegration(rr, connectReq())
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401 (body: %s)", rr.Code, rr.Body.String())
+		}
+		if rr.Body.String() != `{"error":"invalid access token"}` {
+			t.Errorf("error body not passed through verbatim: %s", rr.Body.String())
+		}
+		select {
+		case <-toolsFetched:
+			t.Error("tool refresh must not fire on a rejected connect")
+		case <-time.After(200 * time.Millisecond):
 		}
 	})
 }
