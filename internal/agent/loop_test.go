@@ -4034,9 +4034,8 @@ func TestAgentLoop_CloudDelegateLock(t *testing.T) {
 // exploration where most queries naturally return zero on misses.
 func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 	wantSubstrings := []string{
-		"search/filesystem", // names the preserved case
-		"IS the answer",     // the canonical outcome for search
-		"grep", "glob",      // concrete tool examples reach the agent
+		"deterministic file/search query",
+		"An empty result is final",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4053,12 +4052,8 @@ func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 // synthetic single-lookup versus batch-enumeration distinction.
 func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 	wantSubstrings := []string{
-		"list-and-enumerate semantics", // names the new case
-		"scope artifact",               // distinguishes from real empty
-		"list_calendars",               // concrete synthetic example
-		"ONE",                          // permits exactly one diversification
-		"Google Calendar",              // explicit integration list (no broad "external APIs")
-		"Notion",
+		"unnamed list-style integration scope",
+		"one focused scope diversification",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4074,8 +4069,8 @@ func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 // the model to cross-account/folder-hunt past the user's contract.
 func TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope(t *testing.T) {
 	wantSubstrings := []string{
-		"user explicitly named",   // names the protected case
-		"user-specified contract", // frames the boundary
+		"user-named scope",
+		"An empty result is final",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4091,12 +4086,8 @@ func TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope(t *testing.T) {
 // semantics AND must name the http tool as an empty-is-the-answer case,
 // so the model does not repurpose scope-hunting for arbitrary HTTP.
 func TestCoreRules_EmptyResultRule_ExcludesHTTPTool(t *testing.T) {
-	// Must name http explicitly in the "empty IS the answer" column.
-	if !strings.Contains(coreOperationalRules, "arbitrary HTTP endpoints") {
-		t.Error("empty-result rule should explicitly name 'arbitrary HTTP endpoints' as an empty-is-the-answer case")
-	}
-	if !strings.Contains(coreOperationalRules, "http tool") {
-		t.Error("empty-result rule should name the http tool by tool identifier")
+	if !strings.Contains(coreOperationalRules, "exact HTTP endpoint") {
+		t.Error("empty-result rule should keep exact HTTP endpoints in the final-empty category")
 	}
 	// Must NOT contain the over-broad "external APIs" framing the
 	// previous draft used — that phrasing sweeps http in.
@@ -4126,11 +4117,11 @@ func TestNamedAgentPromptIncludesCoreRules(t *testing.T) {
 	// coreOperationalRules must contain key behavioral constraints.
 	// If any of these are missing, named agents lose critical guardrails.
 	required := []string{
-		"Always use tools to perform actions",
-		"NEVER claim you see, read, or completed something without a tool call",
-		"file_read before file_edit",
-		"## Tool Selection",
-		"## Error Handling",
+		"Use tools to perform actions",
+		"Never claim done, fixed, sent, saved, scheduled, deployed, read, seen, or verified without direct evidence",
+		"Read existing state before modifying it",
+		"## Tools",
+		"Diagnose a failure before changing approach",
 	}
 	for _, s := range required {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -6822,6 +6813,7 @@ func TestAgentLoop_CaptureSentRequest_AlsoDeepCopiesOnWrite(t *testing.T) {
 func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
 	loop := &AgentLoop{tools: NewToolRegistry()}
 	loop.tools.Register(&fakeThinkTool{})
+	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
 	got := loop.operationalRules()
 	if got != coreOperationalRules {
 		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when think registered; len got=%d want=%d", len(got), len(coreOperationalRules))
@@ -6833,6 +6825,7 @@ func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
 // while other sections remain intact and spacing stays clean.
 func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
 	loop := &AgentLoop{tools: NewToolRegistry()}
+	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
 	// Intentionally do NOT register think.
 	got := loop.operationalRules()
 
@@ -6843,8 +6836,8 @@ func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
 		t.Error("'### Planning' header must not appear when think unregistered")
 	}
 	// Surrounding sections must remain.
-	if !strings.Contains(got, "## Approach") {
-		t.Error("pre-planning '## Approach' section missing")
+	if !strings.Contains(got, "## Objective") {
+		t.Error("pre-planning '## Objective' section missing")
 	}
 	if !strings.Contains(got, "## Skills") {
 		t.Error("post-planning '## Skills' section missing")
@@ -6878,10 +6871,28 @@ func TestOperationalRules_NilRegistryStripsBullet(t *testing.T) {
 	}
 }
 
+func TestOperationalRules_StripsSkillGuidanceWhenUseSkillIsNotCallable(t *testing.T) {
+	got := operationalRulesForToolNames([]string{"think"})
+	if strings.Contains(got, "## Skills") || strings.Contains(got, "call use_skill") {
+		t.Fatal("skill guidance must not advertise a tool absent from final provider schemas")
+	}
+	if !strings.Contains(got, "### Planning") {
+		t.Fatal("unrelated callable tool guidance was removed")
+	}
+}
+
 // fakeThinkTool is a minimal Tool used in tests that need a registry where
 // `think` is present without depending on the real ThinkTool implementation
 // (which lives in internal/tools, downstream of internal/agent).
 type fakeThinkTool struct{}
+
+type fakeNamedTool struct{ name string }
+
+func (f *fakeNamedTool) Info() ToolInfo { return ToolInfo{Name: f.name, Description: "stub for tests"} }
+func (f *fakeNamedTool) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{Content: "stub"}, nil
+}
+func (f *fakeNamedTool) RequiresApproval() bool { return false }
 
 func (f *fakeThinkTool) Info() ToolInfo {
 	return ToolInfo{Name: "think", Description: "stub for tests"}

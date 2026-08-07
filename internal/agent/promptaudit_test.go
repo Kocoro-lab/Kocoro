@@ -29,10 +29,6 @@ func TestSystemPromptAudit(t *testing.T) {
 		t.Skip("audit dump skipped in -short mode")
 	}
 
-	// Realistic one-shot CLI baseline using the real production constants:
-	// defaultPersona + coreOperationalRules + contrastExamplesCore is the
-	// BasePrompt assembled in AgentLoop.Run (line ~999).
-	basePrompt := defaultPersona + coreOperationalRules + contrastExamplesCore
 	t.Logf("--- BasePrompt constants ---")
 	dumpConst(t, "  defaultPersona", defaultPersona)
 	dumpConst(t, "  coreOperationalRules", coreOperationalRules)
@@ -47,10 +43,13 @@ func TestSystemPromptAudit(t *testing.T) {
 		"archive_extract", "archive_inspect", "ask_user_question", "bash",
 		"clipboard", "directory_list", "docx_to_text", "file_edit",
 		"file_read", "file_write", "glob", "grep", "http", "memory_append",
-		"notify", "pdf_to_text", "pptx_to_text", "present_deliverable",
+		"memory_recall", "notify", "pdf_to_text", "pptx_to_text", "present_deliverable",
 		"schedule_list", "schedule_show", "system_info", "tool_search",
-		"use_skill", "xlsx_to_text",
+		"session_search", "use_skill", "xlsx_to_text",
 	}
+	// Compose from the final provider-visible names, matching AgentLoop.Run.
+	// Native thinking keeps think out of this representative request.
+	basePrompt := defaultPersona + operationalRulesForToolNames(tools) + contrastExamplesCore
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
 		BasePrompt:     basePrompt,
 		LocalToolNames: tools,
@@ -58,6 +57,10 @@ func TestSystemPromptAudit(t *testing.T) {
 		ModelID:        "medium",
 		OutputFormat:   "markdown",
 	})
+	const representativeSystemCharBudget = 8500
+	if len(parts.System) > representativeSystemCharBudget {
+		t.Fatalf("representative production System is %d chars, budget %d", len(parts.System), representativeSystemCharBudget)
+	}
 	if outputPath := strings.TrimSpace(os.Getenv("KOCORO_PROMPT_AUDIT_OUTPUT")); outputPath != "" {
 		full := prompt.BuildSystemPrompt(prompt.PromptOptions{
 			BasePrompt:     basePrompt,
@@ -200,7 +203,7 @@ func TestCoreOperationalRulesDoNotSuppressOperationalPreambles(t *testing.T) {
 	if !strings.Contains(coreOperationalRules+contrastExamplesCore, requiredPreambleGuard) {
 		t.Errorf("runtime prompt missing operational-preamble guard %q", requiredPreambleGuard)
 	}
-	if !strings.Contains(coreOperationalRules, "Do not apologize for routine tool use.") {
+	if !strings.Contains(coreOperationalRules, "Do not apologize for routine tool use") {
 		t.Error("runtime prompt missing routine tool-use apology guard")
 	}
 }

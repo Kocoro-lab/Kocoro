@@ -52,6 +52,9 @@ run_offline_lane() {
   run_check daemon_idempotency go test ./internal/daemon \
     -run '^Test(RunAgent_IdempotencyKeyReturnsCompletedRunWithoutSecondLLMCall|RunAgent_FailedIdempotentRequestNeverReplaysAutomatically|TerminalIdempotencyState_SoftFailureWithoutDeliverableFailsClosed|TerminalIdempotencyState_DeliverableIsDurableSuccessEvidence|CompletedIdempotentResultReplaysDeliveryReceiptAndStatus)$' \
     -count=1 -v
+  run_check general_purpose_runtime go test ./test/e2e \
+    -run '^TestOffline_AgentLab(GeneralPurposePromptContract|LongReadTrajectoryReachesOutcome|CompactionPersistsAcrossRestart|InterruptedTrajectoryResumesWithoutReplay)$' \
+    -count=1 -v
   run_check harness_self_test go test ./test/e2e \
     -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|PromptVariantRunnerRequiresExplicitPaidGate|ProviderQualificationRejectsUndersizedReleaseSample)$' \
     -count=1 -v

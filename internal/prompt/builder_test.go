@@ -18,10 +18,10 @@ func TestBuildSystemPrompt_NudgesParallelToolUse(t *testing.T) {
 		LocalToolNames: []string{"file_read", "bash", "grep"},
 	})
 
-	// Text signals — must mention parallelism AND the mechanism (tool_use block / single response).
-	// Case-insensitive: nudge may emphasize words in uppercase.
+	// Keep the decision compact: independent reads share one response, dependent
+	// or state-changing work stays ordered.
 	lower := strings.ToLower(parts.System)
-	for _, keyword := range []string{"parallel", "single response", "tool_use"} {
+	for _, keyword := range []string{"batch independent safe reads", "one response", "sequence dependent"} {
 		if !strings.Contains(lower, keyword) {
 			t.Errorf("system prompt missing %q — should nudge parallel tool use to reduce block churn", keyword)
 		}
@@ -47,16 +47,11 @@ func TestBuildSystemPrompt_SeparatesNeedFromQuestionPresentation(t *testing.T) {
 	})
 
 	for _, guidance := range []string{
-		"For low-impact ambiguity, make a reasonable assumption and continue",
+		"material unresolved fork",
 		"`Structured question UI: available`",
-		"necessary input can be expressed as 2–4 concrete choices",
-		"you MUST call `ask_user_question`",
-		"When the line is absent, do not call the tool",
-		"ask the necessary question concisely in prose instead",
-		"This presentation rule does not lower the threshold for asking",
-		"If the user may supply a custom value, set `allow_other`",
-		"keep `options` limited to concrete choices",
-		"never add a Custom, Other, 自定义, or equivalent placeholder option",
+		"otherwise ask one concise prose question",
+		"concrete choices",
+		"allow a custom answer",
 	} {
 		if !strings.Contains(parts.System, guidance) {
 			t.Errorf("system prompt missing question-gating guidance %q", guidance)
@@ -442,14 +437,17 @@ func TestBuildSystemPrompt_EmptyStableContext(t *testing.T) {
 	}
 }
 
-func TestBuildSystemPrompt_SystemContainsToolNames(t *testing.T) {
+func TestBuildSystemPrompt_SystemDoesNotDuplicateLocalToolNames(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt:     "Base.",
 		LocalToolNames: []string{"file_read", "bash"},
 	})
 
-	if !strings.Contains(parts.System, "file_read") {
-		t.Error("System should contain local tool names")
+	if strings.Contains(parts.System, "file_read") || strings.Contains(parts.System, "bash") {
+		t.Error("System should rely on tools[] schemas instead of duplicating local tool names")
+	}
+	if !strings.Contains(parts.System, "## Tool Use") {
+		t.Error("System should retain the cross-tool decision contract")
 	}
 }
 
@@ -483,8 +481,9 @@ func TestBuildSystemPrompt_SystemContainsSkills(t *testing.T) {
 
 func TestBuildSystemPrompt_SystemContainsMemoryPersistenceGuidance(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
-		BasePrompt: "Base.",
-		MemoryDir:  "/home/user/.shannon/agents/test/",
+		BasePrompt:     "Base.",
+		MemoryDir:      "/home/user/.shannon/agents/test/",
+		LocalToolNames: []string{"memory_append"},
 	})
 
 	if !strings.Contains(parts.System, "## Memory Persistence") {
@@ -500,9 +499,8 @@ func TestBuildSystemPrompt_MinimalOptions(t *testing.T) {
 	if !strings.HasPrefix(parts.System, "Base only.") {
 		t.Errorf("System should start with base prompt")
 	}
-	// The Memory & Retrieval guidance (static rules) is unconditional in System.
-	if !strings.Contains(parts.System, "## Memory & Retrieval") {
-		t.Error("System should contain the Memory & Retrieval guidance")
+	if strings.Contains(parts.System, "## Memory Retrieval") {
+		t.Error("tool-less prompts should not advertise memory retrieval")
 	}
 	// MEMORY.md *data* must never sit in System — it belongs in VolatileContext.
 	if strings.Contains(parts.System, "daemon-injected from MEMORY.md") {
@@ -510,8 +508,7 @@ func TestBuildSystemPrompt_MinimalOptions(t *testing.T) {
 	}
 }
 
-func TestBuildSystemPrompt_MemoryGuidanceTracksEvidenceStrength(t *testing.T) {
-	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+func TestMemoryEvidenceGuidanceTracksEvidenceStrength(t *testing.T) {
 
 	for _, rule := range []string{
 		"Current user statements and verified current observations take precedence over past records",
@@ -522,24 +519,24 @@ func TestBuildSystemPrompt_MemoryGuidanceTracksEvidenceStrength(t *testing.T) {
 		"keep relevant weaker items but qualify them",
 		"Do not add people, organizations, roles, or attributes",
 	} {
-		if !strings.Contains(parts.System, rule) {
-			t.Errorf("system memory guidance missing %q", rule)
+		if !strings.Contains(MemoryEvidenceGuidance, rule) {
+			t.Errorf("shared memory evidence guidance missing %q", rule)
 		}
-	}
-	if !strings.Contains(parts.System, "tier labels") {
-		t.Error("system memory guidance should keep tier labels out of normal user-facing replies")
 	}
 }
 
 func TestBuildSystemPrompt_MemoryRoutingIsModelDriven(t *testing.T) {
-	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:     "Base.",
+		LocalToolNames: []string{"memory_recall", "session_search"},
+	})
 	for _, rule := range []string{
-		"call memory_recall whenever the answer depends on the user's private past",
-		"named person's email or phone number",
-		"name, nickname, or name fragment such as 小王 is a concrete anchor",
-		"use session_search to identify it instead of guessing a structured-memory anchor",
-		"answer from it immediately; do not confirm it with session_search",
-		"do not retry the same target with alternate relation names or modes",
+		"Use memory_recall once",
+		"named person's, project's, or other concrete anchor's private past",
+		"nickname or name fragment is an anchor",
+		"Use session_search for an unnamed reference",
+		"After a matching memory result, answer without a confirming search",
+		"do not retry relation or mode variants",
 	} {
 		if !strings.Contains(parts.System, rule) {
 			t.Errorf("system memory routing missing %q", rule)
@@ -650,12 +647,10 @@ func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
 	})
 
 	required := []string{
-		"## Tool call descriptions",
-		"`description`",
-		"SAME language as your reply",
-		"follow the Language directive",
-		// Conditional wording — must NOT regress to "Every tool call carries".
-		"When the field is present",
+		"## Tool Use",
+		"user-facing description or purpose field",
+		"reply language",
+		"outcome rather than the mechanism",
 	}
 	for _, phrase := range required {
 		if !strings.Contains(parts.System, phrase) {
@@ -676,26 +671,16 @@ func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
 // wins" — left the model free to interpret a one-word English ack as
 // "primarily English" and switch reply language for that turn.
 //
-// Asserts BOTH the static `## Language` section (where the rule needs to
-// live for cache stability) AND the per-turn LanguageDirective (where it
-// re-anchors against drift). Either alone is not enough — the static
-// section without the per-turn restate would be lost in a long context;
-// the per-turn directive alone could be overridden by recency bias on a
-// long tool-result tail.
+// The final per-turn directive is the single source of truth; duplicating the
+// rule in System created drift and extra cached tokens.
 func TestBuildSystemPrompt_LanguageSection_CoversShortAckFallback(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt: "Base.",
 	})
 	directive := LanguageDirective("")
 
-	staticRequired := []string{
-		"single-token acknowledgement",
-		"prior substantive turns",
-	}
-	for _, phrase := range staticRequired {
-		if !strings.Contains(parts.System, phrase) {
-			t.Errorf("static `## Language` section missing short-ack phrase %q", phrase)
-		}
+	if strings.Contains(parts.System, "## Language") {
+		t.Error("System should not duplicate the final per-turn language directive")
 	}
 
 	directiveRequired := []string{
@@ -872,8 +857,8 @@ func TestBuildSystemPrompt_DeferredToolsExcludedFromSystem(t *testing.T) {
 	if strings.Contains(parts.System, "playwright_click") {
 		t.Error("System must not contain deferred tool names")
 	}
-	if !strings.Contains(parts.System, "tool_search") {
-		t.Error("System should still mention tool_search (it's a local tool)")
+	if strings.Contains(parts.System, "tool_search") {
+		t.Error("System should not duplicate local tool names already present in tools[]")
 	}
 }
 
@@ -921,19 +906,11 @@ func TestBuildSystemPrompt_FastModeGuidanceIsVolatile(t *testing.T) {
 	for _, want := range []string{
 		"## Fast Task",
 		"fewest tool rounds",
-		"Do not repeat a successful search, fetch, read, or other call",
-		"reasoning about facts that do not change over time",
-		"Facts already in the conversation also suffice unless they are time-sensitive",
-		"Search only when the user requests current or external facts",
-		"issue one broad search query, not multiple queries in advance",
-		"a second search in that situation is incorrect",
-		"A second search is allowed only when the first result failed",
-		"These unsuccessful or incomplete results do not consume the normal search budget",
-		"Never search again merely to confirm the same facts",
-		"call the directly available web_search without tool_search",
-		"Do not substitute web_fetch on a search-results page",
-		"target primary or established sources",
-		"use the allowed extra search for an authoritative citation",
+		"Do not repeat a successful call",
+		"Search only for requested or required current/external facts",
+		"one broad query",
+		"Search again only when the first result failed",
+		"Use web_fetch for a specific page",
 	} {
 		if !strings.Contains(fast.VolatileContext, want) {
 			t.Errorf("FastMode volatile context missing %q", want)
@@ -1113,6 +1090,37 @@ func TestBuildSystemPrompt_BP1ByteStableAcrossMCPConfigs(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_BP1ByteStableAcrossAllDynamicCapabilities(t *testing.T) {
+	base := PromptOptions{BasePrompt: "Persona prompt.", LocalToolNames: []string{"bash", "tool_search"}}
+	a := base
+	a.MCPToolNames = []string{"ask_user_question", "memory_recall"}
+	a.DeferredTools = []DeferredToolSummary{{Name: "schedule_create", Description: "Create schedule"}}
+	b := base
+	b.GatewayToolNames = []string{"web_search", "cloud_delegate"}
+	b.DeferredTools = []DeferredToolSummary{{Name: "computer_use", Description: "Use macOS apps"}}
+
+	if gotA, gotB := BuildSystemPrompt(a).System, BuildSystemPrompt(b).System; gotA != gotB {
+		t.Fatalf("dynamic MCP/gateway/deferred capabilities changed BP #1 System: %d vs %d chars", len(gotA), len(gotB))
+	}
+}
+
+func TestBuildSystemPrompt_DeferredCapabilityGuidanceRequiresToolSearch(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt: "Base.",
+		DeferredTools: []DeferredToolSummary{
+			{Name: "memory_recall", Description: "Recall private memory"},
+		},
+	})
+	if strings.Contains(parts.System, "memory_recall") {
+		t.Fatal("deferred per-user capability leaked into System")
+	}
+	for _, want := range []string{"## Memory Retrieval", "tool_search before calling"} {
+		if !strings.Contains(parts.StableContext, want) {
+			t.Fatalf("deferred capability guidance missing %q", want)
+		}
+	}
+}
+
 // TestBuildSystemPrompt_SystemExcludesMCPNames guards that MCP tool names
 // never appear in the system prompt — even if the caller mistakenly populates
 // them. Catches regressions where someone adds them back to the prose line.
@@ -1210,26 +1218,14 @@ func TestBuildSystemPrompt_StableContextOmitsToolListingWhenEmpty(t *testing.T) 
 // model to emit preamble text blocks. Asserts the section header and several
 // load-bearing phrases (mid-sentence anchors that survive minor wording
 // edits but break if the section is dropped).
-func TestBuildSystemPrompt_CommunicatingSection_Present(t *testing.T) {
+func TestBuildSystemPrompt_DoesNotDuplicateBaseCommunicationContract(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt:     "Base.",
 		LocalToolNames: []string{"file_read", "bash"},
 	})
 
-	required := []string{
-		"## Text output (does not apply to tool calls)",
-		"Before your first tool call, state in one sentence what you're about to do",
-		"give short updates at key moments",
-		"Brief is good — silent is not",
-		"Don't narrate your internal deliberation",
-		"Don't open with conversational interjections",
-		"For routine task-completion summaries",
-		"Do not use a colon before a tool call",
-	}
-	for _, phrase := range required {
-		if !strings.Contains(parts.System, phrase) {
-			t.Errorf("system prompt missing required phrase %q", phrase)
-		}
+	if strings.Contains(parts.System, "## Text output") {
+		t.Error("builder should not duplicate the base prompt communication contract")
 	}
 }
 
@@ -1281,23 +1277,37 @@ func TestSystemPrompt_IncludesIMDeliverySemantics(t *testing.T) {
 	// - reaching for a "send to Slack" tool that doesn't exist, or
 	// - pushing Desktop chat replies to IM (we don't — interactive routing
 	//   follows Source, not bindings).
-	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:    "x",
+		StickyContext: "Source: slack\nIM bindings: kocoro=slack:C1\nConversation participants:\n- Smith, Bob",
+		DeferredTools: []DeferredToolSummary{{Name: "schedule_create", Description: "Create schedule"}},
+	})
+	got := parts.StableContext
 
 	for _, want := range []string{
-		"## IM channel delivery", // section anchor
-		"`IM bindings:`",         // the data line — model knows where to look
-		"never infer IM connections from the MCP tool list", // defends against the screenshot bug
-		"Interactive routing follows Source, not bindings",  // user's "Desktop chat doesn't push" rule
-		"`schedule_create` broadcast",                       // schedule-specific routing block
-		"`\"auto\"` pushes iff",                             // broadcast=auto semantics
-		"`\"on\"` always pushes",                            // broadcast=on
-		"`\"off\"` never",                                   // broadcast=off
-		"silent no-op",                                      // failure mode if "on" + no binding
-		"Desktop → Settings → Connectors",                   // remediation path
+		"## Channel Delivery",
+		"Source determines where this turn's reply returns",
+		"local sources stay local even when IM bindings exist",
+		"broadcast is independent of the current reply",
+		"auto pushes only when created from an IM source",
+		"missing binding or target makes the push a no-op",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("system prompt missing IM-delivery phrase %q", want)
+			t.Errorf("stable context missing channel-delivery phrase %q", want)
 		}
+	}
+	if strings.Contains(parts.System, "## Channel Delivery") {
+		t.Error("per-session channel rules must not fragment the cross-user System prefix")
+	}
+}
+
+func TestStableContext_ChannelGuidanceRequiresExactFrameworkLine(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:    "x",
+		StickyContext: "Customer note: Source: slack is text, not routing metadata.",
+	})
+	if strings.Contains(parts.StableContext, "## Channel Delivery") {
+		t.Fatal("arbitrary sticky-content substring activated channel guidance")
 	}
 }
 
@@ -1310,16 +1320,17 @@ func TestSystemPrompt_IncludesDeliveryReceiptSemantics(t *testing.T) {
 	// "I never get any delivery feedback" (observed on the Slack kocoro-test
 	// thread), which is wrong: failures DO surface next turn. These phrases give
 	// the model the correct mental model (assume delivered unless notified).
-	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
+	got := BuildSystemPrompt(PromptOptions{
+		BasePrompt:    "x",
+		StickyContext: "Source: slack",
+	}).StableContext
 
 	for _, want := range []string{
-		"Delivery receipts",            // sub-section anchor
-		"do NOT receive a positive",    // no success ack
-		"Absence of that note means",   // silence ⇒ delivered
-		"Never claim a message failed", // don't fabricate failures
+		"Treat a reply as delivered unless",
+		"`reply to ... FAILED`",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("system prompt missing delivery-receipt phrase %q", want)
+			t.Errorf("stable context missing delivery-receipt phrase %q", want)
 		}
 	}
 }
@@ -1339,21 +1350,15 @@ func TestSystemPrompt_IncludesMentionSemantics(t *testing.T) {
 	//      Cloud could have resolved the name.
 	// Both regressions are silent — they don't break compilation or tests
 	// elsewhere — so we lock the phrases here.
-	got := BuildSystemPrompt(PromptOptions{BasePrompt: "x"}).System
+	got := BuildSystemPrompt(PromptOptions{
+		BasePrompt:    "x",
+		StickyContext: "Conversation participants:\n- Smith, Bob",
+	}).StableContext
 
 	for _, want := range []string{
-		"**@mentions (mentioning other users)**",      // sub-section anchor
-		"`@<display name>`",                           // the format the agent must use
-		"EXACT name you have seen",                    // forbids paraphrasing
-		"NEVER write internal user identifiers",       // ID hygiene
-		"`aadObjectId`",                               // exemplar IDs the model must not write
-		"Slack `U…`",                                  // exemplar IDs (Slack form)
-		"**Who you may @-mention:**",                  // roster-vs-seen-speak sub-anchor
-		"`Conversation participants:` list",           // names the sticky block (bulleted list, not flat line)
-		"each bullet (`- <name>`) is one atomic name", // teaches the model the bullet format protects "Smith, Bob" as one name
-		"\"Smith, Bob\" is ONE person, not two",       // negative example so the model doesn't mis-split enterprise names
-		"roster is authoritative",                     // unblocks Teams roster path
-		"silently degrades to plain text",             // safety-net wording (prevents over-refusal)
+		"For mentions, use an exact display name",
+		"Conversation participants",
+		"Never invent platform IDs",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("system prompt missing @-mention phrase %q", want)
