@@ -9,9 +9,9 @@ pkg_config_path="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
 mkdir -p "$output_dir"
 
 case "$lane" in
-  offline|routing_live|selector_live|provider_live|prompt_live|memory_live|provider_release) ;;
+  offline|routing_live|selector_live|provider_live|prompt_live|memory_live|quality_live|provider_release) ;;
   *)
-    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, prompt_live, memory_live, or provider_release" >&2
+    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, prompt_live, memory_live, quality_live, or provider_release" >&2
     exit 2
     ;;
 esac
@@ -151,6 +151,43 @@ run_memory_lane() {
     go test ./test/e2e -run '^TestLive_MemoryRecallPreflightAB$' -count=1 -v
 }
 
+run_quality_lane() {
+  if [[ "${KOCORO_AGENT_LAB_QUALITY_LIVE:-}" != "1" ]]; then
+    echo "Set KOCORO_AGENT_LAB_QUALITY_LIVE=1 to authorize the paid general-purpose quality lane." >&2
+    check_names+=("general_purpose_quality_live")
+    check_statuses+=("2")
+    return
+  fi
+  local repetitions="${KOCORO_AGENT_LAB_QUALITY_REPETITIONS:-3}"
+  local sample="${KOCORO_AGENT_LAB_QUALITY_SAMPLE:-smoke}"
+  if [[ ! "$repetitions" =~ ^[0-9]+$ || "$repetitions" -lt 1 || "$repetitions" -gt 100 ]]; then
+    echo "KOCORO_AGENT_LAB_QUALITY_REPETITIONS must be an integer from 1 through 100." >&2
+    check_names+=("general_purpose_quality_live")
+    check_statuses+=("2")
+    return
+  fi
+  if [[ "$sample" != "smoke" && "$sample" != "release" ]]; then
+    echo "KOCORO_AGENT_LAB_QUALITY_SAMPLE must be smoke or release." >&2
+    check_names+=("general_purpose_quality_live")
+    check_statuses+=("2")
+    return
+  fi
+  if [[ "$sample" == "release" && "$repetitions" -lt 30 ]]; then
+    echo "release quality sample requires KOCORO_AGENT_LAB_QUALITY_REPETITIONS >= 30." >&2
+    check_names+=("general_purpose_quality_live")
+    check_statuses+=("2")
+    return
+  fi
+  run_check general_purpose_quality_live env \
+    SHANNON_E2E_LIVE=1 \
+    KOCORO_AGENT_LAB_QUALITY_LIVE=1 \
+    KOCORO_AGENT_LAB_QUALITY_SAMPLE="$sample" \
+    KOCORO_AGENT_LAB_QUALITY_REPETITIONS="$repetitions" \
+    KOCORO_AGENT_LAB_QUALITY_OUTPUT="$output_dir/general-purpose-quality.json" \
+    go test ./test/e2e -run '^TestLive_AgentLabGeneralPurposeQuality$' \
+    -count=1 -v -timeout=60m
+}
+
 run_release_source_preflight() {
   if [[ "$source_dirty" == "true" ]]; then
     echo "$lane requires a clean ShanClaw source tree." >&2
@@ -180,6 +217,9 @@ case "$lane" in
     ;;
   memory_live)
     run_memory_lane
+    ;;
+  quality_live)
+    run_quality_lane
     ;;
   provider_release)
     if run_release_source_preflight; then
