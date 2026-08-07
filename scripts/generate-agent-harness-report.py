@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import html
 import json
 import pathlib
@@ -33,6 +34,19 @@ def ms(value: float) -> str:
 
 def usd(value: float) -> str:
     return f"${value:.6f}"
+
+
+def sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
 
 
 def code_html(value: str) -> str:
@@ -64,8 +78,61 @@ def prompt_rows(report: dict) -> str:
             f"<td>{item['correct_tool_runs']}/{item['runs']}</td>"
             f"<td>{ms(item['total_p50_millis'])}</td>"
             f"<td>{ms(item['total_p95_millis'])}</td>"
+            f"<td>{ms(item['total_p99_millis'])}</td>"
+            f"<td>{ms(item['total_max_millis'])}</td>"
             f"<td>{item['input_tokens_mean']:,.0f}</td>"
             f"<td>{usd(item['cost_usd_total'])}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
+def paired_rows(report: dict) -> str:
+    rows = []
+    for item in report["paired_comparisons"]:
+        rows.append(
+            "<tr>"
+            f"<th>{esc(item['candidate'])}<small>vs {esc(item['control'])}</small></th>"
+            f"<td>{item['pairs']}</td>"
+            f"<td>{item['candidate_latency_wins']} / {item['control_latency_wins']} / {item['latency_ties']}</td>"
+            f"<td>{pct(item['candidate_latency_win_rate'])}</td>"
+            f"<td>{ms(item['total_delta_p50_millis'])}</td>"
+            f"<td>{ms(item['total_delta_p95_millis'])}</td>"
+            f"<td>{ms(item['total_delta_p99_millis'])}</td>"
+            f"<td>{ms(item['total_delta_min_millis'])} / {ms(item['total_delta_max_millis'])}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
+
+
+def outlier_rows(report: dict) -> str:
+    rows = []
+    for summary in report["summary"]:
+        for rank, item in enumerate(summary["slowest_runs"], start=1):
+            rows.append(
+                "<tr>"
+                f"<th>{esc(summary['name'])}<small>#{rank}</small></th>"
+                f"<td>{esc(item['workload'])}</td>"
+                f"<td>{item['repetition']}</td>"
+                f"<td>{item['schedule_index']}</td>"
+                f"<td>{ms(item['total_millis'])}</td>"
+                "</tr>"
+            )
+    return "".join(rows)
+
+
+def bullet_list(items: list[str]) -> str:
+    return "<ul>" + "".join(f"<li>{esc(item)}</li>" for item in items) + "</ul>"
+
+
+def provenance_rows(paths: list[pathlib.Path]) -> str:
+    rows = []
+    for path in paths:
+        rows.append(
+            "<tr>"
+            f"<th>{esc(path.name)}</th>"
+            f"<td><code>{esc(sha256(path))}</code></td>"
+            f"<td>{path.stat().st_size:,} bytes</td>"
             "</tr>"
         )
     return "".join(rows)
@@ -97,6 +164,7 @@ def main() -> None:
     parser.add_argument("--prompt-report", type=pathlib.Path, required=True)
     parser.add_argument("--memory-report", type=pathlib.Path, required=True)
     parser.add_argument("--loop-report", type=pathlib.Path, required=True)
+    parser.add_argument("--offline-gate-log", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
 
@@ -105,7 +173,35 @@ def main() -> None:
     prompt_report = read_json(args.prompt_report)
     memory_report = read_json(args.memory_report)
     loop_report = read_json(args.loop_report)
+    artifact_paths = [args.prompt_audit, args.prompt_report, args.memory_report, args.loop_report]
+    offline_gate_log = ""
+    if args.offline_gate_log:
+        offline_gate_log = args.offline_gate_log.read_text(encoding="utf-8")
+        artifact_paths.append(args.offline_gate_log)
+
+    require(prompt_audit.get("schema_version") == "kocoro.prompt_audit.v1", "unexpected prompt audit schema")
+    require(prompt_report.get("complete") is True, "prompt benchmark is incomplete")
+    require(prompt_report.get("scheduled") == 132 and prompt_report.get("completed") == 132, "prompt benchmark must contain 132/132 runs")
+    require(prompt_report.get("repetitions_per_cell") == 3, "prompt benchmark must be the 3x comparison sample")
+    require(prompt_report.get("release_qualifying") is False, "3x prompt benchmark must not be labeled release-qualifying")
+    require(prompt_report.get("winner_status") == "no_improvement", "prompt benchmark no-candidate decision changed")
+    require(memory_report.get("schema_version") == "kocoro.memory_recall_ab.v1", "unexpected memory report schema")
+    require(memory_report.get("repetitions_per_cell") == 3 and len(memory_report.get("results", [])) == 48, "memory report must contain the 48-run 3x A/B")
+    require(loop_report.get("passed") is True and loop_report.get("trace_count") == 10, "loop detector corpus did not pass 10 traces")
+    offline_gate_names = [
+        "TestOffline_AgentLabGeneralPurposePromptContract",
+        "TestOffline_AgentLabLongReadTrajectoryReachesOutcome",
+        "TestOffline_AgentLabCompactionPersistsAcrossRestart",
+        "TestOffline_AgentLabInterruptedTrajectoryResumesWithoutReplay",
+    ]
+    if offline_gate_log:
+        for test_name in offline_gate_names:
+            require(f"--- PASS: {test_name}" in offline_gate_log, f"offline gate log missing pass: {test_name}")
+        require("FAIL" not in offline_gate_log, "offline gate log contains a failure")
+
     output_rel = args.output.resolve().relative_to(repo)
+    branch_base = git(repo, "rev-parse", "origin/main")
+    branch_head = git(repo, "rev-parse", "HEAD")
     committed_diff = git(
         repo,
         "diff",
@@ -120,15 +216,16 @@ def main() -> None:
     layers = prompt_audit["layers"]
     full = prompt_audit["koe_full"]
     fast = prompt_audit["koe_fast"]
-    current = next(x for x in prompt_report["summary"] if x["name"] == "current")
-    minimal = next(x for x in prompt_report["summary"] if x["name"] == "minimal_v1")
-    conditional = next(x for x in prompt_report["summary"] if x["name"] == "layered_conditional_v1")
     memory_failures = [x for x in memory_report["results"] if not x["correct"]]
     model_memory = memory_report["summary"]["model"]
     preflight_memory = memory_report["summary"]["preflight"]
     memory_cost_reduction = (1 - model_memory["total_cost_usd"] / preflight_memory["total_cost_usd"]) * 100
-    memory_mean_delta = (model_memory["mean_latency_ms"] / preflight_memory["mean_latency_ms"] - 1) * 100
+    memory_mean_reduction = (1 - model_memory["mean_latency_ms"] / preflight_memory["mean_latency_ms"]) * 100
     memory_median_reduction = (1 - model_memory["median_latency_ms"] / preflight_memory["median_latency_ms"]) * 100
+    successful_prompt_tasks = sum(item["successful_tasks"] for item in prompt_report["summary"])
+    correct_prompt_tool_runs = sum(item["correct_tool_runs"] for item in prompt_report["summary"])
+    prompt_failures = prompt_report["variant_specific_failures"] or []
+    fast_volatile_addition = len(fast["volatile_context"]) - len(full["volatile_context"])
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
     document = f"""<!doctype html>
@@ -138,50 +235,63 @@ def main() -> None:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kocoro Agent Harness Review</title>
 <style>
-:root{{--paper:#f5f7fb;--panel:#fff;--ink:#14213d;--muted:#5c6882;--line:#d8deea;--blue:#2457ff;--cyan:#00a7c7;--mint:#168c68;--amber:#b76b00;--red:#c43d4b;--code:#10182b}}
+:root{{--paper:#f5f7fb;--panel:#fff;--ink:#14213d;--muted:#5c6882;--line:#d8deea;--blue:#2457ff;--mint:#168c68;--amber:#b76b00;--red:#c43d4b;--code:#10182b}}
 *{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:linear-gradient(90deg,#edf1f8 1px,transparent 1px),linear-gradient(#edf1f8 1px,transparent 1px),var(--paper);background-size:24px 24px;color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
-a{{color:var(--blue)}}.shell{{display:grid;grid-template-columns:230px minmax(0,1fr);max-width:1500px;margin:auto}}nav{{position:sticky;top:0;height:100vh;padding:32px 22px;border-right:1px solid var(--line);background:rgba(245,247,251,.93);backdrop-filter:blur(14px)}}nav strong{{display:block;font:800 22px/1.05 ui-rounded,"Arial Rounded MT Bold",sans-serif;letter-spacing:-.04em;margin-bottom:28px}}nav a{{display:block;padding:7px 0;color:var(--muted);text-decoration:none}}nav a:hover,nav a:focus{{color:var(--blue)}}main{{min-width:0;padding:52px clamp(24px,5vw,76px) 100px}}header{{max-width:1040px;padding:0 0 42px;border-bottom:3px solid var(--ink)}}.eyebrow{{font:700 12px/1 ui-monospace,SFMono-Regular,monospace;letter-spacing:.13em;color:var(--blue);text-transform:uppercase}}h1{{max-width:900px;margin:17px 0 16px;font:800 clamp(42px,7vw,86px)/.94 ui-rounded,"Arial Rounded MT Bold",sans-serif;letter-spacing:-.065em}}.lede{{font-size:20px;max-width:850px;color:#37435c}}.verdict{{display:grid;grid-template-columns:16px 1fr;gap:18px;margin:34px 0 0;padding:22px;background:#eef2ff;border:1px solid #b9c7ff;border-radius:14px}}.verdict i{{display:block;background:var(--blue);border-radius:20px}}section{{padding:55px 0;border-bottom:1px solid var(--line)}}h2{{margin:0 0 10px;font:800 34px/1.05 ui-rounded,"Arial Rounded MT Bold",sans-serif;letter-spacing:-.035em}}h3{{margin:28px 0 10px;font-size:19px}}.sub{{max-width:880px;color:var(--muted);margin:0 0 26px}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}.card{{position:relative;padding:20px;background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 28px rgba(20,33,61,.05)}}.card:before{{content:"";position:absolute;left:20px;right:20px;top:0;height:3px;background:var(--blue)}}.card strong{{display:block;font-size:24px;line-height:1.1;margin-bottom:8px}}.card small,th small{{display:block;color:var(--muted);font-weight:500}}.ok{{color:var(--mint)}}.warn{{color:var(--amber)}}.bad{{color:var(--red)}}table{{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);font-variant-numeric:tabular-nums}}th,td{{padding:12px 13px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}thead th{{background:#e9edf5;font:700 12px/1.2 ui-monospace,SFMono-Regular,monospace;letter-spacing:.04em}}tbody th{{white-space:nowrap}}details{{margin:10px 0;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}}summary{{cursor:pointer;padding:13px 16px;font-weight:700}}summary span{{float:right;color:var(--muted);font:500 12px ui-monospace,monospace}}pre{{margin:0;padding:18px;max-height:72vh;overflow:auto;background:var(--code);color:#dce6ff;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}}.trace{{display:grid;grid-template-columns:120px 22px 1fr;gap:0 14px;margin:24px 0}}.trace .rail{{position:relative}}.trace .rail:before{{content:"";position:absolute;left:9px;top:0;bottom:-34px;width:2px;background:var(--line)}}.trace .rail:after{{content:"";position:absolute;left:4px;top:6px;width:10px;height:10px;border-radius:50%;background:var(--blue);box-shadow:0 0 0 4px #dfe6ff}}.trace time{{color:var(--muted);font:12px ui-monospace,monospace;padding-top:2px}}.trace p{{margin:0 0 28px}}.tag{{display:inline-block;padding:2px 7px;border-radius:99px;background:#e7ecf6;color:var(--muted);font:700 11px ui-monospace,monospace}}.callout{{padding:18px 20px;border-left:4px solid var(--amber);background:#fff8e8}}footer{{padding-top:35px;color:var(--muted);font:12px ui-monospace,monospace}}@media(max-width:900px){{.shell{{display:block}}nav{{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--line)}}nav a{{display:inline-block;margin-right:14px}}main{{padding-top:36px}}.grid{{grid-template-columns:1fr}}.trace{{grid-template-columns:82px 18px 1fr}}table{{display:block;overflow:auto}}}}@media(prefers-reduced-motion:reduce){{html{{scroll-behavior:auto}}}}
+a{{color:var(--blue)}}code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}.shell{{display:grid;grid-template-columns:240px minmax(0,1fr);max-width:1560px;margin:auto}}nav{{position:sticky;top:0;height:100vh;padding:32px 22px;border-right:1px solid var(--line);background:rgba(245,247,251,.94);backdrop-filter:blur(14px)}}nav strong{{display:block;font:800 22px/1.05 ui-rounded,"Arial Rounded MT Bold",sans-serif;letter-spacing:-.04em;margin-bottom:28px}}nav a{{display:block;padding:7px 0;color:var(--muted);text-decoration:none}}nav a:hover,nav a:focus{{color:var(--blue)}}main{{min-width:0;padding:52px clamp(24px,5vw,76px) 100px}}header{{max-width:1080px;padding:0 0 42px;border-bottom:3px solid var(--ink)}}.eyebrow{{font:700 12px/1 ui-monospace,SFMono-Regular,monospace;letter-spacing:.13em;color:var(--blue);text-transform:uppercase}}h1{{max-width:980px;margin:17px 0 16px;font:800 clamp(42px,7vw,82px)/.94 ui-rounded,"Arial Rounded MT Bold",sans-serif;letter-spacing:-.06em}}.lede{{font-size:20px;max-width:900px;color:#37435c}}.verdict{{display:grid;grid-template-columns:16px 1fr;gap:18px;margin:34px 0 0;padding:22px;background:#fff7e5;border:1px solid #e3bd70;border-radius:14px}}.verdict i{{display:block;background:var(--amber);border-radius:20px}}section{{padding:55px 0;border-bottom:1px solid var(--line)}}h2{{margin:0 0 10px;font:800 34px/1.05 ui-rounded,"Arial Rounded MT Bold",sans-serif;letter-spacing:-.035em}}h3{{margin:30px 0 10px;font-size:19px}}.sub{{max-width:940px;color:var(--muted);margin:0 0 26px}}.grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}.card{{position:relative;padding:20px;background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 28px rgba(20,33,61,.05)}}.card:before{{content:"";position:absolute;left:20px;right:20px;top:0;height:3px;background:var(--blue)}}.card strong{{display:block;font-size:24px;line-height:1.1;margin-bottom:8px}}.card small,th small{{display:block;color:var(--muted);font-weight:500}}.ok{{color:var(--mint)}}.warn{{color:var(--amber)}}.bad{{color:var(--red)}}table{{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);font-variant-numeric:tabular-nums}}th,td{{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}thead th{{background:#e9edf5;font:700 12px/1.2 ui-monospace,SFMono-Regular,monospace;letter-spacing:.04em}}tbody th{{white-space:nowrap}}details{{margin:10px 0;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}}summary{{cursor:pointer;padding:13px 16px;font-weight:700}}summary span{{float:right;color:var(--muted);font:500 12px ui-monospace,monospace}}pre{{margin:0;padding:18px;max-height:72vh;overflow:auto;background:var(--code);color:#dce6ff;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-word}}.trace{{display:grid;grid-template-columns:128px 22px 1fr;gap:0 14px;margin:24px 0}}.trace .rail{{position:relative}}.trace .rail:before{{content:"";position:absolute;left:9px;top:0;bottom:-34px;width:2px;background:var(--line)}}.trace .rail:after{{content:"";position:absolute;left:4px;top:6px;width:10px;height:10px;border-radius:50%;background:var(--blue);box-shadow:0 0 0 4px #dfe6ff}}.trace time{{color:var(--muted);font:12px ui-monospace,monospace;padding-top:2px}}.trace p{{margin:0 0 28px}}.tag{{display:inline-block;padding:2px 7px;border-radius:99px;background:#e7ecf6;color:var(--muted);font:700 11px ui-monospace,monospace}}.callout{{margin:18px 0;padding:18px 20px;border-left:4px solid var(--amber);background:#fff8e8}}ul{{padding-left:22px}}footer{{padding-top:35px;color:var(--muted);font:12px ui-monospace,monospace}}@media(max-width:900px){{.shell{{display:block}}nav{{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--line)}}nav a{{display:inline-block;margin-right:14px}}main{{padding-top:36px}}.grid{{grid-template-columns:1fr}}.trace{{grid-template-columns:86px 18px 1fr}}table{{display:block;overflow:auto}}}}@media(prefers-reduced-motion:reduce){{html{{scroll-behavior:auto}}}}
 </style>
 </head>
 <body><div class="shell">
-<nav><strong>Kocoro<br>Harness Review</strong><a href="#verdict">结论</a><a href="#runtime">运行合理性</a><a href="#memory">Memory A/B</a><a href="#prompt">Prompt A/B</a><a href="#layers">完整提示词</a><a href="#comparison">横向对比</a><a href="#gaps">剩余缺口</a><a href="#diff">完整 Diff</a></nav>
+<nav><strong>Kocoro<br>Harness Review</strong><a href="#verdict">结论</a><a href="#evidence">证据来源</a><a href="#runtime">运行与恢复</a><a href="#prompt">132-run Prompt</a><a href="#memory">48-run Memory</a><a href="#layers">Exact Prompts</a><a href="#comparison">设计对比</a><a href="#gaps">未覆盖边界</a><a href="#diff">完整 Diff</a></nav>
 <main>
-<header id="verdict"><div class="eyebrow">worktree evidence / experiment/kocoro-agent-lab / {esc(now)}</div><h1>运行骨架是强的，提示词还没有完成瘦身。</h1><p class="lede">工具轨迹、停止条件、并发、幂等和循环防护已经达到很高水准；但真实 sidecar memory、自然工作质量和完整工具生态仍缺 release 级证据，因此现在不能称为“顶级 harness 已完成”。</p><div class="verdict"><i></i><div><strong>本轮产品决策</strong><br>生产路径移除 memory preflight，由主模型按需调用 <code>memory_recall</code>；保留旧 preflight 仅作实验对照。最终 3× paired A/B 两条路径均 24/24，主模型路径成本低 {memory_cost_reduction:.1f}%、中位延迟快 {memory_median_reduction:.1f}%，但平均延迟因尾部 outlier 慢 {memory_mean_delta:.1f}%，不能宣传为全面提速。</div></div></header>
+<header id="verdict"><div class="eyebrow">artifact-backed review / experiment/kocoro-agent-lab / {esc(now)}</div><h1>分层已落到生产源码；3× benchmark 没有选出候选。</h1><p class="lede">AgentLoop 的工具轨迹、长任务、compaction 与重启 seam 有强离线证据，生产 builder 的 Kocoro / Koe prompts 也可逐字审阅。但 132-run prompt 样本每 cell 只有 3 次，明确 <code>release_qualifying=false</code>；它用于比较，不足以宣称 release-ready 或估算稀有失败。</p><div class="verdict"><i></i><div><strong>当前判定：no candidate / no improvement</strong><br>{esc(prompt_report['selection_reason'])} <code>layered_conditional_v1</code> 只是 observed efficiency leader，不是可上线 winner。Memory A/B 支持移除固定 preflight：两路均 24/24，主模型路径成本低 {memory_cost_reduction:.1f}%、平均延迟低 {memory_mean_reduction:.1f}%、中位延迟低 {memory_median_reduction:.1f}%；该结论仍限于 synthetic memory routing。</div></div></header>
 
-<section id="runtime"><div class="eyebrow">01 / trajectory, not pass count</div><h2>整体运行合理性</h2><p class="sub">判断单位是完整轨迹：模型调用次数 = 工具轮数 + 最终回答；精确工具名和参数；串行依赖、并行同轮；空结果后停止；副作用不重复；结果变化时不能误杀。</p><div class="grid"><div class="card"><strong class="ok">132 / 132</strong>live prompt runs 工具轨迹正确<small>11 workloads × 4 variants × 3 reps</small></div><div class="card"><strong class="ok">0</strong>重复工具与重复副作用<small>无 retry；completion 拓扑合理</small></div><div class="card"><strong class="ok">0 / 10</strong>loop corpus 误杀或漏检<small>5 productive + 5 genuine loops</small></div></div>
-<div class="trace"><time>productive</time><span class="rail"></span><p>同参数 polling 只要观察结果持续变化，允许到达完成；多来源研究、浏览器多步、不同 HTTP 批次均未触发。</p><time>warning</time><span class="rail"></span><p>无进展的 identical polling 在第 3 次提醒；ping-pong 在第 6 次提醒，给模型一次修正机会。</p><time>force stop</time><span class="rail"></span><p>持续无进展才强停。危险 read loop 会在执行前阻断整个批次，避免“部分批次已经产生副作用”。</p><time>recovery</time><span class="rail"></span><p>写工具的 post-dispatch transport error 不重放；只有明确 replay-safe 的工具才恢复。daemon idempotency 可重放交付回执，不重复 LLM 或副作用。</p></div>
-{code_block('离线 loop detector 完整结果', json.dumps(loop_report, ensure_ascii=False, indent=2))}</section>
+<section id="evidence"><div class="eyebrow">01 / immutable inputs</div><h2>证据来源与校验</h2><p class="sub">生成器对 schema、run 数、repetition 数、no-candidate 状态和 loop corpus 结果 fail closed。表中 SHA-256 对应本次嵌入的真实 artifact；离线 gate log 是本次重新执行的测试输出。</p><table><thead><tr><th>Artifact</th><th>SHA-256</th><th>大小</th></tr></thead><tbody>{provenance_rows(artifact_paths)}</tbody></table><div class="callout"><strong>Branch：</strong><code>{esc(branch_base)}</code> (origin/main) … <code>{esc(branch_head)}</code> (生成器 commit 时的 HEAD)。报告末尾嵌入除本 HTML 外的完整分支 diff。</div></section>
 
-<section id="memory"><div class="eyebrow">02 / model-driven recall</div><h2>Memory：去掉 preflight 的收益主要是成本</h2><p class="sub">最终 2026-08-07 live 配对测试，3 repetitions、48 total runs。fake session_search 的 <code>Info()</code> 直接复用生产 <code>SessionSearchTool.Info()</code>，因此模型看到的工具名称、description 与参数 schema 和真实运行一致；只有 <code>Run()</code> 使用确定性 fixture。synthetic Ready service 只测路由、调用、答案忠实度、延迟与成本；不代表真实用户 bundle、sidecar 检索或排序质量。</p><table><thead><tr><th>路径</th><th>总正确</th><th>正例路由</th><th>路由效率</th><th>正例答案</th><th>负例误召回</th><th>平均延迟</th><th>总成本</th></tr></thead><tbody>{memory_rows(memory_report)}</tbody></table>
-<div class="callout"><strong>最终结果：</strong>失败 {len(memory_failures)} 条。主模型路径平均 {ms(model_memory['mean_latency_ms'])}，旧 preflight {ms(preflight_memory['mean_latency_ms'])}；正例主模型更慢，但负例更快，provider 尾延迟仍显著。调试中的旧 harness 曾漏注册 session_search、误把 honorific 当必需、把多余复查算成功；这些 evaluator 缺陷已修复后才得到本表。</div>
-{code_block('最新 Memory A/B 原始 JSON', json.dumps(memory_report, ensure_ascii=False, indent=2))}</section>
+<section id="runtime"><div class="eyebrow">02 / real AgentLoop seams</div><h2>运行轨迹、长任务、compaction 与恢复</h2><p class="sub">这里不以“测试数量”代替行为证据：live prompt benchmark 走生产 AgentLoop/provider 和确定性 in-memory tools；离线 gate 直接走 AgentLoop、checkpoint、CompactionCheckpointMessages、session Store round-trip、HistoryForLoop 与 ResumeInterrupted。</p><div class="grid"><div class="card"><strong class="ok">{correct_prompt_tool_runs} / 132</strong>live 工具轨迹正确<small>任务结果 {successful_prompt_tasks}/132；差异来自 minimal stress control 的 1 次答案失败</small></div><div class="card"><strong class="ok">0</strong>重复工具 / 重复副作用<small>132-run benchmark 的 observed executions</small></div><div class="card"><strong class="ok">10 / 10</strong>loop corpus<small>{loop_report['productive_count']} productive + {loop_report['loop_count']} genuine loops；false={loop_report['false_signals']}，missed={loop_report['missed_loops']}</small></div></div>
+<div class="trace"><time>14-step read</time><span class="rail"></span><p>14 个不同只读步骤完整结束；每步只执行一次，lossless RunMessages 保留全部 tool result。生产循环允许一次有界 progress/nudge provider turn，但没有误杀长轨迹。</p><time>compaction</time><span class="rail"></span><p>增长 usage 触发 proactive compaction；live checkpoint 比 archive 小且带 production marker，lossless archive 保持独立。</p><time>process restart</time><span class="rail"></span><p>checkpoint 写入真实 session Store，再加载并经 HistoryForLoop 选择 compacted live state；新 AgentLoop 可读回最终 STEP-14。</p><time>interruption</time><span class="rail"></span><p>第 6 步取消后，RunMessages 只含 6 个完成结果；ResumeInterrupted 从第 7 步继续到第 10 步，全部步骤最终各执行一次。</p></div>
+<div class="callout"><strong>离线边界：</strong>这些 gate 使用确定性 provider/tool fixture 来验证 runtime 拓扑，不证明真实模型的写作、研究、规划质量，也不模拟外部服务在 commit 与 receipt 之间崩溃。</div>
+{code_block('离线 runtime gate 实际输出' if offline_gate_log else '离线 runtime gate 日志未提供', offline_gate_log or 'No offline gate log was supplied to the generator.', True)}
+{code_block('离线 loop detector 完整 artifact', json.dumps(loop_report, ensure_ascii=False, indent=2))}</section>
 
-<section id="prompt"><div class="eyebrow">03 / controlled prompt experiment</div><h2>提示词：当前正确，但明显过重</h2><p class="sub">这不是 Fast/Full 对决，而是固定同一 AgentLoop、工具、模型和 workload，仅替换 system instructions。reported winner 只在允许上线的候选中选择；minimal 是压力对照，不能被选择器自动上线。</p><table><thead><tr><th>Variant</th><th>任务</th><th>工具</th><th>P50</th><th>P95</th><th>均值 input tokens</th><th>成本</th></tr></thead><tbody>{prompt_rows(prompt_report)}</tbody></table>
-<div class="grid" style="margin-top:14px"><div class="card"><strong>{len(full['system']):,} chars</strong>代表性 Koe system prompt<small>实际每个 registry / agent 会变化</small></div><div class="card"><strong class="ok">minimal_v1</strong>实测效率最佳<small>P95 {ms(minimal['total_p95_millis'])}，但覆盖不足，不可上线</small></div><div class="card"><strong class="warn">layered_conditional_v1</strong>合格生产候选<small>tokens 比 current 少 {(1-conditional['input_tokens_mean']/current['input_tokens_mean'])*100:.0f}%，但首语义更慢</small></div></div>
-<p><strong>结论：</strong>提示词优化还没好。当前 production 在 33/33 任务与工具轨迹上稳定，但 26k 级 system instructions 是明显负担；不能直接换 minimal，也不能因为 selector 报 conditional winner 就宣称全局最佳。</p>
-{code_block('Prompt live comparison 原始 JSON', json.dumps(prompt_report, ensure_ascii=False, indent=2))}</section>
+<section id="prompt"><div class="eyebrow">03 / 132 live runs, 3x per cell</div><h2>Prompt benchmark：完整 tail、paired 与 no-candidate 结论</h2><p class="sub">11 workloads × 4 variants × 3 matched repetitions；同一 AgentLoop、工具、Luna Fast 模式和 workload，仅替换 system instructions。三次 repetition 达到 comparison 门槛但远低于每 workload 30 次的 release 门槛。<code>minimal_v1</code> 是不可上线的 stress control。</p><div class="grid"><div class="card"><strong class="warn">{prompt_report['winner_status']}</strong>选择器结论<small>{esc(prompt_report['selection_reason'])}</small></div><div class="card"><strong class="bad">release = false</strong>不是 release-ready<small>minimum release repetitions = {prompt_report['minimum_release_repetitions']}</small></div><div class="card"><strong>{usd(prompt_report['reported_cost_usd'])}</strong>observed provider cost<small>{prompt_report['completed']} completed；randomized matched blocks</small></div></div>
+<h3>Aggregate latency / correctness</h3><table><thead><tr><th>Variant</th><th>任务</th><th>工具</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th><th>均值 input</th><th>成本</th></tr></thead><tbody>{prompt_rows(prompt_report)}</tbody></table>
+<p class="sub">P99 在 33-run variant 上等于或接近最慢 observation，必须和 max、slowest runs 一起读。<code>layered_v1</code> 虽然 P50 最快，但 P95/P99/Max 最差；<code>minimal_v1</code> 尾部较短，却在 <code>current_search_once</code> repetition 2 产生任务错误。</p>
+<h3>Matched-pair delta（candidate − current）</h3><table><thead><tr><th>Candidate</th><th>Pairs</th><th>胜 / 负 / 平</th><th>胜率</th><th>Δ P50</th><th>Δ P95</th><th>Δ P99</th><th>Δ Min / Max</th></tr></thead><tbody>{paired_rows(prompt_report)}</tbody></table>
+<p class="sub">负 delta 表示 candidate 更快。三组 candidate 的 median paired delta 都略快，但 P95/P99 delta 均为正，说明尾部存在更慢 matched pairs；这正是不能只看 aggregate P50 或“win rate”的原因。</p>
+<h3>每个 variant 最慢三次</h3><table><thead><tr><th>Variant / rank</th><th>Workload</th><th>Rep</th><th>Schedule</th><th>Latency</th></tr></thead><tbody>{outlier_rows(prompt_report)}</tbody></table>
+<div class="callout"><strong>唯一 observed task failure：</strong>{esc(json.dumps(prompt_failures, ensure_ascii=False))}。所有 132 个工具轨迹仍正确，说明 evaluator 将“执行拓扑正确”和“最终任务答案正确”分开计数。</div>
+{code_block('Prompt 132-run 原始 JSON', json.dumps(prompt_report, ensure_ascii=False, indent=2))}</section>
 
-<section id="layers"><div class="eyebrow">04 / exact assembled text</div><h2>Kocoro / Koe Full / Koe Fast 完整提示词</h2><p class="sub">Koe 不是另一套人格。Kocoro base prompt 进入共享 system；Koe Full 与 Fast 使用相同 system/stable context，Fast 仅在 volatile context 增加 outcome-first 规则。下面由 production builder 实际导出，非手工摘要。</p>
-<h3>Kocoro 层</h3>{code_block('defaultPersona（含 persona_note）', layers['default_persona'], True)}{code_block('coreOperationalRules', layers['core_operational_rules'])}{code_block('contrastExamplesCore', layers['core_contrast_examples'])}{code_block('Kocoro base prompt（上述三层完整拼接）', layers['kocoro_base_prompt'])}
-<h3>Koe Full</h3>{code_block('Full / system', full['system'])}{code_block('Full / stable_context', full['stable_context'])}{code_block('Full / volatile_context', full['volatile_context'], True)}
-<h3>Koe Fast</h3>{code_block('Fast / system（与 Full 字节相同）', fast['system'])}{code_block('Fast / stable_context', fast['stable_context'])}{code_block('Fast / volatile_context（含 Fast Task）', fast['volatile_context'], True)}
-<h3>条件层</h3>{code_block('cloud_delegation_guidance', layers['cloud_delegation_guidance'])}{code_block('cloud contrast examples', layers['cloud_contrast_examples'])}</section>
+<section id="memory"><div class="eyebrow">04 / 48 paired synthetic-memory runs</div><h2>Memory A/B：主模型 recall 降低固定 helper 成本</h2><p class="sub">3 repetitions、48 total runs。模型看到生产 <code>SessionSearchTool.Info()</code> 的名称、description 与 schema；Run 和 Ready memory service 使用 deterministic fixture。它测路由、调用、答案忠实度、延迟和成本，不测真实 sidecar bundle 的生成、检索与排序质量。</p><table><thead><tr><th>路径</th><th>总正确</th><th>正例路由</th><th>路由效率</th><th>正例答案</th><th>负例误召回</th><th>平均延迟</th><th>总成本</th></tr></thead><tbody>{memory_rows(memory_report)}</tbody></table>
+<div class="grid" style="margin-top:14px"><div class="card"><strong class="ok">24 / 24 × 2</strong>两路答案与路由均正确<small>18 positive + 6 negative per variant</small></div><div class="card"><strong class="ok">−{memory_cost_reduction:.1f}%</strong>主模型路径成本<small>{usd(model_memory['total_cost_usd'])} vs {usd(preflight_memory['total_cost_usd'])}</small></div><div class="card"><strong class="ok">−{memory_mean_reduction:.1f}% / −{memory_median_reduction:.1f}%</strong>平均 / 中位延迟<small>{ms(model_memory['mean_latency_ms'])} vs {ms(preflight_memory['mean_latency_ms'])}</small></div></div>
+<div class="callout"><strong>失败 {len(memory_failures)} 条。</strong>主模型路径避免了 {preflight_memory['preflight_helpers']} 次 preflight helper，同时按需发出 {model_memory['explicit_queries']} 次 explicit memory queries 和 {model_memory['session_search_queries']} 次 session search。这个成本/延迟优势不能外推为真实用户 memory recall accuracy。</div>
+{code_block('Memory 48-run 原始 JSON', json.dumps(memory_report, ensure_ascii=False, indent=2))}</section>
 
-<section id="comparison"><div class="eyebrow">05 / local source snapshots</div><h2>Codex / Hermes / OpenClaw 对比</h2><p class="sub">基于本地 study checkout：Codex 7a0e974e08、Hermes 8f2712725、OpenClaw 0ce5e358d4b。比较的是设计方法，不把 coding-agent 专用规则原样搬进日常助手。</p><table><thead><tr><th>系统</th><th>Prompt 组织</th><th>工具/循环</th><th>Memory</th><th>Kocoro 应吸收什么</th></tr></thead><tbody>
-<tr><th>Codex</th><td>model base instructions + developer/user layers；运行边界由 sandbox/approval/goal 状态承载</td><td>强 runtime contract 与恢复证据，不主要依赖“多写几句提示词”</td><td>线程状态、生成/污染模式分离</td><td>把不变量下沉到 runtime；提示词只保留模型必须判断的语义</td></tr>
-<tr><th>Hermes</th><td>stable/workspace/trailing 分层，cache-aware builder；personality、skills、memory 可插拔</td><td>较高 max turns，依赖分层上下文和专门子流程</td><td>provider 插件 + prompt block，也有 query rewrite helper</td><td>保留 Kocoro 的 stable/volatile 缓存设计；不要默认增加 helper</td></tr>
-<tr><th>OpenClaw</th><td>大型 section builder + cache boundary + channel/plugin additions</td><td>generic repeat、known-poll no-progress、ping-pong detector；完整 loop detection 默认可配置</td><td>memory_search + exclusive memory plugin slot</td><td>Kocoro 当前 outcome-aware detector 更积极；应继续补真实工具生态回放</td></tr>
-<tr><th>Kocoro</th><td>persona + core rules + examples + static/stable/volatile</td><td>9 类 detector、批次前阻断、幂等/unknown-outcome 合约</td><td>sidecar + session/MEMORY fallback；现改为主模型主动 recall</td><td>运行骨架领先项保留，26k prompt 继续按证据减重</td></tr></tbody></table></section>
+<section id="layers"><div class="eyebrow">05 / production builder exact output</div><h2>Kocoro / Koe Full / Koe Fast exact prompts</h2><p class="sub">以下文本由当前 production builder 导出，不是手工摘要。该 audit 使用代表性的本地工具集，刻意不含每用户 MCP、gateway、instructions、memory、cwd 和 sticky context，因此真实请求会按 registry/session 变化。Full/Fast 的 system 与 stable context 字节相同；Fast 只在 volatile context 增加 {fast_volatile_addition:,} chars 的 outcome/search guidance。Full/Fast 只是本节的两种执行 profile，不是整份 harness review 的中心。</p>
+<div class="grid"><div class="card"><strong>{len(layers['kocoro_base_prompt']):,}</strong>Kocoro base chars<small>persona + core rules + boundary examples</small></div><div class="card"><strong>{len(full['system']):,}</strong>Full / Fast system chars<small>exactly identical in artifact</small></div><div class="card"><strong>{len(full['volatile_context']):,} / {len(fast['volatile_context']):,}</strong>Full / Fast volatile chars<small>stable context both {len(full['stable_context']):,}</small></div></div>
+<h3>Kocoro exact assembled base</h3>{code_block('Kocoro base prompt', layers['kocoro_base_prompt'], True)}{code_block('defaultPersona', layers['default_persona'])}{code_block('coreOperationalRules', layers['core_operational_rules'])}{code_block('contrastExamplesCore', layers['core_contrast_examples'])}
+<h3>Koe Full exact assembled request layers</h3>{code_block('Koe Full / system', full['system'], True)}{code_block('Koe Full / stable_context', full['stable_context'], True)}{code_block('Koe Full / volatile_context', full['volatile_context'], True)}
+<h3>Koe Fast exact assembled request layers</h3>{code_block('Koe Fast / system', fast['system'], True)}{code_block('Koe Fast / stable_context', fast['stable_context'], True)}{code_block('Koe Fast / volatile_context', fast['volatile_context'], True)}
+<h3>Conditional production layers</h3>{code_block('cloud_delegation_guidance', layers['cloud_delegation_guidance'])}{code_block('cloud contrast examples', layers['cloud_contrast_examples'])}
+{code_block('Prompt audit 原始 JSON', json.dumps(prompt_audit, ensure_ascii=False, indent=2))}</section>
 
-<section id="gaps"><div class="eyebrow">06 / still open</div><h2>当前仍未关闭的缺口</h2><table><thead><tr><th>优先</th><th>缺口</th><th>为什么重要</th><th>完成标准</th></tr></thead><tbody>
-<tr><th><span class="tag">NOW</span></th><td>真实 sidecar / 用户 bundle memory E2E</td><td>现有 A/B 是 deterministic service，不能证明 nightly replay、实体解析和真实召回率</td><td>隔离 bundle，至少 3 repetitions；路由、query shape、with-data、答案忠实度分别统计</td></tr>
-<tr><th><span class="tag">NOW</span></th><td>自然日常工作质量</td><td>receipt workload 擅长查“是否照流程跑”，不测写信、总结、规划、语音短答是否好用</td><td>盲评 rubric + 可复现 fixtures，质量与速度分开</td></tr>
-<tr><th><span class="tag">NEXT</span></th><td>真实 MCP / browser / computer / apps registry</td><td>当前 prompt A/B 使用 in-memory tools，无法覆盖 auth、UI state、tool_search 大 catalog</td><td>本地 dev daemon 的 read-only 和可回滚写入 seam</td></tr>
-<tr><th><span class="tag">NEXT</span></th><td>长轨迹与崩溃恢复</td><td>3-call serial 不代表 10+ steps、compaction、外部写后进程崩溃</td><td>checkpoint + receipt + restart，证明不重复副作用</td></tr>
-<tr><th><span class="tag">NEXT</span></th><td>跨 profile / provider 与稀有失败率</td><td>3 reps 只能用于比较，不能估算 1% 以下失败</td><td>Fast/Full 各自固定模型条件，扩大样本并报告置信区间</td></tr></tbody></table></section>
+<section id="comparison"><div class="eyebrow">06 / architecture, not imitation</div><h2>横向设计对比</h2><p class="sub">比较的是 prompt/runtime 边界的方法，不把 coding-agent 专用规则原样移植到通用助手。</p><table><thead><tr><th>系统</th><th>Prompt 组织</th><th>工具与恢复</th><th>Kocoro 取舍</th></tr></thead><tbody>
+<tr><th>Codex</th><td>model base + developer/user layers；动态权限与目标由 runtime 状态承载</td><td>强调 sandbox、approval、持久状态与可验证工具结果</td><td>把 runtime 可执行的不变量从长提示词中移出</td></tr>
+<tr><th>Hermes</th><td>stable/workspace/trailing 分层，cache-aware builder</td><td>personality、skills、memory 可插拔，也使用 helper</td><td>保留 stable/volatile 分层；helper 必须用实测收益证明</td></tr>
+<tr><th>OpenClaw</th><td>section builder + cache boundary + channel/plugin additions</td><td>repeat/no-progress/ping-pong detectors 可配置</td><td>继续保留 outcome-aware detector，并扩展真实工具生态回放</td></tr>
+<tr><th>Kocoro</th><td>当前源码已拆 persona、core rules、boundary examples、stable/volatile</td><td>批次前 loop 阻断、checkpoint、compaction、idempotency 与 outcome_unknown</td><td>运行骨架有证据；prompt 候选仍需 ≥30 matched reps 与自然质量评测</td></tr></tbody></table></section>
 
-<section id="diff"><div class="eyebrow">07 / source of truth</div><h2>完整修改 Diff</h2><p class="sub">范围为 <code>origin/main...HEAD</code> 的完整分支差异，加上生成本报告前的未提交差异；HTML 自身被排除，避免递归嵌套。</p>{code_block('完整 diff', full_diff)}</section>
-<footer>Generated by scripts/generate-agent-harness-report.py · evidence files remain machine-readable · no external assets</footer>
+<section id="gaps"><div class="eyebrow">07 / explicit non-claims</div><h2>未覆盖边界</h2><p class="sub">这些不是“以后再补”的装饰项，而是当前报告不能作出的产品声明。</p><table><thead><tr><th>优先</th><th>未覆盖</th><th>当前能证明什么</th><th>关闭标准</th></tr></thead><tbody>
+<tr><th><span class="tag">NOW</span></th><td>自然写作、研究、规划与语音答案质量</td><td>离线 gate 只证明 general-purpose prompt contract 到达 provider；不证明输出好用</td><td>盲评 rubric、固定任务与对照；质量、延迟、成本分开</td></tr>
+<tr><th><span class="tag">NOW</span></th><td>真实 sidecar / 用户 bundle memory</td><td>48-run synthetic A/B 证明 routing seam，不证明真实召回率</td><td>隔离真实 bundle，统计 query、with-data、答案忠实度和 no-data</td></tr>
+<tr><th><span class="tag">NOW</span></th><td>3× prompt rare-failure / release qualification</td><td>比较样本有效，明确不是 release-ready</td><td>每 workload ≥30 complete matched repetitions，产品 correctness gate 全通过并报告置信区间</td></tr>
+<tr><th><span class="tag">NEXT</span></th><td>真实 MCP / browser / computer / signed-in apps</td><td>当前 benchmark 的工具确定性且无外部写入</td><td>dev daemon 上 read-only 与可回滚写入，包含 auth、UI state、tool_search catalog</td></tr>
+<tr><th><span class="tag">NEXT</span></th><td>外部写 commit 后进程崩溃</td><td>本地 restart 证明 checkpoint 连续性和无工具重放；不覆盖远端 outcome_unknown</td><td>故障注入 commit/receipt 窗口，按 idempotency key 对账并 fail closed</td></tr>
+<tr><th><span class="tag">NEXT</span></th><td>物理 Koe 音频链路</td><td>本报告含 exact voice-facing prompt 与 source=kocoro topology；不含 mic/AEC/VAD/barge-in</td><td>真实设备、声学环境、端到端 latency 与中断体验</td></tr></tbody></table>
+<h3>Artifact 自带 coverage boundaries</h3>{bullet_list(prompt_report['coverage_boundaries'] + memory_report['coverage_boundaries'])}</section>
+
+<section id="diff"><div class="eyebrow">08 / complete branch evidence</div><h2>完整 branch diff</h2><p class="sub">下面是 <code>origin/main...HEAD</code> 的完整代码/脚本差异，并追加生成时仍存在的 tracked working-tree diff。为避免 HTML 把自身无限递归嵌入，唯一排除项是 <code>docs/agent-harness-review.html</code>；生成器 <code>scripts/generate-agent-harness-report.py</code> 已先提交，因此明确包含在此 diff 中。范围：<code>{esc(branch_base)}...{esc(branch_head)}</code>。</p>{code_block('完整 diff（仅排除本 HTML）', full_diff)}</section>
+<footer>Generated by scripts/generate-agent-harness-report.py · self-contained · no external assets · HTML excluded from embedded diff only to prevent recursion</footer>
 </main></div></body></html>"""
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(document, encoding="utf-8")
