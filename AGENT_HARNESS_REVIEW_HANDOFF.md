@@ -14,6 +14,7 @@ This handoff records evidence and open questions. It is not merge or release aut
 - Branch: `experiment/kocoro-agent-lab`
 - Merge base with `origin/main`: `57421c63`
 - Functional/report source HEAD: `574e9d3b`
+- Desktop-packaged helper source HEAD: `41ac542f` (`574e9d3b` plus this handoff document only)
 - Diff at handoff start: 81 files, 32,336 insertions, 1,002 deletions
 - Self-contained review: `docs/agent-harness-review.html`
 - The HTML embeds the full `origin/main...HEAD` code/script diff except the HTML itself, which is excluded to prevent recursive embedding.
@@ -101,6 +102,27 @@ Both prompt and quality live samples use three repetitions per cell/case and exp
 - The binary was not installed, did not replace the active daemon, and did not modify Desktop.
 - This repository has no Dockerfile. Its documented build is native Go; no Docker build was claimed.
 
+### Desktop integration build now running
+
+- Desktop build worktree: `/Users/hu/Desktop/projects/kocoro-projects/ShanClawDesktop-agent-lab-build`
+- Desktop source: detached `6b88a89` from `ShanClawDesktop/main`
+- Build command:
+
+  ```bash
+  SHAN_REPO=/Users/hu/Desktop/projects/kocoro-projects/ShanClaw-agent-lab \
+    KOE_CGO=1 \
+    bash scripts/dev-build.sh --helper
+  ```
+
+- App: `/Users/hu/Library/Developer/Xcode/DerivedData/KocoroDesktop-dev/Build/Products/Debug/Kocoro Desktop.app`
+- Embedded helper version: `0.4.2-46-g41ac542f`
+- Embedded helper SHA-256: `8b9117b1dfa565c412f679ca822ea3eb656e40ddc93fdaa910edcbbbe4bc5b5d`
+- Helper format: Mach-O arm64 with working Koe; `shan koe --help` contains the Koe-only `--control-port` flag.
+- Desktop, Kocoro Engine, and Kocoro AX are signed by `Apple Development: awakehsh@gmail.com (728Q8GDGQQ)`, Team ID `K6JGB6ACQC`.
+- The official dev build performed a clean Xcode build, stopped the previous fixed-path Desktop/helper/KOE processes, passed its signature gate, and relaunched the app.
+- Runtime verification after launch: Desktop, daemon, and Koe process paths all resolve inside this app; PID 58579 listens on `127.0.0.1:7533`; `/status` reports version `0.4.2-46-g41ac542f`, `is_connected=true`, and `memory.provider=disabled`.
+- The build did not set `KOCORO_INTEGRATION_BUILD`; this is the normal signed Debug profile with a local arm64 cgo Koe helper, not an integration-tagged or release build.
+
 ## Review risks and open questions
 
 1. **Production prompt changed without a benchmark winner.** The final architecture is more compact and all deterministic gates passed, but the prompt comparison correctly selected `no_improvement`. Decide whether architectural simplification plus preserved observed correctness is sufficient, or whether deployment should wait for larger paired/human-quality evidence.
@@ -114,6 +136,7 @@ Both prompt and quality live samples use three repetitions per cell/case and exp
 9. **Some report baselines remain historical constants.** The final Fast input and latency are parsed from the supplied Koe runtime log, but historical before values and tool-array character counts are encoded in the generator. Verify their raw source logs before treating report regeneration as fully self-contained provenance.
 10. **Report source artifacts live under `/tmp`.** The HTML embeds their contents and hashes, but regenerating it later requires rerunning the harnesses or preserving those artifacts elsewhere.
 11. **The branch is broad.** It includes selector admission, loop behavior, memory routing, prompt policy, tool exposure, tests, and a large self-contained HTML. Review and possible integration should be split by behavioral risk, even if the experiment branch stays intact.
+12. **The running Desktop is a signed Debug build.** It now exercises this helper, but it is not a release archive/DMG. Runtime status confirms memory is disabled, so Desktop review must not treat ordinary conversations as real-sidecar memory evidence.
 
 ## Suggested review order
 
@@ -134,6 +157,11 @@ git diff --check
 git diff --stat origin/main...HEAD
 go test ./... -count=1
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig go build ./...
+
+cd /Users/hu/Desktop/projects/kocoro-projects/ShanClawDesktop-agent-lab-build
+SHAN_REPO=/Users/hu/Desktop/projects/kocoro-projects/ShanClaw-agent-lab \
+  KOE_CGO=1 bash scripts/dev-build.sh --helper
+curl -fsS http://127.0.0.1:7533/status
 ```
 
 The paid live lanes and exact artifact-generation commands are documented in `docs/agent-harness-review.html` and the corresponding test/script entry points. Reuse the existing local provider credentials only for explicitly authorized E2E, never print them, keep response cache off for comparisons, and preserve daemon state/port isolation.
