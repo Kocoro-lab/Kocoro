@@ -361,7 +361,6 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// sidecar is up (or memory is disabled), register with a typed-nil
 	// MemoryQuerier so the tool falls back to session_search + MEMORY.md.
 	var memQuerier tools.MemoryQuerier
-	var memPreflightQuerier tools.MemoryPreflightQuerier
 	memCfg := memory.LoadConfigFromRuntime(runCfg)
 	if memCfg.Provider != "" && memCfg.Provider != "disabled" {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -370,17 +369,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		if ready {
 			attached := memory.NewAttachedQuerier(memCfg.SocketPath, memCfg.ClientRequestTimeout)
 			memQuerier = attached
-			memPreflightQuerier = attached
 		}
 	}
 	tools.RegisterMemoryTool(reg, memQuerier, &cliMemoryFallback{sessionMgr: sessMgr})
-	if memPreflightQuerier != nil {
-		var helperLLM client.LLMClient
-		if gw != nil {
-			helperLLM = gw
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(memPreflightQuerier, helperLLM))
-	}
 
 	sess := sessMgr.NewSession()
 	sess.Title = sessionTitleFromQuery(query)

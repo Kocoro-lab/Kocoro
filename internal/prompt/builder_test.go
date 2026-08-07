@@ -531,6 +531,23 @@ func TestBuildSystemPrompt_MemoryGuidanceTracksEvidenceStrength(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_MemoryRoutingIsModelDriven(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
+	for _, rule := range []string{
+		"call memory_recall whenever the answer depends on the user's private past",
+		"do not say remember or recall",
+		"use session_search to identify it instead of guessing a structured-memory anchor",
+		"do not retry the same target with alternate relation names or modes",
+	} {
+		if !strings.Contains(parts.System, rule) {
+			t.Errorf("system memory routing missing %q", rule)
+		}
+	}
+	if strings.Contains(parts.System, "system pre-fetches relevant records") {
+		t.Fatal("production prompt still advertises implicit memory preflight")
+	}
+}
+
 func TestBuildSystemPrompt_MemoryTruncation(t *testing.T) {
 	bigMemory := strings.Repeat("m", maxMemoryChars+500)
 	parts := BuildSystemPrompt(PromptOptions{

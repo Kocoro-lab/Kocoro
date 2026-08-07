@@ -211,6 +211,7 @@ type koeQualificationRunReport struct {
 	CompletionCalls               int      `json:"completion_calls"`
 	ToolIterations                int      `json:"tool_iterations"`
 	ToolCalls                     int      `json:"tool_calls"`
+	ToolSequence                  []string `json:"tool_sequence,omitempty"`
 	DuplicateModelCalls           int      `json:"duplicate_model_calls"`
 	DuplicateToolExecutions       int      `json:"duplicate_tool_executions"`
 	SideEffectExecutions          int      `json:"side_effect_executions"`
@@ -2162,6 +2163,7 @@ func runKoeQualificationJob(
 		CompletionCalls:               len(requests),
 		ToolIterations:                toolIterations,
 		ToolCalls:                     len(toolCalls),
+		ToolSequence:                  koeQualificationToolSequence(toolCalls),
 		DuplicateModelCalls:           koeQualificationDuplicateCalls(toolCalls),
 		DuplicateToolExecutions:       duplicateToolExecutions,
 		SideEffectExecutions:          sideEffectExecutions,
@@ -2680,6 +2682,30 @@ func koeQualificationToolCalls(
 		}
 	}
 	return calls, iterations
+}
+
+func TestKoeQualificationToolSequencePreservesExecutionOrder(t *testing.T) {
+	calls := []client.FunctionCall{
+		{Name: "first"},
+		{Name: "second"},
+		{Name: "first"},
+	}
+	got := koeQualificationToolSequence(calls)
+	want := []string{"first", "second", "first"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("sequence=%v, want %v", got, want)
+	}
+}
+
+func koeQualificationToolSequence(calls []client.FunctionCall) []string {
+	if len(calls) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		names = append(names, call.Name)
+	}
+	return names
 }
 
 func koeQualificationToolIterationsForName(

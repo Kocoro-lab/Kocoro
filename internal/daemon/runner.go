@@ -3517,13 +3517,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// always-allow entry past the handler-side gate.
 	loop.SetUnattendedRun(unattendedRun)
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())
-	if deps.MemSvc != nil {
-		var helperLLM client.LLMClient
-		if deps.GW != nil {
-			helperLLM = deps.GW
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(deps.MemSvc, helperLLM))
-	}
 	loop.SetTimeBasedCompactConfig(agent.TimeBasedCompactConfig{
 		Enabled:             runCfg.Agent.TimeBasedCompact.Enabled,
 		GapThresholdMinutes: runCfg.Agent.TimeBasedCompact.GapThresholdMinutes,

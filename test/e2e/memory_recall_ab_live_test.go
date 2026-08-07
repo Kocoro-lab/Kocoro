@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -161,11 +162,43 @@ func TestLive_MemoryRecallPreflightAB(t *testing.T) {
 	}
 
 	summary := summarizeMemoryRecallAB(results)
+	if outputPath := strings.TrimSpace(os.Getenv("KOCORO_MEMORY_AB_OUTPUT")); outputPath != "" {
+		report := map[string]any{
+			"schema_version":       "kocoro.memory_recall_ab.v1",
+			"generated_at":         time.Now().UTC().Format(time.RFC3339Nano),
+			"repetitions_per_cell": repetitions,
+			"results":              results,
+			"summary":              summary,
+			"coverage_boundaries": []string{
+				"Uses deterministic synthetic memory responses, not a user's private sidecar bundle.",
+				"Measures routing, answer fidelity, calls, latency, tokens, and cost; it does not measure bundle training quality.",
+			},
+		}
+		if err := writeMemoryRecallABJSON(outputPath, report); err != nil {
+			t.Fatalf("write memory A/B report: %v", err)
+		}
+	}
 	body, err := json.Marshal(summary)
 	if err != nil {
 		t.Fatalf("marshal memory A/B summary: %v", err)
 	}
 	t.Logf("memory_ab_summary=%s", body)
+}
+
+func writeMemoryRecallABJSON(path string, report any) error {
+	body, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func memoryRecallABRepetitions(t *testing.T) int {

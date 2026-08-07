@@ -130,34 +130,37 @@ type kocoroPromptVariantCellSummary struct {
 }
 
 type kocoroPromptExperimentReport struct {
-	SchemaVersion           int                              `json:"schema_version"`
-	GeneratedAt             string                           `json:"generated_at"`
-	Complete                bool                             `json:"complete"`
-	Completed               int                              `json:"completed"`
-	Scheduled               int                              `json:"scheduled"`
-	Repetitions             int                              `json:"repetitions_per_cell"`
-	Seed                    int64                            `json:"seed"`
-	Randomized              bool                             `json:"randomized"`
-	SampleQualifying        bool                             `json:"sample_qualifying"`
-	ComparisonScope         string                           `json:"comparison_scope"`
-	ControlledMode          string                           `json:"controlled_mode"`
-	Winner                  string                           `json:"winner,omitempty"`
-	WinnerStatus            string                           `json:"winner_status"`
-	SelectionReason         string                           `json:"selection_reason"`
-	MaxCostUSD              float64                          `json:"max_cost_usd"`
-	ReportedCostUSD         float64                          `json:"reported_cost_usd"`
-	CostObserved            bool                             `json:"cost_observed"`
-	Variants                []kocoroPromptVariantMetadata    `json:"variants"`
-	Workloads               []string                         `json:"workloads"`
-	Runs                    []koeQualificationRunReport      `json:"runs"`
-	Summary                 []kocoroPromptVariantSummary     `json:"summary"`
-	ComparisonSummary       []kocoroPromptVariantSummary     `json:"comparison_summary"`
-	ProductGatePassed       bool                             `json:"product_gate_passed"`
-	ComparisonGatePassed    bool                             `json:"comparison_gate_passed"`
-	UniversalFailures       []kocoroPromptMatchedFailure     `json:"universal_failures"`
-	VariantSpecificFailures []kocoroPromptMatchedFailure     `json:"variant_specific_failures"`
-	Cells                   []kocoroPromptVariantCellSummary `json:"cells"`
-	CoverageBoundaries      []string                         `json:"coverage_boundaries"`
+	SchemaVersion            int                              `json:"schema_version"`
+	GeneratedAt              string                           `json:"generated_at"`
+	Complete                 bool                             `json:"complete"`
+	Completed                int                              `json:"completed"`
+	Scheduled                int                              `json:"scheduled"`
+	Repetitions              int                              `json:"repetitions_per_cell"`
+	Seed                     int64                            `json:"seed"`
+	Randomized               bool                             `json:"randomized"`
+	SampleQualifying         bool                             `json:"sample_qualifying"`
+	ComparisonScope          string                           `json:"comparison_scope"`
+	ControlledMode           string                           `json:"controlled_mode"`
+	Winner                   string                           `json:"winner,omitempty"`
+	WinnerStatus             string                           `json:"winner_status"`
+	SelectionReason          string                           `json:"selection_reason"`
+	ObservedEfficiencyLeader string                           `json:"observed_efficiency_leader,omitempty"`
+	ObservedEfficiencyReason string                           `json:"observed_efficiency_reason,omitempty"`
+	MaxCostUSD               float64                          `json:"max_cost_usd"`
+	ReportedCostUSD          float64                          `json:"reported_cost_usd"`
+	CostObserved             bool                             `json:"cost_observed"`
+	Variants                 []kocoroPromptVariantMetadata    `json:"variants"`
+	Workloads                []string                         `json:"workloads"`
+	Runs                     []koeQualificationRunReport      `json:"runs"`
+	Summary                  []kocoroPromptVariantSummary     `json:"summary"`
+	ComparisonSummary        []kocoroPromptVariantSummary     `json:"comparison_summary"`
+	CurrentControlPassed     bool                             `json:"current_control_passed"`
+	ProductGatePassed        bool                             `json:"product_gate_passed"`
+	ComparisonGatePassed     bool                             `json:"comparison_gate_passed"`
+	UniversalFailures        []kocoroPromptMatchedFailure     `json:"universal_failures"`
+	VariantSpecificFailures  []kocoroPromptMatchedFailure     `json:"variant_specific_failures"`
+	Cells                    []kocoroPromptVariantCellSummary `json:"cells"`
+	CoverageBoundaries       []string                         `json:"coverage_boundaries"`
 }
 
 func kocoroPromptVariantText(name string) string {
@@ -294,6 +297,38 @@ func TestSelectKocoroPromptVariantNeverPromotesMinimalStressControl(t *testing.T
 	}, 3, true)
 	if winner != kocoroPromptVariantLayered || status != "comparison_ready" {
 		t.Fatalf("winner=%q status=%q, want layered_v1/comparison_ready", winner, status)
+	}
+}
+
+func TestSelectObservedEfficiencyLeaderIncludesStressControls(t *testing.T) {
+	passing := func(name string, p50, p95 int64, input float64) kocoroPromptVariantSummary {
+		return kocoroPromptVariantSummary{
+			Name: name, Runs: 3, SuccessfulTasks: 3, CorrectToolRuns: 3,
+			TaskSuccessRate: 1, ToolCorrectnessRate: 1,
+			TotalP50Millis: p50, TotalP95Millis: p95, InputTokensMean: input,
+		}
+	}
+	leader, reason := selectObservedEfficiencyLeader([]kocoroPromptVariantSummary{
+		passing(kocoroPromptVariantCurrent, 100, 100, 1000),
+		passing(kocoroPromptVariantMinimal, 50, 60, 100),
+		passing(kocoroPromptVariantLayered, 70, 80, 500),
+	}, true)
+	if leader != kocoroPromptVariantMinimal || !strings.Contains(reason, "not production eligibility") {
+		t.Fatalf("leader=%q reason=%q, want minimal descriptive leader", leader, reason)
+	}
+}
+
+func TestKocoroPromptSummaryCorrectRequiresNamedPassingVariant(t *testing.T) {
+	passing := kocoroPromptVariantSummary{
+		Name: kocoroPromptVariantCurrent, Runs: 1,
+		SuccessfulTasks: 1, CorrectToolRuns: 1,
+		TaskSuccessRate: 1, ToolCorrectnessRate: 1,
+	}
+	if !kocoroPromptSummaryCorrect([]kocoroPromptVariantSummary{passing}, kocoroPromptVariantCurrent) {
+		t.Fatal("passing current control was not recognized")
+	}
+	if kocoroPromptSummaryCorrect([]kocoroPromptVariantSummary{passing}, kocoroPromptVariantMinimal) {
+		t.Fatal("missing minimal variant was recognized as passing")
 	}
 }
 
@@ -573,37 +608,41 @@ func newKocoroPromptExperimentReport(
 		comparisonSummary, cfg.repetitions,
 		complete && analysis.ComparisonGatePassed,
 	)
+	efficiencyLeader, efficiencyReason := selectObservedEfficiencyLeader(summary, complete)
 	if len(analysis.UniversalFailures) > 0 && winner != "" {
 		reason += " Matched failures shared by every variant were excluded only from relative selection; the product gate remains closed."
 	}
 	return kocoroPromptExperimentReport{
-		SchemaVersion:           1,
-		GeneratedAt:             time.Now().UTC().Format(time.RFC3339Nano),
-		Complete:                complete,
-		Completed:               len(results),
-		Scheduled:               len(jobs),
-		Repetitions:             cfg.repetitions,
-		Seed:                    cfg.seed,
-		Randomized:              true,
-		SampleQualifying:        complete && cfg.repetitions >= 3 && len(results) == len(jobs),
-		ComparisonScope:         "system_instructions_with_constant_agent_loop_tools_mode_and_workloads",
-		ControlledMode:          koeQualificationFastLane,
-		Winner:                  winner,
-		WinnerStatus:            status,
-		SelectionReason:         reason,
-		MaxCostUSD:              cfg.maxCostUSD,
-		ReportedCostUSD:         kocoroPromptReportedCost(results),
-		CostObserved:            kocoroPromptCostObserved(results),
-		Variants:                kocoroPromptVariantMetadataList(),
-		Workloads:               append([]string(nil), cfg.workloads...),
-		Runs:                    append([]koeQualificationRunReport(nil), results...),
-		Summary:                 summary,
-		ComparisonSummary:       comparisonSummary,
-		ProductGatePassed:       complete && analysis.ProductGatePassed,
-		ComparisonGatePassed:    complete && analysis.ComparisonGatePassed,
-		UniversalFailures:       analysis.UniversalFailures,
-		VariantSpecificFailures: analysis.VariantSpecificFailures,
-		Cells:                   summarizeKocoroPromptVariantCells(results),
+		SchemaVersion:            1,
+		GeneratedAt:              time.Now().UTC().Format(time.RFC3339Nano),
+		Complete:                 complete,
+		Completed:                len(results),
+		Scheduled:                len(jobs),
+		Repetitions:              cfg.repetitions,
+		Seed:                     cfg.seed,
+		Randomized:               true,
+		SampleQualifying:         complete && cfg.repetitions >= 3 && len(results) == len(jobs),
+		ComparisonScope:          "system_instructions_with_constant_agent_loop_tools_mode_and_workloads",
+		ControlledMode:           koeQualificationFastLane,
+		Winner:                   winner,
+		WinnerStatus:             status,
+		SelectionReason:          reason,
+		ObservedEfficiencyLeader: efficiencyLeader,
+		ObservedEfficiencyReason: efficiencyReason,
+		MaxCostUSD:               cfg.maxCostUSD,
+		ReportedCostUSD:          kocoroPromptReportedCost(results),
+		CostObserved:             kocoroPromptCostObserved(results),
+		Variants:                 kocoroPromptVariantMetadataList(),
+		Workloads:                append([]string(nil), cfg.workloads...),
+		Runs:                     append([]koeQualificationRunReport(nil), results...),
+		Summary:                  summary,
+		ComparisonSummary:        comparisonSummary,
+		CurrentControlPassed:     complete && kocoroPromptSummaryCorrect(summary, kocoroPromptVariantCurrent),
+		ProductGatePassed:        complete && analysis.ProductGatePassed,
+		ComparisonGatePassed:     complete && analysis.ComparisonGatePassed,
+		UniversalFailures:        analysis.UniversalFailures,
+		VariantSpecificFailures:  analysis.VariantSpecificFailures,
+		Cells:                    summarizeKocoroPromptVariantCells(results),
 		CoverageBoundaries: []string{
 			"The comparison exercises the production agent loop and provider with deterministic in-memory tools; it does not mutate user files or external services.",
 			"Voice routing, microphone behavior, signed-in app UI, and physical interaction are outside this comparison.",
@@ -879,6 +918,47 @@ func selectKocoroPromptVariant(
 	}
 	return eligible[0].Name, status,
 		"Selected only among candidates with perfect observed correctness, at least 30% lower mean input tokens, and median and tail latency no more than 10% above current; then lowest tail latency, median latency, and input tokens."
+}
+
+func selectObservedEfficiencyLeader(
+	summary []kocoroPromptVariantSummary,
+	complete bool,
+) (string, string) {
+	if !complete {
+		return "", "The randomized schedule has not completed."
+	}
+	eligible := make([]kocoroPromptVariantSummary, 0, len(summary))
+	for _, item := range summary {
+		if kocoroPromptVariantCorrect(item) {
+			eligible = append(eligible, item)
+		}
+	}
+	if len(eligible) == 0 {
+		return "", "No variant passed every observed correctness and runtime gate."
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		if eligible[i].TotalP95Millis != eligible[j].TotalP95Millis {
+			return eligible[i].TotalP95Millis < eligible[j].TotalP95Millis
+		}
+		if eligible[i].TotalP50Millis != eligible[j].TotalP50Millis {
+			return eligible[i].TotalP50Millis < eligible[j].TotalP50Millis
+		}
+		if eligible[i].InputTokensMean != eligible[j].InputTokensMean {
+			return eligible[i].InputTokensMean < eligible[j].InputTokensMean
+		}
+		return eligible[i].Name < eligible[j].Name
+	})
+	return eligible[0].Name,
+		"Observed efficiency leader across all variants that passed every measured correctness and runtime gate, ordered by tail latency, median latency, and mean input tokens. This is descriptive evidence, not production eligibility."
+}
+
+func kocoroPromptSummaryCorrect(summary []kocoroPromptVariantSummary, name string) bool {
+	for _, item := range summary {
+		if item.Name == name {
+			return kocoroPromptVariantCorrect(item)
+		}
+	}
+	return false
 }
 
 func kocoroPromptVariantProductCandidate(name string) bool {

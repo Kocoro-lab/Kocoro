@@ -248,10 +248,9 @@ type Model struct {
 	hookRunner          *hooks.HookRunner
 	customCommands      map[string]string // name → prompt content from commands/*.md
 	bypassPermissions   bool
-	agentOverride       *agents.Agent    // per-agent override for re-application after async tool load
-	loadedSkills        []*skills.Skill  // skills for current agent (survives loop re-creation)
-	skillsPtr           *[]*skills.Skill // pointer into use_skill tool's skills slice
-	memPreflight        tools.MemoryPreflightQuerier
+	agentOverride       *agents.Agent      // per-agent override for re-application after async tool load
+	loadedSkills        []*skills.Skill    // skills for current agent (survives loop re-creation)
+	skillsPtr           *[]*skills.Skill   // pointer into use_skill tool's skills slice
 	remoteCleanup       func()             // cleanup for MCP connections from async load
 	cancelRun           context.CancelFunc // cancels the running agent loop
 	injectCh            chan agent.InjectedMessage
@@ -458,7 +457,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// register with a typed-nil MemoryQuerier so the tool falls back to
 	// session_search + MEMORY.md.
 	var memQuerier tools.MemoryQuerier
-	var memPreflightQuerier tools.MemoryPreflightQuerier
 	memCfg := memory.LoadConfigFromRuntime(runtimeCfg)
 	if memCfg.Provider != "" && memCfg.Provider != "disabled" {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -467,7 +465,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		if ready {
 			attached := memory.NewAttachedQuerier(memCfg.SocketPath, memCfg.ClientRequestTimeout)
 			memQuerier = attached
-			memPreflightQuerier = attached
 		}
 	}
 	tools.RegisterMemoryTool(reg, memQuerier, &tuiMemoryFallback{sessionMgr: sessMgr})
@@ -493,13 +490,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// Preserve TUI attribution; Cloud currently uses the short TTL for all sources.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(runtimeCfg.Agent.SkillDiscoveryEnabled())
-	if memPreflightQuerier != nil {
-		var helperLLM client.LLMClient
-		if gateway != nil {
-			helperLLM = gateway
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(memPreflightQuerier, helperLLM))
-	}
 	loop.SetTimeBasedCompactConfig(agent.TimeBasedCompactConfig{
 		Enabled:             runtimeCfg.Agent.TimeBasedCompact.Enabled,
 		GapThresholdMinutes: runtimeCfg.Agent.TimeBasedCompact.GapThresholdMinutes,
@@ -625,7 +615,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		agentOverride:  agentOverride,
 		loadedSkills:   loadedSkills,
 		skillsPtr:      skillsPtr,
-		memPreflight:   memPreflightQuerier,
 		markdownCache:  make(map[string]string),
 		slashCommands:  instanceCmds,
 		sessionAllowed: make(map[string]bool),
@@ -705,13 +694,6 @@ func (m *Model) rebuildAgentLoop() {
 	// Interactive TUI (switched agent) — same routing as the primary loop.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(m.cfg.Agent.SkillDiscoveryEnabled())
-	if m.memPreflight != nil {
-		var helperLLM client.LLMClient
-		if m.gateway != nil {
-			helperLLM = m.gateway
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(m.memPreflight, helperLLM))
-	}
 	if m.cfg.Agent.Model != "" {
 		loop.SetSpecificModel(m.cfg.Agent.Model)
 	} else if m.cfg.Provider == "ollama" && m.cfg.Ollama.Model != "" {

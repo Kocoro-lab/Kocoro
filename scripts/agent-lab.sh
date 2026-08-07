@@ -9,9 +9,9 @@ pkg_config_path="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
 mkdir -p "$output_dir"
 
 case "$lane" in
-  offline|routing_live|selector_live|provider_live|prompt_live|provider_release) ;;
+  offline|routing_live|selector_live|provider_live|prompt_live|memory_live|provider_release) ;;
   *)
-    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, prompt_live, or provider_release" >&2
+    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, prompt_live, memory_live, or provider_release" >&2
     exit 2
     ;;
 esac
@@ -127,6 +127,27 @@ run_prompt_lane() {
     "$output_dir/prompt-variants"
 }
 
+run_memory_lane() {
+  if [[ "${SHANNON_E2E_LIVE:-}" != "1" ]]; then
+    echo "Set SHANNON_E2E_LIVE=1 to authorize the paid memory A/B lane." >&2
+    check_names+=("memory_recall_ab_live")
+    check_statuses+=("2")
+    return
+  fi
+  local repetitions="${KOCORO_MEMORY_AB_REPETITIONS:-3}"
+  if [[ ! "$repetitions" =~ ^[0-9]+$ || "$repetitions" -lt 1 || "$repetitions" -gt 10 ]]; then
+    echo "KOCORO_MEMORY_AB_REPETITIONS must be an integer from 1 through 10." >&2
+    check_names+=("memory_recall_ab_live")
+    check_statuses+=("2")
+    return
+  fi
+  run_check memory_recall_ab_live env \
+    SHANNON_E2E_LIVE=1 \
+    KOCORO_MEMORY_AB_REPETITIONS="$repetitions" \
+    KOCORO_MEMORY_AB_OUTPUT="$output_dir/memory-recall-ab.json" \
+    go test ./test/e2e -run '^TestLive_MemoryRecallPreflightAB$' -count=1 -v
+}
+
 run_release_source_preflight() {
   if [[ "$source_dirty" == "true" ]]; then
     echo "$lane requires a clean ShanClaw source tree." >&2
@@ -153,6 +174,9 @@ case "$lane" in
     ;;
   prompt_live)
     run_prompt_lane
+    ;;
+  memory_live)
+    run_memory_lane
     ;;
   provider_release)
     if run_release_source_preflight; then
