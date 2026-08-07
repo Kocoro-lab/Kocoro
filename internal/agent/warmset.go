@@ -1,9 +1,15 @@
 package agent
 
 import (
+	"encoding/json"
 	"sync"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+)
+
+const (
+	workingSetSchemaCountLimit = 16
+	workingSetSchemaTokenLimit = 8000
 )
 
 // WorkingSet is a session-scoped cache of deferred tool schemas that were
@@ -13,13 +19,18 @@ type WorkingSet struct {
 	mu          sync.RWMutex
 	fingerprint string
 	schemas     map[string]client.Tool
+	order       map[string]uint64
+	nextOrder   uint64
 	searchKey   string
 	searchIndex *toolSearchIndex
 }
 
 // NewWorkingSet creates an empty working set.
 func NewWorkingSet() *WorkingSet {
-	return &WorkingSet{schemas: make(map[string]client.Tool)}
+	return &WorkingSet{
+		schemas: make(map[string]client.Tool),
+		order:   make(map[string]uint64),
+	}
 }
 
 // Add inserts or replaces a schema in the working set.
@@ -32,7 +43,13 @@ func (ws *WorkingSet) Add(name string, schema client.Tool) {
 	if ws.schemas == nil {
 		ws.schemas = make(map[string]client.Tool)
 	}
+	if ws.order == nil {
+		ws.order = make(map[string]uint64)
+	}
+	ws.nextOrder++
 	ws.schemas[name] = schema
+	ws.order[name] = ws.nextOrder
+	ws.evictLocked()
 }
 
 // Remove forgets one warmed schema without invalidating the remaining
@@ -45,6 +62,7 @@ func (ws *WorkingSet) Remove(name string) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	delete(ws.schemas, name)
+	delete(ws.order, name)
 }
 
 // Contains reports whether the working set contains the named schema.
@@ -119,6 +137,8 @@ func (ws *WorkingSet) EnsureFingerprint(fingerprint string) bool {
 	}
 	ws.fingerprint = fingerprint
 	ws.schemas = make(map[string]client.Tool)
+	ws.order = make(map[string]uint64)
+	ws.nextOrder = 0
 	ws.searchKey = ""
 	ws.searchIndex = nil
 	return true
@@ -139,8 +159,44 @@ func (ws *WorkingSet) Invalidate() {
 	defer ws.mu.Unlock()
 	ws.fingerprint = ""
 	ws.schemas = make(map[string]client.Tool)
+	ws.order = make(map[string]uint64)
+	ws.nextOrder = 0
 	ws.searchKey = ""
 	ws.searchIndex = nil
+}
+
+func workingSetSchemaTokens(schema client.Tool) int {
+	body, err := json.Marshal(schema)
+	if err != nil {
+		return 0
+	}
+	return int((float64(len(body)) + charsPerTokenSchema - 1) / charsPerTokenSchema)
+}
+
+func (ws *WorkingSet) evictLocked() {
+	for len(ws.schemas) > workingSetSchemaCountLimit || ws.schemaTokensLocked() > workingSetSchemaTokenLimit {
+		oldestName := ""
+		oldestOrder := ^uint64(0)
+		for name, order := range ws.order {
+			if order < oldestOrder {
+				oldestName = name
+				oldestOrder = order
+			}
+		}
+		if oldestName == "" {
+			return
+		}
+		delete(ws.schemas, oldestName)
+		delete(ws.order, oldestName)
+	}
+}
+
+func (ws *WorkingSet) schemaTokensLocked() int {
+	total := 0
+	for _, schema := range ws.schemas {
+		total += workingSetSchemaTokens(schema)
+	}
+	return total
 }
 
 // toolSearchIndex reuses the tokenized BM25 index while the effective toolset

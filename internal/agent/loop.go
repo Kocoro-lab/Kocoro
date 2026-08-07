@@ -2907,7 +2907,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// Resolve exposure independently for every tool, then pre-seed schemas that
 	// this session already loaded. Any remaining Deferred tool activates
 	// tool_search; schema size is diagnostic only and never reclassifies tools.
-	deferred := deferredToolNames(a.tools)
+	deferred := deferredToolNamesForRun(a.tools, a.executionProfileID != "")
 	profileBoundTools := profileBoundToolNames(a.tools)
 	for name := range profileBoundTools {
 		// A profile requirement is stronger than an accidental Direct exposure:

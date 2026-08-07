@@ -18,13 +18,10 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
-// Bash has a bespoke `description` schema (more detailed than the shared
-// agent.DescriptionFieldSpec used by other tools) because it landed first
-// (PR 4). The wider rollout to file_read / file_write / http / browser /
-// process / etc. completed in PR 7 via the shared helper; bash kept its
-// original wording to avoid invalidating the prompt cache. Future schema
-// cleanup can converge bash onto the shared spec if a cache-rebuild cost
-// is acceptable.
+// Bash keeps a bespoke description field because approval cards require a
+// short user-facing goal. Execution policy stays in runtime validation and
+// permissions; the provider schema carries only the model decisions needed
+// to call the tool correctly.
 type BashTool struct {
 	approvalFn        func(command string) bool
 	ExtraSafeCommands []string
@@ -127,61 +124,18 @@ func (t *BashTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:               "bash",
 		MaxResultSizeChars: 30000,
-		Description: `Execute a shell command. Use for running scripts, data processing, file management, automation, and system operations.
+		Description: `Execute a bounded shell command for scripts, data processing, automation, tests, and system operations.
 
-Each command runs in a fresh shell. The starting directory is the session CWD, but cd/export/aliases from one bash call do NOT persist to later calls.
+Each command runs in a fresh shell from the session working directory; cd, exports, and aliases do not persist. Prefer dedicated tools for file reads/writes/edits, path or content search, and directory listing because they have safer permissions and better result shaping.
 
-IMPORTANT: Avoid using this tool to run cat, head, tail, sed, awk, grep, find, or ls commands unless explicitly instructed or after verifying that a dedicated tool cannot accomplish your task. Use the appropriate dedicated tool instead:
-- Read files: file_read (NOT cat/head/tail)
-- Edit files: file_edit (NOT sed/awk)
-- Write files: file_write (NOT echo > / cat <<EOF)
-- File search: glob (NOT find)
-- Content search: grep (NOT bash grep/rg)
-- List directory: directory_list (NOT ls)
-
-macOS Spotlight (` + "`" + `mdfind` + "`" + `): only fall back to it when glob/grep cannot answer the question — metadata searches, bundle-ID lookups, or files outside the session CWD. Naive mdfind can freeze the system (Spotlight may trigger a reindex). Always follow this template:
-
-    ` + "`" + `{ timeout 15 mdfind "keyword1" 2>/dev/null; timeout 15 mdfind "keyword2" 2>/dev/null; } | sort -u | head -100` + "`" + `
-
-- Never pass ` + "`" + `-onlyin /` + "`" + `, ` + "`" + `-onlyin /Users` + "`" + `, ` + "`" + `-onlyin $HOME` + "`" + `, or ` + "`" + `-onlyin ~` + "`" + ` — wide Spotlight scopes are slow and may trigger a reindex. Either omit ` + "`" + `-onlyin` + "`" + ` or scope to a small subdir (e.g., ` + "`" + `-onlyin ~/Documents/project-x` + "`" + `).
-- Split OR queries into separate mdfind calls then ` + "`" + `sort -u` + "`" + `; never run ` + "`" + `mdfind "A OR B"` + "`" + ` directly.
-- Always pair with ` + "`" + `timeout 15` + "`" + ` and ` + "`" + `| head -100` + "`" + `. If mdfind returns zero results or times out (exit 124), follow up with a focused ` + "`" + `find <subtree> -iname "*keyword*" 2>/dev/null | head -100` + "`" + ` as a separate call — do not chain it via ` + "`" + `||` + "`" + ` in the same pipeline, since ` + "`" + `head` + "`" + ` always exits 0 and the fallback would never fire.
-
-While bash can do similar things, the dedicated tools have better permission handling, output truncation, and result shaping.
-
-Instructions:
-- ALWAYS write a clear, short, non-technical "description" (5-15 words) for every bash call. The end user — often non-technical — sees this description, not the command, on approval prompts and history cards. Describe the user-facing GOAL, not the shell syntax. (The system prompt's "Tool call descriptions" section sets the language rule that applies to every tool, including this one.)
-- Not every command needs approval — the user can set an approval allowlist or auto-approve mode.
-- Always quote file paths that contain spaces with double quotes (e.g., cd "path with spaces/file").
-- Prefer absolute paths over cd to keep the working directory stable.
-- For multi-line Python with embedded quotes or regex, write a script via file_write then run python3 /path/to/script.py — heredoc+quote nesting is a frequent source of shell syntax errors.
-- When issuing multiple commands:
-  - Bash invocations are dispatched in concurrent batches when they are statically provable to be read-only (no shell metacharacters including newlines, first token in a whitelist of read-only commands like git status / git diff / git log / ls / cat / pwd / wc / stat / which). Any command containing &&, ||, ;, |, >, <, $(), newlines, or shell-substitution markers, plus any write/network command (git push, npm install, curl, rm, git remote add, go env -w, ...), runs sequentially as its own batch. If a batch you expected to be parallel ran serially, that's because at least one call's command did not pass the static check — not because of a "rate limit" or "block". Read the actual tool results to confirm what happened.
-  - If commands depend on each other, chain with && in a single bash call.
-  - Use ';' only when sequential execution is needed and earlier failures don't matter.
-  - DO NOT use newlines to separate commands (newlines inside quoted strings are fine).
-- For git commands:
-  - Prefer creating a new commit over amending an existing commit.
-  - Before destructive operations (git reset --hard, git push --force, git checkout --), consider safer alternatives. Only use destructive operations when truly the best approach.
-  - Never skip hooks (--no-verify) or bypass signing unless the user explicitly asked. If a hook fails, investigate and fix the underlying issue.
-- Do NOT start long-running server processes (python -m http.server, flask run, npm start, vite, etc.). This tool uses CombinedOutput() and blocks until the process closes its pipes, so a server that runs forever will hang the call until timeout. Need local HTTP to serve a file to a browser? Just pass file:///abs/path.html to browser_navigate — the daemon bridges file:// to a loopback HTTP endpoint automatically, no manual server needed.
-- Silent commands that consume wall time (sleep, wait, sync, busy loops, network probes) produce no stdout but DO execute. The tool prepends ` + "`" + `[command ran for Ns]` + "`" + ` to any result that took ≥ 1 second, so a result like ` + "`" + `[command ran for 2.0s]\ntask1_done` + "`" + ` is sleep+echo working correctly — the sleep was NOT blocked or skipped. An absence of stdout for a slept command is normal; never fabricate "rate limited" / "blocked" / "skipped" explanations to fill that gap.
-- Avoid unnecessary sleep commands:
-  - Do not sleep between commands that can run immediately — just run them.
-  - Do not retry failing commands in a sleep loop — diagnose the root cause.
-  - If polling an external process, use a check command rather than sleeping first.
-  - If you must sleep, keep duration short (1-5 seconds).`,
+Provide a short, non-technical description of the user-facing goal in the reply language. Quote paths with spaces and prefer absolute paths. For complex multiline code, write a script with file_write and run it instead of nesting a heredoc. Independent read-only calls may run in parallel; chain dependent commands with &&. Do not bypass hooks or signing, start a long-lived server, use unbounded polling/sleep loops, or perform destructive operations without the required user authority. Runtime validation, approval, timeouts, output caps, GUI-injection denial, and side-effect serialization remain authoritative.`,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"command": map[string]any{"type": "string", "description": "Shell command to execute"},
 				"description": map[string]any{
-					"type": "string",
-					"description": "REQUIRED. A short (5-15 word) natural-language summary of WHAT this command does, written for a non-technical end user. " +
-						"Write it in the same language as your reply (per the Language directive). " +
-						"Describe the user-facing INTENT, not the shell syntax. The user will see this — not the command — when approving the call. " +
-						"Examples: '查找最大的 10 个文件', 'Commit current changes', '检查 git 状态', 'Install npm dependencies'. " +
-						"Do NOT just rephrase the command (e.g. avoid 'Run find with du and sort'); describe the goal in plain language.",
+					"type":        "string",
+					"description": "Required 5-15 word summary of the user-facing goal, for a non-technical user, in the reply language. Describe the intent rather than shell syntax.",
 				},
 				"timeout":          map[string]any{"type": "integer", "description": "Timeout in seconds (default: 120)"},
 				"max_output_chars": map[string]any{"type": "integer", "description": "Maximum output characters to return. Use this for noisy commands."},

@@ -58,6 +58,9 @@ run_offline_lane() {
   run_check harness_self_test go test ./test/e2e \
     -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|PromptVariantRunnerRequiresExplicitPaidGate|ProviderQualificationRejectsUndersizedReleaseSample)$' \
     -count=1 -v
+	  run_check quality_harness_self_test go test ./test/e2e \
+	    -run '^TestOffline_AgentLabQuality(ContractValidators|QualificationFailsClosed|LaneRequiresExplicitPaidGate|LaneRejectsUndersizedReleaseSample)$' \
+	    -count=1 -v
 }
 
 run_routing_lane() {

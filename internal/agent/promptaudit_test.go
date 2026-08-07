@@ -39,62 +39,109 @@ func TestSystemPromptAudit(t *testing.T) {
 	// Default gateway + native-thinking Direct set. The exhaustive production
 	// registration matrix is pinned by tools.TestRegisteredLocalToolExposureMatrix;
 	// `think` is intentionally absent because default native thinking skips it.
-	tools := []string{
-		"archive_extract", "archive_inspect", "ask_user_question", "bash",
-		"clipboard", "directory_list", "docx_to_text", "file_edit",
-		"file_read", "file_write", "glob", "grep", "http", "memory_append",
+	fullTools := []string{
+		"archive_extract", "archive_inspect", "ask_user_question", "bash", "calculate",
+		"clipboard", "cloud_delegate", "current_time", "directory_list", "docx_to_text",
+		"file_edit", "file_read", "file_write", "glob", "grep", "http", "memory_append",
 		"memory_recall", "notify", "pdf_to_text", "pptx_to_text", "present_deliverable",
-		"schedule_list", "schedule_show", "system_info", "tool_search",
-		"session_search", "use_skill", "xlsx_to_text",
+		"schedule_list", "schedule_show", "session_search", "system_info", "tool_search",
+		"use_skill", "xlsx_to_text",
 	}
+	fastTools := []string{
+		"ask_user_question", "bash", "calculate", "clipboard", "current_time", "directory_list",
+		"file_edit", "file_read", "file_write", "glob", "grep", "memory_append", "memory_recall", "notify",
+		"present_deliverable", "schedule_list", "schedule_show", "session_search",
+		"tool_search", "use_skill",
+	}
+	commonDeferred := []prompt.DeferredToolSummary{
+		{Name: "accessibility", Description: "Inspect and interact with macOS accessibility elements."},
+		{Name: "applescript", Description: "Run AppleScript for a supported macOS app workflow."},
+		{Name: "browser", Description: "Use the local browser automation fallback."},
+		{Name: "computer", Description: "Use provider-native computer interaction."},
+		{Name: "computer_use", Description: "Complete a bounded macOS app workflow."},
+		{Name: "ghostty", Description: "Interact with Ghostty terminal windows."},
+		{Name: "process", Description: "Inspect and manage local processes."},
+		{Name: "schedule_create", Description: "Create a scheduled task."},
+		{Name: "schedule_remove", Description: "Remove a scheduled task."},
+		{Name: "schedule_update", Description: "Update a scheduled task."},
+		{Name: "screenshot", Description: "Capture a local screenshot."},
+		{Name: "wait_for", Description: "Wait for a bounded local UI condition."},
+	}
+	fastDeferred := append(append([]prompt.DeferredToolSummary(nil), commonDeferred...), []prompt.DeferredToolSummary{
+		{Name: "archive_extract", Description: "Extract an archive into a destination directory."},
+		{Name: "archive_inspect", Description: "Inspect archive contents without extracting them."},
+		{Name: "cloud_delegate", Description: "Delegate a bounded task to the cloud workflow."},
+		{Name: "docx_to_text", Description: "Extract text from a Word document."},
+		{Name: "http", Description: "Make a bounded HTTP request."},
+		{Name: "pdf_to_text", Description: "Extract text from a PDF."},
+		{Name: "pptx_to_text", Description: "Extract text from a presentation."},
+		{Name: "system_info", Description: "Read local system information."},
+		{Name: "xlsx_to_text", Description: "Extract text from a spreadsheet."},
+	}...)
 	// Compose from the final provider-visible names, matching AgentLoop.Run.
 	// Native thinking keeps think out of this representative request.
-	basePrompt := defaultPersona + operationalRulesForToolNames(tools) + contrastExamplesCore
+	fullBasePrompt := defaultPersona + operationalRulesForToolNames(fullTools) + contrastExamplesCore
+	fastBasePrompt := defaultPersona + operationalRulesForToolNames(fastTools) + contrastExamplesCore
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
-		BasePrompt:     basePrompt,
-		LocalToolNames: tools,
-		MemoryDir:      "/Users/test/.shannon/agents/sample",
-		ModelID:        "medium",
-		OutputFormat:   "markdown",
+		BasePrompt:       fastBasePrompt,
+		LocalToolNames:   fastTools,
+		GatewayToolNames: []string{"web_fetch", "web_search"},
+		DeferredTools:    fastDeferred,
+		MemoryDir:        "/Users/test/.shannon/agents/sample",
+		ModelID:          "medium",
+		OutputFormat:     "markdown",
 	})
-	const representativeSystemCharBudget = 8500
-	if len(parts.System) > representativeSystemCharBudget {
-		t.Fatalf("representative production System is %d chars, budget %d", len(parts.System), representativeSystemCharBudget)
+	full := prompt.BuildSystemPrompt(prompt.PromptOptions{
+		BasePrompt:       fullBasePrompt,
+		LocalToolNames:   fullTools,
+		GatewayToolNames: []string{"web_fetch", "web_search"},
+		DeferredTools:    commonDeferred,
+		MemoryDir:        "/Users/test/.shannon/agents/sample",
+		ModelID:          "medium",
+		OutputFormat:     "koe",
+	})
+	fast := prompt.BuildSystemPrompt(prompt.PromptOptions{
+		BasePrompt:       fastBasePrompt,
+		LocalToolNames:   fastTools,
+		GatewayToolNames: []string{"web_fetch", "web_search"},
+		DeferredTools:    fastDeferred,
+		MemoryDir:        "/Users/test/.shannon/agents/sample",
+		ModelID:          "medium",
+		OutputFormat:     "koe",
+		FastMode:         true,
+	})
+	fullSystem := full.System + cloudDelegationGuidance + contrastExamplesCloud
+	const (
+		fastSystemCharBudget = 7200
+		fullSystemCharBudget = 8000
+	)
+	if len(fast.System) > fastSystemCharBudget {
+		t.Fatalf("representative Koe Fast System is %d chars, budget %d", len(fast.System), fastSystemCharBudget)
+	}
+	if len(fullSystem) > fullSystemCharBudget {
+		t.Fatalf("representative Koe Full System is %d chars, budget %d", len(fullSystem), fullSystemCharBudget)
 	}
 	if outputPath := strings.TrimSpace(os.Getenv("KOCORO_PROMPT_AUDIT_OUTPUT")); outputPath != "" {
-		full := prompt.BuildSystemPrompt(prompt.PromptOptions{
-			BasePrompt:     basePrompt,
-			LocalToolNames: tools,
-			MemoryDir:      "/Users/test/.shannon/agents/sample",
-			ModelID:        "medium",
-			OutputFormat:   "koe",
-		})
-		fast := prompt.BuildSystemPrompt(prompt.PromptOptions{
-			BasePrompt:     basePrompt,
-			LocalToolNames: tools,
-			MemoryDir:      "/Users/test/.shannon/agents/sample",
-			ModelID:        "medium",
-			OutputFormat:   "koe",
-			FastMode:       true,
-		})
 		artifact := map[string]any{
 			"schema_version": "kocoro.prompt_audit.v1",
 			"generated_at":   time.Now().UTC().Format(time.RFC3339Nano),
 			"assumptions": []string{
 				"Kocoro default persona with the production core rules and core contrast examples.",
-				"Representative production local-tool set; per-user MCP, gateway, instructions, memory, working directory, and sticky context are intentionally absent.",
-				"Koe Full and Fast share the same system prompt. Fast adds only volatile outcome-first guidance.",
+				"Representative production local-tool set plus the default web openers; per-user MCP, integrations, instructions, memory content, working directory, and sticky context are intentionally absent.",
+				"Koe Fast keeps uncommon schema-heavy local tools behind tool_search; Full keeps their ordinary exposure. The exact system and stable-context layers therefore differ by final provider-visible capabilities.",
 			},
 			"layers": map[string]string{
 				"default_persona":           defaultPersona,
 				"core_operational_rules":    coreOperationalRules,
 				"core_contrast_examples":    contrastExamplesCore,
-				"kocoro_base_prompt":        basePrompt,
+				"kocoro_base_prompt":        fullBasePrompt,
+				"kocoro_full_base_prompt":   fullBasePrompt,
+				"kocoro_fast_base_prompt":   fastBasePrompt,
 				"cloud_delegation_guidance": cloudDelegationGuidance,
 				"cloud_contrast_examples":   contrastExamplesCloud,
 			},
 			"koe_full": map[string]string{
-				"system":           full.System,
+				"system":           fullSystem,
 				"stable_context":   full.StableContext,
 				"volatile_context": full.VolatileContext,
 			},
