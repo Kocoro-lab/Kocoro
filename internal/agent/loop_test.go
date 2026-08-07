@@ -21,6 +21,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
@@ -8165,5 +8166,30 @@ func TestLooksLikeUnverifiedActionClaimZeroToolGate(t *testing.T) {
 		if !looksLikeUnverifiedActionClaim(text) {
 			t.Errorf("performed-action claim not flagged in zero-tool run: %q", text)
 		}
+	}
+}
+
+// durableCompactionCheckpoint must persist only shapes ShapeHistory produced
+// (anchor + marker-prefixed summary). A clone that shrank through local
+// tool-result compression alone has no marker; persisting it would be
+// rejected by HistoryForLoop on the next load and waste a full archive
+// rebuild (live repro: TestLive_Compaction_SurvivesAcrossTheBoundary).
+func TestDurableCompactionCheckpointRequiresMarker(t *testing.T) {
+	anchor := client.Message{Role: "user", Content: client.NewTextContent("Remember build id a3f9c21b")}
+	summary := client.Message{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "prior work…")}
+	failedSummary := client.Message{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "(summary unavailable)")}
+	tail := client.Message{Role: "assistant", Content: client.NewTextContent("OK")}
+
+	if got := durableCompactionCheckpoint([]client.Message{anchor, summary, tail}); got == nil {
+		t.Fatal("shaped checkpoint with marker was rejected")
+	}
+	if got := durableCompactionCheckpoint([]client.Message{anchor, failedSummary, tail}); got == nil {
+		t.Fatal("failed-summary checkpoint still carries the marker and must persist")
+	}
+	if got := durableCompactionCheckpoint([]client.Message{anchor, tail}); got != nil {
+		t.Fatalf("marker-less locally-compressed clone must not become durable: %+v", got)
+	}
+	if got := durableCompactionCheckpoint(nil); got != nil {
+		t.Fatalf("empty capture must not become durable: %+v", got)
 	}
 }

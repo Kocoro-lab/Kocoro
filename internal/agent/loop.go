@@ -525,6 +525,7 @@ const coreOperationalRules = `
 - Reply in the language of the user's latest substantive message unless explicitly asked otherwise. Preserve product names, identifiers, commands, paths, and quoted errors.
 - Lead with the outcome and be concise by default. Before non-trivial tool work, give one brief user-facing preamble and continue with the tool calls in the same response. Do not narrate routine mechanics or hidden reasoning.
 - Summarize relevant results instead of dumping logs. Do not apologize for routine tool use or begin with filler.
+- While a multi-step task runs, surface short user-visible progress notes at meaningful moments — a found root cause, a direction change, a long stretch of tool work. Brief is good; silent until the end is not.
 
 ### Planning
 - think: Append a structured thought to the log when complex reasoning or sequential decisions are needed (long tool chains, policy-heavy tasks). Does not obtain new information or change state. For simpler reasoning extended thinking handles it natively — don't reach for this tool by default.
@@ -2339,6 +2340,25 @@ func SanitizeMessagesForPersistence(messages []client.Message) []client.Message 
 // CompactionCheckpointMessages returns the latest compacted model-visible
 // state produced during this Run. nil means no compaction was applied, so a
 // caller must preserve any checkpoint already stored on the session.
+// durableCompactionCheckpoint returns the persistable form of a captured
+// live-checkpoint slice, or nil when the shape must not become durable.
+//
+// Local tool-result compression can shrink the live clone without ShapeHistory
+// emitting a summary — a message-count no-op whose clone is still materially
+// smaller (applyShapedHistory deliberately applies it in-run). That shape
+// carries no compacted-history marker, so HistoryForLoop rejects it on the
+// next load (session/store.go) and persisting it would only cost the next turn
+// a full archive rebuild plus a fresh compaction. Keep the in-run savings, but
+// never let a marker-less shape become — or overwrite — the durable
+// checkpoint. Implicit episodic memory is in-message-only and is stripped here
+// so it never becomes durable merely because compaction happened this turn.
+func durableCompactionCheckpoint(checkpoint []client.Message) []client.Message {
+	if !ctxwin.IsCompactedHistory(checkpoint) {
+		return nil
+	}
+	return cloneMessages(stripPrivateMemoryForSummary(checkpoint))
+}
+
 func (a *AgentLoop) CompactionCheckpointMessages() []client.Message {
 	if len(a.compactionCheckpointMessages) == 0 {
 		return nil
@@ -3314,9 +3334,11 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				}
 				checkpoint = append(checkpoint, msg)
 			}
-			// Implicit episodic memory is in-message-only and must never become
-			// durable merely because compaction happened during the turn.
-			a.compactionCheckpointMessages = cloneMessages(stripPrivateMemoryForSummary(checkpoint))
+			if durable := durableCompactionCheckpoint(checkpoint); durable != nil {
+				a.compactionCheckpointMessages = durable
+			} else {
+				log.Printf("agent: skipping durable checkpoint capture without compacted-history marker (messages=%d)", len(checkpoint))
+			}
 		}
 	}
 

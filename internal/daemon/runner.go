@@ -3492,6 +3492,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(runCfg.Agent.WarmSetMaxSchemas, runCfg.Agent.WarmSetMaxSchemaTokens)
 	// Seed the soft context window from the configured model or the last
 	// model observed on this session, falling back to the static config.
 	// Without this, every routed daemon turn would re-seed at the static

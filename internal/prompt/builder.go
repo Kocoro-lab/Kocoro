@@ -172,6 +172,33 @@ func promptHasConfiguredTool(opts PromptOptions, name string) bool {
 	return false
 }
 
+// promptHasWebOrBrowserTool reports whether the run can reach the web at all —
+// direct web openers or any configured browser-automation tool (including
+// cold Deferred ones the model can load via tool_search mid-run). Gateway and
+// MCP names participate, so this gate may only shape StableContext (BP #3,
+// per-session cache) — never the cross-user-shared System block (BP #1).
+func promptHasWebOrBrowserTool(opts PromptOptions) bool {
+	for _, name := range promptConfiguredToolNames(opts) {
+		if name == "web_search" || name == "web_fetch" || strings.Contains(name, "browser") {
+			return true
+		}
+	}
+	return false
+}
+
+// webResultsGuidance restores the empty-result honesty rule that predates the
+// layered prompt: a blocked or empty page must be reported, never papered over
+// with invented content. Tuned against real anti-bot/empty-fetch incidents.
+func webResultsGuidance(opts PromptOptions) string {
+	if !promptHasWebOrBrowserTool(opts) {
+		return ""
+	}
+	return "## Web Results\n" +
+		"An empty, blocked, or bot-challenged page is itself a result — report it as such and try a different source. " +
+		"Never invent page content, search results, or quotes from a fetch that did not complete. " +
+		"Prefer web_search/web_fetch for reading content; reserve interactive browsing for pages that require it."
+}
+
 func promptHasDeferredTool(opts PromptOptions, name string) bool {
 	for _, tool := range opts.DeferredTools {
 		if tool.Name == name {
@@ -202,8 +229,9 @@ func buildStaticSystem(opts PromptOptions) string {
 
 	if promptHasTool(opts, "ask_user_question") {
 		sb.WriteString("\n\n## Structured Questions\n")
-		sb.WriteString("Use ask_user_question only for a material unresolved fork. Call it only when Context says `Structured question UI: available`; otherwise ask one concise prose question. Offer concrete choices and allow a custom answer when appropriate.")
+		sb.WriteString("Use ask_user_question only for a material unresolved fork you cannot settle after investigating — a real decision, not permission to start. The structured UI exists only when Context contains the exact line `Structured question UI: available`: when that line is present and the needed input reduces to 2-4 concrete choices, you MUST call the tool in that same response — do not ask the question, restate its choices, or say you are waiting in prose. When the line is absent, ask one concise prose question instead. If a custom value is possible set `allow_other`; never add a Custom, Other, 自定义, or equivalent placeholder option.")
 	}
+
 
 	if promptHasAnyToolNamed(opts, "memory_recall", "session_search") {
 		sb.WriteString("\n\n## Memory Retrieval\n")
@@ -286,6 +314,15 @@ func buildStableContext(opts PromptOptions) string {
 	}
 
 	if guidance := dynamicCapabilityGuidance(opts); guidance != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("<system-reminder>\n")
+		sb.WriteString(guidance)
+		sb.WriteString("\n</system-reminder>")
+	}
+
+	if guidance := webResultsGuidance(opts); guidance != "" {
 		if sb.Len() > 0 {
 			sb.WriteString("\n\n")
 		}

@@ -478,6 +478,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop.SetBrowserObservationMaxChars(runtimeCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runtimeCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runtimeCfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(runtimeCfg.Agent.WarmSetMaxSchemas, runtimeCfg.Agent.WarmSetMaxSchemaTokens)
 	// Seed from the configured model and the session's last-seen model so
 	// the first preflight check after a resume/agent-switch uses the right
 	// cap, instead of falling back to the static config until the next
@@ -679,6 +680,7 @@ func (m *Model) rebuildAgentLoop() {
 	loop.SetBrowserObservationMaxChars(m.cfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(m.cfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(m.cfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(m.cfg.Agent.WarmSetMaxSchemas, m.cfg.Agent.WarmSetMaxSchemaTokens)
 	// Seed the soft context window from the configured model + the
 	// currently-active session's last-seen model. After an agent switch
 	// the session may already carry usage from prior turns served by a

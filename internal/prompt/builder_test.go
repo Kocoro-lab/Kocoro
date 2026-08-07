@@ -49,9 +49,10 @@ func TestBuildSystemPrompt_SeparatesNeedFromQuestionPresentation(t *testing.T) {
 	for _, guidance := range []string{
 		"material unresolved fork",
 		"`Structured question UI: available`",
-		"otherwise ask one concise prose question",
+		"you MUST call the tool in that same response",
+		"ask one concise prose question",
 		"concrete choices",
-		"allow a custom answer",
+		"never add a Custom, Other, 自定义, or equivalent placeholder option",
 	} {
 		if !strings.Contains(parts.System, guidance) {
 			t.Errorf("system prompt missing question-gating guidance %q", guidance)

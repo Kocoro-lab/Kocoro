@@ -111,9 +111,15 @@ func TestSystemPromptAudit(t *testing.T) {
 		FastMode:         true,
 	})
 	fullSystem := full.System + cloudDelegationGuidance + contrastExamplesCloud
+	// Budgets were raised from 7200/8000 when three behavior clauses returned
+	// after the harness review: the ask_user_question MUST gate + placeholder-
+	// option ban (Desktop question cards degraded to prose without it), the
+	// mid-task progress-update rule (2026-05 over-silence regression),
+	// and the web/browser empty-result honesty section. Each traces to a
+	// production incident; the budget guards drift, not these clauses.
 	const (
-		fastSystemCharBudget = 7200
-		fullSystemCharBudget = 8000
+		fastSystemCharBudget = 8300
+		fullSystemCharBudget = 9100
 	)
 	if len(fast.System) > fastSystemCharBudget {
 		t.Fatalf("representative Koe Fast System is %d chars, budget %d", len(fast.System), fastSystemCharBudget)

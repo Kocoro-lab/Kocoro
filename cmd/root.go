@@ -225,6 +225,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(runCfg.Agent.WarmSetMaxSchemas, runCfg.Agent.WarmSetMaxSchemaTokens)
 	// One-shot CLI starts with a fresh session (no last-seen model), but
 	// still seed from the configured model so a known 1M/200K cap guides
 	// the first preflight check before any response arrives.

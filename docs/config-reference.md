@@ -118,6 +118,8 @@ agent:
   observation_window: 3            # keep the N most recent browser/GUI observations at full fidelity; older ones are stubbed. 0 disables. Negative is rejected.
   max_recent_images: 50            # keep the N most recent image-bearing messages (all images); older screenshots become a placeholder. 0 disables (keep all). Negative is rejected.
   max_recent_browser_images: 1     # keep only the N most recent browser/GUI screenshots; user uploads + non-GUI images stay under max_recent_images. 0 disables. Negative is rejected.
+  warm_set_max_schemas: 16         # session warm set: max deferred tool schemas kept loaded after tool_search. When it binds, the least-recently-loaded schema is evicted (next call re-warms via tool_search). 0 = default. Negative is rejected.
+  warm_set_max_schema_tokens: 8000 # session warm set: estimated token budget across warmed schemas. Raise for very large MCP catalogs. The most recently loaded schema is always kept, even alone over budget. 0 = default. Negative is rejected.
 ```
 
 `effort_tier` is the preferred user-facing reasoning control: **Light** (`low`), **Balanced** (`high`), **Deep** (`xhigh`), and **Max** (`max`), plus **Default** (`""`). Cloud translates those stable product tiers to each provider's native value. GPT-5.6 uses `low` / `medium` / `xhigh` / `max`; Anthropic uses `low` / `high` / `xhigh` / `max`. Claude Haiku does not advertise effort support and stays at the model default.

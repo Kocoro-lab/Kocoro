@@ -178,6 +178,15 @@ type AgentConfig struct {
 	// screenshots (scoped by tool); user uploads + non-GUI images stay under
 	// MaxRecentImages. Default 1; 0 disables the browser-scoped filter.
 	MaxRecentBrowserImages int `mapstructure:"max_recent_browser_images" yaml:"max_recent_browser_images" json:"max_recent_browser_images"`
+	// WarmSetMaxSchemas / WarmSetMaxSchemaTokens cap the session warm set of
+	// deferred tool schemas loaded via tool_search (count / estimated tokens).
+	// When a cap binds, the least-recently-loaded schema is evicted and its
+	// next call pays one extra tool_search round trip. Raise for very large
+	// MCP catalogs. Session-level infrastructure — deliberately not part of
+	// the per-agent overlay. Defaults 16 / 8000; values < 1 fall back to the
+	// defaults.
+	WarmSetMaxSchemas      int `mapstructure:"warm_set_max_schemas" yaml:"warm_set_max_schemas" json:"warm_set_max_schemas"`
+	WarmSetMaxSchemaTokens int `mapstructure:"warm_set_max_schema_tokens" yaml:"warm_set_max_schema_tokens" json:"warm_set_max_schema_tokens"`
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an
 	// LLM response). Other phases (tool execution, approval wait, compaction
@@ -511,6 +520,8 @@ func Load() (*Config, error) {
 	// loop re-sends each iteration. observation_window=0 disables the window.
 	viper.SetDefault("agent.observation_window", 3)
 	viper.SetDefault("agent.max_recent_images", 50)
+	viper.SetDefault("agent.warm_set_max_schemas", 16)
+	viper.SetDefault("agent.warm_set_max_schema_tokens", 8000)
 	viper.SetDefault("agent.max_recent_browser_images", 1)
 	// Prompt suggestion (post-turn ghost text). Enabled by default —
 	// the daemon runs a forked completion call after each turn to
@@ -949,6 +960,8 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.observation_window":               {Level: "default"},
 		"agent.max_recent_images":                {Level: "default"},
 		"agent.max_recent_browser_images":        {Level: "default"},
+		"agent.warm_set_max_schemas":             {Level: "default"},
+		"agent.warm_set_max_schema_tokens":       {Level: "default"},
 		"agent.idle_soft_timeout_secs":           {Level: "default"},
 		"agent.idle_hard_timeout_secs":           {Level: "default"},
 		"agent.stream_idle_timeout_secs":         {Level: "default"},
@@ -1026,6 +1039,12 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.max_recent_browser_images") {
 		cfg.Sources["agent.max_recent_browser_images"] = src
+	}
+	if viper.IsSet("agent.warm_set_max_schemas") {
+		cfg.Sources["agent.warm_set_max_schemas"] = src
+	}
+	if viper.IsSet("agent.warm_set_max_schema_tokens") {
+		cfg.Sources["agent.warm_set_max_schema_tokens"] = src
 	}
 	if viper.IsSet("agent.idle_soft_timeout_secs") {
 		cfg.Sources["agent.idle_soft_timeout_secs"] = src
@@ -1420,6 +1439,12 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Agent.InterruptedResumeMaxAgeHours < 0 {
 		return fmt.Errorf("agent.interrupted_resume_max_age_hours (%d) must be >= 0 (0 = default)", cfg.Agent.InterruptedResumeMaxAgeHours)
+	}
+	if cfg.Agent.WarmSetMaxSchemas < 0 {
+		return fmt.Errorf("agent.warm_set_max_schemas (%d) must be >= 0 (0 = default)", cfg.Agent.WarmSetMaxSchemas)
+	}
+	if cfg.Agent.WarmSetMaxSchemaTokens < 0 {
+		return fmt.Errorf("agent.warm_set_max_schema_tokens (%d) must be >= 0 (0 = default)", cfg.Agent.WarmSetMaxSchemaTokens)
 	}
 	if cfg.Cloud.StreamIdleTimeoutSecs < 0 {
 		return fmt.Errorf("cloud.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Cloud.StreamIdleTimeoutSecs)
