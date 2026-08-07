@@ -13,7 +13,7 @@ a{color:var(--blue)}.shell{display:grid;grid-template-columns:230px minmax(0,1fr
 <body><div class="shell">
 <nav><strong>Kocoro<br>Harness Review</strong><a href="#verdict">结论</a><a href="#runtime">运行合理性</a><a href="#memory">Memory A/B</a><a href="#prompt">Prompt A/B</a><a href="#layers">完整提示词</a><a href="#comparison">横向对比</a><a href="#gaps">剩余缺口</a><a href="#diff">完整 Diff</a></nav>
 <main>
-<header id="verdict"><div class="eyebrow">worktree evidence / experiment/kocoro-agent-lab / 2026-08-07T06:34:45+00:00</div><h1>运行骨架是强的，提示词还没有完成瘦身。</h1><p class="lede">工具轨迹、停止条件、并发、幂等和循环防护已经达到很高水准；但真实 sidecar memory、自然工作质量和完整工具生态仍缺 release 级证据，因此现在不能称为“顶级 harness 已完成”。</p><div class="verdict"><i></i><div><strong>本轮产品决策</strong><br>生产路径移除 memory preflight，由主模型按需调用 <code>memory_recall</code>；保留旧 preflight 仅作实验对照。最终 3× paired A/B 两条路径均 24/24，主模型路径成本低 70.9%、中位延迟快 8.7%，但平均延迟因尾部 outlier 慢 20.7%，不能宣传为全面提速。</div></div></header>
+<header id="verdict"><div class="eyebrow">worktree evidence / experiment/kocoro-agent-lab / 2026-08-07T06:39:22+00:00</div><h1>运行骨架是强的，提示词还没有完成瘦身。</h1><p class="lede">工具轨迹、停止条件、并发、幂等和循环防护已经达到很高水准；但真实 sidecar memory、自然工作质量和完整工具生态仍缺 release 级证据，因此现在不能称为“顶级 harness 已完成”。</p><div class="verdict"><i></i><div><strong>本轮产品决策</strong><br>生产路径移除 memory preflight，由主模型按需调用 <code>memory_recall</code>；保留旧 preflight 仅作实验对照。最终 3× paired A/B 两条路径均 24/24，主模型路径成本低 70.9%、中位延迟快 8.7%，但平均延迟因尾部 outlier 慢 20.7%，不能宣传为全面提速。</div></div></header>
 
 <section id="runtime"><div class="eyebrow">01 / trajectory, not pass count</div><h2>整体运行合理性</h2><p class="sub">判断单位是完整轨迹：模型调用次数 = 工具轮数 + 最终回答；精确工具名和参数；串行依赖、并行同轮；空结果后停止；副作用不重复；结果变化时不能误杀。</p><div class="grid"><div class="card"><strong class="ok">132 / 132</strong>live prompt runs 工具轨迹正确<small>11 workloads × 4 variants × 3 reps</small></div><div class="card"><strong class="ok">0</strong>重复工具与重复副作用<small>无 retry；completion 拓扑合理</small></div><div class="card"><strong class="ok">0 / 10</strong>loop corpus 误杀或漏检<small>5 productive + 5 genuine loops</small></div></div>
 <div class="trace"><time>productive</time><span class="rail"></span><p>同参数 polling 只要观察结果持续变化，允许到达完成；多来源研究、浏览器多步、不同 HTTP 批次均未触发。</p><time>warning</time><span class="rail"></span><p>无进展的 identical polling 在第 3 次提醒；ping-pong 在第 6 次提醒，给模型一次修正机会。</p><time>force stop</time><span class="rail"></span><p>持续无进展才强停。危险 read loop 会在执行前阻断整个批次，避免“部分批次已经产生副作用”。</p><time>recovery</time><span class="rail"></span><p>写工具的 post-dispatch transport error 不重放；只有明确 replay-safe 的工具才恢复。daemon idempotency 可重放交付回执，不重复 LLM 或副作用。</p></div>
@@ -21,7 +21,7 @@ a{color:var(--blue)}.shell{display:grid;grid-template-columns:230px minmax(0,1fr
   &quot;schema_version&quot;: &quot;agent.loop_detector_acceptance_result.v1&quot;,
   &quot;corpus_schema&quot;: &quot;agent.loop_detector_acceptance.v1&quot;,
   &quot;suite&quot;: &quot;release_regression_corpus&quot;,
-  &quot;finished_at&quot;: &quot;2026-08-07T06:31:46.591087Z&quot;,
+  &quot;finished_at&quot;: &quot;2026-08-07T06:38:21.277659Z&quot;,
   &quot;trace_count&quot;: 10,
   &quot;productive_count&quot;: 5,
   &quot;loop_count&quot;: 5,
@@ -123,7 +123,7 @@ a{color:var(--blue)}.shell{display:grid;grid-template-columns:230px minmax(0,1fr
   ]
 }</code></pre></details></section>
 
-<section id="memory"><div class="eyebrow">02 / model-driven recall</div><h2>Memory：去掉 preflight 的收益主要是成本</h2><p class="sub">最终 2026-08-07 live 配对测试，3 repetitions、48 total runs。synthetic Ready service 只测路由、调用、答案忠实度、延迟与成本；不代表真实用户 bundle 的召回质量。</p><table><thead><tr><th>路径</th><th>总正确</th><th>正例路由</th><th>路由效率</th><th>正例答案</th><th>负例误召回</th><th>平均延迟</th><th>总成本</th></tr></thead><tbody><tr><th>主模型主动召回</th><td>24/24 (100.0%)</td><td>100.0%</td><td>100.0%</td><td>100.0%</td><td>0/6</td><td>4,273 ms</td><td>$0.010348</td></tr><tr><th>旧 preflight 对照</th><td>24/24 (100.0%)</td><td>100.0%</td><td>100.0%</td><td>100.0%</td><td>0/6</td><td>3,541 ms</td><td>$0.035604</td></tr></tbody></table>
+<section id="memory"><div class="eyebrow">02 / model-driven recall</div><h2>Memory：去掉 preflight 的收益主要是成本</h2><p class="sub">最终 2026-08-07 live 配对测试，3 repetitions、48 total runs。fake session_search 的 <code>Info()</code> 直接复用生产 <code>SessionSearchTool.Info()</code>，因此模型看到的工具名称、description 与参数 schema 和真实运行一致；只有 <code>Run()</code> 使用确定性 fixture。synthetic Ready service 只测路由、调用、答案忠实度、延迟与成本；不代表真实用户 bundle、sidecar 检索或排序质量。</p><table><thead><tr><th>路径</th><th>总正确</th><th>正例路由</th><th>路由效率</th><th>正例答案</th><th>负例误召回</th><th>平均延迟</th><th>总成本</th></tr></thead><tbody><tr><th>主模型主动召回</th><td>24/24 (100.0%)</td><td>100.0%</td><td>100.0%</td><td>100.0%</td><td>0/6</td><td>4,273 ms</td><td>$0.010348</td></tr><tr><th>旧 preflight 对照</th><td>24/24 (100.0%)</td><td>100.0%</td><td>100.0%</td><td>100.0%</td><td>0/6</td><td>3,541 ms</td><td>$0.035604</td></tr></tbody></table>
 <div class="callout"><strong>最终结果：</strong>失败 0 条。主模型路径平均 4,273 ms，旧 preflight 3,541 ms；正例主模型更慢，但负例更快，provider 尾延迟仍显著。调试中的旧 harness 曾漏注册 session_search、误把 honorific 当必需、把多余复查算成功；这些 evaluator 缺陷已修复后才得到本表。</div>
 <details><summary>最新 Memory A/B 原始 JSON <span>39,024 chars</span></summary><pre><code>{
   &quot;coverage_boundaries&quot;: [
@@ -9194,7 +9194,7 @@ Good candidates for memory:
 
 Keep entries as short one-line bullets. Do NOT save ephemeral task status, code snippets, or things already documented in project files. Your context is automatically compacted in long sessions — anything not written to memory may be lost.</code></pre></details><details><summary>Full / stable_context <span>32 chars</span></summary><pre><code>## Session
 Active agent context.</code></pre></details><details open><summary>Full / volatile_context <span>1,106 chars</span></summary><pre><code>## Context
-Current date: 2026-08-07 15:23 JST
+Current date: 2026-08-07 15:35 JST
 Model tier: medium
 Kocoro offers two tiers: medium, large.
 
@@ -9396,7 +9396,7 @@ Good candidates for memory:
 
 Keep entries as short one-line bullets. Do NOT save ephemeral task status, code snippets, or things already documented in project files. Your context is automatically compacted in long sessions — anything not written to memory may be lost.</code></pre></details><details><summary>Fast / stable_context <span>32 chars</span></summary><pre><code>## Session
 Active agent context.</code></pre></details><details open><summary>Fast / volatile_context（含 Fast Task） <span>2,945 chars</span></summary><pre><code>## Context
-Current date: 2026-08-07 15:23 JST
+Current date: 2026-08-07 15:35 JST
 Model tier: medium
 Kocoro offers two tiers: medium, large.
 
@@ -9442,7 +9442,7 @@ Correct: Keep tasks local when they need the user&#x27;s environment or should l
 <tr><th><span class="tag">NEXT</span></th><td>长轨迹与崩溃恢复</td><td>3-call serial 不代表 10+ steps、compaction、外部写后进程崩溃</td><td>checkpoint + receipt + restart，证明不重复副作用</td></tr>
 <tr><th><span class="tag">NEXT</span></th><td>跨 profile / provider 与稀有失败率</td><td>3 reps 只能用于比较，不能估算 1% 以下失败</td><td>Fast/Full 各自固定模型条件，扩大样本并报告置信区间</td></tr></tbody></table></section>
 
-<section id="diff"><div class="eyebrow">07 / source of truth</div><h2>完整修改 Diff</h2><p class="sub">范围为 <code>origin/main...HEAD</code> 的完整分支差异，加上生成本报告前的未提交差异；HTML 自身被排除，避免递归嵌套。</p><details><summary>完整 diff <span>385,731 chars</span></summary><pre><code>diff --git a/AGENTS.md b/AGENTS.md
+<section id="diff"><div class="eyebrow">07 / source of truth</div><h2>完整修改 Diff</h2><p class="sub">范围为 <code>origin/main...HEAD</code> 的完整分支差异，加上生成本报告前的未提交差异；HTML 自身被排除，避免递归嵌套。</p><details><summary>完整 diff <span>384,749 chars</span></summary><pre><code>diff --git a/AGENTS.md b/AGENTS.md
 index e478673c..e377b82f 100644
 --- a/AGENTS.md
 +++ b/AGENTS.md
@@ -9548,7 +9548,7 @@ index 4c8bc743..3e276e66 100644
    model_tier: &quot;&quot;                   # tier override (medium | large); empty = inherit global model_tier. &quot;small&quot; reserved for daemon-internal calls — do not pin via UI.
    reasoning_effort: &quot;&quot;             # &quot;low&quot; / &quot;medium&quot; / &quot;high&quot; (empty = model default)
 diff --git a/internal/agent/loop.go b/internal/agent/loop.go
-index 98a3f3e7..ee9425a3 100644
+index 9ab3b3df..70cac380 100644
 --- a/internal/agent/loop.go
 +++ b/internal/agent/loop.go
 @@ -9,6 +9,7 @@ import (
@@ -9559,7 +9559,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&quot;os&quot;
  &#9;&quot;path/filepath&quot;
  &#9;&quot;reflect&quot;
-@@ -2728,16 +2729,6 @@ func injectPrivateMemoryContext(scaffolded, userPayload, privateContext string)
+@@ -2799,16 +2800,6 @@ func injectPrivateMemoryContext(scaffolded, userPayload, privateContext string)
  &#9;return scaffolded + &quot;\n\n&quot; + privateContext
  }
 &#32;
@@ -9576,7 +9576,7 @@ index 98a3f3e7..ee9425a3 100644
  func cloneMessages(messages []client.Message) []client.Message {
  &#9;out := make([]client.Message, len(messages))
  &#9;copy(out, messages)
-@@ -3173,7 +3164,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
+@@ -3244,7 +3235,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
  &#9;}
 &#32;
  &#9;if a.memoryPreflight != nil &amp;&amp; !initialUserInjected {
@@ -9590,7 +9590,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;opts := MemoryPreflightOptions{ForceHelper: trace.ForceHelper, Trace: &amp;trace}
  &#9;&#9;if preflight := a.memoryPreflight(ctx, userMessage, opts); preflight != nil {
  &#9;&#9;&#9;a.emitInternalUsage(preflight.Usage)
-@@ -3544,6 +3540,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
+@@ -3624,6 +3620,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
  &#9;&#9;latestUserText                   = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
  &#9;&#9;cloudNudgeFired                  bool
  &#9;&#9;cloudDelegateClaimed             bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
@@ -9598,7 +9598,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;cloudResultContent               string // non-empty when a cloud deliverable should bypass LLM summarization
  &#9;&#9;lastDiscoveryInput               string // dedup: skip discovery when user text hasn&#x27;t changed between iterations
  &#9;&#9;contextBloatStatusSent           bool
-@@ -3852,51 +3849,44 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
+@@ -4027,51 +4024,44 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
  &#9;&#9;return text, nil
  &#9;}
 &#32;
@@ -9682,7 +9682,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;}
 &#32;
  &#9;// auditDetectorForceStop emits a single `event:&quot;force_stop&quot;` audit
-@@ -4635,7 +4625,7 @@ iterationLoop:
+@@ -4810,7 +4800,7 @@ iterationLoop:
  &#9;&#9;&#9;&#9;// On retries, skip streaming to avoid duplicate partial deltas.
  &#9;&#9;&#9;&#9;if attempt == 0 &amp;&amp; a.enableStreaming &amp;&amp; a.handler != nil {
  &#9;&#9;&#9;&#9;&#9;streamingText.Reset()
@@ -9691,7 +9691,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;&#9;&#9;&#9;resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
  &#9;&#9;&#9;&#9;&#9;&#9;// A delta means the model received the request (incl. the
  &#9;&#9;&#9;&#9;&#9;&#9;// drained system-event scaffold) and is responding — so the
-@@ -4683,8 +4673,11 @@ iterationLoop:
+@@ -4858,8 +4848,11 @@ iterationLoop:
  &#9;&#9;&#9;&#9;&#9;&#9;setRunStatus(runstatus.CodeDeadlineExceeded, true)
  &#9;&#9;&#9;&#9;&#9;&#9;return partial, usage, fmt.Errorf(&quot;stream aborted: %w&quot;, err)
  &#9;&#9;&#9;&#9;&#9;}
@@ -9705,7 +9705,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;&#9;&#9;&#9;&#9;streamTools.CancelAll()
  &#9;&#9;&#9;&#9;&#9;&#9;// Telemetry (NOT a fix): a streaming call that drops here
  &#9;&#9;&#9;&#9;&#9;&#9;// re-issues as a non-stream request. If the gateway opened a
-@@ -4698,12 +4691,14 @@ iterationLoop:
+@@ -4873,12 +4866,14 @@ iterationLoop:
  &#9;&#9;&#9;&#9;&#9;&#9;fmt.Fprintf(os.Stderr, &quot;[agent] stream-&gt;nonstream fallback iter=%d continuation=%d session_id=%q cache_source=%q skip_cache_write=%t stream_err_type=%T stream_err=%q\n&quot;,
  &#9;&#9;&#9;&#9;&#9;&#9;&#9;i, continuationCount, req.SessionID, req.CacheSource, req.SkipCacheWrite, err, err.Error())
  &#9;&#9;&#9;&#9;&#9;&#9;resp, err = a.client.Complete(ctx, req)
@@ -9722,7 +9722,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;&#9;&#9;&#9;}
  &#9;&#9;&#9;&#9;} else {
  &#9;&#9;&#9;&#9;&#9;resp, err = a.client.Complete(ctx, req)
-@@ -4971,7 +4966,7 @@ iterationLoop:
+@@ -5146,7 +5141,7 @@ iterationLoop:
  &#9;&#9;&#9;&#9;&#9;setRunStatus(runstatus.CodeFromError(err), false)
  &#9;&#9;&#9;&#9;&#9;return &quot;&quot;, usage, fmt.Errorf(&quot;LLM call failed: %w&quot;, err)
  &#9;&#9;&#9;&#9;}
@@ -9731,7 +9731,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;&#9;&#9;reason := classifyLLMError(err)
  &#9;&#9;&#9;&#9;retryCount++
  &#9;&#9;&#9;&#9;reanchorActiveTask(MetaBoundaryRetryAfterError)
-@@ -5593,6 +5588,38 @@ iterationLoop:
+@@ -5768,6 +5763,38 @@ iterationLoop:
  &#9;&#9;if committedStreamTools != nil {
  &#9;&#9;&#9;committedStreamTools.CancelUnmatched(toolCalls)
  &#9;&#9;}
@@ -9770,7 +9770,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;modelToolText := normalizeStructuredToolCallPreamble(resp.OutputText, toolCalls)
  &#9;&#9;normalizedToolText := modelToolText
  &#9;&#9;if normalizedToolText == &quot;&quot; &amp;&amp; !a.unattendedRun {
-@@ -5646,20 +5673,35 @@ iterationLoop:
+@@ -5821,20 +5848,35 @@ iterationLoop:
 &#32;
  &#9;&#9;var worstAction LoopAction
  &#9;&#9;var worstMsg string
@@ -9815,7 +9815,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;}
  &#9;&#9;callMeta := make([]perCallMeta, len(toolCalls))
  &#9;&#9;execResults := make([]toolExecResult, len(toolCalls))
-@@ -5683,6 +5725,21 @@ iterationLoop:
+@@ -5858,6 +5900,21 @@ iterationLoop:
  &#9;&#9;&#9;toolsUsed[fc.Name]++
  &#9;&#9;&#9;argsStr := fc.ArgumentsString()
  &#9;&#9;&#9;callMeta[idx].argsStr = argsStr
@@ -9837,7 +9837,7 @@ index 98a3f3e7..ee9425a3 100644
 &#32;
  &#9;&#9;&#9;dedupKey := fc.Name + &quot;\x00&quot; + normalizeJSON(fc.Arguments)
  &#9;&#9;&#9;if seenCalls[dedupKey] {
-@@ -5927,6 +5984,7 @@ iterationLoop:
+@@ -6102,6 +6159,7 @@ iterationLoop:
  &#9;&#9;&#9;&#9;continue
  &#9;&#9;&#9;}
  &#9;&#9;&#9;callMeta[idx].validated = true
@@ -9845,7 +9845,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;&#9;if readOnly, ok := tool.(ReadOnlyChecker); !ok || !readOnly.IsReadOnlyCall(argsStr) {
  &#9;&#9;&#9;&#9;callMeta[idx].sideEffect = true
  &#9;&#9;&#9;&#9;callMeta[idx].argsDigest = toolArgumentsDigest(fc.Arguments)
-@@ -5966,6 +6024,7 @@ iterationLoop:
+@@ -6141,6 +6199,7 @@ iterationLoop:
  &#9;&#9;&#9;}
 &#32;
  &#9;&#9;&#9;stateTraits := resolveCallStateTraits(fc.Name, argsStr)
@@ -9853,7 +9853,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;&#9;if !stateTraits.Cacheable &amp;&amp; len(stateTraits.Reads) == 0 &amp;&amp; len(stateTraits.Writes) == 0 &amp;&amp; !stateTraits.UnknownWrite {
  &#9;&#9;&#9;&#9;stateTraits = resolveFallbackReadStateTraits(tool, argsStr)
  &#9;&#9;&#9;}
-@@ -6365,6 +6424,13 @@ iterationLoop:
+@@ -6540,6 +6599,13 @@ iterationLoop:
  &#9;&#9;&#9;&#9;cloudDelegateClaimed = false
  &#9;&#9;&#9;}
 &#32;
@@ -9867,7 +9867,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;&#9;// Record in sliding-window loop detector
  &#9;&#9;&#9;errMsg := &quot;&quot;
  &#9;&#9;&#9;if result.IsError {
-@@ -6375,7 +6441,16 @@ iterationLoop:
+@@ -6550,7 +6616,16 @@ iterationLoop:
  &#9;&#9;&#9;&#9;resultSig = extractResultSignature(result.Content)
  &#9;&#9;&#9;}
  &#9;&#9;&#9;nonActionable := isNonActionableSearch(fc.Name, result)
@@ -9885,7 +9885,7 @@ index 98a3f3e7..ee9425a3 100644
 &#32;
  &#9;&#9;&#9;// Check for stuck loops (escalate to worst action seen)
  &#9;&#9;&#9;action, msg := detector.Check(fc.Name)
-@@ -6511,15 +6586,10 @@ iterationLoop:
+@@ -6686,15 +6761,10 @@ iterationLoop:
  &#9;&#9;}
  &#9;&#9;cloudResultContent = &quot;&quot; // reset if mixed with other tools
 &#32;
@@ -9905,7 +9905,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;forceStopFallback := fmt.Sprintf(
  &#9;&#9;&#9;&quot;The loop detector stopped the run after %d turns; synthesis produced no output.&quot;,
  &#9;&#9;&#9;iterationCount,
-@@ -6713,7 +6783,7 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
+@@ -6888,7 +6958,7 @@ func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.Completion
  &#9;&#9;if !isRetryableLLMError(err) || attempt &gt;= maxRetries-1 {
  &#9;&#9;&#9;return nil, fmt.Errorf(&quot;LLM call failed: %w&quot;, err)
  &#9;&#9;}
@@ -9914,7 +9914,7 @@ index 98a3f3e7..ee9425a3 100644
  &#9;&#9;fmt.Fprintf(os.Stderr, &quot;[agent] LLM call failed (attempt %d/%d), retrying in %v: %v\n&quot;, attempt+1, maxRetries, backoff, err)
  &#9;&#9;if a.handler != nil {
  &#9;&#9;&#9;a.handler.OnCloudAgent(&quot;&quot;, &quot;retry&quot;, fmt.Sprintf(&quot;Retrying request (attempt %d/%d)…&quot;, attempt+1, maxRetries))
-@@ -6803,6 +6873,56 @@ func isRetryableLLMError(err error) bool {
+@@ -6978,6 +7048,56 @@ func isRetryableLLMError(err error) bool {
  &#9;return client.TransportErrorShape(err)
  }
 &#32;
@@ -9971,7 +9971,7 @@ index 98a3f3e7..ee9425a3 100644
  // classifyLLMError returns a human-readable reason for an LLM error.
  // Used in retry messages so the UI can show why the request is being retried.
  func classifyLLMError(err error) string {
-@@ -7281,31 +7401,37 @@ func (a *AgentLoop) logMemoryPreflightTrace(trace MemoryPreflightTrace) {
+@@ -7456,31 +7576,37 @@ func (a *AgentLoop) logMemoryPreflightTrace(trace MemoryPreflightTrace) {
  &#9;&#9;return
  &#9;}
  &#9;summary, err := json.Marshal(struct {
@@ -10056,10 +10056,10 @@ index 01dee413..e412c163 100644
  &#9;defer server.Close()
 &#32;
 diff --git a/internal/agent/loop_test.go b/internal/agent/loop_test.go
-index 68ff61ff..a3d8fafa 100644
+index e37b8302..8010bb74 100644
 --- a/internal/agent/loop_test.go
 +++ b/internal/agent/loop_test.go
-@@ -1278,6 +1278,7 @@ func (m *mockCountingTool) RequiresApproval() bool { return false }
+@@ -1279,6 +1279,7 @@ func (m *mockCountingTool) RequiresApproval() bool { return false }
  func (m *mockCountingTool) IsReadOnlyCall(string) bool {
  &#9;return true
  }
@@ -10067,7 +10067,7 @@ index 68ff61ff..a3d8fafa 100644
 &#32;
  type mockComputerUseRecoveryTool struct {
  &#9;runs int
-@@ -5312,6 +5313,156 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
+@@ -5852,6 +5853,156 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
  &#9;}
  }
 &#32;
@@ -10224,7 +10224,7 @@ index 68ff61ff..a3d8fafa 100644
  // TestForceStopExit_DetectorPath_SynthesisPromptShape verifies that the
  // direct LoopForceStop path (3 identical-args tool calls → ConsecutiveDup
  // force-stop) feeds the synthesis turn a structured Task/Done/Pending
-@@ -5363,13 +5514,17 @@ func TestForceStopExit_DetectorPath_SynthesisPromptShape(t *testing.T) {
+@@ -5903,13 +6054,17 @@ func TestForceStopExit_DetectorPath_SynthesisPromptShape(t *testing.T) {
  &#9;&#9;t.Fatalf(&quot;synthesis request body was not captured (expected 4 LLM calls, got %d)&quot;, llmCallCount)
  &#9;}
 &#32;
@@ -10246,7 +10246,7 @@ index 68ff61ff..a3d8fafa 100644
  &#9;&#9;`Do not request any more tools.`,
  &#9;&#9;`identical arguments`, // from ConsecutiveDup&#x27;s message
  &#9;}
-@@ -5431,10 +5586,13 @@ func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
+@@ -5971,10 +6126,13 @@ func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
  &#9;}
 &#32;
  &#9;wantMarkers := []string{
@@ -16629,10 +16629,10 @@ index 00000000..7b88d8b7
 +    raise SystemExit(main())
 diff --git a/scripts/generate-agent-harness-report.py b/scripts/generate-agent-harness-report.py
 new file mode 100755
-index 00000000..67fa07e2
+index 00000000..03fce535
 --- /dev/null
 +++ b/scripts/generate-agent-harness-report.py
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,191 @@
 +#!/usr/bin/env python3
 +&quot;&quot;&quot;Generate the self-contained Kocoro agent harness evidence report.&quot;&quot;&quot;
 +
@@ -16765,7 +16765,6 @@ index 00000000..67fa07e2
 +    memory_mean_delta = (model_memory[&quot;mean_latency_ms&quot;] / preflight_memory[&quot;mean_latency_ms&quot;] - 1) * 100
 +    memory_median_reduction = (1 - model_memory[&quot;median_latency_ms&quot;] / preflight_memory[&quot;median_latency_ms&quot;]) * 100
 +    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec=&quot;seconds&quot;)
-+    commit = git(repo, &quot;rev-parse&quot;, &quot;--short&quot;, &quot;HEAD&quot;)
 +
 +    document = f&quot;&quot;&quot;&lt;!doctype html&gt;
 +&lt;html lang=&quot;zh-CN&quot;&gt;
@@ -16782,7 +16781,7 @@ index 00000000..67fa07e2
 +&lt;body&gt;&lt;div class=&quot;shell&quot;&gt;
 +&lt;nav&gt;&lt;strong&gt;Kocoro&lt;br&gt;Harness Review&lt;/strong&gt;&lt;a href=&quot;#verdict&quot;&gt;结论&lt;/a&gt;&lt;a href=&quot;#runtime&quot;&gt;运行合理性&lt;/a&gt;&lt;a href=&quot;#memory&quot;&gt;Memory A/B&lt;/a&gt;&lt;a href=&quot;#prompt&quot;&gt;Prompt A/B&lt;/a&gt;&lt;a href=&quot;#layers&quot;&gt;完整提示词&lt;/a&gt;&lt;a href=&quot;#comparison&quot;&gt;横向对比&lt;/a&gt;&lt;a href=&quot;#gaps&quot;&gt;剩余缺口&lt;/a&gt;&lt;a href=&quot;#diff&quot;&gt;完整 Diff&lt;/a&gt;&lt;/nav&gt;
 +&lt;main&gt;
-+&lt;header id=&quot;verdict&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;worktree evidence / {esc(commit)} / {esc(now)}&lt;/div&gt;&lt;h1&gt;运行骨架是强的，提示词还没有完成瘦身。&lt;/h1&gt;&lt;p class=&quot;lede&quot;&gt;工具轨迹、停止条件、并发、幂等和循环防护已经达到很高水准；但真实 sidecar memory、自然工作质量和完整工具生态仍缺 release 级证据，因此现在不能称为“顶级 harness 已完成”。&lt;/p&gt;&lt;div class=&quot;verdict&quot;&gt;&lt;i&gt;&lt;/i&gt;&lt;div&gt;&lt;strong&gt;本轮产品决策&lt;/strong&gt;&lt;br&gt;生产路径移除 memory preflight，由主模型按需调用 &lt;code&gt;memory_recall&lt;/code&gt;；保留旧 preflight 仅作实验对照。最终 3× paired A/B 两条路径均 24/24，主模型路径成本低 {memory_cost_reduction:.1f}%、中位延迟快 {memory_median_reduction:.1f}%，但平均延迟因尾部 outlier 慢 {memory_mean_delta:.1f}%，不能宣传为全面提速。&lt;/div&gt;&lt;/div&gt;&lt;/header&gt;
++&lt;header id=&quot;verdict&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;worktree evidence / experiment/kocoro-agent-lab / {esc(now)}&lt;/div&gt;&lt;h1&gt;运行骨架是强的，提示词还没有完成瘦身。&lt;/h1&gt;&lt;p class=&quot;lede&quot;&gt;工具轨迹、停止条件、并发、幂等和循环防护已经达到很高水准；但真实 sidecar memory、自然工作质量和完整工具生态仍缺 release 级证据，因此现在不能称为“顶级 harness 已完成”。&lt;/p&gt;&lt;div class=&quot;verdict&quot;&gt;&lt;i&gt;&lt;/i&gt;&lt;div&gt;&lt;strong&gt;本轮产品决策&lt;/strong&gt;&lt;br&gt;生产路径移除 memory preflight，由主模型按需调用 &lt;code&gt;memory_recall&lt;/code&gt;；保留旧 preflight 仅作实验对照。最终 3× paired A/B 两条路径均 24/24，主模型路径成本低 {memory_cost_reduction:.1f}%、中位延迟快 {memory_median_reduction:.1f}%，但平均延迟因尾部 outlier 慢 {memory_mean_delta:.1f}%，不能宣传为全面提速。&lt;/div&gt;&lt;/div&gt;&lt;/header&gt;
 +
 +&lt;section id=&quot;runtime&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;01 / trajectory, not pass count&lt;/div&gt;&lt;h2&gt;整体运行合理性&lt;/h2&gt;&lt;p class=&quot;sub&quot;&gt;判断单位是完整轨迹：模型调用次数 = 工具轮数 + 最终回答；精确工具名和参数；串行依赖、并行同轮；空结果后停止；副作用不重复；结果变化时不能误杀。&lt;/p&gt;&lt;div class=&quot;grid&quot;&gt;&lt;div class=&quot;card&quot;&gt;&lt;strong class=&quot;ok&quot;&gt;132 / 132&lt;/strong&gt;live prompt runs 工具轨迹正确&lt;small&gt;11 workloads × 4 variants × 3 reps&lt;/small&gt;&lt;/div&gt;&lt;div class=&quot;card&quot;&gt;&lt;strong class=&quot;ok&quot;&gt;0&lt;/strong&gt;重复工具与重复副作用&lt;small&gt;无 retry；completion 拓扑合理&lt;/small&gt;&lt;/div&gt;&lt;div class=&quot;card&quot;&gt;&lt;strong class=&quot;ok&quot;&gt;0 / 10&lt;/strong&gt;loop corpus 误杀或漏检&lt;small&gt;5 productive + 5 genuine loops&lt;/small&gt;&lt;/div&gt;&lt;/div&gt;
 +&lt;div class=&quot;trace&quot;&gt;&lt;time&gt;productive&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;同参数 polling 只要观察结果持续变化，允许到达完成；多来源研究、浏览器多步、不同 HTTP 批次均未触发。&lt;/p&gt;&lt;time&gt;warning&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;无进展的 identical polling 在第 3 次提醒；ping-pong 在第 6 次提醒，给模型一次修正机会。&lt;/p&gt;&lt;time&gt;force stop&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;持续无进展才强停。危险 read loop 会在执行前阻断整个批次，避免“部分批次已经产生副作用”。&lt;/p&gt;&lt;time&gt;recovery&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;写工具的 post-dispatch transport error 不重放；只有明确 replay-safe 的工具才恢复。daemon idempotency 可重放交付回执，不重复 LLM 或副作用。&lt;/p&gt;&lt;/div&gt;
@@ -18134,25 +18133,16 @@ index 70ac5cab..e831900b 100644
  &#9;&#9;t.Skip(&quot;skipping: no API key configured&quot;)
 
 diff --git a/scripts/generate-agent-harness-report.py b/scripts/generate-agent-harness-report.py
-index 67fa07e2..03fce535 100755
+index 03fce535..ea80ab3a 100755
 --- a/scripts/generate-agent-harness-report.py
 +++ b/scripts/generate-agent-harness-report.py
-@@ -130,7 +130,6 @@ def main() -&gt; None:
-     memory_mean_delta = (model_memory[&quot;mean_latency_ms&quot;] / preflight_memory[&quot;mean_latency_ms&quot;] - 1) * 100
-     memory_median_reduction = (1 - model_memory[&quot;median_latency_ms&quot;] / preflight_memory[&quot;median_latency_ms&quot;]) * 100
-     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec=&quot;seconds&quot;)
--    commit = git(repo, &quot;rev-parse&quot;, &quot;--short&quot;, &quot;HEAD&quot;)
+@@ -152,7 +152,7 @@ a{{color:var(--blue)}}.shell{{display:grid;grid-template-columns:230px minmax(0,
+ &lt;div class=&quot;trace&quot;&gt;&lt;time&gt;productive&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;同参数 polling 只要观察结果持续变化，允许到达完成；多来源研究、浏览器多步、不同 HTTP 批次均未触发。&lt;/p&gt;&lt;time&gt;warning&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;无进展的 identical polling 在第 3 次提醒；ping-pong 在第 6 次提醒，给模型一次修正机会。&lt;/p&gt;&lt;time&gt;force stop&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;持续无进展才强停。危险 read loop 会在执行前阻断整个批次，避免“部分批次已经产生副作用”。&lt;/p&gt;&lt;time&gt;recovery&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;写工具的 post-dispatch transport error 不重放；只有明确 replay-safe 的工具才恢复。daemon idempotency 可重放交付回执，不重复 LLM 或副作用。&lt;/p&gt;&lt;/div&gt;
+ {code_block(&#x27;离线 loop detector 完整结果&#x27;, json.dumps(loop_report, ensure_ascii=False, indent=2))}&lt;/section&gt;
 &#32;
-     document = f&quot;&quot;&quot;&lt;!doctype html&gt;
- &lt;html lang=&quot;zh-CN&quot;&gt;
-@@ -147,7 +146,7 @@ a{{color:var(--blue)}}.shell{{display:grid;grid-template-columns:230px minmax(0,
- &lt;body&gt;&lt;div class=&quot;shell&quot;&gt;
- &lt;nav&gt;&lt;strong&gt;Kocoro&lt;br&gt;Harness Review&lt;/strong&gt;&lt;a href=&quot;#verdict&quot;&gt;结论&lt;/a&gt;&lt;a href=&quot;#runtime&quot;&gt;运行合理性&lt;/a&gt;&lt;a href=&quot;#memory&quot;&gt;Memory A/B&lt;/a&gt;&lt;a href=&quot;#prompt&quot;&gt;Prompt A/B&lt;/a&gt;&lt;a href=&quot;#layers&quot;&gt;完整提示词&lt;/a&gt;&lt;a href=&quot;#comparison&quot;&gt;横向对比&lt;/a&gt;&lt;a href=&quot;#gaps&quot;&gt;剩余缺口&lt;/a&gt;&lt;a href=&quot;#diff&quot;&gt;完整 Diff&lt;/a&gt;&lt;/nav&gt;
- &lt;main&gt;
--&lt;header id=&quot;verdict&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;worktree evidence / {esc(commit)} / {esc(now)}&lt;/div&gt;&lt;h1&gt;运行骨架是强的，提示词还没有完成瘦身。&lt;/h1&gt;&lt;p class=&quot;lede&quot;&gt;工具轨迹、停止条件、并发、幂等和循环防护已经达到很高水准；但真实 sidecar memory、自然工作质量和完整工具生态仍缺 release 级证据，因此现在不能称为“顶级 harness 已完成”。&lt;/p&gt;&lt;div class=&quot;verdict&quot;&gt;&lt;i&gt;&lt;/i&gt;&lt;div&gt;&lt;strong&gt;本轮产品决策&lt;/strong&gt;&lt;br&gt;生产路径移除 memory preflight，由主模型按需调用 &lt;code&gt;memory_recall&lt;/code&gt;；保留旧 preflight 仅作实验对照。最终 3× paired A/B 两条路径均 24/24，主模型路径成本低 {memory_cost_reduction:.1f}%、中位延迟快 {memory_median_reduction:.1f}%，但平均延迟因尾部 outlier 慢 {memory_mean_delta:.1f}%，不能宣传为全面提速。&lt;/div&gt;&lt;/div&gt;&lt;/header&gt;
-+&lt;header id=&quot;verdict&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;worktree evidence / experiment/kocoro-agent-lab / {esc(now)}&lt;/div&gt;&lt;h1&gt;运行骨架是强的，提示词还没有完成瘦身。&lt;/h1&gt;&lt;p class=&quot;lede&quot;&gt;工具轨迹、停止条件、并发、幂等和循环防护已经达到很高水准；但真实 sidecar memory、自然工作质量和完整工具生态仍缺 release 级证据，因此现在不能称为“顶级 harness 已完成”。&lt;/p&gt;&lt;div class=&quot;verdict&quot;&gt;&lt;i&gt;&lt;/i&gt;&lt;div&gt;&lt;strong&gt;本轮产品决策&lt;/strong&gt;&lt;br&gt;生产路径移除 memory preflight，由主模型按需调用 &lt;code&gt;memory_recall&lt;/code&gt;；保留旧 preflight 仅作实验对照。最终 3× paired A/B 两条路径均 24/24，主模型路径成本低 {memory_cost_reduction:.1f}%、中位延迟快 {memory_median_reduction:.1f}%，但平均延迟因尾部 outlier 慢 {memory_mean_delta:.1f}%，不能宣传为全面提速。&lt;/div&gt;&lt;/div&gt;&lt;/header&gt;
-&#32;
- &lt;section id=&quot;runtime&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;01 / trajectory, not pass count&lt;/div&gt;&lt;h2&gt;整体运行合理性&lt;/h2&gt;&lt;p class=&quot;sub&quot;&gt;判断单位是完整轨迹：模型调用次数 = 工具轮数 + 最终回答；精确工具名和参数；串行依赖、并行同轮；空结果后停止；副作用不重复；结果变化时不能误杀。&lt;/p&gt;&lt;div class=&quot;grid&quot;&gt;&lt;div class=&quot;card&quot;&gt;&lt;strong class=&quot;ok&quot;&gt;132 / 132&lt;/strong&gt;live prompt runs 工具轨迹正确&lt;small&gt;11 workloads × 4 variants × 3 reps&lt;/small&gt;&lt;/div&gt;&lt;div class=&quot;card&quot;&gt;&lt;strong class=&quot;ok&quot;&gt;0&lt;/strong&gt;重复工具与重复副作用&lt;small&gt;无 retry；completion 拓扑合理&lt;/small&gt;&lt;/div&gt;&lt;div class=&quot;card&quot;&gt;&lt;strong class=&quot;ok&quot;&gt;0 / 10&lt;/strong&gt;loop corpus 误杀或漏检&lt;small&gt;5 productive + 5 genuine loops&lt;/small&gt;&lt;/div&gt;&lt;/div&gt;
- &lt;div class=&quot;trace&quot;&gt;&lt;time&gt;productive&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;同参数 polling 只要观察结果持续变化，允许到达完成；多来源研究、浏览器多步、不同 HTTP 批次均未触发。&lt;/p&gt;&lt;time&gt;warning&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;无进展的 identical polling 在第 3 次提醒；ping-pong 在第 6 次提醒，给模型一次修正机会。&lt;/p&gt;&lt;time&gt;force stop&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;持续无进展才强停。危险 read loop 会在执行前阻断整个批次，避免“部分批次已经产生副作用”。&lt;/p&gt;&lt;time&gt;recovery&lt;/time&gt;&lt;span class=&quot;rail&quot;&gt;&lt;/span&gt;&lt;p&gt;写工具的 post-dispatch transport error 不重放；只有明确 replay-safe 的工具才恢复。daemon idempotency 可重放交付回执，不重复 LLM 或副作用。&lt;/p&gt;&lt;/div&gt;</code></pre></details></section>
+-&lt;section id=&quot;memory&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;02 / model-driven recall&lt;/div&gt;&lt;h2&gt;Memory：去掉 preflight 的收益主要是成本&lt;/h2&gt;&lt;p class=&quot;sub&quot;&gt;最终 2026-08-07 live 配对测试，3 repetitions、48 total runs。synthetic Ready service 只测路由、调用、答案忠实度、延迟与成本；不代表真实用户 bundle 的召回质量。&lt;/p&gt;&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th&gt;路径&lt;/th&gt;&lt;th&gt;总正确&lt;/th&gt;&lt;th&gt;正例路由&lt;/th&gt;&lt;th&gt;路由效率&lt;/th&gt;&lt;th&gt;正例答案&lt;/th&gt;&lt;th&gt;负例误召回&lt;/th&gt;&lt;th&gt;平均延迟&lt;/th&gt;&lt;th&gt;总成本&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;&lt;tbody&gt;{memory_rows(memory_report)}&lt;/tbody&gt;&lt;/table&gt;
++&lt;section id=&quot;memory&quot;&gt;&lt;div class=&quot;eyebrow&quot;&gt;02 / model-driven recall&lt;/div&gt;&lt;h2&gt;Memory：去掉 preflight 的收益主要是成本&lt;/h2&gt;&lt;p class=&quot;sub&quot;&gt;最终 2026-08-07 live 配对测试，3 repetitions、48 total runs。fake session_search 的 &lt;code&gt;Info()&lt;/code&gt; 直接复用生产 &lt;code&gt;SessionSearchTool.Info()&lt;/code&gt;，因此模型看到的工具名称、description 与参数 schema 和真实运行一致；只有 &lt;code&gt;Run()&lt;/code&gt; 使用确定性 fixture。synthetic Ready service 只测路由、调用、答案忠实度、延迟与成本；不代表真实用户 bundle、sidecar 检索或排序质量。&lt;/p&gt;&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th&gt;路径&lt;/th&gt;&lt;th&gt;总正确&lt;/th&gt;&lt;th&gt;正例路由&lt;/th&gt;&lt;th&gt;路由效率&lt;/th&gt;&lt;th&gt;正例答案&lt;/th&gt;&lt;th&gt;负例误召回&lt;/th&gt;&lt;th&gt;平均延迟&lt;/th&gt;&lt;th&gt;总成本&lt;/th&gt;&lt;/tr&gt;&lt;/thead&gt;&lt;tbody&gt;{memory_rows(memory_report)}&lt;/tbody&gt;&lt;/table&gt;
+ &lt;div class=&quot;callout&quot;&gt;&lt;strong&gt;最终结果：&lt;/strong&gt;失败 {len(memory_failures)} 条。主模型路径平均 {ms(model_memory[&#x27;mean_latency_ms&#x27;])}，旧 preflight {ms(preflight_memory[&#x27;mean_latency_ms&#x27;])}；正例主模型更慢，但负例更快，provider 尾延迟仍显著。调试中的旧 harness 曾漏注册 session_search、误把 honorific 当必需、把多余复查算成功；这些 evaluator 缺陷已修复后才得到本表。&lt;/div&gt;
+ {code_block(&#x27;最新 Memory A/B 原始 JSON&#x27;, json.dumps(memory_report, ensure_ascii=False, indent=2))}&lt;/section&gt;</code></pre></details></section>
 <footer>Generated by scripts/generate-agent-harness-report.py · evidence files remain machine-readable · no external assets</footer>
 </main></div></body></html>
