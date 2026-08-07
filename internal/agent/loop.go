@@ -3893,7 +3893,6 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// user nothing and recorded nothing (2026-08-06 schedule incident,
 		// session 2026-08-06-1e187cbe4b2e).
 		persistResp := finalResp
-		forceStopCode := runstatus.CodeIterationLimit
 		text := strings.TrimSpace(finalResp.OutputText)
 		if text == "" {
 			text = strings.TrimSpace(recoverVisibleTextFromBlocks(finalResp))
@@ -3919,39 +3918,50 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				retryReq.Thinking = nil
 				retryReq.ReasoningEffort = ""
 				retryReq.EffortTier = "low"
+				// The recovery is a distinct LLM wait and owns a fresh watchdog
+				// interval. Enter bumps the phase sequence even when the phase
+				// remains ForceStop, rearming both soft and hard idle timers.
+				if a.tracker != nil {
+					a.tracker.Enter(PhaseForceStop)
+				}
 				retryStart := time.Now()
 				retryResp, retryErr := a.completeWithRetry(ctx, retryReq)
 				if retryErr != nil {
-					if errors.Is(retryErr, ErrHardIdleTimeout) || errors.Is(retryErr, context.DeadlineExceeded) {
+					var recoveryErrorClass string
+					switch {
+					case errors.Is(retryErr, ErrHardIdleTimeout):
 						// The initial synthesis already completed successfully;
 						// only the optional recovery timed out. Preserve the
 						// deterministic fallback as a usable partial result instead
 						// of making recovery degrade the pre-PR outcome into an empty
-						// failed run. Keep the timeout visible in terminal status.
-						forceStopCode = runstatus.CodeDeadlineExceeded
-					} else if ctx.Err() != nil {
+						// failed run. Keep the recovery timeout visible in audit while
+						// preserving the loop detector as the terminal cause.
+						recoveryErrorClass = "hard_idle_timeout"
+					case errors.Is(retryErr, context.DeadlineExceeded):
+						recoveryErrorClass = "deadline_exceeded"
+					case ctx.Err() != nil:
 						// User/operator cancellation and other non-timeout causes
 						// still terminate the run; do not manufacture a reply after
 						// control was explicitly withdrawn.
 						captureRunMessages()
 						setRunStatus(runstatus.CodeFromError(retryErr), false)
 						return "", retryErr
-					} else {
-						// Non-cancellation recovery failure: without this row
-						// the failure is invisible (a non-retryable 4xx leaves
-						// no completeWithRetry stderr line either). Class label
-						// only — never the response body.
-						if a.auditor != nil {
-							a.auditor.Log(audit.AuditEntry{
-								Timestamp: time.Now(),
-								SessionID: a.sessionID,
-								Event:     "force_stop_synthesis_recovery_failed",
-								InputSummary: fmt.Sprintf("error_class=%s",
-									classifyLLMError(retryErr)),
-								OutputSummary: fmt.Sprintf("latency_ms=%d",
-									time.Since(retryStart).Milliseconds()),
-							})
-						}
+					default:
+						recoveryErrorClass = classifyLLMError(retryErr)
+					}
+					// Without this row, recovery failures are invisible (a
+					// non-retryable 4xx leaves no completeWithRetry stderr line
+					// either). Class label only — never the response body.
+					if a.auditor != nil {
+						a.auditor.Log(audit.AuditEntry{
+							Timestamp: time.Now(),
+							SessionID: a.sessionID,
+							Event:     "force_stop_synthesis_recovery_failed",
+							InputSummary: fmt.Sprintf("error_class=%s",
+								recoveryErrorClass),
+							OutputSummary: fmt.Sprintf("latency_ms=%d",
+								time.Since(retryStart).Milliseconds()),
+						})
 					}
 				} else {
 					usage.Add(retryResp.Usage)
@@ -3982,7 +3992,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// Every force-stop exit is abnormal: the loop detector terminated
 		// the run early, so this is never a clean success regardless of
 		// whether the model produced final text.
-		setRunStatus(forceStopCode, true)
+		setRunStatus(runstatus.CodeIterationLimit, true)
 		if a.handler != nil {
 			a.handler.OnText(text)
 		}
@@ -6752,9 +6762,8 @@ iterationLoop:
 		fmt.Sprintf("I reached the iteration safety cap after %d turns and couldn't finalize a report.", iterationCount),
 	)
 	if synthErr == nil {
-		// runForceStopTurn already handled the partial status (normally
-		// CodeIterationLimit; CodeDeadlineExceeded if only the optional
-		// empty-synthesis recovery timed out), message append, and OnText.
+		// runForceStopTurn already handled the partial CodeIterationLimit
+		// status, message append, and OnText.
 		return text, usage, ErrMaxIterReached
 	}
 

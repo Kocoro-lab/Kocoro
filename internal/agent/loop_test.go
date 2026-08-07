@@ -4732,7 +4732,7 @@ func TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack(t *testin
 // that the optional degraded-effort recovery cannot make the force-stop
 // outcome worse. Once the initial synthesis completed successfully (but
 // empty), a watchdog cancellation of the recovery must still persist and
-// return the deterministic fallback as a deadline-partial result.
+// return the deterministic fallback under the original force-stop reason.
 func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.T) {
 	var callCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4744,26 +4744,32 @@ func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.
 		case call == 5:
 			json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 10, 0))
 		default:
-			// The recovery call remains in PhaseForceStop until the watchdog
-			// cancels the client request with ErrHardIdleTimeout. Keep the
-			// handler itself bounded so httptest.Server.Close never waits on
-			// transport-specific request-context propagation.
-			time.Sleep(250 * time.Millisecond)
+			// Keep the handler itself bounded so httptest.Server.Close never
+			// waits on transport-specific request-context propagation.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(750 * time.Millisecond):
+			}
 		}
 	}))
 	defer server.Close()
 
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
 	gw := client.NewGatewayClient(server.URL, "")
 	reg := NewToolRegistry()
 	reg.Register(&mockTool{name: "mock_tool"})
-	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
 	loop.SetMaxTokens(32000)
-	loop.idleHardTimeout = 100 * time.Millisecond
+	loop.idleHardTimeout = 500 * time.Millisecond
 	loop.watchdogTick = 5 * time.Millisecond
 
 	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
 	if err != nil {
-		t.Fatalf("expected deadline-partial fallback, got error: %v", err)
+		t.Fatalf("expected iteration-limit fallback, got error: %v", err)
 	}
 	if !strings.Contains(result, "synthesis produced no output") {
 		t.Fatalf("expected deterministic fallback, got %q", result)
@@ -4773,8 +4779,8 @@ func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.
 	}
 
 	status := loop.LastRunStatus()
-	if status.FailureCode != runstatus.CodeDeadlineExceeded {
-		t.Errorf("expected FailureCode=deadline_exceeded, got %q", status.FailureCode)
+	if status.FailureCode != runstatus.CodeIterationLimit {
+		t.Errorf("expected FailureCode=iteration_limit, got %q", status.FailureCode)
 	}
 	if !status.Partial {
 		t.Error("expected Partial=true after recovery hard-idle")
@@ -4785,6 +4791,69 @@ func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.
 	if last.Role != "assistant" || !strings.Contains(last.Content.Text(), "synthesis produced no output") {
 		t.Errorf("fallback was not persisted as the trailing assistant message: role=%q text=%q",
 			last.Role, last.Content.Text())
+	}
+
+	var failedRow map[string]any
+	for _, e := range readAuditLines(t, logDir) {
+		if e["event"] == "force_stop_synthesis_recovery_failed" {
+			failedRow = e
+			break
+		}
+	}
+	if failedRow == nil {
+		t.Fatal("expected force_stop_synthesis_recovery_failed audit row")
+	}
+	in, _ := failedRow["input_summary"].(string)
+	if !strings.Contains(in, "error_class=hard_idle_timeout") {
+		t.Errorf("audit row missing hard-idle error class: %q", in)
+	}
+}
+
+// TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget verifies that the
+// optional recovery owns a fresh ForceStop watchdog interval. The initial
+// synthesis and recovery each fit within idleHardTimeout, but their combined
+// latency does not.
+func TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget(t *testing.T) {
+	var callCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := callCount.Add(1)
+		switch {
+		case call <= 4:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"cmd":"same"}`), 10, 5))
+		case call == 5:
+			time.Sleep(300 * time.Millisecond)
+			json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 10, 0))
+		default:
+			time.Sleep(300 * time.Millisecond)
+			json.NewEncoder(w).Encode(nativeResponse("Recovered with fresh budget.", "end_turn", nil, 10, 0))
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetMaxTokens(32000)
+	loop.idleHardTimeout = 500 * time.Millisecond
+	loop.watchdogTick = 5 * time.Millisecond
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("expected recovery within fresh watchdog budget, got error: %v", err)
+	}
+	if result != "Recovered with fresh budget." {
+		t.Fatalf("expected recovered text, got %q", result)
+	}
+	if got := callCount.Load(); got != 6 {
+		t.Fatalf("expected 6 LLM calls (synthesis + recovery), got %d", got)
+	}
+
+	status := loop.LastRunStatus()
+	if status.FailureCode != runstatus.CodeIterationLimit || !status.Partial {
+		t.Errorf("expected partial iteration-limit status, got code=%q partial=%v",
+			status.FailureCode, status.Partial)
 	}
 }
 
