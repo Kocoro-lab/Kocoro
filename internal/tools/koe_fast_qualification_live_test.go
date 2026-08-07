@@ -197,6 +197,7 @@ type koeQualificationRunReport struct {
 	TaskSuccess                   bool     `json:"task_success"`
 	ExpectedOutput                string   `json:"expected_output,omitempty"`
 	ObservedOutput                string   `json:"observed_output,omitempty"`
+	StreamedOutput                string   `json:"streamed_output,omitempty"`
 	ToolCorrectness               bool     `json:"tool_correctness"`
 	RouteExact                    bool     `json:"route_exact"`
 	ProviderExact                 bool     `json:"provider_exact"`
@@ -308,6 +309,7 @@ type koeQualificationLLMClient struct {
 	firstTextDelta     *time.Duration
 	firstToolCallReady *time.Duration
 	systemPrompt       string
+	streamedOutputs    []string
 }
 
 func (c *koeQualificationLLMClient) Complete(
@@ -328,12 +330,32 @@ func (c *koeQualificationLLMClient) CompleteStream(
 ) (*client.CompletionResponse, error) {
 	req = c.withSystemPrompt(req)
 	c.recordRequest(req)
+	var streamed strings.Builder
 	response, err := c.inner.CompleteStream(ctx, req, func(delta client.StreamDelta) {
+		streamed.WriteString(delta.Text)
 		c.recordStreamDelta(delta)
 		onDelta(delta)
 	})
+	c.recordStreamedOutput(streamed.String())
 	c.recordResponse(response)
 	return response, c.recordAndSanitizeError(err)
+}
+
+func (c *koeQualificationLLMClient) recordStreamedOutput(output string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.streamedOutputs = append(c.streamedOutputs, output)
+}
+
+func (c *koeQualificationLLMClient) lastStreamedOutput() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for index := len(c.streamedOutputs) - 1; index >= 0; index-- {
+		if output := strings.TrimSpace(c.streamedOutputs[index]); output != "" {
+			return output
+		}
+	}
+	return ""
 }
 
 func (c *koeQualificationLLMClient) withSystemPrompt(
@@ -2126,6 +2148,7 @@ func runKoeQualificationJob(
 		TaskSuccess:                   runErr == nil && taskSuccess,
 		ExpectedOutput:                workload.receipt,
 		ObservedOutput:                strings.TrimSpace(resultText),
+		StreamedOutput:                qualificationClient.lastStreamedOutput(),
 		ToolCorrectness:               toolCorrectness,
 		RouteExact:                    routeExact,
 		ProviderExact:                 providerExact,
