@@ -9,9 +9,9 @@ pkg_config_path="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
 mkdir -p "$output_dir"
 
 case "$lane" in
-  offline|routing_live|selector_live|provider_live|provider_release) ;;
+  offline|routing_live|selector_live|provider_live|prompt_live|provider_release) ;;
   *)
-    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, or provider_release" >&2
+    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, prompt_live, or provider_release" >&2
     exit 2
     ;;
 esac
@@ -53,7 +53,7 @@ run_offline_lane() {
     -run '^Test(RunAgent_IdempotencyKeyReturnsCompletedRunWithoutSecondLLMCall|RunAgent_FailedIdempotentRequestNeverReplaysAutomatically|TerminalIdempotencyState_SoftFailureWithoutDeliverableFailsClosed|TerminalIdempotencyState_DeliverableIsDurableSuccessEvidence|CompletedIdempotentResultReplaysDeliveryReceiptAndStatus)$' \
     -count=1 -v
   run_check harness_self_test go test ./test/e2e \
-    -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|ProviderQualificationRejectsUndersizedReleaseSample)$' \
+    -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|PromptVariantRunnerRequiresExplicitPaidGate|ProviderQualificationRejectsUndersizedReleaseSample)$' \
     -count=1 -v
 }
 
@@ -115,6 +115,18 @@ run_provider_lane() {
     "$output_dir/provider"
 }
 
+run_prompt_lane() {
+  if [[ "${KOCORO_PROMPT_VARIANTS_LIVE:-}" != "1" ]]; then
+    echo "Set KOCORO_PROMPT_VARIANTS_LIVE=1 to authorize the paid prompt comparison." >&2
+    check_names+=("prompt_variants_live")
+    check_statuses+=("2")
+    return
+  fi
+  run_check prompt_variants_live \
+    "$repo_dir/scripts/kocoro-prompt-variants.sh" \
+    "$output_dir/prompt-variants"
+}
+
 run_release_source_preflight() {
   if [[ "$source_dirty" == "true" ]]; then
     echo "$lane requires a clean ShanClaw source tree." >&2
@@ -138,6 +150,9 @@ case "$lane" in
     ;;
   provider_live)
     run_provider_lane smoke
+    ;;
+  prompt_live)
+    run_prompt_lane
     ;;
   provider_release)
     if run_release_source_preflight; then

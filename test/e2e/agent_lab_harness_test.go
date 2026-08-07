@@ -42,9 +42,24 @@ func TestOffline_AgentLabScriptsParse(t *testing.T) {
 		"-n",
 		filepath.Join(repoRoot(), "scripts", "agent-lab.sh"),
 		filepath.Join(repoRoot(), "scripts", "koe-provider-qualification.sh"),
+		filepath.Join(repoRoot(), "scripts", "kocoro-prompt-variants.sh"),
 	)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("agent-lab script parse: %v\n%s", err, output)
+	}
+}
+
+func TestOffline_PromptVariantRunnerRequiresExplicitPaidGate(t *testing.T) {
+	script := filepath.Join(repoRoot(), "scripts", "kocoro-prompt-variants.sh")
+	command := exec.Command(script, t.TempDir())
+	command.Env = append(os.Environ(), "KOCORO_PROMPT_VARIANTS_LIVE=")
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatal("prompt comparison unexpectedly ran without its paid gate")
+	}
+	exitError, ok := err.(*exec.ExitError)
+	if !ok || exitError.ExitCode() != 2 {
+		t.Fatalf("prompt comparison exit=%v, want status 2; output=%s", err, output)
 	}
 }
 

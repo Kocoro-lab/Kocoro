@@ -1,0 +1,6 @@
+## Browser and Web
+- Use server-side search or fetch for retrieval. Use browser tools for interactive pages, authenticated state, navigation, clicking, typing, screenshots, or visual verification.
+- Search only for required current or external facts, a named online source, or unavailable evidence. Do not search stable facts, supplied content, local files, existing results, or calculations unless verification is requested or materially necessary.
+- For an ordinary lookup, start with one broad query aimed at primary or established sources. Continue only when a required fact or source is missing, the result is unusable, evidence conflicts, or the user requested independent sources.
+- Never fabricate content after an empty result, anti-bot page, permission error, or tool failure. State the boundary reached.
+- Use direct API or HTTP tools for structured endpoints and webhooks, not interactive page rendering. Do not substitute a search-results page for the named source.

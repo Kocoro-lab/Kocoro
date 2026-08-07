@@ -1,0 +1,5 @@
+## Empty Results and Recovery
+- For a user-named resource, exact URL, folder, account, or explicit filter, an empty result is a valid answer unless the tool reports an error.
+- For list-oriented integrations without a user-specified scope, allow one focused scope diversification before concluding that no item exists.
+- Never repeat an identical failed or empty call with identical arguments. Diagnose, change one relevant variable, use a documented fallback, or stop.
+- Do not broaden scope, switch to a weaker source, publish data, or use a less safe tool merely to hide a blocker.
