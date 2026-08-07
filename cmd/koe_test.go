@@ -62,6 +62,24 @@ func TestKoeConfigDefaults(t *testing.T) {
 	}
 }
 
+// The pinned default is only defensible because --model still overrides it —
+// that is the escape hatch for CLI and on-robot callers who want another tier.
+func TestKoeModelFlagOverridesDefault(t *testing.T) {
+	flags := koeCmd.Flags()
+	if err := flags.Set("model", "gpt-realtime-2.1-mini"); err != nil {
+		t.Fatalf("set --model: %v", err)
+	}
+	t.Cleanup(func() { _ = flags.Set("model", "") })
+
+	cfg := defaultKoeConfig()
+	if v, _ := flags.GetString("model"); v != "" {
+		cfg.model = v
+	}
+	if cfg.model != "gpt-realtime-2.1-mini" {
+		t.Errorf("model after --model = %q, want the flag value to win", cfg.model)
+	}
+}
+
 func TestKoeCmdHasAudioFlags(t *testing.T) {
 	if koeCmd.Flags().Lookup("aec") == nil {
 		t.Fatal("koe command must expose --aec for VPIO opt-in testing")
