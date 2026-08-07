@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -325,7 +326,7 @@ func TestOffline_AgentLabQualityContractValidators(t *testing.T) {
 			answer: "先确认预算，再联系供应商。",
 		},
 		"bounded_research": {
-			answer:    "example.com 由 IANA 保留用于文档示例：" + agentLabQualityResearchURL,
+			answer:    "example.com 由 IANA 保留用于文档示例：[" + agentLabQualityResearchURL + "](" + agentLabQualityResearchURL + ")",
 			toolCalls: 1,
 		},
 		"deferred_automation": {
@@ -368,6 +369,12 @@ func TestOffline_AgentLabQualityContractValidators(t *testing.T) {
 		if failures := tc.validate(fixture.answer, fixture.toolCalls); len(failures) == 0 {
 			t.Errorf("failing %s unexpectedly passed", tc.name)
 		}
+	}
+	if failures := validateAgentLabQualityResearch(
+		"IANA 文档用途："+agentLabQualityResearchURL+" https://unexpected.test/source",
+		1,
+	); !slices.Contains(failures, "research_unexpected_source") {
+		t.Fatalf("different research URL was not rejected: %v", failures)
 	}
 }
 
@@ -802,9 +809,16 @@ func validateAgentLabQualityResearch(answer string, toolCalls int) []string {
 		(!strings.Contains(answer, "文档") && !strings.Contains(strings.ToLower(answer), "documentation")) {
 		failures = append(failures, "research_missing_fact")
 	}
-	urls := regexp.MustCompile(`https?://[^\s）)]+`).FindAllString(answer, -1)
-	if len(urls) != 1 || strings.TrimRightFunc(urls[0], unicode.IsPunct) != agentLabQualityResearchURL {
+	urls := regexp.MustCompile(`https?://[^\s\]\[（）()<>"']+`).FindAllString(answer, -1)
+	if len(urls) == 0 {
 		failures = append(failures, "research_unexpected_source")
+	} else {
+		for _, url := range urls {
+			if strings.TrimRightFunc(url, unicode.IsPunct) != agentLabQualityResearchURL {
+				failures = append(failures, "research_unexpected_source")
+				break
+			}
+		}
 	}
 	return uniqueAgentLabQualityFailures(failures)
 }
