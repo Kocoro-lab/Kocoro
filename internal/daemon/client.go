@@ -220,6 +220,15 @@ const (
 	// daemon omits it (integration connections exist but the local agent never
 	// sees the tools), so Desktop can prompt the user to update the engine.
 	CapIntegrationToolsV1 = "integration_tools_v1"
+	// CapIntegrationConnectBodyV1 — POST /integrations/{provider}/connect
+	// forwards the client's JSON body verbatim to Cloud, which is how
+	// token-mode providers (Shopify: {params:{shop, access_token}}) deliver
+	// credentials and get back an active connection without a browser
+	// round-trip. An old daemon silently DROPS the body and forwards a
+	// body-less connect, so Desktop must gate its credential-entry form on
+	// this token rather than letting Cloud reject a request that never
+	// carried the credentials.
+	CapIntegrationConnectBodyV1 = "integration_connect_body_v1"
 	// CapMessageIdempotencyV1 — POST /message accepts idempotency_key together
 	// with a client-minted session_id. A completed retry returns the persisted
 	// result without invoking the LLM or tools again; interrupted/failed requests
@@ -331,6 +340,7 @@ var Capabilities = []string{
 	CapClawHubExcludeInstalled,
 	CapSearchV1,
 	CapIntegrationToolsV1,
+	CapIntegrationConnectBodyV1,
 	CapMessageIdempotencyV1,
 	CapMessageIdempotencyReceiptV2,
 	CapQuestionV1,
