@@ -30,6 +30,10 @@ const (
 	kocoroPromptVariantMinimal     = "minimal_v1"
 	kocoroPromptVariantLayered     = "layered_v1"
 	kocoroPromptVariantConditional = "layered_conditional_v1"
+
+	kocoroPromptComparisonRepetitions = 3
+	kocoroPromptReleaseRepetitions    = 30
+	kocoroPromptSlowestRunsLimit      = 3
 )
 
 //go:embed testdata/kocoro_prompt_variants/minimal_v1.txt
@@ -94,25 +98,28 @@ type kocoroPromptComparisonAnalysis struct {
 }
 
 type kocoroPromptVariantSummary struct {
-	Name                          string  `json:"name"`
-	Runs                          int     `json:"runs"`
-	SuccessfulTasks               int     `json:"successful_tasks"`
-	CorrectToolRuns               int     `json:"correct_tool_runs"`
-	TaskSuccessRate               float64 `json:"task_success_rate"`
-	ToolCorrectnessRate           float64 `json:"tool_correctness_rate"`
-	ContractFailureCount          int     `json:"contract_failure_count"`
-	RuntimeFailureCount           int     `json:"runtime_failure_count"`
-	DuplicateToolExecutions       int     `json:"duplicate_tool_executions"`
-	DuplicateSideEffectExecutions int     `json:"duplicate_side_effect_executions"`
-	CompletionCallsMean           float64 `json:"completion_calls_mean"`
-	TotalP50Millis                int64   `json:"total_p50_millis"`
-	TotalP95Millis                int64   `json:"total_p95_millis"`
-	FirstSemanticP50Millis        *int64  `json:"first_semantic_p50_millis,omitempty"`
-	InputTokensMean               float64 `json:"input_tokens_mean"`
-	OutputTokensMean              float64 `json:"output_tokens_mean"`
-	CostUSDTotal                  float64 `json:"cost_usd_total"`
-	SystemCharsMin                int     `json:"system_chars_min"`
-	SystemCharsMax                int     `json:"system_chars_max"`
+	Name                          string                           `json:"name"`
+	Runs                          int                              `json:"runs"`
+	SuccessfulTasks               int                              `json:"successful_tasks"`
+	CorrectToolRuns               int                              `json:"correct_tool_runs"`
+	TaskSuccessRate               float64                          `json:"task_success_rate"`
+	ToolCorrectnessRate           float64                          `json:"tool_correctness_rate"`
+	ContractFailureCount          int                              `json:"contract_failure_count"`
+	RuntimeFailureCount           int                              `json:"runtime_failure_count"`
+	DuplicateToolExecutions       int                              `json:"duplicate_tool_executions"`
+	DuplicateSideEffectExecutions int                              `json:"duplicate_side_effect_executions"`
+	CompletionCallsMean           float64                          `json:"completion_calls_mean"`
+	TotalP50Millis                int64                            `json:"total_p50_millis"`
+	TotalP95Millis                int64                            `json:"total_p95_millis"`
+	TotalP99Millis                int64                            `json:"total_p99_millis"`
+	TotalMaxMillis                int64                            `json:"total_max_millis"`
+	SlowestRuns                   []kocoroPromptLatencyObservation `json:"slowest_runs"`
+	FirstSemanticP50Millis        *int64                           `json:"first_semantic_p50_millis,omitempty"`
+	InputTokensMean               float64                          `json:"input_tokens_mean"`
+	OutputTokensMean              float64                          `json:"output_tokens_mean"`
+	CostUSDTotal                  float64                          `json:"cost_usd_total"`
+	SystemCharsMin                int                              `json:"system_chars_min"`
+	SystemCharsMax                int                              `json:"system_chars_max"`
 }
 
 type kocoroPromptVariantCellSummary struct {
@@ -124,43 +131,74 @@ type kocoroPromptVariantCellSummary struct {
 	ToolCorrectnessRate float64 `json:"tool_correctness_rate"`
 	TotalP50Millis      int64   `json:"total_p50_millis"`
 	TotalP95Millis      int64   `json:"total_p95_millis"`
+	TotalP99Millis      int64   `json:"total_p99_millis"`
+	TotalMaxMillis      int64   `json:"total_max_millis"`
 	InputTokensMean     float64 `json:"input_tokens_mean"`
 	CompletionCallsMean float64 `json:"completion_calls_mean"`
 	CostUSDTotal        float64 `json:"cost_usd_total"`
 }
 
+type kocoroPromptLatencyObservation struct {
+	Workload      string `json:"workload"`
+	Repetition    int    `json:"repetition"`
+	ScheduleIndex int    `json:"schedule_index"`
+	TotalMillis   int64  `json:"total_millis"`
+}
+
+type kocoroPromptPairedComparison struct {
+	Candidate               string  `json:"candidate"`
+	Control                 string  `json:"control"`
+	Pairs                   int     `json:"pairs"`
+	CandidateLatencyWins    int     `json:"candidate_latency_wins"`
+	ControlLatencyWins      int     `json:"control_latency_wins"`
+	LatencyTies             int     `json:"latency_ties"`
+	CandidateLatencyWinRate float64 `json:"candidate_latency_win_rate"`
+	TotalDeltaP50Millis     int64   `json:"total_delta_p50_millis"`
+	TotalDeltaP95Millis     int64   `json:"total_delta_p95_millis"`
+	TotalDeltaP99Millis     int64   `json:"total_delta_p99_millis"`
+	TotalDeltaMinMillis     int64   `json:"total_delta_min_millis"`
+	TotalDeltaMaxMillis     int64   `json:"total_delta_max_millis"`
+}
+
 type kocoroPromptExperimentReport struct {
-	SchemaVersion            int                              `json:"schema_version"`
-	GeneratedAt              string                           `json:"generated_at"`
-	Complete                 bool                             `json:"complete"`
-	Completed                int                              `json:"completed"`
-	Scheduled                int                              `json:"scheduled"`
-	Repetitions              int                              `json:"repetitions_per_cell"`
-	Seed                     int64                            `json:"seed"`
-	Randomized               bool                             `json:"randomized"`
-	SampleQualifying         bool                             `json:"sample_qualifying"`
-	ComparisonScope          string                           `json:"comparison_scope"`
-	ControlledMode           string                           `json:"controlled_mode"`
-	Winner                   string                           `json:"winner,omitempty"`
-	WinnerStatus             string                           `json:"winner_status"`
-	SelectionReason          string                           `json:"selection_reason"`
-	ObservedEfficiencyLeader string                           `json:"observed_efficiency_leader,omitempty"`
-	ObservedEfficiencyReason string                           `json:"observed_efficiency_reason,omitempty"`
-	MaxCostUSD               float64                          `json:"max_cost_usd"`
-	ReportedCostUSD          float64                          `json:"reported_cost_usd"`
-	CostObserved             bool                             `json:"cost_observed"`
-	Variants                 []kocoroPromptVariantMetadata    `json:"variants"`
-	Workloads                []string                         `json:"workloads"`
-	Runs                     []koeQualificationRunReport      `json:"runs"`
-	Summary                  []kocoroPromptVariantSummary     `json:"summary"`
-	ComparisonSummary        []kocoroPromptVariantSummary     `json:"comparison_summary"`
-	CurrentControlPassed     bool                             `json:"current_control_passed"`
-	ProductGatePassed        bool                             `json:"product_gate_passed"`
-	ComparisonGatePassed     bool                             `json:"comparison_gate_passed"`
-	UniversalFailures        []kocoroPromptMatchedFailure     `json:"universal_failures"`
-	VariantSpecificFailures  []kocoroPromptMatchedFailure     `json:"variant_specific_failures"`
-	Cells                    []kocoroPromptVariantCellSummary `json:"cells"`
-	CoverageBoundaries       []string                         `json:"coverage_boundaries"`
+	SchemaVersion                int                              `json:"schema_version"`
+	GeneratedAt                  string                           `json:"generated_at"`
+	Complete                     bool                             `json:"complete"`
+	Completed                    int                              `json:"completed"`
+	Scheduled                    int                              `json:"scheduled"`
+	Repetitions                  int                              `json:"repetitions_per_cell"`
+	Seed                         int64                            `json:"seed"`
+	Randomized                   bool                             `json:"randomized"`
+	Interleaved                  bool                             `json:"interleaved"`
+	ScheduleMode                 string                           `json:"schedule_mode"`
+	SampleQualifying             bool                             `json:"sample_qualifying"`
+	ComparisonQualifying         bool                             `json:"comparison_qualifying"`
+	ReleaseQualifying            bool                             `json:"release_qualifying"`
+	MinimumComparisonRepetitions int                              `json:"minimum_comparison_repetitions"`
+	MinimumReleaseRepetitions    int                              `json:"minimum_release_repetitions"`
+	ComparisonScope              string                           `json:"comparison_scope"`
+	ControlledMode               string                           `json:"controlled_mode"`
+	Winner                       string                           `json:"winner,omitempty"`
+	WinnerStatus                 string                           `json:"winner_status"`
+	SelectionReason              string                           `json:"selection_reason"`
+	ObservedEfficiencyLeader     string                           `json:"observed_efficiency_leader,omitempty"`
+	ObservedEfficiencyReason     string                           `json:"observed_efficiency_reason,omitempty"`
+	MaxCostUSD                   float64                          `json:"max_cost_usd"`
+	ReportedCostUSD              float64                          `json:"reported_cost_usd"`
+	CostObserved                 bool                             `json:"cost_observed"`
+	Variants                     []kocoroPromptVariantMetadata    `json:"variants"`
+	Workloads                    []string                         `json:"workloads"`
+	Runs                         []koeQualificationRunReport      `json:"runs"`
+	Summary                      []kocoroPromptVariantSummary     `json:"summary"`
+	ComparisonSummary            []kocoroPromptVariantSummary     `json:"comparison_summary"`
+	CurrentControlPassed         bool                             `json:"current_control_passed"`
+	ProductGatePassed            bool                             `json:"product_gate_passed"`
+	ComparisonGatePassed         bool                             `json:"comparison_gate_passed"`
+	UniversalFailures            []kocoroPromptMatchedFailure     `json:"universal_failures"`
+	VariantSpecificFailures      []kocoroPromptMatchedFailure     `json:"variant_specific_failures"`
+	Cells                        []kocoroPromptVariantCellSummary `json:"cells"`
+	PairedComparisons            []kocoroPromptPairedComparison   `json:"paired_comparisons"`
+	CoverageBoundaries           []string                         `json:"coverage_boundaries"`
 }
 
 func kocoroPromptVariantText(name string) string {
@@ -261,6 +299,125 @@ func TestLoadKocoroPromptExperimentWorkloadsFiltersAndDeduplicates(t *testing.T)
 	want := []string{"empty_search_stop", "stable_no_search"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("workloads=%v, want %v", got, want)
+	}
+}
+
+func TestBuildKocoroPromptExperimentJobsInterleavesMatchedBlocks(t *testing.T) {
+	cfg := kocoroPromptExperimentConfig{
+		koeQualificationRuntimeConfig: koeQualificationRuntimeConfig{
+			repetitions: 2,
+			seed:        42,
+		},
+		workloads: []string{"no_tool", "one_tool"},
+	}
+	jobs := buildKocoroPromptExperimentJobs(cfg)
+	if len(jobs) != 2*2*len(kocoroPromptVariantNames) {
+		t.Fatalf("jobs=%d, want %d", len(jobs), 2*2*len(kocoroPromptVariantNames))
+	}
+	for start := 0; start < len(jobs); start += len(kocoroPromptVariantNames) {
+		block := jobs[start : start+len(kocoroPromptVariantNames)]
+		seen := make(map[string]bool, len(block))
+		for _, job := range block {
+			if job.Workload != block[0].Workload || job.Repetition != block[0].Repetition ||
+				job.Token != block[0].Token {
+				t.Fatalf("matched block at %d is not contiguous: %+v", start, block)
+			}
+			if seen[job.PromptVariant] {
+				t.Fatalf("matched block at %d repeats variant %q", start, job.PromptVariant)
+			}
+			seen[job.PromptVariant] = true
+		}
+	}
+}
+
+func TestSummarizeKocoroPromptVariantsReportsP99AndSlowestRuns(t *testing.T) {
+	values := []int64{100, 200, 300, 400, 1000}
+	var runs []koeQualificationRunReport
+	for index, value := range values {
+		run := passingKocoroPromptRun(kocoroPromptVariantCurrent, "no_tool", index+1)
+		run.TotalMillis = value
+		run.ScheduleIndex = index + 10
+		runs = append(runs, run)
+	}
+	summary := summarizeKocoroPromptVariants(runs)
+	if len(summary) != 1 {
+		t.Fatalf("summary=%d, want 1", len(summary))
+	}
+	got := summary[0]
+	if got.TotalP50Millis != 300 || got.TotalP95Millis != 1000 ||
+		got.TotalP99Millis != 1000 || got.TotalMaxMillis != 1000 {
+		t.Fatalf("latency summary=%+v", got)
+	}
+	if len(got.SlowestRuns) != 3 || got.SlowestRuns[0].TotalMillis != 1000 ||
+		got.SlowestRuns[0].ScheduleIndex != 14 || got.SlowestRuns[2].TotalMillis != 300 {
+		t.Fatalf("slowest_runs=%+v", got.SlowestRuns)
+	}
+}
+
+func TestSummarizeKocoroPromptPairedComparisons(t *testing.T) {
+	control := []int64{100, 200, 300, 400, 1000}
+	candidate := []int64{90, 220, 300, 350, 800}
+	var runs []koeQualificationRunReport
+	for index := range control {
+		currentRun := passingKocoroPromptRun(kocoroPromptVariantCurrent, "no_tool", index+1)
+		currentRun.TotalMillis = control[index]
+		candidateRun := passingKocoroPromptRun(kocoroPromptVariantLayered, "no_tool", index+1)
+		candidateRun.TotalMillis = candidate[index]
+		runs = append(runs, candidateRun, currentRun)
+	}
+	comparisons := summarizeKocoroPromptPairedComparisons(runs)
+	var got kocoroPromptPairedComparison
+	for _, comparison := range comparisons {
+		if comparison.Candidate == kocoroPromptVariantLayered {
+			got = comparison
+		}
+	}
+	if got.Pairs != 5 || got.CandidateLatencyWins != 3 ||
+		got.ControlLatencyWins != 1 || got.LatencyTies != 1 ||
+		math.Abs(got.CandidateLatencyWinRate-0.6) > 1e-9 {
+		t.Fatalf("paired counts=%+v", got)
+	}
+	if got.TotalDeltaP50Millis != -10 || got.TotalDeltaP95Millis != 20 ||
+		got.TotalDeltaP99Millis != 20 || got.TotalDeltaMinMillis != -200 ||
+		got.TotalDeltaMaxMillis != 20 {
+		t.Fatalf("paired deltas=%+v", got)
+	}
+}
+
+func TestKocoroPromptReleaseQualificationRequiresThirtyRepetitions(t *testing.T) {
+	reportFor := func(repetitions int) kocoroPromptExperimentReport {
+		cfg := kocoroPromptExperimentConfig{
+			koeQualificationRuntimeConfig: koeQualificationRuntimeConfig{
+				repetitions: repetitions,
+				seed:        42,
+			},
+			workloads: []string{"no_tool"},
+		}
+		jobs := buildKocoroPromptExperimentJobs(cfg)
+		results := make([]koeQualificationRunReport, 0, len(jobs))
+		for index, job := range jobs {
+			run := passingKocoroPromptRun(job.PromptVariant, job.Workload, job.Repetition)
+			if kocoroPromptVariantProductCandidate(job.PromptVariant) {
+				run.InputTokens = 50
+			}
+			run.ScheduleIndex = index + 1
+			results = append(results, run)
+		}
+		return newKocoroPromptExperimentReport(cfg, jobs, results, true)
+	}
+	comparison := reportFor(kocoroPromptComparisonRepetitions)
+	if !comparison.SampleQualifying || !comparison.ComparisonQualifying ||
+		comparison.ReleaseQualifying {
+		t.Fatalf("three-repetition qualification=%+v", comparison)
+	}
+	twentyNine := reportFor(kocoroPromptReleaseRepetitions - 1)
+	if twentyNine.ReleaseQualifying || twentyNine.WinnerStatus == "release_ready" {
+		t.Fatalf("twenty-nine-repetition qualification=%+v", twentyNine)
+	}
+	release := reportFor(kocoroPromptReleaseRepetitions)
+	if !release.ComparisonQualifying || !release.ReleaseQualifying ||
+		release.WinnerStatus != "release_ready" {
+		t.Fatalf("thirty-repetition qualification=%+v", release)
 	}
 }
 
@@ -497,8 +654,8 @@ func loadKocoroPromptExperimentConfig(t *testing.T) kocoroPromptExperimentConfig
 	repetitions := 1
 	if raw := strings.TrimSpace(os.Getenv(kocoroPromptVariantsRepetitionsEnv)); raw != "" {
 		value, err := strconv.Atoi(raw)
-		if err != nil || value < 1 || value > 10 {
-			t.Fatal("KOCORO_PROMPT_VARIANTS_REPETITIONS must be an integer from 1 through 10")
+		if err != nil || value < 1 || value > 100 {
+			t.Fatal("KOCORO_PROMPT_VARIANTS_REPETITIONS must be an integer from 1 through 100")
 		}
 		repetitions = value
 	}
@@ -574,24 +731,34 @@ func loadKocoroPromptExperimentWorkloads(t *testing.T) []string {
 }
 
 func buildKocoroPromptExperimentJobs(cfg kocoroPromptExperimentConfig) []koeQualificationJob {
-	jobs := make([]koeQualificationJob, 0,
-		len(cfg.workloads)*cfg.repetitions*len(kocoroPromptVariantNames))
+	type matchedBlock struct {
+		workload   string
+		repetition int
+	}
+	blocks := make([]matchedBlock, 0, len(cfg.workloads)*cfg.repetitions)
 	for _, workload := range cfg.workloads {
 		for repetition := 1; repetition <= cfg.repetitions; repetition++ {
-			token := koeQualificationToken(cfg.seed, workload, repetition)
-			for _, variant := range kocoroPromptVariantNames {
-				jobs = append(jobs, koeQualificationJob{
-					Lane:          koeQualificationFastLane,
-					Workload:      workload,
-					Repetition:    repetition,
-					Token:         token,
-					PromptVariant: variant,
-				})
-			}
+			blocks = append(blocks, matchedBlock{workload: workload, repetition: repetition})
 		}
 	}
 	rng := rand.New(rand.NewSource(cfg.seed))
-	rng.Shuffle(len(jobs), func(i, j int) { jobs[i], jobs[j] = jobs[j], jobs[i] })
+	rng.Shuffle(len(blocks), func(i, j int) { blocks[i], blocks[j] = blocks[j], blocks[i] })
+	jobs := make([]koeQualificationJob, 0,
+		len(blocks)*len(kocoroPromptVariantNames))
+	for _, block := range blocks {
+		variants := append([]string(nil), kocoroPromptVariantNames...)
+		rng.Shuffle(len(variants), func(i, j int) { variants[i], variants[j] = variants[j], variants[i] })
+		token := koeQualificationToken(cfg.seed, block.workload, block.repetition)
+		for _, variant := range variants {
+			jobs = append(jobs, koeQualificationJob{
+				Lane:          koeQualificationFastLane,
+				Workload:      block.workload,
+				Repetition:    block.repetition,
+				Token:         token,
+				PromptVariant: variant,
+			})
+		}
+	}
 	return jobs
 }
 
@@ -609,44 +776,63 @@ func newKocoroPromptExperimentReport(
 		complete && analysis.ComparisonGatePassed,
 	)
 	efficiencyLeader, efficiencyReason := selectObservedEfficiencyLeader(summary, complete)
+	sampleQualifying := complete && cfg.repetitions >= kocoroPromptComparisonRepetitions &&
+		len(results) == len(jobs)
+	comparisonQualifying := sampleQualifying && analysis.ComparisonGatePassed
+	releaseQualifying := complete && cfg.repetitions >= kocoroPromptReleaseRepetitions &&
+		len(results) == len(jobs) && analysis.ProductGatePassed && winner != ""
+	if status == "release_ready" && !releaseQualifying {
+		status = "comparison_ready"
+		reason += " Release qualification remains closed because the complete product gate and candidate selection requirements did not both pass."
+	}
 	if len(analysis.UniversalFailures) > 0 && winner != "" {
 		reason += " Matched failures shared by every variant were excluded only from relative selection; the product gate remains closed."
 	}
 	return kocoroPromptExperimentReport{
-		SchemaVersion:            1,
-		GeneratedAt:              time.Now().UTC().Format(time.RFC3339Nano),
-		Complete:                 complete,
-		Completed:                len(results),
-		Scheduled:                len(jobs),
-		Repetitions:              cfg.repetitions,
-		Seed:                     cfg.seed,
-		Randomized:               true,
-		SampleQualifying:         complete && cfg.repetitions >= 3 && len(results) == len(jobs),
-		ComparisonScope:          "system_instructions_with_constant_agent_loop_tools_mode_and_workloads",
-		ControlledMode:           koeQualificationFastLane,
-		Winner:                   winner,
-		WinnerStatus:             status,
-		SelectionReason:          reason,
-		ObservedEfficiencyLeader: efficiencyLeader,
-		ObservedEfficiencyReason: efficiencyReason,
-		MaxCostUSD:               cfg.maxCostUSD,
-		ReportedCostUSD:          kocoroPromptReportedCost(results),
-		CostObserved:             kocoroPromptCostObserved(results),
-		Variants:                 kocoroPromptVariantMetadataList(),
-		Workloads:                append([]string(nil), cfg.workloads...),
-		Runs:                     append([]koeQualificationRunReport(nil), results...),
-		Summary:                  summary,
-		ComparisonSummary:        comparisonSummary,
-		CurrentControlPassed:     complete && kocoroPromptSummaryCorrect(summary, kocoroPromptVariantCurrent),
-		ProductGatePassed:        complete && analysis.ProductGatePassed,
-		ComparisonGatePassed:     complete && analysis.ComparisonGatePassed,
-		UniversalFailures:        analysis.UniversalFailures,
-		VariantSpecificFailures:  analysis.VariantSpecificFailures,
-		Cells:                    summarizeKocoroPromptVariantCells(results),
+		SchemaVersion:                1,
+		GeneratedAt:                  time.Now().UTC().Format(time.RFC3339Nano),
+		Complete:                     complete,
+		Completed:                    len(results),
+		Scheduled:                    len(jobs),
+		Repetitions:                  cfg.repetitions,
+		Seed:                         cfg.seed,
+		Randomized:                   true,
+		Interleaved:                  true,
+		ScheduleMode:                 "randomized_matched_blocks_with_randomized_variant_order",
+		SampleQualifying:             sampleQualifying,
+		ComparisonQualifying:         comparisonQualifying,
+		ReleaseQualifying:            releaseQualifying,
+		MinimumComparisonRepetitions: kocoroPromptComparisonRepetitions,
+		MinimumReleaseRepetitions:    kocoroPromptReleaseRepetitions,
+		ComparisonScope:              "system_instructions_with_constant_agent_loop_tools_mode_and_workloads",
+		ControlledMode:               koeQualificationFastLane,
+		Winner:                       winner,
+		WinnerStatus:                 status,
+		SelectionReason:              reason,
+		ObservedEfficiencyLeader:     efficiencyLeader,
+		ObservedEfficiencyReason:     efficiencyReason,
+		MaxCostUSD:                   cfg.maxCostUSD,
+		ReportedCostUSD:              kocoroPromptReportedCost(results),
+		CostObserved:                 kocoroPromptCostObserved(results),
+		Variants:                     kocoroPromptVariantMetadataList(),
+		Workloads:                    append([]string(nil), cfg.workloads...),
+		Runs:                         append([]koeQualificationRunReport(nil), results...),
+		Summary:                      summary,
+		ComparisonSummary:            comparisonSummary,
+		CurrentControlPassed:         complete && kocoroPromptSummaryCorrect(summary, kocoroPromptVariantCurrent),
+		ProductGatePassed:            complete && analysis.ProductGatePassed,
+		ComparisonGatePassed:         complete && analysis.ComparisonGatePassed,
+		UniversalFailures:            analysis.UniversalFailures,
+		VariantSpecificFailures:      analysis.VariantSpecificFailures,
+		Cells:                        summarizeKocoroPromptVariantCells(results),
+		PairedComparisons:            summarizeKocoroPromptPairedComparisons(results),
 		CoverageBoundaries: []string{
 			"The comparison exercises the production agent loop and provider with deterministic in-memory tools; it does not mutate user files or external services.",
 			"Voice routing, microphone behavior, signed-in app UI, and physical interaction are outside this comparison.",
-			"Three repetitions per cell are comparison-ready but do not establish rare-failure rates.",
+			"Three repetitions per cell are comparison-ready but do not establish rare-failure rates or qualify a release.",
+			"Release qualification fails closed below 30 complete matched repetitions per workload and requires the product correctness gate to pass.",
+			"Paired latency deltas are candidate minus current control; latency win rate is candidate wins divided by all matched pairs, including ties in the denominator.",
+			"Each aggregate exposes P99, maximum latency, and the three slowest runs so tail outliers remain inspectable by workload, repetition, and schedule position.",
 		},
 	}
 }
@@ -808,6 +994,9 @@ func summarizeKocoroPromptVariants(
 		summary.OutputTokensMean /= n
 		summary.TotalP50Millis = koeQualificationPercentile(totals, 0.50)
 		summary.TotalP95Millis = koeQualificationPercentile(totals, 0.95)
+		summary.TotalP99Millis = koeQualificationPercentile(totals, 0.99)
+		summary.TotalMaxMillis = koeQualificationPercentile(totals, 1)
+		summary.SlowestRuns = kocoroPromptSlowestRuns(runs, kocoroPromptSlowestRunsLimit)
 		if len(firstSemantic) > 0 {
 			value := koeQualificationPercentile(firstSemantic, 0.50)
 			summary.FirstSemanticP50Millis = &value
@@ -864,7 +1053,93 @@ func summarizeKocoroPromptVariantCells(
 		cell.CompletionCallsMean /= n
 		cell.TotalP50Millis = koeQualificationPercentile(totals, 0.50)
 		cell.TotalP95Millis = koeQualificationPercentile(totals, 0.95)
+		cell.TotalP99Millis = koeQualificationPercentile(totals, 0.99)
+		cell.TotalMaxMillis = koeQualificationPercentile(totals, 1)
 		out = append(out, cell)
+	}
+	return out
+}
+
+func kocoroPromptSlowestRuns(
+	runs []koeQualificationRunReport,
+	limit int,
+) []kocoroPromptLatencyObservation {
+	ordered := append([]koeQualificationRunReport(nil), runs...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].TotalMillis != ordered[j].TotalMillis {
+			return ordered[i].TotalMillis > ordered[j].TotalMillis
+		}
+		if ordered[i].Workload != ordered[j].Workload {
+			return ordered[i].Workload < ordered[j].Workload
+		}
+		return ordered[i].Repetition < ordered[j].Repetition
+	})
+	if limit > len(ordered) {
+		limit = len(ordered)
+	}
+	out := make([]kocoroPromptLatencyObservation, 0, limit)
+	for _, run := range ordered[:limit] {
+		out = append(out, kocoroPromptLatencyObservation{
+			Workload: run.Workload, Repetition: run.Repetition,
+			ScheduleIndex: run.ScheduleIndex, TotalMillis: run.TotalMillis,
+		})
+	}
+	return out
+}
+
+func summarizeKocoroPromptPairedComparisons(
+	results []koeQualificationRunReport,
+) []kocoroPromptPairedComparison {
+	type matchedKey struct {
+		workload   string
+		repetition int
+	}
+	matched := make(map[matchedKey]map[string]koeQualificationRunReport)
+	for _, result := range results {
+		key := matchedKey{workload: result.Workload, repetition: result.Repetition}
+		if matched[key] == nil {
+			matched[key] = make(map[string]koeQualificationRunReport)
+		}
+		matched[key][result.PromptVariant] = result
+	}
+	out := make([]kocoroPromptPairedComparison, 0, len(kocoroPromptVariantNames)-1)
+	for _, candidate := range kocoroPromptVariantNames {
+		if candidate == kocoroPromptVariantCurrent {
+			continue
+		}
+		comparison := kocoroPromptPairedComparison{
+			Candidate: candidate,
+			Control:   kocoroPromptVariantCurrent,
+		}
+		var deltas []int64
+		for _, variants := range matched {
+			control, controlOK := variants[kocoroPromptVariantCurrent]
+			candidateRun, candidateOK := variants[candidate]
+			if !controlOK || !candidateOK {
+				continue
+			}
+			delta := candidateRun.TotalMillis - control.TotalMillis
+			deltas = append(deltas, delta)
+			switch {
+			case delta < 0:
+				comparison.CandidateLatencyWins++
+			case delta > 0:
+				comparison.ControlLatencyWins++
+			default:
+				comparison.LatencyTies++
+			}
+		}
+		comparison.Pairs = len(deltas)
+		if comparison.Pairs > 0 {
+			comparison.CandidateLatencyWinRate =
+				float64(comparison.CandidateLatencyWins) / float64(comparison.Pairs)
+			comparison.TotalDeltaP50Millis = koeQualificationPercentile(deltas, 0.50)
+			comparison.TotalDeltaP95Millis = koeQualificationPercentile(deltas, 0.95)
+			comparison.TotalDeltaP99Millis = koeQualificationPercentile(deltas, 0.99)
+			comparison.TotalDeltaMinMillis = koeQualificationPercentile(deltas, 0)
+			comparison.TotalDeltaMaxMillis = koeQualificationPercentile(deltas, 1)
+		}
+		out = append(out, comparison)
 	}
 	return out
 }
@@ -913,7 +1188,9 @@ func selectKocoroPromptVariant(
 		return eligible[i].Name < eligible[j].Name
 	})
 	status := "provisional"
-	if repetitions >= 3 {
+	if repetitions >= kocoroPromptReleaseRepetitions {
+		status = "release_ready"
+	} else if repetitions >= kocoroPromptComparisonRepetitions {
 		status = "comparison_ready"
 	}
 	return eligible[0].Name, status,
