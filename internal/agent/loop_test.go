@@ -21,6 +21,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
 	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
@@ -4329,6 +4330,545 @@ func TestForceStop_EmptyResponseFallback(t *testing.T) {
 	if !status.Partial {
 		t.Error("expected Partial=true for empty-response force-stop")
 	}
+}
+
+// forceStopServer builds the standard 4-dup-tool-call force-stop fixture:
+// calls 1-4 return identical mock_tool calls (consecDupThreshold=3: nudge at
+// 3, force-stop at 4); calls >= 5 are handed to synth to script the synthesis
+// turn(s). Requests are decoded and appended to *requests when non-nil.
+func forceStopServer(t *testing.T, synth func(call int) client.CompletionResponse, mu *sync.Mutex, requests *[]client.CompletionRequest) (*httptest.Server, *int) {
+	t.Helper()
+	callCount := new(int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests != nil {
+			var req client.CompletionRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode request: %v", err)
+			}
+			mu.Lock()
+			*requests = append(*requests, req)
+			mu.Unlock()
+		}
+		*callCount++
+		if *callCount <= 4 {
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"cmd":"same"}`), 10, 5))
+			return
+		}
+		json.NewEncoder(w).Encode(synth(*callCount))
+	}))
+	return server, callCount
+}
+
+// TestForceStop_EmptySynthesis_RecoversTextFromBlocks: when the force-stop
+// synthesis response has empty OutputText but ContentBlocks carry real text
+// (Cloud / stream-done aggregator edge case), the visible text must be
+// recovered — parity with the normal final-response path — instead of
+// swapping in the generic fallback. The persisted assistant message must
+// also retain the thinking block (AGENTS.md Thinking Blocks: session
+// persistence must not rewrite them).
+func TestForceStop_EmptySynthesis_RecoversTextFromBlocks(t *testing.T) {
+	server, callCount := forceStopServer(t, func(int) client.CompletionResponse {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "thinking", Thinking: "reasoning trail", Signature: "sig"},
+			{Type: "text", Text: "Recovered synthesis report."},
+		}
+		return resp
+	}, nil, nil)
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetMaxTokens(32000)
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Recovered synthesis report." {
+		t.Errorf("expected block-recovered text, got %q", result)
+	}
+	// Text was recoverable — the recovery retry budget must not be spent.
+	if *callCount != 5 {
+		t.Errorf("expected 5 LLM calls (no recovery retry), got %d", *callCount)
+	}
+	msgs := loop.RunMessages()
+	last := msgs[len(msgs)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("expected trailing assistant message, got role %q", last.Role)
+	}
+	var hasThinking bool
+	for _, b := range last.Content.Blocks() {
+		if b.Type == "thinking" {
+			hasThinking = true
+		}
+	}
+	if !hasThinking {
+		t.Error("force-stop persisted assistant message dropped the thinking block")
+	}
+}
+
+// TestForceStop_EmptySynthesis_LowEffortRecovery: a bare-empty synthesis
+// response gets exactly one recovery attempt with reasoning stripped
+// (EffortTier=low, Thinking=nil, ReasoningEffort="") while the FIRST
+// synthesis request keeps the run's original configuration. The empty
+// initial attempt must leave a force_stop_empty_synthesis audit row.
+func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []client.CompletionRequest
+	)
+	server, callCount := forceStopServer(t, func(call int) client.CompletionResponse {
+		if call == 5 {
+			return nativeResponse("", "end_turn", nil, 10, 0)
+		}
+		return nativeResponse("Recovered after retry.", "end_turn", nil, 10, 5)
+	}, &mu, &requests)
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+	loop.SetMaxTokens(32000)
+	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
+	loop.SetReasoningEffort("high")
+	loop.SetEffortTier("max")
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Recovered after retry." {
+		t.Errorf("expected recovery-turn text, got %q", result)
+	}
+	if *callCount != 6 {
+		t.Fatalf("expected 6 LLM calls (synthesis + 1 recovery), got %d", *callCount)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	first := requests[4] // first synthesis attempt keeps run config
+	if first.EffortTier != "max" || first.Thinking == nil || first.ReasoningEffort != "high" {
+		t.Errorf("first synthesis attempt must keep original config; got effort_tier=%q thinking=%v reasoning=%q",
+			first.EffortTier, first.Thinking, first.ReasoningEffort)
+	}
+	retry := requests[5]
+	if retry.EffortTier != "low" {
+		t.Errorf("recovery attempt EffortTier: got %q, want \"low\"", retry.EffortTier)
+	}
+	if retry.Thinking != nil {
+		t.Errorf("recovery attempt must disable thinking, got %+v", retry.Thinking)
+	}
+	if retry.ReasoningEffort != "" {
+		t.Errorf("recovery attempt must clear ReasoningEffort, got %q", retry.ReasoningEffort)
+	}
+	if len(retry.Tools) != 0 {
+		t.Errorf("recovery attempt must not carry tools, got %d", len(retry.Tools))
+	}
+
+	rows := forceStopEmptySynthesisRows(t, logDir)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 force_stop_empty_synthesis audit row, got %d", len(rows))
+	}
+	in, _ := rows[0]["input_summary"].(string)
+	out, _ := rows[0]["output_summary"].(string)
+	if !strings.Contains(in, "attempt=initial") {
+		t.Errorf("audit row missing attempt=initial: %q", in)
+	}
+	if !strings.Contains(in, "finish_reason=end_turn") || !strings.Contains(in, "effort_tier=max") {
+		t.Errorf("audit row missing finish_reason/effort metadata: %q", in)
+	}
+	if !strings.Contains(out, "blocks=none") || !strings.Contains(out, "latency_ms=") {
+		t.Errorf("audit row missing blocks/latency: %q", out)
+	}
+}
+
+// TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit: when both the
+// synthesis attempt and the single recovery attempt return no visible text,
+// the deterministic fallback is used, the recovery budget binds at one, and
+// BOTH empty attempts leave audit rows (attempt=initial, attempt=recovery).
+func TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit(t *testing.T) {
+	server, callCount := forceStopServer(t, func(int) client.CompletionResponse {
+		return nativeResponse("", "end_turn", nil, 10, 0)
+	}, nil, nil)
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+	loop.SetMaxTokens(32000)
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Errorf("expected deterministic fallback after double-empty, got %q", result)
+	}
+	if *callCount != 6 {
+		t.Errorf("recovery budget must bind at one attempt: expected 6 LLM calls, got %d", *callCount)
+	}
+
+	rows := forceStopEmptySynthesisRows(t, logDir)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 force_stop_empty_synthesis audit rows, got %d", len(rows))
+	}
+	in0, _ := rows[0]["input_summary"].(string)
+	in1, _ := rows[1]["input_summary"].(string)
+	if !strings.Contains(in0, "attempt=initial") {
+		t.Errorf("first row missing attempt=initial: %q", in0)
+	}
+	if !strings.Contains(in1, "attempt=recovery") || !strings.Contains(in1, "effort_tier=low") {
+		t.Errorf("second row missing attempt=recovery/effort_tier=low: %q", in1)
+	}
+}
+
+// TestForceStop_EmptySynthesis_SealedProfileSkipsRecovery: a sealed
+// execution profile (kfp1 Koe fast) owns its model+reasoning configuration —
+// the degraded-effort recovery must not override it, so the empty synthesis
+// goes straight to the deterministic fallback after one attempt.
+func TestForceStop_EmptySynthesis_SealedProfileSkipsRecovery(t *testing.T) {
+	server, callCount := forceStopServer(t, func(int) client.CompletionResponse {
+		return nativeResponse("", "end_turn", nil, 10, 0)
+	}, nil, nil)
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+	loop.SetMaxTokens(32000)
+	loop.SetKoeExecutionProfile(executionprofile.Profile{
+		EffectiveMode: executionprofile.ModeFast,
+		ProfileID:     "kfp1_test",
+		Model:         "gpt-5.6-luna",
+	})
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Errorf("expected deterministic fallback, got %q", result)
+	}
+	if *callCount != 5 {
+		t.Errorf("sealed profile must skip the recovery attempt: expected 5 LLM calls, got %d", *callCount)
+	}
+	rows := forceStopEmptySynthesisRows(t, logDir)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 audit row (initial only), got %d", len(rows))
+	}
+}
+
+// TestForceStop_EmptySynthesis_StripsHallucinatedToolUse: a synthesis
+// response carrying a hallucinated tool_use block must not persist it —
+// force-stop never executes tools, and an unpaired tool_use in history
+// would 400 the next turn's replay.
+func TestForceStop_EmptySynthesis_StripsHallucinatedToolUse(t *testing.T) {
+	server, _ := forceStopServer(t, func(int) client.CompletionResponse {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ToolCalls = []client.FunctionCall{{ID: "tu_x", Name: "bash", Arguments: json.RawMessage(`{}`)}}
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "text", Text: "Report text."},
+			{Type: "tool_use", ID: "tu_x", Name: "bash", Input: json.RawMessage(`{}`)},
+		}
+		return resp
+	}, nil, nil)
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetMaxTokens(32000)
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Report text." {
+		t.Errorf("expected visible text, got %q", result)
+	}
+	msgs := loop.RunMessages()
+	last := msgs[len(msgs)-1]
+	for _, b := range last.Content.Blocks() {
+		if b.Type == "tool_use" {
+			t.Error("force-stop persisted an unpaired tool_use block — next-turn replay would 400")
+		}
+	}
+}
+
+// TestForceStop_EmptySynthesis_StripsHallucinatedComputerCall: a synthesis
+// response carrying a native OpenAI computer_call block (sealed ep1 model
+// violating ToolChoice:none) must not persist it. computer_call is off the
+// ordinary tool_use family — AllToolCalls()/responseWithOnlyToolCalls never
+// see it — so it needs the force-stop sanitizer's explicit strip; an
+// unpaired computer_call in history breaks the next turn's replay.
+func TestForceStop_EmptySynthesis_StripsHallucinatedComputerCall(t *testing.T) {
+	server, _ := forceStopServer(t, func(int) client.CompletionResponse {
+		resp := nativeResponse("", "end_turn", nil, 10, 5)
+		resp.ContentBlocks = []client.ContentBlock{
+			{Type: "text", Text: "Report text."},
+			{
+				Type:                client.OpenAIComputerCallType,
+				Provider:            client.OpenAIComputerProvider,
+				APISurface:          client.APISurfaceOpenAIResponses,
+				ToolContract:        client.ToolContractOpenAIComputerV1,
+				ResponseID:          "shct_" + strings.Repeat("a", 43),
+				CallID:              "call_test1",
+				Status:              client.OpenAIComputerCallStatusCompleted,
+				Actions:             json.RawMessage(`[{"type":"screenshot"}]`),
+				PendingSafetyChecks: []client.OpenAIComputerSafetyCheck{},
+			},
+		}
+		return resp
+	}, nil, nil)
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetMaxTokens(32000)
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "Report text." {
+		t.Errorf("expected visible text, got %q", result)
+	}
+	msgs := loop.RunMessages()
+	last := msgs[len(msgs)-1]
+	for _, b := range last.Content.Blocks() {
+		if b.Type == client.OpenAIComputerCallType {
+			t.Error("force-stop persisted an unpaired computer_call block — next-turn replay would break")
+		}
+	}
+}
+
+// TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack: when
+// the degraded-effort recovery call itself fails on a non-cancellation error
+// (e.g. non-retryable 400), the run must still hand back the deterministic
+// fallback AND leave a content-free force_stop_synthesis_recovery_failed
+// audit row — otherwise the recovery failure is invisible in triage.
+func TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack(t *testing.T) {
+	server, callCount := forceStopServer(t, func(call int) client.CompletionResponse {
+		return nativeResponse("", "end_turn", nil, 10, 0)
+	}, nil, nil)
+	defer server.Close()
+	// Rewrap: fail the 6th call (the recovery attempt) with a 400.
+	inner := server.Config.Handler
+	calls := 0
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 6 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"message":"bad request"}}`))
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+	loop.SetMaxTokens(32000)
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("expected graceful fallback, got error: %v", err)
+	}
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Errorf("expected deterministic fallback, got %q", result)
+	}
+	_ = callCount
+
+	var failedRow map[string]any
+	for _, e := range readAuditLines(t, logDir) {
+		if e["event"] == "force_stop_synthesis_recovery_failed" {
+			failedRow = e
+			break
+		}
+	}
+	if failedRow == nil {
+		t.Fatal("expected force_stop_synthesis_recovery_failed audit row")
+	}
+	in, _ := failedRow["input_summary"].(string)
+	if !strings.Contains(in, "error_class=HTTP 400") {
+		t.Errorf("audit row missing error_class: %q", in)
+	}
+	if strings.Contains(in, "bad request") {
+		t.Errorf("audit row must be content-free (no response body): %q", in)
+	}
+}
+
+// TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback verifies
+// that the optional degraded-effort recovery cannot make the force-stop
+// outcome worse. Once the initial synthesis completed successfully (but
+// empty), a watchdog cancellation of the recovery must still persist and
+// return the deterministic fallback under the original force-stop reason.
+func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.T) {
+	var callCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := callCount.Add(1)
+		switch {
+		case call <= 4:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"cmd":"same"}`), 10, 5))
+		case call == 5:
+			json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 10, 0))
+		default:
+			// Keep the handler itself bounded so httptest.Server.Close never
+			// waits on transport-specific request-context propagation.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(750 * time.Millisecond):
+			}
+		}
+	}))
+	defer server.Close()
+
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, auditor, nil)
+	loop.SetMaxTokens(32000)
+	loop.idleHardTimeout = 500 * time.Millisecond
+	loop.watchdogTick = 5 * time.Millisecond
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("expected iteration-limit fallback, got error: %v", err)
+	}
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Fatalf("expected deterministic fallback, got %q", result)
+	}
+	if got := callCount.Load(); got != 6 {
+		t.Fatalf("expected 6 LLM calls (synthesis + recovery), got %d", got)
+	}
+
+	status := loop.LastRunStatus()
+	if status.FailureCode != runstatus.CodeIterationLimit {
+		t.Errorf("expected FailureCode=iteration_limit, got %q", status.FailureCode)
+	}
+	if !status.Partial {
+		t.Error("expected Partial=true after recovery hard-idle")
+	}
+
+	msgs := loop.RunMessages()
+	last := msgs[len(msgs)-1]
+	if last.Role != "assistant" || !strings.Contains(last.Content.Text(), "synthesis produced no output") {
+		t.Errorf("fallback was not persisted as the trailing assistant message: role=%q text=%q",
+			last.Role, last.Content.Text())
+	}
+
+	var failedRow map[string]any
+	for _, e := range readAuditLines(t, logDir) {
+		if e["event"] == "force_stop_synthesis_recovery_failed" {
+			failedRow = e
+			break
+		}
+	}
+	if failedRow == nil {
+		t.Fatal("expected force_stop_synthesis_recovery_failed audit row")
+	}
+	in, _ := failedRow["input_summary"].(string)
+	if !strings.Contains(in, "error_class=hard_idle_timeout") {
+		t.Errorf("audit row missing hard-idle error class: %q", in)
+	}
+}
+
+// TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget verifies that the
+// optional recovery owns a fresh ForceStop watchdog interval. The initial
+// synthesis and recovery each fit within idleHardTimeout, but their combined
+// latency does not.
+func TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget(t *testing.T) {
+	var callCount atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := callCount.Add(1)
+		switch {
+		case call <= 4:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("mock_tool", `{"cmd":"same"}`), 10, 5))
+		case call == 5:
+			time.Sleep(300 * time.Millisecond)
+			json.NewEncoder(w).Encode(nativeResponse("", "end_turn", nil, 10, 0))
+		default:
+			time.Sleep(300 * time.Millisecond)
+			json.NewEncoder(w).Encode(nativeResponse("Recovered with fresh budget.", "end_turn", nil, 10, 0))
+		}
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := NewToolRegistry()
+	reg.Register(&mockTool{name: "mock_tool"})
+	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetMaxTokens(32000)
+	loop.idleHardTimeout = 500 * time.Millisecond
+	loop.watchdogTick = 5 * time.Millisecond
+
+	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
+	if err != nil {
+		t.Fatalf("expected recovery within fresh watchdog budget, got error: %v", err)
+	}
+	if result != "Recovered with fresh budget." {
+		t.Fatalf("expected recovered text, got %q", result)
+	}
+	if got := callCount.Load(); got != 6 {
+		t.Fatalf("expected 6 LLM calls (synthesis + recovery), got %d", got)
+	}
+
+	status := loop.LastRunStatus()
+	if status.FailureCode != runstatus.CodeIterationLimit || !status.Partial {
+		t.Errorf("expected partial iteration-limit status, got code=%q partial=%v",
+			status.FailureCode, status.Partial)
+	}
+}
+
+// forceStopEmptySynthesisRows filters the audit log down to
+// force_stop_empty_synthesis rows, preserving order.
+func forceStopEmptySynthesisRows(t *testing.T, logDir string) []map[string]any {
+	t.Helper()
+	var rows []map[string]any
+	for _, e := range readAuditLines(t, logDir) {
+		if e["event"] == "force_stop_empty_synthesis" {
+			rows = append(rows, e)
+		}
+	}
+	return rows
 }
 
 // TestBuildReanchorText_MergesPromptAndTextBlocks verifies the reanchor
