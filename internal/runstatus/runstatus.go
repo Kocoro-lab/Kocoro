@@ -26,6 +26,14 @@ const (
 
 	CodeContextCompactionFailed Code = "compaction_failed"
 
+	// CodeCompactionStarted / CodeCompactionFinished bracket one compaction
+	// pass on the run-status stream. They are transient UI signals — a client
+	// shows a "tidying context" indicator on started and removes it on
+	// finished — not run outcomes, so they carry no friendly message.
+	// finished ALWAYS pairs with started, whether or not shaping applied.
+	CodeCompactionStarted  Code = "compaction_started"
+	CodeCompactionFinished Code = "compaction_finished"
+
 	// CodeEmptyResponse is returned when the LLM completed a turn
 	// (err == nil, no tool calls) but produced no visible text — typically
 	// a thinking-only end_turn under heavy reasoning. See

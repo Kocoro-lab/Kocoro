@@ -133,8 +133,8 @@ func foldOversizedTranscript(ctx context.Context, c Completer, messages []client
 	}
 	// One line up front plus one per chunk: the fold is up to
 	// maxSummaryFoldChunks× the input volume of the single-shot path and fires
-	// on exactly the biggest sessions, so a slow fold must be attributable (and countable for the
-	// gap #2 re-open telemetry) instead of looking like a hang. The fold
+	// on exactly the biggest sessions, so a slow fold must be attributable
+	// (and countable when sizing summary spend) instead of looking like a hang. The fold
 	// runs inside one PhaseAwaitingLLM window — on very large transcripts
 	// the sequential calls can approach agent.idle_hard_timeout_secs; the
 	// per-chunk lines below are the operator's signal to raise it.

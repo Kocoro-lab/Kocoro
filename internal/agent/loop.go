@@ -106,6 +106,18 @@ func emitCompactionFailureStatus(handler any, phase string, err error) {
 		fmt.Sprintf("%s: %v", phase, err))
 }
 
+// emitCompactionStatus surfaces the boundaries of one compaction pass as
+// transient run-status events (compaction_started / compaction_finished with
+// the phase as detail) so UI clients can show a "tidying context" indicator
+// while the summary calls run and remove it when the pass leaves. Every
+// started MUST be paired with a finished on all exits of the pass — success,
+// shaping no-op, and summary failure alike — or the indicator sticks.
+func (a *AgentLoop) emitCompactionStatus(code runstatus.Code, phase string) {
+	if rs, ok := a.handler.(RunStatusHandler); ok {
+		rs.OnRunStatus(string(code), phase)
+	}
+}
+
 // shortSessionTruncate is the original short-session fallback wrapper:
 // only fires when len(messages) is below MinShapeable so ShapeHistory
 // cannot help. Kept for the early preflight call sites (main_preflight,
@@ -370,6 +382,36 @@ func describeContentBlocks(blocks []client.ContentBlock) string {
 		}
 	}
 	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// auditForceStopEmptySynthesis records one row per empty force-stop
+// synthesis response so triage can attribute "user only got the canned
+// fallback" to a concrete upstream shape: finish_reason (max_tokens vs
+// end_turn drives different fixes), token spend, latency, block shapes,
+// and the effort configuration the attempt ran with (attempt=initial keeps
+// the run's config; attempt=recovery is the degraded-effort retry).
+// Content-free: block-shape descriptors and counters only, never thinking
+// text. Motivated by the 2026-08-06 schedule incident (session
+// 2026-08-06-1e187cbe4b2e): a 232s synthesis turn returned no visible text
+// and nothing recorded why.
+func (a *AgentLoop) auditForceStopEmptySynthesis(attempt string, resp *client.CompletionResponse, req client.CompletionRequest, elapsed time.Duration) {
+	if a.auditor == nil {
+		return
+	}
+	thinking := "off"
+	if req.Thinking != nil {
+		thinking = req.Thinking.Type
+	}
+	a.auditor.Log(audit.AuditEntry{
+		Timestamp: time.Now(),
+		SessionID: a.sessionID,
+		Event:     "force_stop_empty_synthesis",
+		InputSummary: fmt.Sprintf("attempt=%s model=%s finish_reason=%s effort_tier=%s reasoning_effort=%s thinking=%s",
+			attempt, resp.Model, resp.FinishReason, req.EffortTier, req.ReasoningEffort, thinking),
+		OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d latency_ms=%d blocks=%s",
+			resp.Usage.InputTokens, resp.Usage.OutputTokens,
+			elapsed.Milliseconds(), describeContentBlocks(resp.ContentBlocks)),
+	})
 }
 
 type RunStatus struct {
@@ -856,11 +898,19 @@ type AgentLoop struct {
 	// (tokenizers and schema overheads differ per provider). Always stores a
 	// string; same concurrency exposure as estOverheadTokens.
 	estOverheadModel atomic.Value
-	memoryDir        string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
-	projectEntityDir string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
-	stickyContext    string             // session-scoped facts injected verbatim into system prompt; never truncated
-	outputFormat     string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
-	userFilePaths    []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
+	// lastSystemPromptEst is the token estimate of the most recent Run's final
+	// system prompt. External compaction drivers (TUI /compact) shape a
+	// history that carries only a tiny placeholder system message, while the
+	// calibration overhead is measured against requests whose estimate already
+	// includes the real prompt — so those drivers must add this on top of the
+	// overhead or their budgets over-allocate by the whole prompt. 0 until the
+	// first Run. Atomic for the same daemon-concurrency exposure as above.
+	lastSystemPromptEst atomic.Int64
+	memoryDir           string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	projectEntityDir    string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
+	stickyContext       string             // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat        string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	userFilePaths       []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
 	// alwaysAllowTools is the per-agent persisted set loaded from the agent's
 	// permissions.always_allow_tools config. Sourced from
 	// internal/agents/loader.go AgentPermissionsConfig and injected by the
@@ -1814,6 +1864,47 @@ func buildAssistantMessage(resp *client.CompletionResponse, normalizedToolText s
 		Role:    "assistant",
 		Content: client.NewBlockContent(blocks),
 	}
+}
+
+// stripUnexecutedAssistantCalls returns resp with every call-shaped element
+// removed: ordinary tool_use blocks, native OpenAI computer_call blocks, and
+// the FunctionCall/ToolCalls aliases. The force-stop synthesis turn never
+// executes calls, so persisting any of them would leave an unpaired call in
+// history that breaks the next turn's replay (tool_use → Anthropic 400;
+// computer_call → invalid provider trajectory). computer_call is deliberately
+// off the ordinary tool_use family (AllToolCalls/HasToolCalls never see it),
+// which is why responseWithOnlyToolCalls alone is not a sufficient sanitizer
+// here. Returns resp unchanged when there is nothing to strip.
+func stripUnexecutedAssistantCalls(resp *client.CompletionResponse) *client.CompletionResponse {
+	if resp == nil {
+		return nil
+	}
+	needsStrip := resp.FunctionCall != nil || len(resp.ToolCalls) > 0
+	if !needsStrip {
+		for _, b := range resp.ContentBlocks {
+			if b.Type == "tool_use" || b.Type == client.OpenAIComputerCallType {
+				needsStrip = true
+				break
+			}
+		}
+	}
+	if !needsStrip {
+		return resp
+	}
+	clone := *resp
+	clone.FunctionCall = nil
+	clone.ToolCalls = nil
+	if len(resp.ContentBlocks) > 0 {
+		blocks := make([]client.ContentBlock, 0, len(resp.ContentBlocks))
+		for _, b := range resp.ContentBlocks {
+			if b.Type == "tool_use" || b.Type == client.OpenAIComputerCallType {
+				continue
+			}
+			blocks = append(blocks, b)
+		}
+		clone.ContentBlocks = blocks
+	}
+	return &clone
 }
 
 // responseWithOnlyToolCalls produces the exact assistant trajectory for an
@@ -3101,6 +3192,9 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		h := sha256.Sum256([]byte(systemPrompt))
 		systemStableHash = hex.EncodeToString(h[:8])
 	}
+	a.lastSystemPromptEst.Store(int64(ctxwin.EstimateTokens([]client.Message{
+		{Role: "system", Content: client.NewTextContent(systemPrompt)},
+	})))
 
 	messages := make([]client.Message, 0)
 	messages = append(messages, client.Message{Role: "system", Content: client.NewTextContent(systemPrompt)})
@@ -3491,8 +3585,17 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			executionProfileID string
 			request            client.CompletionRequest
 		}
-		emptyPostToolRetries        int // one recovery turn when tools ran but the model returned no visible final
-		emptyPostToolRecovery       bool
+		emptyPostToolRetries  int // one recovery turn when tools ran but the model returned no visible final
+		emptyPostToolRecovery bool
+		// forceStopEmptyRecoveryUsed caps the force-stop empty-synthesis
+		// recovery at one degraded-effort attempt per Run. Deliberately
+		// independent of emptyPostToolRetries (the main-loop empty-response
+		// retry): a single Run can consume both budgets, worst case two
+		// extra recovery turns (each turn's transport retries stay managed
+		// by completeWithRetry) — acceptable because the force-stop turn is
+		// the last chance to hand the user real content instead of the
+		// canned fallback line.
+		forceStopEmptyRecoveryUsed  bool
 		computerUseOwnsTurn         bool
 		computerUseNeedsApps        bool
 		computerUseAlternateOnly    bool
@@ -3732,6 +3835,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// MinShapeable gate matches the main-loop site — without enough
 		// messages, ShapeHistory is a no-op and the summary call wastes tokens.
 		if shouldPreflightCompact(messages, a.contextWindow, a.estOverhead()) && len(messages) > ctxwin.MinShapeable() {
+			a.emitCompactionStatus(runstatus.CodeCompactionStarted, "force_stop")
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
 					fmt.Sprintf("force-stop turn estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
@@ -3757,6 +3861,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			if _, applied := applyShapedHistory(shaped, "force_stop", "force_stop_preflight"); applied {
 				captureRunMessages()
 			}
+			a.emitCompactionStatus(runstatus.CodeCompactionFinished, "force_stop")
 		}
 
 		req := client.CompletionRequest{
@@ -3786,6 +3891,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			// repeated computer action cannot be silently discarded below.
 			req.ToolChoice = "none"
 		}
+		synthesisStart := time.Now()
 		finalResp, err := a.completeWithRetry(ctx, req)
 		if err != nil {
 			captureRunMessages()
@@ -3804,14 +3910,108 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		cacheTracker.Record(finalResp.Usage)
 		a.reportLLMUsage(finalResp.Usage, finalResp.Model)
 
+		// Empty-synthesis guard — parity with the normal final-response
+		// path (block recovery → bounded degraded retry → audit). This
+		// path previously read only OutputText and silently swapped in the
+		// generic fallback: an HTTP-success response whose visible text
+		// lived in ContentBlocks, or that was thinking-only, delivered the
+		// user nothing and recorded nothing (2026-08-06 schedule incident,
+		// session 2026-08-06-1e187cbe4b2e).
+		persistResp := finalResp
 		text := strings.TrimSpace(finalResp.OutputText)
+		if text == "" {
+			text = strings.TrimSpace(recoverVisibleTextFromBlocks(finalResp))
+		}
+		if text == "" {
+			a.auditForceStopEmptySynthesis("initial", finalResp, req, time.Since(synthesisStart))
+			// One recovery attempt with reasoning stripped: an empty
+			// synthesis on a reasoning-heavy config is most plausibly the
+			// thinking budget swallowing the answer, so the retry hands
+			// the whole output budget to visible text. Sealed profiles
+			// (kfp1 Koe fast / ep1 computer) own their model+reasoning
+			// configuration — never override them; they keep the
+			// single-attempt behavior. Budget semantics documented at the
+			// forceStopEmptyRecoveryUsed declaration.
+			sealed := a.executionProfileID != "" || a.executionProfile != nil || a.computerProfile.ProfileID != ""
+			if !sealed && !forceStopEmptyRecoveryUsed {
+				forceStopEmptyRecoveryUsed = true
+				if rs, ok := a.handler.(RunStatusHandler); ok {
+					rs.OnRunStatus("empty_response_retry",
+						"force-stop synthesis returned no visible text; retrying once with reasoning disabled")
+				}
+				retryReq := req
+				retryReq.Thinking = nil
+				retryReq.ReasoningEffort = ""
+				retryReq.EffortTier = "low"
+				// The recovery is a distinct LLM wait and owns a fresh watchdog
+				// interval. Enter bumps the phase sequence even when the phase
+				// remains ForceStop, rearming both soft and hard idle timers.
+				if a.tracker != nil {
+					a.tracker.Enter(PhaseForceStop)
+				}
+				retryStart := time.Now()
+				retryResp, retryErr := a.completeWithRetry(ctx, retryReq)
+				if retryErr != nil {
+					var recoveryErrorClass string
+					switch {
+					case errors.Is(retryErr, ErrHardIdleTimeout):
+						// The initial synthesis already completed successfully;
+						// only the optional recovery timed out. Preserve the
+						// deterministic fallback as a usable partial result instead
+						// of making recovery degrade the pre-PR outcome into an empty
+						// failed run. Keep the recovery timeout visible in audit while
+						// preserving the loop detector as the terminal cause.
+						recoveryErrorClass = "hard_idle_timeout"
+					case errors.Is(retryErr, context.DeadlineExceeded):
+						recoveryErrorClass = "deadline_exceeded"
+					case ctx.Err() != nil:
+						// User/operator cancellation and other non-timeout causes
+						// still terminate the run; do not manufacture a reply after
+						// control was explicitly withdrawn.
+						captureRunMessages()
+						setRunStatus(runstatus.CodeFromError(retryErr), false)
+						return "", retryErr
+					default:
+						recoveryErrorClass = classifyLLMError(retryErr)
+					}
+					// Without this row, recovery failures are invisible (a
+					// non-retryable 4xx leaves no completeWithRetry stderr line
+					// either). Class label only — never the response body.
+					if a.auditor != nil {
+						a.auditor.Log(audit.AuditEntry{
+							Timestamp: time.Now(),
+							SessionID: a.sessionID,
+							Event:     "force_stop_synthesis_recovery_failed",
+							InputSummary: fmt.Sprintf("error_class=%s",
+								recoveryErrorClass),
+							OutputSummary: fmt.Sprintf("latency_ms=%d",
+								time.Since(retryStart).Milliseconds()),
+						})
+					}
+				} else {
+					usage.Add(retryResp.Usage)
+					cacheTracker.Record(retryResp.Usage)
+					a.reportLLMUsage(retryResp.Usage, retryResp.Model)
+					persistResp = retryResp
+					text = strings.TrimSpace(retryResp.OutputText)
+					if text == "" {
+						text = strings.TrimSpace(recoverVisibleTextFromBlocks(retryResp))
+					}
+					if text == "" {
+						a.auditForceStopEmptySynthesis("recovery", retryResp, retryReq, time.Since(retryStart))
+					}
+				}
+			}
+		}
 		if text == "" {
 			text = fallback
 		}
-		messages = append(messages, client.Message{
-			Role:    "assistant",
-			Content: client.NewTextContent(text),
-		})
+		// Persist via buildAssistantMessage so thinking/redacted_thinking
+		// blocks survive session persistence (AGENTS.md Thinking Blocks).
+		// stripUnexecutedAssistantCalls removes hallucinated tool_use AND
+		// native computer_call blocks first — force-stop never executes
+		// calls, and an unpaired call in history breaks next-turn replay.
+		messages = append(messages, buildAssistantMessage(stripUnexecutedAssistantCalls(persistResp), text))
 		stampMessage()
 		captureRunMessages()
 		// Every force-stop exit is abnormal: the loop detector terminated
@@ -3821,7 +4021,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		if a.handler != nil {
 			a.handler.OnText(text)
 		}
-		if !finalResp.HasToolCalls() {
+		if !persistResp.HasToolCalls() {
 			a.clearLastSentOrdinaryContinuation(req.PreviousResponseID)
 		}
 		return text, nil
@@ -4227,6 +4427,7 @@ iterationLoop:
 			}
 			if shouldCompact {
 				a.tracker.Enter(PhaseCompacting)
+				a.emitCompactionStatus(runstatus.CodeCompactionStarted, "proactive")
 				if compactionSummary == "" {
 					// Write-before-compact: persist durable learnings to MEMORY.md
 					// before messages are discarded by compaction.
@@ -4304,6 +4505,7 @@ iterationLoop:
 						}
 					}
 				}
+				a.emitCompactionStatus(runstatus.CodeCompactionFinished, "proactive")
 			}
 		}
 
@@ -4408,6 +4610,7 @@ iterationLoop:
 		// repeatedly burn calls until lastPromptTokens drops back under 90%.
 		if shouldPreflightCompact(messages, a.contextWindow, a.estOverhead()) && !compactionApplied && !reactiveCompacted && len(messages) > ctxwin.MinShapeable() {
 			a.tracker.Enter(PhaseCompacting)
+			a.emitCompactionStatus(runstatus.CodeCompactionStarted, "preflight")
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
 					fmt.Sprintf("estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
@@ -4457,6 +4660,7 @@ iterationLoop:
 				captureRunMessages()
 				a.tracker.MarkDirty()
 			}
+			a.emitCompactionStatus(runstatus.CodeCompactionFinished, "preflight")
 		}
 
 		// Post-compaction safety net: ShapeHistory always preserves the
@@ -4770,6 +4974,7 @@ iterationLoop:
 					// remain idle-watched; everything else (ShapeHistory, local
 					// I/O) is intentionally not idle-counted.
 					a.tracker.Enter(PhaseCompacting)
+					a.emitCompactionStatus(runstatus.CodeCompactionStarted, "reactive")
 
 					// Write-before-compact: persist durable learnings before discarding history.
 					if a.memoryDir != "" {
@@ -4859,6 +5064,10 @@ iterationLoop:
 						reanchorActiveTask(MetaBoundaryPostCompactionNoRestore)
 						captureRunMessages()
 					}
+					// Emitted here — after all shaping/summary work, before the
+					// request rebuild — so every exit of the pass (including the
+					// rebuild's error return) has already paired with started.
+					a.emitCompactionStatus(runstatus.CodeCompactionFinished, "reactive")
 
 					// Rebuild request with compacted messages. The ordinary
 					// Responses cursor is deliberately NOT carried over: with
@@ -6587,8 +6796,8 @@ iterationLoop:
 		fmt.Sprintf("I reached the iteration safety cap after %d turns and couldn't finalize a report.", iterationCount),
 	)
 	if synthErr == nil {
-		// runForceStopTurn already handled: status (CodeIterationLimit,
-		// Partial=true), message append, OnText handler, checkpoint.
+		// runForceStopTurn already handled the partial CodeIterationLimit
+		// status, message append, and OnText.
 		return text, usage, ErrMaxIterReached
 	}
 

@@ -273,9 +273,11 @@ func TestApplyTurnState_PersistsCompactionCheckpointWithoutReplacingArchive(t *t
 		{Role: "user", Content: client.NewTextContent("new user")},
 		{Role: "assistant", Content: client.NewTextContent("new reply")},
 	})
+	// The fixture must look like real ShapeHistory output (primer + prefixed
+	// summary) — HistoryForLoop rejects markerless checkpoints.
 	agent.SetCompactionCheckpointMessagesForTest(loop, []client.Message{
-		{Role: "user", Content: client.NewTextContent("stable summary")},
-		{Role: "user", Content: client.NewTextContent("new user")},
+		{Role: "user", Content: client.NewTextContent("primer")},
+		{Role: "user", Content: client.NewTextContent("Previous context summary: stable summary")},
 		{Role: "assistant", Content: client.NewTextContent("new reply")},
 	})
 
@@ -294,7 +296,7 @@ func TestApplyTurnState_PersistsCompactionCheckpointWithoutReplacingArchive(t *t
 	if cp == nil || cp.ArchiveThroughIndex != len(sess.Messages) || cp.SchemaVersion != session.CompactionCheckpointSchemaVersion {
 		t.Fatalf("checkpoint not bound to persisted archive: %#v", cp)
 	}
-	if got := sess.HistoryForLoop(); len(got) != 3 || got[0].Content.Text() != "stable summary" {
+	if got := sess.HistoryForLoop(); len(got) != 3 || got[0].Content.Text() != "primer" {
 		t.Fatalf("live history did not use checkpoint: %#v", got)
 	}
 

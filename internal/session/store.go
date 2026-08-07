@@ -328,9 +328,16 @@ func (s *Session) HistoryForLoop() []client.Message {
 			s.ID, cp.SchemaVersion, len(cp.Messages), cp.ArchiveThroughIndex, len(s.Messages))
 		return FilterInjected(s.Messages, s.MessageMeta)
 	}
+	// ShapeHistory always writes the compacted-history marker — even a failed
+	// summary keeps the prefixed "(summary unavailable)" line — so a
+	// checkpoint without it was not produced by compaction. Feeding it
+	// forward would let the next-turn sanitizer silently degrade the primer;
+	// falling back to the lossless archive instead is self-healing (the next
+	// turn re-compacts from the archive).
 	if !ctxwin.IsCompactedHistory(cp.Messages) {
-		log.Printf("session: compaction checkpoint is structurally valid but missing the compacted-history marker (session=%q messages=%d archive_through_index=%d); next-turn sanitization may degrade the primer",
+		log.Printf("session: ignoring compaction checkpoint missing the compacted-history marker (session=%q messages=%d archive_through_index=%d); falling back to archive",
 			s.ID, len(cp.Messages), cp.ArchiveThroughIndex)
+		return FilterInjected(s.Messages, s.MessageMeta)
 	}
 
 	through := cp.ArchiveThroughIndex

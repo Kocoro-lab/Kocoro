@@ -28,6 +28,14 @@ func (a *AgentLoop) ToolsFingerprint() string {
 	return toolSchemaFingerprint(a.tools)
 }
 
+// LastSystemPromptEstimate returns the token estimate of the most recent
+// Run's final system prompt (0 before the first Run). External compaction
+// drivers whose shaped history carries only a placeholder system message must
+// add this to their overhead so budgets account for the real prompt.
+func (a *AgentLoop) LastSystemPromptEstimate() int {
+	return int(a.lastSystemPromptEst.Load())
+}
+
 // SetEstOverheadState restores a checkpointed calibration sample onto a fresh
 // loop (the daemon builds one AgentLoop per request, so without this every
 // resumed Run makes its iteration-0 compaction decisions — proactive
