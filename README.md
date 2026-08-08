@@ -195,7 +195,7 @@ Flags: `-y/--yes` auto-approve; `--agent` named agent; `--dangerously-skip-permi
 
 With `shan koe --barge-in` on the VPIO audio backend, Kocoro can pause and resume around a backchannel, stop speaking without hanging up, accept a new request, or end the call. Stopping speech, cancelling work, and ending the call are separate actions; work already in progress survives a hang-up. Double-tap Option to talk again.
 
-**Fast and Full execution.** Voice requests are dispatched at one of two levels. Bounded work ("what's on my calendar today?") runs **Fast** on a reserved profile tuned for latency; complex or high-risk work runs **Full** on your ordinary global/per-agent agent configuration, byte for byte. The choice is a soft semantic judgment, not a rigid classifier, and the daemon re-decides it on every request — an unrecognized or missing mode always falls back to Full, and nothing can upgrade a request the model marked Full. Fast resolves through Shannon Cloud with a 5-second bound and degrades to Full on any resolution failure, so a Cloud hiccup costs latency, never correctness. There is nothing to configure.
+**Fast and Full execution.** Voice requests are dispatched at one of two levels. Bounded work ("what's on my calendar today?") runs **Fast** on a reserved profile tuned for latency; complex or high-risk work runs **Full** on your ordinary global/per-agent agent configuration, byte for byte. The choice is a soft semantic judgment, not a rigid classifier, and the daemon re-decides it on every request — an unrecognized or missing mode always falls back to Full, and nothing can upgrade a request the model marked Full. Fast resolves through Shannon Cloud with a 5-second bound and degrades to Full on any resolution failure, so a Cloud hiccup costs latency, never correctness. Fast is on by default; set `koe.fast_effort: false` to make every voice-triggered task run Full. It does not change the realtime voice model or override your normal agent's model and effort.
 
 The realtime model is pinned to a single engine default (`gpt-realtime-2.1` as of v0.4.3); `--model` overrides it for CLI and on-robot callers.
 
@@ -229,7 +229,7 @@ Type `/` in the TUI for the interactive menu:
 
 > `/research` and `/swarm` are also accepted via `POST /message` with `Accept: text/event-stream` (HTTP clients including Kocoro Desktop).
 
-Subcommands: `shan mcp serve`, `shan daemon {start,stop,status}`, `shan schedule {create,list,update,remove,enable,disable,sync}`, `shan sessions sync`, `shan koe` ([Voice Front Brain](#voice-front-brain-macos)), `shan ghostty workspace`, `shan update`.
+Subcommands: `shan mcp serve`, `shan daemon {start,stop,status}`, `shan schedule {create,list,update,remove,enable,disable}`, `shan sessions sync`, `shan koe` ([Voice Front Brain](#voice-front-brain-macos)), `shan ghostty workspace`, `shan update`.
 
 ## Local Tools
 
@@ -528,9 +528,9 @@ Long sessions compact automatically — you do not need to run `/compact` to kee
 Two things are worth knowing about how this works:
 
 - **Your transcript is never rewritten.** The session JSON stays the lossless archive used by resume, search, share, and sync. Compaction writes a *separate* checkpoint (summary + retained tail) that only the model sees. Anything compaction drops from the model's view is still in the session file.
-- **The checkpoint is durable.** It is persisted rather than recomputed per request, so the summary does not drift between turns and the prompt cache converges. A crash mid-turn resumes from the checkpoint.
+- **The checkpoint is durable.** It is persisted rather than recomputed per request, so the summary does not drift between turns and the prompt cache converges. It also survives a crash: on restart the daemon continues an interrupted turn from its checkpoint, provided `agent.interrupted_resume_enabled` is on (default) and the checkpoint is still inside the `agent.interrupted_resume_max_age_hours` window (default 4). An older checkpoint is abandoned rather than executed, since the intent behind it has gone stale. Recovered runs always execute unattended, so the unattended tool deny-list applies.
 
-After a compaction the agent re-reads the files it had most recently read, so exact file content the summary only paraphrases comes back into context.
+After a routine compaction the agent re-reads the files it had most recently read — bounded at 5 files and roughly 50K tokens, and skipped entirely when there is no headroom — so exact file content the summary only paraphrases comes back into context. Emergency compaction triggered by a rejected oversized prompt deliberately skips this and instead tells the model to re-read what it needs.
 
 Useful knobs (all optional — the defaults are tuned for the 1M-context model families the default tiers route to):
 
@@ -542,7 +542,7 @@ agent:
   compaction_snapshot_max_age_days: 14 # 0 disables the age sweep
 ```
 
-`/compact [instructions]` forces a pass immediately. Clients that consume the daemon's `run_status` stream (Kocoro Desktop, the TUI) show a transient "Tidying context" indicator between the `compaction_started` and `compaction_finished` events; gate that UI on the `compaction_status_events_v1` capability token.
+`/compact [instructions]` forces a pass immediately. The TUI shows a transient "Tidying context" spinner between the daemon's `compaction_started` and `compaction_finished` run-status events; other clients can render the same indicator by gating on the `compaction_status_events_v1` capability token.
 
 ## Named Agents
 
@@ -657,7 +657,7 @@ Localhost-only HTTP for native-app integration and scripting.
 | `/sessions/{id}/reset` | POST | Clear session history in place (named agent only) |
 | `/sessions/search` | GET | Search session history, `?q=<query>&agent=<name>` |
 | `/projects` | GET, POST | List / create projects (session grouping with a name + theme color) |
-| `/projects/{id}` | GET, PUT, DELETE | Read, rename/recolor, or delete a project and its sessions |
+| `/projects/{id}` | GET, PUT, DELETE | Read or rename/recolor a project. `DELETE` requires `?confirm=true` and **permanently deletes every session filed under it**, not just the project. |
 | `/message` | POST | Send a message; supports HITL injection and idempotent retry |
 | `/migrate/claude-code/preview` | POST | Scan `~/.claude/` and return what would be imported (dry-run) |
 | `/migrate/claude-code/apply` | POST | Execute a previewed import — copies agents, skills, instructions from Claude Code |
@@ -691,7 +691,7 @@ Synchronous response:
 }
 ```
 
-**Idempotent retry.** `POST /message` accepts an `idempotency_key` alongside a client-minted `session_id`. Retrying a *completed* request returns the persisted result without re-invoking the LLM or any tools — which is what makes a file-producing run safe to retry after your client crashes. Interrupted or failed requests fail closed and need explicit recovery rather than silently re-running.
+**Idempotent retry.** `POST /message` accepts an `idempotency_key` (8-128 chars, `[A-Za-z0-9._:-]`) alongside a client-minted `session_id`; it is rejected without one, and on ephemeral requests. Retrying a *completed* request returns the persisted result without re-invoking the LLM or any tools — which is what makes a file-producing run safe to retry after your client crashes. Interrupted or failed requests fail closed and need explicit recovery rather than silently re-running.
 
 > The guarantee is **sequential-retry-safe, not concurrent-submission-safe**: two simultaneous requests carrying the same `session_id` + key can both clear the in-progress guard before either registers, so a naive concurrent client can still double-execute the side effect. Serialize retries of a key. Gate on the `message_idempotency_v1` capability token (`message_idempotency_receipt_v2` additionally persists validated `present_deliverable` receipts and returns stable error codes for failed/in-progress retries).
 
