@@ -111,9 +111,6 @@ type koeQualificationJob struct {
 	Workload   string
 	Repetition int
 	Token      string
-	// PromptVariant is empty for the production prompt and names an isolated
-	// system-prompt replacement for the prompt comparison harness.
-	PromptVariant string
 }
 
 type koeQualificationReport struct {
@@ -192,7 +189,6 @@ type koeQualificationRunReport struct {
 	Lane                          string   `json:"lane"`
 	Workload                      string   `json:"workload"`
 	Repetition                    int      `json:"repetition"`
-	PromptVariant                 string   `json:"prompt_variant,omitempty"`
 	Outcome                       string   `json:"outcome"`
 	TaskSuccess                   bool     `json:"task_success"`
 	ExpectedOutput                string   `json:"expected_output,omitempty"`
@@ -309,7 +305,6 @@ type koeQualificationLLMClient struct {
 	firstSemanticDelta *time.Duration
 	firstTextDelta     *time.Duration
 	firstToolCallReady *time.Duration
-	systemPrompt       string
 	streamedOutputs    []string
 }
 
@@ -317,7 +312,6 @@ func (c *koeQualificationLLMClient) Complete(
 	ctx context.Context,
 	req client.CompletionRequest,
 ) (*client.CompletionResponse, error) {
-	req = c.withSystemPrompt(req)
 	c.recordRequest(req)
 	response, err := c.inner.Complete(ctx, req)
 	c.recordResponse(response)
@@ -329,7 +323,6 @@ func (c *koeQualificationLLMClient) CompleteStream(
 	req client.CompletionRequest,
 	onDelta func(client.StreamDelta),
 ) (*client.CompletionResponse, error) {
-	req = c.withSystemPrompt(req)
 	c.recordRequest(req)
 	var streamed strings.Builder
 	response, err := c.inner.CompleteStream(ctx, req, func(delta client.StreamDelta) {
@@ -357,17 +350,6 @@ func (c *koeQualificationLLMClient) lastStreamedOutput() string {
 		}
 	}
 	return ""
-}
-
-func (c *koeQualificationLLMClient) withSystemPrompt(
-	req client.CompletionRequest,
-) client.CompletionRequest {
-	if c.systemPrompt == "" || len(req.Messages) == 0 || req.Messages[0].Role != "system" {
-		return req
-	}
-	req.Messages = append([]client.Message(nil), req.Messages...)
-	req.Messages[0].Content = client.NewTextContent(c.systemPrompt)
-	return req
 }
 
 func (c *koeQualificationLLMClient) recordAndSanitizeError(err error) error {
@@ -2046,9 +2028,8 @@ func runKoeQualificationJob(
 
 	workload := buildKoeQualificationWorkload(job)
 	qualificationClient := &koeQualificationLLMClient{
-		inner:        gateway,
-		start:        start,
-		systemPrompt: kocoroPromptVariantTextForWorkload(job.PromptVariant, job.Workload),
+		inner: gateway,
+		start: start,
 	}
 
 	loop := NewAgentLoop(
@@ -2073,9 +2054,8 @@ func runKoeQualificationJob(
 	loop.SetSkills(workload.skills)
 	loop.SetCacheSource("koe_fast_qualification")
 	loop.SetSessionID(fmt.Sprintf(
-		"koe-qualification-%s-%s-%s-%d",
+		"koe-qualification-%s-%s-%d",
 		job.Lane,
-		job.PromptVariant,
 		job.Workload,
 		job.Repetition,
 	))
@@ -2145,7 +2125,6 @@ func runKoeQualificationJob(
 		Lane:                          job.Lane,
 		Workload:                      job.Workload,
 		Repetition:                    job.Repetition,
-		PromptVariant:                 job.PromptVariant,
 		TaskSuccess:                   runErr == nil && taskSuccess,
 		ExpectedOutput:                workload.receipt,
 		ObservedOutput:                strings.TrimSpace(resultText),

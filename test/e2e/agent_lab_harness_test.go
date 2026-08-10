@@ -37,29 +37,18 @@ func TestOffline_AgentLabScriptsParse(t *testing.T) {
 	if err != nil {
 		t.Skip("bash unavailable; agent-lab runners require bash")
 	}
-	command := exec.Command(
-		bash,
-		"-n",
-		filepath.Join(repoRoot(), "scripts", "agent-lab.sh"),
-		filepath.Join(repoRoot(), "scripts", "koe-provider-qualification.sh"),
-		filepath.Join(repoRoot(), "scripts", "kocoro-prompt-variants.sh"),
-	)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("agent-lab script parse: %v\n%s", err, output)
-	}
-}
-
-func TestOffline_PromptVariantRunnerRequiresExplicitPaidGate(t *testing.T) {
-	script := filepath.Join(repoRoot(), "scripts", "kocoro-prompt-variants.sh")
-	command := exec.Command(script, t.TempDir())
-	command.Env = append(os.Environ(), "KOCORO_PROMPT_VARIANTS_LIVE=")
-	output, err := command.CombinedOutput()
-	if err == nil {
-		t.Fatal("prompt comparison unexpectedly ran without its paid gate")
-	}
-	exitError, ok := err.(*exec.ExitError)
-	if !ok || exitError.ExitCode() != 2 {
-		t.Fatalf("prompt comparison exit=%v, want status 2; output=%s", err, output)
+	// One invocation per script: `bash -n a.sh b.sh` syntax-checks only a.sh and
+	// silently turns the rest into positional parameters, so a batched call
+	// reports success for scripts it never read — including missing ones.
+	for _, name := range []string{"agent-lab.sh", "koe-provider-qualification.sh"} {
+		script := filepath.Join(repoRoot(), "scripts", name)
+		if _, err := os.Stat(script); err != nil {
+			t.Fatalf("agent-lab script %s: %v", name, err)
+		}
+		output, err := exec.Command(bash, "-n", script).CombinedOutput()
+		if err != nil {
+			t.Fatalf("agent-lab script parse %s: %v\n%s", name, err, output)
+		}
 	}
 }
 
