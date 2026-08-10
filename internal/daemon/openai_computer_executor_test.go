@@ -2589,7 +2589,7 @@ func TestOpenAIComputerTaskToolPersistentDisplayTopologyReconfigurationStopsAfte
 	}
 }
 
-func TestOpenAIComputerTaskToolAppResolutionFailureHasExecutableRecovery(
+func TestOpenAIComputerTaskToolAppResolutionFailureRequestsCorrectedTargets(
 	t *testing.T,
 ) {
 	runtime := &openAIComputerDaemonRuntimeProbe{
@@ -2619,14 +2619,14 @@ func TestOpenAIComputerTaskToolAppResolutionFailureHasExecutableRecovery(
 	}
 	if !result.IsError ||
 		!strings.Contains(result.Content, "app_resolution_failed") ||
-		!strings.Contains(result.Content, "no desktop action was attempted") ||
+		!strings.Contains(result.Content, "corrected canonical installed app names") ||
 		!strings.Contains(
 			result.Content,
-			"only if the user did not require Computer Use specifically",
+			"do not switch to another desktop-control tool",
 		) ||
 		result.ComputerUseOutcome == nil ||
 		result.ComputerUseOutcome.Recovery !=
-			agent.ComputerUseRecoveryAlternateControl {
+			agent.ComputerUseRecoveryRetryWithApps {
 		t.Fatalf("task result = %+v", result)
 	}
 	if len(runtime.resolvedApps) != 1 ||
@@ -4408,8 +4408,12 @@ func TestOpenAIComputerTaskToolSchemaSeparatesControlledAppsAndForegroundPolicy(
 		t.Fatalf("required fields = %q", got)
 	}
 	properties := info.Parameters["properties"].(map[string]any)
-	if _, ok := properties["controlled_apps"]; !ok {
+	controlledApps, ok := properties["controlled_apps"].(map[string]any)
+	if !ok {
 		t.Fatal("controlled app targets are missing")
+	}
+	if description, _ := controlledApps["description"].(string); !strings.Contains(description, "Do not translate app names") {
+		t.Fatalf("controlled app guidance = %q", description)
 	}
 	if _, ok := properties["apps"]; ok {
 		t.Fatal("ambiguous legacy app hints remain model-visible")

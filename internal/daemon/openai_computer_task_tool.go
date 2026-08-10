@@ -772,7 +772,7 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 				"controlled_apps": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Optional macOS app names whose UI the executor may read or change. Exclude any app named only as the frontmost app to preserve.",
+					"description": "Optional canonical installed macOS app names or bundle identifiers whose UI the executor may read or change. Do not translate app names (for example, use Weather or System Settings). Exclude any app named only as the frontmost app to preserve.",
 				},
 				"foreground_policy": map[string]any{
 					"type": "string",
@@ -913,13 +913,13 @@ func (t *openAIComputerTaskToolV1) Run(
 				agent.BusinessError(
 					"computer_use_error: app_resolution_failed\n"+
 						"message: Computer Use could not resolve the requested app target\n"+
-						"recovery: "+openAIComputerPreActionRecoveryV1(false)+"\n"+
+						"recovery: retry computer_use once in this turn with corrected canonical installed app names or bundle identifiers in controlled_apps; do not switch to another desktop-control tool\n"+
 						"detail: "+err.Error(),
 				),
 				agent.ComputerUseTaskNotCompleted,
 				agent.ComputerUseCommitNone,
 				"app_resolution_failed",
-				agent.ComputerUseRecoveryAlternateControl,
+				agent.ComputerUseRecoveryRetryWithApps,
 			), nil
 		}
 		trace.record(openAIComputerTraceEventV1{
