@@ -2285,6 +2285,82 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 	}
 }
 
+func TestAgentLoop_MalformedCorrectedAppCallConsumesRetry(t *testing.T) {
+	computerUse := &mockComputerUseRecoveryTool{}
+	callCount := 0
+	var finalRequest client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var request client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 3:
+			finalRequest = request
+			encoded, err := json.Marshal(request.Messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(string(encoded), "retry computer_use") > 1 {
+				json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+					toolCall("computer_use",
+						`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+					10, 5))
+				return
+			}
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The requested app target remains unresolved.", "end_turn", nil, 10, 5))
+		case 4:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The stale retry instruction caused an extra model iteration.", "end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "The requested app target remains unresolved." ||
+		computerUse.runs != 1 || callCount != 3 {
+		t.Fatalf("result=%q runs=%d calls=%d", result, computerUse.runs, callCount)
+	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript, "corrected_app_retry_rejected") ||
+		!strings.Contains(transcript, "no further computer_use retry or alternate desktop-control path is available in this run") {
+		t.Fatalf("malformed correction did not close recovery paths: %s", transcript)
+	}
+}
+
 func TestAgentLoop_NoEffectComputerUseReleasesAlternateControlButNotSecondTask(
 	t *testing.T,
 ) {

@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 
 struct AppIdentityResult: Encodable {
     let app: String
@@ -121,6 +122,63 @@ func processLaunchDateStringV1(_ application: NSRunningApplication) -> String? {
     application.launchDate.map(processLaunchDateFormatterV1.string(from:))
 }
 
+func metadataQueryLiteralV1(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "*", with: "\\*")
+        .replacingOccurrences(of: "?", with: "\\?")
+}
+
+func uniqueInstalledTaskApplicationURLV1(
+    candidates: [URL],
+    bundleIdentifier: (URL) -> String? = { Bundle(url: $0)?.bundleIdentifier }
+) -> URL? {
+    var validByPath: [String: URL] = [:]
+    for candidate in candidates {
+        let normalized = candidate.standardizedFileURL
+        guard normalized.isFileURL,
+              normalized.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
+              let identifier = bundleIdentifier(normalized)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !identifier.isEmpty else {
+            continue
+        }
+        validByPath[normalized.path] = normalized
+    }
+    guard validByPath.count == 1 else { return nil }
+    return validByPath.values.first
+}
+
+func localizedInstalledTaskApplicationURLV1(appName: String) -> URL? {
+    let requested = appName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !requested.isEmpty else { return nil }
+    let literal = metadataQueryLiteralV1(requested)
+    let predicate =
+        "kMDItemDisplayName == \"\(literal)\"c && " +
+        "kMDItemContentType == \"com.apple.application-bundle\""
+    guard let query = MDQueryCreate(
+        kCFAllocatorDefault,
+        predicate as CFString,
+        nil,
+        nil
+    ), MDQueryExecute(query, CFOptionFlags(kMDQuerySynchronous.rawValue)) else {
+        return nil
+    }
+    let candidates: [URL] = (0..<MDQueryGetResultCount(query)).compactMap { index in
+        guard let rawItem = MDQueryGetResultAtIndex(query, index) else {
+            return nil
+        }
+        let item = unsafeBitCast(rawItem, to: MDItem.self)
+        guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String,
+              !path.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+    return uniqueInstalledTaskApplicationURLV1(candidates: candidates)
+}
+
 private func installedTaskApplicationURLV1(
     appName: String,
     expectedBundleID: String? = nil
@@ -136,10 +194,10 @@ private func installedTaskApplicationURLV1(
            withBundleIdentifier: requested) {
         return url
     }
-    guard let path = NSWorkspace.shared.fullPath(forApplication: requested) else {
-        return nil
+    if let path = NSWorkspace.shared.fullPath(forApplication: requested) {
+        return URL(fileURLWithPath: path)
     }
-    return URL(fileURLWithPath: path)
+    return localizedInstalledTaskApplicationURLV1(appName: requested)
 }
 
 private func openExactTaskApplicationV1(

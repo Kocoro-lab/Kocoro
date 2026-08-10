@@ -79,11 +79,11 @@ func computerUseCallHasControlledAppsAndPolicy(argsJSON string) bool {
 	return false
 }
 
-func computerUseAppsRequiredResult() ToolResult {
+func computerUseAppsCorrectionRejectedResult() ToolResult {
 	return ToolResult{
-		Content: "computer_use_error: initial_target_required\n" +
-			"message: the previous computer_use call attempted no desktop action because it lacked a safe initial app target\n" +
-			"recovery: retry computer_use with the relevant controlled app names in controlled_apps and an explicit foreground_policy; alternate desktop-control tools remain blocked",
+		Content: "computer_use_error: corrected_app_retry_rejected\n" +
+			"message: the one permitted corrected computer_use call did not include non-empty controlled_apps and an explicit foreground_policy, so it was not executed\n" +
+			"recovery: no further computer_use retry or alternate desktop-control path is available in this run; report the unresolved app target honestly",
 		IsError:       true,
 		ErrorCategory: ErrCategoryBusiness,
 	}

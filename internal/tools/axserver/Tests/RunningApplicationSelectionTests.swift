@@ -79,6 +79,53 @@ final class RunningApplicationSelectionTests: XCTestCase {
             taskAppIdentityNeedsInstalledLookupV1(.selected(77)))
     }
 
+    func testLocalizedInstalledApplicationSelectionRequiresOneExactValidBundle() {
+        let systemSettings = URL(fileURLWithPath:
+            "/System/Applications/System Settings.app")
+        let weather = URL(fileURLWithPath:
+            "/System/Applications/Weather.app")
+        let bundleIDs = [
+            systemSettings.standardizedFileURL.path:
+                "com.apple.systempreferences",
+            weather.standardizedFileURL.path: "com.apple.weather",
+        ]
+        let bundleIdentifier: (URL) -> String? = {
+            bundleIDs[$0.standardizedFileURL.path]
+        }
+
+        XCTAssertEqual(
+            uniqueInstalledTaskApplicationURLV1(
+                candidates: [systemSettings],
+                bundleIdentifier: bundleIdentifier),
+            systemSettings)
+        XCTAssertNil(uniqueInstalledTaskApplicationURLV1(
+            candidates: [systemSettings, weather],
+            bundleIdentifier: bundleIdentifier))
+    }
+
+    func testLocalizedInstalledApplicationSelectionFailsClosedForInvalidCandidates() {
+        let notAnApp = URL(fileURLWithPath: "/Applications/Notes.txt")
+        let missingBundleID = URL(fileURLWithPath: "/Applications/Broken.app")
+        XCTAssertNil(uniqueInstalledTaskApplicationURLV1(
+            candidates: [notAnApp, missingBundleID],
+            bundleIdentifier: { _ in nil }))
+    }
+
+    func testLocalizedInstalledApplicationSelectionDeduplicatesOneMetadataPath() {
+        let app = URL(fileURLWithPath: "/Applications/Editor.app")
+        XCTAssertEqual(
+            uniqueInstalledTaskApplicationURLV1(
+                candidates: [app, app],
+                bundleIdentifier: { _ in "com.example.Editor" }),
+            app)
+    }
+
+    func testMetadataQueryLiteralEscapesQuotesAndBackslashesWithoutWildcards() {
+        XCTAssertEqual(
+            metadataQueryLiteralV1("App \\\"Name*?"),
+            "App \\\\\\\"Name\\*\\?")
+    }
+
     func testBackgroundLaunchConfigurationNeverActivatesTarget() {
         let configuration = backgroundTaskAppLaunchConfigurationV1()
         XCTAssertFalse(configuration.activates)
