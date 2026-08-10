@@ -127,6 +127,21 @@ func TestSystemPromptAudit(t *testing.T) {
 	if len(fullSystem) > fullSystemCharBudget {
 		t.Fatalf("representative Koe Full System is %d chars, budget %d", len(fullSystem), fullSystemCharBudget)
 	}
+	// Representative attended Desktop scenario: full Direct set, question UI
+	// live, markdown output. This is the non-voice Kocoro assembly the
+	// workbench shows next to the two Koe modes.
+	desktop := prompt.BuildSystemPrompt(prompt.PromptOptions{
+		BasePrompt:          fullBasePrompt,
+		LocalToolNames:      fullTools,
+		GatewayToolNames:    []string{"web_fetch", "web_search"},
+		DeferredTools:       commonDeferred,
+		MemoryDir:           "/Users/test/.shannon/agents/sample",
+		ModelID:             "medium",
+		OutputFormat:        "markdown",
+		QuestionUIAvailable: true,
+	})
+	desktopSystem := desktop.System + cloudDelegationGuidance + contrastExamplesCloud
+
 	if outputPath := strings.TrimSpace(os.Getenv("KOCORO_PROMPT_AUDIT_OUTPUT")); outputPath != "" {
 		artifact := map[string]any{
 			"schema_version": "kocoro.prompt_audit.v1",
@@ -155,6 +170,11 @@ func TestSystemPromptAudit(t *testing.T) {
 				"system":           fast.System,
 				"stable_context":   fast.StableContext,
 				"volatile_context": fast.VolatileContext,
+			},
+			"kocoro_desktop": map[string]string{
+				"system":           desktopSystem,
+				"stable_context":   desktop.StableContext,
+				"volatile_context": desktop.VolatileContext,
 			},
 		}
 		if err := writePromptAuditArtifact(outputPath, artifact); err != nil {
