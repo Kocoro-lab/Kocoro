@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 func assertReadOnly(t *testing.T, tool agent.Tool, argsJSON string, expected bool) {
@@ -126,9 +127,9 @@ func TestReadOnly_MCPTool_NotImplemented(t *testing.T) {
 	}
 }
 
-func TestReadOnly_ServerTool_NotImplemented(t *testing.T) {
-	tool := &ServerTool{}
-	if _, ok := agent.Tool(tool).(agent.ReadOnlyChecker); ok {
-		t.Error("ServerTool should NOT implement ReadOnlyChecker")
-	}
+func TestReadOnly_ServerTool_SourceAware(t *testing.T) {
+	gateway := NewServerTool(client.ServerToolSchema{Name: "web_search"}, nil)
+	integration := NewIntegrationTool(client.ServerToolSchema{Name: "slack_post"}, nil)
+	assertReadOnly(t, gateway, `{}`, true)
+	assertReadOnly(t, integration, `{}`, false)
 }

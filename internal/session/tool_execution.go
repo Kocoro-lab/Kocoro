@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 const ToolExecutionSchemaVersion = 1
@@ -230,8 +233,8 @@ func (s *Session) ReconcileToolExecutionCheckpoints(now time.Time) error {
 				resultIDs[ToolExecutionDigest(block.ToolUseID)] = struct{}{}
 			}
 		}
-		if message.Role == "user" && !message.Content.HasBlocks() {
-			for _, result := range parseLegacyToolExecutionResults(message.Content.Text()) {
+		if legacyText, ok := legacyToolExecutionMessageText(message); ok {
+			for _, result := range parseLegacyToolExecutionResults(legacyText) {
 				legacyResultTools[ToolExecutionDigest(result.callID)] = result.toolName
 			}
 		}
@@ -269,10 +272,35 @@ type legacyToolExecutionResult struct {
 }
 
 // legacyToolExecutionResultPattern mirrors the exact fallback emitted by
-// agent.formatToolExec. Parsing is anchored and parseLegacyToolExecutionResults
-// requires the complete message to consist only of these records, so prose
-// which merely quotes a tool_exec fragment cannot become checkpoint evidence.
-var legacyToolExecutionResultPattern = regexp.MustCompile(`(?s)^<tool_exec tool="([A-Za-z0-9_]+)" call_id="([^"\s<>]+)">\n<input>.*?</input>\n<output status="(?:ok|error)">.*?</output>\n</tool_exec>`)
+// agent.formatToolExec, whose attributes use Go's %q escaping. Each candidate
+// block is anchored so attributes or prose cannot be smuggled around it.
+var legacyToolExecutionResultPattern = regexp.MustCompile(`(?s)^<tool_exec tool=("(?:\\.|[^"\\])*") call_id=("(?:\\.|[^"\\])*")>\n<input>.*?</input>\n<output status="(?:ok|error)">.*?</output>\n</tool_exec>$`)
+
+const legacyToolExecutionCloseTag = "</tool_exec>"
+
+func legacyToolExecutionMessageText(message client.Message) (string, bool) {
+	if message.Role != "user" {
+		return "", false
+	}
+	if !message.Content.HasBlocks() {
+		return message.Content.Text(), true
+	}
+	var text strings.Builder
+	hasText := false
+	for _, block := range message.Content.Blocks() {
+		switch block.Type {
+		case "text":
+			text.WriteString(block.Text)
+			hasText = true
+		case "image":
+			// Legacy image results store their structural execution record in a
+			// sibling text block. Image bytes are irrelevant to the ledger join.
+		default:
+			return "", false
+		}
+	}
+	return text.String(), hasText
+}
 
 func parseLegacyToolExecutionResults(text string) []legacyToolExecutionResult {
 	remaining := strings.TrimSpace(text)
@@ -281,17 +309,26 @@ func parseLegacyToolExecutionResults(text string) []legacyToolExecutionResult {
 	}
 	results := make([]legacyToolExecutionResult, 0, 1)
 	for remaining != "" {
-		match := legacyToolExecutionResultPattern.FindStringSubmatchIndex(remaining)
-		if match == nil || match[0] != 0 {
+		// Requiring every non-whitespace segment to be a bounded structural
+		// sibling rejects quoted/prose text. A malformed but bounded sibling is
+		// ignored independently so it cannot suppress valid evidence beside it.
+		if !strings.HasPrefix(remaining, "<tool_exec ") {
 			return nil
 		}
-		toolName := remaining[match[2]:match[3]]
-		callID := remaining[match[4]:match[5]]
-		if len(toolName) > 256 || len(callID) > 256 {
+		closeAt := strings.Index(remaining, legacyToolExecutionCloseTag)
+		if closeAt < 0 {
 			return nil
 		}
-		results = append(results, legacyToolExecutionResult{toolName: toolName, callID: callID})
-		remaining = strings.TrimSpace(remaining[match[1]:])
+		blockEnd := closeAt + len(legacyToolExecutionCloseTag)
+		block := remaining[:blockEnd]
+		if match := legacyToolExecutionResultPattern.FindStringSubmatch(block); match != nil {
+			toolName, toolErr := strconv.Unquote(match[1])
+			callID, callErr := strconv.Unquote(match[2])
+			if toolErr == nil && callErr == nil && toolName != "" && callID != "" && len(toolName) <= 256 && len(callID) <= 256 {
+				results = append(results, legacyToolExecutionResult{toolName: toolName, callID: callID})
+			}
+		}
+		remaining = strings.TrimSpace(remaining[blockEnd:])
 	}
 	return results
 }

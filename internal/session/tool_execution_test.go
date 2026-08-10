@@ -3,8 +3,10 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -221,6 +223,104 @@ func TestReconcileToolExecutionCheckpointsSupportsStrictLegacyXML(t *testing.T) 
 	}
 }
 
+func legacyToolExecutionFixture(toolName, callID, status string) string {
+	return fmt.Sprintf("<tool_exec tool=%s call_id=%s>\n<input>{}</input>\n<output status=%q>created</output>\n</tool_exec>",
+		strconv.Quote(toolName), strconv.Quote(callID), status)
+}
+
+func TestReconcileToolExecutionCheckpointsSupportsArbitraryQuotedToolNames(t *testing.T) {
+	toolNames := []string{
+		"calendar-create",
+		"calendar.create",
+		"calendar:create",
+		`calendar:"create`,
+	}
+	sess := Session{}
+	var transcript strings.Builder
+	for i, toolName := range toolNames {
+		callID := fmt.Sprintf("legacy-name-%d", i)
+		record := newTestToolExecution(t, callID, `{}`)
+		record.ToolName = toolName
+		sess.ToolExecutions = append(sess.ToolExecutions, record)
+		if err := sess.MarkToolExecutionDispatching(record.ExecutionID, record.UpdatedAt.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := sess.MarkToolExecutionCommitted(record.ExecutionID, ToolExecutionDigest("created"), record.UpdatedAt.Add(2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if i > 0 {
+			transcript.WriteString("\n\n")
+		}
+		transcript.WriteString(legacyToolExecutionFixture(toolName, callID, "ok"))
+	}
+	sess.Messages = []client.Message{{Role: "user", Content: client.NewTextContent(transcript.String())}}
+
+	if err := sess.ReconcileToolExecutionCheckpoints(time.Date(2026, 8, 10, 12, 0, 3, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range sess.ToolExecutions {
+		if record.State != ToolExecutionCheckpointed {
+			t.Fatalf("tool %q remained %q", record.ToolName, record.State)
+		}
+	}
+}
+
+func TestReconcileToolExecutionCheckpointsBadSiblingDoesNotBlockGoodSibling(t *testing.T) {
+	bad := newTestToolExecution(t, "legacy-bad", `{}`)
+	good := newTestToolExecution(t, "legacy-good", `{}`)
+	sess := Session{ToolExecutions: []ToolExecutionRecord{bad, good}}
+	for _, record := range sess.ToolExecutions {
+		if err := sess.MarkToolExecutionDispatching(record.ExecutionID, record.UpdatedAt.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := sess.MarkToolExecutionCommitted(record.ExecutionID, ToolExecutionDigest("created"), record.UpdatedAt.Add(2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	badSibling := strings.Replace(
+		legacyToolExecutionFixture("calendar_create_event", "legacy-bad", "ok"),
+		`status="ok"`, `status="unknown"`, 1,
+	)
+	goodSibling := legacyToolExecutionFixture("calendar_create_event", "legacy-good", "ok")
+	sess.Messages = []client.Message{{Role: "user", Content: client.NewTextContent(badSibling + "\n\n" + goodSibling)}}
+
+	if err := sess.ReconcileToolExecutionCheckpoints(bad.UpdatedAt.Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.ToolExecutions[0].State; got != ToolExecutionCommitted {
+		t.Fatalf("bad sibling state = %q, want committed", got)
+	}
+	if got := sess.ToolExecutions[1].State; got != ToolExecutionCheckpointed {
+		t.Fatalf("good sibling state = %q, want checkpointed", got)
+	}
+}
+
+func TestReconcileToolExecutionCheckpointsSupportsLegacyImageMessage(t *testing.T) {
+	record := newTestToolExecution(t, "legacy-image", `{}`)
+	sess := Session{
+		Messages: []client.Message{{
+			Role: "user",
+			Content: client.NewBlockContent([]client.ContentBlock{
+				{Type: "text", Text: legacyToolExecutionFixture("calendar_create_event", "legacy-image", "ok")},
+				{Type: "image", Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: "aW1hZ2U="}},
+			}),
+		}},
+		ToolExecutions: []ToolExecutionRecord{record},
+	}
+	if err := sess.MarkToolExecutionDispatching(record.ExecutionID, record.UpdatedAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.MarkToolExecutionCommitted(record.ExecutionID, ToolExecutionDigest("created"), record.UpdatedAt.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.ReconcileToolExecutionCheckpoints(record.UpdatedAt.Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.ToolExecutions[0].State; got != ToolExecutionCheckpointed {
+		t.Fatalf("image-bearing result state = %q, want checkpointed", got)
+	}
+}
+
 func TestReconcileToolExecutionCheckpointsRejectsNonStructuralLegacyText(t *testing.T) {
 	validXML := `<tool_exec tool="calendar_create_event" call_id="legacy-call-123">
 <input>{}</input>
@@ -262,6 +362,32 @@ func TestReconcileToolExecutionCheckpointsRejectsNonStructuralLegacyText(t *test
 				t.Fatalf("non-structural text changed state to %q", got)
 			}
 		})
+	}
+}
+
+func TestReconcileToolExecutionCheckpointsRejectsNarrationInImageMessage(t *testing.T) {
+	record := newTestToolExecution(t, "legacy-image-quoted", `{}`)
+	sess := Session{
+		Messages: []client.Message{{
+			Role: "user",
+			Content: client.NewBlockContent([]client.ContentBlock{
+				{Type: "text", Text: "The tool returned:\n" + legacyToolExecutionFixture("calendar_create_event", "legacy-image-quoted", "ok")},
+				{Type: "image", Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: "aW1hZ2U="}},
+			}),
+		}},
+		ToolExecutions: []ToolExecutionRecord{record},
+	}
+	if err := sess.MarkToolExecutionDispatching(record.ExecutionID, record.UpdatedAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.MarkToolExecutionCommitted(record.ExecutionID, ToolExecutionDigest("created"), record.UpdatedAt.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.ReconcileToolExecutionCheckpoints(record.UpdatedAt.Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.ToolExecutions[0].State; got != ToolExecutionCommitted {
+		t.Fatalf("narrated image result changed state to %q", got)
 	}
 }
 

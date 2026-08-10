@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -130,16 +132,31 @@ func (t *HTTPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	for k, v := range args.Headers {
 		req.Header.Set(k, v)
 	}
+	dispatch := &httpDispatchTrace{}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), dispatch.clientTrace()))
 
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
+		if httpMethodMayMutate(method) && dispatch.mayHaveStarted() {
+			return agent.ToolResult{
+				Content:                  fmt.Sprintf("HTTP request outcome UNKNOWN: %s was dispatched, but no response arrived (%v). The operation may have taken effect; verify before retrying.", method, err),
+				IsError:                  true,
+				SideEffectOutcomeUnknown: true,
+			}, nil
+		}
 		return agent.TransientError(fmt.Sprintf("request failed: %v", err)), nil
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10240))
 	if err != nil {
+		if httpMethodMayMutate(method) {
+			return agent.ToolResult{
+				Content: fmt.Sprintf("HTTP %s returned status %d, but reading its response body failed: %v", method, resp.StatusCode, err),
+				IsError: true,
+			}, nil
+		}
 		return agent.TransientError(fmt.Sprintf("error reading response body: %v", err)), nil
 	}
 
@@ -185,6 +202,37 @@ func (t *HTTPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 func (t *HTTPTool) RequiresApproval() bool { return true }
 
 func (t *HTTPTool) IsReadOnlyCall(string) bool { return false }
+
+type httpDispatchTrace struct {
+	wroteHeaders atomic.Bool
+	wroteRequest atomic.Bool
+}
+
+func (t *httpDispatchTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		WroteHeaders: func() {
+			t.wroteHeaders.Store(true)
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			// WroteRequest is also called when writing failed. A partial write
+			// is enough for a non-idempotent endpoint to have acted.
+			t.wroteRequest.Store(true)
+		},
+	}
+}
+
+func (t *httpDispatchTrace) mayHaveStarted() bool {
+	return t.wroteHeaders.Load() || t.wroteRequest.Load()
+}
+
+func httpMethodMayMutate(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return false
+	default:
+		return true
+	}
+}
 
 func (t *HTTPTool) IsSafeArgs(argsJSON string) bool {
 	var args httpArgs

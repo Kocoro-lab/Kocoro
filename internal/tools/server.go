@@ -94,11 +94,28 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	// show phantom args, and cloud-side reject paths aren't tripped on
 	// older cloud versions without the reserved-daemon-fields whitelist.
 	stripFieldsNotInSchema(args, t.schema.Parameters)
+	if err := ctx.Err(); err != nil {
+		return agent.ToolResult{
+			Content: fmt.Sprintf("server tool call cancelled before dispatch: %v", err),
+			IsError: true,
+		}, nil
+	}
 
 	resp, err := t.execute(ctx, t.schema.Name, args)
 	if err != nil {
 		msg := err.Error()
 		prefix := classifyServerError(msg)
+		if t.source == agent.SourceIntegration && integrationExecutionOutcomeUnknown(msg) {
+			return agent.ToolResult{
+				Content: fmt.Sprintf(
+					"Integration tool outcome UNKNOWN: %s was dispatched, but no complete response arrived (%v). The external action may have taken effect; verify before retrying.",
+					t.schema.Name,
+					err,
+				),
+				IsError:                  true,
+				SideEffectOutcomeUnknown: true,
+			}, nil
+		}
 		return agent.ToolResult{
 			Content: fmt.Sprintf("%sserver tool error: %v", prefix, err),
 			IsError: true,
@@ -180,6 +197,32 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 
 // RequiresApproval returns false — the server enforces its own access control.
 func (t *ServerTool) RequiresApproval() bool { return false }
+
+// IsReadOnlyCall reflects the only semantics the current Cloud schema proves:
+// gatewayAllowedTools are a fixed research/analytics/visual read allowlist,
+// while integration schemas carry no read-only or idempotency annotation.
+// Unknown integration calls therefore stay material and fail closed.
+func (t *ServerTool) IsReadOnlyCall(string) bool {
+	return t.source == agent.SourceGateway
+}
+
+// integrationExecutionOutcomeUnknown classifies the phase information exposed
+// by GatewayClient.ExecuteIntegrationTool. The client currently returns plain
+// wrapped errors rather than a structured dispatch phase, so only local request
+// construction and an HTTP status response are definitive. Every other error
+// (request transport loss, timeout, or malformed/truncated success response)
+// may follow a committed third-party action and must fail closed.
+func integrationExecutionOutcomeUnknown(msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	if strings.HasPrefix(lower, "marshal request:") ||
+		strings.HasPrefix(lower, "create request:") {
+		return false
+	}
+	if strings.HasPrefix(lower, "integration tool ") && strings.Contains(lower, " returned ") {
+		return false
+	}
+	return true
+}
 
 // classifyServerError returns the appropriate error prefix based on the error
 // message, so the agent loop's error-handling instructions can guide the model

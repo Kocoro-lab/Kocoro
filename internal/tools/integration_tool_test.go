@@ -29,6 +29,9 @@ func TestIntegrationTool_Metadata(t *testing.T) {
 	if tool.ToolSource() != agent.SourceIntegration {
 		t.Errorf("ToolSource = %q, want %q", tool.ToolSource(), agent.SourceIntegration)
 	}
+	if tool.IsReadOnlyCall(`{"query":"x"}`) {
+		t.Error("integration schemas have no read-only/idempotent annotation and must fail closed")
+	}
 }
 
 // TestIntegrationTool_Run_HitsIntegrationEndpoint verifies the tool proxies to
@@ -57,6 +60,153 @@ func TestIntegrationTool_Run_HitsIntegrationEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "p1") {
 		t.Errorf("expected output to contain 'p1', got %q", result.Content)
+	}
+}
+
+func TestIntegrationTool_PostDispatchResponseLossIsOutcomeUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "slack_post_message"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want outcome unknown", result)
+	}
+	if result.IsRetryable || result.ErrorCategory != "" {
+		t.Fatalf("outcome unknown must not be retryable: %#v", result)
+	}
+}
+
+func TestIntegrationTool_MalformedSuccessResponseIsOutcomeUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":`))
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "notion_create_page"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"title":"x"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want outcome unknown", result)
+	}
+}
+
+func TestIntegrationTool_HTTPErrorResponseRemainsOrdinaryToolError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"provider unavailable"}`))
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "slack_post_message"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want known HTTP error response", result)
+	}
+	if !strings.HasPrefix(result.Content, "[transient error]") {
+		t.Fatalf("expected classified status error, got %q", result.Content)
+	}
+}
+
+func TestIntegrationTool_PreCancelledContextDoesNotDispatch(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(toolExecResp(true, map[string]any{"ok": true}, nil))
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "slack_post_message"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err := tool.Run(ctx, `{"channel":"c","text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want known pre-dispatch cancellation", result)
+	}
+	if calls != 0 {
+		t.Fatalf("gateway calls = %d, want 0", calls)
+	}
+}
+
+func TestGatewayServerTool_TransportLossStaysReadOnlyError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	tool := NewServerTool(
+		client.ServerToolSchema{Name: "web_search"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	if !tool.IsReadOnlyCall(`{"query":"x"}`) {
+		t.Fatal("gateway allowlisted server tools must be classified read-only")
+	}
+	result, err := tool.Run(context.Background(), `{"query":"x"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want ordinary read-only transport error", result)
+	}
+}
+
+func TestIntegrationExecutionOutcomeUnknownClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{name: "marshal before dispatch", msg: "marshal request: unsupported value", want: false},
+		{name: "request construction before dispatch", msg: "create request: invalid URL", want: false},
+		{name: "known status response", msg: "integration tool slack_post returned 422: invalid channel", want: false},
+		{name: "transport response loss", msg: "request failed: EOF", want: true},
+		{name: "timeout is ambiguous", msg: "request failed: context deadline exceeded", want: true},
+		{name: "decode after dispatch", msg: "decode response: unexpected EOF", want: true},
+		{name: "unknown execution error fails closed", msg: "unexpected integration failure", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := integrationExecutionOutcomeUnknown(tt.msg); got != tt.want {
+				t.Fatalf("integrationExecutionOutcomeUnknown(%q) = %t, want %t", tt.msg, got, tt.want)
+			}
+		})
 	}
 }
 
