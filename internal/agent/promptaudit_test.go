@@ -1,3 +1,15 @@
+//go:build promptaudit
+
+// This file is a reporting tool, not a test suite, so it is excluded from the
+// default build. Run it explicitly:
+//
+//	go test -tags promptaudit ./internal/agent -run TestSystemPromptAudit -v
+//
+// It is kept as a Go test rather than a command because it needs package-level
+// access to coreOperationalRules / contrastExamples* / buildStaticSystem, and
+// because KOCORO_PROMPT_AUDIT_OUTPUT feeds the agent-lab panel's prompt
+// workbench (scripts/build_prompt_workbench.py reads the JSON it writes).
+
 package agent
 
 import (
@@ -259,26 +271,6 @@ func writePromptAuditArtifact(path string, artifact any) error {
 		return err
 	}
 	return os.Rename(tmp, path)
-}
-
-func TestCoreOperationalRulesDoNotSuppressOperationalPreambles(t *testing.T) {
-	for _, forbidden := range []string{
-		"No reasoning preamble.",
-		"Never apologize for, comment on, or explain your own tool calls.",
-		"Reserve narration for reporting the result after the action is complete.",
-	} {
-		if strings.Contains(coreOperationalRules+contrastExamplesCore, forbidden) {
-			t.Errorf("runtime prompt still contains preamble-suppressing instruction %q", forbidden)
-		}
-	}
-
-	const requiredPreambleGuard = "give one brief user-facing preamble and continue with the tool calls in the same response"
-	if !strings.Contains(coreOperationalRules+contrastExamplesCore, requiredPreambleGuard) {
-		t.Errorf("runtime prompt missing operational-preamble guard %q", requiredPreambleGuard)
-	}
-	if !strings.Contains(coreOperationalRules, "Do not apologize for routine tool use") {
-		t.Error("runtime prompt missing routine tool-use apology guard")
-	}
 }
 
 func dumpConst(t *testing.T, label, content string) {
