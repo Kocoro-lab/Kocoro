@@ -281,6 +281,69 @@ func TestLoopDetector_NoProgress_Nudge(t *testing.T) {
 	}
 }
 
+func TestLoopDetector_NoProgress_StrictArgsAndOutcomeProgressContinues(t *testing.T) {
+	ld := NewLoopDetector()
+
+	for step := 1; step <= 20; step++ {
+		ld.recordOutcome(
+			"stateful_step",
+			fmt.Sprintf(`{"step":%d,"token":"token-%02d"}`, step, step-1),
+			false,
+			"",
+			"",
+			fmt.Sprintf("step-%02d-complete-next-token-%02d", step, step),
+			false,
+			true,
+			false,
+		)
+		if action, msg := ld.Check("stateful_step"); action != LoopContinue {
+			t.Fatalf("strictly changing args and outcomes must show progress at step %d, got %v: %s", step, action, msg)
+		}
+	}
+}
+
+func TestLoopDetector_NoProgress_DistinctMutationArgsAndVolatileReceiptsStillStops(t *testing.T) {
+	ld := NewLoopDetector()
+
+	for step := 1; step <= ld.noProgressThreshold; step++ {
+		ld.RecordOutcome(
+			"create_record",
+			fmt.Sprintf(`{"record":"record-%02d"}`, step),
+			false,
+			"",
+			"",
+			fmt.Sprintf("provider-id-%02d", step),
+			false,
+			false,
+		)
+	}
+	action, _ := ld.Check("create_record")
+	if action != LoopNudge {
+		t.Fatalf("untrusted writes must not treat unique provider ids as progress, got %v", action)
+	}
+}
+
+func TestLoopDetector_NoProgress_DistinctMutationArgsWithoutOutcomeEvidenceStillStops(t *testing.T) {
+	ld := NewLoopDetector()
+
+	for step := 1; step <= ld.noProgressThreshold; step++ {
+		ld.RecordOutcome(
+			"create_record",
+			fmt.Sprintf(`{"record":"record-%02d"}`, step),
+			false,
+			"",
+			"",
+			"created",
+			false,
+			false,
+		)
+	}
+	action, _ := ld.Check("create_record")
+	if action != LoopNudge {
+		t.Fatalf("distinct write args with a stable receipt must still nudge, got %v", action)
+	}
+}
+
 func TestLoopDetector_HTTPBatchTolerant_DistinctArgsExempt(t *testing.T) {
 	ld := NewLoopDetector()
 	// 20 http calls with DISTINCT bodies (batch enumeration — e.g. disabling

@@ -3531,7 +3531,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	}
 	var (
 		detector                     = NewLoopDetector()
-		toolsUsed                    = make(map[string]int)
+		toolsUsed                    = make(map[string]int) // model-requested calls; retained for detector context and telemetry
+		dispatchedTools              = make(map[string]int) // calls that passed admission and entered Tool.Run
 		totalToolCalls               int
 		lastText                     string
 		streamingText                strings.Builder // accumulates streaming deltas for cancel recovery
@@ -4223,7 +4224,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 
 iterationLoop:
 	for i := 0; ; i++ {
-		effectiveMax := a.effectiveMaxIter(toolsUsed)
+		effectiveMax := a.effectiveMaxIter(dispatchedTools)
 		if i >= effectiveMax {
 			break
 		}
@@ -5837,16 +5838,17 @@ iterationLoop:
 		// Builds list of approved tool calls. Denied/unknown results are stored
 		// in execResults at their original index so Phase 3 can emit everything in order.
 		type perCallMeta struct {
-			argsStr      string
-			decision     string
-			wasApproved  bool
-			validated    bool
-			sideEffect   bool
-			loopReadOnly bool
-			loopVeto     bool
-			argsDigest   string
-			resolved     bool // true if already resolved (denied/unknown/hook-denied)
-			stateTraits  CallStateTraits
+			argsStr       string
+			decision      string
+			wasApproved   bool
+			validated     bool
+			trustProgress bool
+			sideEffect    bool
+			loopReadOnly  bool
+			loopVeto      bool
+			argsDigest    string
+			resolved      bool // true if already resolved (denied/unknown/hook-denied)
+			stateTraits   CallStateTraits
 		}
 		callMeta := make([]perCallMeta, len(toolCalls))
 		execResults := make([]toolExecResult, len(toolCalls))
@@ -5982,6 +5984,9 @@ iterationLoop:
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
 				}
 				continue
+			}
+			if progressTool, ok := tool.(BoundedProgressTool); ok {
+				callMeta[idx].trustProgress = progressTool.TrustsDistinctOutcomeProgress()
 			}
 
 			// A registered Deferred tool is not callable merely because the
@@ -6231,6 +6236,7 @@ iterationLoop:
 
 			if committedStreamTools != nil {
 				if earlyResult, claimed := committedStreamTools.Claim(ctx, fc); claimed {
+					dispatchedTools[fc.Name]++
 					callMeta[idx].decision = "allow"
 					callMeta[idx].wasApproved = true
 					// NOT marked resolved: Claim only emitted OnToolCall. The
@@ -6268,6 +6274,9 @@ iterationLoop:
 				a.handler,
 				latestUserText,
 			)
+			for _, ac := range approved {
+				dispatchedTools[ac.fc.Name]++
+			}
 		}
 		if len(approved) > 0 || claimedStreamTool {
 			// Per-turn aggregate cap: even when each result is below the 50K
@@ -6560,7 +6569,7 @@ iterationLoop:
 				resultSig = extractResultSignature(result.Content)
 			}
 			nonActionable := isNonActionableSearch(fc.Name, result)
-			detector.RecordOutcome(
+			detector.recordOutcome(
 				fc.Name,
 				argsStr,
 				result.IsError,
@@ -6568,6 +6577,7 @@ iterationLoop:
 				resultSig,
 				toolOutcomeSignature(result.Content),
 				callMeta[idx].loopReadOnly,
+				callMeta[idx].trustProgress,
 				nonActionable,
 			)
 
@@ -6824,7 +6834,7 @@ iterationLoop:
 	// branch the same way they catch the other two maxIter exit paths.
 	captureRunMessages()
 	setRunStatus(runstatus.CodeIterationLimit, true)
-	return "", usage, fmt.Errorf("agent loop exceeded %d iterations: %w", a.effectiveMaxIter(toolsUsed), ErrMaxIterReached)
+	return "", usage, fmt.Errorf("agent loop exceeded %d iterations: %w", a.effectiveMaxIter(dispatchedTools), ErrMaxIterReached)
 }
 
 // lastTextAlreadyPersisted reports whether text is already recorded in
@@ -7883,13 +7893,13 @@ func (n *nudgeWindow) recordAndCheck(iter int) bool {
 	return len(n.recents) >= n.max
 }
 
-// effectiveMaxIter returns a dynamic iteration limit based on tools used so far.
+// effectiveMaxIter returns a dynamic iteration limit based on tools dispatched so far.
 // GUI tasks get a higher limit since screenshot→action loops are normal.
 // Uses isGUIToolName so playwright MCP tools (browser_navigate, browser_snapshot,
 // …) share the same higher budget as the literal GUITools set — otherwise a
 // multi-page web task would hit the default iteration cap mid-flow.
-func (a *AgentLoop) effectiveMaxIter(toolsUsed map[string]int) int {
-	for name := range toolsUsed {
+func (a *AgentLoop) effectiveMaxIter(dispatchedTools map[string]int) int {
+	for name := range dispatchedTools {
 		if isGUIToolName(name) {
 			if a.maxIter < 75 {
 				return 75

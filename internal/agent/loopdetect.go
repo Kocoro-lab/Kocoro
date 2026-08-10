@@ -40,6 +40,7 @@ type ToolCallRecord struct {
 	ResultSig       string // domain signature from results (web tools)
 	OutcomeSig      string // stable signature of the complete tool outcome
 	IsReadOnly      bool   // identical read args may still make progress when outcomes change
+	TrustsProgress  bool   // tool explicitly guarantees distinct outcomes prove bounded state-machine progress
 	IsError         bool
 	ErrorSig        string // first 100 chars of error for grouping
 	IsNonActionable bool   // search returned no useful results (no matches, binary noise, errors)
@@ -49,6 +50,15 @@ type ToolCallRecord struct {
 	// 2026-05-14-thinking-blocks-alignment.md Phase 0). Always false for
 	// other tools, malformed JSON, or non-empty thought values.
 	IsEmptyThinkInput bool
+}
+
+// BoundedProgressTool opts a stateful tool into strict distinct-outcome
+// progress detection. Implementations must represent a bounded state machine
+// where every successful call advances that state and returns durable evidence
+// of the new state. Arbitrary external create/send/delete tools must not opt in:
+// fresh provider ids alone do not make repeated mutations safe.
+type BoundedProgressTool interface {
+	TrustsDistinctOutcomeProgress() bool
 }
 
 // LoopDetector uses a sliding window of recent tool calls to detect stuck loops.
@@ -380,10 +390,17 @@ func (ld *LoopDetector) Record(name, argsJSON string, isError bool, errMsg strin
 }
 
 // RecordOutcome adds a tool call together with the execution outcome used to
-// distinguish a stuck observation loop from legitimate polling. Mutating calls
-// deliberately remain argument-based: repeating the same write is dangerous
-// even when a provider returns fresh ids or timestamps for every attempt.
+// distinguish a stuck observation loop from legitimate polling. Exact repeated
+// mutations deliberately remain argument-based: repeating the same write is
+// dangerous even when a provider returns fresh ids or timestamps. The generic
+// same-tool counter recognizes changing outcomes only for read-only tools or
+// explicit BoundedProgressTool state machines, and then requires every argument
+// and every successful outcome in the window to be distinct.
 func (ld *LoopDetector) RecordOutcome(name, argsJSON string, isError bool, errMsg string, resultSig string, outcomeSig string, isReadOnly bool, isNonActionable bool) {
+	ld.recordOutcome(name, argsJSON, isError, errMsg, resultSig, outcomeSig, isReadOnly, false, isNonActionable)
+}
+
+func (ld *LoopDetector) recordOutcome(name, argsJSON string, isError bool, errMsg string, resultSig string, outcomeSig string, isReadOnly bool, trustsProgress bool, isNonActionable bool) {
 	topicHash := ""
 	if toolFamily(name) != "" {
 		normalized := normalizeWebQuery(argsJSON)
@@ -398,6 +415,7 @@ func (ld *LoopDetector) RecordOutcome(name, argsJSON string, isError bool, errMs
 		ResultSig:         resultSig,
 		OutcomeSig:        outcomeSig,
 		IsReadOnly:        isReadOnly,
+		TrustsProgress:    trustsProgress,
 		IsError:           isError,
 		ErrorSig:          truncateErrSig(errMsg, 100),
 		IsNonActionable:   isNonActionable,
@@ -881,9 +899,11 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// Batch-tolerant tools (http) additionally get a uniqueness gate: when
 	// ≥50% of same-name calls carry distinct argsHash, treat the stream as
 	// legitimate enumeration (e.g. paging an API, polling distinct URLs) and
-	// fall through to the remaining detectors. Generic NoProgress for
-	// think/file_*/grep/glob stays fully active — those tools still need
-	// "called repeatedly with unique args" caught as a spin signal.
+	// fall through to the remaining detectors. Read-only tools and explicit
+	// BoundedProgressTool state machines earn the same relief only with stronger
+	// evidence: every same-name call in the window succeeded, and both its
+	// arguments and complete outcome are unique. Stable/empty outcomes and
+	// arbitrary write tools therefore stay under this guard.
 	if !isRepeatableToolName(ld.repeatableTools, name) && family != "search" {
 		count := 0
 		seen := make(map[string]struct{}, ld.historySize)
@@ -898,7 +918,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			threshold = ld.semiRepeatableThreshold
 		}
 		batchGated := ld.batchTolerant[name] && count > 0 && len(seen)*2 >= count
-		if !batchGated {
+		progressGated := count >= threshold && hasStrictOutcomeProgress(ld.history, name)
+		if !batchGated && !progressGated {
 			if count >= threshold*2 {
 				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
 					"You called %s %d times without meaningful progress.", name, count))
@@ -920,6 +941,35 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// threshold — see plan 2026-05-14-thinking-blocks-alignment.md
 	// post-mortem). Removed 2026-05.
 	return LoopContinue, ""
+}
+
+// hasStrictOutcomeProgress recognizes a dependent/enumerated sequence without
+// trusting a volatile receipt for repeated mutations. Every same-name record in
+// the active window must be a success with a new argument identity and a new
+// complete-outcome identity. Any duplicate, missing evidence, or error keeps the
+// ordinary NoProgress thresholds active.
+func hasStrictOutcomeProgress(history []ToolCallRecord, name string) bool {
+	seenArgs := make(map[string]struct{})
+	seenOutcomes := make(map[string]struct{})
+	count := 0
+	for _, record := range history {
+		if record.Name != name {
+			continue
+		}
+		count++
+		if record.IsError || (!record.IsReadOnly && !record.TrustsProgress) || record.ArgsHash == "" || record.OutcomeSig == "" {
+			return false
+		}
+		if _, duplicate := seenArgs[record.ArgsHash]; duplicate {
+			return false
+		}
+		if _, duplicate := seenOutcomes[record.OutcomeSig]; duplicate {
+			return false
+		}
+		seenArgs[record.ArgsHash] = struct{}{}
+		seenOutcomes[record.OutcomeSig] = struct{}{}
+	}
+	return count > 1
 }
 
 func stableReadOnlyActionTail(history []ToolCallRecord, name, argsHash string) int {
