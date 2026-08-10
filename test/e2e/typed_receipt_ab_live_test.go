@@ -317,3 +317,196 @@ func runTypedReceiptJob(
 	}
 	return run
 }
+
+// ---- Localization probe: is the historical 9/10 receipt corruption bound to
+// the specific token 29B388EA171B, to the serial_3 context shape, or gone? ----
+//
+// Replicates the original qualification serial_3 context verbatim: same tool
+// name, same step-gated semantics, same result text SERIAL_<token>_STEP_k_OK,
+// same English prompt with the expected receipt stated in the prompt (the
+// model copies from the prompt, not from a tool result). Two groups, free
+// text only: the known-bad fixed token vs fresh random tokens.
+//
+// Run:
+//
+//	SHANNON_E2E_LIVE=1 KOCORO_TYPED_RECEIPT_PROBE=1 go test ./test/e2e/ -run TestLive_TypedReceiptBadTokenProbe -v
+
+const (
+	typedReceiptProbeGateEnv = "KOCORO_TYPED_RECEIPT_PROBE"
+	typedReceiptBadToken     = "29B388EA171B"
+)
+
+// probeSerialStepTool replicates qualification_serial_step: strict ascending
+// steps 1..3, result text SERIAL_<token>_STEP_<k>_OK.
+type probeSerialStepTool struct {
+	mu    sync.Mutex
+	next  int
+	token string
+}
+
+func (t *probeSerialStepTool) Info() agent.ToolInfo {
+	return agent.ToolInfo{
+		Name:        "qualification_serial_step",
+		Description: "Execute exactly one stateful qualification step in strict ascending order.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"step": map[string]any{
+					"type": "integer", "minimum": 1, "maximum": 3,
+					"description": "The next serial step, from 1 through 3.",
+				},
+			},
+		},
+		Required: []string{"step"},
+	}
+}
+
+func (t *probeSerialStepTool) RequiresApproval() bool     { return false }
+func (t *probeSerialStepTool) IsReadOnlyCall(string) bool { return false }
+
+func (t *probeSerialStepTool) Run(_ context.Context, argsJSON string) (agent.ToolResult, error) {
+	var args struct {
+		Step int `json:"step"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return agent.ValidationError("qualification_serial_step: invalid step"), nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if args.Step != t.next+1 || args.Step > 3 {
+		return agent.ValidationError("qualification_serial_step: step is out of order"), nil
+	}
+	t.next = args.Step
+	return agent.ToolResult{Content: fmt.Sprintf("SERIAL_%s_STEP_%d_OK", t.token, args.Step)}, nil
+}
+
+func TestLive_TypedReceiptBadTokenProbe(t *testing.T) {
+	if os.Getenv("SHANNON_E2E_LIVE") != "1" {
+		t.Skip("set SHANNON_E2E_LIVE=1 to authorize real provider calls")
+	}
+	if os.Getenv(typedReceiptProbeGateEnv) != "1" {
+		t.Skipf("set %s=1 to run the paid bad-token probe", typedReceiptProbeGateEnv)
+	}
+	cfg := loadAgentLabQualityConfig(t)
+	provider := client.NewGatewayClient(cfg.endpoint, cfg.apiKey)
+
+	resolveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	cloudProfile, resolveErr := provider.ResolveKoeExecutionProfile(resolveCtx)
+	cancel()
+	fastProfile := executionprofile.Resolve(executionprofile.ResolutionInput{
+		RequestedMode: executionprofile.ModeFast,
+		FastEnabled:   true,
+		CloudProfile:  &cloudProfile,
+		CloudError:    resolveErr,
+	})
+	if resolveErr != nil || fastProfile.ValidateFast() != nil {
+		t.Fatalf("Fast profile resolve failed (resolveErr=%v validate=%v)", resolveErr, fastProfile.ValidateFast())
+	}
+
+	type probeRun struct {
+		Group         string `json:"group"`
+		Repetition    int    `json:"repetition"`
+		Token         string `json:"token"`
+		Receipt       string `json:"receipt"`
+		Exact         bool   `json:"exact"`
+		Answer        string `json:"answer"`
+		SuffixRepeat  bool   `json:"suffix_repeat"`
+		LatencyMillis int64  `json:"latency_millis"`
+		CostUSD       float64 `json:"cost_usd"`
+	}
+
+	type job struct {
+		group string
+		rep   int
+	}
+	var jobs []job
+	for rep := 1; rep <= typedReceiptReps; rep++ {
+		jobs = append(jobs, job{"bad_token", rep}, job{"random_token", rep})
+	}
+	rand.New(rand.NewSource(typedReceiptSeed + 7)).Shuffle(len(jobs), func(i, j int) { jobs[i], jobs[j] = jobs[j], jobs[i] })
+
+	var results []probeRun
+	totalCost := 0.0
+	for _, jb := range jobs {
+		if totalCost > typedReceiptMaxCostUSD {
+			t.Fatalf("cost ceiling %.2f USD exceeded at %.4f", typedReceiptMaxCostUSD, totalCost)
+		}
+		token := typedReceiptBadToken
+		if jb.group == "random_token" {
+			token = typedReceiptValue(rand.New(rand.NewSource(typedReceiptSeed + int64(jb.rep)*777)))
+		}
+		receipt := "SERIAL_RECEIPT_" + token
+
+		registry := agent.NewToolRegistry()
+		registry.Register(&probeSerialStepTool{token: token})
+		loop := agent.NewAgentLoop(provider, registry, "medium", t.TempDir(), 10, 30_000, 200, nil, nil, nil)
+		loop.SetCacheSource("typed_receipt_probe")
+		loop.SetSkillDiscovery(false)
+		loop.SetMaxTokens(400)
+		loop.SetTemperature(0)
+		loop.SetHandler(&fastABHandler{})
+		loop.SetKoeExecutionProfile(fastProfile)
+
+		prompt := fmt.Sprintf(
+			"Call qualification_serial_step three times, strictly serially: "+
+				"call step 1 and wait for its result, then step 2 and wait, then step 3 and wait. "+
+				"Never place two steps in one assistant tool-call turn. "+
+				"After all three succeed, reply with exactly %s.",
+			receipt,
+		)
+
+		ctx, jobCancel := context.WithTimeout(context.Background(), 120*time.Second)
+		started := time.Now()
+		answer, usage, err := loop.Run(ctx, prompt, nil, nil)
+		jobCancel()
+		trimmed := strings.TrimSpace(answer)
+		run := probeRun{
+			Group: jb.group, Repetition: jb.rep, Token: token, Receipt: receipt,
+			Answer:        trimmed,
+			Exact:         err == nil && trimmed == receipt,
+			SuffixRepeat:  strings.Contains(trimmed, receipt) && trimmed != receipt,
+			LatencyMillis: time.Since(started).Milliseconds(),
+		}
+		if usage != nil {
+			run.CostUSD = usage.CostUSD
+		}
+		totalCost += run.CostUSD
+		results = append(results, run)
+		t.Logf("probe group=%s rep=%d exact=%v suffix_repeat=%v answer=%q",
+			run.Group, run.Repetition, run.Exact, run.SuffixRepeat, run.Answer)
+	}
+
+	byGroup := map[string][2]int{}
+	for _, r := range results {
+		cell := byGroup[r.Group]
+		cell[1]++
+		if r.Exact {
+			cell[0]++
+		}
+		byGroup[r.Group] = cell
+	}
+	for _, group := range []string{"bad_token", "random_token"} {
+		cell := byGroup[group]
+		t.Logf("GROUP %-12s exact=%d/%d", group, cell[0], cell[1])
+	}
+	t.Logf("bad_token_probe complete runs=%d total_cost=%.6f", len(results), totalCost)
+
+	outputPath := strings.TrimSpace(os.Getenv(typedReceiptOutputEnv))
+	if outputPath == "" {
+		outputPath = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-typed-receipt-probe-%d.json", typedReceiptSeed))
+	}
+	body, err := json.MarshalIndent(map[string]any{
+		"schema_version": "kocoro.typed_receipt_probe.v1",
+		"bad_token":      typedReceiptBadToken,
+		"repetitions":    typedReceiptReps,
+		"total_cost_usd": totalCost,
+		"runs":           results,
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	if err := os.WriteFile(outputPath, append(body, '\n'), 0o644); err != nil {
+		t.Fatalf("write report: %v", err)
+	}
+	t.Logf("report=%s", outputPath)
+}
