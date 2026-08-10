@@ -6569,7 +6569,8 @@ iterationLoop:
 			er := execResults[idx]
 			result := er.result
 			elapsed := er.elapsed
-			retryWithAppsNoEffect := fc.Name == "computer_use" &&
+			retryWithAppsNoEffect := er.err == nil &&
+				fc.Name == "computer_use" &&
 				result.ComputerUseOutcome != nil &&
 				result.ComputerUseOutcome.Validate() == nil &&
 				result.ComputerUseOutcome.Recovery ==
@@ -6587,7 +6588,7 @@ iterationLoop:
 					}
 				}
 				result.Content = strings.TrimSpace(strings.Join(kept, "\n")) +
-					"\nrecovery: no further corrected computer_use retry is available in this turn"
+					"\nrecovery: no further corrected computer_use retry or alternate desktop-control path is available in this run; report the unresolved app target honestly"
 				spentOutcome := *result.ComputerUseOutcome
 				spentOutcome.Recovery = ComputerUseRecoveryNone
 				result.ComputerUseOutcome = &spentOutcome

@@ -1292,7 +1292,9 @@ func (m *mockComputerUseRecoveryTool) Run(
 	if m.runs == 1 || m.alwaysRequiresCorrectedApp {
 		return ToolResult{
 			Content: "computer_use_error: initial_target_required\n" +
-				"recovery: retry computer_use once with controlled_apps and foreground_policy",
+				"message: the requested app target could not be resolved\n" +
+				"recovery: retry computer_use once with controlled_apps and foreground_policy\n" +
+				"detail: requested app is not installed",
 			IsError: true,
 			ComputerUseOutcome: &ComputerUseTaskOutcome{
 				Status:      ComputerUseTaskNotCompleted,
@@ -1382,8 +1384,12 @@ func TestAgentLoop_SecondCorrectedAppFailureDoesNotOfferAnotherRetry(t *testing.
 	}
 	transcript := string(encoded)
 	if !strings.Contains(transcript,
-		"no further corrected computer_use retry is available in this turn") {
+		"no further corrected computer_use retry or alternate desktop-control path is available in this run") {
 		t.Fatalf("spent retry still offered another correction: %s", transcript)
+	}
+	if !strings.Contains(transcript, "report the unresolved app target honestly") ||
+		!strings.Contains(transcript, "detail: requested app is not installed") {
+		t.Fatalf("terminal recovery lost guidance or producer detail: %s", transcript)
 	}
 	if strings.Count(transcript, "retry computer_use once") != 1 {
 		t.Fatalf("spent retry retained contradictory recovery guidance: %s", transcript)
