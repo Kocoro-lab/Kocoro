@@ -71,8 +71,13 @@ type ToolResult struct {
 	IsError       bool
 	ErrorCategory ErrorCategory // empty when IsError is false
 	IsRetryable   bool          // true only for transient errors
-	Images        []ImageBlock
-	CloudResult   bool // true when result is a cloud deliverable (bypass LLM summarization)
+	// SideEffectOutcomeUnknown is set only when a tool request crossed its
+	// dispatch boundary but no response came back. A normal tool error is a
+	// known response and must remain available to the agent; it is not an
+	// ambiguous external action merely because IsError is true.
+	SideEffectOutcomeUnknown bool `json:"-"`
+	Images                   []ImageBlock
+	CloudResult              bool // true when result is a cloud deliverable (bypass LLM summarization)
 	// GUIOutcome is a daemon-internal, redacted execution acknowledgement. It
 	// is consumed by the computer-use control wrapper and is never serialized
 	// into provider-visible tool results.

@@ -4109,7 +4109,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			}
 			rollbackToolExecutions, reconcileErr := stageTranscriptToolExecutionsForSave(sess)
 			if reconcileErr != nil {
-				return nil, fmt.Errorf("reconcile hard-error tool executions: %w", reconcileErr)
+				log.Printf("daemon: hard-error tool execution reconcile failed: %v", reconcileErr)
+				rollbackToolExecutions = func() {}
 			}
 			if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
 				sess.InProgress = true
@@ -4298,7 +4299,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		previousInterruptedTurn := sess.InterruptedTurn
 		rollbackToolExecutions, reconcileErr := stageTranscriptToolExecutionsForSave(sess)
 		if reconcileErr != nil {
-			return nil, fmt.Errorf("reconcile final tool executions: %w", reconcileErr)
+			log.Printf("daemon: final tool execution reconcile failed: %v", reconcileErr)
+			rollbackToolExecutions = func() {}
 		}
 		if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
 			// A post-dispatch outcome that was not durably resolved remains a

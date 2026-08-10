@@ -232,7 +232,11 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	if err != nil {
 		var unknown *mcp.OutcomeUnknownError
 		if errors.As(err, &unknown) {
-			return agent.ToolResult{Content: outcomeUnknownResultMessage(unknown), IsError: true}, nil
+			return agent.ToolResult{
+				Content:                  outcomeUnknownResultMessage(unknown),
+				IsError:                  true,
+				SideEffectOutcomeUnknown: true,
+			}, nil
 		}
 		return agent.ToolResult{Content: fmt.Sprintf("MCP call failed: %v", err), IsError: true}, nil
 	}

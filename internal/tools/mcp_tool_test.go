@@ -92,6 +92,9 @@ func TestMCPTool_Run_WriteToolNotReplayedAfterPostDispatchTransportError(t *test
 	if !result.IsError {
 		t.Fatal("expected error result")
 	}
+	if !result.SideEffectOutcomeUnknown {
+		t.Fatal("post-dispatch transport loss must carry explicit outcome-unknown evidence")
+	}
 	if got := fake.callToolCount.Load(); got != 1 {
 		t.Fatalf("unannotated tool must be dispatched exactly once, got %d", got)
 	}
@@ -267,6 +270,9 @@ func TestMCPTool_Run_NoRetryOnNonTransportError(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Fatal("expected error result")
+	}
+	if result.SideEffectOutcomeUnknown {
+		t.Fatal("a definitive protocol error must remain a normal tool response")
 	}
 	if got := fake.callToolCount.Load(); got != 1 {
 		t.Fatalf("non-transport error must not be retried, got %d dispatches", got)

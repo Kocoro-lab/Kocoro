@@ -322,13 +322,23 @@ func runApprovedToolCall(
 	}
 
 	knownNoEffect := executionResult.result.ErrorCategory == ErrCategoryValidation
+	explicitUnknown := executionResult.err != nil || executionResult.result.SideEffectOutcomeUnknown
 	if outcome := executionResult.result.ComputerUseOutcome; outcome != nil &&
-		outcome.Validate() == nil && outcome.Effect == ComputerUseCommitNone {
-		knownNoEffect = true
+		outcome.Validate() == nil {
+		knownNoEffect = knownNoEffect || outcome.Effect == ComputerUseCommitNone
+		explicitUnknown = explicitUnknown || outcome.Effect == ComputerUseCommitUnknown
 	}
 	if reporter, ok := ac.tool.(SideEffectNoEffectReporter); ok {
 		knownNoEffect = knownNoEffect || reporter.SideEffectFailedWithoutEffect(
 			ac.argsStr, executionResult.result, executionResult.err,
+		)
+	}
+	if explicitUnknown {
+		markErr := journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
+		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+		executionResult.err = nil
+		return executionResult, wrapSideEffectExecutionError(
+			ErrSideEffectOutcomeUnknown, ac.fc.Name, markErr,
 		)
 	}
 	if knownNoEffect {
@@ -344,10 +354,18 @@ func runApprovedToolCall(
 		}
 	}
 
-	markErr := journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
-	executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
-	executionResult.err = nil
-	return executionResult, wrapSideEffectExecutionError(
-		ErrSideEffectOutcomeUnknown, ac.fc.Name, markErr,
-	)
+	// Tool.Run returned a definitive response. IsError describes the tool's
+	// domain outcome, not a lost transport response, so preserve it for the
+	// agent and checkpoint it exactly like a successful result. Only explicit
+	// post-dispatch/no-response evidence above is outcome-unknown.
+	if err := journal.MarkCommitted(journalCtx, prepared.ExecutionID, digest); err == nil {
+		return executionResult, nil
+	} else {
+		_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
+		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+		executionResult.err = nil
+		return executionResult, wrapSideEffectExecutionError(
+			ErrSideEffectOutcomeUnknown, ac.fc.Name, err,
+		)
+	}
 }

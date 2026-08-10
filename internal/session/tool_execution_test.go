@@ -193,36 +193,75 @@ func TestStoreSaveLeavesCommittedRecordWithoutMatchingToolResult(t *testing.T) {
 	}
 }
 
-func TestCheckpointCommittedToolExecutionsSupportsPlainTextTranscript(t *testing.T) {
-	record := newTestToolExecution(t, "toolu_plain", `{}`)
+func TestReconcileToolExecutionCheckpointsSupportsStrictLegacyXML(t *testing.T) {
+	record := newTestToolExecution(t, "legacy-call-123", `{}`)
+	legacyResult := `<tool_exec tool="calendar_create_event" call_id="legacy-call-123">
+<input>{"title":"private"}</input>
+<output status="ok">created</output>
+</tool_exec>`
 	sess := Session{
-		Messages:       []client.Message{{Role: "user", Content: client.NewTextContent("plain XML tool result")}},
+		Messages:       []client.Message{{Role: "user", Content: client.NewTextContent(legacyResult)}},
 		ToolExecutions: []ToolExecutionRecord{record},
 	}
 	if err := sess.MarkToolExecutionDispatching(record.ExecutionID, record.UpdatedAt.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.MarkToolExecutionCommitted(record.ExecutionID, ToolExecutionDigest("plain XML tool result"), record.UpdatedAt.Add(2*time.Second)); err != nil {
+	if err := sess.MarkToolExecutionCommitted(record.ExecutionID, ToolExecutionDigest("created"), record.UpdatedAt.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	resultDigest := sess.ToolExecutions[0].ResultDigest
 	if err := sess.ReconcileToolExecutionCheckpoints(record.UpdatedAt.Add(3 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if got := sess.ToolExecutions[0].State; got != ToolExecutionCommitted {
-		t.Fatalf("plain transcript auto-reconciled to %q", got)
-	}
-	if got := sess.CheckpointCommittedToolExecutions("", record.UpdatedAt.Add(3*time.Second)); got != 0 {
-		t.Fatalf("empty run id checkpointed %d records", got)
-	}
-	if got := sess.CheckpointCommittedToolExecutions("run-test", record.UpdatedAt.Add(3*time.Second)); got != 1 {
-		t.Fatalf("checkpointed count = %d, want 1", got)
-	}
 	if got := sess.ToolExecutions[0].State; got != ToolExecutionCheckpointed {
 		t.Fatalf("state = %q, want checkpointed", got)
 	}
 	if got := sess.ToolExecutions[0].ResultDigest; got != resultDigest {
 		t.Fatalf("result digest changed: got %q, want %q", got, resultDigest)
+	}
+}
+
+func TestReconcileToolExecutionCheckpointsRejectsNonStructuralLegacyText(t *testing.T) {
+	validXML := `<tool_exec tool="calendar_create_event" call_id="legacy-call-123">
+<input>{}</input>
+<output status="ok">created</output>
+</tool_exec>`
+	tests := []struct {
+		name     string
+		text     string
+		toolName string
+		callID   string
+	}{
+		{name: "ordinary text", text: "plain XML tool result", toolName: "calendar_create_event", callID: "legacy-call-123"},
+		{name: "quoted with prefix", text: "The tool returned:\n" + validXML, toolName: "calendar_create_event", callID: "legacy-call-123"},
+		{name: "quoted with suffix", text: validXML + "\nThis was only an example.", toolName: "calendar_create_event", callID: "legacy-call-123"},
+		{name: "wrong call id", text: validXML, toolName: "calendar_create_event", callID: "different-call"},
+		{name: "wrong tool name", text: validXML, toolName: "email_send", callID: "legacy-call-123"},
+		{name: "extra attribute", text: strings.Replace(validXML, ` call_id="`, ` source="quoted" call_id="`, 1), toolName: "calendar_create_event", callID: "legacy-call-123"},
+		{name: "invalid status", text: strings.Replace(validXML, `status="ok"`, `status="unknown"`, 1), toolName: "calendar_create_event", callID: "legacy-call-123"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record := newTestToolExecution(t, tc.callID, `{}`)
+			record.ToolName = tc.toolName
+			sess := Session{
+				Messages:       []client.Message{{Role: "user", Content: client.NewTextContent(tc.text)}},
+				ToolExecutions: []ToolExecutionRecord{record},
+			}
+			if err := sess.MarkToolExecutionDispatching(record.ExecutionID, record.UpdatedAt.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if err := sess.MarkToolExecutionCommitted(record.ExecutionID, ToolExecutionDigest("created"), record.UpdatedAt.Add(2*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if err := sess.ReconcileToolExecutionCheckpoints(record.UpdatedAt.Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if got := sess.ToolExecutions[0].State; got != ToolExecutionCommitted {
+				t.Fatalf("non-structural text changed state to %q", got)
+			}
+		})
 	}
 }
 

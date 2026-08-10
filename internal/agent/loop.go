@@ -5987,6 +5987,7 @@ iterationLoop:
 		// in execResults at their original index so Phase 3 can emit everything in order.
 		type perCallMeta struct {
 			argsStr             string
+			transcriptCallID    string
 			ordinal             int
 			decision            string
 			resolution          string
@@ -6027,6 +6028,12 @@ iterationLoop:
 			toolsUsed[fc.Name]++
 			argsStr := fc.ArgumentsString()
 			callMeta[idx].argsStr = argsStr
+			if !useNative {
+				// Legacy providers do not supply a tool-use ID. Mint one before
+				// dispatch and reuse it for both the durable execution ledger and
+				// the later <tool_exec> transcript result so recovery can join them.
+				callMeta[idx].transcriptCallID = generateCallID()
+			}
 			callMeta[idx].ordinal = totalToolCalls
 			callMeta[idx].argsDigest = toolArgumentsDigest(fc.Arguments)
 			if batchLoopBlocked {
@@ -6432,7 +6439,11 @@ iterationLoop:
 				}
 			}
 
-			approved = append(approved, approvedToolCall{index: idx, fc: fc, tool: tool, argsStr: callMeta[idx].argsStr})
+			executionCall := fc
+			if !useNative {
+				executionCall.ID = callMeta[idx].transcriptCallID
+			}
+			approved = append(approved, approvedToolCall{index: idx, fc: executionCall, tool: tool, argsStr: callMeta[idx].argsStr})
 		}
 
 		// ---- Phase 2 (batched): partition by read-only, execute with concurrency limits ----
@@ -6547,6 +6558,10 @@ iterationLoop:
 		toolResultPolicy := a.toolResultPolicy()
 		for idx, fc := range toolCalls {
 			argsStr := callMeta[idx].argsStr
+			transcriptCallID := fc.ID
+			if !useNative {
+				transcriptCallID = callMeta[idx].transcriptCallID
+			}
 			decision := callMeta[idx].decision
 			wasApproved := callMeta[idx].wasApproved
 			lastToolName = fc.Name
@@ -6575,7 +6590,7 @@ iterationLoop:
 				a.logAudit(fc.Name, argsStr, result.Content, decision, wasApproved, elapsed.Milliseconds(), result.Usage)
 
 				if er.executed && a.handler != nil {
-					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, result, elapsed)
+					a.handler.OnToolResult(fc.Name, argsStr, transcriptCallID, result, elapsed)
 				}
 			}
 			if fc.Name == "computer_use" &&
@@ -6628,7 +6643,7 @@ iterationLoop:
 			}
 			digest := sha256.Sum256([]byte(result.Content))
 			a.recordToolOutcomeEvidence(executionprofile.ToolOutcomeEvidence{
-				ToolCallID:         fc.ID,
+				ToolCallID:         transcriptCallID,
 				ToolName:           fc.Name,
 				Validated:          callMeta[idx].validated,
 				Outcome:            outcome,
@@ -6756,7 +6771,7 @@ iterationLoop:
 				}
 			} else {
 				if len(result.Images) > 0 {
-					text := formatToolExec(fc.Name, truncateStr(argsStr, a.argsTrunc), generateCallID(), contextResult, false)
+					text := formatToolExec(fc.Name, truncateStr(argsStr, a.argsTrunc), transcriptCallID, contextResult, false)
 					var blocks []client.ContentBlock
 					blocks = append(blocks, client.ContentBlock{Type: "text", Text: text})
 					for _, img := range result.Images {
@@ -6771,7 +6786,7 @@ iterationLoop:
 					})
 					stampMessage()
 				} else {
-					allResults.WriteString(formatToolExec(fc.Name, truncateStr(argsStr, a.argsTrunc), generateCallID(), contextResult, result.IsError))
+					allResults.WriteString(formatToolExec(fc.Name, truncateStr(argsStr, a.argsTrunc), transcriptCallID, contextResult, result.IsError))
 					allResults.WriteString("\n\n")
 				}
 			}

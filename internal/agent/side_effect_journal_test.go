@@ -246,7 +246,9 @@ func TestExecuteBatches_SideEffectJournalFailsClosedBeforeDispatch(t *testing.T)
 
 func TestExecuteBatches_SideEffectOutcomeUnknownStopsFollowingBatch(t *testing.T) {
 	journal := &recordingSideEffectJournal{}
-	first := &journalWriteTool{journal: journal, result: TransientError("connection lost")}
+	firstResult := TransientError("connection lost")
+	firstResult.SideEffectOutcomeUnknown = true
+	first := &journalWriteTool{journal: journal, result: firstResult}
 	second := &journalWriteTool{journal: journal, result: ToolResult{Content: "second"}}
 	results := make([]toolExecResult, 2)
 	err := executeBatches(
@@ -288,8 +290,12 @@ func TestExecuteBatches_SideEffectOutcomeUnknownStopsFollowingBatch(t *testing.T
 
 func TestExecuteBatches_ConcurrentSideEffectOutcomesAreCollected(t *testing.T) {
 	journal := &recordingSideEffectJournal{}
-	first := &journalWriteTool{journal: journal, result: TransientError("first lost")}
-	second := &journalWriteTool{journal: journal, result: TransientError("second lost")}
+	firstResult := TransientError("first lost")
+	firstResult.SideEffectOutcomeUnknown = true
+	secondResult := TransientError("second lost")
+	secondResult.SideEffectOutcomeUnknown = true
+	first := &journalWriteTool{journal: journal, result: firstResult}
+	second := &journalWriteTool{journal: journal, result: secondResult}
 	results := make([]toolExecResult, 2)
 	err := executeBatches(
 		context.Background(),
@@ -308,6 +314,37 @@ func TestExecuteBatches_ConcurrentSideEffectOutcomesAreCollected(t *testing.T) {
 	}
 	if first.runs.Load() != 1 || second.runs.Load() != 1 {
 		t.Fatalf("tool runs = (%d, %d), want (1, 1)", first.runs.Load(), second.runs.Load())
+	}
+}
+
+func TestExecuteBatches_ReturnedToolErrorContinuesFollowingBatch(t *testing.T) {
+	journal := &recordingSideEffectJournal{}
+	first := &journalWriteTool{journal: journal, result: TransientError("remote operation rejected")}
+	second := &journalWriteTool{journal: journal, result: ToolResult{Content: "second completed"}}
+	results := make([]toolExecResult, 2)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{
+			{journalApprovedCall(first, 0)},
+			{journalApprovedCall(second, 1)},
+		},
+		results, nil, nil, "",
+		sideEffectBatchHooks{
+			journal:            journal,
+			checkpointPrepared: func(context.Context) error { return nil },
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeBatches: %v", err)
+	}
+	if first.runs.Load() != 1 || second.runs.Load() != 1 {
+		t.Fatalf("tool runs = (%d, %d), want (1, 1)", first.runs.Load(), second.runs.Load())
+	}
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run committed prepare dispatching run committed]"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if !results[0].result.IsError || results[0].result.SideEffectOutcomeUnknown {
+		t.Fatalf("returned tool error was rewritten: %+v", results[0].result)
 	}
 }
 
@@ -410,10 +447,66 @@ func (c *journalLoopClient) CompleteStream(ctx context.Context, req client.Compl
 	return c.Complete(ctx, req)
 }
 
+type legacyJournalLoopClient struct{ calls atomic.Int32 }
+
+func (c *legacyJournalLoopClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	if c.calls.Add(1) == 1 {
+		return &client.CompletionResponse{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				Name: "journal_write", Arguments: json.RawMessage(`{"value":"private"}`),
+			}},
+		}, nil
+	}
+	return &client.CompletionResponse{OutputText: "done", FinishReason: "stop"}, nil
+}
+
+func (c *legacyJournalLoopClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+func TestAgentLoop_LegacyToolResultReusesLedgerJoinID(t *testing.T) {
+	llm := &legacyJournalLoopClient{}
+	journal := &recordingSideEffectJournal{}
+	tool := &journalWriteTool{journal: journal, result: ToolResult{Content: "created"}}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(llm, registry, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
+	loop.SetSideEffectExecutionJournal(journal)
+	loop.SetCheckpointFunc(func(context.Context) error { return nil })
+
+	if text, _, err := loop.Run(context.Background(), "create it", nil, nil); err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v), want clean legacy completion", text, err)
+	}
+	journal.mu.Lock()
+	if len(journal.prepared) != 1 {
+		journal.mu.Unlock()
+		t.Fatalf("prepared executions = %d, want 1", len(journal.prepared))
+	}
+	joinID := journal.prepared[0].ToolUseID
+	journal.mu.Unlock()
+	if joinID == "" {
+		t.Fatal("legacy execution did not mint a ledger join ID")
+	}
+	want := `call_id="` + joinID + `"`
+	found := false
+	for _, message := range loop.RunMessages() {
+		if strings.Contains(message.Content.Text(), want) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("legacy transcript did not reuse ledger join ID %q", joinID)
+	}
+}
+
 func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing.T) {
 	llm := &journalLoopClient{}
 	journal := &recordingSideEffectJournal{}
-	tool := &journalWriteTool{journal: journal, result: TransientError("lost after dispatch")}
+	result := TransientError("lost after dispatch")
+	result.SideEffectOutcomeUnknown = true
+	tool := &journalWriteTool{journal: journal, result: result}
 	registry := NewToolRegistry()
 	registry.Register(tool)
 	loop := NewAgentLoop(llm, registry, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)

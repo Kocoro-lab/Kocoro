@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -222,10 +223,16 @@ func (s *Session) ReconcileToolExecutionCheckpoints(now time.Time) error {
 		return err
 	}
 	resultIDs := make(map[string]struct{})
+	legacyResultTools := make(map[string]string)
 	for _, message := range s.Messages {
 		for _, block := range message.Content.Blocks() {
 			if block.Type == "tool_result" && block.ToolUseID != "" {
 				resultIDs[ToolExecutionDigest(block.ToolUseID)] = struct{}{}
+			}
+		}
+		if message.Role == "user" && !message.Content.HasBlocks() {
+			for _, result := range parseLegacyToolExecutionResults(message.Content.Text()) {
+				legacyResultTools[ToolExecutionDigest(result.callID)] = result.toolName
 			}
 		}
 	}
@@ -240,7 +247,9 @@ func (s *Session) ReconcileToolExecutionCheckpoints(now time.Time) error {
 			continue
 		}
 		if _, ok := resultIDs[record.ToolUseIDDigest]; !ok {
-			continue
+			if toolName, legacyOK := legacyResultTools[record.ToolUseIDDigest]; !legacyOK || toolName != record.ToolName {
+				continue
+			}
 		}
 		matching = append(matching, i)
 	}
@@ -254,33 +263,37 @@ func (s *Session) ReconcileToolExecutionCheckpoints(now time.Time) error {
 	return s.ValidateToolExecutions()
 }
 
-// CheckpointCommittedToolExecutions is the explicit checkpoint path for
-// provider transcripts whose tool_result is not represented by a structured
-// ContentBlock. The caller must invoke it only after the complete tool-result
-// batch has been applied to Session.Messages and immediately before the same
-// atomic Save.
-func (s *Session) CheckpointCommittedToolExecutions(runID string, now time.Time) int {
-	if runID == "" {
-		return 0
+type legacyToolExecutionResult struct {
+	toolName string
+	callID   string
+}
+
+// legacyToolExecutionResultPattern mirrors the exact fallback emitted by
+// agent.formatToolExec. Parsing is anchored and parseLegacyToolExecutionResults
+// requires the complete message to consist only of these records, so prose
+// which merely quotes a tool_exec fragment cannot become checkpoint evidence.
+var legacyToolExecutionResultPattern = regexp.MustCompile(`(?s)^<tool_exec tool="([A-Za-z0-9_]+)" call_id="([^"\s<>]+)">\n<input>.*?</input>\n<output status="(?:ok|error)">.*?</output>\n</tool_exec>`)
+
+func parseLegacyToolExecutionResults(text string) []legacyToolExecutionResult {
+	remaining := strings.TrimSpace(text)
+	if remaining == "" {
+		return nil
 	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	count := 0
-	for i := range s.ToolExecutions {
-		record := &s.ToolExecutions[i]
-		if record.State != ToolExecutionCommitted || (runID != "" && record.RunID != runID) {
-			continue
+	results := make([]legacyToolExecutionResult, 0, 1)
+	for remaining != "" {
+		match := legacyToolExecutionResultPattern.FindStringSubmatchIndex(remaining)
+		if match == nil || match[0] != 0 {
+			return nil
 		}
-		record.State = ToolExecutionCheckpointed
-		checkpointAt := now.UTC()
-		if checkpointAt.Before(record.UpdatedAt) {
-			checkpointAt = record.UpdatedAt
+		toolName := remaining[match[2]:match[3]]
+		callID := remaining[match[4]:match[5]]
+		if len(toolName) > 256 || len(callID) > 256 {
+			return nil
 		}
-		record.UpdatedAt = checkpointAt
-		count++
+		results = append(results, legacyToolExecutionResult{toolName: toolName, callID: callID})
+		remaining = strings.TrimSpace(remaining[match[1]:])
 	}
-	return count
+	return results
 }
 
 // TrimTerminalToolExecutions retains the newest bounded set of terminal
