@@ -1259,8 +1259,9 @@ func (m *mockCountingTool) IsReadOnlyCall(string) bool {
 }
 
 type mockComputerUseRecoveryTool struct {
-	runs int
-	args []string
+	runs                       int
+	args                       []string
+	alwaysRequiresCorrectedApp bool
 }
 
 func (m *mockComputerUseRecoveryTool) Info() ToolInfo {
@@ -1288,7 +1289,7 @@ func (m *mockComputerUseRecoveryTool) Run(
 ) (ToolResult, error) {
 	m.runs++
 	m.args = append(m.args, args)
-	if m.runs == 1 {
+	if m.runs == 1 || m.alwaysRequiresCorrectedApp {
 		return ToolResult{
 			Content: "computer_use_error: initial_target_required\n" +
 				"recovery: retry computer_use once with controlled_apps and foreground_policy",
@@ -1308,6 +1309,85 @@ func (m *mockComputerUseRecoveryTool) Run(
 			Effect: ComputerUseCommitKnown,
 		},
 	}, nil
+}
+
+func TestAgentLoop_SecondCorrectedAppFailureDoesNotOfferAnotherRetry(t *testing.T) {
+	computerUse := &mockComputerUseRecoveryTool{alwaysRequiresCorrectedApp: true}
+	callCount := 0
+	var finalRequest client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var request client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 3:
+			finalRequest = request
+			encoded, err := json.Marshal(request.Messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(string(encoded), "retry computer_use once") > 1 {
+				json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+					toolCall("computer_use",
+						`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+					10, 5))
+				return
+			}
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The requested app is not installed.", "end_turn", nil, 10, 5))
+		case 4:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The retry instruction caused an extra model iteration.", "end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "The requested app is not installed." ||
+		computerUse.runs != 2 || callCount != 3 {
+		t.Fatalf("result=%q runs=%d calls=%d", result, computerUse.runs, callCount)
+	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript,
+		"no further corrected computer_use retry is available in this turn") {
+		t.Fatalf("spent retry still offered another correction: %s", transcript)
+	}
+	if strings.Count(transcript, "retry computer_use once") != 1 {
+		t.Fatalf("spent retry retained contradictory recovery guidance: %s", transcript)
+	}
 }
 
 func (m *mockComputerUseRecoveryTool) RequiresApproval() bool { return false }

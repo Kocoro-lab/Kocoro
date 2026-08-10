@@ -6569,6 +6569,29 @@ iterationLoop:
 			er := execResults[idx]
 			result := er.result
 			elapsed := er.elapsed
+			retryWithAppsNoEffect := fc.Name == "computer_use" &&
+				result.ComputerUseOutcome != nil &&
+				result.ComputerUseOutcome.Validate() == nil &&
+				result.ComputerUseOutcome.Recovery ==
+					ComputerUseRecoveryRetryWithApps &&
+				result.ComputerUseOutcome.Status ==
+					ComputerUseTaskNotCompleted &&
+				result.ComputerUseOutcome.Effect ==
+					ComputerUseCommitNone
+			if retryWithAppsNoEffect && computerUseAppsRecoveryUsed {
+				lines := strings.Split(result.Content, "\n")
+				kept := lines[:0]
+				for _, line := range lines {
+					if !strings.HasPrefix(strings.TrimSpace(line), "recovery:") {
+						kept = append(kept, line)
+					}
+				}
+				result.Content = strings.TrimSpace(strings.Join(kept, "\n")) +
+					"\nrecovery: no further corrected computer_use retry is available in this turn"
+				spentOutcome := *result.ComputerUseOutcome
+				spentOutcome.Recovery = ComputerUseRecoveryNone
+				result.ComputerUseOutcome = &spentOutcome
+			}
 			if callMeta[idx].resolved {
 				// Already resolved in Phase 1 (denied/unknown/hook-denied).
 				// Just record in context — audit and handler events were already fired.
@@ -6593,16 +6616,7 @@ iterationLoop:
 					a.handler.OnToolResult(fc.Name, argsStr, transcriptCallID, result, elapsed)
 				}
 			}
-			if fc.Name == "computer_use" &&
-				result.ComputerUseOutcome != nil &&
-				result.ComputerUseOutcome.Validate() == nil &&
-				result.ComputerUseOutcome.Recovery ==
-					ComputerUseRecoveryRetryWithApps &&
-				result.ComputerUseOutcome.Status ==
-					ComputerUseTaskNotCompleted &&
-				result.ComputerUseOutcome.Effect ==
-					ComputerUseCommitNone &&
-				!computerUseAppsRecoveryUsed {
+			if retryWithAppsNoEffect && !computerUseAppsRecoveryUsed {
 				// This call never acquired a usable desktop target and therefore
 				// does not own the turn. Permit only one corrected computer_use
 				// call with explicit controlled targets and foreground policy;
