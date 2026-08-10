@@ -51,6 +51,10 @@ func TestCalculateToolRejectsUnsafeOrInvalidExpressions(t *testing.T) {
 		"someFunction(2)",
 		"value + 1",
 		"2 << 3",
+		"1e4097",
+		"1e-4097",
+		"0x1p4097",
+		"1e999999999999999999999",
 		strings.Repeat("1+", calculateMaxASTNodes) + "1",
 	}
 	tool := &CalculateTool{}

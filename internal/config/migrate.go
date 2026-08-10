@@ -272,11 +272,11 @@ func replaceIndentedIntLine(raw []byte, key string, oldVal, newVal int) ([]byte,
 	return []byte(re.ReplaceAllString(string(raw), replacement)), true
 }
 
-// maxIterationsToEmergencyFuseMigration replaces any configured global
-// agent.max_iterations value with the current emergency-fuse default. The
-// product has no user-facing control for this field, so retaining historical
-// values would silently keep upgraded installs on the old 25/40-round limits.
-// Per-agent config files remain explicit harness/operator overrides.
+// maxIterationsToEmergencyFuseMigration treats the two shipped global values
+// (25 and 40) as legacy defaults and replaces them with the current emergency
+// fuse. The file format has no provenance to distinguish a manually entered
+// identical value; this product migration intentionally reserves those two
+// values. All other global values and every per-agent override survive.
 type maxIterationsToEmergencyFuseMigration struct{}
 
 func (m *maxIterationsToEmergencyFuseMigration) ID() string {
@@ -301,7 +301,8 @@ func (m *maxIterationsToEmergencyFuseMigration) Apply(shannonDir string) (bool, 
 	if err := yaml.Unmarshal(raw, &probe); err != nil {
 		return false, nil
 	}
-	if probe.Agent.MaxIterations == nil || *probe.Agent.MaxIterations == DefaultAgentMaxIterations {
+	if probe.Agent.MaxIterations == nil ||
+		(*probe.Agent.MaxIterations != 25 && *probe.Agent.MaxIterations != 40) {
 		return false, nil
 	}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -267,6 +268,14 @@ func TestExecuteBatches_SideEffectOutcomeUnknownStopsFollowingBatch(t *testing.T
 	if !results[0].result.IsError || results[0].result.ErrorCategory != ErrCategoryBusiness {
 		t.Fatalf("result = %+v, want non-retryable outcome-unknown error", results[0].result)
 	}
+	if !results[0].executed {
+		t.Fatal("first call must be recorded as executed")
+	}
+	if results[1].executed || !results[1].result.IsError ||
+		results[1].result.ErrorCategory != ErrCategoryBusiness ||
+		!strings.Contains(results[1].result.Content, "was not executed") {
+		t.Fatalf("skipped sibling result = %+v, executed=%t; want explicit non-executed error", results[1].result, results[1].executed)
+	}
 }
 
 func TestExecuteBatches_ConcurrentSideEffectOutcomesAreCollected(t *testing.T) {
@@ -374,11 +383,18 @@ func (c *journalLoopClient) Complete(context.Context, client.CompletionRequest) 
 	c.calls.Add(1)
 	return &client.CompletionResponse{
 		FinishReason: "tool_use",
-		ToolCalls: []client.FunctionCall{{
-			ID:        "side-effect-call",
-			Name:      "journal_write",
-			Arguments: json.RawMessage(`{"value":"private"}`),
-		}},
+		ToolCalls: []client.FunctionCall{
+			{
+				ID:        "side-effect-call",
+				Name:      "journal_write",
+				Arguments: json.RawMessage(`{"value":"private"}`),
+			},
+			{
+				ID:        "skipped-side-effect-call",
+				Name:      "journal_write",
+				Arguments: json.RawMessage(`{"value":"must-not-run"}`),
+			},
+		},
 	}, nil
 }
 
@@ -394,6 +410,8 @@ func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing
 	registry.Register(tool)
 	loop := NewAgentLoop(llm, registry, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
 	loop.SetSideEffectExecutionJournal(journal)
+	handler := &collectingHandler{}
+	loop.SetHandler(handler)
 	checkpointCalls := 0
 	loop.SetCheckpointFunc(func(ctx context.Context) error {
 		checkpointCalls++
@@ -430,6 +448,13 @@ func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing
 	}
 	if llm.calls.Load() != 1 {
 		t.Fatalf("LLM calls = %d, want 1", llm.calls.Load())
+	}
+	if tool.runs.Load() != 1 {
+		t.Fatalf("tool runs = %d, want only the first call dispatched", tool.runs.Load())
+	}
+	if len(handler.results) != 2 || !handler.results[1].IsError ||
+		!strings.Contains(handler.results[1].Content, "was not executed") {
+		t.Fatalf("handler results = %+v, want explicit error for skipped sibling", handler.results)
 	}
 	if checkpointCalls != 2 {
 		t.Fatalf("checkpoint calls = %d, want pre-dispatch + terminal result", checkpointCalls)

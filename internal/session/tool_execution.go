@@ -14,7 +14,11 @@ import (
 const ToolExecutionSchemaVersion = 1
 
 // MaxRetainedTerminalToolExecutions bounds completed ledger history per
-// session. Non-terminal and outcome-unknown records are never removed.
+// session. A long editing run can create hundreds of checkpointed writes; once
+// this binds, only the oldest terminal audit records are removed while every
+// unresolved/outcome-unknown record remains. It is not operator-configurable:
+// changing retention affects the session recovery schema and requires a code
+// review rather than a per-install tuning knob.
 const MaxRetainedTerminalToolExecutions = 256
 
 type ToolExecutionState string

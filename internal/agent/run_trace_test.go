@@ -292,6 +292,7 @@ func TestRunTrace_PartialTerminalMatchesLastRunStatus(t *testing.T) {
 		t.Fatalf("terminal=%+v LastRunStatus=%+v", terminal, status)
 	}
 	if terminal.ProviderDispatchesAtTerminal != 2 || terminal.HelperDispatchesAtTerminal != 0 ||
+		terminal.ProviderDispatchLimit != requestBudgetMinimumNormalDispatchLimit ||
 		terminal.UnknownUsageDispatchesAtTerminal != 0 || terminal.TokenExposureAtTerminal != 15 ||
 		terminal.TokenLimit != requestBudgetMinimumTokenExposure || terminal.TerminalTokenExposure != 15 {
 		t.Fatalf("terminal budget snapshot = %+v", terminal)

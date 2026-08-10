@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"math/big"
+	"strconv"
 	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -16,6 +17,13 @@ import (
 const (
 	calculateMaxExpressionChars = 512
 	calculateMaxASTNodes        = 128
+	// Workload: ordinary exact local arithmetic, including scientific notation.
+	// Exponents beyond 4096 can turn a few input bytes into tens of millions of
+	// digits before the expression/AST limits bind. When this cap binds the tool
+	// returns a validation error before allocating the rational. It is purposely
+	// not configurable; tasks needing larger symbolic magnitudes should keep
+	// scientific notation instead of materializing the integer locally.
+	calculateMaxLiteralExponent = 4096
 )
 
 // CalculateTool evaluates bounded arithmetic locally. It deliberately accepts
@@ -107,6 +115,9 @@ func evaluateArithmeticExpr(expr ast.Expr, nodes *int) (*big.Rat, error) {
 		if node.Kind != token.INT && node.Kind != token.FLOAT {
 			return nil, fmt.Errorf("unsupported literal %q", node.Value)
 		}
+		if err := validateNumericLiteralExponent(node.Value); err != nil {
+			return nil, err
+		}
 		value := new(big.Rat)
 		if _, ok := value.SetString(strings.ReplaceAll(node.Value, "_", "")); !ok {
 			return nil, fmt.Errorf("invalid number %q", node.Value)
@@ -160,6 +171,23 @@ func evaluateArithmeticExpr(expr ast.Expr, nodes *int) (*big.Rat, error) {
 	default:
 		return nil, fmt.Errorf("only arithmetic literals and operators are allowed")
 	}
+}
+
+func validateNumericLiteralExponent(literal string) error {
+	cleaned := strings.ReplaceAll(literal, "_", "")
+	markers := "eE"
+	if strings.HasPrefix(cleaned, "0x") || strings.HasPrefix(cleaned, "0X") {
+		markers = "pP"
+	}
+	marker := strings.LastIndexAny(cleaned, markers)
+	if marker < 0 {
+		return nil
+	}
+	exponent, err := strconv.ParseInt(cleaned[marker+1:], 10, 64)
+	if err != nil || exponent > calculateMaxLiteralExponent || exponent < -calculateMaxLiteralExponent {
+		return fmt.Errorf("number exponent exceeds +/- %d", calculateMaxLiteralExponent)
+	}
+	return nil
 }
 
 func formatRational(value *big.Rat) string {

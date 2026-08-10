@@ -104,6 +104,22 @@ func executeBatches(
 	if handler != nil {
 		ctx = WithUsageEmit(ctx, handler.OnUsage)
 	}
+	// Every approved call needs a paired tool_result even when an earlier batch
+	// aborts the response. Start from an explicit non-executed error and overwrite
+	// it only when admission reaches Tool.Run. A zero-valued ToolResult would be
+	// serialized as a false success and could make recovery believe the skipped
+	// mutation completed.
+	for _, batch := range batches {
+		for _, ac := range batch {
+			execResults[ac.index] = toolExecResult{
+				result: BusinessError(fmt.Sprintf(
+					"%s was not executed because an earlier action in the same response stopped the batch",
+					ac.fc.Name,
+				)),
+				name: ac.fc.Name,
+			}
+		}
+	}
 	for _, batch := range batches {
 		var batchErr error
 		if len(batch) == 1 {
@@ -283,6 +299,7 @@ func runApprovedToolCall(
 	}
 
 	startTime = time.Now()
+	executionResult.executed = true
 	executionResult.result, executionResult.err = ac.tool.Run(toolCtx, ac.argsStr)
 	if prepared == nil || journal == nil {
 		return executionResult, nil

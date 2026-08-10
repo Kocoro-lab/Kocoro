@@ -77,6 +77,7 @@ type RunTraceTerminal struct {
 	// UX calls such as prompt suggestions may spend the same budget afterward;
 	// their usage stays in the existing audit rows and never rewrites this event.
 	ProviderDispatchesAtTerminal     int   `json:"provider_dispatches_at_terminal"`
+	ProviderDispatchLimit            int   `json:"provider_dispatch_limit"`
 	HelperDispatchesAtTerminal       int   `json:"helper_dispatches_at_terminal"`
 	UnknownUsageDispatchesAtTerminal int   `json:"unknown_usage_dispatches_at_terminal"`
 	TokenExposureAtTerminal          int64 `json:"token_exposure_at_terminal"`

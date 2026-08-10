@@ -4021,10 +4021,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
 	loop.SetCheckpointFunc(func(ctx context.Context) error {
-		// EventLog is a write-ahead observation stream. Flush before the
-		// authoritative session checkpoint; recovery never uses it for replay.
+		// EventLog is an observation stream, not recovery authority. Attempt to
+		// align it with the checkpoint, but never let corrupt/failed telemetry
+		// block the session transcript or side-effect ledger from becoming durable.
 		if err := runEvents.Flush(); err != nil {
-			return fmt.Errorf("flush run events at checkpoint: %w", err)
+			log.Printf("daemon: checkpoint run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, err)
 		}
 		applyTurnState(sess, loop, turnUsage, turnBase)
 		syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())

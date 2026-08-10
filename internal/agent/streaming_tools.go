@@ -153,8 +153,9 @@ func (s *streamToolStarter) Start(fc client.FunctionCall, activeSkillFilter map[
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				run.result = toolExecResult{
-					result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", recovered), IsError: true},
-					name:   fc.Name,
+					result:   ToolResult{Content: fmt.Sprintf("tool panicked: %v", recovered), IsError: true},
+					name:     fc.Name,
+					executed: true,
 				}
 			}
 		}()
@@ -165,10 +166,11 @@ func (s *streamToolStarter) Start(fc client.FunctionCall, activeSkillFilter map[
 		start := time.Now()
 		result, err := tool.Run(dispatchToolCtx, argsStr)
 		run.result = toolExecResult{
-			result:  result,
-			elapsed: time.Since(start),
-			err:     err,
-			name:    fc.Name,
+			result:   result,
+			elapsed:  time.Since(start),
+			err:      err,
+			name:     fc.Name,
+			executed: true,
 		}
 	}()
 }
@@ -200,9 +202,10 @@ func (s *streamToolStarter) Claim(ctx context.Context, fc client.FunctionCall) (
 	case <-ctx.Done():
 		run.cancel()
 		return toolExecResult{
-			result: ToolResult{Content: "tool startup cancelled with the turn", IsError: true},
-			err:    ctx.Err(),
-			name:   fc.Name,
+			result:   ToolResult{Content: "tool startup cancelled with the turn", IsError: true},
+			err:      ctx.Err(),
+			name:     fc.Name,
+			executed: true,
 		}, true
 	}
 }

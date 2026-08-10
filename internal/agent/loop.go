@@ -2713,10 +2713,11 @@ func (a *AgentLoop) SetEnableStreaming(enable bool) {
 // toolExecResult holds the output of a single tool.Run() call.
 // Used to collect results from parallel tool execution.
 type toolExecResult struct {
-	result  ToolResult
-	elapsed time.Duration
-	err     error
-	name    string // tool name; used by applyAggregateCap to skip Unlimited tools
+	result   ToolResult
+	elapsed  time.Duration
+	err      error
+	name     string // tool name; used by applyAggregateCap to skip Unlimited tools
+	executed bool   // Tool.Run was entered; synthetic admissions and skipped siblings stay false
 }
 
 // approvedToolCall tracks a tool call that passed permission checks and pre-hooks.
@@ -3023,7 +3024,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		persona = a.agentBasePrompt
 	}
 	usage := &TurnUsage{}
-	requestBudget := newRequestLLMBudget(a.contextWindow)
+	requestBudget := newRequestLLMBudget(a.contextWindow, a.maxIter)
 	a.lastSentMu.Lock()
 	a.activeRunBudget = requestBudget
 	a.lastSentMu.Unlock()
@@ -3682,6 +3683,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				Partial: partial, FailureCode: string(code), LastTool: lastToolName,
 				RetryCount: retryCount, IterationCount: iterationCount,
 				ProviderDispatchesAtTerminal:     budget.NormalDispatches + budget.TerminalDispatches,
+				ProviderDispatchLimit:            budget.NormalDispatchLimit,
 				HelperDispatchesAtTerminal:       budget.HelperDispatches,
 				UnknownUsageDispatchesAtTerminal: budget.UnknownActual,
 				TokenExposureAtTerminal:          budget.ConsumedTokens + budget.ReservedTokens,
@@ -6566,7 +6568,7 @@ iterationLoop:
 					result.Content = sanitizeResult(result.Content)
 				}
 
-				if a.hookRunner != nil {
+				if er.executed && a.hookRunner != nil {
 					_ = a.hookRunner.RunPostToolUse(ctx, fc.Name, argsStr, result.Content, a.sessionID)
 				}
 
@@ -6632,7 +6634,7 @@ iterationLoop:
 				Outcome:            outcome,
 				PermissionDecision: callMeta[idx].decision,
 				PermissionApproved: callMeta[idx].wasApproved,
-				SideEffect:         callMeta[idx].sideEffect && !callMeta[idx].resolved,
+				SideEffect:         callMeta[idx].sideEffect && er.executed,
 				ArgumentsDigest:    callMeta[idx].argsDigest,
 				ResultDigest:       hex.EncodeToString(digest[:]),
 			})
@@ -6657,7 +6659,7 @@ iterationLoop:
 					ExecutionBatchSize:   callMeta[idx].executionBatchSize,
 					ExecutionParallel:    callMeta[idx].executionParallel,
 					MaxConcurrency:       callMeta[idx].maxConcurrency,
-					Executed:             !callMeta[idx].resolved,
+					Executed:             er.executed,
 					Outcome:              traceOutcome,
 					ErrorCategory:        result.ErrorCategory,
 					Retryable:            result.ErrorCategory == ErrCategoryTransient,

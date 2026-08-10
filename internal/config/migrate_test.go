@@ -261,8 +261,8 @@ agent:
 	}
 }
 
-func TestMigrate_MaxIterationsOverridesConfiguredValue(t *testing.T) {
-	for _, configured := range []int{1, 25, 40, 999} {
+func TestMigrate_MaxIterationsReplacesHistoricalDefaults(t *testing.T) {
+	for _, configured := range []int{25, 40} {
 		t.Run(fmt.Sprintf("configured_%d", configured), func(t *testing.T) {
 			dir := t.TempDir()
 			input := fmt.Sprintf("agent:\n    max_iterations: %d  # hidden legacy value\n    temperature: 0.5\n", configured)
@@ -285,6 +285,30 @@ func TestMigrate_MaxIterationsOverridesConfiguredValue(t *testing.T) {
 			}
 			if got := readFile(t, backup); got != input {
 				t.Fatalf("backup mismatch\nwant:\n%s\ngot:\n%s", input, got)
+			}
+		})
+	}
+}
+
+func TestMigrate_MaxIterationsPreservesUserCeilings(t *testing.T) {
+	for _, configured := range []int{1, 64, 999} {
+		t.Run(fmt.Sprintf("configured_%d", configured), func(t *testing.T) {
+			dir := t.TempDir()
+			input := fmt.Sprintf("agent:\n    max_iterations: %d  # user ceiling\n", configured)
+			configPath := writeYAML(t, dir, input)
+
+			changed, err := (&maxIterationsToEmergencyFuseMigration{}).Apply(dir)
+			if err != nil {
+				t.Fatalf("apply migration: %v", err)
+			}
+			if changed {
+				t.Fatal("user-authored ceiling must not be replaced")
+			}
+			if got := readFile(t, configPath); got != input {
+				t.Fatalf("yaml changed\nwant:\n%s\ngot:\n%s", input, got)
+			}
+			if findMaxIterationsBackup(t, dir) != "" {
+				t.Fatal("no backup expected for a no-op")
 			}
 		})
 	}

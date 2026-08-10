@@ -12,11 +12,20 @@ import (
 )
 
 const (
-	requestBudgetNormalDispatchLimit   = 64
-	requestBudgetHelperDispatchLimit   = 8
-	requestBudgetTerminalDispatchLimit = 1
-	requestBudgetMinimumTokenExposure  = int64(1_000_000)
-	requestBudgetContextMultiplier     = int64(8)
+	// The normal provider budget must leave the configured emergency iteration
+	// fuse reachable even when an iteration uses its bounded retry/fallback path.
+	// The 64-call floor covers short custom loops; helper calls and the one
+	// inconsistent-finish replay also receive explicit allowance. When this binds,
+	// the run returns a budget_exhausted partial before another provider call.
+	// Operators raise or lower it through the existing max_iterations setting;
+	// no second, contradictory dispatch-limit setting is exposed.
+	requestBudgetMinimumNormalDispatchLimit  = 64
+	requestBudgetDispatchesPerIteration      = 4
+	requestBudgetInconsistentReplayAllowance = requestBudgetDispatchesPerIteration
+	requestBudgetHelperDispatchLimit         = 8
+	requestBudgetTerminalDispatchLimit       = 1
+	requestBudgetMinimumTokenExposure        = int64(1_000_000)
+	requestBudgetContextMultiplier           = int64(8)
 )
 
 // ErrRequestBudgetExhausted is returned before a provider dispatch when the
@@ -66,7 +75,8 @@ func (e *requestBudgetError) Unwrap() error { return ErrRequestBudgetExhausted }
 type requestLLMBudget struct {
 	mu sync.Mutex
 
-	tokenExposureLimit int64
+	tokenExposureLimit  int64
+	normalDispatchLimit int
 
 	normalDispatches   int
 	helperDispatches   int
@@ -79,24 +89,48 @@ type requestLLMBudget struct {
 }
 
 type requestBudgetSnapshot struct {
-	TokenExposureLimit int64
-	NormalDispatches   int
-	HelperDispatches   int
-	TerminalDispatches int
-	ReservedTokens     int64
-	ConsumedTokens     int64
-	TerminalTokens     int64
-	UnknownActual      int
+	TokenExposureLimit  int64
+	NormalDispatchLimit int
+	NormalDispatches    int
+	HelperDispatches    int
+	TerminalDispatches  int
+	ReservedTokens      int64
+	ConsumedTokens      int64
+	TerminalTokens      int64
+	UnknownActual       int
 }
 
-func newRequestLLMBudget(contextWindow int) *requestLLMBudget {
+func newRequestLLMBudget(contextWindow, maxIterations int) *requestLLMBudget {
 	limit := requestBudgetMinimumTokenExposure
 	if contextWindow > 0 {
 		if scaled := int64(contextWindow) * requestBudgetContextMultiplier; scaled > limit {
 			limit = scaled
 		}
 	}
-	return &requestLLMBudget{tokenExposureLimit: limit}
+	dispatchLimit := normalDispatchLimitForIterations(maxIterations)
+	return &requestLLMBudget{
+		tokenExposureLimit:  limit,
+		normalDispatchLimit: dispatchLimit,
+	}
+}
+
+func normalDispatchLimitForIterations(maxIterations int) int {
+	if maxIterations < 1 {
+		maxIterations = 1
+	}
+	// Each iteration can open a stream, fall back to non-streaming, then use
+	// the remaining two slots in the three-attempt retry loop. The one per-run
+	// inconsistent-finish replay can consume that allowance once more.
+	fixedAllowance := requestBudgetHelperDispatchLimit + requestBudgetInconsistentReplayAllowance
+	maxInt := int(^uint(0) >> 1)
+	if maxIterations > (maxInt-fixedAllowance)/requestBudgetDispatchesPerIteration {
+		return maxInt
+	}
+	dispatchLimit := maxIterations*requestBudgetDispatchesPerIteration + fixedAllowance
+	if dispatchLimit < requestBudgetMinimumNormalDispatchLimit {
+		dispatchLimit = requestBudgetMinimumNormalDispatchLimit
+	}
+	return dispatchLimit
 }
 
 type requestBudgetReservation struct {
@@ -121,7 +155,7 @@ func (b *requestLLMBudget) reserve(class requestBudgetClass, estimate int64) (*r
 		return &requestBudgetReservation{budget: b, class: class, estimate: estimate}, nil
 	}
 
-	if b.normalDispatches >= requestBudgetNormalDispatchLimit {
+	if b.normalDispatches >= b.normalDispatchLimit {
 		return nil, &requestBudgetError{class: class, reason: "normal_dispatch_limit"}
 	}
 	if class == requestBudgetHelper && b.helperDispatches >= requestBudgetHelperDispatchLimit {
@@ -181,14 +215,15 @@ func (b *requestLLMBudget) snapshot() requestBudgetSnapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return requestBudgetSnapshot{
-		TokenExposureLimit: b.tokenExposureLimit,
-		NormalDispatches:   b.normalDispatches,
-		HelperDispatches:   b.helperDispatches,
-		TerminalDispatches: b.terminalDispatches,
-		ReservedTokens:     b.reservedTokens,
-		ConsumedTokens:     b.consumedTokens,
-		TerminalTokens:     b.terminalTokens,
-		UnknownActual:      b.unknownActual,
+		TokenExposureLimit:  b.tokenExposureLimit,
+		NormalDispatchLimit: b.normalDispatchLimit,
+		NormalDispatches:    b.normalDispatches,
+		HelperDispatches:    b.helperDispatches,
+		TerminalDispatches:  b.terminalDispatches,
+		ReservedTokens:      b.reservedTokens,
+		ConsumedTokens:      b.consumedTokens,
+		TerminalTokens:      b.terminalTokens,
+		UnknownActual:       b.unknownActual,
 	}
 }
 
