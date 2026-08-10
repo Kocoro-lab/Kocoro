@@ -332,7 +332,11 @@ func runApprovedToolCall(
 		)
 	}
 	if knownNoEffect {
-		if err := journal.MarkAbandoned(journalCtx, prepared.ExecutionID, digest); err == nil {
+		// Tool.Run returned a definitive result after dispatch. "Committed" here
+		// means the result is known and can be joined to the transcript; it does
+		// not claim that an external mutation occurred. Abandoned is reserved for
+		// prepared executions that never entered Tool.Run.
+		if err := journal.MarkCommitted(journalCtx, prepared.ExecutionID, digest); err == nil {
 			return executionResult, nil
 		} else {
 			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)

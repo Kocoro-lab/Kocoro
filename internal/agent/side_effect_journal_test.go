@@ -327,7 +327,7 @@ func TestExecuteBatches_CommitPersistenceFailureBecomesOutcomeUnknown(t *testing
 	}
 }
 
-func TestExecuteBatches_ValidationFailureIsDurablyAbandoned(t *testing.T) {
+func TestExecuteBatches_ValidationFailurePersistsDefinitiveResult(t *testing.T) {
 	journal := &recordingSideEffectJournal{}
 	tool := &journalWriteTool{journal: journal, result: ValidationError("bad value")}
 	results := make([]toolExecResult, 1)
@@ -346,12 +346,12 @@ func TestExecuteBatches_ValidationFailureIsDurablyAbandoned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("executeBatches: %v", err)
 	}
-	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run abandoned]"; got != want {
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run committed]"; got != want {
 		t.Fatalf("events = %s, want %s", got, want)
 	}
 }
 
-func TestExecuteBatches_ComputerUseNoCommitFailureIsDurablyAbandoned(t *testing.T) {
+func TestExecuteBatches_ComputerUseNoCommitFailurePersistsDefinitiveResult(t *testing.T) {
 	journal := &recordingSideEffectJournal{}
 	result := BusinessError("policy blocked before input")
 	result.ComputerUseOutcome = &ComputerUseTaskOutcome{
@@ -372,7 +372,7 @@ func TestExecuteBatches_ComputerUseNoCommitFailureIsDurablyAbandoned(t *testing.
 	if err != nil {
 		t.Fatalf("executeBatches: %v", err)
 	}
-	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run abandoned]"; got != want {
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run committed]"; got != want {
 		t.Fatalf("events = %s, want %s", got, want)
 	}
 }
