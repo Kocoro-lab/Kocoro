@@ -36,6 +36,7 @@ const (
 	migrationsFileName               = "migrations.json"
 	migrationsLockName               = "migrations.lock"
 	migrationIDContextWindow128To200 = "context_window_128_to_200"
+	migrationIDMaxIterationsToFuse   = "max_iterations_to_emergency_fuse_v1"
 	migrationIDAPIKeyToKeychain      = "api_key_to_keychain_v1"
 )
 
@@ -62,6 +63,7 @@ type migrationRecord struct {
 // shannon dir (typically irrelevant since each migration is independent).
 var registeredMigrations = []Migration{
 	&contextWindow128To200Migration{},
+	&maxIterationsToEmergencyFuseMigration{},
 	&apiKeyToKeychainMigration{},
 }
 
@@ -268,6 +270,109 @@ func replaceIndentedIntLine(raw []byte, key string, oldVal, newVal int) ([]byte,
 	}
 	replacement := fmt.Sprintf("${1}%d${2}", newVal)
 	return []byte(re.ReplaceAllString(string(raw), replacement)), true
+}
+
+// maxIterationsToEmergencyFuseMigration replaces any configured global
+// agent.max_iterations value with the current emergency-fuse default. The
+// product has no user-facing control for this field, so retaining historical
+// values would silently keep upgraded installs on the old 25/40-round limits.
+// Per-agent config files remain explicit harness/operator overrides.
+type maxIterationsToEmergencyFuseMigration struct{}
+
+func (m *maxIterationsToEmergencyFuseMigration) ID() string {
+	return migrationIDMaxIterationsToFuse
+}
+
+func (m *maxIterationsToEmergencyFuseMigration) Apply(shannonDir string) (bool, error) {
+	configPath := filepath.Join(shannonDir, "config.yaml")
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	var probe struct {
+		Agent struct {
+			MaxIterations *int `yaml:"max_iterations"`
+		} `yaml:"agent"`
+	}
+	if err := yaml.Unmarshal(raw, &probe); err != nil {
+		return false, nil
+	}
+	if probe.Agent.MaxIterations == nil || *probe.Agent.MaxIterations == DefaultAgentMaxIterations {
+		return false, nil
+	}
+
+	newRaw, replaced := replaceAgentIntLine(
+		raw,
+		"max_iterations",
+		*probe.Agent.MaxIterations,
+		DefaultAgentMaxIterations,
+	)
+	if !replaced {
+		return false, nil
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return false, fmt.Errorf("stat config: %w", err)
+	}
+	origMode := info.Mode().Perm()
+	stamp := time.Now().UTC().Format("20060102T150405Z")
+	backupPath := configPath + ".pre-migrate-max-iterations-" + stamp + ".bak"
+	if err := os.WriteFile(backupPath, raw, origMode); err != nil {
+		return false, fmt.Errorf("write backup: %w", err)
+	}
+
+	tmpPath := configPath + ".max-iterations.migrate.tmp"
+	if err := os.WriteFile(tmpPath, newRaw, origMode); err != nil {
+		return false, fmt.Errorf("write tmp yaml: %w", err)
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("rename yaml: %w", err)
+	}
+	return true, nil
+}
+
+// replaceAgentIntLine changes a scalar that is a direct member of the
+// top-level agent mapping without reformatting the rest of the yaml.
+func replaceAgentIntLine(raw []byte, key string, oldVal, newVal int) ([]byte, bool) {
+	lines := strings.SplitAfter(string(raw), "\n")
+	agentLine := regexp.MustCompile(`^agent:\s*(?:#.*)?(?:\r?\n)?$`)
+	target := regexp.MustCompile(fmt.Sprintf(
+		`^(\s+%s:\s*)%d(\s*(?:#.*)?)(\r?\n)?$`,
+		regexp.QuoteMeta(key),
+		oldVal,
+	))
+	inAgent := false
+	for i, line := range lines {
+		if !inAgent {
+			if agentLine.MatchString(line) {
+				inAgent = true
+			}
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if line[0] != ' ' && line[0] != '\t' {
+			break
+		}
+		if !target.MatchString(line) {
+			continue
+		}
+		lines[i] = target.ReplaceAllString(
+			line,
+			fmt.Sprintf("${1}%d${2}${3}", newVal),
+		)
+		return []byte(strings.Join(lines, "")), true
+	}
+	return raw, false
 }
 
 // apiKeyToKeychainMigration moves a plaintext top-level `api_key` from

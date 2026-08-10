@@ -123,7 +123,7 @@ type LoopDetector struct {
 }
 
 // GUITools are tools that indicate GUI automation tasks.
-// Used by both LoopDetector (exempt from NoProgress) and effectiveMaxIter (higher limit).
+// Used by LoopDetector to recognize GUI observation/action workflows.
 // Note: the literal "browser" key covers the legacy in-process browser tool.
 // Real MCP playwright tool names (browser_navigate, browser_snapshot, …) are
 // handled via isGUIToolName, which also prefix-matches "browser_".

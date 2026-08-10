@@ -82,7 +82,7 @@ func (a *AgentLoop) ContextWindow() (tokens int, explicit bool) {
 	return a.contextWindow, a.contextWindowExplicit
 }
 
-// MaxIterations returns the configured agent-loop iteration limit.
+// MaxIterations returns the configured emergency agent-loop iteration fuse.
 func (a *AgentLoop) MaxIterations() int {
 	if a == nil {
 		return 0

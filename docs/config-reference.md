@@ -71,7 +71,7 @@ Per-server fields: `command` + `args` (stdio), `type: http` + `url` (HTTP), `env
 
 ```yaml
 agent:
-  max_iterations: 40               # max model/tool iterations per turn (default: 40; GUI workflows get at least 75)
+  max_iterations: 256              # emergency model/tool-round fuse (default: 256; normal completion is outcome-driven)
   temperature: 0                   # LLM temperature (default: 0)
   max_tokens: 0                    # max output tokens (default: 0 = resolve from the selected model)
   model: ""                        # specific model override (empty = use model_tier)

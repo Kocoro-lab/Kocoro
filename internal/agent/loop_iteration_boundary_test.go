@@ -125,10 +125,10 @@ func TestAgentLoopIterationBoundary_ToolOnNthTurnBlocksNthPlusOne(t *testing.T) 
 	}
 }
 
-// TestAgentLoopIterationBoundary_GUIActivationOnNthTurn verifies that a real
-// GUI tool executed on round 25 activates the intended 75-turn budget before
-// the next loop-boundary check, allowing a terminal response on round 26.
-func TestAgentLoopIterationBoundary_GUIActivationOnNthTurn(t *testing.T) {
+// TestAgentLoopIterationBoundary_GUIToolDoesNotExtendConfiguredFuse verifies
+// that tool class cannot silently rewrite an operator's explicit fuse. The
+// default is deliberately high, but an explicitly bounded run stays bounded.
+func TestAgentLoopIterationBoundary_GUIToolDoesNotExtendConfiguredFuse(t *testing.T) {
 	const baseMaxIter = 25
 	requestCount := 0
 	synthesisRequests := 0
@@ -139,7 +139,10 @@ func TestAgentLoopIterationBoundary_GUIActivationOnNthTurn(t *testing.T) {
 		}
 		if len(req.Tools) == 0 {
 			synthesisRequests++
-			_ = json.NewEncoder(w).Encode(nativeResponse("unexpected cap synthesis", "end_turn", nil, 10, 5))
+			_ = json.NewEncoder(w).Encode(nativeResponse(
+				"**Outcome** — partial\n**Pending / blocked** — the configured emergency fuse was reached.",
+				"end_turn", nil, 10, 5,
+			))
 			return
 		}
 		requestCount++
@@ -155,7 +158,7 @@ func TestAgentLoopIterationBoundary_GUIActivationOnNthTurn(t *testing.T) {
 				"", "tool_use", toolCall("screenshot", `{"step":25}`), 10, 5,
 			))
 		default:
-			_ = json.NewEncoder(w).Encode(nativeResponse("completed after GUI activation", "end_turn", nil, 10, 5))
+			_ = json.NewEncoder(w).Encode(nativeResponse("incorrectly continued past configured fuse", "end_turn", nil, 10, 5))
 		}
 	}))
 	defer server.Close()
@@ -166,15 +169,15 @@ func TestAgentLoopIterationBoundary_GUIActivationOnNthTurn(t *testing.T) {
 	reg.Register(screenshot)
 	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), reg, "medium", "", baseMaxIter, 2000, 200, nil, nil, nil)
 
-	result, _, err := loop.Run(context.Background(), "use GUI at the base budget boundary", nil, nil)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	result, _, err := loop.Run(context.Background(), "use GUI at the configured fuse boundary", nil, nil)
+	if !errors.Is(err, ErrMaxIterReached) {
+		t.Fatalf("Run error = %v, want ErrMaxIterReached", err)
 	}
-	if result != "completed after GUI activation" {
-		t.Fatalf("result = %q", result)
+	if result == "" {
+		t.Fatal("configured-fuse synthesis returned no partial report")
 	}
-	if requestCount != baseMaxIter+1 || synthesisRequests != 0 {
-		t.Fatalf("ordinary requests = %d, synthesis requests = %d; want 26 and 0", requestCount, synthesisRequests)
+	if requestCount != baseMaxIter || synthesisRequests != 1 {
+		t.Fatalf("ordinary requests = %d, synthesis requests = %d; want 25 and 1", requestCount, synthesisRequests)
 	}
 	for i, tool := range tools {
 		if got := tool.runs.Load(); got != 1 {
@@ -185,8 +188,8 @@ func TestAgentLoopIterationBoundary_GUIActivationOnNthTurn(t *testing.T) {
 		t.Fatalf("screenshot executions = %d, want 1", got)
 	}
 	status := loop.LastRunStatus()
-	if status.Partial || status.FailureCode != runstatus.CodeNone || status.IterationCount != baseMaxIter+1 {
-		t.Fatalf("run status = %+v, want clean completion at iteration %d", status, baseMaxIter+1)
+	if !status.Partial || status.FailureCode != runstatus.CodeIterationLimit || status.IterationCount != baseMaxIter {
+		t.Fatalf("run status = %+v, want partial iteration-limit at iteration %d", status, baseMaxIter)
 	}
 }
 
@@ -194,11 +197,10 @@ type approvalBoundaryTool struct{ *mockTool }
 
 func (*approvalBoundaryTool) RequiresApproval() bool { return true }
 
-// TestAgentLoopIterationBoundary_RejectedGUIRequestDoesNotExtendBudget keeps
-// the dynamic GUI allowance tied to dispatch, not merely to a model-emitted
-// tool name. Rejected calls still belong in request telemetry and loop-detector
-// history, but cannot purchase another 50 model turns without executing.
-func TestAgentLoopIterationBoundary_RejectedGUIRequestDoesNotExtendBudget(t *testing.T) {
+// TestAgentLoopIterationBoundary_RejectedGUIRequestDoesNotChangeConfiguredFuse keeps
+// rejected calls inside the same configured fuse. Tool names and admission
+// outcomes never grant extra model turns.
+func TestAgentLoopIterationBoundary_RejectedGUIRequestDoesNotChangeConfiguredFuse(t *testing.T) {
 	const baseMaxIter = 25
 	tests := []struct {
 		name      string

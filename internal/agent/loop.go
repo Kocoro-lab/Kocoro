@@ -1048,7 +1048,7 @@ type CheckpointFunc func(ctx context.Context) error
 
 func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, shannonDir string, maxIter int, resultTrunc int, argsTrunc int, perms *permissions.PermissionsConfig, auditor *audit.AuditLogger, hookRunner *hooks.HookRunner) *AgentLoop {
 	if maxIter <= 0 {
-		maxIter = 25
+		maxIter = 256
 	}
 	if resultTrunc <= 0 {
 		resultTrunc = 30000
@@ -1973,7 +1973,7 @@ func (a *AgentLoop) SetContextWindowExplicit(tokens int) {
 	a.contextWindowExplicit = true
 }
 
-// SetMaxIterations overrides the maximum number of agent loop iterations.
+// SetMaxIterations overrides the emergency agent-loop iteration fuse.
 func (a *AgentLoop) SetMaxIterations(n int) {
 	a.maxIter = n
 }
@@ -3532,7 +3532,6 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	var (
 		detector                     = NewLoopDetector()
 		toolsUsed                    = make(map[string]int) // model-requested calls; retained for detector context and telemetry
-		dispatchedTools              = make(map[string]int) // calls that passed admission and entered Tool.Run
 		totalToolCalls               int
 		lastText                     string
 		streamingText                strings.Builder // accumulates streaming deltas for cancel recovery
@@ -3588,16 +3587,16 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		latestUserText                   = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
 		cloudNudgeFired                  bool
 		cloudDelegateClaimed             bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
-		criticalLoopRecoveryIteration    = -1 // iteration of the last atomic-veto recovery turn; -1 = none yet. Quota is per trailing window (nudgeWindowIters), not per run — see the batch-veto branch.
+		criticalLoopRecoveryIteration    = -1   // iteration of the last atomic-veto recovery turn; -1 = none yet. Quota is per trailing window (nudgeWindowIters), not per run — see the batch-veto branch.
 		cloudResultContent               string // non-empty when a cloud deliverable should bypass LLM summarization
 		lastDiscoveryInput               string // dedup: skip discovery when user text hasn't changed between iterations
 		contextBloatStatusSent           bool
 
-		lastToolName    string
-		retryCount      int
-		iterationCount  int
-		stateVersions   = newStateVersionTracker()
-		lastShapedRead  = make(map[string]ShapedResult)
+		lastToolName   string
+		retryCount     int
+		iterationCount int
+		stateVersions  = newStateVersionTracker()
+		lastShapedRead = make(map[string]ShapedResult)
 
 		// Denied-call blocking: track tool+args denied by the user this turn
 		// to prevent re-prompting for the same call.
@@ -4224,8 +4223,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 
 iterationLoop:
 	for i := 0; ; i++ {
-		effectiveMax := a.effectiveMaxIter(dispatchedTools)
-		if i >= effectiveMax {
+		if i >= a.maxIter {
 			break
 		}
 		iterationCount = i + 1
@@ -4342,9 +4340,9 @@ iterationLoop:
 		// context-length-overflow recovery and are gated by reactiveCompacted.
 		_ = timeBasedCompact(messages, a.lastAssistantAt, a.timeBasedCompactCfg)
 
-		// Progress checkpoint at ~60% of effective limit
+		// Progress checkpoint at ~60% of the configured emergency fuse.
 		if !checkpointDone && totalToolCalls > 0 {
-			checkpointAt := effectiveMax * 3 / 5
+			checkpointAt := a.maxIter * 3 / 5
 			if i == checkpointAt {
 				messages = append(messages, client.Message{
 					Role:    "user",
@@ -4740,7 +4738,7 @@ iterationLoop:
 		// issuing the SAME `req` inline preserves cache identity and lets
 		// Anthropic sampling non-determinism recover the missing block.
 		// Doing this here (rather than via outer-loop `continue`) avoids:
-		//   1. burning an `i` slot of effectiveMaxIter at the cap boundary,
+		//   1. burning an `i` slot of the emergency iteration fuse at its boundary,
 		//   2. running top-of-loop mutators (compaction, injectCh drain,
 		//      timeBasedCompact, applyShortSessionTruncate) between attempts,
 		//   3. truncatedText concatenation masking the empty signal.
@@ -6236,7 +6234,6 @@ iterationLoop:
 
 			if committedStreamTools != nil {
 				if earlyResult, claimed := committedStreamTools.Claim(ctx, fc); claimed {
-					dispatchedTools[fc.Name]++
 					callMeta[idx].decision = "allow"
 					callMeta[idx].wasApproved = true
 					// NOT marked resolved: Claim only emitted OnToolCall. The
@@ -6274,9 +6271,6 @@ iterationLoop:
 				a.handler,
 				latestUserText,
 			)
-			for _, ac := range approved {
-				dispatchedTools[ac.fc.Name]++
-			}
 		}
 		if len(approved) > 0 || claimedStreamTool {
 			// Per-turn aggregate cap: even when each result is below the 50K
@@ -6834,7 +6828,7 @@ iterationLoop:
 	// branch the same way they catch the other two maxIter exit paths.
 	captureRunMessages()
 	setRunStatus(runstatus.CodeIterationLimit, true)
-	return "", usage, fmt.Errorf("agent loop exceeded %d iterations: %w", a.effectiveMaxIter(dispatchedTools), ErrMaxIterReached)
+	return "", usage, fmt.Errorf("agent loop exceeded %d iterations: %w", a.maxIter, ErrMaxIterReached)
 }
 
 // lastTextAlreadyPersisted reports whether text is already recorded in
@@ -7891,23 +7885,6 @@ func (n *nudgeWindow) recordAndCheck(iter int) bool {
 	}
 	n.recents = n.recents[:keep]
 	return len(n.recents) >= n.max
-}
-
-// effectiveMaxIter returns a dynamic iteration limit based on tools dispatched so far.
-// GUI tasks get a higher limit since screenshot→action loops are normal.
-// Uses isGUIToolName so playwright MCP tools (browser_navigate, browser_snapshot,
-// …) share the same higher budget as the literal GUITools set — otherwise a
-// multi-page web task would hit the default iteration cap mid-flow.
-func (a *AgentLoop) effectiveMaxIter(dispatchedTools map[string]int) int {
-	for name := range dispatchedTools {
-		if isGUIToolName(name) {
-			if a.maxIter < 75 {
-				return 75
-			}
-			return a.maxIter
-		}
-	}
-	return a.maxIter
 }
 
 // filterOldImages replaces image blocks in old messages with text placeholders,

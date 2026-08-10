@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,20 @@ func findBackup(t *testing.T, dir string) string {
 	return ""
 }
 
+func findMaxIterationsBackup(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "config.yaml.pre-migrate-max-iterations-") {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
+}
+
 func markerApplied(t *testing.T, dir, id string) bool {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(dir, migrationsFileName))
@@ -68,7 +83,7 @@ endpoint: https://api-dev.shannon.run
 	got := readFile(t, configPath)
 	const want = `agent:
     context_window: 200000
-    max_iterations: 25
+    max_iterations: 256
 endpoint: https://api-dev.shannon.run
 `
 	if got != want {
@@ -86,13 +101,16 @@ endpoint: https://api-dev.shannon.run
 	if !markerApplied(t, dir, migrationIDContextWindow128To200) {
 		t.Fatal("expected migration marker to be recorded")
 	}
+	if !markerApplied(t, dir, migrationIDMaxIterationsToFuse) {
+		t.Fatal("expected max-iterations migration marker to be recorded")
+	}
 }
 
 func TestMigrate_ValueNotTarget_NoOpButMarked(t *testing.T) {
 	dir := t.TempDir()
 	const input = `agent:
     context_window: 64000
-    max_iterations: 25
+    max_iterations: 256
 `
 	configPath := writeYAML(t, dir, input)
 
@@ -187,7 +205,7 @@ api_key: ""
 	}
 }
 
-// Verify that ONLY the targeted line changes — comments, key order,
+// Verify that ONLY the targeted values change — comments, key order,
 // trailing whitespace, and unrelated values must remain byte-for-byte.
 func TestMigrate_PreservesFormatting(t *testing.T) {
 	dir := t.TempDir()
@@ -213,7 +231,7 @@ endpoint: https://api-dev.shannon.run
 
 agent:
     # nested comment
-    max_iterations: 25
+    max_iterations: 256
     context_window: 200000  # old default
     temperature: 0.5
 mcp_servers:
@@ -232,7 +250,7 @@ func TestMigrate_TopLevelKeyNotMatched(t *testing.T) {
 	dir := t.TempDir()
 	const input = `context_window: 128000
 agent:
-    max_iterations: 25
+    max_iterations: 256
 `
 	configPath := writeYAML(t, dir, input)
 
@@ -240,6 +258,67 @@ agent:
 
 	if got := readFile(t, configPath); got != input {
 		t.Fatalf("top-level context_window must not be rewritten (no `agent:` parent)\nwant:\n%s\ngot:\n%s", input, got)
+	}
+}
+
+func TestMigrate_MaxIterationsOverridesConfiguredValue(t *testing.T) {
+	for _, configured := range []int{1, 25, 40, 999} {
+		t.Run(fmt.Sprintf("configured_%d", configured), func(t *testing.T) {
+			dir := t.TempDir()
+			input := fmt.Sprintf("agent:\n    max_iterations: %d  # hidden legacy value\n    temperature: 0.5\n", configured)
+			configPath := writeYAML(t, dir, input)
+
+			changed, err := (&maxIterationsToEmergencyFuseMigration{}).Apply(dir)
+			if err != nil {
+				t.Fatalf("apply migration: %v", err)
+			}
+			if !changed {
+				t.Fatal("expected configured value to be replaced")
+			}
+			want := "agent:\n    max_iterations: 256  # hidden legacy value\n    temperature: 0.5\n"
+			if got := readFile(t, configPath); got != want {
+				t.Fatalf("yaml mismatch\nwant:\n%s\ngot:\n%s", want, got)
+			}
+			backup := findMaxIterationsBackup(t, dir)
+			if backup == "" {
+				t.Fatal("expected max-iterations backup")
+			}
+			if got := readFile(t, backup); got != input {
+				t.Fatalf("backup mismatch\nwant:\n%s\ngot:\n%s", input, got)
+			}
+		})
+	}
+}
+
+func TestMigrate_MaxIterationsCurrentDefaultNoOp(t *testing.T) {
+	dir := t.TempDir()
+	const input = "agent:\n    max_iterations: 256\n"
+	configPath := writeYAML(t, dir, input)
+
+	changed, err := (&maxIterationsToEmergencyFuseMigration{}).Apply(dir)
+	if err != nil {
+		t.Fatalf("apply migration: %v", err)
+	}
+	if changed {
+		t.Fatal("current default must be a no-op")
+	}
+	if got := readFile(t, configPath); got != input {
+		t.Fatalf("yaml changed\nwant:\n%s\ngot:\n%s", input, got)
+	}
+	if findMaxIterationsBackup(t, dir) != "" {
+		t.Fatal("no backup expected for a no-op")
+	}
+}
+
+func TestReplaceAgentIntLine_DoesNotTouchOtherSections(t *testing.T) {
+	in := []byte("custom:\n    max_iterations: 3\nagent:\n    max_iterations: 3\nother:\n    max_iterations: 3\n")
+	want := "custom:\n    max_iterations: 3\nagent:\n    max_iterations: 256\nother:\n    max_iterations: 3\n"
+	out, ok := replaceAgentIntLine(in, "max_iterations", 3, 256)
+	if !ok {
+		t.Fatal("expected replacement")
+	}
+	if string(out) != want {
+		t.Fatalf("scoped replacement mismatch\nwant:\n%s\ngot:\n%s", want, out)
 	}
 }
 

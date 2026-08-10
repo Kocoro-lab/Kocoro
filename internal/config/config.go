@@ -17,7 +17,11 @@ import (
 )
 
 const (
-	DefaultAgentMaxIterations = 40
+	// DefaultAgentMaxIterations is an emergency fuse, not a normal completion
+	// budget. Progress, errors, cancellation, and resource watchdogs should end
+	// ordinary runs well before this point. Operators can lower it per agent when
+	// a bounded environment needs a stricter cost ceiling.
+	DefaultAgentMaxIterations = 256
 	DefaultAgentMaxTokens     = 0
 )
 
@@ -472,9 +476,10 @@ func Load() (*Config, error) {
 	viper.SetDefault("api_key", "")
 	viper.SetDefault("model_tier", "medium")
 	viper.SetDefault("auto_update_check", true)
-	// agent.max_iterations: bumped 25 → 40 — typical "refactor 12 files" or
-	// "batch-process 20 attachments" tasks routinely need >25 iterations.
-	// User-configurable per agent; this is just the default.
+	// agent.max_iterations is a high emergency fuse, not the normal task budget.
+	// Long, demonstrably progressing workflows may legitimately require dozens
+	// of model/tool rounds; loop detection, watchdogs, cancellation, and context
+	// budgeting are the primary controls. User-configurable per agent.
 	viper.SetDefault("agent.max_iterations", DefaultAgentMaxIterations)
 	viper.SetDefault("agent.system_event_cap", 20)
 	viper.SetDefault("agent.reply_route_index_cap", 256)

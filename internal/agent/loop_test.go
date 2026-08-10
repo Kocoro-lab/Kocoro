@@ -1105,38 +1105,15 @@ func TestTopTools(t *testing.T) {
 	})
 }
 
-func TestEffectiveMaxIter(t *testing.T) {
-	a := &AgentLoop{maxIter: 25}
-
-	// No GUI tools: use default
-	if got := a.effectiveMaxIter(map[string]int{"bash": 3}); got != 25 {
-		t.Errorf("coding tasks: expected 25, got %d", got)
+func TestNewAgentLoop_DefaultsToEmergencyIterationFuse(t *testing.T) {
+	loop := NewAgentLoop(nil, nil, "medium", "", 0, 0, 0, nil, nil, nil)
+	if got := loop.MaxIterations(); got != 256 {
+		t.Fatalf("default max iterations = %d, want emergency fuse 256", got)
 	}
 
-	// GUI tool present: bump to 75
-	if got := a.effectiveMaxIter(map[string]int{"screenshot": 1, "bash": 2}); got != 75 {
-		t.Errorf("GUI tasks: expected 75, got %d", got)
-	}
-
-	// User set high limit: keep it
-	a.maxIter = 100
-	if got := a.effectiveMaxIter(map[string]int{"screenshot": 1}); got != 100 {
-		t.Errorf("high user limit: expected 100, got %d", got)
-	}
-
-	// Empty toolsUsed: use default
-	a.maxIter = 25
-	if got := a.effectiveMaxIter(map[string]int{}); got != 25 {
-		t.Errorf("empty tools: expected 25, got %d", got)
-	}
-
-	// Playwright MCP browser_* tools: bump to 75 via isGUIToolName prefix match.
-	// The loop detector already covered browser_* via isGUIToolName but
-	// effectiveMaxIter was still reading the literal GUITools map, so real
-	// playwright workflows never got the higher iteration budget.
-	a.maxIter = 25
-	if got := a.effectiveMaxIter(map[string]int{"browser_navigate": 1, "browser_snapshot": 2}); got != 75 {
-		t.Errorf("playwright browser_* tasks: expected 75, got %d", got)
+	loop.SetMaxIterations(12)
+	if got := loop.MaxIterations(); got != 12 {
+		t.Fatalf("explicit max iterations = %d, want 12", got)
 	}
 }
 

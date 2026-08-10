@@ -47,7 +47,7 @@ const (
 
 	fastLongChainSteps              = 56
 	fastLongChainExpectedIterations = fastLongChainSteps + 1
-	fastLongChainMaxIterations      = 64
+	fastLongChainMaxIterations      = config.DefaultAgentMaxIterations
 	fastLongChainMaxTokens          = 700
 	fastLongChainSmokeRepetitions   = 3
 	fastLongChainReleaseRepetitions = 15

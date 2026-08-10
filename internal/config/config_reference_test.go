@@ -18,7 +18,7 @@ func TestConfigReferenceTracksAgentDefaults(t *testing.T) {
 	wants := []string{
 		fmt.Sprintf("max_iterations: %d", DefaultAgentMaxIterations),
 		fmt.Sprintf("max_tokens: %d", DefaultAgentMaxTokens),
-		"max model/tool iterations per turn",
+		"emergency model/tool-round fuse",
 		"resolve from the selected model",
 	}
 	for _, want := range wants {
