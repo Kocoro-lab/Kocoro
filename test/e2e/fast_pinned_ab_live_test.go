@@ -16,12 +16,17 @@ package e2e
 //
 // Run:
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 go test ./test/e2e/ -run TestLive_FastPinnedVsFullAB -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 go test ./test/e2e/ -run TestLive_FastPinnedVsFullAB -timeout 60m -v
+//
+// Release qualification:
+//
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 KOCORO_FAST_PINNED_AB_SAMPLE=release KOCORO_FAST_PINNED_AB_REPETITIONS=15 go test ./test/e2e/ -run TestLive_FastPinnedVsFullAB -timeout 60m -v
 
 import (
 	"context"
-	"fmt"
 	"encoding/json"
+	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -34,15 +39,17 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	agentsapi "github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
 const (
-	fastPinnedABGateEnv    = "KOCORO_FAST_PINNED_AB"
-	fastPinnedABRepsEnv    = "KOCORO_FAST_PINNED_AB_REPETITIONS"
-	fastPinnedABOutputEnv  = "KOCORO_FAST_PINNED_AB_OUTPUT"
+	fastPinnedABGateEnv   = "KOCORO_FAST_PINNED_AB"
+	fastPinnedABRepsEnv   = "KOCORO_FAST_PINNED_AB_REPETITIONS"
+	fastPinnedABOutputEnv = "KOCORO_FAST_PINNED_AB_OUTPUT"
+	fastPinnedABSampleEnv = "KOCORO_FAST_PINNED_AB_SAMPLE"
 	// Runtime model id for the Full control arm — the same control the
 	// 420-run qualification lane uses (koeQualificationSonnetModel). This is
 	// request configuration, not a tooling reference.
@@ -50,6 +57,59 @@ const (
 	fastPinnedABMaxCostUSD = 5.0
 	fastPinnedABSeed       = int64(20260810)
 )
+
+type fastPinnedCacheOffClient struct {
+	inner client.LLMClient
+
+	mu       sync.Mutex
+	requests int
+	cached   bool
+}
+
+func (c *fastPinnedCacheOffClient) Complete(
+	ctx context.Context,
+	req client.CompletionRequest,
+) (*client.CompletionResponse, error) {
+	req.ResponseCachePolicy = executionprofile.ResponseCacheOff
+	resp, err := c.inner.Complete(ctx, req)
+	c.record(resp)
+	return resp, err
+}
+
+func (c *fastPinnedCacheOffClient) CompleteStream(
+	ctx context.Context,
+	req client.CompletionRequest,
+	onDelta func(client.StreamDelta),
+) (*client.CompletionResponse, error) {
+	req.ResponseCachePolicy = executionprofile.ResponseCacheOff
+	resp, err := c.inner.CompleteStream(ctx, req, onDelta)
+	c.record(resp)
+	return resp, err
+}
+
+func (c *fastPinnedCacheOffClient) record(resp *client.CompletionResponse) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.requests++
+	if resp != nil && resp.Cached {
+		c.cached = true
+	}
+}
+
+func (c *fastPinnedCacheOffClient) observations() (isolated bool, cached bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.requests > 0 && !c.cached, c.cached
+}
+
+func fastPinnedTrialID(seed int64, caseName string, repetition int) string {
+	return fmt.Sprintf("%d/%s/%02d", seed, caseName, repetition)
+}
+
+func fastPinnedTrialPrompt(prompt, trialID string) string {
+	return prompt + "\n\nEvaluation trial ID: " + trialID +
+		". This marker only separates independent evaluation samples; do not mention it in the answer."
+}
 
 // fastABHandler auto-approves tool calls (file tools all require approval)
 // and counts per-tool invocations for the validators.
@@ -67,14 +127,14 @@ func (h *fastABHandler) OnToolCall(name, _ string, _ string) {
 	h.toolCalls[name]++
 }
 func (h *fastABHandler) OnToolResult(string, string, string, agent.ToolResult, time.Duration) {}
-func (h *fastABHandler) OnText(string)                                                       {}
-func (h *fastABHandler) OnPreamble(string)                                                   {}
-func (h *fastABHandler) OnStreamDelta(string)                                                {}
-func (h *fastABHandler) OnApprovalNeeded(string, string) bool                                { return true }
-func (h *fastABHandler) OnUsage(agent.TurnUsage)                                             {}
-func (h *fastABHandler) OnCloudAgent(string, string, string)                                 {}
-func (h *fastABHandler) OnCloudProgress(int, int)                                            {}
-func (h *fastABHandler) OnCloudPlan(string, string, bool)                                    {}
+func (h *fastABHandler) OnText(string)                                                        {}
+func (h *fastABHandler) OnPreamble(string)                                                    {}
+func (h *fastABHandler) OnStreamDelta(string)                                                 {}
+func (h *fastABHandler) OnApprovalNeeded(string, string) bool                                 { return true }
+func (h *fastABHandler) OnUsage(agent.TurnUsage)                                              {}
+func (h *fastABHandler) OnCloudAgent(string, string, string)                                  {}
+func (h *fastABHandler) OnCloudProgress(int, int)                                             {}
+func (h *fastABHandler) OnCloudPlan(string, string, bool)                                     {}
 
 func (h *fastABHandler) count(name string) int {
 	h.mu.Lock()
@@ -336,14 +396,77 @@ type fastABRun struct {
 	Case          string   `json:"case"`
 	Arm           string   `json:"arm"`
 	Repetition    int      `json:"repetition"`
+	TrialID       string   `json:"trial_id"`
+	CachePolicy   string   `json:"response_cache_policy"`
+	Cached        bool     `json:"cached"`
 	Correct       bool     `json:"correct"`
 	Failures      []string `json:"failures,omitempty"`
 	LatencyMillis int64    `json:"latency_millis"`
 	LLMCalls      int      `json:"llm_calls"`
 	InputTokens   int      `json:"input_tokens"`
 	OutputTokens  int      `json:"output_tokens"`
+	TotalTokens   int      `json:"total_tokens"`
 	CostUSD       float64  `json:"cost_usd"`
+	UsageObserved bool     `json:"usage_observed"`
+	CostObserved  bool     `json:"cost_observed"`
 	Answer        string   `json:"answer"`
+}
+
+type fastPinnedCellSummary struct {
+	Case         string  `json:"case"`
+	Arm          string  `json:"arm"`
+	Runs         int     `json:"runs"`
+	CorrectRuns  int     `json:"correct_runs"`
+	MedianMillis int64   `json:"median_ms"`
+	P90Millis    int64   `json:"p90_ms"`
+	MeanLLMCalls float64 `json:"mean_llm_calls"`
+	CostUSD      float64 `json:"cost_usd"`
+}
+
+type fastPinnedArmSummary struct {
+	Arm                     string   `json:"arm"`
+	Complete                bool     `json:"complete"`
+	Scheduled               int      `json:"scheduled"`
+	Completed               int      `json:"completed"`
+	Correct                 bool     `json:"correct"`
+	CorrectRuns             int      `json:"correct_runs"`
+	UsageObserved           bool     `json:"usage_observed"`
+	CostObserved            bool     `json:"cost_observed"`
+	CacheIsolationObserved  bool     `json:"cache_isolation_observed"`
+	TerminalAnswersObserved bool     `json:"terminal_answers_observed"`
+	ObservabilityObserved   bool     `json:"observability_observed"`
+	TotalCostUSD            float64  `json:"total_cost_usd"`
+	ComparisonQualifying    bool     `json:"comparison_qualifying"`
+	ReleaseQualifying       bool     `json:"release_qualifying"`
+	QualificationFailures   []string `json:"qualification_failures"`
+}
+
+type fastPinnedQualificationReport struct {
+	SchemaVersion                string                  `json:"schema_version"`
+	GeneratedAt                  string                  `json:"generated_at"`
+	Complete                     bool                    `json:"complete"`
+	Sample                       string                  `json:"sample"`
+	RepetitionsPerCell           int                     `json:"repetitions_per_cell"`
+	MinimumComparisonRepetitions int                     `json:"minimum_comparison_repetitions"`
+	MinimumReleaseRepetitions    int                     `json:"minimum_release_repetitions"`
+	Seed                         int64                   `json:"seed"`
+	Scheduled                    int                     `json:"scheduled"`
+	Completed                    int                     `json:"completed"`
+	CorrectRuns                  int                     `json:"correct_runs"`
+	UsageObserved                bool                    `json:"usage_observed"`
+	CostObserved                 bool                    `json:"cost_observed"`
+	CacheIsolationObserved       bool                    `json:"cache_isolation_observed"`
+	TerminalAnswersObserved      bool                    `json:"terminal_answers_observed"`
+	ComparisonQualifying         bool                    `json:"comparison_qualifying"`
+	ReleaseQualifying            bool                    `json:"release_qualifying"`
+	FastReleaseQualifying        bool                    `json:"fast_release_qualifying"`
+	FullReleaseQualifying        bool                    `json:"full_release_qualifying"`
+	TotalCostUSD                 float64                 `json:"total_cost_usd"`
+	MaxCostUSD                   float64                 `json:"max_cost_usd"`
+	Arms                         []fastPinnedArmSummary  `json:"arms"`
+	Cells                        []fastPinnedCellSummary `json:"cells"`
+	QualificationFailures        []string                `json:"qualification_failures"`
+	Runs                         []fastABRun             `json:"runs"`
 }
 
 func TestLive_FastPinnedVsFullAB(t *testing.T) {
@@ -364,6 +487,7 @@ func TestLive_FastPinnedVsFullAB(t *testing.T) {
 		}
 		repetitions = value
 	}
+	sample := fastPinnedSample(t, fastPinnedABSampleEnv, repetitions)
 
 	// Resolve the Fast profile once, exactly like the daemon admission path.
 	resolveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -399,18 +523,19 @@ func TestLive_FastPinnedVsFullAB(t *testing.T) {
 	var results []fastABRun
 	totalCost := 0.0
 	for _, jb := range jobs {
-		if totalCost > fastPinnedABMaxCostUSD {
-			t.Fatalf("cost ceiling %.2f USD exceeded at %.4f — aborting", fastPinnedABMaxCostUSD, totalCost)
-		}
 		tc := cases[jb.caseIndex]
 		run := runFastABJob(t, provider, fastProfile, tc, jb.arm, jb.repetition)
 		totalCost += run.CostUSD
 		results = append(results, run)
 		t.Logf("fast_ab case=%s arm=%s rep=%d correct=%v failures=%v latency_ms=%d llm_calls=%d cost=%.6f",
 			run.Case, run.Arm, run.Repetition, run.Correct, run.Failures, run.LatencyMillis, run.LLMCalls, run.CostUSD)
+		if totalCost > fastPinnedABMaxCostUSD {
+			t.Logf("cost ceiling %.2f USD exceeded at %.4f — stopping with an incomplete report", fastPinnedABMaxCostUSD, totalCost)
+			break
+		}
 	}
 
-	summarizeFastAB(t, results, repetitions, totalCost)
+	summarizeFastAB(t, results, repetitions, totalCost, sample)
 }
 
 func runFastABJob(
@@ -423,7 +548,8 @@ func runFastABJob(
 ) fastABRun {
 	t.Helper()
 	dir := t.TempDir()
-	prompt := tc.setup(t, dir)
+	trialID := fastPinnedTrialID(fastPinnedABSeed, tc.name, repetition)
+	prompt := fastPinnedTrialPrompt(tc.setup(t, dir), trialID)
 
 	registry := agent.NewToolRegistry()
 	registry.Register(&tools.FileReadTool{})
@@ -437,7 +563,8 @@ func runFastABJob(
 		registry.Register(probe)
 	}
 
-	loop := agent.NewAgentLoop(provider, registry, "medium", dir, 12, 30_000, 200, nil, nil, nil)
+	cacheOffProvider := &fastPinnedCacheOffClient{inner: provider}
+	loop := agent.NewAgentLoop(cacheOffProvider, registry, "medium", dir, 12, 30_000, 200, nil, nil, nil)
 	loop.SetCacheSource("fast_pinned_ab")
 	loop.SetSkillDiscovery(false)
 	loop.SetMaxTokens(1200)
@@ -459,8 +586,16 @@ func runFastABJob(
 	answer, usage, err := loop.Run(ctx, prompt, nil, nil)
 	run := fastABRun{
 		Case: tc.name, Arm: arm, Repetition: repetition,
+		TrialID:       trialID,
 		LatencyMillis: time.Since(started).Milliseconds(),
 		Answer:        strings.TrimSpace(answer),
+	}
+	cacheIsolated, cached := cacheOffProvider.observations()
+	run.Cached = cached
+	if cacheIsolated {
+		run.CachePolicy = string(executionprofile.ResponseCacheOff)
+	} else {
+		run.Failures = append(run.Failures, "response_cache_not_isolated")
 	}
 	if err != nil {
 		run.Failures = append(run.Failures, "loop_error:"+err.Error())
@@ -469,86 +604,355 @@ func runFastABJob(
 		run.LLMCalls = usage.LLMCalls
 		run.InputTokens = usage.InputTokens
 		run.OutputTokens = usage.OutputTokens
+		run.TotalTokens = usage.TotalTokens
 		run.CostUSD = usage.CostUSD
+		run.UsageObserved = usage.LLMCalls > 0 && usage.TotalTokens > 0
+		run.CostObserved = usage.LLMCalls > 0 && usage.CostUSD > 0
+	}
+	if !run.UsageObserved {
+		run.Failures = append(run.Failures, "usage_not_observed")
+	}
+	if !run.CostObserved {
+		run.Failures = append(run.Failures, "cost_not_observed")
+	}
+	if run.Answer == "" {
+		run.Failures = append(run.Failures, "terminal_answer_missing")
 	}
 	run.Failures = append(run.Failures, tc.validate(run.Answer, dir, handler, probe)...)
 	run.Correct = len(run.Failures) == 0
 	return run
 }
 
-func summarizeFastAB(t *testing.T, results []fastABRun, repetitions int, totalCost float64) {
+func summarizeFastAB(t *testing.T, results []fastABRun, repetitions int, totalCost float64, sample string) {
 	t.Helper()
-	type agg struct {
-		correct, total int
-		latencies      []int64
-		cost           float64
-		llmCalls       int
+	caseNames := make([]string, 0, len(fastPinnedABCases()))
+	for _, tc := range fastPinnedABCases() {
+		caseNames = append(caseNames, tc.name)
 	}
-	byArm := map[string]*agg{}
-	byCell := map[string]*agg{}
-	for _, r := range results {
-		for _, key := range []string{r.Arm, r.Case + "/" + r.Arm} {
-			m := byArm
-			if strings.Contains(key, "/") {
-				m = byCell
-			}
-			a := m[key]
-			if a == nil {
-				a = &agg{}
-				m[key] = a
-			}
-			a.total++
-			if r.Correct {
-				a.correct++
-			}
-			a.latencies = append(a.latencies, r.LatencyMillis)
-			a.cost += r.CostUSD
-			a.llmCalls += r.LLMCalls
-		}
+	report := newFastPinnedQualificationReport(
+		"kocoro.fast_pinned_ab.v3", fastPinnedABSeed, sample, repetitions,
+		caseNames, results, totalCost, fastPinnedABMaxCostUSD,
+	)
+	for _, cell := range report.Cells {
+		t.Logf("cell %-32s correct=%d/%d median_ms=%d p90_ms=%d mean_llm_calls=%.1f total_cost=%.6f",
+			cell.Case+"/"+cell.Arm, cell.CorrectRuns, cell.Runs,
+			cell.MedianMillis, cell.P90Millis, cell.MeanLLMCalls, cell.CostUSD)
 	}
-	median := func(v []int64) int64 {
-		if len(v) == 0 {
-			return 0
-		}
-		sorted := append([]int64(nil), v...)
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-		return sorted[len(sorted)/2]
-	}
-	var cellKeys []string
-	for k := range byCell {
-		cellKeys = append(cellKeys, k)
-	}
-	sort.Strings(cellKeys)
-	for _, k := range cellKeys {
-		a := byCell[k]
-		t.Logf("cell %-32s correct=%d/%d median_ms=%d mean_cost=%.6f", k, a.correct, a.total, median(a.latencies), a.cost/float64(a.total))
-	}
-	for _, armName := range []string{"fast", "full"} {
-		a := byArm[armName]
-		if a == nil {
-			continue
-		}
-		t.Logf("ARM %-4s correct=%d/%d median_ms=%d total_cost=%.6f mean_llm_calls=%.1f",
-			armName, a.correct, a.total, median(a.latencies), a.cost, float64(a.llmCalls)/float64(a.total))
-	}
-	t.Logf("fast_pinned_ab complete runs=%d repetitions=%d total_cost=%.6f", len(results), repetitions, totalCost)
+	t.Logf("fast_pinned_ab complete=%t runs=%d repetitions=%d comparison_qualifying=%t release_qualifying=%t total_cost=%.6f",
+		report.Complete, len(results), repetitions, report.ComparisonQualifying, report.ReleaseQualifying, totalCost)
 
 	outputPath := strings.TrimSpace(os.Getenv(fastPinnedABOutputEnv))
 	if outputPath == "" {
 		outputPath = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-fast-pinned-ab-%d.json", fastPinnedABSeed))
 	}
-	body, err := json.MarshalIndent(map[string]any{
-		"schema_version": "kocoro.fast_pinned_ab.v1",
-		"seed":           fastPinnedABSeed,
-		"repetitions":    repetitions,
-		"total_cost_usd": totalCost,
-		"runs":           results,
-	}, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal report: %v", err)
-	}
-	if err := os.WriteFile(outputPath, append(body, '\n'), 0o644); err != nil {
+	if err := writeFastPinnedQualificationReport(outputPath, report); err != nil {
 		t.Fatalf("write report: %v", err)
 	}
 	t.Logf("report=%s", outputPath)
+	assertFastPinnedQualification(t, report, outputPath)
+}
+
+func fastPinnedSample(t *testing.T, envName string, repetitions int) string {
+	t.Helper()
+	sample := strings.TrimSpace(os.Getenv(envName))
+	if sample == "" {
+		sample = "smoke"
+	}
+	if sample != "smoke" && sample != "release" {
+		t.Fatalf("%s must be smoke or release", envName)
+	}
+	minimum := agentLabQualityComparisonRepetitions
+	if sample == "release" {
+		minimum = agentLabQualityReleaseRepetitions
+	}
+	if repetitions < minimum {
+		t.Fatalf("%s=%s requires repetitions >= %d", envName, sample, minimum)
+	}
+	return sample
+}
+
+func newFastPinnedQualificationReport(
+	schemaVersion string,
+	seed int64,
+	sample string,
+	repetitions int,
+	caseNames []string,
+	results []fastABRun,
+	totalCost float64,
+	maxCost float64,
+) fastPinnedQualificationReport {
+	type armState struct {
+		summary            fastPinnedArmSummary
+		structuralFailures []string
+	}
+	report := fastPinnedQualificationReport{
+		SchemaVersion:                schemaVersion,
+		GeneratedAt:                  time.Now().UTC().Format(time.RFC3339Nano),
+		Sample:                       sample,
+		RepetitionsPerCell:           repetitions,
+		MinimumComparisonRepetitions: agentLabQualityComparisonRepetitions,
+		MinimumReleaseRepetitions:    agentLabQualityReleaseRepetitions,
+		Seed:                         seed,
+		Scheduled:                    len(caseNames) * 2 * repetitions,
+		Completed:                    len(results),
+		UsageObserved:                len(results) > 0,
+		CostObserved:                 len(results) > 0,
+		CacheIsolationObserved:       len(results) > 0,
+		TerminalAnswersObserved:      len(results) > 0,
+		TotalCostUSD:                 totalCost,
+		MaxCostUSD:                   maxCost,
+		Runs:                         append([]fastABRun(nil), results...),
+	}
+	armStates := map[string]*armState{}
+	for _, arm := range []string{"fast", "full"} {
+		armStates[arm] = &armState{summary: fastPinnedArmSummary{
+			Arm: arm, Scheduled: len(caseNames) * repetitions,
+			UsageObserved: true, CostObserved: true,
+			CacheIsolationObserved: true, TerminalAnswersObserved: true,
+		}}
+	}
+	type cellState struct {
+		summary     fastPinnedCellSummary
+		repetitions map[int]bool
+		latencies   []int64
+		llmCalls    int
+	}
+	expected := make(map[string]*cellState, len(caseNames)*2)
+	for _, caseName := range caseNames {
+		for _, arm := range []string{"fast", "full"} {
+			key := caseName + "/" + arm
+			expected[key] = &cellState{
+				summary:     fastPinnedCellSummary{Case: caseName, Arm: arm},
+				repetitions: make(map[int]bool, repetitions),
+			}
+		}
+	}
+	for _, run := range results {
+		arm := armStates[run.Arm]
+		if arm != nil {
+			arm.summary.Completed++
+			arm.summary.TotalCostUSD += run.CostUSD
+			if run.Correct {
+				arm.summary.CorrectRuns++
+			}
+			if !run.UsageObserved {
+				arm.summary.UsageObserved = false
+			}
+			if !run.CostObserved {
+				arm.summary.CostObserved = false
+			}
+			if run.CachePolicy != string(executionprofile.ResponseCacheOff) || run.Cached {
+				arm.summary.CacheIsolationObserved = false
+			}
+			if strings.TrimSpace(run.Answer) == "" {
+				arm.summary.TerminalAnswersObserved = false
+			}
+		}
+		if run.Correct {
+			report.CorrectRuns++
+		}
+		if !run.UsageObserved {
+			report.UsageObserved = false
+		}
+		if !run.CostObserved {
+			report.CostObserved = false
+		}
+		if run.CachePolicy != string(executionprofile.ResponseCacheOff) || run.Cached {
+			report.CacheIsolationObserved = false
+		}
+		wantTrialID := fastPinnedTrialID(seed, run.Case, run.Repetition)
+		if run.TrialID != wantTrialID {
+			failure := fmt.Sprintf("trial_id_mismatch:%s/%s:%d", run.Case, run.Arm, run.Repetition)
+			report.QualificationFailures = append(report.QualificationFailures, failure)
+			if arm != nil {
+				arm.structuralFailures = append(arm.structuralFailures, failure)
+			}
+		}
+		if strings.TrimSpace(run.Answer) == "" {
+			report.TerminalAnswersObserved = false
+		}
+		key := run.Case + "/" + run.Arm
+		cell := expected[key]
+		if cell == nil {
+			failure := "unexpected_cell:" + key
+			report.QualificationFailures = append(report.QualificationFailures, failure)
+			if arm != nil {
+				arm.structuralFailures = append(arm.structuralFailures, failure)
+			}
+			continue
+		}
+		cell.summary.Runs++
+		cell.summary.CostUSD += run.CostUSD
+		cell.latencies = append(cell.latencies, run.LatencyMillis)
+		cell.llmCalls += run.LLMCalls
+		if run.Correct {
+			cell.summary.CorrectRuns++
+		}
+		if run.Repetition < 1 || run.Repetition > repetitions {
+			failure := fmt.Sprintf("invalid_repetition:%s:%d", key, run.Repetition)
+			report.QualificationFailures = append(report.QualificationFailures, failure)
+			if arm != nil {
+				arm.structuralFailures = append(arm.structuralFailures, failure)
+			}
+		} else if cell.repetitions[run.Repetition] {
+			failure := fmt.Sprintf("duplicate_repetition:%s:%d", key, run.Repetition)
+			report.QualificationFailures = append(report.QualificationFailures, failure)
+			if arm != nil {
+				arm.structuralFailures = append(arm.structuralFailures, failure)
+			}
+		} else {
+			cell.repetitions[run.Repetition] = true
+		}
+	}
+	cellKeys := make([]string, 0, len(expected))
+	for key := range expected {
+		cellKeys = append(cellKeys, key)
+	}
+	sort.Strings(cellKeys)
+	for _, key := range cellKeys {
+		cell := expected[key]
+		cell.summary.MedianMillis = fastPinnedMedian(cell.latencies)
+		cell.summary.P90Millis = fastPinnedPercentile(cell.latencies, 0.90)
+		if cell.summary.Runs > 0 {
+			cell.summary.MeanLLMCalls = float64(cell.llmCalls) / float64(cell.summary.Runs)
+		}
+		report.Cells = append(report.Cells, cell.summary)
+		if cell.summary.Runs != repetitions || len(cell.repetitions) != repetitions {
+			failure := fmt.Sprintf("incomplete_cell:%s:%d/%d", key, len(cell.repetitions), repetitions)
+			report.QualificationFailures = append(report.QualificationFailures, failure)
+			armStates[cell.summary.Arm].structuralFailures = append(
+				armStates[cell.summary.Arm].structuralFailures, failure)
+		}
+	}
+	if report.Completed != report.Scheduled {
+		report.QualificationFailures = append(report.QualificationFailures,
+			fmt.Sprintf("incomplete_schedule:%d/%d", report.Completed, report.Scheduled))
+	}
+	report.Complete = len(report.QualificationFailures) == 0
+	if report.CorrectRuns != report.Completed {
+		report.QualificationFailures = append(report.QualificationFailures,
+			fmt.Sprintf("incorrect_runs:%d/%d", report.CorrectRuns, report.Completed))
+	}
+	if !report.UsageObserved {
+		report.QualificationFailures = append(report.QualificationFailures, "usage_not_observed")
+	}
+	if !report.CostObserved {
+		report.QualificationFailures = append(report.QualificationFailures, "cost_not_observed")
+	}
+	if !report.CacheIsolationObserved {
+		report.QualificationFailures = append(report.QualificationFailures, "response_cache_not_isolated")
+	}
+	if !report.TerminalAnswersObserved {
+		report.QualificationFailures = append(report.QualificationFailures, "terminal_answer_missing")
+	}
+	if report.TotalCostUSD > report.MaxCostUSD {
+		report.QualificationFailures = append(report.QualificationFailures, "cost_ceiling_exceeded")
+	}
+	for _, armName := range []string{"fast", "full"} {
+		state := armStates[armName]
+		arm := &state.summary
+		if arm.Completed == 0 {
+			arm.UsageObserved = false
+			arm.CostObserved = false
+			arm.CacheIsolationObserved = false
+			arm.TerminalAnswersObserved = false
+		}
+		if arm.Completed != arm.Scheduled {
+			state.structuralFailures = append(state.structuralFailures,
+				fmt.Sprintf("incomplete_schedule:%s:%d/%d", armName, arm.Completed, arm.Scheduled))
+		}
+		arm.Complete = len(state.structuralFailures) == 0
+		arm.QualificationFailures = append(arm.QualificationFailures, state.structuralFailures...)
+		arm.Correct = arm.Complete && arm.Completed > 0 && arm.CorrectRuns == arm.Completed
+		if arm.CorrectRuns != arm.Completed {
+			arm.QualificationFailures = append(arm.QualificationFailures,
+				fmt.Sprintf("incorrect_runs:%s:%d/%d", armName, arm.CorrectRuns, arm.Completed))
+		}
+		if !arm.UsageObserved {
+			arm.QualificationFailures = append(arm.QualificationFailures, "usage_not_observed:"+armName)
+		}
+		if !arm.CostObserved {
+			arm.QualificationFailures = append(arm.QualificationFailures, "cost_not_observed:"+armName)
+		}
+		if !arm.CacheIsolationObserved {
+			arm.QualificationFailures = append(arm.QualificationFailures, "response_cache_not_isolated:"+armName)
+		}
+		if !arm.TerminalAnswersObserved {
+			arm.QualificationFailures = append(arm.QualificationFailures, "terminal_answer_missing:"+armName)
+		}
+		arm.ObservabilityObserved = arm.UsageObserved && arm.CostObserved &&
+			arm.CacheIsolationObserved && arm.TerminalAnswersObserved
+		allArmValid := arm.Complete && arm.Correct && arm.ObservabilityObserved &&
+			report.TotalCostUSD <= report.MaxCostUSD
+		arm.ComparisonQualifying = allArmValid && repetitions >= report.MinimumComparisonRepetitions
+		arm.ReleaseQualifying = sample == "release" && allArmValid &&
+			repetitions >= report.MinimumReleaseRepetitions
+		report.Arms = append(report.Arms, *arm)
+		switch armName {
+		case "fast":
+			report.FastReleaseQualifying = arm.ReleaseQualifying
+		case "full":
+			report.FullReleaseQualifying = arm.ReleaseQualifying
+		}
+	}
+	allValid := report.Complete && report.Completed > 0 &&
+		report.CorrectRuns == report.Completed && report.UsageObserved && report.CostObserved &&
+		report.CacheIsolationObserved && report.TerminalAnswersObserved && report.TotalCostUSD <= report.MaxCostUSD
+	report.ComparisonQualifying = allValid && repetitions >= report.MinimumComparisonRepetitions
+	report.ReleaseQualifying = sample == "release" && allValid && repetitions >= report.MinimumReleaseRepetitions
+	return report
+}
+
+func fastPinnedMedian(values []int64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	ordered := append([]int64(nil), values...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	return ordered[len(ordered)/2]
+}
+
+func fastPinnedPercentile(values []int64, percentile float64) int64 {
+	if len(values) == 0 {
+		return 0
+	}
+	ordered := append([]int64(nil), values...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	index := int(math.Ceil(float64(len(ordered))*percentile)) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(ordered) {
+		index = len(ordered) - 1
+	}
+	return ordered[index]
+}
+
+func writeFastPinnedQualificationReport(path string, report fastPinnedQualificationReport) error {
+	body, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return agentsapi.AtomicWrite(path, append(body, '\n'))
+}
+
+func assertFastPinnedQualification(t *testing.T, report fastPinnedQualificationReport, outputPath string) {
+	t.Helper()
+	if report.Sample == "release" {
+		if !report.Complete || !report.FastReleaseQualifying {
+			t.Fatalf("Fast-pinned release gate did not qualify the Fast product arm: failures=%v report=%s",
+				report.QualificationFailures, outputPath)
+		}
+		if !report.FullReleaseQualifying {
+			t.Logf("Full control arm did not release-qualify; global comparison remains non-qualifying: report=%s", outputPath)
+		}
+		return
+	}
+	if !report.Complete || !report.ComparisonQualifying {
+		t.Fatalf("Fast-pinned gate failed closed: complete=%t comparison_qualifying=%t failures=%v report=%s",
+			report.Complete, report.ComparisonQualifying, report.QualificationFailures, outputPath)
+	}
 }

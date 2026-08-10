@@ -11,7 +11,11 @@ package e2e
 // Run (after the moderate lane finishes — never concurrently, latency
 // numbers would contaminate each other):
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_HARD=1 go test ./test/e2e/ -run TestLive_FastPinnedHardTier -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_HARD=1 go test ./test/e2e/ -run TestLive_FastPinnedHardTier -timeout 120m -v
+//
+// Release qualification:
+//
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_HARD=1 KOCORO_FAST_PINNED_HARD_SAMPLE=release KOCORO_FAST_PINNED_HARD_REPETITIONS=15 go test ./test/e2e/ -run TestLive_FastPinnedHardTier -timeout 120m -v
 
 import (
 	"context"
@@ -20,7 +24,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +40,7 @@ const (
 	fastPinnedHardGateEnv    = "KOCORO_FAST_PINNED_HARD"
 	fastPinnedHardRepsEnv    = "KOCORO_FAST_PINNED_HARD_REPETITIONS"
 	fastPinnedHardOutputEnv  = "KOCORO_FAST_PINNED_HARD_OUTPUT"
+	fastPinnedHardSampleEnv  = "KOCORO_FAST_PINNED_HARD_SAMPLE"
 	fastPinnedHardMaxCostUSD = 8.0
 	fastPinnedHardSeed       = int64(20260811)
 	hardChainSteps           = 12
@@ -328,6 +332,7 @@ func TestLive_FastPinnedHardTier(t *testing.T) {
 		}
 		repetitions = value
 	}
+	sample := fastPinnedSample(t, fastPinnedHardSampleEnv, repetitions)
 
 	resolveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	cloudProfile, resolveErr := provider.ResolveKoeExecutionProfile(resolveCtx)
@@ -362,16 +367,17 @@ func TestLive_FastPinnedHardTier(t *testing.T) {
 	var results []fastABRun
 	totalCost := 0.0
 	for _, jb := range jobs {
-		if totalCost > fastPinnedHardMaxCostUSD {
-			t.Fatalf("cost ceiling %.2f USD exceeded at %.4f", fastPinnedHardMaxCostUSD, totalCost)
-		}
 		run := runFastHardJob(t, provider, fastProfile, cases[jb.caseIndex], jb.arm, jb.repetition)
 		totalCost += run.CostUSD
 		results = append(results, run)
 		t.Logf("fast_hard case=%s arm=%s rep=%d correct=%v failures=%v latency_ms=%d llm_calls=%d cost=%.6f",
 			run.Case, run.Arm, run.Repetition, run.Correct, run.Failures, run.LatencyMillis, run.LLMCalls, run.CostUSD)
+		if totalCost > fastPinnedHardMaxCostUSD {
+			t.Logf("cost ceiling %.2f USD exceeded at %.4f — stopping with an incomplete report", fastPinnedHardMaxCostUSD, totalCost)
+			break
+		}
 	}
-	summarizeFastHard(t, results, repetitions, totalCost)
+	summarizeFastHard(t, results, repetitions, totalCost, sample)
 }
 
 func runFastHardJob(
@@ -384,7 +390,8 @@ func runFastHardJob(
 ) fastABRun {
 	t.Helper()
 	dir := t.TempDir()
-	prompt := tc.setup(t, dir)
+	trialID := fastPinnedTrialID(fastPinnedHardSeed, tc.name, repetition)
+	prompt := fastPinnedTrialPrompt(tc.setup(t, dir), trialID)
 
 	registry := agent.NewToolRegistry()
 	registry.Register(&tools.FileReadTool{})
@@ -404,7 +411,8 @@ func runFastHardJob(
 		registry.Register(ledger)
 	}
 
-	loop := agent.NewAgentLoop(provider, registry, "medium", dir, 30, 30_000, 200, nil, nil, nil)
+	cacheOffProvider := &fastPinnedCacheOffClient{inner: provider}
+	loop := agent.NewAgentLoop(cacheOffProvider, registry, "medium", dir, 30, 30_000, 200, nil, nil, nil)
 	loop.SetCacheSource("fast_pinned_hard")
 	loop.SetSkillDiscovery(false)
 	loop.SetMaxTokens(4000)
@@ -426,8 +434,16 @@ func runFastHardJob(
 	answer, usage, err := loop.Run(ctx, prompt, nil, nil)
 	run := fastABRun{
 		Case: tc.name, Arm: arm, Repetition: repetition,
+		TrialID:       trialID,
 		LatencyMillis: time.Since(started).Milliseconds(),
 		Answer:        strings.TrimSpace(answer),
+	}
+	cacheIsolated, cached := cacheOffProvider.observations()
+	run.Cached = cached
+	if cacheIsolated {
+		run.CachePolicy = string(executionprofile.ResponseCacheOff)
+	} else {
+		run.Failures = append(run.Failures, "response_cache_not_isolated")
 	}
 	if err != nil {
 		run.Failures = append(run.Failures, "loop_error:"+err.Error())
@@ -436,7 +452,19 @@ func runFastHardJob(
 		run.LLMCalls = usage.LLMCalls
 		run.InputTokens = usage.InputTokens
 		run.OutputTokens = usage.OutputTokens
+		run.TotalTokens = usage.TotalTokens
 		run.CostUSD = usage.CostUSD
+		run.UsageObserved = usage.LLMCalls > 0 && usage.TotalTokens > 0
+		run.CostObserved = usage.LLMCalls > 0 && usage.CostUSD > 0
+	}
+	if !run.UsageObserved {
+		run.Failures = append(run.Failures, "usage_not_observed")
+	}
+	if !run.CostObserved {
+		run.Failures = append(run.Failures, "cost_not_observed")
+	}
+	if run.Answer == "" {
+		run.Failures = append(run.Failures, "terminal_answer_missing")
 	}
 	switch tc.name {
 	case "long_chain_12":
@@ -474,64 +502,31 @@ func runFastHardJob(
 	return run
 }
 
-func summarizeFastHard(t *testing.T, results []fastABRun, repetitions int, totalCost float64) {
+func summarizeFastHard(t *testing.T, results []fastABRun, repetitions int, totalCost float64, sample string) {
 	t.Helper()
-	type agg struct {
-		correct, total int
-		latencies      []int64
-		cost           float64
+	caseNames := make([]string, 0, len(fastPinnedHardCases()))
+	for _, tc := range fastPinnedHardCases() {
+		caseNames = append(caseNames, tc.name)
 	}
-	byKey := map[string]*agg{}
-	for _, r := range results {
-		for _, key := range []string{"ARM/" + r.Arm, r.Case + "/" + r.Arm} {
-			a := byKey[key]
-			if a == nil {
-				a = &agg{}
-				byKey[key] = a
-			}
-			a.total++
-			if r.Correct {
-				a.correct++
-			}
-			a.latencies = append(a.latencies, r.LatencyMillis)
-			a.cost += r.CostUSD
-		}
+	report := newFastPinnedQualificationReport(
+		"kocoro.fast_pinned_hard.v3", fastPinnedHardSeed, sample, repetitions,
+		caseNames, results, totalCost, fastPinnedHardMaxCostUSD,
+	)
+	for _, cell := range report.Cells {
+		t.Logf("hard %-28s correct=%d/%d median_ms=%d p90_ms=%d mean_llm_calls=%.1f total_cost=%.6f",
+			cell.Case+"/"+cell.Arm, cell.CorrectRuns, cell.Runs,
+			cell.MedianMillis, cell.P90Millis, cell.MeanLLMCalls, cell.CostUSD)
 	}
-	median := func(v []int64) int64 {
-		if len(v) == 0 {
-			return 0
-		}
-		s := append([]int64(nil), v...)
-		sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
-		return s[len(s)/2]
-	}
-	var keys []string
-	for k := range byKey {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		a := byKey[k]
-		t.Logf("hard %-28s correct=%d/%d median_ms=%d total_cost=%.6f", k, a.correct, a.total, median(a.latencies), a.cost)
-	}
-	t.Logf("fast_pinned_hard complete runs=%d repetitions=%d total_cost=%.6f", len(results), repetitions, totalCost)
+	t.Logf("fast_pinned_hard complete=%t runs=%d repetitions=%d comparison_qualifying=%t release_qualifying=%t total_cost=%.6f",
+		report.Complete, len(results), repetitions, report.ComparisonQualifying, report.ReleaseQualifying, totalCost)
 
 	outputPath := strings.TrimSpace(os.Getenv(fastPinnedHardOutputEnv))
 	if outputPath == "" {
 		outputPath = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-fast-pinned-hard-%d.json", fastPinnedHardSeed))
 	}
-	body, err := json.MarshalIndent(map[string]any{
-		"schema_version": "kocoro.fast_pinned_hard.v1",
-		"seed":           fastPinnedHardSeed,
-		"repetitions":    repetitions,
-		"total_cost_usd": totalCost,
-		"runs":           results,
-	}, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal report: %v", err)
-	}
-	if err := os.WriteFile(outputPath, append(body, '\n'), 0o644); err != nil {
+	if err := writeFastPinnedQualificationReport(outputPath, report); err != nil {
 		t.Fatalf("write report: %v", err)
 	}
 	t.Logf("report=%s", outputPath)
+	assertFastPinnedQualification(t, report, outputPath)
 }
