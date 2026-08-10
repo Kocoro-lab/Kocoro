@@ -2707,35 +2707,35 @@ type ToolUsage struct {
 	UnitType     string `json:"unit_type,omitempty"`
 }
 
-// IntegrationToolDispatchError reports whether a failed integration request
-// provably stopped before the HTTP dispatch boundary. A true
-// MayHaveDispatched value means Cloud may have received the request, so a
-// non-idempotent provider action must not be retried blindly.
-type IntegrationToolDispatchError struct {
+// ToolDispatchError records whether a tool request may have crossed the
+// network dispatch boundary. Retryable is true only for a transient failure
+// proven to have happened before dispatch.
+type ToolDispatchError struct {
 	MayHaveDispatched bool
+	Retryable         bool
 	Err               error
 }
 
-func (e *IntegrationToolDispatchError) Error() string {
+func (e *ToolDispatchError) Error() string {
 	if e == nil || e.Err == nil {
-		return "integration tool request failed"
+		return "tool request failed"
 	}
 	return e.Err.Error()
 }
 
-func (e *IntegrationToolDispatchError) Unwrap() error {
+func (e *ToolDispatchError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
 	return e.Err
 }
 
-type integrationDispatchTrace struct {
+type toolDispatchTrace struct {
 	wroteHeaders atomic.Bool
 	wroteRequest atomic.Bool
 }
 
-func (t *integrationDispatchTrace) clientTrace() *httptrace.ClientTrace {
+func (t *toolDispatchTrace) clientTrace() *httptrace.ClientTrace {
 	return &httptrace.ClientTrace{
 		WroteHeaders: func() {
 			t.wroteHeaders.Store(true)
@@ -2746,7 +2746,7 @@ func (t *integrationDispatchTrace) clientTrace() *httptrace.ClientTrace {
 	}
 }
 
-func (t *integrationDispatchTrace) mayHaveDispatched() bool {
+func (t *toolDispatchTrace) mayHaveDispatched() bool {
 	return t.wroteHeaders.Load() || t.wroteRequest.Load()
 }
 
@@ -2785,36 +2785,42 @@ func (c *GatewayClient) ExecuteTool(ctx context.Context, name string, arguments 
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, &ToolDispatchError{Err: fmt.Errorf("marshal request: %w", err)}
 	}
 
 	endpoint := c.baseURL + "/api/v1/tools/" + url.PathEscape(name) + "/execute"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, &ToolDispatchError{Err: fmt.Errorf("create request: %w", err)}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key := c.getAPIKey(); key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
 
+	dispatch := &toolDispatchTrace{}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), dispatch.clientTrace()))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		mayHaveDispatched := dispatch.mayHaveDispatched()
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: mayHaveDispatched,
+			Retryable:         !mayHaveDispatched,
+			Err:               fmt.Errorf("request failed: %w", err),
+		}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		errBody := readResponseBody(resp)
-		if errBody != "" {
-			return nil, fmt.Errorf("tool %s returned %d: %s", name, resp.StatusCode, errBody)
-		}
-		return nil, fmt.Errorf("tool %s returned %d", name, resp.StatusCode)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 
 	var result ToolExecuteResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: true,
+			Err:               fmt.Errorf("decode response: %w", err),
+		}
 	}
 	return &result, nil
 }
@@ -2855,23 +2861,33 @@ func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string,
 	reqBody := ToolExecuteRequest{Arguments: arguments}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: false,
+			Retryable:         false,
+			Err:               fmt.Errorf("marshal request: %w", err),
+		}
 	}
 	endpoint := c.baseURL + "/api/v1/integrations/tools/" + url.PathEscape(name) + "/execute"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: false,
+			Retryable:         false,
+			Err:               fmt.Errorf("create request: %w", err),
+		}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key := c.getAPIKey(); key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
-	dispatch := &integrationDispatchTrace{}
+	dispatch := &toolDispatchTrace{}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), dispatch.clientTrace()))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, &IntegrationToolDispatchError{
-			MayHaveDispatched: dispatch.mayHaveDispatched(),
+		mayHaveDispatched := dispatch.mayHaveDispatched()
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: mayHaveDispatched,
+			Retryable:         !mayHaveDispatched,
 			Err:               fmt.Errorf("request failed: %w", err),
 		}
 	}
@@ -2881,7 +2897,7 @@ func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string,
 	}
 	var result ToolExecuteResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, &IntegrationToolDispatchError{
+		return nil, &ToolDispatchError{
 			MayHaveDispatched: true,
 			Err:               fmt.Errorf("decode response: %w", err),
 		}

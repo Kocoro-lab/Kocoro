@@ -321,17 +321,12 @@ func runApprovedToolCall(
 		}
 	}
 
-	knownNoEffect := executionResult.result.ErrorCategory == ErrCategoryValidation
+	knownNoEffect := executionResult.result.SideEffectKnownNoEffect
 	explicitUnknown := executionResult.err != nil || executionResult.result.SideEffectOutcomeUnknown
 	if outcome := executionResult.result.ComputerUseOutcome; outcome != nil &&
 		outcome.Validate() == nil {
 		knownNoEffect = knownNoEffect || outcome.Effect == ComputerUseCommitNone
 		explicitUnknown = explicitUnknown || outcome.Effect == ComputerUseCommitUnknown
-	}
-	if reporter, ok := ac.tool.(SideEffectNoEffectReporter); ok {
-		knownNoEffect = knownNoEffect || reporter.SideEffectFailedWithoutEffect(
-			ac.argsStr, executionResult.result, executionResult.err,
-		)
 	}
 	if explicitUnknown {
 		markErr := journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)

@@ -372,27 +372,40 @@ func TestExecuteBatches_CommitPersistenceFailureBecomesOutcomeUnknown(t *testing
 	}
 }
 
-func TestExecuteBatches_ValidationFailurePersistsDefinitiveResult(t *testing.T) {
-	journal := &recordingSideEffectJournal{}
-	tool := &journalWriteTool{journal: journal, result: ValidationError("bad value")}
-	results := make([]toolExecResult, 1)
-	err := executeBatches(
-		context.Background(),
-		[][]approvedToolCall{{journalApprovedCall(tool, 0)}},
-		results, nil, nil, "",
-		sideEffectBatchHooks{
-			journal: journal,
-			checkpointPrepared: func(context.Context) error {
-				journal.record("checkpoint")
-				return nil
-			},
-		},
-	)
-	if err != nil {
-		t.Fatalf("executeBatches: %v", err)
-	}
-	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run failed_no_effect]"; got != want {
-		t.Fatalf("events = %s, want %s", got, want)
+func TestExecuteBatches_ToolErrorPersistenceUsesExplicitNoEffectEvidence(t *testing.T) {
+	explicit := BusinessError("rejected before dispatch")
+	explicit.SideEffectKnownNoEffect = true
+	for _, tc := range []struct {
+		name      string
+		result    ToolResult
+		wantEvent string
+	}{
+		{name: "validation category alone", result: ValidationError("remote rejected after partial work"), wantEvent: "committed"},
+		{name: "explicit marker", result: explicit, wantEvent: "failed_no_effect"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := &recordingSideEffectJournal{}
+			tool := &journalWriteTool{journal: journal, result: tc.result}
+			results := make([]toolExecResult, 1)
+			err := executeBatches(
+				context.Background(),
+				[][]approvedToolCall{{journalApprovedCall(tool, 0)}},
+				results, nil, nil, "",
+				sideEffectBatchHooks{
+					journal: journal,
+					checkpointPrepared: func(context.Context) error {
+						journal.record("checkpoint")
+						return nil
+					},
+				},
+			)
+			if err != nil {
+				t.Fatalf("executeBatches: %v", err)
+			}
+			if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run "+tc.wantEvent+"]"; got != want {
+				t.Fatalf("events = %s, want %s", got, want)
+			}
+		})
 	}
 }
 

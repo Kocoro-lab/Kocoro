@@ -76,8 +76,12 @@ type ToolResult struct {
 	// known response and must remain available to the agent; it is not an
 	// ambiguous external action merely because IsError is true.
 	SideEffectOutcomeUnknown bool `json:"-"`
-	Images                   []ImageBlock
-	CloudResult              bool // true when result is a cloud deliverable (bypass LLM summarization)
+	// SideEffectKnownNoEffect is an internal assertion that a failed material
+	// tool call provably did not commit an external action. It must be set only
+	// from protocol/dispatch evidence, never inferred from provider prose.
+	SideEffectKnownNoEffect bool `json:"-"`
+	Images                  []ImageBlock
+	CloudResult             bool // true when result is a cloud deliverable (bypass LLM summarization)
 	// GUIOutcome is a daemon-internal, redacted execution acknowledgement. It
 	// is consumed by the computer-use control wrapper and is never serialized
 	// into provider-visible tool results.

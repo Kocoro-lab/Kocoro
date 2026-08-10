@@ -1081,10 +1081,24 @@ func isLoopReadOnlyCall(tool Tool, name, argsJSON string) bool {
 	if readOnly, ok := tool.(ReadOnlyChecker); ok && readOnly.IsReadOnlyCall(argsJSON) {
 		return true
 	}
-	if material, ok := tool.(MaterialSideEffectChecker); ok && !material.HasMaterialSideEffect(argsJSON) {
+	if source, ok := tool.(ToolSourcer); ok {
+		switch source.ToolSource() {
+		case SourceMCP:
+			return name == "browser_snapshot" || isReadMCPName(name)
+		case SourceGateway, SourceIntegration:
+			return false
+		}
+	}
+	if name == "browser_snapshot" {
 		return true
 	}
-	return isReadMCPName(name) || name == "browser_snapshot"
+	// Local argument-aware tools such as bash and process deliberately keep
+	// IsReadOnlyCall false to prevent speculative execution, while their
+	// materiality checker can still prove an individual poll is observational.
+	if material, ok := tool.(MaterialSideEffectChecker); ok {
+		return !material.HasMaterialSideEffect(argsJSON)
+	}
+	return false
 }
 
 // latestRecoveredAfterSameArgsErrors reports whether the latest same-name,

@@ -6309,7 +6309,7 @@ iterationLoop:
 			}
 			callMeta[idx].validated = true
 			callMeta[idx].loopReadOnly = isLoopReadOnlyCall(tool, fc.Name, argsStr)
-			if readOnly, ok := tool.(ReadOnlyChecker); !ok || !readOnly.IsReadOnlyCall(argsStr) {
+			if hasMaterialSideEffect(tool, argsStr) {
 				callMeta[idx].sideEffect = true
 				if a.hasPriorSideEffect(
 					fc.Name,

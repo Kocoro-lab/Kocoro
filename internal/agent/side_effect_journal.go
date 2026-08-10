@@ -48,14 +48,6 @@ type SideEffectExecutionJournal interface {
 	MarkOutcomeUnknown(context.Context, string, string) error
 }
 
-// SideEffectNoEffectReporter may classify a failed Tool.Run as definitely not
-// having committed an external mutation. Returning true is a strong safety
-// assertion; tools should return false whenever post-dispatch outcome is not
-// provable.
-type SideEffectNoEffectReporter interface {
-	SideEffectFailedWithoutEffect(args string, result ToolResult, runErr error) bool
-}
-
 // SideEffectExecutionContext is the opaque per-dispatch identity exposed to a
 // capable tool. A tool/provider may use IdempotencyKey if it has a real native
 // idempotency contract; otherwise it should ignore it.

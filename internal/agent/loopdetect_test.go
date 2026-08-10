@@ -1,10 +1,32 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 )
+
+type loopMaterialOnlyTool struct{ name string }
+
+func (t *loopMaterialOnlyTool) Info() ToolInfo { return ToolInfo{Name: t.name} }
+func (*loopMaterialOnlyTool) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{}, nil
+}
+func (*loopMaterialOnlyTool) RequiresApproval() bool            { return false }
+func (*loopMaterialOnlyTool) HasMaterialSideEffect(string) bool { return false }
+
+type loopReadOnlyTool struct{ loopMaterialOnlyTool }
+
+func (*loopReadOnlyTool) IsReadOnlyCall(string) bool { return true }
+
+type loopMCPMaterialTool struct{ loopMaterialOnlyTool }
+
+func (*loopMCPMaterialTool) ToolSource() ToolSource { return SourceMCP }
+
+type loopGatewayMaterialTool struct{ loopMaterialOnlyTool }
+
+func (*loopGatewayMaterialTool) ToolSource() ToolSource { return SourceGateway }
 
 func TestLoopDetector_ConsecutiveDup_Nudge(t *testing.T) {
 	ld := NewLoopDetector()
@@ -299,6 +321,77 @@ func TestLoopDetector_NoProgress_StrictArgsAndOutcomeProgressContinues(t *testin
 		if action, msg := ld.Check("stateful_step"); action != LoopContinue {
 			t.Fatalf("strictly changing args and outcomes must show progress at step %d, got %v: %s", step, action, msg)
 		}
+	}
+}
+
+func TestIsLoopReadOnlyCall_SourceAwareMaterialRelief(t *testing.T) {
+	localObservation := &loopMaterialOnlyTool{name: "process"}
+	if !isLoopReadOnlyCall(localObservation, localObservation.Info().Name, `{}`) {
+		t.Fatal("local material=false call must retain read-loop relief")
+	}
+
+	gatewayObservation := &loopGatewayMaterialTool{loopMaterialOnlyTool{name: "web_fetch"}}
+	if isLoopReadOnlyCall(gatewayObservation, gatewayObservation.Info().Name, `{}`) {
+		t.Fatal("gateway material=false must not imply read-loop relief")
+	}
+
+	readOnly := &loopReadOnlyTool{loopMaterialOnlyTool{name: "explicit_read"}}
+	if !isLoopReadOnlyCall(readOnly, readOnly.Info().Name, `{}`) {
+		t.Fatal("ReadOnlyChecker=true must continue to classify a tool as read-only")
+	}
+
+	mcpTool := &loopMCPMaterialTool{loopMaterialOnlyTool{name: "list_records"}}
+	if !isLoopReadOnlyCall(mcpTool, "list_records", `{}`) {
+		t.Fatal("the explicit MCP read-name fallback must remain read-only")
+	}
+	if isLoopReadOnlyCall(gatewayObservation, "browser_snapshot", `{}`) {
+		t.Fatal("a gateway name collision must not receive browser read-loop relief")
+	}
+	if !isLoopReadOnlyCall(&loopMaterialOnlyTool{name: "browser_snapshot"}, "browser_snapshot", `{}`) {
+		t.Fatal("the local browser_snapshot fallback must remain read-only")
+	}
+}
+
+func TestLoopDetector_NoProgress_SourceAwareMaterialRelief(t *testing.T) {
+	tests := []struct {
+		name       string
+		tool       Tool
+		wantAction LoopAction
+	}{
+		{
+			name:       "gateway-material-only",
+			tool:       &loopGatewayMaterialTool{loopMaterialOnlyTool{name: "source_gateway"}},
+			wantAction: LoopNudge,
+		},
+		{
+			name:       "local-observation",
+			tool:       &loopMaterialOnlyTool{name: "process"},
+			wantAction: LoopContinue,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ld := NewLoopDetector()
+			for step := 1; step <= ld.noProgressThreshold; step++ {
+				args := fmt.Sprintf(`{"cursor":%d}`, step)
+				ld.RecordOutcome(
+					tt.tool.Info().Name,
+					args,
+					false,
+					"",
+					"",
+					fmt.Sprintf("page-%d", step),
+					isLoopReadOnlyCall(tt.tool, tt.tool.Info().Name, args),
+					false,
+				)
+			}
+
+			action, msg := ld.Check(tt.tool.Info().Name)
+			if action != tt.wantAction {
+				t.Fatalf("got action %v, want %v: %s", action, tt.wantAction, msg)
+			}
+		})
 	}
 }
 

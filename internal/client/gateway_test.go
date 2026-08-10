@@ -964,12 +964,38 @@ func TestExecuteIntegrationTool_ConnectionRefusedIsPreDispatch(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected connection failure")
 	}
-	var dispatchErr *IntegrationToolDispatchError
+	var dispatchErr *ToolDispatchError
 	if !errors.As(err, &dispatchErr) {
-		t.Fatalf("error = %T %v, want *IntegrationToolDispatchError", err, err)
+		t.Fatalf("error = %T %v, want *ToolDispatchError", err, err)
 	}
-	if dispatchErr.MayHaveDispatched {
+	if dispatchErr.MayHaveDispatched || !dispatchErr.Retryable {
 		t.Fatalf("connection-refused request reported dispatched: %v", err)
+	}
+}
+
+func TestExecuteIntegrationTool_MarshalFailureIsTypedPreDispatch(t *testing.T) {
+	gw := NewGatewayClient("http://example.test", "")
+	_, err := gw.ExecuteIntegrationTool(context.Background(), "slack_post_message", map[string]any{
+		"unsupported": func() {},
+	})
+	var dispatchErr *ToolDispatchError
+	if !errors.As(err, &dispatchErr) {
+		t.Fatalf("error = %T %v, want *ToolDispatchError", err, err)
+	}
+	if dispatchErr.MayHaveDispatched || dispatchErr.Retryable || !strings.Contains(err.Error(), "marshal request:") {
+		t.Fatalf("dispatch error = %#v", dispatchErr)
+	}
+}
+
+func TestExecuteIntegrationTool_CreateRequestFailureIsTypedPreDispatch(t *testing.T) {
+	gw := NewGatewayClient("://invalid-base-url", "")
+	_, err := gw.ExecuteIntegrationTool(context.Background(), "slack_post_message", map[string]any{"text": "hello"})
+	var dispatchErr *ToolDispatchError
+	if !errors.As(err, &dispatchErr) {
+		t.Fatalf("error = %T %v, want *ToolDispatchError", err, err)
+	}
+	if dispatchErr.MayHaveDispatched || dispatchErr.Retryable || !strings.Contains(err.Error(), "create request:") {
+		t.Fatalf("dispatch error = %#v", dispatchErr)
 	}
 }
 
@@ -986,9 +1012,9 @@ func TestExecuteIntegrationTool_ResponseLossIsPostDispatch(t *testing.T) {
 
 	gw := NewGatewayClient(server.URL, "")
 	_, err := gw.ExecuteIntegrationTool(context.Background(), "slack_post_message", map[string]any{"text": "hello"})
-	var dispatchErr *IntegrationToolDispatchError
+	var dispatchErr *ToolDispatchError
 	if !errors.As(err, &dispatchErr) {
-		t.Fatalf("error = %T %v, want *IntegrationToolDispatchError", err, err)
+		t.Fatalf("error = %T %v, want *ToolDispatchError", err, err)
 	}
 	if !dispatchErr.MayHaveDispatched {
 		t.Fatalf("response-loss request reported pre-dispatch: %v", err)
@@ -1004,7 +1030,7 @@ func TestExecuteIntegrationTool_MalformedSuccessIsPostDispatch(t *testing.T) {
 
 	gw := NewGatewayClient(server.URL, "")
 	_, err := gw.ExecuteIntegrationTool(context.Background(), "notion_create_page", map[string]any{"title": "x"})
-	var dispatchErr *IntegrationToolDispatchError
+	var dispatchErr *ToolDispatchError
 	if !errors.As(err, &dispatchErr) || !dispatchErr.MayHaveDispatched {
 		t.Fatalf("error = %T %v, want post-dispatch error", err, err)
 	}
