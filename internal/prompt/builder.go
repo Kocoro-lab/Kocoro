@@ -194,7 +194,7 @@ func webResultsGuidance(opts PromptOptions) string {
 		return ""
 	}
 	return "## Web Results\n" +
-		"An empty, blocked, or bot-challenged page is itself a result — report it as such and try a different source. " +
+		"An empty, blocked, or bot-challenged page is itself a result. For a user-named page or source, report it and stop; only when the task does not depend on that source may you try one different source. " +
 		"Never invent page content, search results, or quotes from a fetch that did not complete. " +
 		"Prefer web_search/web_fetch for reading content; reserve interactive browsing for pages that require it."
 }
@@ -231,7 +231,6 @@ func buildStaticSystem(opts PromptOptions) string {
 		sb.WriteString("\n\n## Structured Questions\n")
 		sb.WriteString("Use ask_user_question only for a material unresolved fork you cannot settle after investigating — a real decision, not permission to start. The structured UI exists only when Context contains the exact line `Structured question UI: available`: when that line is present and the needed input reduces to 2-4 concrete choices, you MUST call the tool in that same response — do not ask the question, restate its choices, or say you are waiting in prose. When the line is absent, ask one concise prose question instead. If a custom value is possible set `allow_other`; never add a Custom, Other, 自定义, or equivalent placeholder option.")
 	}
-
 
 	if promptHasAnyToolNamed(opts, "memory_recall", "session_search") {
 		sb.WriteString("\n\n## Memory Retrieval\n")
@@ -443,7 +442,7 @@ func buildVolatileContext(opts PromptOptions) string {
 
 	if opts.FastMode {
 		sb.WriteString("\n\n## Fast Task\n")
-		sb.WriteString("Use the fewest tool rounds that can answer correctly and stop when the core outcome and required evidence are complete. Do not repeat a successful call for reassurance, wording, or optional detail. Search only for requested or required current/external facts; start with one broad query aimed at a primary or established source. Search again only when the first result failed, was unusable, omitted a required fact or source, conflicted, or the user requested independent sources. Use web_fetch for a specific page or a missing page detail, not as a substitute for search.")
+		sb.WriteString("Do not add a call unless it closes a required outcome or evidence gap; batch independent safe work when possible. Search only for requested or required current/external facts. For open-ended search, start with one broad query aimed at a primary or established source. Search again only when the first result failed, was unusable, omitted a required fact or source, conflicted, or the user requested independent sources. For a user-named page, fetch that page directly and do not substitute another source when it is empty or blocked.")
 	}
 
 	// Memory — stays volatile: memory_append can mutate MEMORY.md during a
@@ -554,7 +553,7 @@ func formatGuidance(format string) string {
 	switch format {
 	case "koe":
 		return "Write one complete, concise user-facing reply for a native voice conversation and Kocoro Desktop. " +
-			"Lead with the actual outcome, preserve the important facts, numbers, failures, and uncertainty, and use the language of the user's current message. " +
+			"Lead with the actual outcome and preserve the important facts, numbers, failures, and uncertainty. " +
 			"Never narrate plans, tool mechanics, or work-in-progress as if it were the result. Do not add a separate spoken summary, voice script, XML tag, or meta commentary; the native Realtime model will make the spoken projection from this final reply. " +
 			"Use readable Markdown only when structure materially helps the Desktop copy. Keep long reports, tables, code, links, and file details in the reply instead of flattening or omitting them for voice. " +
 			"If you produced a file, state what it contains; validated deliverable metadata is sent separately. Mention Kocoro Desktop only when substantial structured detail or a deliverable is genuinely useful there. " +

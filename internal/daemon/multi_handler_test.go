@@ -177,6 +177,52 @@ func TestMultiHandlerSatisfiesRunStatusHandlerInterface(t *testing.T) {
 	var _ agent.RunStatusHandler = (*multiHandler)(nil) // compile-time check
 }
 
+type runTraceSpy struct {
+	usageSpy
+	events []agent.RunTraceEvent
+}
+
+func (s *runTraceSpy) OnRunTrace(event agent.RunTraceEvent) {
+	s.events = append(s.events, event)
+}
+
+func TestMultiHandlerOnRunTracePropagatesToImplementers(t *testing.T) {
+	first := &runTraceSpy{}
+	plain := &plainSpy{}
+	second := &runTraceSpy{}
+	m := &multiHandler{handlers: []agent.EventHandler{first, plain, second}}
+	event := agent.RunTraceEvent{
+		Seq:       7,
+		Iteration: 3,
+		Type:      agent.RunTraceEventRetry,
+		Retry: &agent.RunTraceRetry{
+			Kind:           "provider_transient",
+			Attempt:        2,
+			ReasonCategory: "rate_limit",
+		},
+	}
+
+	m.OnRunTrace(event)
+
+	for name, spy := range map[string]*runTraceSpy{"first": first, "second": second} {
+		if len(spy.events) != 1 || spy.events[0].Seq != event.Seq ||
+			spy.events[0].Iteration != event.Iteration || spy.events[0].Type != event.Type ||
+			spy.events[0].Retry == nil || *spy.events[0].Retry != *event.Retry {
+			t.Fatalf("%s trace events = %+v, want %+v", name, spy.events, event)
+		}
+	}
+	// plain does not implement RunTraceHandler; surviving the call proves the
+	// optional fan-out skips it without disrupting normal EventHandler behavior.
+	m.OnText("x")
+	if plain.text != 1 {
+		t.Fatalf("plain.text = %d, want 1", plain.text)
+	}
+}
+
+func TestMultiHandlerSatisfiesRunTraceHandlerInterface(t *testing.T) {
+	var _ agent.RunTraceHandler = (*multiHandler)(nil) // compile-time check
+}
+
 // injectCommitSpy implements agent.InjectCommitHandler (and agent.EventHandler
 // via the embedded usageSpy). Used to verify multiHandler.OnInjectedCommitted
 // propagates via type assertion.

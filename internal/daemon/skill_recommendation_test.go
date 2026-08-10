@@ -1704,6 +1704,29 @@ func TestSkillRecommendationEffectHandlerSideEffectLadder(t *testing.T) {
 	}
 }
 
+func TestSkillRecommendationEffectHandlerForwardsRunTrace(t *testing.T) {
+	trace := &runTraceSpy{}
+	h := &skillRecommendationEffectHandler{EventHandler: trace}
+	event := agent.RunTraceEvent{
+		Seq:       4,
+		Iteration: 2,
+		Type:      agent.RunTraceEventNudge,
+		Nudge:     &agent.RunTraceNudge{Kind: "progress", Action: "continue"},
+	}
+
+	h.OnRunTrace(event)
+
+	if len(trace.events) != 1 || trace.events[0].Seq != event.Seq ||
+		trace.events[0].Iteration != event.Iteration || trace.events[0].Type != event.Type ||
+		trace.events[0].Nudge == nil || *trace.events[0].Nudge != *event.Nudge {
+		t.Fatalf("trace events = %+v, want %+v", trace.events, event)
+	}
+}
+
+func TestSkillRecommendationEffectHandlerSatisfiesRunTraceHandler(t *testing.T) {
+	var _ agent.RunTraceHandler = (*skillRecommendationEffectHandler)(nil)
+}
+
 func TestSkillRecommendationDiscoveryMatchesProductionQueries(t *testing.T) {
 	// The EXACT arguments the model sent in production (2026-08-03) that
 	// returned [] against a catalog whose Document entry literally says

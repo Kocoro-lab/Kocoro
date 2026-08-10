@@ -114,8 +114,10 @@ func fastPinnedTrialPrompt(prompt, trialID string) string {
 // fastABHandler auto-approves tool calls (file tools all require approval)
 // and counts per-tool invocations for the validators.
 type fastABHandler struct {
-	mu        sync.Mutex
-	toolCalls map[string]int
+	mu         sync.Mutex
+	toolCalls  map[string]int
+	trajectory []agent.RunTraceEvent
+	usage      agent.UsageAccumulator
 }
 
 func (h *fastABHandler) OnToolCall(name, _ string, _ string) {
@@ -131,15 +133,49 @@ func (h *fastABHandler) OnText(string)                                          
 func (h *fastABHandler) OnPreamble(string)                                                    {}
 func (h *fastABHandler) OnStreamDelta(string)                                                 {}
 func (h *fastABHandler) OnApprovalNeeded(string, string) bool                                 { return true }
-func (h *fastABHandler) OnUsage(agent.TurnUsage)                                              {}
+func (h *fastABHandler) OnUsage(usage agent.TurnUsage)                                        { h.usage.Add(usage) }
 func (h *fastABHandler) OnCloudAgent(string, string, string)                                  {}
 func (h *fastABHandler) OnCloudProgress(int, int)                                             {}
 func (h *fastABHandler) OnCloudPlan(string, string, bool)                                     {}
+
+func (h *fastABHandler) OnRunTrace(event agent.RunTraceEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.trajectory = append(h.trajectory, event)
+}
 
 func (h *fastABHandler) count(name string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.toolCalls[name]
+}
+
+func (h *fastABHandler) trace() []agent.RunTraceEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var trace []agent.RunTraceEvent
+	for _, event := range h.trajectory {
+		if event.Type == agent.RunTraceEventToolOutcome {
+			trace = append(trace, event)
+		}
+	}
+	return trace
+}
+
+func (h *fastABHandler) loopEvents() []agent.RunTraceEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var events []agent.RunTraceEvent
+	for _, event := range h.trajectory {
+		if event.Type != agent.RunTraceEventToolOutcome {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+func (h *fastABHandler) accumulatedUsage() agent.AccumulatedUsage {
+	return h.usage.Snapshot()
 }
 
 // chainProbeTool is a five-step task with真实 step-to-step data dependence:
@@ -393,23 +429,28 @@ func validateFastABSchedule(answer string) []string {
 }
 
 type fastABRun struct {
-	Case          string   `json:"case"`
-	Arm           string   `json:"arm"`
-	Repetition    int      `json:"repetition"`
-	TrialID       string   `json:"trial_id"`
-	CachePolicy   string   `json:"response_cache_policy"`
-	Cached        bool     `json:"cached"`
-	Correct       bool     `json:"correct"`
-	Failures      []string `json:"failures,omitempty"`
-	LatencyMillis int64    `json:"latency_millis"`
-	LLMCalls      int      `json:"llm_calls"`
-	InputTokens   int      `json:"input_tokens"`
-	OutputTokens  int      `json:"output_tokens"`
-	TotalTokens   int      `json:"total_tokens"`
-	CostUSD       float64  `json:"cost_usd"`
-	UsageObserved bool     `json:"usage_observed"`
-	CostObserved  bool     `json:"cost_observed"`
-	Answer        string   `json:"answer"`
+	Case               string                `json:"case"`
+	Arm                string                `json:"arm"`
+	Repetition         int                   `json:"repetition"`
+	TrialID            string                `json:"trial_id"`
+	CachePolicy        string                `json:"response_cache_policy"`
+	Cached             bool                  `json:"cached"`
+	Correct            bool                  `json:"correct"`
+	Failures           []string              `json:"failures,omitempty"`
+	LatencyMillis      int64                 `json:"latency_millis"`
+	LLMCalls           int                   `json:"llm_calls"`
+	InputTokens        int                   `json:"input_tokens"`
+	OutputTokens       int                   `json:"output_tokens"`
+	TotalTokens        int                   `json:"total_tokens"`
+	CostUSD            float64               `json:"cost_usd"`
+	UsageObserved      bool                  `json:"usage_observed"`
+	CostObserved       bool                  `json:"cost_observed"`
+	Answer             string                `json:"answer"`
+	TrajectoryObserved bool                  `json:"trajectory_observed"`
+	ToolTrajectory     []agent.RunTraceEvent `json:"tool_trajectory"`
+	LoopEvents         []agent.RunTraceEvent `json:"loop_events"`
+	Status             fastPinnedRunStatus   `json:"status"`
+	Efficiency         fastPinnedEfficiency  `json:"efficiency"`
 }
 
 type fastPinnedCellSummary struct {
@@ -424,21 +465,25 @@ type fastPinnedCellSummary struct {
 }
 
 type fastPinnedArmSummary struct {
-	Arm                     string   `json:"arm"`
-	Complete                bool     `json:"complete"`
-	Scheduled               int      `json:"scheduled"`
-	Completed               int      `json:"completed"`
-	Correct                 bool     `json:"correct"`
-	CorrectRuns             int      `json:"correct_runs"`
-	UsageObserved           bool     `json:"usage_observed"`
-	CostObserved            bool     `json:"cost_observed"`
-	CacheIsolationObserved  bool     `json:"cache_isolation_observed"`
-	TerminalAnswersObserved bool     `json:"terminal_answers_observed"`
-	ObservabilityObserved   bool     `json:"observability_observed"`
-	TotalCostUSD            float64  `json:"total_cost_usd"`
-	ComparisonQualifying    bool     `json:"comparison_qualifying"`
-	ReleaseQualifying       bool     `json:"release_qualifying"`
-	QualificationFailures   []string `json:"qualification_failures"`
+	Arm                           string   `json:"arm"`
+	Complete                      bool     `json:"complete"`
+	Scheduled                     int      `json:"scheduled"`
+	Completed                     int      `json:"completed"`
+	Correct                       bool     `json:"correct"`
+	CorrectRuns                   int      `json:"correct_runs"`
+	UsageObserved                 bool     `json:"usage_observed"`
+	CostObserved                  bool     `json:"cost_observed"`
+	CacheIsolationObserved        bool     `json:"cache_isolation_observed"`
+	TerminalAnswersObserved       bool     `json:"terminal_answers_observed"`
+	ObservabilityObserved         bool     `json:"observability_observed"`
+	TrajectoryObserved            bool     `json:"trajectory_observed"`
+	EfficiencyObserved            bool     `json:"efficiency_observed"`
+	EfficiencyQualifying          bool     `json:"efficiency_qualifying"`
+	RelativePerformanceQualifying bool     `json:"relative_performance_qualifying"`
+	TotalCostUSD                  float64  `json:"total_cost_usd"`
+	ComparisonQualifying          bool     `json:"comparison_qualifying"`
+	ReleaseQualifying             bool     `json:"release_qualifying"`
+	QualificationFailures         []string `json:"qualification_failures"`
 }
 
 type fastPinnedQualificationReport struct {
@@ -457,6 +502,14 @@ type fastPinnedQualificationReport struct {
 	CostObserved                 bool                    `json:"cost_observed"`
 	CacheIsolationObserved       bool                    `json:"cache_isolation_observed"`
 	TerminalAnswersObserved      bool                    `json:"terminal_answers_observed"`
+	TrajectoryObserved           bool                    `json:"trajectory_observed"`
+	EfficiencyObserved           bool                    `json:"efficiency_observed"`
+	EfficiencyQualifying         bool                    `json:"efficiency_qualifying"`
+	FastPerformanceObserved      bool                    `json:"fast_performance_observed"`
+	FastPerformanceQualifying    bool                    `json:"fast_performance_qualifying"`
+	FastLatencyRatio             float64                 `json:"fast_latency_ratio"`
+	FastCostRatio                float64                 `json:"fast_cost_ratio"`
+	MaximumNonInferiorityRatio   float64                 `json:"maximum_noninferiority_ratio"`
 	ComparisonQualifying         bool                    `json:"comparison_qualifying"`
 	ReleaseQualifying            bool                    `json:"release_qualifying"`
 	FastReleaseQualifying        bool                    `json:"fast_release_qualifying"`
@@ -527,8 +580,10 @@ func TestLive_FastPinnedVsFullAB(t *testing.T) {
 		run := runFastABJob(t, provider, fastProfile, tc, jb.arm, jb.repetition)
 		totalCost += run.CostUSD
 		results = append(results, run)
-		t.Logf("fast_ab case=%s arm=%s rep=%d correct=%v failures=%v latency_ms=%d llm_calls=%d cost=%.6f",
-			run.Case, run.Arm, run.Repetition, run.Correct, run.Failures, run.LatencyMillis, run.LLMCalls, run.CostUSD)
+		t.Logf("fast_ab case=%s arm=%s rep=%d correct=%v failures=%v efficient=%v efficiency_violations=%v latency_ms=%d llm_calls=%d cost=%.6f",
+			run.Case, run.Arm, run.Repetition, run.Correct, run.Failures,
+			run.Efficiency.Qualifying, run.Efficiency.Violations,
+			run.LatencyMillis, run.LLMCalls, run.CostUSD)
 		if totalCost > fastPinnedABMaxCostUSD {
 			t.Logf("cost ceiling %.2f USD exceeded at %.4f — stopping with an incomplete report", fastPinnedABMaxCostUSD, totalCost)
 			break
@@ -583,12 +638,21 @@ func runFastABJob(
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	started := time.Now()
-	answer, usage, err := loop.Run(ctx, prompt, nil, nil)
+	answer, _, err := loop.Run(ctx, prompt, nil, nil)
+	status := loop.LastRunStatus()
 	run := fastABRun{
 		Case: tc.name, Arm: arm, Repetition: repetition,
-		TrialID:       trialID,
-		LatencyMillis: time.Since(started).Milliseconds(),
-		Answer:        strings.TrimSpace(answer),
+		TrialID:            trialID,
+		LatencyMillis:      time.Since(started).Milliseconds(),
+		Answer:             strings.TrimSpace(answer),
+		TrajectoryObserved: true,
+		ToolTrajectory:     handler.trace(),
+		LoopEvents:         handler.loopEvents(),
+		Status: fastPinnedRunStatus{
+			Partial: status.Partial, FailureCode: string(status.FailureCode),
+			LastTool: status.LastTool, RetryCount: status.RetryCount,
+			IterationCount: status.IterationCount,
+		},
 	}
 	cacheIsolated, cached := cacheOffProvider.observations()
 	run.Cached = cached
@@ -600,15 +664,14 @@ func runFastABJob(
 	if err != nil {
 		run.Failures = append(run.Failures, "loop_error:"+err.Error())
 	}
-	if usage != nil {
-		run.LLMCalls = usage.LLMCalls
-		run.InputTokens = usage.InputTokens
-		run.OutputTokens = usage.OutputTokens
-		run.TotalTokens = usage.TotalTokens
-		run.CostUSD = usage.CostUSD
-		run.UsageObserved = usage.LLMCalls > 0 && usage.TotalTokens > 0
-		run.CostObserved = usage.LLMCalls > 0 && usage.CostUSD > 0
-	}
+	usage := handler.accumulatedUsage()
+	run.LLMCalls = usage.LLM.LLMCalls
+	run.InputTokens = usage.LLM.InputTokens
+	run.OutputTokens = usage.LLM.OutputTokens
+	run.TotalTokens = usage.LLM.TotalTokens
+	run.CostUSD = usage.TotalCostUSD()
+	run.UsageObserved = usage.LLM.LLMCalls > 0 && usage.LLM.TotalTokens > 0
+	run.CostObserved = usage.LLM.LLMCalls > 0 && run.CostUSD > 0
 	if !run.UsageObserved {
 		run.Failures = append(run.Failures, "usage_not_observed")
 	}
@@ -618,6 +681,7 @@ func runFastABJob(
 	if run.Answer == "" {
 		run.Failures = append(run.Failures, "terminal_answer_missing")
 	}
+	run.Efficiency = evaluateFastPinnedEfficiency(run.Case, run.LLMCalls, run.Status, run.ToolTrajectory)
 	run.Failures = append(run.Failures, tc.validate(run.Answer, dir, handler, probe)...)
 	run.Correct = len(run.Failures) == 0
 	return run
@@ -630,7 +694,7 @@ func summarizeFastAB(t *testing.T, results []fastABRun, repetitions int, totalCo
 		caseNames = append(caseNames, tc.name)
 	}
 	report := newFastPinnedQualificationReport(
-		"kocoro.fast_pinned_ab.v3", fastPinnedABSeed, sample, repetitions,
+		"kocoro.fast_pinned_ab.v4", fastPinnedABSeed, sample, repetitions,
 		caseNames, results, totalCost, fastPinnedABMaxCostUSD,
 	)
 	for _, cell := range report.Cells {
@@ -643,7 +707,8 @@ func summarizeFastAB(t *testing.T, results []fastABRun, repetitions int, totalCo
 
 	outputPath := strings.TrimSpace(os.Getenv(fastPinnedABOutputEnv))
 	if outputPath == "" {
-		outputPath = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-fast-pinned-ab-%d.json", fastPinnedABSeed))
+		outputPath = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-fast-pinned-ab-%d-%s.json",
+			fastPinnedABSeed, time.Now().UTC().Format("20060102T150405.000000000Z")))
 	}
 	if err := writeFastPinnedQualificationReport(outputPath, report); err != nil {
 		t.Fatalf("write report: %v", err)
@@ -681,6 +746,8 @@ func newFastPinnedQualificationReport(
 	totalCost float64,
 	maxCost float64,
 ) fastPinnedQualificationReport {
+	requiresTrajectory := strings.HasSuffix(schemaVersion, ".v4")
+	const maximumNonInferiorityRatio = 1.20
 	type armState struct {
 		summary            fastPinnedArmSummary
 		structuralFailures []string
@@ -699,6 +766,10 @@ func newFastPinnedQualificationReport(
 		CostObserved:                 len(results) > 0,
 		CacheIsolationObserved:       len(results) > 0,
 		TerminalAnswersObserved:      len(results) > 0,
+		TrajectoryObserved:           !requiresTrajectory || len(results) > 0,
+		EfficiencyObserved:           !requiresTrajectory || len(results) > 0,
+		EfficiencyQualifying:         !requiresTrajectory || len(results) > 0,
+		MaximumNonInferiorityRatio:   maximumNonInferiorityRatio,
 		TotalCostUSD:                 totalCost,
 		MaxCostUSD:                   maxCost,
 		Runs:                         append([]fastABRun(nil), results...),
@@ -709,6 +780,8 @@ func newFastPinnedQualificationReport(
 			Arm: arm, Scheduled: len(caseNames) * repetitions,
 			UsageObserved: true, CostObserved: true,
 			CacheIsolationObserved: true, TerminalAnswersObserved: true,
+			TrajectoryObserved: true, EfficiencyObserved: true,
+			EfficiencyQualifying: true,
 		}}
 	}
 	type cellState struct {
@@ -728,6 +801,10 @@ func newFastPinnedQualificationReport(
 		}
 	}
 	for _, run := range results {
+		computedEfficiency := evaluateFastPinnedEfficiency(run.Case, run.LLMCalls, run.Status, run.ToolTrajectory)
+		trajectoryObserved := fastPinnedProcessObserved(run)
+		efficiencyObserved := run.Efficiency.PolicyID == fastPinnedEfficiencyPolicyID
+		efficiencyQualifying := efficiencyObserved && run.Efficiency.Qualifying && computedEfficiency.Qualifying
 		arm := armStates[run.Arm]
 		if arm != nil {
 			arm.summary.Completed++
@@ -746,6 +823,15 @@ func newFastPinnedQualificationReport(
 			}
 			if strings.TrimSpace(run.Answer) == "" {
 				arm.summary.TerminalAnswersObserved = false
+			}
+			if requiresTrajectory && !trajectoryObserved {
+				arm.summary.TrajectoryObserved = false
+			}
+			if requiresTrajectory && !efficiencyObserved {
+				arm.summary.EfficiencyObserved = false
+			}
+			if requiresTrajectory && !efficiencyQualifying {
+				arm.summary.EfficiencyQualifying = false
 			}
 		}
 		if run.Correct {
@@ -770,6 +856,15 @@ func newFastPinnedQualificationReport(
 		}
 		if strings.TrimSpace(run.Answer) == "" {
 			report.TerminalAnswersObserved = false
+		}
+		if requiresTrajectory && !trajectoryObserved {
+			report.TrajectoryObserved = false
+		}
+		if requiresTrajectory && !efficiencyObserved {
+			report.EfficiencyObserved = false
+		}
+		if requiresTrajectory && !efficiencyQualifying {
+			report.EfficiencyQualifying = false
 		}
 		key := run.Case + "/" + run.Arm
 		cell := expected[key]
@@ -824,11 +919,45 @@ func newFastPinnedQualificationReport(
 				armStates[cell.summary.Arm].structuralFailures, failure)
 		}
 	}
+	if requiresTrajectory {
+		var fastMedianSum, fullMedianSum int64
+		var fastCost, fullCost float64
+		performanceObserved := len(caseNames) > 0
+		for _, caseName := range caseNames {
+			fastCell := expected[caseName+"/fast"]
+			fullCell := expected[caseName+"/full"]
+			if fastCell == nil || fullCell == nil ||
+				fastCell.summary.Runs != repetitions || fullCell.summary.Runs != repetitions ||
+				fastCell.summary.MedianMillis <= 0 || fullCell.summary.MedianMillis <= 0 ||
+				fastCell.summary.CostUSD <= 0 || fullCell.summary.CostUSD <= 0 {
+				performanceObserved = false
+				continue
+			}
+			fastMedianSum += fastCell.summary.MedianMillis
+			fullMedianSum += fullCell.summary.MedianMillis
+			fastCost += fastCell.summary.CostUSD
+			fullCost += fullCell.summary.CostUSD
+		}
+		report.FastPerformanceObserved = performanceObserved && fullMedianSum > 0 && fullCost > 0
+		if report.FastPerformanceObserved {
+			report.FastLatencyRatio = float64(fastMedianSum) / float64(fullMedianSum)
+			report.FastCostRatio = fastCost / fullCost
+			report.FastPerformanceQualifying = report.FastLatencyRatio <= maximumNonInferiorityRatio &&
+				report.FastCostRatio <= maximumNonInferiorityRatio
+		}
+	}
 	if report.Completed != report.Scheduled {
 		report.QualificationFailures = append(report.QualificationFailures,
 			fmt.Sprintf("incomplete_schedule:%d/%d", report.Completed, report.Scheduled))
 	}
 	report.Complete = len(report.QualificationFailures) == 0
+	if requiresTrajectory && !report.FastPerformanceObserved {
+		report.QualificationFailures = append(report.QualificationFailures, "fast_relative_performance_not_observed")
+	} else if requiresTrajectory && !report.FastPerformanceQualifying {
+		report.QualificationFailures = append(report.QualificationFailures,
+			fmt.Sprintf("fast_relative_performance_regressed:latency=%.4f:cost=%.4f:max=%.2f",
+				report.FastLatencyRatio, report.FastCostRatio, maximumNonInferiorityRatio))
+	}
 	if report.CorrectRuns != report.Completed {
 		report.QualificationFailures = append(report.QualificationFailures,
 			fmt.Sprintf("incorrect_runs:%d/%d", report.CorrectRuns, report.Completed))
@@ -845,6 +974,15 @@ func newFastPinnedQualificationReport(
 	if !report.TerminalAnswersObserved {
 		report.QualificationFailures = append(report.QualificationFailures, "terminal_answer_missing")
 	}
+	if requiresTrajectory && !report.TrajectoryObserved {
+		report.QualificationFailures = append(report.QualificationFailures, "trajectory_not_observed")
+	}
+	if requiresTrajectory && !report.EfficiencyObserved {
+		report.QualificationFailures = append(report.QualificationFailures, "efficiency_not_observed")
+	}
+	if requiresTrajectory && !report.EfficiencyQualifying {
+		report.QualificationFailures = append(report.QualificationFailures, "efficiency_not_qualifying")
+	}
 	if report.TotalCostUSD > report.MaxCostUSD {
 		report.QualificationFailures = append(report.QualificationFailures, "cost_ceiling_exceeded")
 	}
@@ -856,6 +994,11 @@ func newFastPinnedQualificationReport(
 			arm.CostObserved = false
 			arm.CacheIsolationObserved = false
 			arm.TerminalAnswersObserved = false
+			if requiresTrajectory {
+				arm.TrajectoryObserved = false
+				arm.EfficiencyObserved = false
+				arm.EfficiencyQualifying = false
+			}
 		}
 		if arm.Completed != arm.Scheduled {
 			state.structuralFailures = append(state.structuralFailures,
@@ -880,10 +1023,25 @@ func newFastPinnedQualificationReport(
 		if !arm.TerminalAnswersObserved {
 			arm.QualificationFailures = append(arm.QualificationFailures, "terminal_answer_missing:"+armName)
 		}
+		if requiresTrajectory && !arm.TrajectoryObserved {
+			arm.QualificationFailures = append(arm.QualificationFailures, "trajectory_not_observed:"+armName)
+		}
+		if requiresTrajectory && !arm.EfficiencyObserved {
+			arm.QualificationFailures = append(arm.QualificationFailures, "efficiency_not_observed:"+armName)
+		}
+		if requiresTrajectory && !arm.EfficiencyQualifying {
+			arm.QualificationFailures = append(arm.QualificationFailures, "efficiency_not_qualifying:"+armName)
+		}
+		arm.RelativePerformanceQualifying = !requiresTrajectory || armName != "fast" || report.FastPerformanceQualifying
+		if !arm.RelativePerformanceQualifying {
+			arm.QualificationFailures = append(arm.QualificationFailures, "fast_relative_performance_not_qualifying")
+		}
 		arm.ObservabilityObserved = arm.UsageObserved && arm.CostObserved &&
-			arm.CacheIsolationObserved && arm.TerminalAnswersObserved
+			arm.CacheIsolationObserved && arm.TerminalAnswersObserved &&
+			(!requiresTrajectory || (arm.TrajectoryObserved && arm.EfficiencyObserved))
 		allArmValid := arm.Complete && arm.Correct && arm.ObservabilityObserved &&
-			report.TotalCostUSD <= report.MaxCostUSD
+			report.TotalCostUSD <= report.MaxCostUSD &&
+			(!requiresTrajectory || (arm.EfficiencyQualifying && arm.RelativePerformanceQualifying))
 		arm.ComparisonQualifying = allArmValid && repetitions >= report.MinimumComparisonRepetitions
 		arm.ReleaseQualifying = sample == "release" && allArmValid &&
 			repetitions >= report.MinimumReleaseRepetitions
@@ -897,7 +1055,9 @@ func newFastPinnedQualificationReport(
 	}
 	allValid := report.Complete && report.Completed > 0 &&
 		report.CorrectRuns == report.Completed && report.UsageObserved && report.CostObserved &&
-		report.CacheIsolationObserved && report.TerminalAnswersObserved && report.TotalCostUSD <= report.MaxCostUSD
+		report.CacheIsolationObserved && report.TerminalAnswersObserved && report.TotalCostUSD <= report.MaxCostUSD &&
+		(!requiresTrajectory || (report.TrajectoryObserved && report.EfficiencyObserved && report.EfficiencyQualifying &&
+			report.FastPerformanceObserved && report.FastPerformanceQualifying))
 	report.ComparisonQualifying = allValid && repetitions >= report.MinimumComparisonRepetitions
 	report.ReleaseQualifying = sample == "release" && allValid && repetitions >= report.MinimumReleaseRepetitions
 	return report

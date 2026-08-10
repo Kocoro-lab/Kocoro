@@ -59,7 +59,6 @@ func TestOffline_AgentLabGeneralPurposePromptContract(t *testing.T) {
 			source: "kocoro",
 			required: []string{
 				"Kocoro is not limited to everyday work or coding",
-				"Reply in the language of the user's latest substantive message",
 			},
 		},
 	}
@@ -92,6 +91,15 @@ func TestOffline_AgentLabGeneralPurposePromptContract(t *testing.T) {
 			for _, phrase := range tc.required {
 				if !strings.Contains(system, phrase) {
 					t.Errorf("system prompt missing %q", phrase)
+				}
+			}
+			if tc.source == "kocoro" {
+				const languageAnchor = "Reply in the language of the user's CURRENT message"
+				if !messagesContain(req.Messages, languageAnchor) {
+					t.Errorf("provider request missing final language anchor %q", languageAnchor)
+				}
+				if strings.Contains(system, languageAnchor) {
+					t.Fatal("provider request duplicates the per-turn language authority in the system prompt")
 				}
 			}
 		})

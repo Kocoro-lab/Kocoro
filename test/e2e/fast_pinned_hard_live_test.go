@@ -370,8 +370,10 @@ func TestLive_FastPinnedHardTier(t *testing.T) {
 		run := runFastHardJob(t, provider, fastProfile, cases[jb.caseIndex], jb.arm, jb.repetition)
 		totalCost += run.CostUSD
 		results = append(results, run)
-		t.Logf("fast_hard case=%s arm=%s rep=%d correct=%v failures=%v latency_ms=%d llm_calls=%d cost=%.6f",
-			run.Case, run.Arm, run.Repetition, run.Correct, run.Failures, run.LatencyMillis, run.LLMCalls, run.CostUSD)
+		t.Logf("fast_hard case=%s arm=%s rep=%d correct=%v failures=%v efficient=%v efficiency_violations=%v latency_ms=%d llm_calls=%d cost=%.6f",
+			run.Case, run.Arm, run.Repetition, run.Correct, run.Failures,
+			run.Efficiency.Qualifying, run.Efficiency.Violations,
+			run.LatencyMillis, run.LLMCalls, run.CostUSD)
 		if totalCost > fastPinnedHardMaxCostUSD {
 			t.Logf("cost ceiling %.2f USD exceeded at %.4f — stopping with an incomplete report", fastPinnedHardMaxCostUSD, totalCost)
 			break
@@ -431,12 +433,21 @@ func runFastHardJob(
 	ctx, cancel := context.WithTimeout(context.Background(), 420*time.Second)
 	defer cancel()
 	started := time.Now()
-	answer, usage, err := loop.Run(ctx, prompt, nil, nil)
+	answer, _, err := loop.Run(ctx, prompt, nil, nil)
+	status := loop.LastRunStatus()
 	run := fastABRun{
 		Case: tc.name, Arm: arm, Repetition: repetition,
-		TrialID:       trialID,
-		LatencyMillis: time.Since(started).Milliseconds(),
-		Answer:        strings.TrimSpace(answer),
+		TrialID:            trialID,
+		LatencyMillis:      time.Since(started).Milliseconds(),
+		Answer:             strings.TrimSpace(answer),
+		TrajectoryObserved: true,
+		ToolTrajectory:     handler.trace(),
+		LoopEvents:         handler.loopEvents(),
+		Status: fastPinnedRunStatus{
+			Partial: status.Partial, FailureCode: string(status.FailureCode),
+			LastTool: status.LastTool, RetryCount: status.RetryCount,
+			IterationCount: status.IterationCount,
+		},
 	}
 	cacheIsolated, cached := cacheOffProvider.observations()
 	run.Cached = cached
@@ -448,15 +459,14 @@ func runFastHardJob(
 	if err != nil {
 		run.Failures = append(run.Failures, "loop_error:"+err.Error())
 	}
-	if usage != nil {
-		run.LLMCalls = usage.LLMCalls
-		run.InputTokens = usage.InputTokens
-		run.OutputTokens = usage.OutputTokens
-		run.TotalTokens = usage.TotalTokens
-		run.CostUSD = usage.CostUSD
-		run.UsageObserved = usage.LLMCalls > 0 && usage.TotalTokens > 0
-		run.CostObserved = usage.LLMCalls > 0 && usage.CostUSD > 0
-	}
+	usage := handler.accumulatedUsage()
+	run.LLMCalls = usage.LLM.LLMCalls
+	run.InputTokens = usage.LLM.InputTokens
+	run.OutputTokens = usage.LLM.OutputTokens
+	run.TotalTokens = usage.LLM.TotalTokens
+	run.CostUSD = usage.TotalCostUSD()
+	run.UsageObserved = usage.LLM.LLMCalls > 0 && usage.LLM.TotalTokens > 0
+	run.CostObserved = usage.LLM.LLMCalls > 0 && run.CostUSD > 0
 	if !run.UsageObserved {
 		run.Failures = append(run.Failures, "usage_not_observed")
 	}
@@ -466,6 +476,7 @@ func runFastHardJob(
 	if run.Answer == "" {
 		run.Failures = append(run.Failures, "terminal_answer_missing")
 	}
+	run.Efficiency = evaluateFastPinnedEfficiency(run.Case, run.LLMCalls, run.Status, run.ToolTrajectory)
 	switch tc.name {
 	case "long_chain_12":
 		if !strings.Contains(run.Answer, "LONGCHAIN-457") {
@@ -509,7 +520,7 @@ func summarizeFastHard(t *testing.T, results []fastABRun, repetitions int, total
 		caseNames = append(caseNames, tc.name)
 	}
 	report := newFastPinnedQualificationReport(
-		"kocoro.fast_pinned_hard.v3", fastPinnedHardSeed, sample, repetitions,
+		"kocoro.fast_pinned_hard.v4", fastPinnedHardSeed, sample, repetitions,
 		caseNames, results, totalCost, fastPinnedHardMaxCostUSD,
 	)
 	for _, cell := range report.Cells {
@@ -522,7 +533,8 @@ func summarizeFastHard(t *testing.T, results []fastABRun, repetitions int, total
 
 	outputPath := strings.TrimSpace(os.Getenv(fastPinnedHardOutputEnv))
 	if outputPath == "" {
-		outputPath = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-fast-pinned-hard-%d.json", fastPinnedHardSeed))
+		outputPath = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-fast-pinned-hard-%d-%s.json",
+			fastPinnedHardSeed, time.Now().UTC().Format("20060102T150405.000000000Z")))
 	}
 	if err := writeFastPinnedQualificationReport(outputPath, report); err != nil {
 		t.Fatalf("write report: %v", err)

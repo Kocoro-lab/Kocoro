@@ -793,6 +793,7 @@ func mustDaemonJSONQuote(t *testing.T, value string) string {
 type openAIComputerDaemonApprovalHandler struct {
 	nullEventHandler
 	approvals int
+	usage     agent.UsageAccumulator
 }
 
 func (h *openAIComputerDaemonApprovalHandler) OnApprovalNeeded(
@@ -801,6 +802,44 @@ func (h *openAIComputerDaemonApprovalHandler) OnApprovalNeeded(
 ) bool {
 	h.approvals++
 	return true
+}
+
+func (h *openAIComputerDaemonApprovalHandler) OnUsage(usage agent.TurnUsage) {
+	h.usage.Add(usage)
+}
+
+func TestOpenAIComputerChildHandlerTracksAndForwardsUsage(t *testing.T) {
+	parent := &openAIComputerDaemonApprovalHandler{}
+	local := &agent.UsageAccumulator{}
+	handler := openAIComputerChildHandlerV1{
+		parent: parent,
+		usage:  local,
+	}
+	delta := agent.LLMUsageDelta(client.Usage{
+		InputTokens:           120,
+		OutputTokens:          30,
+		TotalTokens:           150,
+		CostUSD:               0.42,
+		CacheReadTokens:       80,
+		CacheCreation5mTokens: 20,
+		CacheCreation1hTokens: 40,
+	}, "gpt-test")
+
+	handler.OnUsage(delta)
+
+	for name, got := range map[string]agent.TurnUsage{
+		"local":  local.Snapshot().LLM,
+		"parent": parent.usage.Snapshot().LLM,
+	} {
+		if got.LLMCalls != 1 || got.InputTokens != 120 ||
+			got.OutputTokens != 30 || got.TotalTokens != 150 ||
+			got.CostUSD != 0.42 || got.CacheReadTokens != 80 ||
+			got.CacheCreationTokens != 60 ||
+			got.CacheCreation5mTokens != 20 ||
+			got.CacheCreation1hTokens != 40 {
+			t.Fatalf("%s usage = %+v", name, got)
+		}
+	}
 }
 
 func newOpenAIComputerDaemonExecutorFixture(
@@ -2154,6 +2193,11 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 	}
 	if len(llm.requests) != 2 {
 		t.Fatalf("child completion requests = %d, want one batch + one continuation", len(llm.requests))
+	}
+	childUsage := handler.usage.Snapshot().LLM
+	if childUsage.LLMCalls != 2 || childUsage.InputTokens != 20 ||
+		childUsage.OutputTokens != 10 || childUsage.TotalTokens != 30 {
+		t.Fatalf("parent-forwarded child usage = %+v, want 2 calls and 20/10/30 tokens", childUsage)
 	}
 	if llm.requests[0].ToolChoice != "any" {
 		t.Fatalf("initial child tool_choice = %#v, want any", llm.requests[0].ToolChoice)

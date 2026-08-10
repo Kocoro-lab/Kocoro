@@ -14,6 +14,7 @@ import (
 //     This means any handler returning "approved" approves the call.
 //   - SetSessionID (Task 8): propagate only to wrapped handlers that implement it.
 //   - OnRunStatus (Task 9): propagate only to wrapped handlers that implement RunStatusHandler.
+//   - OnRunTrace: propagate only to wrapped handlers that implement RunTraceHandler.
 type multiHandler struct {
 	handlers []agent.EventHandler
 }
@@ -114,6 +115,18 @@ func (m *multiHandler) OnRunStatus(code, detail string) {
 	for _, h := range m.handlers {
 		if rsh, ok := h.(agent.RunStatusHandler); ok {
 			rsh.OnRunStatus(code, detail)
+		}
+	}
+}
+
+// OnRunTrace propagates canonical trajectory events to wrapped handlers that
+// implement agent.RunTraceHandler. The method is present on multiHandler itself
+// so the agent loop's optional-interface assertion succeeds after RunAgent wraps
+// the transport handler with the daemon bus handler.
+func (m *multiHandler) OnRunTrace(event agent.RunTraceEvent) {
+	for _, h := range m.handlers {
+		if rth, ok := h.(agent.RunTraceHandler); ok {
+			rth.OnRunTrace(event)
 		}
 	}
 }

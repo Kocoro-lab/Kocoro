@@ -105,13 +105,16 @@ func TestDoTaskDescriptionMatchesPersonaContract(t *testing.T) {
 			desc = d.Description
 		}
 	}
-	for _, want := range []string{"vary", "one obvious step", "never quiz the user", "full final user-facing reply", "stable public knowledge", "nature of the information"} {
+	for _, want := range []string{"vary", "one obvious step", "never quiz the user", "full final user-facing reply", "stable public knowledge", "nature of the information", "active reply language"} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("do_task description missing %q", want)
 		}
 	}
 	if strings.Contains(desc, `Chinese utterance -> "我来处理"`) {
 		t.Fatal("do_task description must not mandate a single fixed acknowledgement phrase anymore")
+	}
+	if strings.Contains(desc, "language of the utterance") {
+		t.Fatal("do_task description must defer to the session's active reply language")
 	}
 }
 

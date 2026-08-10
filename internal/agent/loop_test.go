@@ -1608,9 +1608,6 @@ func (m *mockCloudTreeTool) IsReadOnlyCall(string) bool {
 	return true
 }
 
-
-
-
 func TestAgentLoop_StateAwareCache_FileWriteInvalidatesRead(t *testing.T) {
 	readTool := &mockCountingTool{name: "file_read", content: "contents"}
 	writeTool := &mockCountingTool{name: "file_write", content: "written"}
@@ -3948,6 +3945,16 @@ func TestCoreRules_EmptyResultRule_NoContradictoryOldPhrasing(t *testing.T) {
 	defaultComposed := defaultPersona + coreOperationalRules
 	if strings.Contains(defaultComposed, forbidden) {
 		t.Errorf("found old unqualified phrasing in defaultComposed system prompt")
+	}
+}
+
+func TestCoreRules_LeaveReplyLanguageToFinalDirective(t *testing.T) {
+	if strings.Contains(coreOperationalRules, "Reply in the language") ||
+		strings.Contains(coreOperationalRules, "latest substantive message") {
+		t.Fatal("core rules contain a second reply-language authority")
+	}
+	if !strings.Contains(coreOperationalRules, "Preserve product names") {
+		t.Fatal("core rules lost the original-form preservation contract")
 	}
 }
 

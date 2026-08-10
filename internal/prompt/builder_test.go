@@ -906,12 +906,13 @@ func TestBuildSystemPrompt_FastModeGuidanceIsVolatile(t *testing.T) {
 	fast := BuildSystemPrompt(PromptOptions{BasePrompt: "Base.", FastMode: true})
 	for _, want := range []string{
 		"## Fast Task",
-		"fewest tool rounds",
-		"Do not repeat a successful call",
+		"closes a required outcome or evidence gap",
+		"batch independent safe work",
 		"Search only for requested or required current/external facts",
-		"one broad query",
+		"open-ended search",
 		"Search again only when the first result failed",
-		"Use web_fetch for a specific page",
+		"user-named page",
+		"do not substitute another source",
 	} {
 		if !strings.Contains(fast.VolatileContext, want) {
 			t.Errorf("FastMode volatile context missing %q", want)
@@ -924,6 +925,29 @@ func TestBuildSystemPrompt_FastModeGuidanceIsVolatile(t *testing.T) {
 	normal := BuildSystemPrompt(PromptOptions{BasePrompt: "Base."})
 	if strings.Contains(normal.VolatileContext, "## Fast Task") {
 		t.Fatal("normal mode must not receive FastMode guidance")
+	}
+}
+
+func TestBuildSystemPrompt_WebResultsRespectNamedSourceBoundary(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:       "Base.",
+		GatewayToolNames: []string{"web_fetch"},
+	})
+	guidance := parts.StableContext
+	for _, want := range []string{"user-named page or source", "report it and stop", "one different source"} {
+		if !strings.Contains(guidance, want) {
+			t.Errorf("web guidance missing %q: %s", want, guidance)
+		}
+	}
+	if strings.Contains(guidance, "report it as such and try a different source") {
+		t.Fatal("web guidance still forces source substitution for user-named pages")
+	}
+}
+
+func TestFormatGuidanceKoeDoesNotCompeteWithLanguageDirective(t *testing.T) {
+	guidance := formatGuidance("koe")
+	if strings.Contains(guidance, "language of the user's current message") || strings.Contains(guidance, "reply in the language") {
+		t.Fatalf("Koe format guidance contains a second language authority: %s", guidance)
 	}
 }
 

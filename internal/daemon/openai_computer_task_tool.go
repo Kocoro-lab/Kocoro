@@ -1285,7 +1285,11 @@ func (t *openAIComputerTaskToolV1) Run(
 	child.SetExecutionProfile(profile)
 	child.SetOpenAIComputerBatchExecutor(runner)
 	child.SetForceInitialToolUse(true)
-	child.SetHandler(openAIComputerChildHandlerV1{parent: t.handler})
+	childUsage := &agent.UsageAccumulator{}
+	child.SetHandler(openAIComputerChildHandlerV1{
+		parent: t.handler,
+		usage:  childUsage,
+	})
 	child.SetStickyContext(
 		"execution_role=private_openai_native_computer\n" +
 			"Complete the user's entire desktop goal with the native computer tool. " +
@@ -1354,13 +1358,23 @@ func (t *openAIComputerTaskToolV1) Run(
 	)
 	stats := runner.BatchStatsV1()
 	providerStats := privateGateway.StatsV1()
+	childLLMUsage := childUsage.Snapshot().LLM
 	providerEvent := openAIComputerTraceEventV1{
-		Phase:         "private_executor",
-		Status:        "completed",
-		ModelCalls:    providerStats.ModelCalls,
-		ModelTimeouts: providerStats.ModelTimeouts,
-		BatchCount:    stats.Batches,
-		DurationMS:    time.Since(providerStarted).Milliseconds(),
+		Phase:                 "private_executor",
+		Status:                "completed",
+		ModelCalls:            providerStats.ModelCalls,
+		ModelTimeouts:         providerStats.ModelTimeouts,
+		BatchCount:            stats.Batches,
+		LLMCalls:              childLLMUsage.LLMCalls,
+		InputTokens:           childLLMUsage.InputTokens,
+		OutputTokens:          childLLMUsage.OutputTokens,
+		TotalTokens:           childLLMUsage.TotalTokens,
+		CostUSD:               childLLMUsage.CostUSD,
+		CacheReadTokens:       childLLMUsage.CacheReadTokens,
+		CacheCreationTokens:   childLLMUsage.CacheCreationTokens,
+		CacheCreation5mTokens: childLLMUsage.CacheCreation5mTokens,
+		CacheCreation1hTokens: childLLMUsage.CacheCreation1hTokens,
+		DurationMS:            time.Since(providerStarted).Milliseconds(),
 	}
 	if err != nil {
 		var initialUnavailable *openAIComputerInitialResponseUnavailableV1
@@ -1700,6 +1714,7 @@ func (t *openAIComputerTaskToolV1) Run(
 // while its intermediate narration stays inside the single parent tool card.
 type openAIComputerChildHandlerV1 struct {
 	parent agent.EventHandler
+	usage  *agent.UsageAccumulator
 }
 
 func (h openAIComputerChildHandlerV1) OnToolCall(string, string, string) {}
@@ -1714,6 +1729,9 @@ func (h openAIComputerChildHandlerV1) OnCloudAgent(string, string, string) {}
 func (h openAIComputerChildHandlerV1) OnCloudProgress(int, int)            {}
 func (h openAIComputerChildHandlerV1) OnCloudPlan(string, string, bool)    {}
 func (h openAIComputerChildHandlerV1) OnUsage(usage agent.TurnUsage) {
+	if h.usage != nil {
+		h.usage.Add(usage)
+	}
 	if h.parent != nil {
 		h.parent.OnUsage(usage)
 	}

@@ -115,6 +115,12 @@ func emitCompactionFailureStatus(handler any, phase string, err error) {
 // started MUST be paired with a finished on all exits of the pass — success,
 // shaping no-op, and summary failure alike — or the indicator sticks.
 func (a *AgentLoop) emitCompactionStatus(code runstatus.Code, phase string) {
+	a.emitRunTrace(RunTraceEvent{
+		Type: RunTraceEventCompaction,
+		Compaction: &RunTraceCompaction{
+			Phase: phase, Status: string(code), Applied: false,
+		},
+	})
 	if rs, ok := a.handler.(RunStatusHandler); ok {
 		rs.OnRunStatus(string(code), phase)
 	}
@@ -181,6 +187,7 @@ func (a *AgentLoop) truncateUserMessageOverBudget(messages []client.Message, sou
 		truncations++
 	}
 	if totalDropped > 0 {
+		a.emitAppliedCompaction(sourceTag, 0)
 		if rs, ok := a.handler.(RunStatusHandler); ok {
 			rs.OnRunStatus("preflight_user_truncate",
 				fmt.Sprintf("%s: truncated user messages by %d chars across %d message(s) (%s, %d msgs, est %d tokens)",
@@ -231,6 +238,12 @@ func (a *AgentLoop) recordCompactionSuccess(phase, detail string) {
 // ToolName, matching the schema convention at audit/audit.go:13 — non-tool
 // entries leave ToolName empty (force_stop is the existing precedent).
 func (a *AgentLoop) recordCompactionFailure(phase string, err error) {
+	a.emitRunTrace(RunTraceEvent{
+		Type: RunTraceEventCompaction,
+		Compaction: &RunTraceCompaction{
+			Phase: phase, Status: "failed", Applied: false,
+		},
+	})
 	emitCompactionFailureStatus(a.handler, phase, err)
 	if a.auditor != nil {
 		a.auditor.Log(audit.AuditEntry{
@@ -502,8 +515,7 @@ const coreOperationalRules = `
 - If an external write may have happened but its outcome is unknown, report outcome_unknown and do not repeat it without reconciliation or an idempotency contract.
 
 ## Tools
-- Use tools to perform actions and obtain current, private, device, app, calculated, or source-specific facts. Tool schemas are authoritative for capabilities and parameters.
-- Prefer the narrowest dedicated tool. Read existing state before modifying it. Batch independent safe reads; keep dependent or state-changing calls sequential unless the tool contract explicitly supports concurrency.
+- Use tools to perform actions and obtain current, private, device, app, calculated, or source-specific facts. Read existing state before modifying it.
 - Every call must close a required outcome or evidence gap. Never repeat equivalent arguments without new evidence or changed state, and never add calls only for reassurance.
 - Treat a successful result with a clear receipt or returned object as evidence. When it is ambiguous, use the narrowest independent verification.
 - For sensitive personal discovery, check only the obvious scoped sources before asking. Exhaustive exploration is appropriate only inside a user-scoped project or dataset.
@@ -522,7 +534,7 @@ const coreOperationalRules = `
 - If end-to-end verification is unavailable, state exactly what was tested and what remains unproved.
 
 ## Communication
-- Reply in the language of the user's latest substantive message unless explicitly asked otherwise. Preserve product names, identifiers, commands, paths, and quoted errors.
+- Preserve product names, identifiers, commands, paths, and quoted errors in their original form.
 - Lead with the outcome and be concise by default. Before non-trivial tool work, give one brief user-facing preamble and continue with the tool calls in the same response. Do not narrate routine mechanics or hidden reasoning.
 - Summarize relevant results instead of dumping logs. Do not apologize for routine tool use or begin with filler.
 - While a multi-step task runs, surface short user-visible progress notes at meaningful moments — a found root cause, a direction change, a long stretch of tool work. Brief is good; silent until the end is not.
@@ -767,6 +779,7 @@ type AgentLoop struct {
 	tools       *ToolRegistry
 	modelTier   string
 	handler     EventHandler
+	runTrace    *runTraceEmitter
 	shannonDir  string
 	maxIter     int
 	maxTokens   int
@@ -2869,6 +2882,9 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	}()
 	a.tracker.Enter(PhaseSetup)
 
+	a.runTrace = newRunTraceEmitter(a.handler)
+	defer func() { a.runTrace = nil }()
+
 	// Per-run activated skills set: tools (use_skill, bash) consult it via
 	// context to scope skill secret env vars to skills explicitly activated
 	// by the model, avoiding global secret leakage across unrelated skills.
@@ -3394,6 +3410,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 
 		activateCompactionCheckpoint()
 		dropped := before - len(messages)
+		a.emitAppliedCompaction(recordPhase, dropped)
 		a.recordCompactionSuccess(recordPhase, fmt.Sprintf("msgs=%d→%d dropped=%d", before, len(messages), dropped))
 		return dropped, true
 	}
@@ -3632,6 +3649,13 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			RetryCount:     retryCount,
 			IterationCount: iterationCount,
 		}
+		a.emitRunTrace(RunTraceEvent{
+			Type: RunTraceEventTerminal,
+			Terminal: &RunTraceTerminal{
+				Partial: partial, FailureCode: string(code), LastTool: lastToolName,
+				RetryCount: retryCount, IterationCount: iterationCount,
+			},
+		})
 	}
 
 	truncateRawUserForPersistence := func(raw string) string {
@@ -3896,6 +3920,13 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			sealed := a.executionProfileID != "" || a.executionProfile != nil || a.computerProfile.ProfileID != ""
 			if !sealed && !forceStopEmptyRecoveryUsed {
 				forceStopEmptyRecoveryUsed = true
+				a.emitRunTrace(RunTraceEvent{
+					Type: RunTraceEventRetry,
+					Retry: &RunTraceRetry{
+						Kind: "force_stop_empty_synthesis", Attempt: 2,
+						ReasonCategory: "empty_response",
+					},
+				})
 				if rs, ok := a.handler.(RunStatusHandler); ok {
 					rs.OnRunStatus("empty_response_retry",
 						"force-stop synthesis returned no visible text; retrying once with reasoning disabled")
@@ -4227,6 +4258,9 @@ iterationLoop:
 			break
 		}
 		iterationCount = i + 1
+		if a.runTrace != nil {
+			a.runTrace.setIteration(iterationCount)
+		}
 
 		// Check for context cancellation (e.g. user pressed Esc)
 		if ctx.Err() != nil {
@@ -4747,6 +4781,7 @@ iterationLoop:
 		// re-burn thinking tokens for those shapes. Bounded by
 		// maxInconsistentFinishRetries (per-Run). Re-issues run the inner
 		// attempt loop fresh (attempt=0), so streamingText resets naturally.
+		responseAttempt := 0
 		for {
 			for attempt := 0; ; attempt++ {
 				// Enter (or re-enter) the idle-counted phase for this attempt.
@@ -4842,6 +4877,7 @@ iterationLoop:
 					resp, err = a.client.Complete(ctx, req)
 				}
 				if err == nil {
+					responseAttempt = attempt + 1
 					if isOpenAIComputerContinuation {
 						openAIContinuationScreenshot = nil
 					}
@@ -5107,6 +5143,14 @@ iterationLoop:
 				backoff := llmRetryDelay(err, attempt)
 				reason := classifyLLMError(err)
 				retryCount++
+				a.emitRunTrace(RunTraceEvent{
+					Iteration: i + 1,
+					Type:      RunTraceEventRetry,
+					Retry: &RunTraceRetry{
+						Kind: "provider_transient", Attempt: attempt + 2,
+						ReasonCategory: reason, DelayMillis: backoff.Milliseconds(),
+					},
+				})
 				reanchorActiveTask(MetaBoundaryRetryAfterError)
 				if !reuseExactRequestOnRetry {
 					req.Messages = messages
@@ -5143,6 +5187,17 @@ iterationLoop:
 				}
 			}
 
+			a.emitRunTrace(RunTraceEvent{
+				Iteration: i + 1,
+				Type:      RunTraceEventModelResponse,
+				Model: &RunTraceModelResponse{
+					Attempt: responseAttempt, Model: resp.Model,
+					FinishReason: resp.FinishReason, ToolCalls: len(resp.AllToolCalls()),
+					Cached: resp.Cached, InputTokens: resp.Usage.InputTokens,
+					OutputTokens: resp.Usage.OutputTokens, TotalTokens: resp.Usage.TotalTokens,
+				},
+			})
+
 			// Inconsistent-finish detection. Check the raw response BEFORE
 			// any fullText/truncatedText assembly: a prior max_tokens
 			// continuation could leave truncatedText non-empty, which would
@@ -5159,6 +5214,14 @@ iterationLoop:
 				inconsistentFinishRetries < maxInconsistentFinishRetries {
 				recordMainLLMUsage(resp, false)
 				inconsistentFinishRetries++
+				a.emitRunTrace(RunTraceEvent{
+					Iteration: i + 1,
+					Type:      RunTraceEventRetry,
+					Retry: &RunTraceRetry{
+						Kind: "inconsistent_finish_recovery", Attempt: inconsistentFinishRetries + 1,
+						ReasonCategory: "incomplete_response",
+					},
+				})
 				// Distinct audit event so post-incident triage can attribute
 				// recoveries to this path vs the legitimate end_turn empty case.
 				if a.auditor != nil {
@@ -5460,6 +5523,10 @@ iterationLoop:
 					Role:    "user",
 					Content: client.NewTextContent("Your response was cut off. Continue from where you stopped."),
 				})
+				a.emitRunTrace(RunTraceEvent{
+					Type:  RunTraceEventNudge,
+					Nudge: &RunTraceNudge{Kind: "max_tokens_continuation", Action: "continue_output"},
+				})
 				markInjected()
 				continue
 			}
@@ -5500,6 +5567,10 @@ iterationLoop:
 					Role:    "user",
 					Content: client.NewTextContent("STOP. You wrote out tool calls as text instead of actually calling them. Those are fabricated results — none of those actions happened. Use real tool calls to perform the actions."),
 				})
+				a.emitRunTrace(RunTraceEvent{
+					Type:  RunTraceEventNudge,
+					Nudge: &RunTraceNudge{Kind: "fabricated_tool_call", Action: "use_real_tools"},
+				})
 				markInjected()
 				continue
 			}
@@ -5524,6 +5595,10 @@ iterationLoop:
 					Role:    "user",
 					Content: client.NewTextContent("You described a result without calling a tool to verify it in this response. Use the appropriate tool (screenshot, accessibility read_tree, file_read, bash, etc.) to confirm before proceeding."),
 				})
+				a.emitRunTrace(RunTraceEvent{
+					Type:  RunTraceEventNudge,
+					Nudge: &RunTraceNudge{Kind: "unverified_action_claim", Action: "verify_with_tool"},
+				})
 				markInjected()
 				continue
 			}
@@ -5535,6 +5610,10 @@ iterationLoop:
 				messages = append(messages, client.Message{
 					Role:    "user",
 					Content: client.NewTextContent("STOP. A tool was denied by the user this turn, but your response claims it completed. The denied tool did NOT run. Acknowledge the denial and ask how to proceed instead."),
+				})
+				a.emitRunTrace(RunTraceEvent{
+					Type:  RunTraceEventNudge,
+					Nudge: &RunTraceNudge{Kind: "success_claim_after_denial", Action: "acknowledge_denial"},
 				})
 				markInjected()
 				continue
@@ -5551,6 +5630,10 @@ iterationLoop:
 					resp.FinishReason == "tool_use" ||
 					looksLikeToolContinuationPreamble(resp.OutputText) {
 					reanchorActiveTask(MetaBoundaryToolSearchLoaded)
+					a.emitRunTrace(RunTraceEvent{
+						Type:  RunTraceEventNudge,
+						Nudge: &RunTraceNudge{Kind: "tool_search_continuation", Action: "use_loaded_tools"},
+					})
 					// tool_search nudge path — preserve the model's pre-load
 					// reasoning so the next iteration sees the same trajectory.
 					messages = append(messages, buildAssistantMessage(resp, resp.OutputText))
@@ -5595,6 +5678,13 @@ iterationLoop:
 								"and finish the user's task.",
 						),
 					})
+					a.emitRunTrace(RunTraceEvent{
+						Type: RunTraceEventRetry,
+						Retry: &RunTraceRetry{
+							Kind: "empty_post_tool_response", Attempt: emptyPostToolRetries + 1,
+							ReasonCategory: "empty_response",
+						},
+					})
 					markInjected()
 					if rs, ok := a.handler.(RunStatusHandler); ok {
 						rs.OnRunStatus(
@@ -5633,7 +5723,6 @@ iterationLoop:
 				Content: client.NewTextContent(fullText),
 			})
 			captureRunMessages()
-			setRunStatus(runstatus.CodeNone, false)
 			if a.handler != nil {
 				a.handler.OnText(fullText)
 			}
@@ -5679,6 +5768,7 @@ iterationLoop:
 				continue
 			}
 			a.clearLastSentOrdinaryContinuation(req.PreviousResponseID)
+			setRunStatus(runstatus.CodeNone, false)
 			return fullText, usage, nil
 		}
 
@@ -5836,17 +5926,24 @@ iterationLoop:
 		// Builds list of approved tool calls. Denied/unknown results are stored
 		// in execResults at their original index so Phase 3 can emit everything in order.
 		type perCallMeta struct {
-			argsStr       string
-			decision      string
-			wasApproved   bool
-			validated     bool
-			trustProgress bool
-			sideEffect    bool
-			loopReadOnly  bool
-			loopVeto      bool
-			argsDigest    string
-			resolved      bool // true if already resolved (denied/unknown/hook-denied)
-			stateTraits   CallStateTraits
+			argsStr             string
+			ordinal             int
+			decision            string
+			resolution          string
+			wasApproved         bool
+			validated           bool
+			trustProgress       bool
+			sideEffect          bool
+			loopReadOnly        bool
+			loopVeto            bool
+			argsDigest          string
+			resolved            bool // true if already resolved (denied/unknown/hook-denied)
+			executionBatchIndex int
+			executionBatchSize  int
+			executionParallel   bool
+			maxConcurrency      int
+			executionBatchSet   bool
+			stateTraits         CallStateTraits
 		}
 		callMeta := make([]perCallMeta, len(toolCalls))
 		execResults := make([]toolExecResult, len(toolCalls))
@@ -5870,8 +5967,11 @@ iterationLoop:
 			toolsUsed[fc.Name]++
 			argsStr := fc.ArgumentsString()
 			callMeta[idx].argsStr = argsStr
+			callMeta[idx].ordinal = totalToolCalls
+			callMeta[idx].argsDigest = toolArgumentsDigest(fc.Arguments)
 			if batchLoopBlocked {
 				callMeta[idx].decision = "loop_blocked"
+				callMeta[idx].resolution = "loop_blocked"
 				callMeta[idx].resolved = true
 				callMeta[idx].loopVeto = true
 				execResults[idx] = toolExecResult{
@@ -5888,6 +5988,7 @@ iterationLoop:
 
 			dedupKey := fc.Name + "\x00" + normalizeJSON(fc.Arguments)
 			if seenCalls[dedupKey] {
+				callMeta[idx].resolution = "duplicate"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "duplicate tool call skipped (identical to earlier call in this response)", IsError: true},
@@ -5920,6 +6021,7 @@ iterationLoop:
 					blocked = computerUseRetryBlockedResult()
 				}
 				a.logAudit(fc.Name, argsStr, blocked.Content, "deny", false, 0, nil)
+				callMeta[idx].resolution = "denied"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{result: blocked, name: fc.Name}
 				if a.handler != nil {
@@ -5939,6 +6041,7 @@ iterationLoop:
 			// Denied-call blocking: auto-reject if this exact call was denied earlier
 			if deniedCalls[dedupKey] {
 				callMeta[idx].decision = "deny"
+				callMeta[idx].resolution = "denied"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "tool call blocked: previously denied this turn. Use a different approach.", IsError: true},
@@ -5955,6 +6058,7 @@ iterationLoop:
 			// The lock resets if the call fails, allowing retry.
 			if fc.Name == "cloud_delegate" {
 				if cloudDelegateClaimed {
+					callMeta[idx].resolution = "duplicate"
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{Content: "cloud_delegate already called this turn. Use the previous result — do not re-delegate.", IsError: true},
@@ -5973,6 +6077,7 @@ iterationLoop:
 
 			tool, ok := effTools.Get(fc.Name)
 			if !ok {
+				callMeta[idx].resolution = "rejected"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "unknown tool: " + fc.Name, IsError: true},
@@ -5992,6 +6097,7 @@ iterationLoop:
 			// (or safely pre-seeded) before validation, approval, hooks, or I/O.
 			if deferred[fc.Name] {
 				if _, loaded := loadedDeferred[fc.Name]; !loaded {
+					callMeta[idx].resolution = "rejected"
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{
@@ -6020,6 +6126,7 @@ iterationLoop:
 				}
 				a.logAudit(fc.Name, argsStr, denyMsg, "deny", false, 0, nil)
 				callMeta[idx].decision = "deny"
+				callMeta[idx].resolution = "denied"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: denyMsg, IsError: true, ErrorCategory: ErrCategoryPermission},
@@ -6070,6 +6177,7 @@ iterationLoop:
 						truncationRecoveryCount, maxTruncationRecoveries)
 				}
 
+				callMeta[idx].resolution = "truncated"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					// InternalOnly: write to transcript (LLM next-turn input
@@ -6124,6 +6232,7 @@ iterationLoop:
 			// waste a remote MCP/gateway round-trip.
 			if validationResult, valid := ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
 				a.logAudit(fc.Name, argsStr, validationResult.Content, "validation", false, 0, nil)
+				callMeta[idx].resolution = "rejected"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{result: validationResult, name: fc.Name}
 				if a.handler != nil {
@@ -6135,12 +6244,12 @@ iterationLoop:
 			callMeta[idx].loopReadOnly = isLoopReadOnlyCall(tool, fc.Name, argsStr)
 			if readOnly, ok := tool.(ReadOnlyChecker); !ok || !readOnly.IsReadOnlyCall(argsStr) {
 				callMeta[idx].sideEffect = true
-				callMeta[idx].argsDigest = toolArgumentsDigest(fc.Arguments)
 				if a.hasPriorSideEffect(
 					fc.Name,
 					callMeta[idx].argsDigest,
 				) {
 					callMeta[idx].decision = "replay_blocked"
+					callMeta[idx].resolution = "replay_blocked"
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{
@@ -6186,6 +6295,7 @@ iterationLoop:
 					}
 				}
 				a.logAudit(fc.Name, argsStr, denial.Content, decision, false, 0, nil)
+				callMeta[idx].resolution = "denied"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: denial,
@@ -6198,6 +6308,7 @@ iterationLoop:
 			}
 			if decision == "ask" && !wasApproved {
 				a.logAudit(fc.Name, argsStr, "tool call denied by user", decision, false, 0, nil)
+				callMeta[idx].resolution = "denied"
 				callMeta[idx].resolved = true
 				execResults[idx] = toolExecResult{
 					result: ToolResult{Content: "Tool execution was DENIED by the user. The command did NOT run. Do not claim it completed or report any output from it.", IsError: true},
@@ -6220,6 +6331,7 @@ iterationLoop:
 					a.logAudit(fc.Name, argsStr, "tool call denied by hook: "+hookReason, "deny", false, 0, nil)
 					callMeta[idx].decision = "deny"
 					callMeta[idx].wasApproved = false
+					callMeta[idx].resolution = "denied"
 					callMeta[idx].resolved = true
 					execResults[idx] = toolExecResult{
 						result: ToolResult{Content: "tool call denied by hook: " + hookReason, IsError: true},
@@ -6242,6 +6354,10 @@ iterationLoop:
 					// sanitizeResult, the audit row, and the terminal
 					// OnToolResult event.
 					execResults[idx] = earlyResult
+					callMeta[idx].executionBatchIndex = a.runTrace.nextBatchOrdinal()
+					callMeta[idx].executionBatchSize = 1
+					callMeta[idx].maxConcurrency = 1
+					callMeta[idx].executionBatchSet = true
 					claimedStreamTool = true
 					// Preserve read-before-edit state before later calls in this
 					// response reach execution. The normal executor performs the
@@ -6262,6 +6378,21 @@ iterationLoop:
 		// ---- Phase 2 (batched): partition by read-only, execute with concurrency limits ----
 		if len(approved) > 0 {
 			batches := partitionToolCalls(approved)
+			for _, batch := range batches {
+				batchOrdinal := a.runTrace.nextBatchOrdinal()
+				concurrency := len(batch)
+				if concurrency > maxToolConcurrency {
+					concurrency = maxToolConcurrency
+				}
+				for _, ac := range batch {
+					meta := &callMeta[ac.index]
+					meta.executionBatchIndex = batchOrdinal
+					meta.executionBatchSize = len(batch)
+					meta.executionParallel = len(batch) > 1
+					meta.maxConcurrency = concurrency
+					meta.executionBatchSet = true
+				}
+			}
 			a.tracker.Enter(PhaseExecutingTools)
 			executeBatches(
 				ctx,
@@ -6413,6 +6544,10 @@ iterationLoop:
 			} else if !callMeta[idx].validated {
 				outcome = "rejected"
 			}
+			traceOutcome := outcome
+			if callMeta[idx].resolution != "" {
+				traceOutcome = callMeta[idx].resolution
+			}
 			digest := sha256.Sum256([]byte(result.Content))
 			a.recordToolOutcomeEvidence(executionprofile.ToolOutcomeEvidence{
 				ToolCallID:         fc.ID,
@@ -6424,6 +6559,34 @@ iterationLoop:
 				SideEffect:         callMeta[idx].sideEffect && !callMeta[idx].resolved,
 				ArgumentsDigest:    callMeta[idx].argsDigest,
 				ResultDigest:       hex.EncodeToString(digest[:]),
+			})
+
+			var executionBatchIndex *int
+			if callMeta[idx].executionBatchSet {
+				batchIndex := callMeta[idx].executionBatchIndex
+				executionBatchIndex = &batchIndex
+			}
+			a.emitRunTrace(RunTraceEvent{
+				Iteration: i + 1,
+				Type:      RunTraceEventToolOutcome,
+				Tool: &RunTraceToolOutcome{
+					Ordinal:              callMeta[idx].ordinal,
+					Name:                 fc.Name,
+					ArgumentsHMACSHA256:  a.runTrace.digest(normalizeJSON(fc.Arguments)),
+					ResultHMACSHA256:     a.runTrace.digest(result.Content),
+					ModelBatchID:         i + 1,
+					ModelBatchIndex:      idx,
+					ModelBatchSize:       len(toolCalls),
+					ExecutionBatchIndex:  executionBatchIndex,
+					ExecutionBatchSize:   callMeta[idx].executionBatchSize,
+					ExecutionParallel:    callMeta[idx].executionParallel,
+					MaxConcurrency:       callMeta[idx].maxConcurrency,
+					Executed:             !callMeta[idx].resolved,
+					Outcome:              traceOutcome,
+					ErrorCategory:        result.ErrorCategory,
+					Retryable:            result.ErrorCategory == ErrCategoryTransient,
+					DurationMilliseconds: elapsed.Milliseconds(),
+				},
 			})
 
 			// Track successful file reads for read-before-edit enforcement
@@ -6743,6 +6906,11 @@ iterationLoop:
 				Role:    "developer",
 				Content: client.NewTextContent(worstMsg),
 			})
+			a.emitRunTrace(RunTraceEvent{
+				Iteration: i + 1,
+				Type:      RunTraceEventNudge,
+				Nudge:     &RunTraceNudge{Kind: "loop_detector", Action: "change_approach"},
+			})
 			markInjected()
 		}
 
@@ -6768,6 +6936,10 @@ iterationLoop:
 				messages = append(messages, client.Message{
 					Role:    "user",
 					Content: client.NewTextContent("You seem to be struggling with web/research tasks. Consider using cloud_delegate to handle this on Shannon Cloud."),
+				})
+				a.emitRunTrace(RunTraceEvent{
+					Type:  RunTraceEventNudge,
+					Nudge: &RunTraceNudge{Kind: "cloud_delegation_recovery", Action: "consider_cloud_delegate"},
 				})
 				markInjected()
 			}

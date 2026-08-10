@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
@@ -334,8 +335,96 @@ func TestOffline_FastPinnedQualificationFailsClosed(t *testing.T) {
 	})
 }
 
-// TestOffline_FastPinnedRequalifyV2Artifact recalculates qualification solely
-// from an existing report's raw runs. It never constructs an LLM client.
+func TestOffline_FastPinnedV4RequiresObservedEfficientTrajectory(t *testing.T) {
+	caseNames := []string{"multi_file_synthesis", "constrained_schedule"}
+	runs := fastPinnedQualificationFixture(caseNames, agentLabQualityReleaseRepetitions)
+	for index := range runs {
+		run := &runs[index]
+		run.LLMCalls = 2
+		run.Status = fastPinnedRunStatus{IterationCount: 2}
+		run.TrajectoryObserved = true
+		run.LoopEvents = []agent.RunTraceEvent{
+			{
+				Seq: 1, Iteration: 1, Type: agent.RunTraceEventModelResponse,
+				Model: &agent.RunTraceModelResponse{Attempt: 1, FinishReason: "tool_use"},
+			},
+			{
+				Seq: 2, Iteration: 2, Type: agent.RunTraceEventTerminal,
+				Terminal: &agent.RunTraceTerminal{IterationCount: 2},
+			},
+		}
+		if run.Case == "multi_file_synthesis" {
+			run.ToolTrajectory = fastPinnedTrace(1, 0, 3, "file_read", "file_read", "file_read")
+		}
+		run.Efficiency = evaluateFastPinnedEfficiency(run.Case, run.LLMCalls, run.Status, run.ToolTrajectory)
+		if !run.Efficiency.Qualifying {
+			t.Fatalf("fixture efficiency failed: %+v", run.Efficiency)
+		}
+	}
+
+	report := newFastPinnedQualificationReport(
+		"fixture.v4", 1, "release", agentLabQualityReleaseRepetitions,
+		caseNames, runs, 1, 5,
+	)
+	if !report.FastReleaseQualifying || !report.FullReleaseQualifying ||
+		!report.TrajectoryObserved || !report.EfficiencyObserved || !report.EfficiencyQualifying ||
+		!report.FastPerformanceObserved || !report.FastPerformanceQualifying {
+		t.Fatalf("observed efficient v4 fixture did not qualify: %+v", report)
+	}
+
+	regressed := append([]fastABRun(nil), runs...)
+	for index := range regressed {
+		if regressed[index].Arm == "fast" {
+			regressed[index].LatencyMillis *= 2
+			regressed[index].CostUSD *= 2
+		}
+	}
+	regressedReport := newFastPinnedQualificationReport(
+		"fixture.v4", 1, "release", agentLabQualityReleaseRepetitions,
+		caseNames, regressed, 1, 5,
+	)
+	if !regressedReport.Complete || regressedReport.FastReleaseQualifying || regressedReport.FastPerformanceQualifying ||
+		!containsFastPinnedFailure(regressedReport.QualificationFailures, "fast_relative_performance_regressed") {
+		t.Fatalf("slower and more expensive Fast arm qualified: %+v", regressedReport)
+	}
+
+	missingTrace := append([]fastABRun(nil), runs...)
+	missingTrace[0].TrajectoryObserved = false
+	missingTrace[0].ToolTrajectory = nil
+	missingReport := newFastPinnedQualificationReport(
+		"fixture.v4", 1, "release", agentLabQualityReleaseRepetitions,
+		caseNames, missingTrace, 1, 5,
+	)
+	if missingReport.FastReleaseQualifying || missingReport.ReleaseQualifying ||
+		!containsFastPinnedFailure(missingReport.QualificationFailures, "trajectory_not_observed") {
+		t.Fatalf("missing trajectory qualified: %+v", missingReport)
+	}
+
+	mismatchedTerminal := append([]fastABRun(nil), runs...)
+	mismatchedTerminal[0].LoopEvents = append([]agent.RunTraceEvent(nil), runs[0].LoopEvents...)
+	mismatchedTerminal[0].LoopEvents[1].Terminal = &agent.RunTraceTerminal{Partial: true, IterationCount: 2}
+	mismatchReport := newFastPinnedQualificationReport(
+		"fixture.v4", 1, "release", agentLabQualityReleaseRepetitions,
+		caseNames, mismatchedTerminal, 1, 5,
+	)
+	if mismatchReport.ReleaseQualifying || mismatchReport.TrajectoryObserved {
+		t.Fatalf("terminal trace mismatch qualified: %+v", mismatchReport)
+	}
+
+	legacyRuns := fastPinnedQualificationFixture(caseNames, agentLabQualityReleaseRepetitions)
+	legacyAsV4 := newFastPinnedQualificationReport(
+		"fixture.v4", 1, "release", agentLabQualityReleaseRepetitions,
+		caseNames, legacyRuns, 1, 5,
+	)
+	if legacyAsV4.FastReleaseQualifying || legacyAsV4.FullReleaseQualifying ||
+		legacyAsV4.ReleaseQualifying || legacyAsV4.TrajectoryObserved || legacyAsV4.EfficiencyObserved {
+		t.Fatalf("v3-style evidence gained v4 qualification: %+v", legacyAsV4)
+	}
+}
+
+// TestOffline_FastPinnedRequalifyV2Artifact recalculates legacy comparison
+// evidence solely from an existing report's raw runs. A legacy artifact can
+// never gain current release qualification. It never constructs an LLM client.
 //
 //	KOCORO_FAST_PINNED_REQUALIFY=1 KOCORO_FAST_PINNED_REQUALIFY_INPUT=/path/report-v2.json KOCORO_FAST_PINNED_REQUALIFY_OUTPUT=/path/report-v3.json go test ./test/e2e -run '^TestOffline_FastPinnedRequalifyV2Artifact$' -count=1 -v
 func TestOffline_FastPinnedRequalifyV2Artifact(t *testing.T) {
@@ -392,16 +481,19 @@ func TestOffline_FastPinnedRequalifyV2Artifact(t *testing.T) {
 	}
 	requalified := newFastPinnedQualificationReport(
 		strings.TrimSuffix(source.SchemaVersion, ".v2")+".v3",
-		source.Seed, source.Sample, source.RepetitionsPerCell,
+		source.Seed, "legacy_requalified", source.RepetitionsPerCell,
 		caseNames, source.Runs, totalCost, source.MaxCostUSD,
 	)
 	if err := writeFastPinnedQualificationReport(outputAbs, requalified); err != nil {
 		t.Fatalf("write v3 report: %v", err)
 	}
-	t.Logf("requalified v2 artifact: fast_release_qualifying=%t full_release_qualifying=%t global_release_qualifying=%t report=%s",
-		requalified.FastReleaseQualifying, requalified.FullReleaseQualifying,
-		requalified.ReleaseQualifying, outputAbs)
-	assertFastPinnedQualification(t, requalified, outputAbs)
+	if requalified.FastReleaseQualifying || requalified.FullReleaseQualifying || requalified.ReleaseQualifying {
+		t.Fatalf("legacy evidence gained release qualification: %+v", requalified)
+	}
+	if !fastPinnedArm(t, requalified, "fast").ComparisonQualifying {
+		t.Fatalf("legacy Fast comparison evidence was not preserved: %+v", requalified)
+	}
+	t.Logf("requalified legacy v2 comparison evidence: release_qualifying=false report=%s", outputAbs)
 }
 
 func fastPinnedQualificationFixture(caseNames []string, repetitions int) []fastABRun {
