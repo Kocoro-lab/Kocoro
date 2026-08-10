@@ -3587,7 +3587,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		latestUserText                   = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
 		cloudNudgeFired                  bool
 		cloudDelegateClaimed             bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
-		criticalLoopRecoveryUsed         bool   // first atomic loop veto gets one normal-tools recovery response
+		criticalLoopRecoveryIteration    = -1 // iteration of the last atomic-veto recovery turn; -1 = none yet. Quota is per trailing window (nudgeWindowIters), not per run — see the batch-veto branch.
 		cloudResultContent               string // non-empty when a cloud deliverable should bypass LLM summarization
 		lastDiscoveryInput               string // dedup: skip discovery when user text hasn't changed between iterations
 		contextBloatStatusSent           bool
@@ -5818,11 +5818,18 @@ iterationLoop:
 		if batchLoopBlocked {
 			worstAction = LoopNudge
 			worstMsg = batchLoopMessage + " No tool in this batch executed. Use a different action, answer from existing evidence, or report the blocker."
-			if criticalLoopRecoveryUsed {
+			// The recovery quota is per trailing window, not per run: a stall
+			// that begins more than nudgeWindowIters iterations after the last
+			// recovery turn is a new incident and earns its own recovery
+			// chance (same trailing window the nudge escalation uses above).
+			// Only a repeat within the window force-stops — a per-run one-shot
+			// quota terminated recoverable second stalls in long trajectories
+			// (pinned by TestAgentLoopSecondDistantStallEarnsNewRecoveryTurn).
+			if criticalLoopRecoveryIteration >= 0 && i-criticalLoopRecoveryIteration <= nudgeWindowIters {
 				worstAction = LoopForceStop
-				worstMsg = loopForceStopNote(batchLoopMessage + " The model repeated a critical loop after its recovery turn.")
+				worstMsg = loopForceStopNote(batchLoopMessage + " The model repeated a critical loop within its recovery window.")
 			} else {
-				criticalLoopRecoveryUsed = true
+				criticalLoopRecoveryIteration = i
 			}
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("tool_loop_batch_blocked", batchLoopMessage)
