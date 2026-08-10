@@ -1026,6 +1026,10 @@ type AgentLoop struct {
 	// for the next fire point — dirty state is never silently dropped.
 	checkpointMinInterval time.Duration
 	lastCheckpointAt      time.Time
+	// sideEffectJournal wraps material mutations in a durable dispatch state
+	// machine. nil preserves the legacy execution path for callers that have
+	// not installed a persistent journal.
+	sideEffectJournal SideEffectExecutionJournal
 
 	// tracker is the per-Run phase state machine. Created at Run() entry,
 	// set to PhaseDone + AssertClean via defer on exit. Reads are safe from
@@ -1106,6 +1110,14 @@ func (a *AgentLoop) SetCheckpointFunc(fn CheckpointFunc) {
 	a.checkpointFn = fn
 }
 
+// SetSideEffectExecutionJournal installs the durable execution boundary for
+// material tool calls. A journal requires SetCheckpointFunc: immediately after
+// Prepare, the loop forces a checkpoint containing the assistant tool call and
+// the caller-owned in-progress marker before MarkDispatching and Tool.Run.
+func (a *AgentLoop) SetSideEffectExecutionJournal(journal SideEffectExecutionJournal) {
+	a.sideEffectJournal = journal
+}
+
 // SetCheckpointMinInterval sets a debounce window between checkpoint
 // fires. When a fire point is reached within this window of the previous
 // successful checkpoint, the call is skipped and the dirty flag is left
@@ -1160,9 +1172,9 @@ func (a *AgentLoop) maybeCheckpoint(ctx context.Context) {
 	a.lastCheckpointAt = time.Now()
 }
 
-// checkpointNow bypasses debounce for a newly activated ep1 computer profile.
-// The next completion is not allowed to carry that profile until the transcript
-// and activation overlay share one durable checkpoint.
+// checkpointNow bypasses debounce for a state transition that must be durable
+// before the next external boundary. Current callers use it for newly activated
+// computer profiles and for material side-effect dispatch.
 func (a *AgentLoop) checkpointNow(ctx context.Context) error {
 	if a.checkpointFn == nil || a.tracker == nil {
 		return nil
@@ -1174,7 +1186,12 @@ func (a *AgentLoop) checkpointNow(ctx context.Context) error {
 		return err
 	}
 	a.tracker.TakeDirty()
-	a.lastCheckpointAt = time.Now()
+	// A pre-dispatch checkpoint protects the upcoming external write; it must
+	// not debounce the end-of-iteration checkpoint that persists the matching
+	// result moments later.
+	if CheckpointReasonFromContext(ctx) != CheckpointReasonSideEffectPrepared {
+		a.lastCheckpointAt = time.Now()
+	}
 	return nil
 }
 
@@ -6417,6 +6434,7 @@ iterationLoop:
 		}
 
 		// ---- Phase 2 (batched): partition by read-only, execute with concurrency limits ----
+		var sideEffectExecutionErr error
 		if len(approved) > 0 {
 			batches := partitionToolCalls(approved)
 			for _, batch := range batches {
@@ -6435,13 +6453,30 @@ iterationLoop:
 				}
 			}
 			a.tracker.Enter(PhaseExecutingTools)
-			executeBatches(
+			sideEffectExecutionErr = executeBatches(
 				ctx,
 				batches,
 				execResults,
 				readTracker,
 				a.handler,
 				latestUserText,
+				sideEffectBatchHooks{
+					journal: a.sideEffectJournal,
+					checkpointPrepared: func(checkpointCtx context.Context) error {
+						// The assistant tool_call is already in messages at this point.
+						// Capture it before the caller persists InProgress, then require
+						// that save to finish before the journal enters dispatching.
+						captureRunMessages()
+						if a.checkpointFn == nil {
+							return ErrSideEffectJournalUnavailable
+						}
+						a.tracker.MarkDirty()
+						return a.checkpointNow(withCheckpointReason(
+							checkpointCtx,
+							CheckpointReasonSideEffectPrepared,
+						))
+					},
+				},
 			)
 		}
 		if len(approved) > 0 || claimedStreamTool {
@@ -6857,6 +6892,46 @@ iterationLoop:
 				Content: client.NewTextContent(strings.TrimRight(allResults.String(), " \t\n\r")),
 			})
 			stampMessage()
+		}
+
+		if sideEffectExecutionErr != nil {
+			// Pair and persist the synthetic result, but never ask the model to
+			// interpret or retry an uncertain mutation. A cancellation that raced
+			// with Tool.Run must not suppress this final local durability attempt.
+			terminalText := "The external action was not executed because its durable execution record could not be saved."
+			if errors.Is(sideEffectExecutionErr, ErrSideEffectOutcomeUnknown) {
+				terminalText = "The external action may have completed, but its result could not be durably confirmed. It was not retried. Review the external system before retrying."
+			}
+			messages = append(messages, client.Message{
+				Role:    "assistant",
+				Content: client.NewTextContent(terminalText),
+			})
+			stampMessage()
+			captureRunMessages()
+			a.tracker.MarkDirty()
+			if checkpointErr := a.checkpointNow(context.WithoutCancel(ctx)); checkpointErr != nil {
+				sideEffectExecutionErr = fmt.Errorf(
+					"%w: persist terminal side-effect result: %v",
+					sideEffectExecutionErr,
+					checkpointErr,
+				)
+			}
+			code := runstatus.CodeSideEffectJournalUnavailable
+			partial := false
+			detail := "material tool execution stopped before dispatch because its durable journal was unavailable"
+			if errors.Is(sideEffectExecutionErr, ErrSideEffectOutcomeUnknown) {
+				code = runstatus.CodeSideEffectOutcomeUnknown
+				partial = true
+				detail = "external state may have changed; automatic continuation and retry were stopped"
+			}
+			setRunStatus(code, partial)
+			if rs, ok := a.handler.(RunStatusHandler); ok {
+				rs.OnRunStatus(string(code), detail)
+			}
+			if a.handler != nil {
+				a.handler.OnText(terminalText)
+			}
+			return terminalText, usage, sideEffectExecutionErr
 		}
 
 		// A daemon-owned action-card boundary deliberately ends the turn after

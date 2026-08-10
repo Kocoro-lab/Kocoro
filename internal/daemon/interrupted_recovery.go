@@ -26,10 +26,11 @@ type interruptedTurnCandidate struct {
 }
 
 var (
-	errInterruptedRecoverySuperseded = errors.New("interrupted recovery superseded")
-	errInterruptedRecoveryStale      = errors.New("interrupted recovery stale")
-	errInterruptedRecoveryExhausted  = errors.New("interrupted recovery exhausted")
-	errInterruptedRecoveryInvalidRun = errors.New("interrupted recovery has invalid run identity")
+	errInterruptedRecoverySuperseded     = errors.New("interrupted recovery superseded")
+	errInterruptedRecoveryStale          = errors.New("interrupted recovery stale")
+	errInterruptedRecoveryExhausted      = errors.New("interrupted recovery exhausted")
+	errInterruptedRecoveryInvalidRun     = errors.New("interrupted recovery has invalid run identity")
+	errInterruptedRecoveryReviewRequired = errors.New("interrupted recovery requires side-effect review")
 )
 
 // discoverInterruptedTurns scans the default and named-agent session stores.
@@ -305,6 +306,10 @@ func (s *Server) resumeInterruptedCandidate(ctx context.Context, candidate inter
 		case errors.Is(runErr, errInterruptedRecoveryInvalidRun):
 			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
 				"checkpoint run identity is invalid; no model call was made")
+			return
+		case errors.Is(runErr, errInterruptedRecoveryReviewRequired):
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_review_required",
+				"an external action may have completed; it was not retried and no model call was made")
 			return
 		}
 		log.Printf("daemon: interrupted turn resume failed session=%s agent=%s: %v",

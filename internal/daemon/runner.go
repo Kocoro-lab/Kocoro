@@ -2291,6 +2291,9 @@ func claimInterruptedResume(
 		checkpointAt = sess.UpdatedAt
 		state.UpdatedAt = checkpointAt
 	}
+	if err := guardInterruptedToolExecutions(sessMgr, sess, state); err != nil {
+		return err
+	}
 
 	now := time.Now()
 	if checkpointAt.IsZero() ||
@@ -3531,6 +3534,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
+	if !req.Ephemeral {
+		loop.SetSideEffectExecutionJournal(newSessionSideEffectJournal(
+			sessMgr,
+			sess,
+			req.RunID,
+			req.AttemptID,
+		))
+	}
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
@@ -4023,7 +4034,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		sess.InProgress = true
 		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+		rollbackToolExecutions := stageCommittedToolExecutionsForCheckpoint(
+			agent.CheckpointReasonFromContext(ctx),
+			sess,
+			req.RunID,
+		)
 		if err := sessMgr.Save(); err != nil {
+			rollbackToolExecutions()
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
 			// Return the error so AgentLoop.maybeCheckpoint keeps the
 			// dirty flag set and the next fire point retries.
@@ -4113,7 +4130,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				sess.InProgress = false // ordinary hard-error path: turn is over
 				sess.InterruptedTurn = nil
 			}
+			rollbackToolExecutions := stageCommittedToolExecutionsForSave(sess, req.RunID)
 			if err := sessMgr.Save(); err != nil {
+				rollbackToolExecutions()
 				log.Printf("daemon: failed to save error session: %v", err)
 			} else {
 				savedSessionID = sess.ID
@@ -4258,8 +4277,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
 			return nil, err
 		}
-		sess.InProgress = false // turn completed — clear mid-turn crash marker
-		sess.InterruptedTurn = nil
 		if req.IdempotencyKey != "" {
 			receipts := deliverableReceipts.snapshot()
 			setIdempotentRequestState(
@@ -4276,7 +4293,24 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if runEventFlushErr != nil {
 			log.Printf("daemon: final run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, runEventFlushErr)
 		}
+		previousInProgress := sess.InProgress
+		previousInterruptedTurn := sess.InterruptedTurn
+		rollbackToolExecutions := stageCommittedToolExecutionsForSave(sess, req.RunID)
+		if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
+			// A post-dispatch outcome that was not durably resolved remains a
+			// startup-review marker. The recovery path will never replay it.
+			sess.InProgress = true
+			sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+		} else {
+			sess.InProgress = false
+			sess.InterruptedTurn = nil
+		}
 		saveErr = sessMgr.Save()
+		if saveErr != nil {
+			rollbackToolExecutions()
+			sess.InProgress = previousInProgress
+			sess.InterruptedTurn = previousInterruptedTurn
+		}
 		if runEventFlushErr != nil {
 			if err := runEvents.Flush(); err != nil {
 				log.Printf("daemon: final run event flush retry failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, err)
@@ -4979,6 +5013,7 @@ func closeRouteDone(done chan struct{}) {
 func isSoftRunError(err error) bool {
 	return errors.Is(err, agent.ErrMaxIterReached) ||
 		errors.Is(err, agent.ErrRequestBudgetExhausted) ||
+		errors.Is(err, agent.ErrSideEffectOutcomeUnknown) ||
 		errors.Is(err, agent.ErrHardIdleTimeout) ||
 		errors.Is(err, client.ErrStreamIdleTimeout) ||
 		errors.Is(err, context.Canceled) ||

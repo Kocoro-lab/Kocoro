@@ -47,6 +47,21 @@ func TestCodeFromError_ClassifiesRequestBudgetExhaustion(t *testing.T) {
 	}
 }
 
+func TestCodeFromError_ClassifiesSideEffectBoundaries(t *testing.T) {
+	tests := []struct {
+		err  error
+		want Code
+	}{
+		{errors.New("agent: side-effect execution outcome unknown"), CodeSideEffectOutcomeUnknown},
+		{errors.New("agent: side-effect execution journal unavailable"), CodeSideEffectJournalUnavailable},
+	}
+	for _, test := range tests {
+		if got := CodeFromError(test.err); got != test.want {
+			t.Fatalf("CodeFromError(%q) = %q, want %q", test.err, got, test.want)
+		}
+	}
+}
+
 // TestCodeFromError_TransportShapes pins that every transport-layer shape
 // surfaced by the gateway client labels as CodeNetworkInterrupted, not the
 // generic CodeUnexpected. Shares client.TransportErrorShape with the retry

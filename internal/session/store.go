@@ -136,6 +136,10 @@ type Session struct {
 	// resolved profile metadata plus validated tool/deliverable evidence; no
 	// provider-native response ids or hidden reasoning are persisted.
 	ExecutionRuns []executionprofile.Run `json:"execution_runs,omitempty"`
+	// ToolExecutions is the durable boundary around material side effects. It
+	// stores only opaque identifiers and SHA-256 digests, never tool arguments
+	// or results. Recovery treats any non-terminal dispatch as unsafe to replay.
+	ToolExecutions []ToolExecutionRecord `json:"tool_executions,omitempty"`
 	// Pinned sticks the session to the top of the list regardless of
 	// recency. Set/cleared via PATCH /sessions/{id} {"pinned": bool}.
 	Pinned bool `json:"pinned,omitempty"`
@@ -831,6 +835,20 @@ func (s *Store) SavePreservingUpdatedAt(sess *Session) error {
 }
 
 func (s *Store) save(sess *Session, touchUpdatedAt bool) error {
+	if err := sess.ValidateToolExecutions(); err != nil {
+		return err
+	}
+	originalToolExecutions := append([]ToolExecutionRecord(nil), sess.ToolExecutions...)
+	saveSucceeded := false
+	defer func() {
+		if !saveSucceeded {
+			sess.ToolExecutions = originalToolExecutions
+		}
+	}()
+	if err := sess.ReconcileToolExecutionCheckpoints(time.Now()); err != nil {
+		return err
+	}
+	sess.TrimTerminalToolExecutions(MaxRetainedTerminalToolExecutions)
 	if touchUpdatedAt {
 		sess.UpdatedAt = s.nextUpdatedAt()
 	}
@@ -887,6 +905,7 @@ func (s *Store) save(sess *Session, touchUpdatedAt bool) error {
 	if s.index != nil {
 		s.index.UpsertSession(sess) // best-effort, don't fail save on index error
 	}
+	saveSucceeded = true
 	return nil
 }
 
@@ -1108,6 +1127,9 @@ func (s *Store) Load(id string) (*Session, error) {
 	}
 	if sess.SchemaVersion == 0 {
 		sess.SchemaVersion = 1
+	}
+	if err := sess.ValidateToolExecutions(); err != nil {
+		return nil, err
 	}
 	// Sessions created before schedule_id was introduced already persisted a
 	// stable channel in the form "schedule-<id>". Recover that association at

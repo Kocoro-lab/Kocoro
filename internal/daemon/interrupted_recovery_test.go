@@ -513,6 +513,70 @@ func TestResumeInterruptedTurnsAbandonsExhaustedWithoutGatewayCall(t *testing.T)
 	}
 }
 
+func TestResumeInterruptedTurnsRequiresReviewWithoutGatewayCall(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "must not be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+	const id = "recovery-side-effect-review-001"
+	dir := filepath.Join(deps.ShannonDir, "sessions")
+	state := &session.InterruptedTurn{
+		Source:    "desktop",
+		RunID:     "run1_00000000000000000000000000000001",
+		AttemptID: "att1_00000000000000000000000000000001",
+	}
+	writeInterruptedSession(t, dir, id, state)
+	mgr := session.NewManager(dir)
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := session.NewToolExecutionRecordFromDigest(
+		state.RunID,
+		state.AttemptID,
+		"create_record",
+		"tool-side-effect-review",
+		session.ToolExecutionDigest(`{"value":1}`),
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AddToolExecution(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.MarkToolExecutionDispatching(record.ExecutionID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+	_ = mgr.Close()
+
+	(&Server{deps: deps}).resumeInterruptedTurns(context.Background())
+	if requests := gw.requests(); len(requests) != 0 {
+		t.Fatalf("review-required recovery called gateway %d times", len(requests))
+	}
+
+	mgr = session.NewManager(dir)
+	defer mgr.Close()
+	persisted, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.InProgress || persisted.InterruptedTurn != nil {
+		t.Fatalf("review-required recovery marker not cleared: %#v", persisted.InterruptedTurn)
+	}
+	if got := persisted.ToolExecutions[0].State; got != session.ToolExecutionOutcomeUnknown {
+		t.Fatalf("tool execution state = %q", got)
+	}
+	if got := persisted.Messages[len(persisted.Messages)-1].Content.Text(); !strings.Contains(got, "was not retried") {
+		t.Fatalf("review warning = %q", got)
+	}
+}
+
 func TestResumeInterruptedTurnFailuresPreserveCheckpointAndStopAtLimit(t *testing.T) {
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "temporary gateway failure", http.StatusServiceUnavailable)

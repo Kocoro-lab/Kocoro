@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -91,7 +92,12 @@ func executeBatches(
 	readTracker *ReadTracker,
 	handler EventHandler,
 	userRequest string,
-) {
+	sideEffectHooks ...sideEffectBatchHooks,
+) error {
+	var hooks sideEffectBatchHooks
+	if len(sideEffectHooks) > 0 {
+		hooks = sideEffectHooks[0]
+	}
 	// Attach the handler's OnUsage as the per-run usage emitter so tools
 	// that bill per call (gateway tools reporting xAI/Grok or SerpAPI costs)
 	// can fold their usage into the session totals.
@@ -99,73 +105,65 @@ func executeBatches(
 		ctx = WithUsageEmit(ctx, handler.OnUsage)
 	}
 	for _, batch := range batches {
+		var batchErr error
 		if len(batch) == 1 {
 			// Single call: run directly, no goroutine overhead.
 			ac := batch[0]
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						execResults[ac.index] = toolExecResult{
-							result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", r), IsError: true},
-							name:   ac.fc.Name,
-						}
-					}
-				}()
+			prepared, err := prepareApprovedToolCall(ctx, ac, hooks)
+			if err != nil {
+				execResults[ac.index] = toolExecResult{
+					result: sideEffectJournalUnavailableResult(ac.fc.Name),
+					name:   ac.fc.Name,
+				}
+				batchErr = err
+			} else {
 				if handler != nil {
 					handler.OnToolCall(ac.fc.Name, ac.argsStr, ac.fc.ID)
 				}
-				toolCtx, toolCancel := dispatchCtx(ctx, ac.tool)
-				if toolCancel != nil {
-					defer toolCancel()
-				}
-				toolCtx = withToolInvocation(toolCtx, ToolInvocation{
-					ToolName:    ac.fc.Name,
-					ToolUseID:   ac.fc.ID,
-					UserRequest: userRequest,
-				})
-				startTime := time.Now()
-				result, runErr := ac.tool.Run(toolCtx, ac.argsStr)
-				execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}
-			}()
+				execResults[ac.index], batchErr = runApprovedToolCall(ctx, ac, userRequest, prepared, hooks.journal)
+			}
 		} else {
 			// Concurrent batch with semaphore.
 			sem := make(chan struct{}, maxToolConcurrency)
+			batchErrs := make(chan error, len(batch))
 			var wg sync.WaitGroup
 			wg.Add(len(batch))
 			for _, ac := range batch {
 				sem <- struct{}{} // acquire — blocks until a slot is free
+				prepared, err := prepareApprovedToolCall(ctx, ac, hooks)
+				if err != nil {
+					<-sem
+					execResults[ac.index] = toolExecResult{
+						result: sideEffectJournalUnavailableResult(ac.fc.Name),
+						name:   ac.fc.Name,
+					}
+					batchErrs <- err
+					wg.Done()
+					continue
+				}
 				// Emit "running" after acquiring the slot so the event reflects
 				// actual execution start, not just batch membership. Called from
 				// the main goroutine so handler writes stay serialized.
 				if handler != nil {
 					handler.OnToolCall(ac.fc.Name, ac.argsStr, ac.fc.ID)
 				}
-				go func(ac approvedToolCall) {
+				go func(ac approvedToolCall, prepared *PreparedSideEffectExecution) {
 					defer wg.Done()
 					defer func() { <-sem }() // release
-					defer func() {
-						if r := recover(); r != nil {
-							execResults[ac.index] = toolExecResult{
-								result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", r), IsError: true},
-								name:   ac.fc.Name,
-							}
-						}
-					}()
-					toolCtx, toolCancel := dispatchCtx(ctx, ac.tool)
-					if toolCancel != nil {
-						defer toolCancel()
+					result, err := runApprovedToolCall(ctx, ac, userRequest, prepared, hooks.journal)
+					execResults[ac.index] = result
+					if err != nil {
+						batchErrs <- err
 					}
-					toolCtx = withToolInvocation(toolCtx, ToolInvocation{
-						ToolName:    ac.fc.Name,
-						ToolUseID:   ac.fc.ID,
-						UserRequest: userRequest,
-					})
-					startTime := time.Now()
-					result, runErr := ac.tool.Run(toolCtx, ac.argsStr)
-					execResults[ac.index] = toolExecResult{result: result, elapsed: time.Since(startTime), err: runErr, name: ac.fc.Name}
-				}(ac)
+				}(ac, prepared)
 			}
 			wg.Wait()
+			close(batchErrs)
+			for err := range batchErrs {
+				if batchErr == nil {
+					batchErr = err
+				}
+			}
 		}
 
 		// Inter-batch side effect: track file_read results for ReadTracker.
@@ -181,5 +179,158 @@ func executeBatches(
 				}
 			}
 		}
+		if batchErr != nil {
+			return batchErr
+		}
 	}
+	return nil
+}
+
+type sideEffectBatchHooks struct {
+	journal            SideEffectExecutionJournal
+	checkpointPrepared func(context.Context) error
+}
+
+func prepareApprovedToolCall(
+	ctx context.Context,
+	ac approvedToolCall,
+	hooks sideEffectBatchHooks,
+) (*PreparedSideEffectExecution, error) {
+	if hooks.journal == nil || !hasMaterialSideEffect(ac.tool, ac.argsStr) {
+		return nil, nil
+	}
+	prepared, err := hooks.journal.Prepare(ctx, SideEffectExecution{
+		ToolUseID:       ac.fc.ID,
+		ToolName:        ac.fc.Name,
+		ArgumentsSHA256: sideEffectArgumentsDigest(ac.argsStr),
+	})
+	if err == nil {
+		err = validatePreparedSideEffect(prepared)
+	}
+	if err != nil {
+		return nil, wrapSideEffectExecutionError(
+			ErrSideEffectJournalUnavailable, ac.fc.Name, err,
+		)
+	}
+	if hooks.checkpointPrepared == nil {
+		err = errors.New("pre-dispatch checkpoint hook is not installed")
+	} else {
+		err = hooks.checkpointPrepared(ctx)
+	}
+	if err != nil {
+		_ = hooks.journal.MarkAbandoned(context.WithoutCancel(ctx), prepared.ExecutionID, "")
+		return nil, wrapSideEffectExecutionError(
+			ErrSideEffectJournalUnavailable, ac.fc.Name, err,
+		)
+	}
+	if err := hooks.journal.MarkDispatching(ctx, prepared.ExecutionID); err != nil {
+		_ = hooks.journal.MarkAbandoned(context.WithoutCancel(ctx), prepared.ExecutionID, "")
+		return nil, wrapSideEffectExecutionError(
+			ErrSideEffectJournalUnavailable, ac.fc.Name, err,
+		)
+	}
+	return &prepared, nil
+}
+
+func runApprovedToolCall(
+	ctx context.Context,
+	ac approvedToolCall,
+	userRequest string,
+	prepared *PreparedSideEffectExecution,
+	journal SideEffectExecutionJournal,
+) (executionResult toolExecResult, fatalErr error) {
+	executionResult.name = ac.fc.Name
+	var startTime time.Time
+	defer func() {
+		if !startTime.IsZero() {
+			executionResult.elapsed = time.Since(startTime)
+		}
+		if recovered := recover(); recovered != nil {
+			executionResult.result = ToolResult{
+				Content: fmt.Sprintf("tool panicked: %v", recovered),
+				IsError: true,
+			}
+			if prepared == nil || journal == nil {
+				// Preserve the legacy no-journal panic result, which did not
+				// report a duration because Tool.Run never returned normally.
+				executionResult.elapsed = 0
+				return
+			}
+			_ = journal.MarkOutcomeUnknown(
+				context.WithoutCancel(ctx),
+				prepared.ExecutionID,
+				sideEffectResultDigest(executionResult.result, nil),
+			)
+			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+			fatalErr = wrapSideEffectExecutionError(
+				ErrSideEffectOutcomeUnknown, ac.fc.Name,
+				fmt.Errorf("tool panicked"),
+			)
+		}
+	}()
+
+	toolCtx, toolCancel := dispatchCtx(ctx, ac.tool)
+	if toolCancel != nil {
+		defer toolCancel()
+	}
+	toolCtx = withToolInvocation(toolCtx, ToolInvocation{
+		ToolName:    ac.fc.Name,
+		ToolUseID:   ac.fc.ID,
+		UserRequest: userRequest,
+	})
+	if prepared != nil {
+		toolCtx = withSideEffectExecution(toolCtx, *prepared)
+	}
+
+	startTime = time.Now()
+	executionResult.result, executionResult.err = ac.tool.Run(toolCtx, ac.argsStr)
+	if prepared == nil || journal == nil {
+		return executionResult, nil
+	}
+
+	digest := sideEffectResultDigest(executionResult.result, executionResult.err)
+	journalCtx := context.WithoutCancel(ctx)
+	failed := executionResult.err != nil || executionResult.result.IsError
+	if !failed {
+		if err := journal.MarkCommitted(journalCtx, prepared.ExecutionID, digest); err == nil {
+			return executionResult, nil
+		} else {
+			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
+			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+			executionResult.err = nil
+			return executionResult, wrapSideEffectExecutionError(
+				ErrSideEffectOutcomeUnknown, ac.fc.Name, err,
+			)
+		}
+	}
+
+	knownNoEffect := executionResult.result.ErrorCategory == ErrCategoryValidation
+	if outcome := executionResult.result.ComputerUseOutcome; outcome != nil &&
+		outcome.Validate() == nil && outcome.Effect == ComputerUseCommitNone {
+		knownNoEffect = true
+	}
+	if reporter, ok := ac.tool.(SideEffectNoEffectReporter); ok {
+		knownNoEffect = knownNoEffect || reporter.SideEffectFailedWithoutEffect(
+			ac.argsStr, executionResult.result, executionResult.err,
+		)
+	}
+	if knownNoEffect {
+		if err := journal.MarkAbandoned(journalCtx, prepared.ExecutionID, digest); err == nil {
+			return executionResult, nil
+		} else {
+			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
+			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+			executionResult.err = nil
+			return executionResult, wrapSideEffectExecutionError(
+				ErrSideEffectOutcomeUnknown, ac.fc.Name, err,
+			)
+		}
+	}
+
+	markErr := journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
+	executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+	executionResult.err = nil
+	return executionResult, wrapSideEffectExecutionError(
+		ErrSideEffectOutcomeUnknown, ac.fc.Name, markErr,
+	)
 }
