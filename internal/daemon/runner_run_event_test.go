@@ -30,6 +30,7 @@ func TestRunAgentPersistsUniversalRunEventLogForDesktop(t *testing.T) {
 	if result.SessionID != sessionID {
 		t.Fatalf("session id = %q", result.SessionID)
 	}
+	waitForTitlePersisted(t, filepath.Join(deps.ShannonDir, "sessions", sessionID+".json"))
 	runRoot := filepath.Join(deps.ShannonDir, "sessions", ".run-events", sessionID)
 	runEntries, err := os.ReadDir(runRoot)
 	if err != nil || len(runEntries) != 1 {
