@@ -717,6 +717,54 @@ func (l *openAIComputerDaemonInitialResponseLLM) callCount() int {
 	return l.calls
 }
 
+type openAIComputerNestedBudgetProbeTool struct {
+	raw   client.LLMClient
+	stats openAIComputerProviderStatsV1
+}
+
+func (*openAIComputerNestedBudgetProbeTool) Info() agent.ToolInfo {
+	return agent.ToolInfo{
+		Name:       "nested_computer_provider_probe",
+		Parameters: map[string]any{"type": "object"},
+	}
+}
+
+func (*openAIComputerNestedBudgetProbeTool) RequiresApproval() bool {
+	return false
+}
+
+func (t *openAIComputerNestedBudgetProbeTool) Run(
+	ctx context.Context,
+	_ string,
+) (agent.ToolResult, error) {
+	private := newOpenAIComputerPrivateGatewayV1(
+		ctx,
+		t.raw,
+		5*time.Millisecond,
+		2,
+	)
+	_, err := private.CompleteStream(
+		ctx,
+		client.CompletionRequest{},
+		func(client.StreamDelta) {},
+	)
+	t.stats = private.StatsV1()
+	return agent.ToolResult{Content: "nested provider completed"}, err
+}
+
+type openAIComputerNestedBudgetTraceHandler struct {
+	nullEventHandler
+	terminal *agent.RunTraceTerminal
+}
+
+func (h *openAIComputerNestedBudgetTraceHandler) OnRunTrace(
+	event agent.RunTraceEvent,
+) {
+	if event.Type == agent.RunTraceEventTerminal {
+		h.terminal = event.Terminal
+	}
+}
+
 func (l *openAIComputerDaemonLoopLLM) Complete(
 	_ context.Context,
 	request client.CompletionRequest,
@@ -3781,6 +3829,69 @@ func TestOpenAIComputerTaskToolExecutorFailureBeforeActionDoesNotClaimUnknownSid
 	}
 }
 
+func TestOpenAIComputerTaskToolMapsBudgetExhaustionBeforeActionToNoEffect(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-budget-before-action",
+		"turn-openai-budget-before-action",
+	)
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "aW5pdGlhbC1pbWFnZQ==",
+				}},
+			},
+		},
+	}
+	llm := &openAIComputerDaemonLoopLLM{
+		err: agent.ErrRequestBudgetExhausted,
+	}
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:    llm,
+		profile:    trustedOpenAIComputerProfileForDaemon(t),
+		childTools: agent.NewToolRegistry(),
+		workflow:   workflow,
+		runtime:    &openAIComputerDaemonRuntimeProbe{tool: probe},
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Inspect Calculator","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed","description":"Inspect the app"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError || result.IsRetryable ||
+		result.ErrorCategory != agent.ErrCategoryBusiness ||
+		!result.SideEffectKnownNoEffect || result.SideEffectOutcomeUnknown ||
+		!strings.Contains(result.Content, "request_budget_exhausted_before_action") ||
+		!strings.Contains(result.Content, "do not retry computer_use") {
+		t.Fatalf("task result = %+v", result)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskNotCompleted ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitNone ||
+		result.ComputerUseOutcome.FailureCode !=
+			"request_budget_exhausted_before_action" {
+		t.Fatalf("task outcome = %+v", result.ComputerUseOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got != "final_screenshot" {
+		t.Fatalf("budget exhaustion ran desktop actions: %q", got)
+	}
+}
+
 func TestOpenAIComputerTaskToolPreservesEarlierCommitWhenLaterProviderCallFails(
 	t *testing.T,
 ) {
@@ -3874,6 +3985,98 @@ func TestOpenAIComputerTaskToolPreservesEarlierCommitWhenLaterProviderCallFails(
 	if got := strings.Join(probe.runNames(), ","); got !=
 		"final_screenshot,click,final_screenshot" {
 		t.Fatalf("desktop run order = %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolMapsBudgetExhaustionAfterActionToUnknown(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-budget-after-commit",
+		"turn-openai-budget-after-commit",
+	)
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.apple.TextEdit",
+		targetAppName:  "TextEdit",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "click committed",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result:                          agent.GUIActionResultCompletedUnverified,
+					Phase:                           agent.GUIActionPhaseVerifying,
+					SameObservationContinuationSafe: true,
+				},
+			},
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "aW1hZ2U=",
+				}},
+			},
+		},
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	llm := &openAIComputerDaemonLoopLLM{
+		responses: []*client.CompletionResponse{
+			openAIComputerDaemonLoopResponse(
+				t,
+				profile,
+				openAIComputerDaemonContinuationToken,
+				string(openAIComputerDaemonCall(
+					`{"type":"click","button":"left","x":10,"y":20}`,
+				)),
+				"",
+			),
+		},
+		errors: []error{nil, agent.ErrRequestBudgetExhausted},
+	}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Click the visible control","controlled_apps":["TextEdit"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil {
+		t.Fatalf("task Run: %v", err)
+	}
+	if !result.IsError || result.IsRetryable ||
+		result.ErrorCategory != agent.ErrCategoryBusiness ||
+		result.SideEffectKnownNoEffect || !result.SideEffectOutcomeUnknown ||
+		!strings.Contains(result.Content, "computer_use_result: unverified") ||
+		!strings.Contains(result.Content, "request_budget_exhausted_after_action") ||
+		!strings.Contains(result.Content, "do not repeat the unresolved action") {
+		t.Fatalf("task result = %+v", result)
+	}
+	if result.ComputerUseOutcome == nil ||
+		result.ComputerUseOutcome.Status != agent.ComputerUseTaskUnverified ||
+		result.ComputerUseOutcome.Effect != agent.ComputerUseCommitUnknown ||
+		result.ComputerUseOutcome.FailureCode !=
+			"request_budget_exhausted_after_action" {
+		t.Fatalf("task outcome = %+v", result.ComputerUseOutcome)
+	}
+	if got := strings.Join(probe.runNames(), ","); got !=
+		"final_screenshot,click,final_screenshot" {
+		t.Fatalf("budget exhaustion replayed desktop actions: %q", got)
 	}
 }
 
@@ -3986,6 +4189,126 @@ func TestOpenAIComputerInitialResponseClientRetriesOneBoundedStall(
 	if stats := bounded.StatsV1(); stats.ModelCalls != 3 ||
 		stats.ModelTimeouts != 1 {
 		t.Fatalf("continuation provider stats = %+v", stats)
+	}
+}
+
+func TestOpenAIComputerPrivateGatewayChargesEachInitialRawAttemptToRootBudget(
+	t *testing.T,
+) {
+	raw := &openAIComputerDaemonInitialResponseLLM{
+		succeedOn: 2,
+		successful: &client.CompletionResponse{Usage: client.Usage{
+			InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+		}},
+	}
+	probe := &openAIComputerNestedBudgetProbeTool{raw: raw}
+	parent := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID:        "nested-computer-provider",
+				Name:      probe.Info().Name,
+				Arguments: json.RawMessage(`{}`),
+			}},
+			Usage: client.Usage{
+				InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+			},
+		},
+		{
+			FinishReason: "stop",
+			OutputText:   "nested provider finished",
+			Usage: client.Usage{
+				InputTokens: 10, OutputTokens: 5, TotalTokens: 15,
+			},
+		},
+	}}
+	registry := agent.NewToolRegistry()
+	registry.Register(probe)
+	loop := agent.NewAgentLoop(
+		parent,
+		registry,
+		"medium",
+		t.TempDir(),
+		4,
+		2000,
+		200,
+		nil,
+		nil,
+		nil,
+	)
+	handler := &openAIComputerNestedBudgetTraceHandler{}
+	loop.SetHandler(handler)
+
+	reply, _, err := loop.Run(
+		context.Background(),
+		"exercise the nested provider",
+		nil,
+		nil,
+	)
+	if err != nil || reply != "nested provider finished" {
+		t.Fatalf("parent Run reply=%q err=%v", reply, err)
+	}
+	if got := raw.callCount(); got != 2 {
+		t.Fatalf("raw provider calls=%d, want initial attempt plus retry", got)
+	}
+	if probe.stats.ModelCalls != 2 || probe.stats.ModelTimeouts != 1 {
+		t.Fatalf("private provider stats = %+v", probe.stats)
+	}
+	if handler.terminal == nil ||
+		handler.terminal.NestedDispatchesAtTerminal != 2 ||
+		handler.terminal.ProviderDispatchesAtTerminal != 4 {
+		t.Fatalf("root terminal budget trace = %+v", handler.terminal)
+	}
+}
+
+func TestOpenAIComputerInitialResponseClientDoesNotCountBudgetRejection(
+	t *testing.T,
+) {
+	delegate := &openAIComputerDaemonLoopLLM{
+		err: agent.ErrRequestBudgetExhausted,
+	}
+	bounded := newOpenAIComputerInitialResponseClientV1(
+		delegate,
+		10*time.Millisecond,
+		2,
+	)
+	response, err := bounded.Complete(
+		context.Background(),
+		client.CompletionRequest{},
+	)
+	if response != nil || !errors.Is(err, agent.ErrRequestBudgetExhausted) {
+		t.Fatalf("budget rejection response=%p err=%v", response, err)
+	}
+	if len(delegate.requests) != 1 {
+		t.Fatalf("budget rejection invokes=%d, want no timeout retry", len(delegate.requests))
+	}
+	if stats := bounded.StatsV1(); stats.ModelCalls != 0 ||
+		stats.ModelTimeouts != 0 {
+		t.Fatalf("budget rejection stats = %+v", stats)
+	}
+}
+
+func TestOpenAIComputerInitialResponseClientPrecancelDoesNotInvokeOrCount(
+	t *testing.T,
+) {
+	delegate := &openAIComputerDaemonInitialResponseLLM{}
+	bounded := newOpenAIComputerInitialResponseClientV1(
+		delegate,
+		10*time.Millisecond,
+		2,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	response, err := bounded.Complete(ctx, client.CompletionRequest{})
+	if response != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-cancel response=%p err=%v", response, err)
+	}
+	if got := delegate.callCount(); got != 0 {
+		t.Fatalf("pre-cancel delegate calls=%d", got)
+	}
+	if stats := bounded.StatsV1(); stats.ModelCalls != 0 ||
+		stats.ModelTimeouts != 0 {
+		t.Fatalf("pre-cancel stats = %+v", stats)
 	}
 }
 

@@ -79,6 +79,7 @@ type RunTraceTerminal struct {
 	ProviderDispatchesAtTerminal     int   `json:"provider_dispatches_at_terminal"`
 	ProviderDispatchLimit            int   `json:"provider_dispatch_limit"`
 	HelperDispatchesAtTerminal       int   `json:"helper_dispatches_at_terminal"`
+	NestedDispatchesAtTerminal       int   `json:"nested_dispatches_at_terminal"`
 	UnknownUsageDispatchesAtTerminal int   `json:"unknown_usage_dispatches_at_terminal"`
 	TokenExposureAtTerminal          int64 `json:"token_exposure_at_terminal"`
 	TokenLimit                       int64 `json:"token_limit"`

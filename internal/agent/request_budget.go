@@ -12,19 +12,17 @@ import (
 )
 
 const (
-	// The normal provider budget must leave the configured emergency iteration
-	// fuse reachable even when an iteration uses its bounded retry/fallback path.
-	// The 64-call floor covers short custom loops; helper calls and the one
-	// inconsistent-finish replay also receive explicit allowance. When this binds,
-	// the run returns a budget_exhausted partial before another provider call.
-	// Operators raise or lower it through the existing max_iterations setting;
-	// no second, contradictory dispatch-limit setting is exposed.
-	requestBudgetMinimumNormalDispatchLimit  = 64
-	requestBudgetDispatchesPerIteration      = 4
-	requestBudgetInconsistentReplayAllowance = requestBudgetDispatchesPerIteration
-	requestBudgetHelperDispatchLimit         = 8
-	requestBudgetTerminalDispatchLimit       = 1
-	requestBudgetMinimumTokenExposure        = int64(1_000_000)
+	// One root Run may make at most 64 ordinary provider attempts across the
+	// parent loop, helpers, forks, and nested raw clients. The workload that sets
+	// this bound is the qualified 56-step dependent chain: 56 tool-producing
+	// responses plus its final response leave seven attempts for bounded recovery.
+	// When it binds, the run returns a budget_exhausted partial before dispatch;
+	// max_iterations remains the separate emergency loop fuse and is not an
+	// override for provider exposure. This is intentionally not user-configurable.
+	requestBudgetNormalDispatchLimit   = 64
+	requestBudgetHelperDispatchLimit   = 8
+	requestBudgetTerminalDispatchLimit = 1
+	requestBudgetMinimumTokenExposure  = int64(1_000_000)
 	// Provider usage schemas disagree on whether cache-read tokens are included
 	// in input/total tokens. Two context windows per permitted dispatch keeps the
 	// exposure guard conservative under either representation without turning it
@@ -43,6 +41,7 @@ const (
 	requestBudgetHelper
 	requestBudgetTerminal
 	requestBudgetFork
+	requestBudgetNested
 )
 
 func (c requestBudgetClass) String() string {
@@ -55,6 +54,8 @@ func (c requestBudgetClass) String() string {
 		return "terminal"
 	case requestBudgetFork:
 		return "fork"
+	case requestBudgetNested:
+		return "nested"
 	default:
 		return "unknown"
 	}
@@ -72,7 +73,7 @@ func (e *requestBudgetError) Error() string {
 func (e *requestBudgetError) Unwrap() error { return ErrRequestBudgetExhausted }
 
 // requestLLMBudget bounds provider exposure for one AgentLoop.Run. Normal,
-// helper, and fork calls share the normal dispatch and token caps. Terminal
+// helper, fork, and nested calls share the normal dispatch and token caps. Terminal
 // synthesis has one independent dispatch so exhaustion can still produce a
 // useful partial response. Terminal exposure remains observable in the
 // snapshot but does not compete with the already-exhausted normal token pool.
@@ -84,6 +85,7 @@ type requestLLMBudget struct {
 
 	normalDispatches   int
 	helperDispatches   int
+	nestedDispatches   int
 	terminalDispatches int
 
 	reservedTokens int64
@@ -97,6 +99,7 @@ type requestBudgetSnapshot struct {
 	NormalDispatchLimit int
 	NormalDispatches    int
 	HelperDispatches    int
+	NestedDispatches    int
 	TerminalDispatches  int
 	ReservedTokens      int64
 	ConsumedTokens      int64
@@ -104,8 +107,8 @@ type requestBudgetSnapshot struct {
 	UnknownActual       int
 }
 
-func newRequestLLMBudget(contextWindow, maxIterations int) *requestLLMBudget {
-	dispatchLimit := normalDispatchLimitForIterations(maxIterations)
+func newRequestLLMBudget(contextWindow int) *requestLLMBudget {
+	dispatchLimit := requestBudgetNormalDispatchLimit
 	return &requestLLMBudget{
 		tokenExposureLimit:  tokenExposureLimitForDispatches(contextWindow, dispatchLimit),
 		normalDispatchLimit: dispatchLimit,
@@ -130,25 +133,6 @@ func tokenExposureLimitForDispatches(contextWindow, dispatchLimit int) int64 {
 		return requestBudgetMinimumTokenExposure
 	}
 	return limit
-}
-
-func normalDispatchLimitForIterations(maxIterations int) int {
-	if maxIterations < 1 {
-		maxIterations = 1
-	}
-	// Each iteration can open a stream, fall back to non-streaming, then use
-	// the remaining two slots in the three-attempt retry loop. The one per-run
-	// inconsistent-finish replay can consume that allowance once more.
-	fixedAllowance := requestBudgetHelperDispatchLimit + requestBudgetInconsistentReplayAllowance
-	maxInt := int(^uint(0) >> 1)
-	if maxIterations > (maxInt-fixedAllowance)/requestBudgetDispatchesPerIteration {
-		return maxInt
-	}
-	dispatchLimit := maxIterations*requestBudgetDispatchesPerIteration + fixedAllowance
-	if dispatchLimit < requestBudgetMinimumNormalDispatchLimit {
-		dispatchLimit = requestBudgetMinimumNormalDispatchLimit
-	}
-	return dispatchLimit
 }
 
 type requestBudgetReservation struct {
@@ -186,6 +170,8 @@ func (b *requestLLMBudget) reserve(class requestBudgetClass, estimate int64) (*r
 	b.normalDispatches++
 	if class == requestBudgetHelper {
 		b.helperDispatches++
+	} else if class == requestBudgetNested {
+		b.nestedDispatches++
 	}
 	b.reservedTokens += estimate
 	return &requestBudgetReservation{budget: b, class: class, estimate: estimate}, nil
@@ -237,12 +223,44 @@ func (b *requestLLMBudget) snapshot() requestBudgetSnapshot {
 		NormalDispatchLimit: b.normalDispatchLimit,
 		NormalDispatches:    b.normalDispatches,
 		HelperDispatches:    b.helperDispatches,
+		NestedDispatches:    b.nestedDispatches,
 		TerminalDispatches:  b.terminalDispatches,
 		ReservedTokens:      b.reservedTokens,
 		ConsumedTokens:      b.consumedTokens,
 		TerminalTokens:      b.terminalTokens,
 		UnknownActual:       b.unknownActual,
 	}
+}
+
+type requestLLMBudgetContextKey struct{}
+
+func withRequestLLMBudget(ctx context.Context, budget *requestLLMBudget) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if budget == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestLLMBudgetContextKey{}, budget)
+}
+
+// WrapNestedLLMClientFromContext binds a raw nested provider client to the
+// root AgentLoop.Run budget carried by ctx. Callers must put this wrapper at the
+// raw provider boundary, below any retrying client, so every admitted delegate
+// attempt reserves independently. A context not owned by an active AgentLoop
+// returns delegate unchanged for direct tests and non-loop callers.
+func WrapNestedLLMClientFromContext(
+	ctx context.Context,
+	delegate client.LLMClient,
+) client.LLMClient {
+	if ctx == nil {
+		return delegate
+	}
+	budget, ok := ctx.Value(requestLLMBudgetContextKey{}).(*requestLLMBudget)
+	if !ok || budget == nil {
+		return delegate
+	}
+	return newBudgetedLLMClient(delegate, budget, requestBudgetNested, nil)
 }
 
 type budgetedLLMClient struct {
@@ -257,6 +275,9 @@ func newBudgetedLLMClient(delegate client.LLMClient, budget *requestLLMBudget, c
 }
 
 func (c *budgetedLLMClient) Complete(ctx context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	reservation, err := c.reserve(req)
 	if err != nil {
 		return nil, err
@@ -272,6 +293,9 @@ func (c *budgetedLLMClient) Complete(ctx context.Context, req client.CompletionR
 }
 
 func (c *budgetedLLMClient) CompleteStream(ctx context.Context, req client.CompletionRequest, onDelta func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	reservation, err := c.reserve(req)
 	if err != nil {
 		return nil, err

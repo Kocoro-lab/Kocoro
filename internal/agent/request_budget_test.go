@@ -17,29 +17,23 @@ import (
 func TestRequestLLMBudget_DefaultLimits(t *testing.T) {
 	t.Parallel()
 
-	if got := newRequestLLMBudget(100_000, 256).snapshot().TokenExposureLimit; got != 207_200_000 {
+	if got := newRequestLLMBudget(100_000).snapshot().TokenExposureLimit; got != 12_800_000 {
 		t.Fatalf("small context token limit = %d, want dispatch-aligned allowance", got)
 	}
-	if got := newRequestLLMBudget(200_000, 256).snapshot().TokenExposureLimit; got != 414_400_000 {
+	if got := newRequestLLMBudget(200_000).snapshot().TokenExposureLimit; got != 25_600_000 {
 		t.Fatalf("scaled token limit = %d, want dispatch-aligned allowance", got)
 	}
-	if got, want := newRequestLLMBudget(0, 256).snapshot().NormalDispatchLimit, 1036; got != want {
+	if got, want := newRequestLLMBudget(0).snapshot().NormalDispatchLimit, requestBudgetNormalDispatchLimit; got != want {
 		t.Fatalf("default normal dispatch limit = %d, want %d", got, want)
-	}
-	if got := newRequestLLMBudget(0, 10).snapshot().NormalDispatchLimit; got != requestBudgetMinimumNormalDispatchLimit {
-		t.Fatalf("short-loop normal dispatch limit = %d, want floor %d", got, requestBudgetMinimumNormalDispatchLimit)
 	}
 }
 
-func TestRequestLLMBudget_DispatchLimitSaturatesOnOverflow(t *testing.T) {
+func TestRequestLLMBudget_TokenLimitSaturatesOnOverflow(t *testing.T) {
 	t.Parallel()
 
 	maxInt := int(^uint(0) >> 1)
-	if got := newRequestLLMBudget(0, maxInt).snapshot().NormalDispatchLimit; got != maxInt {
-		t.Fatalf("normal dispatch limit = %d, want saturation at %d", got, maxInt)
-	}
 	maxInt64 := int64(^uint64(0) >> 1)
-	if got := newRequestLLMBudget(maxInt, maxInt).snapshot().TokenExposureLimit; got != maxInt64 {
+	if got := newRequestLLMBudget(maxInt).snapshot().TokenExposureLimit; got != maxInt64 {
 		t.Fatalf("token exposure limit = %d, want saturation at %d", got, maxInt64)
 	}
 }
@@ -47,7 +41,7 @@ func TestRequestLLMBudget_DispatchLimitSaturatesOnOverflow(t *testing.T) {
 func TestRequestLLMBudget_DispatchClassesAndTerminalReserve(t *testing.T) {
 	t.Parallel()
 
-	b := newRequestLLMBudget(0, 10)
+	b := newRequestLLMBudget(0)
 	for i := 0; i < requestBudgetHelperDispatchLimit; i++ {
 		if _, err := b.reserve(requestBudgetHelper, 0); err != nil {
 			t.Fatalf("helper reserve %d: %v", i+1, err)
@@ -56,7 +50,10 @@ func TestRequestLLMBudget_DispatchClassesAndTerminalReserve(t *testing.T) {
 	if _, err := b.reserve(requestBudgetHelper, 0); !errors.Is(err, ErrRequestBudgetExhausted) {
 		t.Fatalf("helper over limit error = %v, want budget exhausted", err)
 	}
-	for i := requestBudgetHelperDispatchLimit; i < b.normalDispatchLimit; i++ {
+	if _, err := b.reserve(requestBudgetNested, 0); err != nil {
+		t.Fatalf("nested reserve: %v", err)
+	}
+	for i := requestBudgetHelperDispatchLimit + 1; i < b.normalDispatchLimit; i++ {
 		if _, err := b.reserve(requestBudgetMain, 0); err != nil {
 			t.Fatalf("normal reserve %d: %v", i+1, err)
 		}
@@ -72,7 +69,8 @@ func TestRequestLLMBudget_DispatchClassesAndTerminalReserve(t *testing.T) {
 	}
 
 	snapshot := b.snapshot()
-	if snapshot.NormalDispatches != requestBudgetMinimumNormalDispatchLimit || snapshot.HelperDispatches != 8 || snapshot.TerminalDispatches != 1 {
+	if snapshot.NormalDispatches != requestBudgetNormalDispatchLimit || snapshot.HelperDispatches != 8 ||
+		snapshot.NestedDispatches != 1 || snapshot.TerminalDispatches != 1 {
 		t.Fatalf("unexpected dispatch snapshot: %+v", snapshot)
 	}
 }
@@ -80,7 +78,7 @@ func TestRequestLLMBudget_DispatchClassesAndTerminalReserve(t *testing.T) {
 func TestRequestLLMBudget_ReconcileKnownUnknownAndCached(t *testing.T) {
 	t.Parallel()
 
-	b := newRequestLLMBudget(0, 10)
+	b := newRequestLLMBudget(0)
 	known, err := b.reserve(requestBudgetMain, 1_000)
 	if err != nil {
 		t.Fatal(err)
@@ -135,7 +133,7 @@ func TestRequestLLMBudget_ReconcileKnownUnknownAndCached(t *testing.T) {
 func TestRequestLLMBudget_TokenReservationReleasesToActual(t *testing.T) {
 	t.Parallel()
 
-	b := newRequestLLMBudget(0, 10)
+	b := newRequestLLMBudget(0)
 	first, err := b.reserve(requestBudgetMain, 900_000)
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +150,7 @@ func TestRequestLLMBudget_TokenReservationReleasesToActual(t *testing.T) {
 func TestRequestLLMBudget_ConcurrentReserveIsAtomic(t *testing.T) {
 	t.Parallel()
 
-	b := newRequestLLMBudget(0, 10)
+	b := newRequestLLMBudget(0)
 	var successes atomic.Int32
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -167,8 +165,8 @@ func TestRequestLLMBudget_ConcurrentReserveIsAtomic(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := successes.Load(); got != requestBudgetMinimumNormalDispatchLimit {
-		t.Fatalf("successful reserves = %d, want %d", got, requestBudgetMinimumNormalDispatchLimit)
+	if got := successes.Load(); got != requestBudgetNormalDispatchLimit {
+		t.Fatalf("successful reserves = %d, want %d", got, requestBudgetNormalDispatchLimit)
 	}
 }
 
@@ -177,6 +175,56 @@ type requestBudgetFakeLLM struct {
 	streamCalls   atomic.Int32
 	response      *client.CompletionResponse
 	err           error
+}
+
+type requestBudgetTwoAttemptClient struct {
+	delegate client.LLMClient
+}
+
+type nestedBudgetProbeTool struct {
+	delegate client.LLMClient
+}
+
+func (t *nestedBudgetProbeTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        "nested_budget_probe",
+		Description: "exercise a nested provider call",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}
+}
+
+func (t *nestedBudgetProbeTool) Run(
+	ctx context.Context,
+	_ string,
+) (ToolResult, error) {
+	llm := WrapNestedLLMClientFromContext(ctx, t.delegate)
+	if _, err := llm.Complete(ctx, client.CompletionRequest{MaxTokens: 20}); err != nil {
+		return ToolResult{}, err
+	}
+	return ToolResult{Content: "nested provider completed"}, nil
+}
+
+func (*nestedBudgetProbeTool) RequiresApproval() bool { return false }
+
+func (c *requestBudgetTwoAttemptClient) Complete(
+	ctx context.Context,
+	req client.CompletionRequest,
+) (*client.CompletionResponse, error) {
+	if _, err := c.delegate.Complete(ctx, req); err != nil {
+		return nil, err
+	}
+	return c.delegate.Complete(ctx, req)
+}
+
+func (c *requestBudgetTwoAttemptClient) CompleteStream(
+	ctx context.Context,
+	req client.CompletionRequest,
+	onDelta func(client.StreamDelta),
+) (*client.CompletionResponse, error) {
+	if _, err := c.delegate.CompleteStream(ctx, req, onDelta); err != nil {
+		return nil, err
+	}
+	return c.delegate.CompleteStream(ctx, req, onDelta)
 }
 
 func (f *requestBudgetFakeLLM) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
@@ -195,7 +243,7 @@ func TestBudgetedLLMClient_ReservesEveryProviderVariant(t *testing.T) {
 	delegate := &requestBudgetFakeLLM{response: &client.CompletionResponse{
 		Usage: client.Usage{InputTokens: 10, OutputTokens: 2},
 	}}
-	b := newRequestLLMBudget(0, 10)
+	b := newRequestLLMBudget(0)
 	llm := newBudgetedLLMClient(delegate, b, requestBudgetMain, nil)
 	req := client.CompletionRequest{MaxTokens: 20}
 	if _, err := llm.Complete(context.Background(), req); err != nil {
@@ -210,6 +258,143 @@ func TestBudgetedLLMClient_ReservesEveryProviderVariant(t *testing.T) {
 	snapshot := b.snapshot()
 	if snapshot.NormalDispatches != 2 || snapshot.ConsumedTokens != 24 {
 		t.Fatalf("budget snapshot = %+v", snapshot)
+	}
+}
+
+func TestWrapNestedLLMClientFromContext_ChargesEveryRawAttempt(t *testing.T) {
+	t.Parallel()
+
+	delegate := &requestBudgetFakeLLM{response: &client.CompletionResponse{
+		Usage: client.Usage{InputTokens: 10, OutputTokens: 2},
+	}}
+	b := newRequestLLMBudget(0)
+	ctx := withRequestLLMBudget(context.Background(), b)
+	raw := WrapNestedLLMClientFromContext(ctx, delegate)
+	retrying := &requestBudgetTwoAttemptClient{delegate: raw}
+	req := client.CompletionRequest{MaxTokens: 20}
+	if _, err := retrying.Complete(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := retrying.CompleteStream(ctx, req, nil); err != nil {
+		t.Fatal(err)
+	}
+	childBudget := newRequestLLMBudget(0)
+	childCtx := withRequestLLMBudget(ctx, childBudget)
+	if _, err := raw.Complete(childCtx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	if delegate.completeCalls.Load() != 3 || delegate.streamCalls.Load() != 2 {
+		t.Fatalf("raw attempts = complete:%d stream:%d, want 3/2",
+			delegate.completeCalls.Load(), delegate.streamCalls.Load())
+	}
+	snapshot := b.snapshot()
+	if snapshot.NormalDispatches != 5 || snapshot.NestedDispatches != 5 ||
+		snapshot.ConsumedTokens != 60 {
+		t.Fatalf("root budget snapshot = %+v", snapshot)
+	}
+	if childSnapshot := childBudget.snapshot(); childSnapshot.NormalDispatches != 0 {
+		t.Fatalf("captured nested wrapper rebound to child budget: %+v", childSnapshot)
+	}
+	if got := WrapNestedLLMClientFromContext(context.Background(), delegate); got != delegate {
+		t.Fatal("context without a root budget did not preserve the raw delegate")
+	}
+}
+
+func TestWrapNestedLLMClientFromContext_PreCanceledDoesNotReserve(t *testing.T) {
+	t.Parallel()
+
+	for _, streaming := range []bool{false, true} {
+		name := "complete"
+		if streaming {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			delegate := &requestBudgetFakeLLM{response: &client.CompletionResponse{}}
+			b := newRequestLLMBudget(0)
+			rootCtx := withRequestLLMBudget(context.Background(), b)
+			llm := WrapNestedLLMClientFromContext(rootCtx, delegate)
+			canceledCtx, cancel := context.WithCancel(rootCtx)
+			cancel()
+			var err error
+			if streaming {
+				_, err = llm.CompleteStream(canceledCtx, client.CompletionRequest{MaxTokens: 20}, nil)
+			} else {
+				_, err = llm.Complete(canceledCtx, client.CompletionRequest{MaxTokens: 20})
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context canceled", err)
+			}
+			if delegate.completeCalls.Load() != 0 || delegate.streamCalls.Load() != 0 {
+				t.Fatalf("pre-canceled call reached delegate: complete=%d stream=%d",
+					delegate.completeCalls.Load(), delegate.streamCalls.Load())
+			}
+			if snapshot := b.snapshot(); snapshot.NormalDispatches != 0 ||
+				snapshot.NestedDispatches != 0 || snapshot.ReservedTokens != 0 ||
+				snapshot.ConsumedTokens != 0 {
+				t.Fatalf("pre-canceled call consumed budget: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestRequestLLMBudget_NestedCannotConsumeTerminalReserve(t *testing.T) {
+	t.Parallel()
+
+	b := newRequestLLMBudget(0)
+	for i := 0; i < requestBudgetNormalDispatchLimit; i++ {
+		if _, err := b.reserve(requestBudgetNested, 0); err != nil {
+			t.Fatalf("nested reserve %d: %v", i+1, err)
+		}
+	}
+	if _, err := b.reserve(requestBudgetNested, 0); !errors.Is(err, ErrRequestBudgetExhausted) {
+		t.Fatalf("nested over limit error = %v, want budget exhausted", err)
+	}
+	if _, err := b.reserve(requestBudgetTerminal, 0); err != nil {
+		t.Fatalf("terminal reserve was consumed by nested calls: %v", err)
+	}
+	snapshot := b.snapshot()
+	if snapshot.NestedDispatches != requestBudgetNormalDispatchLimit ||
+		snapshot.TerminalDispatches != 1 {
+		t.Fatalf("budget snapshot = %+v", snapshot)
+	}
+}
+
+func TestAgentLoop_RequestBudgetContextAggregatesNestedDispatchInTrace(t *testing.T) {
+	first := nativeResponse(
+		"", "tool_use", toolCall("nested_budget_probe", `{}`), 10, 2,
+	)
+	final := nativeResponse("done", "end_turn", nil, 10, 2)
+	parent := &budgetCaptureLLMClient{responses: []*client.CompletionResponse{&first, &final}}
+	nested := &requestBudgetFakeLLM{response: &client.CompletionResponse{
+		Usage: client.Usage{InputTokens: 4, OutputTokens: 1},
+	}}
+	registry := NewToolRegistry()
+	registry.Register(&nestedBudgetProbeTool{delegate: nested})
+	handler := &runTraceRecorder{}
+	loop := NewAgentLoop(parent, registry, "medium", "", 256, 2_000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+
+	result, _, err := loop.Run(context.Background(), "run nested provider", nil, nil)
+	if err != nil || result != "done" {
+		t.Fatalf("Run result=%q err=%v", result, err)
+	}
+	if nested.completeCalls.Load() != 1 {
+		t.Fatalf("nested delegate calls = %d, want 1", nested.completeCalls.Load())
+	}
+	var terminal *RunTraceTerminal
+	for _, event := range handler.events {
+		if event.Type == RunTraceEventTerminal {
+			terminal = event.Terminal
+		}
+	}
+	if terminal == nil {
+		t.Fatal("missing terminal trace")
+	}
+	if terminal.ProviderDispatchesAtTerminal != 3 ||
+		terminal.NestedDispatchesAtTerminal != 1 ||
+		terminal.ProviderDispatchLimit != requestBudgetNormalDispatchLimit {
+		t.Fatalf("terminal budget trace = %+v", terminal)
 	}
 }
 
@@ -282,8 +467,9 @@ func TestAgentLoop_RequestBudgetExhaustionUsesOneTerminalAndContentFreeTrace(t *
 	}
 	trace := terminalEvents[0].Terminal
 	if !trace.Partial || trace.FailureCode != "budget_exhausted" || trace.ProviderDispatchesAtTerminal != 2 ||
-		trace.ProviderDispatchLimit != requestBudgetMinimumNormalDispatchLimit ||
-		trace.HelperDispatchesAtTerminal != 0 || trace.UnknownUsageDispatchesAtTerminal != 0 ||
+		trace.ProviderDispatchLimit != requestBudgetNormalDispatchLimit ||
+		trace.HelperDispatchesAtTerminal != 0 || trace.NestedDispatchesAtTerminal != 0 ||
+		trace.UnknownUsageDispatchesAtTerminal != 0 ||
 		trace.TokenExposureAtTerminal != 1_000_006 || trace.TokenLimit != 1_000_000 || trace.TerminalTokenExposure != 15 {
 		t.Fatalf("terminal trace = %+v", trace)
 	}
@@ -298,10 +484,10 @@ func TestAgentLoop_RequestBudgetExhaustionUsesOneTerminalAndContentFreeTrace(t *
 	}
 }
 
-func TestAgentLoop_RequestBudgetDispatchBoundaryTracksIterationFuse(t *testing.T) {
+func TestAgentLoop_RequestBudgetStopsBeforeHigherIterationFuse(t *testing.T) {
 	const maxIterations = 65
-	responses := make([]*client.CompletionResponse, 0, maxIterations+1)
-	for step := 1; step <= maxIterations; step++ {
+	responses := make([]*client.CompletionResponse, 0, requestBudgetNormalDispatchLimit+1)
+	for step := 1; step <= requestBudgetNormalDispatchLimit; step++ {
 		resp := nativeResponse(
 			"", "tool_use",
 			toolCall("boundary_progress", fmt.Sprintf(`{"step":%d,"token":"token-%02d"}`, step, step-1)),
@@ -318,23 +504,23 @@ func TestAgentLoop_RequestBudgetDispatchBoundaryTracksIterationFuse(t *testing.T
 	loop := NewAgentLoop(llm, registry, "medium", "", maxIterations, 2_000, 200, nil, nil, nil)
 
 	result, _, err := loop.Run(context.Background(), "advance until the provider budget stops", nil, nil)
-	if !errors.Is(err, ErrMaxIterReached) || errors.Is(err, ErrRequestBudgetExhausted) {
-		t.Fatalf("Run error = %v, want iteration fuse before provider budget", err)
+	if !errors.Is(err, ErrRequestBudgetExhausted) || errors.Is(err, ErrMaxIterReached) {
+		t.Fatalf("Run error = %v, want provider budget before iteration fuse", err)
 	}
 	if result != "bounded partial summary" {
 		t.Fatalf("result = %q", result)
 	}
-	if tool.runs != maxIterations {
-		t.Fatalf("tool runs = %d, want iteration fuse %d", tool.runs, maxIterations)
+	if tool.runs != requestBudgetNormalDispatchLimit {
+		t.Fatalf("tool runs = %d, want provider limit %d", tool.runs, requestBudgetNormalDispatchLimit)
 	}
-	if len(llm.requests) != maxIterations+1 {
-		t.Fatalf("provider calls = %d, want %d iterations plus one terminal", len(llm.requests), maxIterations+1)
+	if len(llm.requests) != requestBudgetNormalDispatchLimit+1 {
+		t.Fatalf("provider calls = %d, want %d normal plus one terminal", len(llm.requests), requestBudgetNormalDispatchLimit+1)
 	}
 	if got := len(llm.requests[len(llm.requests)-1].Tools); got != 0 {
 		t.Fatalf("terminal request exposed %d tools", got)
 	}
 	status := loop.LastRunStatus()
-	if !status.Partial || status.FailureCode != runstatus.CodeIterationLimit {
+	if !status.Partial || status.FailureCode != runstatus.CodeBudgetExhausted {
 		t.Fatalf("LastRunStatus = %+v", status)
 	}
 }

@@ -91,15 +91,37 @@ func newOpenAIComputerInitialResponseClientV1(
 	}
 }
 
+func newOpenAIComputerPrivateGatewayV1(
+	ctx context.Context,
+	delegate client.LLMClient,
+	window time.Duration,
+	attempts int,
+) *openAIComputerInitialResponseClientV1 {
+	return newOpenAIComputerInitialResponseClientV1(
+		agent.WrapNestedLLMClientFromContext(ctx, delegate),
+		window,
+		attempts,
+	)
+}
+
 func (c *openAIComputerInitialResponseClientV1) complete(
 	ctx context.Context,
 	invoke func(context.Context) (*client.CompletionResponse, error),
 ) (*client.CompletionResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	if c.completed {
 		c.modelCalls++
 		c.mu.Unlock()
-		return invoke(ctx)
+		response, err := invoke(ctx)
+		if errors.Is(err, agent.ErrRequestBudgetExhausted) {
+			c.mu.Lock()
+			c.modelCalls--
+			c.mu.Unlock()
+		}
+		return response, err
 	}
 	if c.unavailable != nil {
 		unavailable := c.unavailable
@@ -117,6 +139,10 @@ func (c *openAIComputerInitialResponseClientV1) complete(
 		if err == nil {
 			c.completed = true
 			return response, nil
+		}
+		if errors.Is(err, agent.ErrRequestBudgetExhausted) {
+			c.modelCalls--
+			return nil, err
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -391,6 +417,45 @@ func openAIComputerNoEffectInterventionResultV1(
 		category,
 		agent.ComputerUseRecoveryNone,
 	)
+}
+
+func openAIComputerRequestBudgetExhaustedResultV1(
+	detail string,
+	effect agent.ComputerUseCommitEffect,
+) agent.ToolResult {
+	detail = strings.Join(strings.Fields(
+		boundOpenAIComputerObservationDetailV1(detail),
+	), " ")
+	if detail == "" {
+		detail = "the shared provider request budget was exhausted"
+	}
+	if effect == agent.ComputerUseCommitKnown ||
+		effect == agent.ComputerUseCommitUnknown {
+		result := openAIComputerTaskUnverifiedResultV1(
+			"request_budget_exhausted_after_action",
+			detail,
+			effect,
+		)
+		result.IsError = true
+		result.ErrorCategory = agent.ErrCategoryBusiness
+		result.SideEffectOutcomeUnknown =
+			effect == agent.ComputerUseCommitUnknown
+		return result
+	}
+	result := withOpenAIComputerTaskFailureOutcomeV1(
+		agent.BusinessError(
+			"computer_use_error: request_budget_exhausted_before_action\n"+
+				"message: Computer Use stopped before a native input action because the shared provider request budget was exhausted\n"+
+				"recovery: do not retry computer_use or start another provider-backed desktop-control path in this turn\n"+
+				"detail: "+detail,
+		),
+		agent.ComputerUseTaskNotCompleted,
+		agent.ComputerUseCommitNone,
+		"request_budget_exhausted_before_action",
+		agent.ComputerUseRecoveryNone,
+	)
+	result.SideEffectKnownNoEffect = true
+	return result
 }
 
 func openAIComputerPreActionRecoveryV1(
@@ -1262,7 +1327,8 @@ func (t *openAIComputerTaskToolV1) Run(
 	runner.trace = trace
 	runner.observationRetry = retryObservation
 	runner.postBatchSettle = t.postBatchSettle
-	privateGateway := newOpenAIComputerInitialResponseClientV1(
+	privateGateway := newOpenAIComputerPrivateGatewayV1(
+		ctx,
 		t.gateway,
 		t.initialResponseTimeout,
 		t.initialResponseAttempts,
@@ -1393,6 +1459,25 @@ func (t *openAIComputerTaskToolV1) Run(
 		}
 	}
 	trace.record(providerEvent)
+	if err != nil && errors.Is(err, agent.ErrRequestBudgetExhausted) {
+		failureCode := "request_budget_exhausted_before_action"
+		status := "failed"
+		if stats.TaskEffect == agent.ComputerUseCommitKnown ||
+			stats.TaskEffect == agent.ComputerUseCommitUnknown {
+			failureCode = "request_budget_exhausted_after_action"
+			status = "completed_unverified"
+		}
+		trace.record(openAIComputerTraceEventV1{
+			Phase:       "task",
+			Status:      status,
+			FailureCode: failureCode,
+			DurationMS:  time.Since(taskStarted).Milliseconds(),
+		})
+		return openAIComputerRequestBudgetExhaustedResultV1(
+			err.Error(),
+			stats.TaskEffect,
+		), nil
+	}
 	if stats.TaskEffect == agent.ComputerUseCommitUnknown &&
 		(err != nil || !stats.LastBatchHadFreshObservation) {
 		failureCode := stats.LastFailureCode

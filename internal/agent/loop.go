@@ -3024,7 +3024,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		persona = a.agentBasePrompt
 	}
 	usage := &TurnUsage{}
-	requestBudget := newRequestLLMBudget(a.contextWindow, a.maxIter)
+	requestBudget := newRequestLLMBudget(a.contextWindow)
+	ctx = withRequestLLMBudget(ctx, requestBudget)
 	a.lastSentMu.Lock()
 	a.activeRunBudget = requestBudget
 	a.lastSentMu.Unlock()
@@ -3685,6 +3686,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 				ProviderDispatchesAtTerminal:     budget.NormalDispatches + budget.TerminalDispatches,
 				ProviderDispatchLimit:            budget.NormalDispatchLimit,
 				HelperDispatchesAtTerminal:       budget.HelperDispatches,
+				NestedDispatchesAtTerminal:       budget.NestedDispatches,
 				UnknownUsageDispatchesAtTerminal: budget.UnknownActual,
 				TokenExposureAtTerminal:          budget.ConsumedTokens + budget.ReservedTokens,
 				TokenLimit:                       budget.TokenExposureLimit,
