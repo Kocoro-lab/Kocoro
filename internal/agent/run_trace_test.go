@@ -291,6 +291,11 @@ func TestRunTrace_PartialTerminalMatchesLastRunStatus(t *testing.T) {
 		terminal.IterationCount != status.IterationCount {
 		t.Fatalf("terminal=%+v LastRunStatus=%+v", terminal, status)
 	}
+	if terminal.ProviderDispatchesAtTerminal != 2 || terminal.HelperDispatchesAtTerminal != 0 ||
+		terminal.UnknownUsageDispatchesAtTerminal != 0 || terminal.TokenExposureAtTerminal != 15 ||
+		terminal.TokenLimit != requestBudgetMinimumTokenExposure || terminal.TerminalTokenExposure != 15 {
+		t.Fatalf("terminal budget snapshot = %+v", terminal)
+	}
 }
 
 func TestRunTrace_CompactionLifecycleIsOrderedAndContentFree(t *testing.T) {

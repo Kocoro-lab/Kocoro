@@ -73,6 +73,8 @@ type InterruptedTurn struct {
 	IMStatusContext json.RawMessage        `json:"im_status_context,omitempty"`
 	Participants    []string               `json:"participants,omitempty"`
 	ResumeAttempts  int                    `json:"resume_attempts,omitempty"`
+	RunID           string                 `json:"run_id,omitempty"`
+	AttemptID       string                 `json:"attempt_id,omitempty"`
 	ExecutionRun    executionprofile.Run   `json:"execution_run,omitempty"`
 	ExecutionConfig *agent.ExecutionConfig `json:"execution_config,omitempty"`
 	UpdatedAt       time.Time              `json:"updated_at"`
@@ -1192,6 +1194,7 @@ func (s *Store) Delete(id string) error {
 	// (full pre-drop history); deleting the session must not leave them
 	// behind. Best-effort: the session file itself is already gone.
 	os.RemoveAll(filepath.Join(s.dir, compactionSnapshotDirName, id))
+	os.RemoveAll(filepath.Join(s.dir, runEventDirName, id))
 
 	if s.index != nil {
 		s.index.DeleteSession(id) // best-effort

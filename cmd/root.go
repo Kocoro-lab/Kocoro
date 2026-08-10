@@ -383,7 +383,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	sessMgr.OnSessionClose(sess.ID, loop.SpillCleanupFunc())
 
 	result, _, err := loop.Run(context.Background(), query, nil, nil)
-	if err != nil && !errors.Is(err, agent.ErrMaxIterReached) {
+	if err != nil && !errors.Is(err, agent.ErrMaxIterReached) && !errors.Is(err, agent.ErrRequestBudgetExhausted) {
 		return err
 	}
 	status := loop.LastRunStatus()
@@ -417,8 +417,13 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// Soft warning for loop-detector force-stop: the reply is valid and
 	// already printed above, but the run ended early. Matches the TUI
 	// behavior so one-shot CLI and TUI report force-stops consistently.
-	if err == nil && status.Partial && status.FailureCode == runstatus.CodeIterationLimit {
-		fmt.Fprintln(os.Stderr, "\nStopped early after repeated failed attempts.")
+	if status.Partial {
+		switch status.FailureCode {
+		case runstatus.CodeIterationLimit:
+			fmt.Fprintln(os.Stderr, "\nStopped early after repeated failed attempts.")
+		case runstatus.CodeBudgetExhausted:
+			fmt.Fprintln(os.Stderr, "\nStopped after reaching the request's provider budget; the result may be incomplete.")
+		}
 	}
 	usageLine := fmt.Sprintf("\n[tokens: %d in / %d out | llm: $%.4f",
 		llm.InputTokens, llm.OutputTokens, llm.CostUSD)

@@ -143,6 +143,109 @@ func TestInterruptedExecutionConfigCloneIsDeep(t *testing.T) {
 	}
 }
 
+func TestInterruptedRecoveryKeepsRunIDAndMintsAttemptPerClaim(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const (
+		id        = "recovery-run-identity-001"
+		runID     = "run1_0123456789abcdef0123456789abcdef"
+		attemptID = "att1_0123456789abcdef0123456789abcdef"
+	)
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{
+		Source: "desktop", RunID: runID, AttemptID: attemptID,
+	})
+
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	claim := func(candidate interruptedTurnCandidate) (*session.Session, RunAgentRequest) {
+		mgr := session.NewManager(dir)
+		sess, err := mgr.Resume(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := buildInterruptedResumeRequest(candidate, 3, 4*time.Hour)
+		if req.RunID != runID || req.AttemptID != "" {
+			t.Fatalf("candidate identity = run %q attempt %q", req.RunID, req.AttemptID)
+		}
+		if err := claimInterruptedResume(mgr, sess, &req, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := mgr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return sess, req
+	}
+
+	firstSession, first := claim(candidates[0])
+	if first.RunID != runID || first.AttemptID == "" || first.AttemptID == attemptID ||
+		firstSession.InterruptedTurn.AttemptID != first.AttemptID {
+		t.Fatalf("first recovered identity req=%+v state=%+v", first, firstSession.InterruptedTurn)
+	}
+	secondCandidate := interruptedTurnCandidate{
+		SessionID: id, StoreDir: dir, State: cloneInterruptedTurn(*firstSession.InterruptedTurn),
+		UpdatedAt: firstSession.UpdatedAt,
+	}
+	_, second := claim(secondCandidate)
+	if second.RunID != runID || second.AttemptID == first.AttemptID {
+		t.Fatalf("second recovered identity = run %q attempt %q; first=%q", second.RunID, second.AttemptID, first.AttemptID)
+	}
+}
+
+func TestInterruptedRecoveryMintsRunIDForLegacyCheckpoint(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const id = "recovery-run-legacy-001"
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{Source: "desktop"})
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := buildInterruptedResumeRequest(candidates[0], 3, 4*time.Hour)
+	if err := claimInterruptedResume(mgr, sess, &req, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !session.IsValidRunID(req.RunID) || !session.IsValidAttemptID(req.AttemptID) ||
+		sess.InterruptedTurn.RunID != req.RunID || sess.InterruptedTurn.AttemptID != req.AttemptID {
+		t.Fatalf("legacy identity req=%+v state=%+v", req, sess.InterruptedTurn)
+	}
+}
+
+func TestInterruptedRecoveryAbandonsInvalidRunIDBeforeExecution(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const id = "recovery-run-invalid-001"
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{Source: "desktop", RunID: "not-canonical"})
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := buildInterruptedResumeRequest(candidates[0], 3, 4*time.Hour)
+	if err := claimInterruptedResume(mgr, sess, &req, ""); !errors.Is(err, errInterruptedRecoveryInvalidRun) {
+		t.Fatalf("claim error = %v", err)
+	}
+	persisted, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.InProgress || persisted.InterruptedTurn != nil {
+		t.Fatalf("invalid run identity remained recoverable: %+v", persisted)
+	}
+}
+
 func TestInterruptedResumeUsesAuthoritativeCheckpointConfigAOverCurrentB(t *testing.T) {
 	shannonDir := t.TempDir()
 	dir := filepath.Join(shannonDir, "sessions")

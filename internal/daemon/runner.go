@@ -129,6 +129,11 @@ type RunAgentRequest struct {
 	ParentRunID    string                         `json:"parent_run_id,omitempty"`
 	ExecutionRun   executionprofile.Run           `json:"-"`
 	ModeAdmission  executionprofile.ModeAdmission `json:"-"`
+	// RunID identifies one universal AgentLoop task across interrupted recovery.
+	// AttemptID identifies this concrete loop construction and changes on resume.
+	// Both are daemon-owned and never accepted from HTTP callers.
+	RunID     string `json:"-"`
+	AttemptID string `json:"-"`
 	// ExecutionConfig is the resolved pre-profile Agent baseline carried only
 	// by interrupted recovery. HTTP clients cannot inject it.
 	ExecutionConfig *agent.ExecutionConfig `json:"-"`
@@ -2191,6 +2196,8 @@ func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string
 		IMStatusContext: append(json.RawMessage(nil), req.IMStatusContext...),
 		Participants:    append([]string(nil), req.Participants...),
 		ResumeAttempts:  req.InterruptedResumeAttempt,
+		RunID:           req.RunID,
+		AttemptID:       req.AttemptID,
 		ExecutionRun:    cloneExecutionRun(req.ExecutionRun),
 		ExecutionConfig: agent.CloneExecutionConfig(req.ExecutionConfig),
 		UpdatedAt:       updatedAt,
@@ -2374,6 +2381,27 @@ func claimInterruptedResume(
 		req.ParentRunID = state.ExecutionRun.ParentRunID
 	}
 
+	if state.RunID == "" {
+		runID, err := newAgentRunID()
+		if err != nil {
+			return fmt.Errorf("mint recovered agent run id: %w", err)
+		}
+		state.RunID = runID
+	} else if !session.IsValidRunID(state.RunID) {
+		sess.InProgress = false
+		sess.InterruptedTurn = nil
+		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {
+			return fmt.Errorf("abandon invalid checkpointed agent run id %q: %w", state.RunID, err)
+		}
+		return fmt.Errorf("%w: %q", errInterruptedRecoveryInvalidRun, state.RunID)
+	}
+	attemptID, err := newAgentAttemptID()
+	if err != nil {
+		return fmt.Errorf("mint recovered agent attempt id: %w", err)
+	}
+	req.RunID = state.RunID
+	req.AttemptID = attemptID
+	state.AttemptID = attemptID
 	req.InterruptedResumeAttempt = state.ResumeAttempts + 1
 	req.InterruptedResumeCheckpointUpdatedAt = checkpointAt
 	state.Agent = agentName
@@ -2937,6 +2965,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		return result, err
 	}
+	if !req.ResumeInterrupted {
+		if err := mintFreshAgentRun(&req); err != nil {
+			return nil, fmt.Errorf("mint agent run identity: %w", err)
+		}
+	} else if req.RunID == "" || req.AttemptID == "" {
+		return nil, errors.New("interrupted recovery has no authoritative run identity")
+	}
 
 	idempotencySettled := req.IdempotencyKey == ""
 	idempotencyOutcomeKnown := false
@@ -3144,7 +3179,18 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// publishes progress events regardless of transport. See
 	// docs/superpowers/specs/2026-04-23-event-bus-progress-coverage-design.md.
 	bus := &busEventHandler{deps: deps, agent: agentName}
-	handler = &multiHandler{handlers: []agent.EventHandler{handler, bus}}
+	combinedHandler := &multiHandler{handlers: []agent.EventHandler{handler, bus}}
+	var runEvents *runEventCollector
+	if !req.Ephemeral {
+		eventLog, err := sessMgr.OpenRunEventLog(sess.ID, req.RunID, req.AttemptID)
+		if err != nil {
+			return nil, fmt.Errorf("open agent run event log: %w", err)
+		}
+		runEvents = newRunEventCollector(combinedHandler, eventLog, sess.ID, req.RunID, req.AttemptID)
+		handler = runEvents
+	} else {
+		handler = combinedHandler
+	}
 
 	// Notify handler of resolved session ID so it can include it in EventBus payloads.
 	if setter, ok := handler.(interface{ SetSessionID(string) }); ok {
@@ -3964,6 +4010,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
 	loop.SetCheckpointFunc(func(ctx context.Context) error {
+		// EventLog is a write-ahead observation stream. Flush before the
+		// authoritative session checkpoint; recovery never uses it for replay.
+		if err := runEvents.Flush(); err != nil {
+			return fmt.Errorf("flush run events at checkpoint: %w", err)
+		}
 		applyTurnState(sess, loop, turnUsage, turnBase)
 		syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())
 		refreshExecutionConfigRuntimeState(loop, &req)
@@ -4013,6 +4064,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		idempotencyFailureCode = status.FailureCode
 		userErr := FriendlyAgentError(runErr)
+		runEventFlushErr := runEvents.Flush()
+		if runEventFlushErr != nil {
+			log.Printf("daemon: hard-error run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, runEventFlushErr)
+		}
 		savedSessionID := ""
 		if !req.Ephemeral && result == "" {
 			// Use the same idempotent rebuild as the mid-turn checkpoint
@@ -4064,6 +4119,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				savedSessionID = sess.ID
 			}
 		}
+		if runEventFlushErr != nil {
+			if err := runEvents.Flush(); err != nil {
+				log.Printf("daemon: hard-error run event flush retry failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, err)
+			}
+		}
 		if deps.EventBus != nil {
 			payload, _ := json.Marshal(map[string]any{
 				"agent":          agentName,
@@ -4101,6 +4161,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	if errors.Is(runErr, agent.ErrMaxIterReached) {
 		log.Printf("daemon: agent %s hit iteration limit, saving partial result", agentName)
+	} else if errors.Is(runErr, agent.ErrRequestBudgetExhausted) {
+		log.Printf("daemon: agent %s exhausted its provider budget, saving partial result", agentName)
 	}
 
 	// Koe voice projection: pull the model-authored <spoken_summary> line out of
@@ -4210,7 +4272,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				receipts,
 			)
 		}
+		runEventFlushErr := runEvents.Flush()
+		if runEventFlushErr != nil {
+			log.Printf("daemon: final run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, runEventFlushErr)
+		}
 		saveErr = sessMgr.Save()
+		if runEventFlushErr != nil {
+			if err := runEvents.Flush(); err != nil {
+				log.Printf("daemon: final run event flush retry failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, err)
+			}
+		}
 		if saveErr != nil {
 			log.Printf("daemon: failed to save session: %v", saveErr)
 			if deps.EventBus != nil {
@@ -4332,7 +4403,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				PlanMode:                 false, // plan-mode tracking lands in a future task
 			}
 			if agent.ShouldGenerateSuggestion(args) {
-				if mainReq, ok := loop.LastSentRequest(); ok {
+				if mainReq, forkLLM, ok := loop.LastSentRequestWithClient(); ok {
 					// context.Background(): the goroutine outlives the
 					// request ctx (HTTP handler / WS dispatch returns
 					// before the forked call completes). Cancellation
@@ -4343,7 +4414,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					// predicts the user's NEXT message after seeing the
 					// assistant's response (not a stale follow-up to
 					// the prior user turn).
-					go fireSuggestionAfterRun(context.Background(), deps, agentName, sess.ID, mainReq, result)
+					go fireSuggestionAfterRun(context.Background(), deps, forkLLM, agentName, sess.ID, mainReq, result)
 				}
 			}
 		}
@@ -4506,7 +4577,7 @@ func suggestionReadyPayload(sessionID, agentName, text string) []byte {
 // can verify the suggestion path is hitting the main turn's prompt cache.
 // Without this telemetry there's no signal that the feature is paying
 // warm-cache pricing as designed.
-func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, sessionID string, main client.CompletionRequest, assistantReply string) {
+func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, llm client.LLMClient, agentName, sessionID string, main client.CompletionRequest, assistantReply string) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("daemon: prompt_suggestion panic: %v", rec)
@@ -4538,7 +4609,7 @@ func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, se
 	// suggestion the user has already moved past.
 	observedGen := deps.Suggestions.CurrentGen(sessionID)
 
-	res, err := agent.GenerateSuggestionWithUsage(ctx, deps.GW, main)
+	res, err := agent.GenerateSuggestionWithUsage(ctx, llm, main)
 	if err != nil {
 		// Transport / gateway failure — silent. Audit a row for diagnosability
 		// only if Auditor is wired; the model is empty here.
@@ -4896,8 +4967,8 @@ func closeRouteDone(done chan struct{}) {
 }
 
 // isSoftRunError reports whether err is a normal termination (cancel, timeout,
-// max iterations) rather than a hard failure. Soft errors should persist the
-// full conversation from RunMessages(), not just a friendly error stub.
+// safety limit) rather than a hard failure. Soft errors should persist the full
+// conversation from RunMessages(), not just a friendly error stub.
 //
 // ErrStreamIdleTimeout is soft: the agent loop already captures partial
 // streaming text and emits OnRunStatus("stream_idle_timeout") with
@@ -4907,6 +4978,7 @@ func closeRouteDone(done chan struct{}) {
 // any text received before the drop).
 func isSoftRunError(err error) bool {
 	return errors.Is(err, agent.ErrMaxIterReached) ||
+		errors.Is(err, agent.ErrRequestBudgetExhausted) ||
 		errors.Is(err, agent.ErrHardIdleTimeout) ||
 		errors.Is(err, client.ErrStreamIdleTimeout) ||
 		errors.Is(err, context.Canceled) ||

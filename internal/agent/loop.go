@@ -1042,6 +1042,8 @@ type AgentLoop struct {
 	lastSentMu      sync.Mutex
 	lastSentRequest client.CompletionRequest
 	lastSentValid   bool
+	activeRunBudget *requestLLMBudget
+	lastSentBudget  *requestLLMBudget
 	// lastIterUsage holds the most recent single-iteration LLM usage (NOT the
 	// turn-aggregate). The suggestion fork's cache-cold gate reads this so a
 	// multi-tool turn that started cold but ended warm gets correctly judged
@@ -3004,6 +3006,13 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		persona = a.agentBasePrompt
 	}
 	usage := &TurnUsage{}
+	requestBudget := newRequestLLMBudget(a.contextWindow)
+	a.lastSentMu.Lock()
+	a.activeRunBudget = requestBudget
+	a.lastSentMu.Unlock()
+	mainLLM := newBudgetedLLMClient(a.client, requestBudget, requestBudgetMain, a.estOverhead)
+	helperLLM := newBudgetedLLMClient(a.client, requestBudget, requestBudgetHelper, nil)
+	terminalLLM := newBudgetedLLMClient(a.client, requestBudget, requestBudgetTerminal, a.estOverhead)
 
 	// Per-Run cache tracker. Records main-tier LLM responses only (helper
 	// calls have their own cache_source="helper" namespace). Emits a single
@@ -3041,7 +3050,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// Memory consolidation: merge auto-*.md detail files when accumulated.
 	// Runs at most once per 7 days, only when ≥12 detail files exist.
 	if a.memoryDir != "" {
-		gcUsage, gcErr := ctxwin.ConsolidateMemory(ctx, a.client, a.memoryDir)
+		gcUsage, gcErr := ctxwin.ConsolidateMemory(ctx, helperLLM, a.memoryDir)
 		a.emitInternalUsage(gcUsage)
 		if gcErr != nil {
 			fmt.Fprintf(os.Stderr, "[context] memory consolidation failed: %v\n", gcErr)
@@ -3642,6 +3651,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// keeps the tools array byte-stable for Anthropic prompt cache.
 
 	setRunStatus := func(code runstatus.Code, partial bool) {
+		budget := requestBudget.snapshot()
 		a.lastRunStatus = RunStatus{
 			Partial:        partial,
 			FailureCode:    code,
@@ -3654,6 +3664,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			Terminal: &RunTraceTerminal{
 				Partial: partial, FailureCode: string(code), LastTool: lastToolName,
 				RetryCount: retryCount, IterationCount: iterationCount,
+				ProviderDispatchesAtTerminal:     budget.NormalDispatches + budget.TerminalDispatches,
+				HelperDispatchesAtTerminal:       budget.HelperDispatches,
+				UnknownUsageDispatchesAtTerminal: budget.UnknownActual,
+				TokenExposureAtTerminal:          budget.ConsumedTokens + budget.ReservedTokens,
+				TokenLimit:                       budget.TokenExposureLimit,
+				TerminalTokenExposure:            budget.TerminalTokens,
 			},
 		})
 	}
@@ -3764,7 +3780,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// Temperature, ReasoningEffort) and substitutes a neutral fallback when
 	// the model returns empty text, so callers never see a blank bubble.
 	// Tools are intentionally omitted to force a text-only response.
-	runForceStopTurn := func(reason string, fallback string) (string, error) {
+	runForceStopTurn := func(reason string, fallback string, outcomeCode runstatus.Code) (string, error) {
 		// Frame the force-stop reason so the model doesn't hallucinate
 		// about WHETHER its tools ran. The detector fires AFTER tool
 		// execution — every tool_use the model emitted before this point
@@ -3829,7 +3845,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			emergencyMessages := cloneMessages(messages)
 			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 			restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
+			summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, helperLLM, stripPrivateMemoryForSummary(emergencyMessages))
 			restoreLLM()
 			a.emitInternalUsage(sumUsage)
 			var shaped ctxwin.ShapedHistory
@@ -3877,7 +3893,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			req.ToolChoice = "none"
 		}
 		synthesisStart := time.Now()
-		finalResp, err := a.completeWithRetry(ctx, req)
+		finalResp, err := a.completeWithRetryClient(ctx, terminalLLM, req)
 		if err != nil {
 			captureRunMessages()
 			// Hard-idle during ForceStop is still a soft/partial outcome,
@@ -3918,7 +3934,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			// single-attempt behavior. Budget semantics documented at the
 			// forceStopEmptyRecoveryUsed declaration.
 			sealed := a.executionProfileID != "" || a.executionProfile != nil || a.computerProfile.ProfileID != ""
-			if !sealed && !forceStopEmptyRecoveryUsed {
+			if !sealed && !forceStopEmptyRecoveryUsed &&
+				requestBudget.snapshot().TerminalDispatches < requestBudgetTerminalDispatchLimit {
 				forceStopEmptyRecoveryUsed = true
 				a.emitRunTrace(RunTraceEvent{
 					Type: RunTraceEventRetry,
@@ -3942,7 +3959,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 					a.tracker.Enter(PhaseForceStop)
 				}
 				retryStart := time.Now()
-				retryResp, retryErr := a.completeWithRetry(ctx, retryReq)
+				retryResp, retryErr := a.completeWithRetryClient(ctx, terminalLLM, retryReq)
 				if retryErr != nil {
 					var recoveryErrorClass string
 					switch {
@@ -4009,7 +4026,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// Every force-stop exit is abnormal: the loop detector terminated
 		// the run early, so this is never a clean success regardless of
 		// whether the model produced final text.
-		setRunStatus(runstatus.CodeIterationLimit, true)
+		setRunStatus(outcomeCode, true)
 		if a.handler != nil {
 			a.handler.OnText(text)
 		}
@@ -4017,6 +4034,26 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			a.clearLastSentOrdinaryContinuation(req.PreviousResponseID)
 		}
 		return text, nil
+	}
+
+	budgetFallback := "I stopped after reaching this request's provider budget. The result may be incomplete."
+	runBudgetStop := func(cause error) (string, error) {
+		text, synthErr := runForceStopTurn(
+			"The request-scoped provider budget was reached. Do not call tools. Summarize only completed work and clearly identify anything unfinished.",
+			budgetFallback,
+			runstatus.CodeBudgetExhausted,
+		)
+		if synthErr != nil {
+			text = budgetFallback
+			messages = append(messages, client.Message{Role: "assistant", Content: client.NewTextContent(text)})
+			stampMessage()
+			captureRunMessages()
+			setRunStatus(runstatus.CodeBudgetExhausted, true)
+			if a.handler != nil {
+				a.handler.OnText(text)
+			}
+		}
+		return text, cause
 	}
 
 	// buildBoundedOutcomeReason is the single synthesis contract for every
@@ -4307,7 +4344,7 @@ iterationLoop:
 			discoveryInput := latestUserText // snapshot for goroutine (latestUserText may be mutated by drain below)
 			// Goroutine self-terminates within 5s (discoveryTimeout) even if Run() returns early.
 			go func() {
-				matched, u := discoverRelevantSkills(ctx, a.client, discoveryInput, a.agentSkills)
+				matched, u := discoverRelevantSkills(ctx, helperLLM, discoveryInput, a.agentSkills)
 				discoveryCh <- discoveryResult{matched: matched, usage: u}
 			}()
 		}
@@ -4420,7 +4457,7 @@ iterationLoop:
 					// before messages are discarded by compaction.
 					if a.memoryDir != "" {
 						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-						pUsage, pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir)
+						pUsage, pErr := ctxwin.PersistLearnings(ctx, helperLLM, messages, a.memoryDir)
 						restoreLLM()
 						a.emitInternalUsage(pUsage)
 						if pErr != nil {
@@ -4429,7 +4466,7 @@ iterationLoop:
 					}
 
 					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(messages))
+					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, helperLLM, stripPrivateMemoryForSummary(messages))
 					restoreLLM()
 					a.emitInternalUsage(sumUsage)
 					trimmedSummary := strings.TrimSpace(summary)
@@ -4622,7 +4659,7 @@ iterationLoop:
 			} else {
 				restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
 				var sumUsage client.Usage
-				summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, stripPrivateMemoryForSummary(emergencyMessages))
+				summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, helperLLM, stripPrivateMemoryForSummary(emergencyMessages))
 				restoreLLM()
 				a.emitInternalUsage(sumUsage)
 				if sumErr == nil {
@@ -4799,7 +4836,7 @@ iterationLoop:
 				if attempt == 0 && a.enableStreaming && a.handler != nil {
 					streamingText.Reset()
 					streamTools := newStreamToolStarter(ctx, a, effTools, req.Tools, a.handler, detector)
-					resp, err = a.client.CompleteStream(ctx, req, func(delta client.StreamDelta) {
+					resp, err = mainLLM.CompleteStream(ctx, req, func(delta client.StreamDelta) {
 						// A delta means the model received the request (incl. the
 						// drained system-event scaffold) and is responding — so the
 						// events are delivered and must NOT be re-enqueued even if the
@@ -4863,7 +4900,7 @@ iterationLoop:
 						// next occurrence's shape is recoverable from client logs.
 						fmt.Fprintf(os.Stderr, "[agent] stream->nonstream fallback iter=%d continuation=%d session_id=%q cache_source=%q skip_cache_write=%t stream_err_type=%T stream_err=%q\n",
 							i, continuationCount, req.SessionID, req.CacheSource, req.SkipCacheWrite, err, err.Error())
-						resp, err = a.client.Complete(ctx, req)
+						resp, err = mainLLM.Complete(ctx, req)
 					} else if err == nil && resp != nil {
 						committedStreamTools = streamTools
 						committedStreamTools.CancelUnmatched(resp.AllToolCalls())
@@ -4874,7 +4911,7 @@ iterationLoop:
 						streamTools.CancelAll()
 					}
 				} else {
-					resp, err = a.client.Complete(ctx, req)
+					resp, err = mainLLM.Complete(ctx, req)
 				}
 				if err == nil {
 					responseAttempt = attempt + 1
@@ -4957,6 +4994,10 @@ iterationLoop:
 					a.maybeCheckpoint(ctx)
 					continue iterationLoop
 				}
+				if errors.Is(err, ErrRequestBudgetExhausted) {
+					text, budgetErr := runBudgetStop(err)
+					return text, usage, budgetErr
+				}
 				// Reactive compaction: if the error is a context-length overflow,
 				// try the normal compaction profile first so summary quality stays
 				// close to proactive compaction. Escalate to the emergency profile
@@ -4973,7 +5014,7 @@ iterationLoop:
 					// Write-before-compact: persist durable learnings before discarding history.
 					if a.memoryDir != "" {
 						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-						pUsage, pErr := ctxwin.PersistLearnings(ctx, a.client, messages, a.memoryDir)
+						pUsage, pErr := ctxwin.PersistLearnings(ctx, helperLLM, messages, a.memoryDir)
 						restoreLLM()
 						a.emitInternalUsage(pUsage)
 						if pErr != nil {
@@ -4996,9 +5037,9 @@ iterationLoop:
 					}
 
 					softMessages := cloneMessages(messages)
-					compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, a.client, latestUserText)
+					compressOldToolResults(a.ctxWithUsageEmit(ctx), softMessages, compressAfter, maxResultChars, helperLLM, latestUserText)
 					restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(softMessages), nextSummary))
+					summary, sumUsage, sumErr := ctxwin.GenerateSummary(ctx, helperLLM, reactiveSummaryInput(stripPrivateMemoryForSummary(softMessages), nextSummary))
 					restoreLLM()
 					a.emitInternalUsage(sumUsage)
 					if sumErr != nil {
@@ -5018,7 +5059,7 @@ iterationLoop:
 						compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
 
 						restoreLLM := a.tracker.EnterTransient(PhaseAwaitingLLM)
-						summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, a.client, reactiveSummaryInput(stripPrivateMemoryForSummary(emergencyMessages), nextSummary))
+						summary, sumUsage, sumErr = ctxwin.GenerateSummary(ctx, helperLLM, reactiveSummaryInput(stripPrivateMemoryForSummary(emergencyMessages), nextSummary))
 						restoreLLM()
 						a.emitInternalUsage(sumUsage)
 						if sumErr != nil {
@@ -6882,7 +6923,7 @@ iterationLoop:
 		)
 		if worstAction == LoopForceStop {
 			auditDetectorForceStop(worstMsg)
-			text, err := runForceStopTurn(buildForceStopReason(worstMsg), forceStopFallback)
+			text, err := runForceStopTurn(buildForceStopReason(worstMsg), forceStopFallback, runstatus.CodeIterationLimit)
 			if err != nil {
 				return "", usage, err
 			}
@@ -6896,6 +6937,7 @@ iterationLoop:
 				text, err := runForceStopTurn(
 					buildForceStopReason(escalationNote),
 					forceStopFallback,
+					runstatus.CodeIterationLimit,
 				)
 				if err != nil {
 					return "", usage, err
@@ -6968,6 +7010,7 @@ iterationLoop:
 	text, synthErr := runForceStopTurn(
 		buildMaxIterReason(),
 		fmt.Sprintf("I reached the iteration safety cap after %d turns and couldn't finalize a report.", iterationCount),
+		runstatus.CodeIterationLimit,
 	)
 	if synthErr == nil {
 		// runForceStopTurn already handled the partial CodeIterationLimit
@@ -7036,19 +7079,30 @@ func lastTextAlreadyPersisted(messages []client.Message, text string) bool {
 // completeWithRetry calls client.Complete with retry+backoff for transient errors.
 // Used for non-streaming LLM calls (loop-force-stop, nudge escalation, etc.).
 func (a *AgentLoop) completeWithRetry(ctx context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	return a.completeWithRetryClient(ctx, a.client, req)
+}
+
+func (a *AgentLoop) completeWithRetryClient(ctx context.Context, llm client.LLMClient, req client.CompletionRequest) (*client.CompletionResponse, error) {
 	const maxRetries = 3
 	var resp *client.CompletionResponse
 	var err error
+	var firstErr error
 	for attempt := 0; ; attempt++ {
 		// Snapshot the dispatched request for post-Run forks (suggestion /
 		// speculation). Captured every iteration since req does not mutate
 		// across retries within this call but may differ from the main-loop
 		// request that preceded us (e.g. force-stop / nudge-escalation tail).
 		a.captureSentRequest(req)
-		resp, err = a.client.Complete(ctx, req)
+		resp, err = llm.Complete(ctx, req)
 		if err == nil {
 			a.lastAssistantAt = time.Now()
 			return resp, nil
+		}
+		if errors.Is(err, ErrRequestBudgetExhausted) && firstErr != nil {
+			return nil, firstErr
+		}
+		if firstErr == nil {
+			firstErr = err
 		}
 		if ctx.Err() != nil {
 			// Prefer the context cause when available so watchdog hard
@@ -8692,6 +8746,7 @@ func (a *AgentLoop) captureSentRequest(req client.CompletionRequest) {
 		snapshot.Tools = append([]client.Tool(nil), req.Tools...)
 	}
 	a.lastSentRequest = snapshot
+	a.lastSentBudget = a.activeRunBudget
 	a.lastSentValid = true
 }
 
@@ -8730,10 +8785,29 @@ func (a *AgentLoop) LastSentRequest() (client.CompletionRequest, bool) {
 	if !a.lastSentValid {
 		return client.CompletionRequest{}, false
 	}
-	out := a.lastSentRequest
-	out.Messages = append([]client.Message(nil), a.lastSentRequest.Messages...)
-	if len(a.lastSentRequest.Tools) > 0 {
-		out.Tools = append([]client.Tool(nil), a.lastSentRequest.Tools...)
+	return cloneCompletionRequest(a.lastSentRequest), true
+}
+
+// LastSentRequestWithClient atomically returns the canonical request together
+// with a fork-only client bound to that request's Run budget. Post-Run features
+// must use the returned client instead of the raw gateway or they bypass the
+// request-scoped dispatch and token limits.
+func (a *AgentLoop) LastSentRequestWithClient() (client.CompletionRequest, client.LLMClient, bool) {
+	a.lastSentMu.Lock()
+	defer a.lastSentMu.Unlock()
+	if !a.lastSentValid || a.lastSentBudget == nil {
+		return client.CompletionRequest{}, nil, false
+	}
+	out := cloneCompletionRequest(a.lastSentRequest)
+	llm := newBudgetedLLMClient(a.client, a.lastSentBudget, requestBudgetFork, nil)
+	return out, llm, true
+}
+
+func cloneCompletionRequest(in client.CompletionRequest) client.CompletionRequest {
+	out := in
+	out.Messages = append([]client.Message(nil), in.Messages...)
+	if len(in.Tools) > 0 {
+		out.Tools = append([]client.Tool(nil), in.Tools...)
 	}
 	// Thinking is a pointer — shallow-copy aliases the loop's internal
 	// snapshot. A caller mutating out.Thinking.BudgetTokens would silently
@@ -8741,11 +8815,11 @@ func (a *AgentLoop) LastSentRequest() (client.CompletionRequest, bool) {
 	// also deep-copies Thinking on the way out (forkedrequest.go), so the
 	// suggestion path is safe today; this guard closes the same footgun
 	// for any other consumer that calls LastSentRequest directly.
-	if a.lastSentRequest.Thinking != nil {
-		thinkingCopy := *a.lastSentRequest.Thinking
+	if in.Thinking != nil {
+		thinkingCopy := *in.Thinking
 		out.Thinking = &thinkingCopy
 	}
-	return out, true
+	return out
 }
 
 // LastLLMUsage returns the usage from the most recent single LLM iteration

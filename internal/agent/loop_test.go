@@ -4247,12 +4247,10 @@ func TestForceStop_EmptySynthesis_RecoversTextFromBlocks(t *testing.T) {
 	}
 }
 
-// TestForceStop_EmptySynthesis_LowEffortRecovery: a bare-empty synthesis
-// response gets exactly one recovery attempt with reasoning stripped
-// (EffortTier=low, Thinking=nil, ReasoningEffort="") while the FIRST
-// synthesis request keeps the run's original configuration. The empty
-// initial attempt must leave a force_stop_empty_synthesis audit row.
-func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
+// TestForceStop_EmptySynthesis_SingleTerminalFallback verifies that an empty
+// terminal synthesis consumes the sole terminal dispatch and falls back
+// deterministically without issuing a second provider request.
+func TestForceStop_EmptySynthesis_SingleTerminalFallback(t *testing.T) {
 	var (
 		mu       sync.Mutex
 		requests []client.CompletionRequest
@@ -4283,11 +4281,11 @@ func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "Recovered after retry." {
-		t.Errorf("expected recovery-turn text, got %q", result)
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Errorf("expected deterministic fallback, got %q", result)
 	}
-	if *callCount != 6 {
-		t.Fatalf("expected 6 LLM calls (synthesis + 1 recovery), got %d", *callCount)
+	if *callCount != 5 {
+		t.Fatalf("expected 5 LLM calls with one terminal synthesis, got %d", *callCount)
 	}
 
 	mu.Lock()
@@ -4297,20 +4295,6 @@ func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
 		t.Errorf("first synthesis attempt must keep original config; got effort_tier=%q thinking=%v reasoning=%q",
 			first.EffortTier, first.Thinking, first.ReasoningEffort)
 	}
-	retry := requests[5]
-	if retry.EffortTier != "low" {
-		t.Errorf("recovery attempt EffortTier: got %q, want \"low\"", retry.EffortTier)
-	}
-	if retry.Thinking != nil {
-		t.Errorf("recovery attempt must disable thinking, got %+v", retry.Thinking)
-	}
-	if retry.ReasoningEffort != "" {
-		t.Errorf("recovery attempt must clear ReasoningEffort, got %q", retry.ReasoningEffort)
-	}
-	if len(retry.Tools) != 0 {
-		t.Errorf("recovery attempt must not carry tools, got %d", len(retry.Tools))
-	}
-
 	rows := forceStopEmptySynthesisRows(t, logDir)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 force_stop_empty_synthesis audit row, got %d", len(rows))
@@ -4328,11 +4312,9 @@ func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
 	}
 }
 
-// TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit: when both the
-// synthesis attempt and the single recovery attempt return no visible text,
-// the deterministic fallback is used, the recovery budget binds at one, and
-// BOTH empty attempts leave audit rows (attempt=initial, attempt=recovery).
-func TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit(t *testing.T) {
+// TestForceStop_EmptySynthesis_FallbackAndAudit verifies that the sole
+// terminal synthesis falls back deterministically when it returns no text.
+func TestForceStop_EmptySynthesis_FallbackAndAudit(t *testing.T) {
 	server, callCount := forceStopServer(t, func(int) client.CompletionResponse {
 		return nativeResponse("", "end_turn", nil, 10, 0)
 	}, nil, nil)
@@ -4354,23 +4336,19 @@ func TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !strings.Contains(result, "synthesis produced no output") {
-		t.Errorf("expected deterministic fallback after double-empty, got %q", result)
+		t.Errorf("expected deterministic fallback, got %q", result)
 	}
-	if *callCount != 6 {
-		t.Errorf("recovery budget must bind at one attempt: expected 6 LLM calls, got %d", *callCount)
+	if *callCount != 5 {
+		t.Errorf("expected 5 LLM calls with one terminal synthesis, got %d", *callCount)
 	}
 
 	rows := forceStopEmptySynthesisRows(t, logDir)
-	if len(rows) != 2 {
-		t.Fatalf("expected 2 force_stop_empty_synthesis audit rows, got %d", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 force_stop_empty_synthesis audit row, got %d", len(rows))
 	}
 	in0, _ := rows[0]["input_summary"].(string)
-	in1, _ := rows[1]["input_summary"].(string)
 	if !strings.Contains(in0, "attempt=initial") {
 		t.Errorf("first row missing attempt=initial: %q", in0)
-	}
-	if !strings.Contains(in1, "attempt=recovery") || !strings.Contains(in1, "effort_tier=low") {
-		t.Errorf("second row missing attempt=recovery/effort_tier=low: %q", in1)
 	}
 }
 
@@ -4503,12 +4481,9 @@ func TestForceStop_EmptySynthesis_StripsHallucinatedComputerCall(t *testing.T) {
 	}
 }
 
-// TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack: when
-// the degraded-effort recovery call itself fails on a non-cancellation error
-// (e.g. non-retryable 400), the run must still hand back the deterministic
-// fallback AND leave a content-free force_stop_synthesis_recovery_failed
-// audit row — otherwise the recovery failure is invisible in triage.
-func TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack(t *testing.T) {
+// TestForceStop_EmptySynthesis_SkipsRecoveryCall verifies that an empty
+// terminal synthesis cannot trigger a second provider dispatch.
+func TestForceStop_EmptySynthesis_SkipsRecoveryCall(t *testing.T) {
 	server, callCount := forceStopServer(t, func(call int) client.CompletionResponse {
 		return nativeResponse("", "end_turn", nil, 10, 0)
 	}, nil, nil)
@@ -4544,33 +4519,20 @@ func TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack(t *testin
 	if !strings.Contains(result, "synthesis produced no output") {
 		t.Errorf("expected deterministic fallback, got %q", result)
 	}
-	_ = callCount
+	if *callCount != 5 || calls != 5 {
+		t.Fatalf("expected 5 LLM calls with no recovery dispatch, got server=%d wrapper=%d", *callCount, calls)
+	}
 
-	var failedRow map[string]any
 	for _, e := range readAuditLines(t, logDir) {
 		if e["event"] == "force_stop_synthesis_recovery_failed" {
-			failedRow = e
-			break
+			t.Fatal("unexpected force_stop_synthesis_recovery_failed audit row without a recovery dispatch")
 		}
-	}
-	if failedRow == nil {
-		t.Fatal("expected force_stop_synthesis_recovery_failed audit row")
-	}
-	in, _ := failedRow["input_summary"].(string)
-	if !strings.Contains(in, "error_class=HTTP 400") {
-		t.Errorf("audit row missing error_class: %q", in)
-	}
-	if strings.Contains(in, "bad request") {
-		t.Errorf("audit row must be content-free (no response body): %q", in)
 	}
 }
 
-// TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback verifies
-// that the optional degraded-effort recovery cannot make the force-stop
-// outcome worse. Once the initial synthesis completed successfully (but
-// empty), a watchdog cancellation of the recovery must still persist and
-// return the deterministic fallback under the original force-stop reason.
-func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.T) {
+// TestForceStop_EmptySynthesis_DoesNotStartRecoveryHardIdle verifies that the
+// terminal cap prevents an empty synthesis from starting a recovery request.
+func TestForceStop_EmptySynthesis_DoesNotStartRecoveryHardIdle(t *testing.T) {
 	var callCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := callCount.Add(1)
@@ -4611,8 +4573,8 @@ func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.
 	if !strings.Contains(result, "synthesis produced no output") {
 		t.Fatalf("expected deterministic fallback, got %q", result)
 	}
-	if got := callCount.Load(); got != 6 {
-		t.Fatalf("expected 6 LLM calls (synthesis + recovery), got %d", got)
+	if got := callCount.Load(); got != 5 {
+		t.Fatalf("expected 5 LLM calls with no recovery dispatch, got %d", got)
 	}
 
 	status := loop.LastRunStatus()
@@ -4630,27 +4592,16 @@ func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.
 			last.Role, last.Content.Text())
 	}
 
-	var failedRow map[string]any
 	for _, e := range readAuditLines(t, logDir) {
 		if e["event"] == "force_stop_synthesis_recovery_failed" {
-			failedRow = e
-			break
+			t.Fatal("unexpected recovery failure audit row without a recovery dispatch")
 		}
-	}
-	if failedRow == nil {
-		t.Fatal("expected force_stop_synthesis_recovery_failed audit row")
-	}
-	in, _ := failedRow["input_summary"].(string)
-	if !strings.Contains(in, "error_class=hard_idle_timeout") {
-		t.Errorf("audit row missing hard-idle error class: %q", in)
 	}
 }
 
-// TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget verifies that the
-// optional recovery owns a fresh ForceStop watchdog interval. The initial
-// synthesis and recovery each fit within idleHardTimeout, but their combined
-// latency does not.
-func TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget(t *testing.T) {
+// TestForceStop_EmptySynthesis_SlowTerminalStillSkipsRecovery verifies that a
+// successful-but-empty terminal request consumes the only terminal dispatch.
+func TestForceStop_EmptySynthesis_SlowTerminalStillSkipsRecovery(t *testing.T) {
 	var callCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := callCount.Add(1)
@@ -4678,13 +4629,13 @@ func TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget(t *testing.T) {
 
 	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
 	if err != nil {
-		t.Fatalf("expected recovery within fresh watchdog budget, got error: %v", err)
+		t.Fatalf("expected deterministic fallback, got error: %v", err)
 	}
-	if result != "Recovered with fresh budget." {
-		t.Fatalf("expected recovered text, got %q", result)
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Fatalf("expected deterministic fallback, got %q", result)
 	}
-	if got := callCount.Load(); got != 6 {
-		t.Fatalf("expected 6 LLM calls (synthesis + recovery), got %d", got)
+	if got := callCount.Load(); got != 5 {
+		t.Fatalf("expected 5 LLM calls with no recovery dispatch, got %d", got)
 	}
 
 	status := loop.LastRunStatus()

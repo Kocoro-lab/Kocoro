@@ -1387,7 +1387,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamLive = "" // final answer is rendered to scrollback below
 		m.cancelRun = nil
 		m.injectCh = nil
-		if msg.err != nil && !errors.Is(msg.err, context.Canceled) && !errors.Is(msg.err, agent.ErrMaxIterReached) {
+		if msg.err != nil && !errors.Is(msg.err, context.Canceled) && !errors.Is(msg.err, agent.ErrMaxIterReached) && !errors.Is(msg.err, agent.ErrRequestBudgetExhausted) {
 			code := msg.status.FailureCode
 			if code == runstatus.CodeNone {
 				code = runstatus.CodeFromError(msg.err)
@@ -1396,15 +1396,20 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Display the assistant response (rendered here instead of OnText to
 		// avoid a race where the Println Cmd arrives after state has changed).
-		if msg.result != "" && (msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached)) {
+		if msg.result != "" && (msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) || errors.Is(msg.err, agent.ErrRequestBudgetExhausted)) {
 			m.appendMarkdownOutput(msg.result, m.renderMarkdownCached(msg.result, m.width))
 			m.appendOutput("")
 			// Soft warning for loop-detector force-stop: the reply is valid
 			// and rendered above, but the run ended early. Show a dim hint,
 			// not a red error.
-			if msg.err == nil && msg.status.Partial && msg.status.FailureCode == runstatus.CodeIterationLimit {
+			if msg.status.Partial {
 				dim := lipgloss.NewStyle().Foreground(colorDim).Italic(true)
-				m.appendOutput(dim.Render("  Stopped early after repeated failed attempts."))
+				switch msg.status.FailureCode {
+				case runstatus.CodeIterationLimit:
+					m.appendOutput(dim.Render("  Stopped early after repeated failed attempts."))
+				case runstatus.CodeBudgetExhausted:
+					m.appendOutput(dim.Render("  Provider budget reached; review the partial result."))
+				}
 			}
 		}
 		// Tool count summary (individual tool lines already shown during execution)
@@ -1412,7 +1417,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toolExpandLevel = 0
 		}
 		// Don't show usage/elapsed for cancelled tasks
-		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
+		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) || errors.Is(msg.err, agent.ErrRequestBudgetExhausted) {
 			elapsed := formatElapsed(time.Since(m.processingStartTime))
 			usageDim := lipgloss.NewStyle().Foreground(colorDim)
 			// Prefer session's cumulative usage (captures direct LLM + cloud_delegate
@@ -1445,7 +1450,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// successful turn (same shared core as the daemon path). tea.Batch
 		// drops a nil Cmd, so this is a no-op when gating fails.
 		var titleCmd tea.Cmd
-		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
+		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) || errors.Is(msg.err, agent.ErrRequestBudgetExhausted) {
 			if sess := m.sessions.Current(); sess != nil {
 				titleCmd = m.generateTitleCmd(sess.ID, sess.Source, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 			}
@@ -2091,7 +2096,7 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 		// don't leave in-memory partial state without disk persistence.
 		sess := m.sessions.Current()
 		isCancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-		shouldPersist := isCancelled || err == nil || errors.Is(err, agent.ErrMaxIterReached)
+		shouldPersist := isCancelled || err == nil || errors.Is(err, agent.ErrMaxIterReached) || errors.Is(err, agent.ErrRequestBudgetExhausted)
 		if shouldPersist {
 			runMsgs := m.agentLoop.RunMessages()
 			runInjected := m.agentLoop.RunMessageInjected()
