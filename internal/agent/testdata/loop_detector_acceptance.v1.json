@@ -5,212 +5,815 @@
     {
       "id": "productive_multi_source_research",
       "class": "productive",
-      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "expectation": {
+        "first_nudge_min": 0,
+        "first_nudge_max": 0,
+        "first_force_stop_min": 0,
+        "first_force_stop_max": 0
+      },
       "events": [
-        {"name": "web_search", "args": "{\"query\":\"golang concurrency patterns\"}", "result_sig": "go.dev/concurrency"},
-        {"name": "web_search", "args": "{\"query\":\"python machine learning tutorial\"}", "result_sig": "python.org/ml"},
-        {"name": "web_search", "args": "{\"query\":\"rust ownership explained\"}", "result_sig": "rust-lang.org/ownership"},
-        {"name": "web_search", "args": "{\"query\":\"javascript async await\"}", "result_sig": "mdn/async"},
-        {"name": "web_fetch", "args": "{\"url\":\"https://go.dev/doc/effective_go\"}", "result_sig": "effective-go"},
-        {"name": "web_fetch", "args": "{\"url\":\"https://docs.python.org/3/tutorial/\"}", "result_sig": "python-tutorial"},
-        {"name": "web_fetch", "args": "{\"url\":\"https://doc.rust-lang.org/book/\"}", "result_sig": "rust-book"}
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"golang concurrency patterns\"}",
+          "result_sig": "go.dev/concurrency"
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"python machine learning tutorial\"}",
+          "result_sig": "python.org/ml"
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"rust ownership explained\"}",
+          "result_sig": "rust-lang.org/ownership"
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"javascript async await\"}",
+          "result_sig": "mdn/async"
+        },
+        {
+          "name": "web_fetch",
+          "args": "{\"url\":\"https://go.dev/doc/effective_go\"}",
+          "result_sig": "effective-go"
+        },
+        {
+          "name": "web_fetch",
+          "args": "{\"url\":\"https://docs.python.org/3/tutorial/\"}",
+          "result_sig": "python-tutorial"
+        },
+        {
+          "name": "web_fetch",
+          "args": "{\"url\":\"https://doc.rust-lang.org/book/\"}",
+          "result_sig": "rust-book"
+        }
       ]
     },
     {
       "id": "productive_browser_multistep",
       "class": "productive",
-      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "expectation": {
+        "first_nudge_min": 0,
+        "first_nudge_max": 0,
+        "first_force_stop_min": 0,
+        "first_force_stop_max": 0
+      },
       "events": [
-        {"name": "browser_snapshot", "args": "{}"},
-        {"name": "browser_click", "args": "{\"ref\":\"e0\"}"},
-        {"name": "browser_snapshot", "args": "{}"},
-        {"name": "browser_click", "args": "{\"ref\":\"e1\"}"},
-        {"name": "browser_snapshot", "args": "{}"},
-        {"name": "browser_click", "args": "{\"ref\":\"e2\"}"},
-        {"name": "browser_snapshot", "args": "{}"},
-        {"name": "browser_click", "args": "{\"ref\":\"e3\"}"},
-        {"name": "browser_snapshot", "args": "{}"},
-        {"name": "browser_click", "args": "{\"ref\":\"e4\"}"}
+        {
+          "name": "browser_snapshot",
+          "args": "{}"
+        },
+        {
+          "name": "browser_click",
+          "args": "{\"ref\":\"e0\"}"
+        },
+        {
+          "name": "browser_snapshot",
+          "args": "{}"
+        },
+        {
+          "name": "browser_click",
+          "args": "{\"ref\":\"e1\"}"
+        },
+        {
+          "name": "browser_snapshot",
+          "args": "{}"
+        },
+        {
+          "name": "browser_click",
+          "args": "{\"ref\":\"e2\"}"
+        },
+        {
+          "name": "browser_snapshot",
+          "args": "{}"
+        },
+        {
+          "name": "browser_click",
+          "args": "{\"ref\":\"e3\"}"
+        },
+        {
+          "name": "browser_snapshot",
+          "args": "{}"
+        },
+        {
+          "name": "browser_click",
+          "args": "{\"ref\":\"e4\"}"
+        }
       ]
     },
     {
       "id": "productive_distinct_http_batch",
       "class": "productive",
-      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "expectation": {
+        "first_nudge_min": 0,
+        "first_nudge_max": 0,
+        "first_force_stop_min": 0,
+        "first_force_stop_max": 0
+      },
       "events": [
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-01\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-02\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-03\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-04\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-05\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-06\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-07\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-08\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-09\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-10\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-11\"}"},
-        {"name": "http", "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-12\"}"}
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-01\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-02\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-03\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-04\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-05\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-06\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-07\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-08\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-09\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-10\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-11\"}"
+        },
+        {
+          "name": "http",
+          "args": "{\"method\":\"POST\",\"path\":\"/skills/disabled\",\"body\":\"skill-12\"}"
+        }
       ]
     },
     {
       "id": "productive_same_args_polling_with_progress",
       "class": "productive",
-      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "expectation": {
+        "first_nudge_min": 0,
+        "first_nudge_max": 0,
+        "first_force_stop_min": 0,
+        "first_force_stop_max": 0
+      },
       "events": [
-        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "queued", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "starting", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "running-25", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "running-60", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-1\"}", "outcome_sig": "complete", "is_read_only": true}
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-1\"}",
+          "outcome_sig": "queued",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-1\"}",
+          "outcome_sig": "starting",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-1\"}",
+          "outcome_sig": "running-25",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-1\"}",
+          "outcome_sig": "running-60",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-1\"}",
+          "outcome_sig": "complete",
+          "is_read_only": true
+        }
       ]
     },
     {
       "id": "loop_same_args_polling_without_progress",
       "class": "loop",
-      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 6, "first_force_stop_max": 6, "ideal_stop_after": 3, "max_wasted_calls": 3},
+      "expectation": {
+        "first_nudge_min": 3,
+        "first_nudge_max": 3,
+        "first_force_stop_min": 6,
+        "first_force_stop_max": 6,
+        "ideal_stop_after": 3,
+        "max_wasted_calls": 3
+      },
       "events": [
-        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true},
-        {"name": "process_status", "args": "{\"job_id\":\"job-2\"}", "outcome_sig": "running-0", "is_read_only": true}
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-2\"}",
+          "outcome_sig": "running-0",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-2\"}",
+          "outcome_sig": "running-0",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-2\"}",
+          "outcome_sig": "running-0",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-2\"}",
+          "outcome_sig": "running-0",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-2\"}",
+          "outcome_sig": "running-0",
+          "is_read_only": true
+        },
+        {
+          "name": "process_status",
+          "args": "{\"job_id\":\"job-2\"}",
+          "outcome_sig": "running-0",
+          "is_read_only": true
+        }
       ]
     },
     {
       "id": "loop_identical_polling",
       "class": "loop",
-      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 4, "first_force_stop_max": 4, "ideal_stop_after": 3, "max_wasted_calls": 1},
+      "expectation": {
+        "first_nudge_min": 3,
+        "first_nudge_max": 3,
+        "first_force_stop_min": 4,
+        "first_force_stop_max": 4,
+        "ideal_stop_after": 3,
+        "max_wasted_calls": 1
+      },
       "events": [
-        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"},
-        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"},
-        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"},
-        {"name": "bash", "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"}
+        {
+          "name": "bash",
+          "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"
+        },
+        {
+          "name": "bash",
+          "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"
+        },
+        {
+          "name": "bash",
+          "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"
+        },
+        {
+          "name": "bash",
+          "args": "{\"command\":\"sleep 5 && curl -s http://localhost:8080/status\"}"
+        }
       ]
     },
     {
       "id": "productive_alternating_observations_with_progress",
       "class": "productive",
-      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "expectation": {
+        "first_nudge_min": 0,
+        "first_nudge_max": 0,
+        "first_force_stop_min": 0,
+        "first_force_stop_max": 0
+      },
       "events": [
-        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "queued", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "booting", "is_read_only": true},
-        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "running-25", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "loaded model", "is_read_only": true},
-        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "running-70", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "writing output", "is_read_only": true},
-        {"name": "job_status", "args": "{\"id\":\"job-3\"}", "outcome_sig": "complete", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-3\",\"tail\":20}", "outcome_sig": "done", "is_read_only": true}
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-3\"}",
+          "outcome_sig": "queued",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-3\",\"tail\":20}",
+          "outcome_sig": "booting",
+          "is_read_only": true
+        },
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-3\"}",
+          "outcome_sig": "running-25",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-3\",\"tail\":20}",
+          "outcome_sig": "loaded model",
+          "is_read_only": true
+        },
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-3\"}",
+          "outcome_sig": "running-70",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-3\",\"tail\":20}",
+          "outcome_sig": "writing output",
+          "is_read_only": true
+        },
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-3\"}",
+          "outcome_sig": "complete",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-3\",\"tail\":20}",
+          "outcome_sig": "done",
+          "is_read_only": true
+        }
       ]
     },
     {
       "id": "loop_ping_pong_without_progress",
       "class": "loop",
-      "expectation": {"first_nudge_min": 6, "first_nudge_max": 6, "first_force_stop_min": 9, "first_force_stop_max": 9, "ideal_stop_after": 6, "max_wasted_calls": 3},
+      "expectation": {
+        "first_nudge_min": 6,
+        "first_nudge_max": 6,
+        "first_force_stop_min": 9,
+        "first_force_stop_max": 9,
+        "ideal_stop_after": 6,
+        "max_wasted_calls": 3
+      },
       "events": [
-        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
-        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
-        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
-        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true},
-        {"name": "job_log", "args": "{\"id\":\"job-4\",\"tail\":20}", "outcome_sig": "no new lines", "is_read_only": true},
-        {"name": "job_status", "args": "{\"id\":\"job-4\"}", "outcome_sig": "running", "is_read_only": true}
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-4\"}",
+          "outcome_sig": "running",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-4\",\"tail\":20}",
+          "outcome_sig": "no new lines",
+          "is_read_only": true
+        },
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-4\"}",
+          "outcome_sig": "running",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-4\",\"tail\":20}",
+          "outcome_sig": "no new lines",
+          "is_read_only": true
+        },
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-4\"}",
+          "outcome_sig": "running",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-4\",\"tail\":20}",
+          "outcome_sig": "no new lines",
+          "is_read_only": true
+        },
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-4\"}",
+          "outcome_sig": "running",
+          "is_read_only": true
+        },
+        {
+          "name": "job_log",
+          "args": "{\"id\":\"job-4\",\"tail\":20}",
+          "outcome_sig": "no new lines",
+          "is_read_only": true
+        },
+        {
+          "name": "job_status",
+          "args": "{\"id\":\"job-4\"}",
+          "outcome_sig": "running",
+          "is_read_only": true
+        }
       ]
     },
     {
       "id": "loop_repeated_validation_error",
       "class": "loop",
-      "expectation": {"first_nudge_min": 0, "first_nudge_max": 0, "first_force_stop_min": 3, "first_force_stop_max": 3, "ideal_stop_after": 3, "max_wasted_calls": 0},
+      "expectation": {
+        "first_nudge_min": 0,
+        "first_nudge_max": 0,
+        "first_force_stop_min": 3,
+        "first_force_stop_max": 3,
+        "ideal_stop_after": 3,
+        "max_wasted_calls": 0
+      },
       "events": [
-        {"name": "file_write", "args": "{\"path\":\"notes.txt\"}", "is_error": true, "error": "[validation error] content is required"},
-        {"name": "file_write", "args": "{\"path\":\"notes.txt\"}", "is_error": true, "error": "[validation error] content is required"},
-        {"name": "file_write", "args": "{\"path\":\"notes.txt\"}", "is_error": true, "error": "[validation error] content is required"}
+        {
+          "name": "file_write",
+          "args": "{\"path\":\"notes.txt\"}",
+          "is_error": true,
+          "error": "[validation error] content is required"
+        },
+        {
+          "name": "file_write",
+          "args": "{\"path\":\"notes.txt\"}",
+          "is_error": true,
+          "error": "[validation error] content is required"
+        },
+        {
+          "name": "file_write",
+          "args": "{\"path\":\"notes.txt\"}",
+          "is_error": true,
+          "error": "[validation error] content is required"
+        }
       ]
     },
     {
       "id": "loop_varied_world_news_queries",
       "class": "loop",
-      "expectation": {"first_nudge_min": 3, "first_nudge_max": 5, "first_force_stop_min": 8, "first_force_stop_max": 8, "ideal_stop_after": 5, "max_wasted_calls": 3},
+      "expectation": {
+        "first_nudge_min": 3,
+        "first_nudge_max": 5,
+        "first_force_stop_min": 8,
+        "first_force_stop_max": 8,
+        "ideal_stop_after": 5,
+        "max_wasted_calls": 3
+      },
       "events": [
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 major headlines\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines Reuters AP BBC\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP BBC Al Jazeera\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news today March 2 2026 top headlines\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 top headlines Reuters AP BBC Al Jazeera CNN\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 latest updates\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 breaking\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
-        {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 BBC CNN Al Jazeera\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true}
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news today March 2 2026\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news today March 2 2026 major headlines\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 top headlines Reuters BBC Al Jazeera\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news today March 2 2026 top headlines Reuters AP BBC\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 Reuters AP BBC Al Jazeera\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 top headlines\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news today March 2 2026 top headlines\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 top headlines Reuters AP BBC Al Jazeera CNN\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 latest updates\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 breaking\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 Reuters AP\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        },
+        {
+          "name": "web_search",
+          "args": "{\"query\":\"world news March 2 2026 BBC CNN Al Jazeera\"}",
+          "result_sig": "reuters.com,bbc.com",
+          "is_read_only": true
+        }
       ]
     },
     {
       "id": "known_gap_three_tool_cycle",
       "class": "known-gap",
       "comment": "A->B->C read-only cycle with stable outcomes: pairwise ping-pong never matches, per-tool stable-outcome nudges start at call 13 but the detector never force-stops (measured: 0 forces in 60 calls). Production relies on the loop-level 3-nudges-in-10-iterations escalation. Fix direction: cycle-aware detection; then promote to class loop.",
-      "expectation": {"first_nudge_min": 13, "first_nudge_max": 13, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "expectation": {
+        "first_nudge_min": 13,
+        "first_nudge_max": 13,
+        "first_force_stop_min": 0,
+        "first_force_stop_max": 0
+      },
       "events": [
-        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
-        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
-        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
-        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
-        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
-        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
-        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
-        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
-        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
-        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
-        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
-        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
-        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
-        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
-        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
-        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
-        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
-        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true}
+        {
+          "name": "wiki_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-a",
+          "is_read_only": true
+        },
+        {
+          "name": "news_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-b",
+          "is_read_only": true
+        },
+        {
+          "name": "blog_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-c",
+          "is_read_only": true
+        },
+        {
+          "name": "wiki_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-a",
+          "is_read_only": true
+        },
+        {
+          "name": "news_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-b",
+          "is_read_only": true
+        },
+        {
+          "name": "blog_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-c",
+          "is_read_only": true
+        },
+        {
+          "name": "wiki_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-a",
+          "is_read_only": true
+        },
+        {
+          "name": "news_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-b",
+          "is_read_only": true
+        },
+        {
+          "name": "blog_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-c",
+          "is_read_only": true
+        },
+        {
+          "name": "wiki_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-a",
+          "is_read_only": true
+        },
+        {
+          "name": "news_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-b",
+          "is_read_only": true
+        },
+        {
+          "name": "blog_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-c",
+          "is_read_only": true
+        },
+        {
+          "name": "wiki_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-a",
+          "is_read_only": true
+        },
+        {
+          "name": "news_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-b",
+          "is_read_only": true
+        },
+        {
+          "name": "blog_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-c",
+          "is_read_only": true
+        },
+        {
+          "name": "wiki_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-a",
+          "is_read_only": true
+        },
+        {
+          "name": "news_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-b",
+          "is_read_only": true
+        },
+        {
+          "name": "blog_lookup",
+          "args": "{\"q\":\"same-topic\"}",
+          "outcome_sig": "sig-c",
+          "is_read_only": true
+        }
       ]
     },
     {
       "id": "known_gap_noisy_outcome_same_args",
       "class": "known-gap",
       "comment": "Same tool+args read-only polling whose outcome changes every call (timestamps/progress noise): outcome-aware relaxation treats each call as progress, nudges start at call 12 and repeat, but no force-stop (measured: 0 forces in 40 calls). Production relies on the nudge-window escalation. Fix direction: rate-limit noisy-outcome credit; then promote to class loop.",
-      "expectation": {"first_nudge_min": 12, "first_nudge_max": 12, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "expectation": {
+        "first_nudge_min": 12,
+        "first_nudge_max": 12,
+        "first_force_stop_min": 0,
+        "first_force_stop_max": 0
+      },
       "events": [
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-01", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-02", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-03", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-04", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-05", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-06", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-07", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-08", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-09", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-10", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-11", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-12", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-13", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-14", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-15", "is_read_only": true},
-        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-16", "is_read_only": true}
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-01",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-02",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-03",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-04",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-05",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-06",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-07",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-08",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-09",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-10",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-11",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-12",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-13",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-14",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-15",
+          "is_read_only": true
+        },
+        {
+          "name": "status_probe",
+          "args": "{\"job\":\"j-9\"}",
+          "outcome_sig": "tick-16",
+          "is_read_only": true
+        }
       ]
     },
     {
       "id": "loop_misclassified_get_token_side_effect",
       "class": "loop",
-      "comment": "isReadMCPName classifies side-effectful get_* MCP tools (e.g. token minting) as read-only, moving them from the mutating channel (force at call 4) to the relaxed read-only channel (CheckBefore block at call 6): two extra side-effect executions per incident. Fix direction: tighten isReadMCPName or cap the relaxation for heuristic-only read classification.",
-      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 6, "first_force_stop_max": 6, "ideal_stop_after": 3, "max_wasted_calls": 3},
+      "comment": "get_token is a minted resource: the isReadMCPName mint/consume layer (promoted 2026-08-10, regression corpus in loopdetect_readname_regression_test.go) now classifies it mutating, so the side-effect budget applies — nudge at call 3, force at call 4. Previously the read-name misclassification delayed the force to call 6.",
+      "expectation": {
+        "first_nudge_min": 3,
+        "first_nudge_max": 3,
+        "first_force_stop_min": 4,
+        "first_force_stop_max": 4,
+        "ideal_stop_after": 3,
+        "max_wasted_calls": 1
+      },
       "events": [
-        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
-        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
-        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
-        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
-        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
-        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
-        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true}
+        {
+          "name": "get_token",
+          "args": "{\"scope\":\"deploy\"}",
+          "outcome_sig": "minted-rotates-secret",
+          "is_read_only": false
+        },
+        {
+          "name": "get_token",
+          "args": "{\"scope\":\"deploy\"}",
+          "outcome_sig": "minted-rotates-secret",
+          "is_read_only": false
+        },
+        {
+          "name": "get_token",
+          "args": "{\"scope\":\"deploy\"}",
+          "outcome_sig": "minted-rotates-secret",
+          "is_read_only": false
+        },
+        {
+          "name": "get_token",
+          "args": "{\"scope\":\"deploy\"}",
+          "outcome_sig": "minted-rotates-secret",
+          "is_read_only": false
+        },
+        {
+          "name": "get_token",
+          "args": "{\"scope\":\"deploy\"}",
+          "outcome_sig": "minted-rotates-secret",
+          "is_read_only": false
+        },
+        {
+          "name": "get_token",
+          "args": "{\"scope\":\"deploy\"}",
+          "outcome_sig": "minted-rotates-secret",
+          "is_read_only": false
+        },
+        {
+          "name": "get_token",
+          "args": "{\"scope\":\"deploy\"}",
+          "outcome_sig": "minted-rotates-secret",
+          "is_read_only": false
+        }
       ]
     }
   ]

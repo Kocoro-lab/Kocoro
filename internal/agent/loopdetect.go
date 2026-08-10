@@ -286,6 +286,32 @@ var writeVerbs = map[string]bool{
 // Fail-closed: ambiguous names (run_* / execute_* — could be SELECT or
 // INSERT) go through writeVerbs so the count-based guard stays engaged.
 // Names whose verb sits at position 3 or later are treated as writes.
+// mintedResourceNouns are resources a "get" typically MINTS or CONSUMES
+// rather than reads: fetching one changes server state (a fresh token, an
+// acquired lock, a burned nonce). A read-verb name touching one of these is
+// treated as mutating so the loop detector applies the tighter side-effect
+// budget (force at call 4, not the read-only 6). Deliberately narrow:
+// ambiguous nouns (session, key, url alone) stay read-only — the regression
+// corpus in loopdetect_readname_regression_test.go pins both directions.
+var mintedResourceNouns = map[string]bool{
+	"token": true, "tokens": true, "lock": true, "locks": true,
+	"lease": true, "leases": true, "nonce": true, "otp": true,
+	"credential": true, "credentials": true, "secret": true, "secrets": true,
+	"ticket": true, "tickets": true,
+}
+
+// consumedWorkItemNouns complete the queue-consuming "next <work item>"
+// pattern (get_next_job dequeues; get_next_page paginates and stays read).
+var consumedWorkItemNouns = map[string]bool{
+	"task": true, "job": true, "message": true, "item": true,
+}
+
+// urlMinterQualifiers complete the presigned-URL pattern: get_upload_url /
+// get_signed_url mint a capability, while a bare get_url stays read-only.
+var urlMinterQualifiers = map[string]bool{
+	"upload": true, "signed": true, "presigned": true,
+}
+
 func isReadMCPName(name string) bool {
 	tokens := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
 		return r == '_' || r == '-'
@@ -303,7 +329,23 @@ func isReadMCPName(name string) bool {
 			hasRead = true
 		}
 	}
-	return hasRead
+	if !hasRead {
+		return false
+	}
+	// Mint/consume layer scans EVERY token — the resource noun can sit past
+	// position 3 (get_upload_url, google_auth_get_access_token).
+	for i, tok := range tokens {
+		if mintedResourceNouns[tok] {
+			return false
+		}
+		if tok == "next" && i+1 < len(tokens) && consumedWorkItemNouns[tokens[i+1]] {
+			return false
+		}
+		if urlMinterQualifiers[tok] && i+1 < len(tokens) && tokens[i+1] == "url" {
+			return false
+		}
+	}
+	return true
 }
 
 // NewLoopDetector creates a detector with production defaults.
