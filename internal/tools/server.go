@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -95,27 +97,16 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	// older cloud versions without the reserved-daemon-fields whitelist.
 	stripFieldsNotInSchema(args, t.schema.Parameters)
 	if err := ctx.Err(); err != nil {
-		return agent.ToolResult{
-			Content: fmt.Sprintf("server tool call cancelled before dispatch: %v", err),
-			IsError: true,
-		}, nil
+		return agent.ValidationError(fmt.Sprintf("server tool call cancelled before dispatch: %v", err)), nil
 	}
 
 	resp, err := t.execute(ctx, t.schema.Name, args)
 	if err != nil {
+		if t.source == agent.SourceIntegration {
+			return t.integrationErrorResult(err), nil
+		}
 		msg := err.Error()
 		prefix := classifyServerError(msg)
-		if t.source == agent.SourceIntegration && integrationExecutionOutcomeUnknown(msg) {
-			return agent.ToolResult{
-				Content: fmt.Sprintf(
-					"Integration tool outcome UNKNOWN: %s was dispatched, but no complete response arrived (%v). The external action may have taken effect; verify before retrying.",
-					t.schema.Name,
-					err,
-				),
-				IsError:                  true,
-				SideEffectOutcomeUnknown: true,
-			}, nil
-		}
 		return agent.ToolResult{
 			Content: fmt.Sprintf("%sserver tool error: %v", prefix, err),
 			IsError: true,
@@ -195,33 +186,76 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	return agent.ToolResult{Content: string(resp.Output), Usage: toolUsage}, nil
 }
 
+func (t *ServerTool) integrationErrorResult(err error) agent.ToolResult {
+	var dispatchErr *client.IntegrationToolDispatchError
+	if errors.As(err, &dispatchErr) {
+		if dispatchErr.MayHaveDispatched {
+			return agent.ToolResult{
+				Content: fmt.Sprintf(
+					"Integration tool outcome UNKNOWN: %s may have been dispatched, but no complete response arrived. The external action may have taken effect; verify before retrying.",
+					t.schema.Name,
+				),
+				IsError:                  true,
+				SideEffectOutcomeUnknown: true,
+			}
+		}
+		return agent.TransientError(fmt.Sprintf("integration tool %s failed before dispatch: %v", t.schema.Name, err))
+	}
+
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		msg := fmt.Sprintf("integration tool %s returned %d", t.schema.Name, apiErr.StatusCode)
+		if apiErr.Body != "" {
+			msg += ": " + apiErr.Body
+		}
+		switch apiErr.StatusCode {
+		case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusGatewayTimeout:
+			return agent.ToolResult{
+				Content: fmt.Sprintf(
+					"Integration tool outcome UNKNOWN: Cloud returned %d after accepting %s. The external action may have taken effect; verify before retrying.",
+					apiErr.StatusCode,
+					t.schema.Name,
+				),
+				IsError:                  true,
+				SideEffectOutcomeUnknown: true,
+			}
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return agent.ValidationError(msg)
+		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+			return agent.ToolResult{
+				Content:       "[transient error] " + msg + ". The request received a definitive rejection; review before retrying this non-idempotent action.",
+				IsError:       true,
+				ErrorCategory: agent.ErrCategoryTransient,
+				IsRetryable:   false,
+			}
+		}
+		prefix := classifyServerError(msg)
+		return agent.ToolResult{Content: prefix + "server tool error: " + msg, IsError: true}
+	}
+
+	return agent.ToolResult{
+		Content: fmt.Sprintf(
+			"Integration tool outcome UNKNOWN: %s failed without dispatch-phase evidence. The external action may have taken effect; verify before retrying.",
+			t.schema.Name,
+		),
+		IsError:                  true,
+		SideEffectOutcomeUnknown: true,
+	}
+}
+
 // RequiresApproval returns false — the server enforces its own access control.
 func (t *ServerTool) RequiresApproval() bool { return false }
 
-// IsReadOnlyCall reflects the only semantics the current Cloud schema proves:
-// gatewayAllowedTools are a fixed research/analytics/visual read allowlist,
-// while integration schemas carry no read-only or idempotency annotation.
-// Unknown integration calls therefore stay material and fail closed.
-func (t *ServerTool) IsReadOnlyCall(string) bool {
-	return t.source == agent.SourceGateway
-}
-
-// integrationExecutionOutcomeUnknown classifies the phase information exposed
-// by GatewayClient.ExecuteIntegrationTool. The client currently returns plain
-// wrapped errors rather than a structured dispatch phase, so only local request
-// construction and an HTTP status response are definitive. Every other error
-// (request transport loss, timeout, or malformed/truncated success response)
-// may follow a committed third-party action and must fail closed.
-func integrationExecutionOutcomeUnknown(msg string) bool {
-	lower := strings.ToLower(strings.TrimSpace(msg))
-	if strings.HasPrefix(lower, "marshal request:") ||
-		strings.HasPrefix(lower, "create request:") {
+// SideEffectFailedWithoutEffect lets the durable journal distinguish safe
+// pre-dispatch/rejected integration failures from ambiguous post-dispatch
+// failures. Only typed validation and transient results produced above qualify;
+// response loss and forwarded-status ambiguity are marked outcome-unknown.
+func (t *ServerTool) SideEffectFailedWithoutEffect(_ string, result agent.ToolResult, runErr error) bool {
+	if t.source != agent.SourceIntegration || runErr != nil || !result.IsError || result.SideEffectOutcomeUnknown {
 		return false
 	}
-	if strings.HasPrefix(lower, "integration tool ") && strings.Contains(lower, " returned ") {
-		return false
-	}
-	return true
+	return result.ErrorCategory == agent.ErrCategoryValidation ||
+		result.ErrorCategory == agent.ErrCategoryTransient
 }
 
 // classifyServerError returns the appropriate error prefix based on the error

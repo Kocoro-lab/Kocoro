@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
@@ -2705,6 +2707,49 @@ type ToolUsage struct {
 	UnitType     string `json:"unit_type,omitempty"`
 }
 
+// IntegrationToolDispatchError reports whether a failed integration request
+// provably stopped before the HTTP dispatch boundary. A true
+// MayHaveDispatched value means Cloud may have received the request, so a
+// non-idempotent provider action must not be retried blindly.
+type IntegrationToolDispatchError struct {
+	MayHaveDispatched bool
+	Err               error
+}
+
+func (e *IntegrationToolDispatchError) Error() string {
+	if e == nil || e.Err == nil {
+		return "integration tool request failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *IntegrationToolDispatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+type integrationDispatchTrace struct {
+	wroteHeaders atomic.Bool
+	wroteRequest atomic.Bool
+}
+
+func (t *integrationDispatchTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		WroteHeaders: func() {
+			t.wroteHeaders.Store(true)
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			t.wroteRequest.Store(true)
+		},
+	}
+}
+
+func (t *integrationDispatchTrace) mayHaveDispatched() bool {
+	return t.wroteHeaders.Load() || t.wroteRequest.Load()
+}
+
 // ListTools fetches available server-side tool schemas from the gateway.
 func (c *GatewayClient) ListTools(ctx context.Context) ([]ServerToolSchema, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/tools", nil)
@@ -2821,21 +2866,25 @@ func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string,
 	if key := c.getAPIKey(); key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
+	dispatch := &integrationDispatchTrace{}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), dispatch.clientTrace()))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, &IntegrationToolDispatchError{
+			MayHaveDispatched: dispatch.mayHaveDispatched(),
+			Err:               fmt.Errorf("request failed: %w", err),
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		errBody := readResponseBody(resp)
-		if errBody != "" {
-			return nil, fmt.Errorf("integration tool %s returned %d: %s", name, resp.StatusCode, errBody)
-		}
-		return nil, fmt.Errorf("integration tool %s returned %d", name, resp.StatusCode)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 	var result ToolExecuteResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, &IntegrationToolDispatchError{
+			MayHaveDispatched: true,
+			Err:               fmt.Errorf("decode response: %w", err),
+		}
 	}
 	return &result, nil
 }

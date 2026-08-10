@@ -108,6 +108,9 @@ func TestHTTP_PostDispatchResponseLossIsOutcomeUnknownForMutation(t *testing.T) 
 	if result.IsRetryable || result.ErrorCategory != "" {
 		t.Fatalf("outcome unknown must not be retryable: %#v", result)
 	}
+	if contains(result.Content, srv.URL) {
+		t.Fatalf("outcome-unknown diagnostic leaked request URL: %q", result.Content)
+	}
 }
 
 func TestHTTP_PostDispatchResponseLossForReadRemainsTransient(t *testing.T) {

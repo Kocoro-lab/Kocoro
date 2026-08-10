@@ -29,8 +29,8 @@ func TestIntegrationTool_Metadata(t *testing.T) {
 	if tool.ToolSource() != agent.SourceIntegration {
 		t.Errorf("ToolSource = %q, want %q", tool.ToolSource(), agent.SourceIntegration)
 	}
-	if tool.IsReadOnlyCall(`{"query":"x"}`) {
-		t.Error("integration schemas have no read-only/idempotent annotation and must fail closed")
+	if _, ok := agent.Tool(tool).(agent.ReadOnlyChecker); ok {
+		t.Error("server tools must not couple journal materiality to speculative read-only execution")
 	}
 }
 
@@ -88,6 +88,9 @@ func TestIntegrationTool_PostDispatchResponseLossIsOutcomeUnknown(t *testing.T) 
 	if result.IsRetryable || result.ErrorCategory != "" {
 		t.Fatalf("outcome unknown must not be retryable: %#v", result)
 	}
+	if strings.Contains(result.Content, server.URL) {
+		t.Fatalf("outcome-unknown diagnostic leaked gateway URL: %q", result.Content)
+	}
 }
 
 func TestIntegrationTool_MalformedSuccessResponseIsOutcomeUnknown(t *testing.T) {
@@ -110,26 +113,72 @@ func TestIntegrationTool_MalformedSuccessResponseIsOutcomeUnknown(t *testing.T) 
 	}
 }
 
-func TestIntegrationTool_HTTPErrorResponseRemainsOrdinaryToolError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte(`{"error":"provider unavailable"}`))
-	}))
-	defer server.Close()
+func TestIntegrationTool_ConnectionRefusedIsTransientNoEffect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := server.URL
+	server.Close()
 
 	tool := NewIntegrationTool(
 		client.ServerToolSchema{Name: "slack_post_message"},
-		client.NewGatewayClient(server.URL, ""),
+		client.NewGatewayClient(baseURL, ""),
 	)
 	result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !result.IsError || result.SideEffectOutcomeUnknown {
-		t.Fatalf("result = %#v, want known HTTP error response", result)
+		t.Fatalf("result = %#v, want known pre-dispatch failure", result)
 	}
-	if !strings.HasPrefix(result.Content, "[transient error]") {
-		t.Fatalf("expected classified status error, got %q", result.Content)
+	if result.ErrorCategory != agent.ErrCategoryTransient || !result.IsRetryable {
+		t.Fatalf("result = %#v, want retryable transient", result)
+	}
+	if !tool.SideEffectFailedWithoutEffect("", result, nil) {
+		t.Fatal("pre-dispatch transport failure must be reported as no-effect")
+	}
+}
+
+func TestIntegrationTool_HTTPStatusPolicy(t *testing.T) {
+	tests := []struct {
+		status       int
+		wantUnknown  bool
+		wantCategory agent.ErrorCategory
+		wantRetry    bool
+	}{
+		{status: http.StatusBadRequest, wantCategory: agent.ErrCategoryValidation},
+		{status: http.StatusUnprocessableEntity, wantCategory: agent.ErrCategoryValidation},
+		{status: http.StatusRequestTimeout, wantUnknown: true},
+		{status: http.StatusBadGateway, wantUnknown: true},
+		{status: http.StatusGatewayTimeout, wantUnknown: true},
+		{status: http.StatusTooManyRequests, wantCategory: agent.ErrCategoryTransient},
+		{status: http.StatusServiceUnavailable, wantCategory: agent.ErrCategoryTransient},
+	}
+	for _, tt := range tests {
+		t.Run(http.StatusText(tt.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(`{"error":"cloud rejected request"}`))
+			}))
+			defer server.Close()
+
+			tool := NewIntegrationTool(
+				client.ServerToolSchema{Name: "slack_post_message"},
+				client.NewGatewayClient(server.URL, ""),
+			)
+			result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if !result.IsError || result.SideEffectOutcomeUnknown != tt.wantUnknown {
+				t.Fatalf("result = %#v, want unknown=%t", result, tt.wantUnknown)
+			}
+			if result.ErrorCategory != tt.wantCategory || result.IsRetryable != tt.wantRetry {
+				t.Fatalf("result = %#v, want category=%q retry=%t", result, tt.wantCategory, tt.wantRetry)
+			}
+			wantNoEffect := !tt.wantUnknown
+			if got := tool.SideEffectFailedWithoutEffect("", result, nil); got != wantNoEffect {
+				t.Fatalf("SideEffectFailedWithoutEffect = %t, want %t", got, wantNoEffect)
+			}
+		})
 	}
 }
 
@@ -155,12 +204,15 @@ func TestIntegrationTool_PreCancelledContextDoesNotDispatch(t *testing.T) {
 	if !result.IsError || result.SideEffectOutcomeUnknown {
 		t.Fatalf("result = %#v, want known pre-dispatch cancellation", result)
 	}
+	if result.ErrorCategory != agent.ErrCategoryValidation || result.IsRetryable {
+		t.Fatalf("result = %#v, want validation/no-effect", result)
+	}
 	if calls != 0 {
 		t.Fatalf("gateway calls = %d, want 0", calls)
 	}
 }
 
-func TestGatewayServerTool_TransportLossStaysReadOnlyError(t *testing.T) {
+func TestGatewayServerTool_TransportLossStaysOrdinaryError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, _, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -175,38 +227,12 @@ func TestGatewayServerTool_TransportLossStaysReadOnlyError(t *testing.T) {
 		client.ServerToolSchema{Name: "web_search"},
 		client.NewGatewayClient(server.URL, ""),
 	)
-	if !tool.IsReadOnlyCall(`{"query":"x"}`) {
-		t.Fatal("gateway allowlisted server tools must be classified read-only")
-	}
 	result, err := tool.Run(context.Background(), `{"query":"x"}`)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !result.IsError || result.SideEffectOutcomeUnknown {
 		t.Fatalf("result = %#v, want ordinary read-only transport error", result)
-	}
-}
-
-func TestIntegrationExecutionOutcomeUnknownClassification(t *testing.T) {
-	tests := []struct {
-		name string
-		msg  string
-		want bool
-	}{
-		{name: "marshal before dispatch", msg: "marshal request: unsupported value", want: false},
-		{name: "request construction before dispatch", msg: "create request: invalid URL", want: false},
-		{name: "known status response", msg: "integration tool slack_post returned 422: invalid channel", want: false},
-		{name: "transport response loss", msg: "request failed: EOF", want: true},
-		{name: "timeout is ambiguous", msg: "request failed: context deadline exceeded", want: true},
-		{name: "decode after dispatch", msg: "decode response: unexpected EOF", want: true},
-		{name: "unknown execution error fails closed", msg: "unexpected integration failure", want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := integrationExecutionOutcomeUnknown(tt.msg); got != tt.want {
-				t.Fatalf("integrationExecutionOutcomeUnknown(%q) = %t, want %t", tt.msg, got, tt.want)
-			}
-		})
 	}
 }
 

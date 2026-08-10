@@ -954,6 +954,80 @@ func TestExecuteTool_403(t *testing.T) {
 	}
 }
 
+func TestExecuteIntegrationTool_ConnectionRefusedIsPreDispatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := server.URL
+	server.Close()
+
+	gw := NewGatewayClient(baseURL, "")
+	_, err := gw.ExecuteIntegrationTool(context.Background(), "slack_post_message", map[string]any{"text": "hello"})
+	if err == nil {
+		t.Fatal("expected connection failure")
+	}
+	var dispatchErr *IntegrationToolDispatchError
+	if !errors.As(err, &dispatchErr) {
+		t.Fatalf("error = %T %v, want *IntegrationToolDispatchError", err, err)
+	}
+	if dispatchErr.MayHaveDispatched {
+		t.Fatalf("connection-refused request reported dispatched: %v", err)
+	}
+}
+
+func TestExecuteIntegrationTool_ResponseLossIsPostDispatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "")
+	_, err := gw.ExecuteIntegrationTool(context.Background(), "slack_post_message", map[string]any{"text": "hello"})
+	var dispatchErr *IntegrationToolDispatchError
+	if !errors.As(err, &dispatchErr) {
+		t.Fatalf("error = %T %v, want *IntegrationToolDispatchError", err, err)
+	}
+	if !dispatchErr.MayHaveDispatched {
+		t.Fatalf("response-loss request reported pre-dispatch: %v", err)
+	}
+}
+
+func TestExecuteIntegrationTool_MalformedSuccessIsPostDispatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":`))
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "")
+	_, err := gw.ExecuteIntegrationTool(context.Background(), "notion_create_page", map[string]any{"title": "x"})
+	var dispatchErr *IntegrationToolDispatchError
+	if !errors.As(err, &dispatchErr) || !dispatchErr.MayHaveDispatched {
+		t.Fatalf("error = %T %v, want post-dispatch error", err, err)
+	}
+}
+
+func TestExecuteIntegrationTool_HTTPStatusIsTypedAPIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":"invalid channel"}`))
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "")
+	_, err := gw.ExecuteIntegrationTool(context.Background(), "slack_post_message", map[string]any{"text": "hello"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T %v, want *APIError", err, err)
+	}
+	if apiErr.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(apiErr.Body, "invalid channel") {
+		t.Fatalf("APIError = %#v", apiErr)
+	}
+}
+
 func TestCompletionRequest_MarshalsCacheSourceField(t *testing.T) {
 	req := CompletionRequest{
 		Messages:    []Message{{Role: "user", Content: NewTextContent("hi")}},

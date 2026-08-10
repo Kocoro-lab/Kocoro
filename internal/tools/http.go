@@ -140,7 +140,7 @@ func (t *HTTPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	if err != nil {
 		if httpMethodMayMutate(method) && dispatch.mayHaveStarted() {
 			return agent.ToolResult{
-				Content:                  fmt.Sprintf("HTTP request outcome UNKNOWN: %s was dispatched, but no response arrived (%v). The operation may have taken effect; verify before retrying.", method, err),
+				Content:                  fmt.Sprintf("HTTP request outcome UNKNOWN: %s was dispatched, but no response arrived. The operation may have taken effect; verify before retrying.", method),
 				IsError:                  true,
 				SideEffectOutcomeUnknown: true,
 			}, nil
@@ -201,6 +201,9 @@ func (t *HTTPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 
 func (t *HTTPTool) RequiresApproval() bool { return true }
 
+// IsReadOnlyCall deliberately stays false even for GET. Arbitrary GET
+// endpoints can trigger webhooks, and marking this tool read-only would also
+// opt it into speculative execution before the model response commits.
 func (t *HTTPTool) IsReadOnlyCall(string) bool { return false }
 
 type httpDispatchTrace struct {
