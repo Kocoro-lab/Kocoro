@@ -563,7 +563,7 @@ func TestPrepareDoTaskTreatsKocoroAsDefaultAgent(t *testing.T) {
 	)
 
 	req, task, clarify, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"calculate 17 times 19","agent":"Kocoro","relationship":"new","task_id":null,"execution_mode":"fast","full_reason":"none"}`),
+		[]byte(`{"task":"calculate 17 times 19","agent":"Kocoro","relationship":"new","task_id":null}`),
 		"en",
 		false,
 	)
