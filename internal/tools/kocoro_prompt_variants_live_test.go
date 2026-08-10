@@ -32,7 +32,7 @@ const (
 	kocoroPromptVariantConditional = "layered_conditional_v1"
 
 	kocoroPromptComparisonRepetitions = 3
-	kocoroPromptReleaseRepetitions    = 30
+	kocoroPromptReleaseRepetitions    = 15 // halved from 30 on 2026-08-10; see agentLabQualityReleaseRepetitions rationale
 	kocoroPromptSlowestRunsLimit      = 3
 )
 
@@ -384,7 +384,7 @@ func TestSummarizeKocoroPromptPairedComparisons(t *testing.T) {
 	}
 }
 
-func TestKocoroPromptReleaseQualificationRequiresThirtyRepetitions(t *testing.T) {
+func TestKocoroPromptReleaseQualificationRequiresFifteenRepetitions(t *testing.T) {
 	reportFor := func(repetitions int) kocoroPromptExperimentReport {
 		cfg := kocoroPromptExperimentConfig{
 			koeQualificationRuntimeConfig: koeQualificationRuntimeConfig{

@@ -175,8 +175,8 @@ run_quality_lane() {
     check_statuses+=("2")
     return
   fi
-  if [[ "$sample" == "release" && "$repetitions" -lt 30 ]]; then
-    echo "release quality sample requires KOCORO_AGENT_LAB_QUALITY_REPETITIONS >= 30." >&2
+  if [[ "$sample" == "release" && "$repetitions" -lt 15 ]]; then
+    echo "release quality sample requires KOCORO_AGENT_LAB_QUALITY_REPETITIONS >= 15." >&2
     check_names+=("general_purpose_quality_live")
     check_statuses+=("2")
     return

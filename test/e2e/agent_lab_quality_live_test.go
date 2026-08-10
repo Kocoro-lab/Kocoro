@@ -35,7 +35,11 @@ const (
 	agentLabQualityMaxCostEnv     = "KOCORO_AGENT_LAB_QUALITY_MAX_COST_USD"
 
 	agentLabQualityComparisonRepetitions = 3
-	agentLabQualityReleaseRepetitions    = 30
+	// Release threshold halved from 30 on 2026-08-10 (user decision):
+	// 15 all-pass bounds the per-cell failure rate under ~18% (95% CI)
+	// and pooled arms far tighter; 30 doubled the cost for little
+	// marginal evidence. Comparison runs stay at 3-5.
+	agentLabQualityReleaseRepetitions    = 15
 	agentLabQualityDefaultSeed           = int64(20260807)
 	agentLabQualityResearchURL           = "https://www.iana.org/help/example-domains"
 	agentLabQualityDeferredMarker        = "AGENT_LAB_DEFERRED_731"
@@ -483,13 +487,13 @@ func TestOffline_AgentLabQualityLaneRejectsUndersizedReleaseSample(t *testing.T)
 		"AGENT_LAB_LANE=quality_live",
 		"KOCORO_AGENT_LAB_QUALITY_LIVE=1",
 		"KOCORO_AGENT_LAB_QUALITY_SAMPLE=release",
-		"KOCORO_AGENT_LAB_QUALITY_REPETITIONS=29",
+		"KOCORO_AGENT_LAB_QUALITY_REPETITIONS=14",
 	)
 	output, err := command.CombinedOutput()
 	if err == nil {
 		t.Fatal("undersized release quality sample unexpectedly ran")
 	}
-	if !strings.Contains(string(output), "REPETITIONS >= 30") {
+	if !strings.Contains(string(output), "REPETITIONS >= 15") {
 		t.Fatalf("undersized quality release error is not actionable: %s", output)
 	}
 }
