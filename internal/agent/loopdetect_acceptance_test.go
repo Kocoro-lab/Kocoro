@@ -60,6 +60,7 @@ type loopAcceptanceReport struct {
 	TraceCount       int                         `json:"trace_count"`
 	ProductiveCount  int                         `json:"productive_count"`
 	LoopCount        int                         `json:"loop_count"`
+	KnownGapCount    int                         `json:"known_gap_count,omitempty"`
 	FalseSignals     int                         `json:"false_signals"`
 	MissedLoops      int                         `json:"missed_loops"`
 	TotalWastedCalls int                         `json:"total_wasted_calls"`
@@ -107,6 +108,13 @@ func TestLoopDetectorAcceptanceCorpus(t *testing.T) {
 			if result.FirstForceStop == 0 {
 				report.MissedLoops++
 			}
+		case "known-gap":
+			// A genuine loop shape the detector deliberately does not force-stop
+			// today (outcome-aware relaxation trade-off). The expectation pins
+			// CURRENT behavior so drift is visible; it is excluded from the
+			// missed-loop gate. When a detector change closes the gap, promote
+			// the trace to class "loop" with the new stop position.
+			report.KnownGapCount++
 		default:
 			t.Fatalf("trace %q has invalid class %q", trace.ID, trace.Class)
 		}

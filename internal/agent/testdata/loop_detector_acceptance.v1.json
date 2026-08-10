@@ -147,6 +147,71 @@
         {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 Reuters AP\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true},
         {"name": "web_search", "args": "{\"query\":\"world news March 2 2026 BBC CNN Al Jazeera\"}", "result_sig": "reuters.com,bbc.com", "is_read_only": true}
       ]
+    },
+    {
+      "id": "known_gap_three_tool_cycle",
+      "class": "known-gap",
+      "comment": "A->B->C read-only cycle with stable outcomes: pairwise ping-pong never matches, per-tool stable-outcome nudges start at call 13 but the detector never force-stops (measured: 0 forces in 60 calls). Production relies on the loop-level 3-nudges-in-10-iterations escalation. Fix direction: cycle-aware detection; then promote to class loop.",
+      "expectation": {"first_nudge_min": 13, "first_nudge_max": 13, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "events": [
+        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
+        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
+        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
+        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
+        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
+        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
+        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
+        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
+        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
+        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
+        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
+        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
+        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
+        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
+        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true},
+        {"name": "wiki_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-a", "is_read_only": true},
+        {"name": "news_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-b", "is_read_only": true},
+        {"name": "blog_lookup", "args": "{\"q\":\"same-topic\"}", "outcome_sig": "sig-c", "is_read_only": true}
+      ]
+    },
+    {
+      "id": "known_gap_noisy_outcome_same_args",
+      "class": "known-gap",
+      "comment": "Same tool+args read-only polling whose outcome changes every call (timestamps/progress noise): outcome-aware relaxation treats each call as progress, nudges start at call 12 and repeat, but no force-stop (measured: 0 forces in 40 calls). Production relies on the nudge-window escalation. Fix direction: rate-limit noisy-outcome credit; then promote to class loop.",
+      "expectation": {"first_nudge_min": 12, "first_nudge_max": 12, "first_force_stop_min": 0, "first_force_stop_max": 0},
+      "events": [
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-01", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-02", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-03", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-04", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-05", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-06", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-07", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-08", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-09", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-10", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-11", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-12", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-13", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-14", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-15", "is_read_only": true},
+        {"name": "status_probe", "args": "{\"job\":\"j-9\"}", "outcome_sig": "tick-16", "is_read_only": true}
+      ]
+    },
+    {
+      "id": "loop_misclassified_get_token_side_effect",
+      "class": "loop",
+      "comment": "isReadMCPName classifies side-effectful get_* MCP tools (e.g. token minting) as read-only, moving them from the mutating channel (force at call 4) to the relaxed read-only channel (CheckBefore block at call 6): two extra side-effect executions per incident. Fix direction: tighten isReadMCPName or cap the relaxation for heuristic-only read classification.",
+      "expectation": {"first_nudge_min": 3, "first_nudge_max": 3, "first_force_stop_min": 6, "first_force_stop_max": 6, "ideal_stop_after": 3, "max_wasted_calls": 3},
+      "events": [
+        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
+        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
+        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
+        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
+        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
+        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true},
+        {"name": "get_token", "args": "{\"scope\":\"deploy\"}", "outcome_sig": "minted-rotates-secret", "is_read_only": true}
+      ]
     }
   ]
 }
