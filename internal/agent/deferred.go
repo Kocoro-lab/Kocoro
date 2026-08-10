@@ -341,6 +341,18 @@ var koeFastColdTools = map[string]bool{
 	"xlsx_to_text":    true,
 }
 
+// KoeFastColdToolNames returns a copy of the Fast-only cold-tool policy list
+// so registry-level drift tests outside this package can pin it against the
+// real local-tool registration.
+func KoeFastColdToolNames() []string {
+	names := make([]string, 0, len(koeFastColdTools))
+	for name := range koeFastColdTools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func deferredToolNamesForRun(reg *ToolRegistry, koeFast bool) map[string]bool {
 	names := deferredToolNames(reg)
 	if !koeFast || reg == nil {

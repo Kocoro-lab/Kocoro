@@ -25,6 +25,12 @@ const (
 	charsPerTokenSchema = 3.5
 )
 
+// EstimateToolSchemaTokens exposes the per-tool schema-token estimate for
+// registry-level policy tests (e.g. the Koe Fast cold-tool drift pin).
+func EstimateToolSchemaTokens(tool Tool) int {
+	return estimateToolSchemaTokens(tool)
+}
+
 func estimateToolSchemaTokens(tool Tool) int {
 	if tool == nil {
 		return 0
