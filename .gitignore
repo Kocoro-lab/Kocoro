@@ -34,3 +34,9 @@ build/
 
 # Agent SDD process reports — scratch, not shipped
 sdd/task-*-report.md
+
+# Session-handoff briefs are scratch and must never be committed.
+# The session-handoff skill writes only this reserved name; see ~/.claude/skills/session-handoff.
+# Deliberately NOT a bare "*handoff*" pattern — DESKTOP-UI-HANDOFF.md, *-wecom-ui-handoff.md
+# and book chapters on handoff mechanisms are legitimate tracked docs.
+session-handoff-*.md

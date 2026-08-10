@@ -24,7 +24,7 @@ Built on **[Shannon](https://github.com/Kocoro-lab/Shannon)** — the open-sourc
 - [CLI Usage](#cli-usage) · [Voice Front Brain](#voice-front-brain-macos) · [Commands](#commands)
 - [Local Tools](#local-tools) · [Permission Engine](#permission-engine) · [Audit Logging](#audit-logging) · [Hooks](#hooks)
 - [MCP Server](#mcp-server) · [MCP Client](#mcp-client)
-- [Configuration](#configuration) · [Instructions & Memory](#instructions--memory) · [Sessions](#sessions)
+- [Configuration](#configuration) · [Instructions & Memory](#instructions--memory) · [Sessions](#sessions) · [Context compaction](#context-compaction)
 - [Named Agents](#named-agents)
 - [Daemon Mode](#daemon-mode) · [Local HTTP API](#local-http-api-port-7533) · [Prompt Suggestion](#prompt-suggestion-ghost-text-in-input)
 - [Memory (Kocoro Cloud)](#memory-kocoro-cloud-feature) · [Session sync to Cloud](#session-sync-to-cloud)
@@ -195,6 +195,10 @@ Flags: `-y/--yes` auto-approve; `--agent` named agent; `--dangerously-skip-permi
 
 With `shan koe --barge-in` on the VPIO audio backend, Kocoro can pause and resume around a backchannel, stop speaking without hanging up, accept a new request, or end the call. Stopping speech, cancelling work, and ending the call are separate actions; work already in progress survives a hang-up. Double-tap Option to talk again.
 
+**Fast and Full execution.** Voice requests are dispatched at one of two levels. Bounded work ("what's on my calendar today?") runs **Fast** on a reserved profile tuned for latency; complex or high-risk work runs **Full** on your ordinary global/per-agent agent configuration, byte for byte. The choice is a soft semantic judgment, not a rigid classifier, and the daemon re-decides it on every request — an unrecognized or missing mode always falls back to Full, and nothing can upgrade a request the model marked Full. Fast resolves through Shannon Cloud with a 5-second bound and degrades to Full on any resolution failure, so a Cloud hiccup costs latency, never correctness. Fast is on by default; set `koe.fast_effort: false` to make every voice-triggered task run Full. It does not change the realtime voice model or override your normal agent's model and effort.
+
+The realtime model is pinned to a single engine default (`gpt-realtime-2.1` as of v0.4.3); `--model` overrides it for CLI and on-robot callers.
+
 ## Commands
 
 Type `/` in the TUI for the interactive menu:
@@ -225,7 +229,7 @@ Type `/` in the TUI for the interactive menu:
 
 > `/research` and `/swarm` are also accepted via `POST /message` with `Accept: text/event-stream` (HTTP clients including Kocoro Desktop).
 
-Subcommands: `shan mcp serve`, `shan daemon {start,stop,status}`, `shan schedule {create,list,update,remove,enable,disable,sync}`.
+Subcommands: `shan mcp serve`, `shan daemon {start,stop,status}`, `shan schedule {create,list,update,remove,enable,disable}`, `shan sessions sync`, `shan koe` ([Voice Front Brain](#voice-front-brain-macos)), `shan ghostty workspace`, `shan update`.
 
 ## Local Tools
 
@@ -287,7 +291,8 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | `session_search` | No | FTS5 keyword search across past session messages. |
 | `memory_append` | No | Append entries to agent MEMORY.md (flock-protected). |
 | `ask_user_question` | No | Ask the user to pick among a few explicit options (1-4 questions, 2-4 options each) when genuinely blocked or when they must choose between equivalent alternatives. You get the full chosen labels back. Rendered as a selection card in Kocoro Desktop; on channels/surfaces that can't prompt, it returns cleanly so the agent proceeds on its own judgment. |
-| `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill discovery auto-suggests relevant skills each turn via `model_tier: small` prefetch. |
+| `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill names and descriptions are always listed to the model, so it can call this unprompted. Additionally, an opt-in `model_tier: small` prefetch can semantically suggest a relevant skill on the first turn — set `agent.skill_discovery: true` to enable it (off by default, so ordinary turns carry no extra model call). |
+| `present_deliverable` | No | Surface a finished file as a deliverable. The daemon validates the path locally and emits a vouched file reference to attached clients. **Kocoro Desktop renders it in the session's Deliverables sidebar; TUI, one-shot CLI, and MCP have no such surface**, so there the call succeeds without producing any UI. The path may sit outside the session working directory — the event is a user-visible file card, not proof the file was created inside a sandbox. |
 
 ### Calendar (registered only when daemon is a Kocoro Desktop subprocess)
 
@@ -516,6 +521,29 @@ Conversations persisted as JSON in `~/.shannon/sessions/` (or `~/.shannon/agents
 /session new                           # start fresh
 ```
 
+### Context compaction
+
+Long sessions compact automatically — you do not need to run `/compact` to keep a session alive. When the prompt approaches the model's context window, the agent replaces the older middle of the conversation with a summary and keeps the recent turns intact.
+
+Two things are worth knowing about how this works:
+
+- **Your transcript is never rewritten.** The session JSON stays the lossless archive used by resume, search, share, and sync. Compaction writes a *separate* checkpoint (summary + retained tail) that only the model sees. Anything compaction drops from the model's view is still in the session file.
+- **The checkpoint is durable.** It is persisted rather than recomputed per request, so the summary does not drift between turns and the prompt cache converges. It also survives a crash: on restart the daemon continues an interrupted turn from its checkpoint, provided `agent.interrupted_resume_enabled` is on (default) and the checkpoint is still inside the `agent.interrupted_resume_max_age_hours` window (default 4). An older checkpoint is abandoned rather than executed, since the intent behind it has gone stale. Recovered runs always execute unattended, so the unattended tool deny-list applies.
+
+After a routine compaction the agent re-reads the files it had most recently read — bounded at 5 files and roughly 50K tokens, and skipped entirely when there is no headroom — so exact file content the summary only paraphrases comes back into context. Emergency compaction triggered by a rejected oversized prompt deliberately skips this and instead tells the model to re-read what it needs.
+
+Useful knobs (all optional — the defaults are tuned for the 1M-context model families the default tiers route to):
+
+```yaml
+agent:
+  context_window: 1000000              # seed; auto-corrected from the response model
+  compact_timeout_secs: 300            # bound on one manual /compact pass
+  compaction_snapshot_retention: 1     # pre-compaction snapshots kept per session
+  compaction_snapshot_max_age_days: 14 # 0 disables the age sweep
+```
+
+`/compact [instructions]` forces a pass immediately. The TUI shows a transient "Tidying context" spinner between the daemon's `compaction_started` and `compaction_finished` run-status events; other clients can render the same indicator by gating on the `compaction_status_events_v1` capability token.
+
 ## Named Agents
 
 Create independent agents with their own instructions, memory, tools, MCP servers, and model settings:
@@ -628,7 +656,9 @@ Localhost-only HTTP for native-app integration and scripting.
 | `/sessions/{id}/edit` | POST | Truncate history at index, re-run with new content |
 | `/sessions/{id}/reset` | POST | Clear session history in place (named agent only) |
 | `/sessions/search` | GET | Search session history, `?q=<query>&agent=<name>` |
-| `/message` | POST | Send a message; supports HITL injection |
+| `/projects` | GET, POST | List / create projects (session grouping with a name + theme color) |
+| `/projects/{id}` | GET, PUT, DELETE | Read or rename/recolor a project. `DELETE` requires `?confirm=true` and **permanently deletes every session filed under it**, not just the project. |
+| `/message` | POST | Send a message; supports HITL injection and idempotent retry |
 | `/migrate/claude-code/preview` | POST | Scan `~/.claude/` and return what would be imported (dry-run) |
 | `/migrate/claude-code/apply` | POST | Execute a previewed import — copies agents, skills, instructions from Claude Code |
 | `/config/reload` | POST | Reload config, restart watchers and heartbeat managers |
@@ -660,6 +690,12 @@ Synchronous response:
   "usage": {"input_tokens": 150, "output_tokens": 20, "total_tokens": 170, "cost_usd": 0.002}
 }
 ```
+
+**Idempotent retry.** `POST /message` accepts an `idempotency_key` (8-128 chars, `[A-Za-z0-9._:-]`) alongside a client-minted `session_id`; it is rejected without one, and on ephemeral requests. Retrying a *completed* request returns the persisted result without re-invoking the LLM or any tools — which is what makes a file-producing run safe to retry after your client crashes. Interrupted or failed requests fail closed and need explicit recovery rather than silently re-running.
+
+> The guarantee is **sequential-retry-safe, not concurrent-submission-safe**: two simultaneous requests carrying the same `session_id` + key can both clear the in-progress guard before either registers, so a naive concurrent client can still double-execute the side effect. Serialize retries of a key. Gate on the `message_idempotency_v1` capability token (`message_idempotency_receipt_v2` additionally persists validated `present_deliverable` receipts and returns stable error codes for failed/in-progress retries).
+
+**Projects** group sessions under a name and theme color. Every session row carries a `project_id`, `GET /sessions` accepts a `project_id` filter, `PATCH /sessions/{id}` re-files a session, and project-scoped instructions/memory are injected into its runs. Gate on `project_entity_v1` — an older daemon 404s `/projects` and never emits `project_id`.
 
 **Bridging a messaging platform (Discord, Matrix, custom webhook, etc.) to the daemon?** See the [Channel Integration Guide](examples/channel-integration-guide.md) for the full `POST /message` + SSE + interactive approval workflow, plus a community reference Discord bot. Official Slack/LINE/Feishu/Lark integrations go through Shannon Cloud for multi-tenant OAuth and audit — the local HTTP path here is for personal/dev deployments.
 
