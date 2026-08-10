@@ -1280,7 +1280,6 @@ func (m *mockCountingTool) RequiresApproval() bool { return false }
 func (m *mockCountingTool) IsReadOnlyCall(string) bool {
 	return true
 }
-func (m *mockCountingTool) CacheAcrossIterations(string) bool { return true }
 
 type mockComputerUseRecoveryTool struct {
 	runs int
@@ -1632,147 +1631,8 @@ func (m *mockCloudTreeTool) IsReadOnlyCall(string) bool {
 	return true
 }
 
-// TestAgentLoop_CrossIterDedup_SanitizedReplay verifies that cached results
-// go through sanitizeResult before being stored, so replayed content doesn't
-// leak raw base64 blobs into context.
-func TestAgentLoop_CrossIterDedup_SanitizedReplay(t *testing.T) {
-	// A long base64-like blob that sanitizeResult should replace
-	blob := strings.Repeat("iVBORw0KGgoAAAANSUhEUg", 50) // ~1100 chars
-	rawContent := "Screenshot: data:image/png;base64," + blob
 
-	tool := &mockCountingTool{name: "mock_tool", content: rawContent}
 
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		switch callCount {
-		case 1:
-			// Iter 1: call mock_tool → returns base64 content
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("mock_tool", `{"cmd":"screenshot"}`), 10, 5))
-		case 2:
-			// Iter 2: call mock_tool again with same args → should get sanitized cached result
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("mock_tool", `{"cmd":"screenshot"}`), 10, 5))
-		default:
-			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
-		}
-	}))
-	defer server.Close()
-
-	gw := client.NewGatewayClient(server.URL, "")
-	reg := NewToolRegistry()
-	reg.Register(tool)
-	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-
-	result, _, err := loop.Run(context.Background(), "test", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != "Done." {
-		t.Errorf("expected 'Done.', got %q", result)
-	}
-	// Tool should only execute once — second call returns cached result
-	if tool.runs != 1 {
-		t.Errorf("expected tool to execute 1 time, got %d", tool.runs)
-	}
-}
-
-// TestAgentLoop_CrossIterDedup_PersistentAcrossIterations verifies that the
-// cross-iteration cache persists across non-consecutive iterations:
-// iter 1 calls tool_a, iter 2 calls tool_b, iter 3 calls tool_a again → cached.
-func TestAgentLoop_CrossIterDedup_PersistentAcrossIterations(t *testing.T) {
-	toolA := &mockCountingTool{name: "tool_a", content: "result A"}
-	toolB := &mockCountingTool{name: "tool_b", content: "result B"}
-
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		switch callCount {
-		case 1:
-			// Iter 1: call tool_a
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("tool_a", `{"x":1}`), 10, 5))
-		case 2:
-			// Iter 2: call tool_b (different tool)
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("tool_b", `{"x":2}`), 10, 5))
-		case 3:
-			// Iter 3: call tool_a again with same args → should be cached
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("tool_a", `{"x":1}`), 10, 5))
-		default:
-			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
-		}
-	}))
-	defer server.Close()
-
-	gw := client.NewGatewayClient(server.URL, "")
-	reg := NewToolRegistry()
-	reg.Register(toolA)
-	reg.Register(toolB)
-	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-
-	result, _, err := loop.Run(context.Background(), "test", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != "Done." {
-		t.Errorf("expected 'Done.', got %q", result)
-	}
-	// tool_a should execute only once (iter 1); iter 3 returns cached
-	if toolA.runs != 1 {
-		t.Errorf("expected tool_a to execute 1 time, got %d", toolA.runs)
-	}
-	// tool_b should execute once (iter 2)
-	if toolB.runs != 1 {
-		t.Errorf("expected tool_b to execute 1 time, got %d", toolB.runs)
-	}
-}
-
-func TestAgentLoop_StateAwareCache_BrowserWriteInvalidatesSnapshot(t *testing.T) {
-	snapshotTool := &mockCountingTool{name: "browser_snapshot", content: "snapshot"}
-	navigateTool := &mockCountingTool{name: "browser_navigate", content: "navigated"}
-
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		switch callCount {
-		case 1:
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("browser_snapshot", `{}`), 10, 5))
-		case 2:
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("browser_navigate", `{"url":"https://example.com"}`), 10, 5))
-		case 3:
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("browser_snapshot", `{}`), 10, 5))
-		default:
-			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
-		}
-	}))
-	defer server.Close()
-
-	gw := client.NewGatewayClient(server.URL, "")
-	reg := NewToolRegistry()
-	reg.Register(snapshotTool)
-	reg.Register(navigateTool)
-	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-
-	result, _, err := loop.Run(context.Background(), "test browser state cache", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != "Done." {
-		t.Errorf("expected 'Done.', got %q", result)
-	}
-	if snapshotTool.runs != 2 {
-		t.Errorf("expected browser_snapshot to execute twice after navigation, got %d", snapshotTool.runs)
-	}
-	if navigateTool.runs != 1 {
-		t.Errorf("expected browser_navigate to execute once, got %d", navigateTool.runs)
-	}
-}
 
 func TestAgentLoop_StateAwareCache_FileWriteInvalidatesRead(t *testing.T) {
 	readTool := &mockCountingTool{name: "file_read", content: "contents"}

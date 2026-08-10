@@ -3592,9 +3592,6 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		lastDiscoveryInput               string // dedup: skip discovery when user text hasn't changed between iterations
 		contextBloatStatusSent           bool
 
-		// Cross-iteration dedup: cache successful results from previous iteration
-		// to prevent re-execution of identical tool calls across consecutive iterations.
-		prevIterResults = make(map[string]ToolResult)
 		lastToolName    string
 		retryCount      int
 		iterationCount  int
@@ -5849,7 +5846,6 @@ iterationLoop:
 			loopVeto     bool
 			argsDigest   string
 			resolved     bool // true if already resolved (denied/unknown/hook-denied)
-			cacheKey     string
 			stateTraits  CallStateTraits
 		}
 		callMeta := make([]perCallMeta, len(toolCalls))
@@ -6172,33 +6168,7 @@ iterationLoop:
 				}
 			}
 
-			stateTraits := resolveCallStateTraits(fc.Name, argsStr)
-			stateTraits = enforceCrossIterationCacheContract(tool, argsStr, stateTraits)
-			if !stateTraits.Cacheable && len(stateTraits.Reads) == 0 && len(stateTraits.Writes) == 0 && !stateTraits.UnknownWrite {
-				stateTraits = resolveFallbackReadStateTraits(tool, argsStr)
-			}
-			callMeta[idx].stateTraits = stateTraits
-			callMeta[idx].cacheKey = buildStateAwareCacheKey(fc.Name, fc.Arguments, stateTraits, stateVersions)
-
-			// Cross-iteration dedup: return cached result if identical call against the
-			// same tracked state succeeded in a previous iteration.
-			if callMeta[idx].cacheKey != "" {
-				if cached, ok := prevIterResults[callMeta[idx].cacheKey]; ok {
-					callMeta[idx].resolved = true
-					execResults[idx] = toolExecResult{
-						result: ToolResult{
-							Content: "Already called with identical arguments. Previous result:\n" + cached.Content,
-							IsError: cached.IsError,
-							Images:  cached.Images,
-						},
-						name: fc.Name,
-					}
-					if a.handler != nil {
-						a.handler.OnToolResult(fc.Name, argsStr, fc.ID, execResults[idx].result, 0)
-					}
-					continue
-				}
-			}
+			callMeta[idx].stateTraits = resolveCallStateTraits(fc.Name, argsStr)
 
 			// Permission check
 			decision, wasApproved := a.checkPermissionAndApproval(ctx, fc.Name, argsStr, tool, approvalCache)
@@ -6772,32 +6742,16 @@ iterationLoop:
 			markInjected()
 		}
 
-		// Accumulate cross-iteration result cache from this iteration's successful executions.
-		// Cache keys are state-versioned, so writes advance tracked state before later
-		// iterations compute their read fingerprints. Unknown writes fail closed by
-		// clearing the cache because we cannot safely determine what changed.
+		// Writes advance tracked state so later iterations' shape-context
+		// fingerprints (shapeContextKey) start a new generation.
 		for _, ac := range approved {
 			r := execResults[ac.index].result
 			if r.IsError {
 				continue
 			}
-
-			meta := callMeta[ac.index]
-			if meta.stateTraits.UnknownWrite {
-				clear(prevIterResults)
+			if writes := callMeta[ac.index].stateTraits.Writes; len(writes) > 0 {
+				stateVersions.bump(writes)
 			}
-			if len(meta.stateTraits.Writes) > 0 {
-				stateVersions.bump(meta.stateTraits.Writes)
-			}
-			if meta.cacheKey == "" {
-				continue
-			}
-
-			cached := ToolResult{Content: r.Content, IsError: false, Images: r.Images}
-			if len(cached.Images) == 0 {
-				cached.Content = sanitizeResult(cached.Content)
-			}
-			prevIterResults[meta.cacheKey] = cached
 		}
 
 		// toolSearchFired is consumed in the text-only path (next iteration)
