@@ -2294,7 +2294,7 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 		t.Fatal(err)
 	}
 	transcript := string(encoded)
-	if !strings.Contains(transcript, "initial_target_required") ||
+	if !strings.Contains(transcript, "alternate desktop-control tools remain blocked") ||
 		strings.Contains(transcript, "corrected_app_retry_rejected") {
 		t.Fatalf("alternate call consumed the corrected-app retry: %s", transcript)
 	}

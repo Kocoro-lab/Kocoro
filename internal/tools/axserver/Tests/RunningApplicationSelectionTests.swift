@@ -161,7 +161,7 @@ final class RunningApplicationSelectionTests: XCTestCase {
             utilities.path.hasPrefix($0.path + "/")
         })
         XCTAssertTrue(scopes.contains {
-            $0.path == "/System/Library/CoreServices/Applications"
+            $0.path == "/System/Library/CoreServices"
         })
     }
 

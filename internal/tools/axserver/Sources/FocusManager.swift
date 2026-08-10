@@ -156,7 +156,7 @@ func installedTaskApplicationSearchScopesV1(
         fileManager.urls(for: .applicationDirectory, in: $0)
     }
     candidates.append(URL(
-        fileURLWithPath: "/System/Library/CoreServices/Applications",
+        fileURLWithPath: "/System/Library/CoreServices",
         isDirectory: true))
 
     var scopesByPath: [String: URL] = [:]
@@ -225,7 +225,7 @@ private func metadataApplicationQueryV1(
     guard MDQueryExecute(query, 0) else { return .unavailable }
 
     let deadline = DispatchTime.now() + max(timeout, 0)
-    while !MDQueryIsGatheringComplete(query) {
+    while !deliveryQueue.sync(execute: { MDQueryIsGatheringComplete(query) }) {
         guard DispatchTime.now().uptimeNanoseconds < deadline.uptimeNanoseconds else {
             deliveryQueue.async { MDQueryStop(query) }
             return .timedOut
