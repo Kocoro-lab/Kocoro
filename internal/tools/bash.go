@@ -128,7 +128,9 @@ func (t *BashTool) Info() agent.ToolInfo {
 
 Each command runs in a fresh shell from the session working directory; cd, exports, and aliases do not persist. Prefer dedicated tools for file reads/writes/edits, path or content search, and directory listing because they have safer permissions and better result shaping.
 
-Provide a short, non-technical description of the user-facing goal in the reply language. Quote paths with spaces and prefer absolute paths. For complex multiline code, write a script with file_write and run it instead of nesting a heredoc. Independent read-only calls may run in parallel; chain dependent commands with &&. Do not bypass hooks or signing, start a long-lived server, use unbounded polling/sleep loops, or perform destructive operations without the required user authority. Runtime validation, approval, timeouts, output caps, GUI-injection denial, and side-effect serialization remain authoritative.`,
+Provide a short, non-technical description of the user-facing goal in the reply language. Quote paths with spaces and prefer absolute paths. For complex multiline code, write a script with file_write and run it instead of nesting a heredoc. Independent read-only calls may run in parallel; chain dependent commands with &&. Do not bypass hooks or signing, start a long-lived server, use unbounded polling/sleep loops, or perform destructive operations without the required user authority. Runtime validation, approval, timeouts, output caps, GUI-injection denial, and side-effect serialization remain authoritative.
+
+Operational notes: for macOS Spotlight use bounded focused calls such as timeout 15 mdfind "keyword" 2>/dev/null | head -100; never use a root/home-wide -onlyin scope, and split OR searches into separate calls. A read-only batch runs serially when any command fails the static concurrency check, not because it was rate-limited. A [command ran for Ns] prefix proves a silent command consumed that wall time; do not claim it was skipped or blocked.`,
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

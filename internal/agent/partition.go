@@ -112,8 +112,8 @@ func executeBatches(
 	for _, batch := range batches {
 		for _, ac := range batch {
 			execResults[ac.index] = toolExecResult{
-				result: BusinessError(fmt.Sprintf(
-					"%s was not executed because an earlier action in the same response stopped the batch",
+				result: TransientError(fmt.Sprintf(
+					"%s was not executed because an earlier action in the same response stopped the batch; it is safe to run again if still needed",
 					ac.fc.Name,
 				)),
 				name: ac.fc.Name,
@@ -332,11 +332,7 @@ func runApprovedToolCall(
 		)
 	}
 	if knownNoEffect {
-		// Tool.Run returned a definitive result after dispatch. "Committed" here
-		// means the result is known and can be joined to the transcript; it does
-		// not claim that an external mutation occurred. Abandoned is reserved for
-		// prepared executions that never entered Tool.Run.
-		if err := journal.MarkCommitted(journalCtx, prepared.ExecutionID, digest); err == nil {
+		if err := journal.MarkFailedNoEffect(journalCtx, prepared.ExecutionID, digest); err == nil {
 			return executionResult, nil
 		} else {
 			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)

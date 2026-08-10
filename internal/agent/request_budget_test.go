@@ -17,11 +17,11 @@ import (
 func TestRequestLLMBudget_DefaultLimits(t *testing.T) {
 	t.Parallel()
 
-	if got := newRequestLLMBudget(100_000, 256).snapshot().TokenExposureLimit; got != 1_000_000 {
-		t.Fatalf("small context token limit = %d, want 1000000", got)
+	if got := newRequestLLMBudget(100_000, 256).snapshot().TokenExposureLimit; got != 207_200_000 {
+		t.Fatalf("small context token limit = %d, want dispatch-aligned allowance", got)
 	}
-	if got := newRequestLLMBudget(200_000, 256).snapshot().TokenExposureLimit; got != 1_600_000 {
-		t.Fatalf("scaled token limit = %d, want 1600000", got)
+	if got := newRequestLLMBudget(200_000, 256).snapshot().TokenExposureLimit; got != 414_400_000 {
+		t.Fatalf("scaled token limit = %d, want dispatch-aligned allowance", got)
 	}
 	if got, want := newRequestLLMBudget(0, 256).snapshot().NormalDispatchLimit, 1036; got != want {
 		t.Fatalf("default normal dispatch limit = %d, want %d", got, want)
@@ -37,6 +37,10 @@ func TestRequestLLMBudget_DispatchLimitSaturatesOnOverflow(t *testing.T) {
 	maxInt := int(^uint(0) >> 1)
 	if got := newRequestLLMBudget(0, maxInt).snapshot().NormalDispatchLimit; got != maxInt {
 		t.Fatalf("normal dispatch limit = %d, want saturation at %d", got, maxInt)
+	}
+	maxInt64 := int64(^uint64(0) >> 1)
+	if got := newRequestLLMBudget(maxInt, maxInt).snapshot().TokenExposureLimit; got != maxInt64 {
+		t.Fatalf("token exposure limit = %d, want saturation at %d", got, maxInt64)
 	}
 }
 

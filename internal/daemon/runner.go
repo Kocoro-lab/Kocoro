@@ -4020,7 +4020,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		turnUsage = up
 	}
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
-	loop.SetCheckpointFunc(func(ctx context.Context) error {
+	loop.SetCheckpointFunc(func(context.Context) error {
 		// EventLog is an observation stream, not recovery authority. Attempt to
 		// align it with the checkpoint, but never let corrupt/failed telemetry
 		// block the session transcript or side-effect ledger from becoming durable.
@@ -4035,13 +4035,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		sess.InProgress = true
 		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
-		rollbackToolExecutions := stageCommittedToolExecutionsForCheckpoint(
-			agent.CheckpointReasonFromContext(ctx),
-			sess,
-			req.RunID,
-		)
 		if err := sessMgr.Save(); err != nil {
-			rollbackToolExecutions()
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
 			// Return the error so AgentLoop.maybeCheckpoint keeps the
 			// dirty flag set and the next fire point retries.
@@ -4113,7 +4107,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
 				return nil, err
 			}
-			if req.ResumeInterrupted {
+			rollbackToolExecutions, reconcileErr := stageTranscriptToolExecutionsForSave(sess)
+			if reconcileErr != nil {
+				return nil, fmt.Errorf("reconcile hard-error tool executions: %w", reconcileErr)
+			}
+			if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
+				sess.InProgress = true
+				sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+			} else if req.ResumeInterrupted {
 				// A recovery attempt that fails before making forward progress
 				// remains eligible for a later daemon restart until the
 				// configured recovery-attempt cap is reached. Clearing this
@@ -4131,7 +4132,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				sess.InProgress = false // ordinary hard-error path: turn is over
 				sess.InterruptedTurn = nil
 			}
-			rollbackToolExecutions := stageCommittedToolExecutionsForSave(sess, req.RunID)
 			if err := sessMgr.Save(); err != nil {
 				rollbackToolExecutions()
 				log.Printf("daemon: failed to save error session: %v", err)
@@ -4296,7 +4296,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		previousInProgress := sess.InProgress
 		previousInterruptedTurn := sess.InterruptedTurn
-		rollbackToolExecutions := stageCommittedToolExecutionsForSave(sess, req.RunID)
+		rollbackToolExecutions, reconcileErr := stageTranscriptToolExecutionsForSave(sess)
+		if reconcileErr != nil {
+			return nil, fmt.Errorf("reconcile final tool executions: %w", reconcileErr)
+		}
 		if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
 			// A post-dispatch outcome that was not durably resolved remains a
 			// startup-review marker. The recovery path will never replay it.

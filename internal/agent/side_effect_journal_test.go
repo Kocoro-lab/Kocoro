@@ -62,6 +62,14 @@ func (j *recordingSideEffectJournal) MarkCommitted(_ context.Context, _ string, 
 	return j.commitErr
 }
 
+func (j *recordingSideEffectJournal) MarkFailedNoEffect(_ context.Context, _ string, digest string) error {
+	j.mu.Lock()
+	j.events = append(j.events, "failed_no_effect")
+	j.resultDigests = append(j.resultDigests, digest)
+	j.mu.Unlock()
+	return j.commitErr
+}
+
 func (j *recordingSideEffectJournal) MarkAbandoned(_ context.Context, _ string, digest string) error {
 	j.mu.Lock()
 	j.events = append(j.events, "abandoned")
@@ -272,7 +280,7 @@ func TestExecuteBatches_SideEffectOutcomeUnknownStopsFollowingBatch(t *testing.T
 		t.Fatal("first call must be recorded as executed")
 	}
 	if results[1].executed || !results[1].result.IsError ||
-		results[1].result.ErrorCategory != ErrCategoryBusiness ||
+		results[1].result.ErrorCategory != ErrCategoryTransient ||
 		!strings.Contains(results[1].result.Content, "was not executed") {
 		t.Fatalf("skipped sibling result = %+v, executed=%t; want explicit non-executed error", results[1].result, results[1].executed)
 	}
@@ -346,7 +354,7 @@ func TestExecuteBatches_ValidationFailurePersistsDefinitiveResult(t *testing.T) 
 	if err != nil {
 		t.Fatalf("executeBatches: %v", err)
 	}
-	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run committed]"; got != want {
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run failed_no_effect]"; got != want {
 		t.Fatalf("events = %s, want %s", got, want)
 	}
 }
@@ -372,7 +380,7 @@ func TestExecuteBatches_ComputerUseNoCommitFailurePersistsDefinitiveResult(t *te
 	if err != nil {
 		t.Fatalf("executeBatches: %v", err)
 	}
-	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run committed]"; got != want {
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run failed_no_effect]"; got != want {
 		t.Fatalf("events = %s, want %s", got, want)
 	}
 }
@@ -452,9 +460,8 @@ func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing
 	if tool.runs.Load() != 1 {
 		t.Fatalf("tool runs = %d, want only the first call dispatched", tool.runs.Load())
 	}
-	if len(handler.results) != 2 || !handler.results[1].IsError ||
-		!strings.Contains(handler.results[1].Content, "was not executed") {
-		t.Fatalf("handler results = %+v, want explicit error for skipped sibling", handler.results)
+	if len(handler.results) != 1 {
+		t.Fatalf("handler results = %+v, want only the dispatched call", handler.results)
 	}
 	if checkpointCalls != 2 {
 		t.Fatalf("checkpoint calls = %d, want pre-dispatch + terminal result", checkpointCalls)
@@ -462,6 +469,17 @@ func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing
 	status := loop.LastRunStatus()
 	if !status.Partial || status.FailureCode != runstatus.CodeSideEffectOutcomeUnknown {
 		t.Fatalf("run status = %+v", status)
+	}
+	skippedPaired := false
+	for _, message := range loop.RunMessages() {
+		for _, block := range message.Content.Blocks() {
+			if block.Type == "tool_result" && block.ToolUseID == "skipped-side-effect-call" {
+				skippedPaired = block.IsError && strings.Contains(client.ToolResultText(block), "safe to run again")
+			}
+		}
+	}
+	if !skippedPaired {
+		t.Fatal("skipped sibling transcript result was not paired as safely retryable")
 	}
 	assertNativeToolPairs(t, loop.RunMessages())
 }

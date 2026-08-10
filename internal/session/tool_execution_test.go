@@ -106,6 +106,30 @@ func TestToolExecutionStateMachineRejectsUnsafeTransitions(t *testing.T) {
 	}
 }
 
+func TestToolExecutionFailedNoEffectIsDefinitiveAndNonBlocking(t *testing.T) {
+	record := newTestToolExecution(t, "toolu_no_effect", `{}`)
+	sess := Session{ToolExecutions: []ToolExecutionRecord{record}}
+	if err := sess.MarkToolExecutionDispatching(record.ExecutionID, record.UpdatedAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.MarkToolExecutionFailedNoEffect(record.ExecutionID, "not-a-digest", record.UpdatedAt.Add(2*time.Second)); !errors.Is(err, ErrInvalidToolExecutionLedger) {
+		t.Fatalf("invalid result digest error = %v, want invalid ledger", err)
+	}
+	resultDigest := ToolExecutionDigest("known failure without external effect")
+	if err := sess.MarkToolExecutionFailedNoEffect(record.ExecutionID, resultDigest, record.UpdatedAt.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := sess.ToolExecutions[0].State; got != ToolExecutionFailedNoEffect {
+		t.Fatalf("state = %q, want failed_no_effect", got)
+	}
+	if got := sess.ToolExecutions[0].ResultDigest; got != resultDigest {
+		t.Fatalf("result digest = %q, want %q", got, resultDigest)
+	}
+	if blocked := sess.BlockingToolExecutions("run-test"); len(blocked) != 0 {
+		t.Fatalf("known no-effect execution blocked recovery: %#v", blocked)
+	}
+}
+
 func TestStoreSaveCheckpointsCommittedRecordWithMatchingToolResult(t *testing.T) {
 	store := NewStore(t.TempDir())
 	defer store.Close()

@@ -43,6 +43,7 @@ type SideEffectExecutionJournal interface {
 	Prepare(context.Context, SideEffectExecution) (PreparedSideEffectExecution, error)
 	MarkDispatching(context.Context, string) error
 	MarkCommitted(context.Context, string, string) error
+	MarkFailedNoEffect(context.Context, string, string) error
 	MarkAbandoned(context.Context, string, string) error
 	MarkOutcomeUnknown(context.Context, string, string) error
 }

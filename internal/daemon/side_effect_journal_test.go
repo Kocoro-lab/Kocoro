@@ -49,7 +49,10 @@ func TestSessionSideEffectJournalPersistsDigestOnlyAndCheckpointsWithTranscript(
 			client.NewToolResultBlock(toolUseID, "sent", false),
 		}),
 	})
-	rollback := stageCommittedToolExecutionsForSave(sess, "run_test_001")
+	rollback, err := stageTranscriptToolExecutionsForSave(sess)
+	if err != nil {
+		t.Fatalf("stage transcript checkpoint: %v", err)
+	}
 	if err := manager.Save(); err != nil {
 		rollback()
 		t.Fatalf("Save checkpoint: %v", err)
@@ -132,6 +135,51 @@ func TestGuardInterruptedToolExecutionsBlocksAmbiguousDispatchAndPersistsWarning
 	blocks := persisted.Messages[1].Content.Blocks()
 	if len(blocks) != 1 || blocks[0].Type != "tool_result" || blocks[0].ToolUseID != "tool-use-002" {
 		t.Fatalf("synthetic outcome-unknown pair = %#v", blocks)
+	}
+}
+
+func TestGuardInterruptedToolExecutionsContinuesAfterKnownNoEffectFailure(t *testing.T) {
+	manager := session.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = manager.Close() })
+	sess := manager.NewSessionWithID("side-effect-session-no-effect")
+	state := session.InterruptedTurn{
+		RunID: "run_no_effect", AttemptID: "attempt_no_effect", Source: "desktop", UpdatedAt: time.Now(),
+	}
+	const toolUseID = "tool-use-no-effect"
+	sess.Messages = []client.Message{{
+		Role: "assistant",
+		Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolUseBlock(toolUseID, "computer_use", []byte(`{"task":"locate"}`)),
+		}),
+	}}
+	sess.MessageMeta = []session.MessageMeta{{Source: "desktop", Timestamp: session.TimePtr(time.Now())}}
+	sess.InProgress = true
+	sess.InterruptedTurn = &state
+	journal := newSessionSideEffectJournal(manager, sess, state.RunID, state.AttemptID)
+	prepared, err := journal.Prepare(context.Background(), agent.SideEffectExecution{
+		ToolUseID: toolUseID, ToolName: "computer_use",
+		ArgumentsSHA256: session.ToolExecutionDigest(`{"task":"locate"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.MarkDispatching(context.Background(), prepared.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.MarkFailedNoEffect(context.Background(), prepared.ExecutionID, session.ToolExecutionDigest("app_resolution_failed")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := guardInterruptedToolExecutions(manager, sess, state); err != nil {
+		t.Fatalf("known no-effect recovery was blocked: %v", err)
+	}
+	if blocked := sess.BlockingToolExecutions(state.RunID); len(blocked) != 0 {
+		t.Fatalf("known no-effect recovery has blocking records: %#v", blocked)
+	}
+	blocks := sess.Messages[len(sess.Messages)-1].Content.Blocks()
+	if len(blocks) != 1 || blocks[0].Type != "tool_result" || blocks[0].ToolUseID != toolUseID ||
+		!strings.Contains(client.ToolResultText(blocks[0]), "safe to continue") {
+		t.Fatalf("safe synthetic result = %#v", blocks)
 	}
 }
 
@@ -221,11 +269,10 @@ func TestPreparedCheckpointDoesNotCheckpointEarlierUncapturedWrite(t *testing.T)
 	if err := sess.MarkToolExecutionCommitted(record.ExecutionID, session.ToolExecutionDigest("created"), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	rollback := stageCommittedToolExecutionsForCheckpoint(
-		agent.CheckpointReasonSideEffectPrepared,
-		sess,
-		record.RunID,
-	)
+	rollback, err := stageTranscriptToolExecutionsForSave(sess)
+	if err != nil {
+		t.Fatalf("stage transcript checkpoint: %v", err)
+	}
 	defer rollback()
 	if got := sess.ToolExecutions[0].State; got != session.ToolExecutionCommitted {
 		t.Fatalf("pre-dispatch checkpoint changed earlier write to %q", got)

@@ -83,6 +83,12 @@ func (j *sessionSideEffectJournal) MarkCommitted(_ context.Context, executionID,
 	})
 }
 
+func (j *sessionSideEffectJournal) MarkFailedNoEffect(_ context.Context, executionID, resultDigest string) error {
+	return j.transition(executionID, func() error {
+		return j.session.MarkToolExecutionFailedNoEffect(executionID, resultDigest, time.Now())
+	})
+}
+
 func (j *sessionSideEffectJournal) MarkAbandoned(_ context.Context, executionID, _ string) error {
 	return j.transition(executionID, func() error {
 		return j.session.AbandonToolExecution(executionID, time.Now())
@@ -126,26 +132,17 @@ func cloneToolExecutions(records []session.ToolExecutionRecord) []session.ToolEx
 	return append([]session.ToolExecutionRecord(nil), records...)
 }
 
-func stageCommittedToolExecutionsForSave(sess *session.Session, runID string) func() {
+func stageTranscriptToolExecutionsForSave(sess *session.Session) (func(), error) {
 	if sess == nil {
-		return func() {}
+		return func() {}, nil
 	}
 	before := cloneToolExecutions(sess.ToolExecutions)
-	sess.CheckpointCommittedToolExecutions(runID, time.Now())
+	if err := sess.ReconcileToolExecutionCheckpoints(time.Now()); err != nil {
+		return func() {}, err
+	}
 	return func() {
 		sess.ToolExecutions = before
-	}
-}
-
-func stageCommittedToolExecutionsForCheckpoint(
-	reason agent.CheckpointReason,
-	sess *session.Session,
-	runID string,
-) func() {
-	if reason == agent.CheckpointReasonSideEffectPrepared {
-		return func() {}
-	}
-	return stageCommittedToolExecutionsForSave(sess, runID)
+	}, nil
 }
 
 func guardInterruptedToolExecutions(

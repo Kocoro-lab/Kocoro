@@ -27,6 +27,7 @@ const (
 	ToolExecutionPrepared       ToolExecutionState = "prepared"
 	ToolExecutionDispatching    ToolExecutionState = "dispatching"
 	ToolExecutionCommitted      ToolExecutionState = "committed"
+	ToolExecutionFailedNoEffect ToolExecutionState = "failed_no_effect"
 	ToolExecutionCheckpointed   ToolExecutionState = "checkpointed"
 	ToolExecutionOutcomeUnknown ToolExecutionState = "outcome_unknown"
 	ToolExecutionAbandoned      ToolExecutionState = "abandoned"
@@ -133,6 +134,10 @@ func (s *Session) MarkToolExecutionCommitted(executionID, resultDigest string, n
 	return s.transitionToolExecution(executionID, ToolExecutionCommitted, resultDigest, now)
 }
 
+func (s *Session) MarkToolExecutionFailedNoEffect(executionID, resultDigest string, now time.Time) error {
+	return s.transitionToolExecution(executionID, ToolExecutionFailedNoEffect, resultDigest, now)
+}
+
 func (s *Session) MarkToolExecutionOutcomeUnknown(executionID, resultDigest string, now time.Time) error {
 	return s.transitionToolExecution(executionID, ToolExecutionOutcomeUnknown, resultDigest, now)
 }
@@ -173,15 +178,15 @@ func (s *Session) transitionToolExecution(executionID string, next ToolExecution
 	case ToolExecutionPrepared:
 		valid = next == ToolExecutionDispatching || next == ToolExecutionAbandoned
 	case ToolExecutionDispatching:
-		valid = next == ToolExecutionCommitted || next == ToolExecutionOutcomeUnknown
+		valid = next == ToolExecutionCommitted || next == ToolExecutionFailedNoEffect || next == ToolExecutionOutcomeUnknown
 	case ToolExecutionCommitted:
 		valid = next == ToolExecutionOutcomeUnknown
 	}
 	if !valid {
 		return fmt.Errorf("%w: invalid transition %s to %s", ErrInvalidToolExecutionLedger, record.State, next)
 	}
-	if next == ToolExecutionCommitted && !validToolExecutionDigest(resultDigest) {
-		return fmt.Errorf("%w: committed execution requires result digest", ErrInvalidToolExecutionLedger)
+	if (next == ToolExecutionCommitted || next == ToolExecutionFailedNoEffect) && !validToolExecutionDigest(resultDigest) {
+		return fmt.Errorf("%w: definitive execution result requires result digest", ErrInvalidToolExecutionLedger)
 	}
 	if resultDigest != "" && !validToolExecutionDigest(resultDigest) {
 		return fmt.Errorf("%w: invalid result digest", ErrInvalidToolExecutionLedger)
@@ -281,6 +286,9 @@ func (s *Session) CheckpointCommittedToolExecutions(runID string, now time.Time)
 // TrimTerminalToolExecutions retains the newest bounded set of terminal
 // records. Prepared, dispatching, committed, and outcome-unknown entries are
 // preserved regardless of age so recovery evidence cannot be discarded.
+// Failed-no-effect is terminal because the tool provided structured proof that
+// no external mutation committed even if the process stopped before transcript
+// checkpointing.
 func (s *Session) TrimTerminalToolExecutions(limit int) int {
 	if limit < 0 {
 		limit = 0
@@ -291,7 +299,7 @@ func (s *Session) TrimTerminalToolExecutions(limit int) int {
 	}
 	terminals := make([]terminalEntry, 0, len(s.ToolExecutions))
 	for i, record := range s.ToolExecutions {
-		if record.State == ToolExecutionCheckpointed || record.State == ToolExecutionAbandoned {
+		if record.State == ToolExecutionCheckpointed || record.State == ToolExecutionFailedNoEffect || record.State == ToolExecutionAbandoned {
 			terminals = append(terminals, terminalEntry{index: i, updatedAt: record.UpdatedAt})
 		}
 	}
@@ -311,7 +319,7 @@ func (s *Session) TrimTerminalToolExecutions(limit int) int {
 	trimmed := len(terminals) - limit
 	retained := make([]ToolExecutionRecord, 0, len(s.ToolExecutions)-trimmed)
 	for i, record := range s.ToolExecutions {
-		if record.State != ToolExecutionCheckpointed && record.State != ToolExecutionAbandoned {
+		if record.State != ToolExecutionCheckpointed && record.State != ToolExecutionFailedNoEffect && record.State != ToolExecutionAbandoned {
 			retained = append(retained, record)
 			continue
 		}
@@ -399,7 +407,7 @@ func (r ToolExecutionRecord) validate() error {
 		if r.ResultDigest != "" {
 			return fmt.Errorf("%w: result digest before completion", ErrInvalidToolExecutionLedger)
 		}
-	case ToolExecutionCommitted, ToolExecutionCheckpointed:
+	case ToolExecutionCommitted, ToolExecutionCheckpointed, ToolExecutionFailedNoEffect:
 		if r.ResultDigest == "" {
 			return fmt.Errorf("%w: missing result digest", ErrInvalidToolExecutionLedger)
 		}

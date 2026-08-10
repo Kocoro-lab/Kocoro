@@ -6574,7 +6574,7 @@ iterationLoop:
 
 				a.logAudit(fc.Name, argsStr, result.Content, decision, wasApproved, elapsed.Milliseconds(), result.Usage)
 
-				if a.handler != nil {
+				if er.executed && a.handler != nil {
 					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, result, elapsed)
 				}
 			}

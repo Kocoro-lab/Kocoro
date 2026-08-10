@@ -25,7 +25,11 @@ const (
 	requestBudgetHelperDispatchLimit         = 8
 	requestBudgetTerminalDispatchLimit       = 1
 	requestBudgetMinimumTokenExposure        = int64(1_000_000)
-	requestBudgetContextMultiplier           = int64(8)
+	// Provider usage schemas disagree on whether cache-read tokens are included
+	// in input/total tokens. Two context windows per permitted dispatch keeps the
+	// exposure guard conservative under either representation without turning it
+	// into a hidden iteration cap. Cost remains tracked from provider-reported USD.
+	requestBudgetTokenExposurePerDispatch = int64(2)
 )
 
 // ErrRequestBudgetExhausted is returned before a provider dispatch when the
@@ -101,17 +105,31 @@ type requestBudgetSnapshot struct {
 }
 
 func newRequestLLMBudget(contextWindow, maxIterations int) *requestLLMBudget {
-	limit := requestBudgetMinimumTokenExposure
-	if contextWindow > 0 {
-		if scaled := int64(contextWindow) * requestBudgetContextMultiplier; scaled > limit {
-			limit = scaled
-		}
-	}
 	dispatchLimit := normalDispatchLimitForIterations(maxIterations)
 	return &requestLLMBudget{
-		tokenExposureLimit:  limit,
+		tokenExposureLimit:  tokenExposureLimitForDispatches(contextWindow, dispatchLimit),
 		normalDispatchLimit: dispatchLimit,
 	}
+}
+
+func tokenExposureLimitForDispatches(contextWindow, dispatchLimit int) int64 {
+	if contextWindow <= 0 || dispatchLimit <= 0 {
+		return requestBudgetMinimumTokenExposure
+	}
+	maxInt64 := int64(^uint64(0) >> 1)
+	perDispatch := int64(contextWindow)
+	if perDispatch > maxInt64/requestBudgetTokenExposurePerDispatch {
+		return maxInt64
+	}
+	perDispatch *= requestBudgetTokenExposurePerDispatch
+	if int64(dispatchLimit) > maxInt64/perDispatch {
+		return maxInt64
+	}
+	limit := int64(dispatchLimit) * perDispatch
+	if limit < requestBudgetMinimumTokenExposure {
+		return requestBudgetMinimumTokenExposure
+	}
+	return limit
 }
 
 func normalDispatchLimitForIterations(maxIterations int) int {
