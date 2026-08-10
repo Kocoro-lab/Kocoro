@@ -71,7 +71,7 @@ Per-server fields: `command` + `args` (stdio), `type: http` + `url` (HTTP), `env
 
 ```yaml
 agent:
-  max_iterations: 256              # emergency round fuse; provider attempts are separately capped at 64 per root run
+  max_iterations: 256              # emergency model/tool-round fuse; provider attempts are separately capped at 64 per root run plus one terminal synthesis
   temperature: 0                   # LLM temperature (default: 0)
   max_tokens: 0                    # max output tokens (default: 0 = resolve from the selected model)
   model: ""                        # specific model override (empty = use model_tier)

@@ -3877,6 +3877,7 @@ func TestOpenAIComputerTaskToolMapsBudgetExhaustionBeforeActionToNoEffect(
 		result.ErrorCategory != agent.ErrCategoryBusiness ||
 		!result.SideEffectKnownNoEffect || result.SideEffectOutcomeUnknown ||
 		!strings.Contains(result.Content, "request_budget_exhausted_before_action") ||
+		strings.Contains(result.Content, "child_summary:") ||
 		!strings.Contains(result.Content, "do not retry computer_use") {
 		t.Fatalf("task result = %+v", result)
 	}
@@ -3889,6 +3890,91 @@ func TestOpenAIComputerTaskToolMapsBudgetExhaustionBeforeActionToNoEffect(
 	}
 	if got := strings.Join(probe.runNames(), ","); got != "final_screenshot" {
 		t.Fatalf("budget exhaustion ran desktop actions: %q", got)
+	}
+}
+
+func TestOpenAIComputerTaskToolSeedsChildBudgetFromSealedModelContextWindow(
+	t *testing.T,
+) {
+	coordinator := guicontrol.NewCoordinator(guicontrol.CoordinatorOptions{})
+	workflow := testGUIWorkflow(
+		coordinator,
+		"session-openai-child-context-window",
+		"turn-openai-child-context-window",
+	)
+	autoAcknowledgeOpenAIComputerController(t, coordinator)
+	defer workflow.EndTurn()
+
+	probe := &openAIComputerDaemonProbeTool{
+		targetBundleID: "com.example.calculator",
+		targetAppName:  "Calculator",
+		results: map[string]agent.ToolResult{
+			"click": {
+				Content: "pressed",
+				GUIOutcome: &agent.GUIActionOutcome{
+					Result: agent.GUIActionResultVerified,
+					Phase:  agent.GUIActionPhaseVerifying,
+				},
+			},
+			"final_screenshot": {
+				Content: "observed",
+				Images: []agent.ImageBlock{{
+					MediaType: "image/png",
+					Data:      "aW1hZ2U=",
+				}},
+			},
+		},
+	}
+	profile := trustedOpenAIComputerProfileForDaemon(t)
+	first := openAIComputerDaemonLoopResponse(
+		t,
+		profile,
+		openAIComputerDaemonContinuationToken,
+		string(openAIComputerDaemonCall(
+			`{"type":"click","button":"left","x":10,"y":20}`,
+		)),
+		"",
+	)
+	first.Usage = client.Usage{
+		InputTokens: 1_010_000,
+		TotalTokens: 1_010_000,
+	}
+	llm := &openAIComputerDaemonLoopLLM{responses: []*client.CompletionResponse{
+		first,
+		openAIComputerDaemonLoopResponse(
+			t,
+			profile,
+			"resp_daemon_child_context_window_final",
+			`{"type":"text","text":"{\"status\":\"completed\",\"summary\":\"Calculator shows the requested result.\"}"}`,
+			`{"status":"completed","summary":"Calculator shows the requested result."}`,
+		),
+	}}
+	childTools := agent.NewToolRegistry()
+	childTools.Register(tools.NewOpenAIComputerAdapterV1(nil))
+	taskTool := &openAIComputerTaskToolV1{
+		gateway:     llm,
+		profile:     profile,
+		childTools:  childTools,
+		workflow:    workflow,
+		runtime:     &openAIComputerDaemonRuntimeProbe{tool: probe},
+		modelTier:   "large",
+		maxIter:     4,
+		resultTrunc: 2000,
+		argsTrunc:   200,
+	}
+
+	result, err := taskTool.Run(
+		context.Background(),
+		`{"task":"Press Calculator 7","controlled_apps":["Calculator"],`+
+			`"foreground_policy":"foreground_allowed",`+
+			`"description":"Complete the desktop task"}`,
+	)
+	if err != nil || result.IsError ||
+		result.Content != "Calculator shows the requested result." {
+		t.Fatalf("task result=%+v err=%v", result, err)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("child provider calls = %d, want 2", len(llm.requests))
 	}
 }
 

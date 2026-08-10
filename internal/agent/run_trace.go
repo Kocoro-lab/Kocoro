@@ -76,7 +76,8 @@ type RunTraceTerminal struct {
 	// Budget fields are a snapshot at AgentLoop termination. Optional post-run
 	// UX calls such as prompt suggestions may spend the same budget afterward;
 	// their usage stays in the existing audit rows and never rewrites this event.
-	// ProviderDispatchesAtTerminal is the aggregate; nested is its reported subset.
+	// ProviderDispatchesAtTerminal is the aggregate; helper and nested are its
+	// reported subsets.
 	ProviderDispatchesAtTerminal     int   `json:"provider_dispatches_at_terminal"`
 	ProviderDispatchLimit            int   `json:"provider_dispatch_limit"`
 	HelperDispatchesAtTerminal       int   `json:"helper_dispatches_at_terminal"`

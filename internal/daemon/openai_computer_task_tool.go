@@ -1348,6 +1348,9 @@ func (t *openAIComputerTaskToolV1) Run(
 	child.SetSkillDiscovery(false)
 	child.SetBypassPermissions(true)
 	child.SetSpecificModel(profile.Model())
+	if contextWindow, ok := agent.LookupModelContextWindow(profile.Model()); ok {
+		child.SetContextWindow(contextWindow)
+	}
 	child.SetExecutionProfile(profile)
 	child.SetOpenAIComputerBatchExecutor(runner)
 	child.SetForceInitialToolUse(true)
@@ -1474,7 +1477,9 @@ func (t *openAIComputerTaskToolV1) Run(
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
 		detail := err.Error()
-		if status == "completed_unverified" && strings.TrimSpace(reply) != "" {
+		if (stats.TaskEffect == agent.ComputerUseCommitKnown ||
+			stats.TaskEffect == agent.ComputerUseCommitUnknown) &&
+			strings.TrimSpace(reply) != "" {
 			detail += "\nchild_summary: " + reply
 		}
 		return openAIComputerRequestBudgetExhaustedResultV1(
