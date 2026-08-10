@@ -4064,6 +4064,7 @@ func TestOpenAIComputerTaskToolMapsBudgetExhaustionAfterActionToUnknown(
 		result.SideEffectKnownNoEffect || !result.SideEffectOutcomeUnknown ||
 		!strings.Contains(result.Content, "computer_use_result: unverified") ||
 		!strings.Contains(result.Content, "request_budget_exhausted_after_action") ||
+		!strings.Contains(result.Content, "child_summary:") ||
 		!strings.Contains(result.Content, "do not repeat the unresolved action") {
 		t.Fatalf("task result = %+v", result)
 	}

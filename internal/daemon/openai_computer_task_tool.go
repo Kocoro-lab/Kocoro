@@ -1473,8 +1473,12 @@ func (t *openAIComputerTaskToolV1) Run(
 			FailureCode: failureCode,
 			DurationMS:  time.Since(taskStarted).Milliseconds(),
 		})
+		detail := err.Error()
+		if status == "completed_unverified" && strings.TrimSpace(reply) != "" {
+			detail += "\nchild_summary: " + reply
+		}
 		return openAIComputerRequestBudgetExhaustedResultV1(
-			err.Error(),
+			detail,
 			stats.TaskEffect,
 		), nil
 	}
