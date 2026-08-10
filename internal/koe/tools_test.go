@@ -507,27 +507,24 @@ func TestToolDefsLedgerSchema(t *testing.T) {
 		doTask := find(defs, "do_task")
 		params := string(doTask.Parameters)
 		for _, want := range []string{
-			`"execution_mode"`,
-			`"full_reason"`,
-			`"fast"`,
-			`"full"`,
-			`"none"`,
-			`"production_incident_or_recovery"`,
-			`"broad_cross_system_change"`,
 			`"additionalproperties":false`,
-			"classify only the current task",
-			"choose fast by default",
-			"weather or news briefs",
-			"focused code fixes with tests",
-			"one failure",
-			"when unsure, choose fast",
-			"diagnostic telemetry",
-			"imperfect label",
-			"exact enum token",
 			"kocoro is the assistant identity",
 		} {
 			if !strings.Contains(strings.ToLower(params), want) {
 				t.Fatalf("%s do_task schema missing %q: %s", name, want, params)
+			}
+		}
+		// The voice model must not be asked to route: execution mode comes from
+		// koe.fast_effort and is admitted daemon-side, not selected here.
+		for _, unwanted := range []string{
+			"execution_mode",
+			"full_reason",
+			"production_incident_or_recovery",
+			"broad_cross_system_change",
+			"classify only the current task",
+		} {
+			if strings.Contains(strings.ToLower(params), unwanted) {
+				t.Fatalf("%s do_task schema still exposes routing field %q: %s", name, unwanted, params)
 			}
 		}
 		var schema struct {
@@ -578,96 +575,87 @@ func TestPrepareDoTaskTreatsKocoroAsDefaultAgent(t *testing.T) {
 	}
 }
 
-func TestPrepareDoTaskExecutionModeAndLineage(t *testing.T) {
+// The voice model no longer selects an execution mode, so every do_task
+// requests Fast and the run lineage is what this pins. Full is reached only by
+// the daemon downgrading a resolved run (koe.fast_effort off, or a Cloud
+// profile-resolution failure), which comes back through RecordExecutionRun.
+func TestPrepareDoTaskPinsFastAndChainsLineage(t *testing.T) {
 	t.Setenv("KOE_TASK_LEDGER", "1")
 	state := NewCallState("burst-mode", "")
 	dispatcher := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
 
 	fastReq, task, clarify, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"check one stable value","relationship":"new","execution_mode":"fast","full_reason":"none"}`), "en", false)
+		[]byte(`{"task":"check one stable value","relationship":"new"}`), "en", false)
 	if err != nil || clarify != nil || task == nil {
-		t.Fatalf("prepare fast: req=%+v task=%+v clarify=%+v err=%v", fastReq, task, clarify, err)
+		t.Fatalf("prepare: req=%+v task=%+v clarify=%+v err=%v", fastReq, task, clarify, err)
 	}
 	if fastReq.ExecutionMode != executionprofile.ModeFast ||
 		fastReq.RequestedExecutionMode == nil || *fastReq.RequestedExecutionMode != "fast" ||
 		fastReq.FullReason != executionprofile.FullReasonNone ||
 		fastReq.LogicalTaskID == "" || fastReq.ExecutionRunID == "" || fastReq.ParentRunID != "" {
-		t.Fatalf("fast request lineage = %+v", fastReq)
+		t.Fatalf("first request = %+v, want a parentless Fast run with lineage ids", fastReq)
 	}
 
-	fullReq, followed, clarify, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"use Full mode for the sensitive review","relationship":"follow_up","task_id":"`+task.ID+`","execution_mode":"full","full_reason":"explicit_full_mode_request"}`), "en", false)
+	// A follow-up while the task is still running stays on the same run: with the
+	// selector gone, no request can escalate the mode mid-flight.
+	sameRun, followed, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"also mention the timezone","relationship":"follow_up","task_id":"`+task.ID+`"}`), "en", false)
 	if err != nil || clarify != nil || followed == nil {
-		t.Fatalf("prepare upgrade: req=%+v task=%+v clarify=%+v err=%v", fullReq, followed, clarify, err)
+		t.Fatalf("prepare in-flight follow-up: req=%+v task=%+v clarify=%+v err=%v", sameRun, followed, clarify, err)
 	}
-	if fullReq.ExecutionMode != executionprofile.ModeFull ||
-		fullReq.RequestedExecutionMode == nil || *fullReq.RequestedExecutionMode != "full" ||
-		fullReq.FullReason != executionprofile.FullReasonExplicitFullRequest ||
-		fullReq.ParentRunID != fastReq.ExecutionRunID ||
-		fullReq.ExecutionRunID == fastReq.ExecutionRunID ||
-		fullReq.LogicalTaskID != fastReq.LogicalTaskID {
-		t.Fatalf("fast->full child lineage = %+v, parent=%+v", fullReq, fastReq)
-	}
-	state.LandResult(task.ID, SayResult{Status: "ok", Reply: "done"})
-	stickyReq, _, clarify, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"make one quick correction","relationship":"follow_up","task_id":"`+task.ID+`","execution_mode":"fast","full_reason":"none"}`), "en", false)
-	if err != nil || clarify != nil || stickyReq.ExecutionMode != executionprofile.ModeFast ||
-		stickyReq.InheritedMode != executionprofile.ModeFull {
-		t.Fatalf("completed full->fast lineage did not preserve requested/effective modes: req=%+v clarify=%+v err=%v", stickyReq, clarify, err)
+	if sameRun.ExecutionRunID != fastReq.ExecutionRunID || sameRun.ParentRunID != "" {
+		t.Fatalf("in-flight follow-up = %+v, want the parent run reused", sameRun)
 	}
 
-	unknownReq, _, _, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"separate work","relationship":"new","execution_mode":"turbo","full_reason":"none"}`), "en", false)
-	if err != nil || unknownReq.ExecutionMode != executionprofile.ModeFull {
-		t.Fatalf("unknown execution mode = %+v err=%v, want full", unknownReq, err)
+	// A follow-up after the task landed opens a child run under the same logical task.
+	state.LandResult(task.ID, SayResult{Status: "ok", Reply: "done"})
+	childReq, _, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"refine that answer","relationship":"follow_up","task_id":"`+task.ID+`"}`), "en", false)
+	if err != nil || clarify != nil {
+		t.Fatalf("prepare follow-up: req=%+v clarify=%+v err=%v", childReq, clarify, err)
+	}
+	if childReq.ParentRunID != fastReq.ExecutionRunID ||
+		childReq.ExecutionRunID == fastReq.ExecutionRunID ||
+		childReq.LogicalTaskID != fastReq.LogicalTaskID {
+		t.Fatalf("follow-up lineage = %+v, parent=%+v", childReq, fastReq)
 	}
 }
 
-func TestPrepareDoTaskFailsClosedOnContradictoryModeAndReason(t *testing.T) {
+// A follow-up on a task the daemon already downgraded to Full must inherit
+// Full rather than silently restarting the work in Fast.
+func TestPrepareDoTaskInheritsDaemonDowngradedFull(t *testing.T) {
 	t.Setenv("KOE_TASK_LEDGER", "1")
-	state := NewCallState("burst-admission", "")
+	state := NewCallState("burst-inherit", "")
 	dispatcher := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
 
-	selectedFull, task, clarify, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"Run the full unit-test suite for internal/cache.","relationship":"new","execution_mode":"full","full_reason":"none"}`),
-		"en",
-		false,
-	)
+	first, task, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"summarize the sensitive review","relationship":"new"}`), "en", false)
 	if err != nil || clarify != nil || task == nil {
-		t.Fatalf("prepare selected Full: req=%+v task=%+v clarify=%+v err=%v", selectedFull, task, clarify, err)
-	}
-	if selectedFull.ExecutionMode != executionprofile.ModeFull ||
-		selectedFull.RequestedExecutionMode == nil ||
-		*selectedFull.RequestedExecutionMode != "full" {
-		t.Fatalf("selected Full was changed by missing diagnostic reason: %+v", selectedFull)
+		t.Fatalf("prepare: req=%+v task=%+v clarify=%+v err=%v", first, task, clarify, err)
 	}
 
-	contradictoryFast, task, clarify, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"Investigate the real production data-loss incident.","relationship":"new","execution_mode":"fast","full_reason":"production_incident_or_recovery"}`),
-		"en",
-		false,
-	)
-	if err != nil || clarify != nil || task == nil {
-		t.Fatalf("prepare contradictory Fast: req=%+v task=%+v clarify=%+v err=%v", contradictoryFast, task, clarify, err)
+	// Exactly what the daemon does when koe.fast_effort is off: a Fast request
+	// resolves to a Full profile, and the resolved run is written back.
+	resolved := task.CurrentExecutionRun()
+	resolved.Profile = executionprofile.Resolve(executionprofile.ResolutionInput{
+		RequestedMode: executionprofile.ModeFast,
+		FastEnabled:   false,
+	})
+	if resolved.Profile.EffectiveMode != executionprofile.ModeFull {
+		t.Fatalf("fast_effort=off must resolve Full, got %+v", resolved.Profile)
 	}
-	if contradictoryFast.ExecutionMode != executionprofile.ModeFull ||
-		contradictoryFast.RequestedExecutionMode == nil ||
-		*contradictoryFast.RequestedExecutionMode != "fast" ||
-		contradictoryFast.FullReason != executionprofile.FullReasonProductionIncident {
-		t.Fatalf("contradictory Fast did not fail closed: %+v", contradictoryFast)
+	if !state.RecordExecutionRun(task.ID, resolved) {
+		t.Fatal("daemon-resolved run was rejected by the ledger")
 	}
+	state.LandResult(task.ID, SayResult{Status: "ok", Reply: "done"})
 
-	unknownReasonFast, task, clarify, err := dispatcher.PrepareDoTask(
-		[]byte(`{"task":"Summarize the current note.","relationship":"new","execution_mode":"fast","full_reason":"lots_of_tools"}`),
-		"en",
-		false,
-	)
-	if err != nil || clarify != nil || task == nil {
-		t.Fatalf("prepare Fast with unknown reason: req=%+v task=%+v clarify=%+v err=%v", unknownReasonFast, task, clarify, err)
+	next, _, clarify, err := dispatcher.PrepareDoTask(
+		[]byte(`{"task":"make one quick correction","relationship":"follow_up","task_id":"`+task.ID+`"}`), "en", false)
+	if err != nil || clarify != nil {
+		t.Fatalf("prepare follow-up: req=%+v clarify=%+v err=%v", next, clarify, err)
 	}
-	if unknownReasonFast.ExecutionMode != executionprofile.ModeFast ||
-		unknownReasonFast.FullReason != executionprofile.FullReasonNone {
-		t.Fatalf("unknown reason changed selected Fast: %+v", unknownReasonFast)
+	if next.ExecutionMode != executionprofile.ModeFast || next.InheritedMode != executionprofile.ModeFull {
+		t.Fatalf("follow-up = %+v, want a Fast request inheriting Full", next)
 	}
 }
 

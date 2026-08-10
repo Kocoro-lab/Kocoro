@@ -768,9 +768,10 @@ func TestSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	cfg := sessionConfig("persona", "marin", false)
 	session := cfg["session"].(map[string]any)
 	instructions, _ := session["instructions"].(string)
-	if !strings.HasPrefix(instructions, "persona\n\n") ||
-		!strings.Contains(instructions, executionModeSchemaInstructions) {
-		t.Fatalf("sessionConfig execution-mode schema instructions = %q", instructions)
+	// The persona is now the whole instruction payload: the do_task execution-mode
+	// schema block used to be appended here, and went away with the selector.
+	if instructions != "persona" {
+		t.Fatalf("sessionConfig instructions = %q, want the persona verbatim", instructions)
 	}
 	raw, _ := json.Marshal(cfg)
 	s := string(raw)

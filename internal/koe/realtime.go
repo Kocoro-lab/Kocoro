@@ -1581,10 +1581,6 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 		input["noise_reduction"] = map[string]any{"type": noiseReduction}
 	}
 	sessionInstructions := strings.TrimSpace(persona)
-	if sessionInstructions != "" {
-		sessionInstructions += "\n\n"
-	}
-	sessionInstructions += executionModeSchemaInstructions
 	return map[string]any{
 		"type": "session.update",
 		"session": map[string]any{
