@@ -97,18 +97,18 @@ final class RunningApplicationSelectionTests: XCTestCase {
             uniqueInstalledTaskApplicationURLV1(
                 candidates: [systemSettings],
                 bundleIdentifier: bundleIdentifier),
-            systemSettings)
-        XCTAssertNil(uniqueInstalledTaskApplicationURLV1(
+            .resolved(systemSettings))
+        XCTAssertEqual(uniqueInstalledTaskApplicationURLV1(
             candidates: [systemSettings, weather],
-            bundleIdentifier: bundleIdentifier))
+            bundleIdentifier: bundleIdentifier), .ambiguous)
     }
 
     func testLocalizedInstalledApplicationSelectionFailsClosedForInvalidCandidates() {
         let notAnApp = URL(fileURLWithPath: "/Applications/Notes.txt")
         let missingBundleID = URL(fileURLWithPath: "/Applications/Broken.app")
-        XCTAssertNil(uniqueInstalledTaskApplicationURLV1(
+        XCTAssertEqual(uniqueInstalledTaskApplicationURLV1(
             candidates: [notAnApp, missingBundleID],
-            bundleIdentifier: { _ in nil }))
+            bundleIdentifier: { _ in nil }), .notFound)
     }
 
     func testLocalizedInstalledApplicationSelectionDeduplicatesOneMetadataPath() {
@@ -117,7 +117,91 @@ final class RunningApplicationSelectionTests: XCTestCase {
             uniqueInstalledTaskApplicationURLV1(
                 candidates: [app, app],
                 bundleIdentifier: { _ in "com.example.Editor" }),
-            app)
+            .resolved(app))
+    }
+
+    func testLocalizedInstalledApplicationSelectionDeduplicatesSymlinkTarget() throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let application = temporaryDirectory
+            .appendingPathComponent("Editor.app", isDirectory: true)
+        let alias = temporaryDirectory
+            .appendingPathComponent("Editor Alias.app", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: application,
+            withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: alias,
+            withDestinationURL: application)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        XCTAssertEqual(uniqueInstalledTaskApplicationURLV1(
+            candidates: [alias, application],
+            bundleIdentifier: { _ in "com.example.Editor" }),
+            .resolved(application.resolvingSymlinksInPath().standardizedFileURL))
+    }
+
+    func testLocalizedInstalledApplicationSelectionKeepsDistinctCopiesAmbiguous() {
+        let first = URL(fileURLWithPath: "/Applications/Editor.app")
+        let second = URL(fileURLWithPath: "/Users/test/Applications/Editor.app")
+        XCTAssertEqual(uniqueInstalledTaskApplicationURLV1(
+            candidates: [first, second],
+            bundleIdentifier: { _ in "com.example.Editor" }), .ambiguous)
+    }
+
+    func testInstalledApplicationSearchScopesExcludeNetworkAndMountedVolumes() {
+        let scopes = installedTaskApplicationSearchScopesV1()
+        XCTAssertFalse(scopes.isEmpty)
+        XCTAssertFalse(scopes.contains { $0.path.hasPrefix("/Network/") })
+        XCTAssertFalse(scopes.contains { $0.path.hasPrefix("/Volumes/") })
+
+        let utilities = URL(fileURLWithPath:
+            "/System/Applications/Utilities", isDirectory: true)
+        XCTAssertTrue(scopes.contains {
+            utilities.path.hasPrefix($0.path + "/")
+        })
+        XCTAssertTrue(scopes.contains {
+            $0.path == "/System/Library/CoreServices/Applications"
+        })
+    }
+
+    func testLocalizedLookupPreservesTimeoutAndUsesBoundedStandardScopes() {
+        var receivedTimeout: TimeInterval?
+        var receivedScopes: [URL] = []
+        let result = localizedInstalledTaskApplicationLookupV1(
+            appName: "Editor",
+            timeout: 0.25
+        ) { _, scopes, timeout in
+            receivedScopes = scopes
+            receivedTimeout = timeout
+            return .timedOut
+        }
+        XCTAssertEqual(result, .timedOut)
+        XCTAssertEqual(receivedTimeout, 0.25)
+        XCTAssertFalse(receivedScopes.contains {
+            $0.path.hasPrefix("/Network/") || $0.path.hasPrefix("/Volumes/")
+        })
+    }
+
+    func testInstalledLookupDiagnosticsAreDistinctAndDoNotExposePaths() {
+        let appName = "Editor"
+        let notFound = installedTaskApplicationLookupErrorMessageV1(
+            appName: appName,
+            result: .notFound)
+        let ambiguous = installedTaskApplicationLookupErrorMessageV1(
+            appName: appName,
+            result: .ambiguous)
+        let timedOut = installedTaskApplicationLookupErrorMessageV1(
+            appName: appName,
+            result: .timedOut)
+
+        XCTAssertNotEqual(notFound, ambiguous)
+        XCTAssertNotEqual(ambiguous, timedOut)
+        XCTAssertTrue(ambiguous?.contains("bundle identifier") == true)
+        XCTAssertTrue(timedOut?.contains("timed out") == true)
+        for message in [notFound, ambiguous, timedOut].compactMap({ $0 }) {
+            XCTAssertFalse(message.contains("/Applications/"))
+        }
     }
 
     func testMetadataQueryLiteralEscapesQuotesAndBackslashesWithoutWildcards() {

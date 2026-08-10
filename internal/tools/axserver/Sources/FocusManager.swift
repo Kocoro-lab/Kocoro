@@ -130,15 +130,60 @@ func metadataQueryLiteralV1(_ value: String) -> String {
         .replacingOccurrences(of: "?", with: "\\?")
 }
 
+enum InstalledTaskApplicationLookupResultV1: Equatable {
+    case resolved(URL)
+    case notFound
+    case ambiguous
+    case timedOut
+    case unavailable
+}
+
+enum MetadataApplicationQueryResultV1: Equatable {
+    case candidates([URL])
+    case timedOut
+    case unavailable
+}
+
+func installedTaskApplicationSearchScopesV1(
+    fileManager: FileManager = .default
+) -> [URL] {
+    let domains: [FileManager.SearchPathDomainMask] = [
+        .userDomainMask,
+        .localDomainMask,
+        .systemDomainMask,
+    ]
+    var candidates = domains.flatMap {
+        fileManager.urls(for: .applicationDirectory, in: $0)
+    }
+    candidates.append(URL(
+        fileURLWithPath: "/System/Library/CoreServices/Applications",
+        isDirectory: true))
+
+    var scopesByPath: [String: URL] = [:]
+    for candidate in candidates {
+        let normalized = candidate.resolvingSymlinksInPath().standardizedFileURL
+        guard let resourceValues = try? normalized.resourceValues(forKeys: [
+            .isDirectoryKey,
+            .volumeIsLocalKey,
+        ]),
+            resourceValues.isDirectory == true,
+            resourceValues.volumeIsLocal == true else {
+            continue
+        }
+        scopesByPath[normalized.path] = normalized
+    }
+    return scopesByPath.values.sorted { $0.path < $1.path }
+}
+
 func uniqueInstalledTaskApplicationURLV1(
     candidates: [URL],
     bundleIdentifier: (URL) -> String? = { Bundle(url: $0)?.bundleIdentifier }
-) -> URL? {
+) -> InstalledTaskApplicationLookupResultV1 {
     var validByPath: [String: URL] = [:]
     for candidate in candidates {
-        let normalized = candidate.standardizedFileURL
-        guard normalized.isFileURL,
-              normalized.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
+        guard candidate.isFileURL else { continue }
+        let normalized = candidate.resolvingSymlinksInPath().standardizedFileURL
+        guard normalized.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
               let identifier = bundleIdentifier(normalized)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !identifier.isEmpty else {
@@ -146,58 +191,132 @@ func uniqueInstalledTaskApplicationURLV1(
         }
         validByPath[normalized.path] = normalized
     }
-    guard validByPath.count == 1 else { return nil }
-    return validByPath.values.first
+    if validByPath.isEmpty { return .notFound }
+    guard validByPath.count == 1, let applicationURL = validByPath.values.first else {
+        return .ambiguous
+    }
+    return .resolved(applicationURL)
 }
 
-func localizedInstalledTaskApplicationURLV1(appName: String) -> URL? {
+typealias MetadataApplicationQueryRunnerV1 = (
+    _ predicate: String,
+    _ scopes: [URL],
+    _ timeout: TimeInterval
+) -> MetadataApplicationQueryResultV1
+
+private func metadataApplicationQueryV1(
+    predicate: String,
+    scopes: [URL],
+    timeout: TimeInterval
+) -> MetadataApplicationQueryResultV1 {
+    guard !scopes.isEmpty,
+          let query = MDQueryCreate(
+            kCFAllocatorDefault,
+            predicate as CFString,
+            nil,
+            nil) else {
+        return .unavailable
+    }
+    let deliveryQueue = DispatchQueue(
+        label: "run.shannon.kocoro.ax-server.app-metadata-query",
+        qos: .userInitiated)
+    MDQuerySetSearchScope(query, scopes as CFArray, 0)
+    MDQuerySetDispatchQueue(query, deliveryQueue)
+    guard MDQueryExecute(query, 0) else { return .unavailable }
+
+    let deadline = DispatchTime.now() + max(timeout, 0)
+    while !MDQueryIsGatheringComplete(query) {
+        guard DispatchTime.now().uptimeNanoseconds < deadline.uptimeNanoseconds else {
+            deliveryQueue.async { MDQueryStop(query) }
+            return .timedOut
+        }
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    let candidates: [URL] = deliveryQueue.sync {
+        (0..<MDQueryGetResultCount(query)).compactMap { index in
+            guard let rawItem = MDQueryGetResultAtIndex(query, index) else {
+                return nil
+            }
+            let item = unsafeBitCast(rawItem, to: MDItem.self)
+            guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String,
+                  !path.isEmpty else {
+                return nil
+            }
+            return URL(fileURLWithPath: path)
+        }
+    }
+    return .candidates(candidates)
+}
+
+// Exact display-name metadata queries are limited to standard local app roots.
+// This bound keeps the ax_server request loop responsive if Spotlight stalls;
+// tests and any future broader caller can supply a different timeout.
+func installedTaskApplicationMetadataQueryTimeoutV1() -> TimeInterval {
+    2
+}
+
+func localizedInstalledTaskApplicationLookupV1(
+    appName: String,
+    timeout: TimeInterval = installedTaskApplicationMetadataQueryTimeoutV1(),
+    queryRunner: MetadataApplicationQueryRunnerV1 = metadataApplicationQueryV1
+) -> InstalledTaskApplicationLookupResultV1 {
     let requested = appName.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !requested.isEmpty else { return nil }
+    guard !requested.isEmpty else { return .notFound }
     let literal = metadataQueryLiteralV1(requested)
     let predicate =
         "kMDItemDisplayName == \"\(literal)\"c && " +
         "kMDItemContentType == \"com.apple.application-bundle\""
-    guard let query = MDQueryCreate(
-        kCFAllocatorDefault,
-        predicate as CFString,
-        nil,
-        nil
-    ), MDQueryExecute(query, CFOptionFlags(kMDQuerySynchronous.rawValue)) else {
-        return nil
+    switch queryRunner(
+        predicate,
+        installedTaskApplicationSearchScopesV1(),
+        timeout
+    ) {
+    case let .candidates(candidates):
+        return uniqueInstalledTaskApplicationURLV1(candidates: candidates)
+    case .timedOut:
+        return .timedOut
+    case .unavailable:
+        return .unavailable
     }
-    let candidates: [URL] = (0..<MDQueryGetResultCount(query)).compactMap { index in
-        guard let rawItem = MDQueryGetResultAtIndex(query, index) else {
-            return nil
-        }
-        let item = unsafeBitCast(rawItem, to: MDItem.self)
-        guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String,
-              !path.isEmpty else {
-            return nil
-        }
-        return URL(fileURLWithPath: path)
-    }
-    return uniqueInstalledTaskApplicationURLV1(candidates: candidates)
 }
 
-private func installedTaskApplicationURLV1(
+func installedTaskApplicationLookupErrorMessageV1(
+    appName: String,
+    result: InstalledTaskApplicationLookupResultV1
+) -> String? {
+    switch result {
+    case .resolved:
+        return nil
+    case .notFound:
+        return "App '\(appName)' is not installed"
+    case .ambiguous:
+        return "Multiple installed applications exactly match '\(appName)'; use the bundle identifier"
+    case .timedOut:
+        return "Installed application lookup timed out for '\(appName)'; use the bundle identifier"
+    case .unavailable:
+        return "Installed application lookup is unavailable for '\(appName)'; use the bundle identifier"
+    }
+}
+
+private func installedTaskApplicationLookupV1(
     appName: String,
     expectedBundleID: String? = nil
-) -> URL? {
+) -> InstalledTaskApplicationLookupResultV1 {
     if let expectedBundleID, !expectedBundleID.isEmpty,
        let url = NSWorkspace.shared.urlForApplication(
            withBundleIdentifier: expectedBundleID) {
-        return url
+        return .resolved(url)
     }
     let requested = appName.trimmingCharacters(in: .whitespacesAndNewlines)
     if !requested.isEmpty,
        let url = NSWorkspace.shared.urlForApplication(
            withBundleIdentifier: requested) {
-        return url
+        return .resolved(url)
     }
     if let path = NSWorkspace.shared.fullPath(forApplication: requested) {
-        return URL(fileURLWithPath: path)
+        return .resolved(URL(fileURLWithPath: path))
     }
-    return localizedInstalledTaskApplicationURLV1(appName: requested)
+    return localizedInstalledTaskApplicationLookupV1(appName: requested)
 }
 
 private func openExactTaskApplicationV1(
@@ -245,9 +364,20 @@ struct FocusManager {
                     pid: Int(running.processIdentifier)),
                 nil)
         }
-        guard taskAppIdentityNeedsInstalledLookupV1(resolution.selection),
-              let applicationURL = installedTaskApplicationURLV1(appName: appName),
-              let bundle = Bundle(url: applicationURL),
+        guard taskAppIdentityNeedsInstalledLookupV1(resolution.selection) else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: "App '\(appName)' is not installed"))
+        }
+        let lookup = installedTaskApplicationLookupV1(appName: appName)
+        guard case let .resolved(applicationURL) = lookup else {
+            return (nil, ErrorInfo(
+                code: -1,
+                message: installedTaskApplicationLookupErrorMessageV1(
+                    appName: appName,
+                    result: lookup) ?? "App '\(appName)' is not installed"))
+        }
+        guard let bundle = Bundle(url: applicationURL),
               let bundleID = bundle.bundleIdentifier,
               !bundleID.isEmpty else {
             return (nil, ErrorInfo(
@@ -314,12 +444,15 @@ struct FocusManager {
         }
 
         if target == nil {
-            guard let applicationURL = installedTaskApplicationURLV1(
+            let lookup = installedTaskApplicationLookupV1(
                 appName: appName,
-                expectedBundleID: expectedBundleID) else {
+                expectedBundleID: expectedBundleID)
+            guard case let .resolved(applicationURL) = lookup else {
                 return (nil, ErrorInfo(
                     code: -1,
-                    message: "App '\(appName)' is not installed"))
+                    message: installedTaskApplicationLookupErrorMessageV1(
+                        appName: appName,
+                        result: lookup) ?? "App '\(appName)' is not installed"))
             }
             let (launched, launchError) = openExactTaskApplicationV1(
                 at: applicationURL,

@@ -2234,8 +2234,13 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 		content: "must not run",
 	}
 	callCount := 0
+	var finalRequest client.CompletionRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
+		var request client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
 		switch callCount {
 		case 1:
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
@@ -2247,6 +2252,7 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 				toolCall("browser_navigate", `{"url":"https://example.com"}`),
 				10, 5))
 		case 3:
+			finalRequest = request
 			json.NewEncoder(w).Encode(nativeResponse(
 				"Stopped until the app target is supplied.",
 				"end_turn", nil, 10, 5,
@@ -2283,6 +2289,79 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 			browserNavigate.runs,
 		)
 	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript, "initial_target_required") ||
+		strings.Contains(transcript, "corrected_app_retry_rejected") {
+		t.Fatalf("alternate call consumed the corrected-app retry: %s", transcript)
+	}
+}
+
+func TestAgentLoop_AlternateCallDoesNotConsumeCorrectedAppRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		toolName string
+		args     string
+	}{
+		{name: "browser", toolName: "browser_navigate", args: `{"url":"https://example.com"}`},
+		{name: "tool search", toolName: "tool_search", args: `{"query":"browser desktop control"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			computerUse := &mockComputerUseRecoveryTool{}
+			alternate := &mockCountingTool{name: tc.toolName, content: "must not run"}
+			callCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callCount++
+				switch callCount {
+				case 1:
+					json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+						toolCall("computer_use", `{"task":"open the browser","description":"open browser"}`),
+						10, 5))
+				case 2:
+					response := nativeResponse("", "tool_use", nil, 10, 5)
+					response.ToolCalls = []client.FunctionCall{
+						*toolCall(tc.toolName, tc.args),
+						*toolCall("computer_use", `{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+					}
+					json.NewEncoder(w).Encode(response)
+				case 3:
+					json.NewEncoder(w).Encode(nativeResponse(
+						"Browser task completed.", "end_turn", nil, 10, 5))
+				default:
+					t.Errorf("unexpected LLM call %d", callCount)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+
+			reg := NewToolRegistry()
+			reg.Register(computerUse)
+			reg.Register(alternate)
+			loop := NewAgentLoop(
+				client.NewGatewayClient(server.URL, ""),
+				reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+			)
+			result, _, err := loop.Run(
+				context.Background(),
+				"Use computer use to open a browser",
+				nil,
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if result != "Browser task completed." ||
+				computerUse.runs != 2 || alternate.runs != 0 || callCount != 3 {
+				t.Fatalf(
+					"result=%q computer runs=%d alternate runs=%d calls=%d",
+					result, computerUse.runs, alternate.runs, callCount,
+				)
+			}
+		})
+	}
 }
 
 func TestAgentLoop_MalformedCorrectedAppCallConsumesRetry(t *testing.T) {
@@ -2302,10 +2381,14 @@ func TestAgentLoop_MalformedCorrectedAppCallConsumesRetry(t *testing.T) {
 					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
 				10, 5))
 		case 2:
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("computer_use",
+			response := nativeResponse("", "tool_use", nil, 10, 5)
+			response.ToolCalls = []client.FunctionCall{
+				*toolCall("computer_use",
 					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
-				10, 5))
+				*toolCall("computer_use",
+					`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+			}
+			json.NewEncoder(w).Encode(response)
 		case 3:
 			finalRequest = request
 			encoded, err := json.Marshal(request.Messages)

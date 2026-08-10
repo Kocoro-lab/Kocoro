@@ -6083,13 +6083,17 @@ iterationLoop:
 				blockedRepeatedComputerUse || blockedBesideComputerUse {
 				blocked := alternateDesktopControlBlockedResult()
 				if blockedByMissingComputerUseApps {
-					blocked = computerUseAppsCorrectionRejectedResult()
-					// The retry allowance is consumed by this malformed correction.
-					// Close every desktop-control path now instead of advertising a
-					// correction the same run would keep rejecting.
-					computerUseOwnsTurn = true
-					computerUseNeedsApps = false
-					computerUseAlternateOnly = false
+					if fc.Name == "computer_use" {
+						blocked = computerUseAppsCorrectionRejectedResult()
+						// The retry allowance is consumed by this malformed correction.
+						// Close every desktop-control path now instead of advertising a
+						// correction the same run would keep rejecting.
+						computerUseOwnsTurn = true
+						computerUseNeedsApps = false
+						computerUseAlternateOnly = false
+					} else {
+						blocked = computerUseAppsRequiredResult()
+					}
 				} else if blockedRepeatedComputerUse {
 					blocked = computerUseRetryBlockedResult()
 				}

@@ -89,6 +89,16 @@ func computerUseAppsCorrectionRejectedResult() ToolResult {
 	}
 }
 
+func computerUseAppsRequiredResult() ToolResult {
+	return ToolResult{
+		Content: "computer_use_error: initial_target_required\n" +
+			"message: the previous computer_use call attempted no desktop action because it lacked a safe initial app target\n" +
+			"recovery: retry computer_use with the relevant controlled app names in controlled_apps and an explicit foreground_policy; alternate desktop-control tools remain blocked",
+		IsError:       true,
+		ErrorCategory: ErrCategoryBusiness,
+	}
+}
+
 func computerUseRetryBlockedResult() ToolResult {
 	return ToolResult{
 		Content: "computer_use_error: repeated_goal_task_blocked\n" +
