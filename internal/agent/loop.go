@@ -877,13 +877,14 @@ type AgentLoop struct {
 	// includes the real prompt — so those drivers must add this on top of the
 	// overhead or their budgets over-allocate by the whole prompt. 0 until the
 	// first Run. Atomic for the same daemon-concurrency exposure as above.
-	lastSystemPromptEst atomic.Int64
-	memoryDir           string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
-	projectEntityDir    string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
-	stickyContext       string             // session-scoped facts injected verbatim into system prompt; never truncated
-	outputFormat        string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
-	responseDetail      string             // "concise" / "balanced" / "detailed" — rendered in BP3 StableContext
-	userFilePaths       []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
+	lastSystemPromptEst    atomic.Int64
+	memoryDir              string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
+	projectEntityDir       string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
+	stickyContext          string             // session-scoped facts injected verbatim into system prompt; never truncated
+	outputFormat           string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	responseDetail         string             // "concise" / "balanced" / "detailed" — rendered in BP3 StableContext
+	suppressResponseDetail bool               // internal structured-output lanes omit natural-language answer guidance
+	userFilePaths          []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
 	// alwaysAllowTools is the per-agent persisted set loaded from the agent's
 	// permissions.always_allow_tools config. Sourced from
 	// internal/agents/loader.go AgentPermissionsConfig and injected by the
@@ -1977,6 +1978,12 @@ func (a *AgentLoop) SetEffortTier(tier string) {
 // balanced defensively if an invalid transient value reaches this boundary.
 func (a *AgentLoop) SetResponseDetail(detail string) {
 	a.responseDetail = detail
+}
+
+// SetSuppressResponseDetail excludes natural-language answer-style guidance
+// from internal loops with a strict machine-readable response contract.
+func (a *AgentLoop) SetSuppressResponseDetail(suppress bool) {
+	a.suppressResponseDetail = suppress
 }
 
 // SetServiceTier sets the process-global OpenAI processing lane. The request
@@ -3215,23 +3222,24 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	localNames, mcpNames, gatewayNames := partitionLiveToolNamesBySource(effTools, toolNames)
 	basePrompt := persona + operationalRulesForToolNames(toolNames) + contrastExamplesCore
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
-		BasePrompt:          basePrompt,
-		Memory:              mem,
-		Instructions:        instrText,
-		LocalToolNames:      localNames,
-		MCPToolNames:        mcpNames,
-		GatewayToolNames:    gatewayNames,
-		DeferredTools:       deferredSummaries,
-		MCPContext:          a.mcpContext,
-		CWD:                 cwd,
-		Skills:              a.agentSkills,
-		MemoryDir:           a.memoryDir,
-		StickyContext:       a.stickyContext,
-		ModelID:             modelID,
-		OutputFormat:        a.outputFormat,
-		ResponseDetail:      a.ResponseDetail(),
-		QuestionUIAvailable: QuestionAskerFrom(ctx) != nil,
-		FastMode:            a.executionProfileID != "",
+		BasePrompt:             basePrompt,
+		Memory:                 mem,
+		Instructions:           instrText,
+		LocalToolNames:         localNames,
+		MCPToolNames:           mcpNames,
+		GatewayToolNames:       gatewayNames,
+		DeferredTools:          deferredSummaries,
+		MCPContext:             a.mcpContext,
+		CWD:                    cwd,
+		Skills:                 a.agentSkills,
+		MemoryDir:              a.memoryDir,
+		StickyContext:          a.stickyContext,
+		ModelID:                modelID,
+		OutputFormat:           a.outputFormat,
+		ResponseDetail:         a.ResponseDetail(),
+		SuppressResponseDetail: a.suppressResponseDetail,
+		QuestionUIAvailable:    QuestionAskerFrom(ctx) != nil,
+		FastMode:               a.executionProfileID != "",
 	})
 
 	// Append cloud delegation guidance and cloud-specific contrast example

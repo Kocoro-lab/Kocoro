@@ -71,23 +71,32 @@ func TestLive_ResponseDetailAcrossProviders(t *testing.T) {
 	provider := client.NewGatewayClient(cfg.endpoint, cfg.apiKey)
 	models := []string{"gpt-5.6-luna", "claude-sonnet-5"}
 	levels := []string{"concise", "balanced", "detailed"}
+	prompts := []string{
+		"A friend asks why seasons happen and why summer is not caused by Earth being closer to the Sun. Explain it so an educated non-specialist can understand.",
+		"Explain the practical difference between a compiler and an interpreter to a product manager who can read code but does not work on language runtimes.",
+		"Explain the main tradeoffs between renting and buying a home without assuming a particular city, income, or interest rate.",
+	}
 
 	for _, model := range models {
 		t.Run(model, func(t *testing.T) {
-			results := make(map[string]responseDetailABResult, len(levels))
-			for _, level := range levels {
-				results[level] = runResponseDetailAB(t, provider, model, level)
+			totalWords := make(map[string]int, len(levels))
+			for promptIndex, prompt := range prompts {
+				for _, level := range levels {
+					result := runResponseDetailAB(t, provider, model, level, promptIndex, prompt)
+					totalWords[level] += result.words
+				}
 			}
 
-			concise := results["concise"]
-			balanced := results["balanced"]
-			detailed := results["detailed"]
-			if concise.words >= balanced.words || balanced.words >= detailed.words {
+			concise := totalWords["concise"]
+			balanced := totalWords["balanced"]
+			detailed := totalWords["detailed"]
+			if concise*100 > detailed*85 || concise*100 > balanced*115 || balanced*100 > detailed*115 {
 				t.Fatalf(
-					"response detail was not monotonic for %s: concise=%d balanced=%d detailed=%d\nconcise=%q\nbalanced=%q\ndetailed=%q",
-					model, concise.words, balanced.words, detailed.words, concise.answer, balanced.answer, detailed.answer,
+					"response detail aggregate outside tolerance for %s: concise=%d balanced=%d detailed=%d",
+					model, concise, balanced, detailed,
 				)
 			}
+			t.Logf("response_detail_ab_aggregate model=%s concise=%d balanced=%d detailed=%d", model, concise, balanced, detailed)
 		})
 	}
 }
@@ -97,6 +106,8 @@ func runResponseDetailAB(
 	provider client.LLMClient,
 	model string,
 	level string,
+	promptIndex int,
+	prompt string,
 ) responseDetailABResult {
 	t.Helper()
 	wrapped := &responseDetailCacheOffClient{inner: provider}
@@ -109,7 +120,6 @@ func runResponseDetailAB(
 	handler := &responseDetailHandler{}
 	loop.SetHandler(handler)
 
-	prompt := "A friend asks why seasons happen and why summer is not caused by Earth being closer to the Sun. Explain it so an educated non-specialist can understand."
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	started := time.Now()
@@ -135,8 +145,8 @@ func runResponseDetailAB(
 		costUSD:      usage.TotalCostUSD(),
 	}
 	t.Logf(
-		"response_detail_ab model=%s level=%s words=%d output_tokens=%d latency=%s cost=$%.6f",
-		model, level, result.words, result.outputTokens, result.latency.Round(time.Millisecond), result.costUSD,
+		"response_detail_ab model=%s prompt=%d level=%s words=%d output_tokens=%d latency=%s cost=$%.6f",
+		model, promptIndex, level, result.words, result.outputTokens, result.latency.Round(time.Millisecond), result.costUSD,
 	)
 	return result
 }

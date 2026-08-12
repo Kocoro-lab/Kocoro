@@ -2132,6 +2132,44 @@ func TestRunAgent_Success_PopulatesMessageIndices(t *testing.T) {
 	}
 }
 
+func TestRunAgent_GlobalResponseDetailReachesProviderPrompt(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "concise reply"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.Config.Agent.ResponseDetail = "concise"
+	defer deps.SessionCache.CloseAll()
+
+	_, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "hi",
+		Source:        "desktop",
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent error: %v", err)
+	}
+	requests := gw.requests()
+	if len(requests) == 0 {
+		t.Fatal("gateway captured no completion request")
+	}
+	found := false
+	for _, request := range requests {
+		for _, message := range request.Messages {
+			if strings.Contains(message.Content.Text(), `<response_detail level="concise">`) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("global response detail missing from provider prompt: %+v", requests)
+	}
+}
+
 // Hard-error path: RunAgent today returns (nil, err); after this task it
 // must return (&RunAgentResult{SessionID, MessageStartIndex, MessageEndIndex,
 // FailureCode}, err) so the scheduler can stamp LastRun on partial transcripts.

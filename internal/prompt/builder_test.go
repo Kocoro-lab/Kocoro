@@ -1292,6 +1292,21 @@ func TestBuildSystemPrompt_ResponseDetailDoesNotChangeBP1(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPrompt_ResponseDetailCanBeSuppressedForStructuredInternalLane(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{
+		BasePrompt:             "Base.",
+		StickyContext:          "Return exactly one JSON object.",
+		ResponseDetail:         "detailed",
+		SuppressResponseDetail: true,
+	})
+	if strings.Contains(parts.StableContext, "response_detail") {
+		t.Fatalf("structured internal lane received response-detail guidance: %q", parts.StableContext)
+	}
+	if !strings.Contains(parts.StableContext, "Return exactly one JSON object.") {
+		t.Fatalf("suppression dropped unrelated stable context: %q", parts.StableContext)
+	}
+}
+
 // TestBuildSystemPrompt_CommunicatingSection_Present verifies the static
 // system prompt includes the user-communication section that instructs the
 // model to emit preamble text blocks. Asserts the section header and several

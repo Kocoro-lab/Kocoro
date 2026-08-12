@@ -2280,7 +2280,11 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		hasSafeNavigationRecoveryInstructions := false
 		hasSelfContainedInspectionResultInstructions := false
 		hasControlledAppSwitchInstructions := false
+		hasResponseDetailGuidance := false
 		for _, message := range request.Messages {
+			if strings.Contains(message.Content.Text(), "<response_detail") {
+				hasResponseDetailGuidance = true
+			}
 			if strings.Contains(
 				message.Content.Text(),
 				"execution_role=private_openai_native_computer",
@@ -2389,6 +2393,9 @@ func TestOpenAIComputerTaskToolKeepsParentOutOfClickTypeAndAppSwitchLoop(t *test
 		}
 		if !hasControlledAppSwitchInstructions {
 			t.Fatalf("child request %d lacks controlled-app switch instructions", index)
+		}
+		if hasResponseDetailGuidance {
+			t.Fatalf("child request %d received natural-language response-detail guidance", index)
 		}
 	}
 	if blocks := llm.requests[0].Messages[len(llm.requests[0].Messages)-1].Content.Blocks(); len(blocks) != 2 || blocks[1].Type != "image" {
