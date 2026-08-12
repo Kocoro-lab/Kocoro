@@ -224,7 +224,7 @@ func buildStaticSystem(opts PromptOptions) string {
 
 	if promptHasAnyTool(opts) {
 		sb.WriteString("\n\n## Tool Use\n")
-		sb.WriteString("The tools[] schemas are the capability and argument source of truth. Use the narrowest suitable tool, batch independent safe reads in one response, and sequence dependent or state-changing calls. If a tool has a user-facing description or purpose field, write it in the reply language and describe the outcome rather than the mechanism.")
+		sb.WriteString("The tools[] schemas are the capability and argument source of truth. Use the narrowest suitable tool, batch independent safe reads in one response, and sequence dependent or state-changing calls. If a tool has a user-facing description or purpose field, describe the outcome rather than the mechanism; the Language directive already governs the language it is written in.")
 	}
 
 	if promptHasTool(opts, "ask_user_question") {

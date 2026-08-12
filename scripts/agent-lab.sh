@@ -5,13 +5,12 @@ export PYTHONDONTWRITEBYTECODE=1
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 lane="${AGENT_LAB_LANE:-offline}"
 output_dir="${1:-${TMPDIR:-/tmp}/kocoro-agent-lab/$lane}"
-pkg_config_path="${PKG_CONFIG_PATH:-/opt/homebrew/lib/pkgconfig}"
 mkdir -p "$output_dir"
 
 case "$lane" in
-  offline|routing_live|selector_live|provider_live|prompt_live|memory_live|quality_live|provider_release) ;;
+  offline|provider_live|quality_live|provider_release) ;;
   *)
-    echo "AGENT_LAB_LANE must be offline, routing_live, selector_live, provider_live, prompt_live, memory_live, quality_live, or provider_release" >&2
+    echo "AGENT_LAB_LANE must be offline, provider_live, quality_live, or provider_release" >&2
     exit 2
     ;;
 esac
@@ -56,51 +55,14 @@ run_offline_lane() {
     -run '^TestOffline_AgentLab(GeneralPurposePromptContract|LongReadTrajectoryReachesOutcome|CompactionPersistsAcrossRestart|InterruptedTrajectoryResumesWithoutReplay)$' \
     -count=1 -v
   run_check harness_self_test go test ./test/e2e \
-    -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|PromptVariantRunnerRequiresExplicitPaidGate|ProviderQualificationRejectsUndersizedReleaseSample)$' \
+    -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|AgentLabLaneReferencesResolve|ProviderQualificationRejectsUndersizedReleaseSample)$' \
     -count=1 -v
 	  run_check quality_harness_self_test go test ./test/e2e \
 	    -run '^TestOffline_AgentLabQuality(ContractValidators|QualificationFailsClosed|LaneRequiresExplicitPaidGate|LaneRejectsUndersizedReleaseSample)$' \
 	    -count=1 -v
 }
 
-run_routing_lane() {
-  if [[ "${KOE_MODE_CLASSIFIER_E2E:-}" != "1" ]]; then
-    echo "Set KOE_MODE_CLASSIFIER_E2E=1 to authorize the paid routing lane." >&2
-    check_names+=("routing_live")
-    check_statuses+=("2")
-    return
-  fi
-  run_check routing_live env PKG_CONFIG_PATH="$pkg_config_path" \
-    "$repo_dir/scripts/koe-mode-ab.sh" "$output_dir/routing"
-}
 
-run_selector_lane() {
-  if [[ "${KOE_SELECTOR_AGENTLOOP_E2E:-}" != "1" ]]; then
-    echo "Set KOE_SELECTOR_AGENTLOOP_E2E=1 to authorize the paid selector-to-AgentLoop lane." >&2
-    check_names+=("selector_agentloop_live")
-    check_statuses+=("2")
-    return
-  fi
-  local repeats="${KOE_SELECTOR_AGENTLOOP_REPEATS:-3}"
-  if [[ ! "$repeats" =~ ^[0-9]+$ || "$repeats" -lt 3 ]]; then
-    echo "KOE_SELECTOR_AGENTLOOP_REPEATS must be an integer >= 3 for release qualification." >&2
-    check_names+=("selector_agentloop_live")
-    check_statuses+=("2")
-    return
-  fi
-  local daemon_url="${KOE_DAEMON_URL:-http://127.0.0.1:7533}"
-  if ! curl -fsS --max-time 5 "$daemon_url/status" -o "$output_dir/daemon-status.json"; then
-    echo "Koe selector preflight failed: daemon status is unavailable at $daemon_url/status" >&2
-    check_names+=("selector_daemon_preflight")
-    check_statuses+=("2")
-    return
-  fi
-  run_check selector_agentloop_live env \
-    KOE_SELECTOR_AGENTLOOP_E2E=1 \
-    PKG_CONFIG_PATH="$pkg_config_path" \
-    go test ./internal/koe -run '^TestKoeSelectorToAgentLoopTextE2E$' \
-    -count="$repeats" -v -timeout=10m
-}
 
 run_provider_lane() {
   local required_sample="${1:-smoke}"
@@ -121,38 +83,7 @@ run_provider_lane() {
     "$output_dir/provider"
 }
 
-run_prompt_lane() {
-  if [[ "${KOCORO_PROMPT_VARIANTS_LIVE:-}" != "1" ]]; then
-    echo "Set KOCORO_PROMPT_VARIANTS_LIVE=1 to authorize the paid prompt comparison." >&2
-    check_names+=("prompt_variants_live")
-    check_statuses+=("2")
-    return
-  fi
-  run_check prompt_variants_live \
-    "$repo_dir/scripts/kocoro-prompt-variants.sh" \
-    "$output_dir/prompt-variants"
-}
 
-run_memory_lane() {
-  if [[ "${SHANNON_E2E_LIVE:-}" != "1" ]]; then
-    echo "Set SHANNON_E2E_LIVE=1 to authorize the paid memory A/B lane." >&2
-    check_names+=("memory_recall_ab_live")
-    check_statuses+=("2")
-    return
-  fi
-  local repetitions="${KOCORO_MEMORY_AB_REPETITIONS:-3}"
-  if [[ ! "$repetitions" =~ ^[0-9]+$ || "$repetitions" -lt 1 || "$repetitions" -gt 10 ]]; then
-    echo "KOCORO_MEMORY_AB_REPETITIONS must be an integer from 1 through 10." >&2
-    check_names+=("memory_recall_ab_live")
-    check_statuses+=("2")
-    return
-  fi
-  run_check memory_recall_ab_live env \
-    SHANNON_E2E_LIVE=1 \
-    KOCORO_MEMORY_AB_REPETITIONS="$repetitions" \
-    KOCORO_MEMORY_AB_OUTPUT="$output_dir/memory-recall-ab.json" \
-    go test ./test/e2e -run '^TestLive_MemoryRecallPreflightAB$' -count=1 -v
-}
 
 run_quality_lane() {
   if [[ "${KOCORO_AGENT_LAB_QUALITY_LIVE:-}" != "1" ]]; then
@@ -206,20 +137,8 @@ case "$lane" in
   offline)
     run_offline_lane
     ;;
-  routing_live)
-    run_routing_lane
-    ;;
-  selector_live)
-    run_selector_lane
-    ;;
   provider_live)
     run_provider_lane smoke
-    ;;
-  prompt_live)
-    run_prompt_lane
-    ;;
-  memory_live)
-    run_memory_lane
     ;;
   quality_live)
     run_quality_lane
@@ -227,8 +146,6 @@ case "$lane" in
   provider_release)
     if run_release_source_preflight; then
       run_offline_lane
-      run_routing_lane
-      run_selector_lane
       run_provider_lane release
     fi
     ;;

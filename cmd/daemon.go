@@ -56,6 +56,7 @@ var daemonStartCmd = &cobra.Command{
 		detach, _ := cmd.Flags().GetBool("detach")
 		force, _ := cmd.Flags().GetBool("force")
 		isolated, _ := cmd.Flags().GetBool("isolated")
+		isolatedMCP, _ := cmd.Flags().GetString("isolated-mcp")
 		port, _ := cmd.Flags().GetInt("port")
 		stateDir, _ := cmd.Flags().GetString("state-dir")
 		rpcSockPath, _ := cmd.Flags().GetString("rpc-socket")
@@ -65,6 +66,9 @@ var daemonStartCmd = &cobra.Command{
 			rpcSockPath, rpcPidfilePath,
 		); err != nil {
 			return err
+		}
+		if !isolated && strings.TrimSpace(isolatedMCP) != "" {
+			return fmt.Errorf("daemon: --isolated-mcp requires --isolated")
 		}
 		if isolated {
 			if err := config.SetShannonDirOverrideForProcess(stateDir); err != nil {
@@ -348,7 +352,12 @@ var daemonStartCmd = &cobra.Command{
 		}()
 
 		if isolated {
-			log.Print(daemon.IsolationMarkerMCPDisabled)
+			if allowed := restrictMCPServersToAllowlist(cfg, isolatedMCP); len(allowed) > 0 {
+				log.Printf("%s %s", daemon.IsolationMarkerMCPAllowlisted, strings.Join(allowed, ","))
+				startDaemonMCPServices(ctx, deps, mcpMgr, startMCP, auditor)
+			} else {
+				log.Print(daemon.IsolationMarkerMCPDisabled)
+			}
 		} else {
 			startDaemonMCPServices(ctx, deps, mcpMgr, startMCP, auditor)
 		}
@@ -747,6 +756,35 @@ func acquireDaemonPIDFile(shannonDir string) (*daemon.PIDFile, error) {
 		return nil, fmt.Errorf("create daemon state directory: %w", err)
 	}
 	return daemon.AcquirePIDFile(filepath.Join(shannonDir, "daemon.pid"))
+}
+
+// restrictMCPServersToAllowlist narrows an isolated run's MCP servers to the
+// comma-separated names in --isolated-mcp, disabling every other configured
+// server in place. It returns the names actually kept (sorted), or nil when the
+// flag is empty or nothing matched — nil means the caller keeps MCP fully off,
+// so a typo fails closed to the previous behavior rather than silently starting
+// every server the developer has configured.
+func restrictMCPServersToAllowlist(cfg *config.Config, allowlist string) []string {
+	requested := map[string]bool{}
+	for _, name := range strings.Split(allowlist, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			requested[name] = true
+		}
+	}
+	if len(requested) == 0 || cfg == nil {
+		return nil
+	}
+	var kept []string
+	for name, serverCfg := range cfg.MCPServers {
+		if requested[name] && !serverCfg.Disabled {
+			kept = append(kept, name)
+			continue
+		}
+		serverCfg.Disabled = true
+		cfg.MCPServers[name] = serverCfg
+	}
+	sort.Strings(kept)
+	return kept
 }
 
 func validateDaemonStartMode(isolated, detach, force bool, port int, stateDir, rpcSocket, rpcPIDFile string) error {
@@ -1558,7 +1596,8 @@ func init() {
 	daemonStartCmd.Flags().Int("port", defaultDaemonPort, "Local HTTP port (non-default requires --isolated)")
 	daemonStartCmd.Flags().Bool("isolated", false, "Run a state-isolated daemon for live E2E testing")
 	daemonStartCmd.Flags().String("state-dir", "", "Absolute state directory for isolated live E2E testing")
-	for _, name := range []string{"isolated", "port", "state-dir"} {
+	daemonStartCmd.Flags().String("isolated-mcp", "", "Comma-separated MCP servers to keep enabled in an isolated run (default: none)")
+	for _, name := range []string{"isolated", "port", "state-dir", "isolated-mcp"} {
 		if err := daemonStartCmd.Flags().MarkHidden(name); err != nil {
 			panic(err)
 		}

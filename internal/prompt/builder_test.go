@@ -626,22 +626,33 @@ func TestLanguageDirective_CoversToolDescAndMicroCompact(t *testing.T) {
 			t.Errorf("LanguageDirective() missing 2026-05-22 immunization phrase %q", phrase)
 		}
 	}
+
+	// The System block no longer restates the description-field language rule
+	// (it was the third copy, and the one sitting in the cross-user BP #1
+	// prefix). Both directive branches are now the only carrier of the
+	// 2026-05-22 post-mortem guard, so the locked branch must state it too.
+	if locked := LanguageDirective("日本語"); !strings.Contains(locked, "`description`") {
+		t.Error("locked LanguageDirective() must bind the tool description field to the configured language")
+	}
 }
 
-// TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present verifies the
-// static system prompt contains a top-level "## Tool call descriptions"
-// section that binds every tool's `description` / `purpose` field to the
-// reply language as set by the final Language directive. Companion to the per-turn directive
-// asserted by TestLanguageDirective_CoversToolDescAndMicroCompact — the
-// system-prompt section is the byte-stable cached statement of the rule,
-// the per-turn directive is the live re-anchor. Both must remain present.
-// Regression guard for the 2026-05-22 session-share post-mortem.
+// TestBuildSystemPrompt_ToolDescriptionContract_NotDuplicatedByLanguageRule
+// verifies the System block keeps the CONTENT contract for a tool's
+// `description` / `purpose` field (state the outcome, not the mechanism) while
+// delegating the LANGUAGE of that field to the per-turn Language directive.
+//
+// The System block used to restate the language rule too, making it the third
+// copy after both LanguageDirective branches — and the only one living in the
+// cross-user BP #1 prefix, where it cost every tenant cached tokens to repeat
+// a rule the strongest-recency block already carried. The 2026-05-22
+// session-share post-mortem guard now lives solely in
+// TestLanguageDirective_CoversToolDescAndMicroCompact.
 //
 // Keep the conditional wording because provider-native tools do not expose
 // Kocoro's function parameters. The rollback-compatible legacy `computer`
 // tool is now an ordinary function and follows the same description contract
 // as other approval-required function tools.
-func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
+func TestBuildSystemPrompt_ToolDescriptionContract_NotDuplicatedByLanguageRule(t *testing.T) {
 	parts := BuildSystemPrompt(PromptOptions{
 		BasePrompt:     "Base.",
 		LocalToolNames: []string{"file_read", "bash"},
@@ -650,13 +661,15 @@ func TestBuildSystemPrompt_ToolDescriptionLanguageLock_Present(t *testing.T) {
 	required := []string{
 		"## Tool Use",
 		"user-facing description or purpose field",
-		"reply language",
 		"outcome rather than the mechanism",
 	}
 	for _, phrase := range required {
 		if !strings.Contains(parts.System, phrase) {
-			t.Errorf("system prompt missing tool-description language-lock phrase %q", phrase)
+			t.Errorf("system prompt missing tool-description content contract %q", phrase)
 		}
+	}
+	if strings.Contains(parts.System, "write it in the reply language") {
+		t.Error("system prompt restates the reply-language rule that LanguageDirective already owns")
 	}
 	if strings.Contains(parts.System, "do not invent one for it") {
 		t.Error("system prompt still exempts legacy computer from its function description contract")

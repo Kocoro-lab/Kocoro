@@ -48,48 +48,13 @@ func TestSystemPromptAudit(t *testing.T) {
 	dumpConst(t, "  cloudDelegationGuidance (conditional)", cloudDelegationGuidance)
 	dumpConst(t, "  contrastExamplesCloud (conditional)", contrastExamplesCloud)
 
-	// Default gateway + native-thinking Direct set. The exhaustive production
-	// registration matrix is pinned by tools.TestRegisteredLocalToolExposureMatrix;
-	// `think` is intentionally absent because default native thinking skips it.
-	fullTools := []string{
-		"archive_extract", "archive_inspect", "ask_user_question", "bash", "calculate",
-		"clipboard", "cloud_delegate", "current_time", "directory_list", "docx_to_text",
-		"file_edit", "file_read", "file_write", "glob", "grep", "http", "memory_append",
-		"memory_recall", "notify", "pdf_to_text", "pptx_to_text", "present_deliverable",
-		"schedule_list", "schedule_show", "session_search", "system_info", "tool_search",
-		"use_skill", "xlsx_to_text",
-	}
-	fastTools := []string{
-		"ask_user_question", "bash", "calculate", "clipboard", "current_time", "directory_list",
-		"file_edit", "file_read", "file_write", "glob", "grep", "memory_append", "memory_recall", "notify",
-		"present_deliverable", "schedule_list", "schedule_show", "session_search",
-		"tool_search", "use_skill",
-	}
-	commonDeferred := []prompt.DeferredToolSummary{
-		{Name: "accessibility", Description: "Inspect and interact with macOS accessibility elements."},
-		{Name: "applescript", Description: "Run AppleScript for a supported macOS app workflow."},
-		{Name: "browser", Description: "Use the local browser automation fallback."},
-		{Name: "computer", Description: "Use provider-native computer interaction."},
-		{Name: "computer_use", Description: "Complete a bounded macOS app workflow."},
-		{Name: "ghostty", Description: "Interact with Ghostty terminal windows."},
-		{Name: "process", Description: "Inspect and manage local processes."},
-		{Name: "schedule_create", Description: "Create a scheduled task."},
-		{Name: "schedule_remove", Description: "Remove a scheduled task."},
-		{Name: "schedule_update", Description: "Update a scheduled task."},
-		{Name: "screenshot", Description: "Capture a local screenshot."},
-		{Name: "wait_for", Description: "Wait for a bounded local UI condition."},
-	}
-	fastDeferred := append(append([]prompt.DeferredToolSummary(nil), commonDeferred...), []prompt.DeferredToolSummary{
-		{Name: "archive_extract", Description: "Extract an archive into a destination directory."},
-		{Name: "archive_inspect", Description: "Inspect archive contents without extracting them."},
-		{Name: "cloud_delegate", Description: "Delegate a bounded task to the cloud workflow."},
-		{Name: "docx_to_text", Description: "Extract text from a Word document."},
-		{Name: "http", Description: "Make a bounded HTTP request."},
-		{Name: "pdf_to_text", Description: "Extract text from a PDF."},
-		{Name: "pptx_to_text", Description: "Extract text from a presentation."},
-		{Name: "system_info", Description: "Read local system information."},
-		{Name: "xlsx_to_text", Description: "Extract text from a spreadsheet."},
-	}...)
+	// Tool sets and deferred catalogs live in promptbudget_test.go so the
+	// standing budget guard and this report can never describe different
+	// prompts.
+	fullTools := representativeFullTools()
+	fastTools := representativeFastTools()
+	commonDeferred := representativeCommonDeferred()
+	fastDeferred := representativeFastDeferred()
 	// Compose from the final provider-visible names, matching AgentLoop.Run.
 	// Native thinking keeps think out of this representative request.
 	fullBasePrompt := defaultPersona + operationalRulesForToolNames(fullTools) + contrastExamplesCore
@@ -123,22 +88,10 @@ func TestSystemPromptAudit(t *testing.T) {
 		FastMode:         true,
 	})
 	fullSystem := full.System + cloudDelegationGuidance + contrastExamplesCloud
-	// Budgets were raised from 7200/8000 when three behavior clauses returned
-	// after the harness review: the ask_user_question MUST gate + placeholder-
-	// option ban (Desktop question cards degraded to prose without it), the
-	// mid-task progress-update rule (2026-05 over-silence regression),
-	// and the web/browser empty-result honesty section. Each traces to a
-	// production incident; the budget guards drift, not these clauses.
-	const (
-		fastSystemCharBudget = 8300
-		fullSystemCharBudget = 9100
-	)
-	if len(fast.System) > fastSystemCharBudget {
-		t.Fatalf("representative Koe Fast System is %d chars, budget %d", len(fast.System), fastSystemCharBudget)
-	}
-	if len(fullSystem) > fullSystemCharBudget {
-		t.Fatalf("representative Koe Full System is %d chars, budget %d", len(fullSystem), fullSystemCharBudget)
-	}
+	// Budget enforcement lives in TestRepresentativeSystemPromptStaysWithinBudget
+	// (no build tag) so it runs on every `go test ./...`. This file is a report
+	// generator and must never be the only thing standing between the prompt and
+	// re-inflation.
 	// Representative attended Desktop scenario: full Direct set, question UI
 	// live, markdown output. This is the non-voice Kocoro assembly the
 	// workbench shows next to the two Koe modes.

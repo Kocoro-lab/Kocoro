@@ -211,7 +211,45 @@ func (b *synchronizedBuffer) String() string {
 	return b.b.String()
 }
 
-func startIsolatedLiveDaemon(t *testing.T, bin string) *isolatedLiveDaemon {
+// seedIsolatedDaemonConfig gives the isolated daemon the developer's CLOUD
+// COORDINATES while leaving every piece of real state behind.
+//
+// `--isolated` isolates filesystem state and port ownership; it was never meant
+// to isolate which backend the run talks to. With a bare temp state dir the
+// daemon falls back to the built-in default endpoint plus whatever key the OS
+// credential store holds — so on a machine pointed at a local Cloud stack every
+// live daemon test died with `401 Invalid token`. That was invisible while the
+// suite required SHANNON_E2E_LIVE=1 to run at all.
+//
+// Only endpoint and api_key are copied. Agents, sessions, MCP servers,
+// schedules, and skills stay empty, so the isolation contract is unchanged.
+// auto_approve is set because these runs have no approval UI attached; without
+// it a tool-using test blocks until its timeout.
+//
+// Model settings are deliberately NOT copied. A behavior contract has to mean
+// the same thing on every developer's machine, and agent.model / effort_tier /
+// language are personal choices — measuring this suite against them would make
+// a run's verdict depend on whose laptop it executed on. This was not
+// hypothetical: the same progress-note probe scored 6/6 under one developer's
+// pinned model and 2/8 under the product defaults, so a threshold calibrated on
+// the former would have failed everyone else. These runs therefore exercise the
+// defaults the product actually ships.
+func seedIsolatedDaemonConfig(t *testing.T, stateDir string, extraYAML ...string) {
+	t.Helper()
+	endpoint, apiKey := readCloudConfig(t)
+	if endpoint == "" || apiKey == "" {
+		t.Skip("live E2E skipped: no endpoint/api_key in ~/.shannon/config.yaml")
+	}
+	config := fmt.Sprintf("endpoint: %q\napi_key: %q\ndaemon:\n  auto_approve: true\n", endpoint, apiKey)
+	for _, extra := range extraYAML {
+		config += extra
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte(config), 0o600); err != nil {
+		t.Fatalf("seed isolated daemon config: %v", err)
+	}
+}
+
+func startIsolatedLiveDaemon(t *testing.T, bin string, extraConfigYAML ...string) *isolatedLiveDaemon {
 	t.Helper()
 	port := 0
 	for port == 0 || port == 7533 {
@@ -226,6 +264,7 @@ func startIsolatedLiveDaemon(t *testing.T, bin string) *isolatedLiveDaemon {
 	}
 
 	stateDir := t.TempDir()
+	seedIsolatedDaemonConfig(t, stateDir, extraConfigYAML...)
 	daemon := &isolatedLiveDaemon{baseURL: fmt.Sprintf("http://127.0.0.1:%d", port)}
 	cmd := exec.Command(
 		bin, "daemon", "start", "--isolated",
@@ -295,10 +334,17 @@ func waitForDaemon(t *testing.T, daemon *isolatedLiveDaemon, timeout time.Durati
 func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout time.Duration) {
 	t.Helper()
 	want := []string{
-		daemonpkg.IsolationMarkerMCPDisabled,
 		daemonpkg.IsolationMarkerAutomationDisabled,
 		daemonpkg.IsolationMarkerCloudWSSuppressed,
 		daemonpkg.IsolationMarkerBackgroundDisabled,
+	}
+	// MCP is either fully off or narrowed to an --isolated-mcp allowlist. Both
+	// are contained startups, so accept either marker — but require one of
+	// them, so a build that silently stopped emitting an MCP decision (and
+	// therefore might be connecting to every configured server) still fails.
+	mcpMarkers := []string{
+		daemonpkg.IsolationMarkerMCPDisabled,
+		daemonpkg.IsolationMarkerMCPAllowlisted,
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -309,6 +355,16 @@ func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout t
 				complete = false
 				break
 			}
+		}
+		if complete {
+			sawMCPDecision := false
+			for _, marker := range mcpMarkers {
+				if strings.Contains(log, marker) {
+					sawMCPDecision = true
+					break
+				}
+			}
+			complete = sawMCPDecision
 		}
 		if complete {
 			return
