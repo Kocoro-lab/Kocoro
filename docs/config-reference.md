@@ -78,6 +78,7 @@ agent:
   model_tier: ""                   # tier override (medium | large); empty = inherit global model_tier. "small" reserved for daemon-internal calls — do not pin via UI.
   reasoning_effort: ""             # "low" / "medium" / "high" (empty = model default)
   effort_tier: ""                  # unified intent: low | high | xhigh | max (empty = provider default)
+  response_detail: balanced         # final-answer style: concise | balanced | detailed; independent of reasoning effort
   service_tier: ""                 # global OpenAI processing: "" | default | fast; pair with an exact OpenAI model
   context_window: 1_000_000        # seed; auto-adjusted from observed model. Per-agent override locks the cap. (Ollama callers clamp to 200K — see ContextWindowFloorForProvider.)
 

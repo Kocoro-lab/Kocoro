@@ -1307,6 +1307,13 @@ func TestBuildSystemPrompt_ResponseDetailCanBeSuppressedForStructuredInternalLan
 	}
 }
 
+func TestBuildSystemPrompt_ResponseDetailWordBudgetIsLanguageNeutral(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{ResponseDetail: "concise"})
+	if !strings.Contains(parts.StableContext, "not as a character limit") {
+		t.Fatalf("response-detail guidance does not define equivalent-length semantics: %q", parts.StableContext)
+	}
+}
+
 // TestBuildSystemPrompt_CommunicatingSection_Present verifies the static
 // system prompt includes the user-communication section that instructs the
 // model to emit preamble text blocks. Asserts the section header and several

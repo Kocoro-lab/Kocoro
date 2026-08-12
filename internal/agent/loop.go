@@ -2611,6 +2611,8 @@ func (a *AgentLoop) SwitchAgent(basePrompt string, memoryDir string, reg *ToolRe
 	// previous agent's state.
 	a.alwaysAllowTools = nil
 	a.responseLanguage = "" // re-injected by SetResponseLanguage(global) + per-agent overlay
+	// responseDetail intentionally survives here: daemon callers inject it
+	// after SwitchAgent, while the TUI and one-shot CLI inject it before.
 	// The tool registry just changed and its schema mass is the dominant term
 	// of the estimator calibration — a stale sample from a schema-heavy agent
 	// would over-compact the new agent's first iterations.

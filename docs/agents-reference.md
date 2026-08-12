@@ -52,6 +52,7 @@ mcp_servers:
 agent:
   model: "claude-sonnet-4-6"
   model_tier: "large"               # optional; medium | large. Omit to inherit global model_tier. `agent.model` (specific id) wins over `agent.model_tier` when both are set. ("small" is a daemon-internal sub-tier for skill discovery / micro-compaction; do not pin it via per-agent override.)
+  response_detail: "concise"         # optional; concise | balanced | detailed. Omit or set empty to inherit the global final-answer style.
   max_iterations: 10                # optional stricter emergency fuse for this agent
   temperature: 0.2
   max_tokens: 16000

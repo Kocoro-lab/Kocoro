@@ -384,6 +384,7 @@ func responseDetailBlock(level string) string {
 	}
 
 	return "<system-reminder>\n<response_detail level=\"" + level + "\">\n" + guidance + " " +
+		"For languages without whitespace-delimited words, treat the word count as equivalent-length guidance, not as a character limit. " +
 		"A specific response length, structure, or format requested by the user overrides this preference. Do not shorten requested code, documents, translations, or other produced artifacts.\n" +
 		"</response_detail>\n</system-reminder>"
 }
