@@ -1699,7 +1699,13 @@ type ServerDeps struct {
 	Registry             *agent.ToolRegistry
 	MCPManager           *mcp.ClientManager  // live MCP connections; swapped on reload
 	Supervisor           *mcp.Supervisor     // MCP health supervisor; swapped on reload
-	Cleanup              func()              // closes MCP connections; swapped on reload
+	// MCPReconnect schedules bounded retries for servers whose async connect
+	// failed. Owned by the MCPManager generation that spawned it, so it is
+	// swapped (and the old one stopped) alongside MCPManager on reload —
+	// letting a superseded ladder keep firing would resurrect connections on
+	// a manager nothing can reach.
+	MCPReconnect *mcp.ReconnectScheduler
+	Cleanup      func() // closes MCP connections; swapped on reload
 	BaselineReg          *agent.ToolRegistry // local-only tools; refreshed on reload
 	GatewayOverlay       []agent.Tool        // cached gateway tools; refreshed on reload
 	PostOverlays         []agent.Tool        // cloud_delegate etc.; refreshed on reload
@@ -1790,7 +1796,14 @@ func (d *ServerDeps) ShutdownCleanup() {
 	d.mu.Lock()
 	cleanup := d.Cleanup
 	d.Cleanup = nil
+	// Cancel pending MCP reconnects before closing connections, so a timer
+	// cannot respawn a subprocess the cleanup is about to reap.
+	reconnect := d.MCPReconnect
+	d.MCPReconnect = nil
 	d.mu.Unlock()
+	if reconnect != nil {
+		reconnect.Stop()
+	}
 	if cleanup != nil {
 		cleanup()
 	}

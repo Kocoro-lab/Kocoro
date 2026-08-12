@@ -7346,6 +7346,23 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 	}
 	capturedSup := sup
 	capturedMgr := mgr
+	// This call IS the user's explicit retry signal, so re-arm every server it
+	// covers: one that already burned through its automatic attempts must get
+	// a fresh streak rather than being permanently written off.
+	for name := range retry {
+		s.deps.ForgetMCPReconnect(name)
+	}
+	onResult := buildMCPConnectResult(s.deps.liveMCPReconnectSink(), MCPConnectHooks{
+		IsCurrent: func() bool {
+			_, _, depsSup := s.deps.Snapshot()
+			return depsSup == capturedSup
+		},
+		AuditFail: s.auditMCPConnectFailure,
+		OnConnected: func(name string) {
+			capturedSup.ProbeNow(name)
+			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+		},
+	})
 	go func() {
 		// Final stale-check before spawning subprocesses: a fast follow-up
 		// reload may have swapped deps between scheduling this goroutine
@@ -7355,20 +7372,7 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 		if depsSup != capturedSup {
 			return
 		}
-		capturedMgr.StartConnectAll(s.ctx, retry, defaultTimeout, func(name string, connErr error) {
-			_, _, depsSup := s.deps.Snapshot()
-			if depsSup != capturedSup {
-				return // deps swapped by a newer reload — drop stale result.
-			}
-			if connErr != nil {
-				log.Printf("[mcp] %s: reload retry failed: %v", name, connErr)
-				s.auditMCPConnectFailure(name, connErr)
-				return
-			}
-			log.Printf("[mcp] %s: reload retry succeeded; probing supervisor", name)
-			capturedSup.ProbeNow(name)
-			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
-		})
+		capturedMgr.StartConnectAll(s.ctx, retry, defaultTimeout, onResult)
 	}()
 }
 
@@ -7538,20 +7542,21 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		if startMCP != nil {
 			capturedSupervisor := newSupervisor
 			capturedMgr := newMCPMgr
-			go startMCP(s.ctx, func(name string, connErr error) {
-				_, _, depsSup := s.deps.Snapshot()
-				if depsSup != capturedSupervisor {
-					return // deps swapped by a newer reload — drop result.
-				}
-				if connErr != nil {
-					log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
-					s.auditMCPConnectFailure(name, connErr)
-					return
-				}
-				log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
-				capturedSupervisor.ProbeNow(name)
-				tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+			onResult, scheduler := NewMCPReconnectWiring(s.ctx, capturedMgr, MCPConnectTimeout(newCfg), MCPConnectHooks{
+				IsCurrent: func() bool {
+					_, _, depsSup := s.deps.Snapshot()
+					return depsSup == capturedSupervisor
+				},
+				AuditFail: s.auditMCPConnectFailure,
+				OnConnected: func(name string) {
+					capturedSupervisor.ProbeNow(name)
+					tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+				},
 			})
+			// Retries belong to the manager that spawned them; installing the
+			// new scheduler stops the superseded one.
+			s.deps.SwapMCPReconnectScheduler(scheduler)
+			go startMCP(s.ctx, onResult)
 		}
 	} else {
 		// Config changed but MCP servers didn't — update config and refresh
