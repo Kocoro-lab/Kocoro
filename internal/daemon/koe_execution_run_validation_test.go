@@ -142,7 +142,7 @@ func TestRunAgentResumeAcceptsLegacyKoeCheckpointWithoutExecutionRun(t *testing.
 		} else {
 			llmCalls.Add(1)
 		}
-		http.Error(w, "cloud unavailable", http.StatusInternalServerError)
+		http.Error(w, "synthetic request failure", http.StatusBadRequest)
 	}))
 	defer server.Close()
 

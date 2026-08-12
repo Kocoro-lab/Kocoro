@@ -79,7 +79,7 @@ func TestRunAgent_FailedIdempotentRequestNeverReplaysAutomatically(t *testing.T)
 	var calls atomic.Int32
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		http.Error(w, "synthetic upstream failure", http.StatusInternalServerError)
+		http.Error(w, "synthetic request failure", http.StatusBadRequest)
 	}))
 	defer gateway.Close()
 

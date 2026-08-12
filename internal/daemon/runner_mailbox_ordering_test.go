@@ -204,10 +204,10 @@ func TestRunAgent_MailboxStaysPendingOnHardError(t *testing.T) {
 	deps, store := mailboxOrderingDeps(t)
 	defer deps.SessionCache.CloseAll()
 
-	// Always-500 gateway → the first (and only) LLM call hard-errors before any
+	// Non-retryable gateway error → the LLM call hard-errors before any
 	// checkpoint or final save can persist the drained text and consume the row.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "synthetic upstream failure", http.StatusInternalServerError)
+		http.Error(w, "synthetic request failure", http.StatusBadRequest)
 	}))
 	defer ts.Close()
 	deps.GW = client.NewGatewayClient(ts.URL, "test-key")
@@ -225,7 +225,7 @@ func TestRunAgent_MailboxStaysPendingOnHardError(t *testing.T) {
 		NewSession: true, // empty Source → no pre-loop save; hard error before final save
 	}, nullEventHandler{})
 	if err == nil {
-		t.Fatal("expected hard error from always-500 gateway")
+		t.Fatal("expected hard error from gateway")
 	}
 
 	pend, lerr := store.LoadPendingByRoute(routeKey)

@@ -2192,9 +2192,9 @@ func TestRunAgent_GlobalResponseDetailReachesProviderPrompt(t *testing.T) {
 // The three production callers (cmd/daemon.go x2, heartbeat.go) gate on err
 // first and never deref result on error, so this is wire-safe.
 func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
-	// httptest handler that always 500s — every LLM call hits a hard error.
+	// A non-retryable upstream response exercises the hard-error path directly.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "synthetic upstream failure", http.StatusInternalServerError)
+		http.Error(w, "synthetic request failure", http.StatusBadRequest)
 	}))
 	defer ts.Close()
 
@@ -2210,7 +2210,7 @@ func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
 	}
 	res, err := RunAgent(context.Background(), deps, req, nullEventHandler{})
 	if err == nil {
-		t.Fatal("expected hard error from always-500 gateway")
+		t.Fatal("expected hard error from gateway")
 	}
 	if res == nil {
 		t.Fatal("partial result must be non-nil on hard error (scheduler needs sessionID to stamp LastRun)")
@@ -2229,7 +2229,7 @@ func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
 	if res.MessageEndIndex < res.MessageStartIndex {
 		t.Errorf("indices invariant violated: end %d < start %d", res.MessageEndIndex, res.MessageStartIndex)
 	}
-	// Baseline: always-500 gateway never lets an LLM call succeed AND
+	// Baseline: the rejecting gateway never lets an LLM call succeed AND
 	// nullEventHandler does not implement UsageProvider, so partial Usage
 	// must be the zero value. The companion test PreservesAccumulatedUsage
 	// covers the path where prior calls succeeded before a later hard error.
