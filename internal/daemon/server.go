@@ -7154,6 +7154,10 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.effort_tier %q is not valid; use one of %s", tier, strings.Join(agents.EffortTierAllowedValues(), ", ")))
 			return
 		}
+		if detail, ok := agentPatch["response_detail"].(string); ok && !config.IsValidAgentResponseDetail(detail) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.response_detail %q is not valid; use one of %s", detail, strings.Join(config.AgentResponseDetailAllowedValues(), ", ")))
+			return
+		}
 		if tier, ok := agentPatch["service_tier"].(string); ok && !config.IsValidAgentServiceTier(tier) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.service_tier %q is not valid; use one of %s", tier, strings.Join(config.AgentServiceTierAllowedValues(), ", ")))
 			return

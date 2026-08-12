@@ -98,6 +98,7 @@ func interruptedExecutionConfigA() *agent.ExecutionConfig {
 		Thinking:              &client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096},
 		ReasoningEffort:       "high",
 		EffortTier:            "xhigh",
+		ResponseDetail:        "detailed",
 		ServiceTier:           "fast",
 		ResponseLanguage:      "中文",
 		Temperature:           0.27,
@@ -113,6 +114,7 @@ func applyInterruptedExecutionConfigB(loop *agent.AgentLoop) {
 	loop.SetModelTier("small")
 	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
 	loop.SetReasoningEffort("low")
+	loop.SetResponseDetail("concise")
 	loop.SetEffortTier("low")
 	loop.SetServiceTier("default")
 	loop.SetResponseLanguage("English")

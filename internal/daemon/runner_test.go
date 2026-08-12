@@ -1816,6 +1816,26 @@ func TestApplyAgentModelOverlayToLoop_EmptyEffortInherits(t *testing.T) {
 	}
 }
 
+func TestApplyAgentModelOverlayToLoop_ResponseDetail(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetResponseDetail("balanced")
+	detailed := "detailed"
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ResponseDetail: &detailed})
+	if got := loop.ResponseDetail(); got != "detailed" {
+		t.Fatalf("ResponseDetail after overlay = %q, want detailed", got)
+	}
+}
+
+func TestApplyAgentModelOverlayToLoop_EmptyResponseDetailInherits(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetResponseDetail("concise")
+	empty := ""
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ResponseDetail: &empty})
+	if got := loop.ResponseDetail(); got != "concise" {
+		t.Fatalf("ResponseDetail after empty overlay = %q, want concise", got)
+	}
+}
+
 func TestResolveKoeExecutionRunFailsClosedWithoutChangingAgentConfig(t *testing.T) {
 	fls := false
 	tests := []struct {

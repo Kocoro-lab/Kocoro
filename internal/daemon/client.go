@@ -274,6 +274,9 @@ const (
 	// checkpointed, and forwarded on ordinary completion requests while sealed
 	// Koe/computer profiles and named-agent model overrides remain isolated.
 	CapAgentServiceTierV1 = "agent_service_tier_v1"
+	// CapAgentResponseDetailV1 means agent.response_detail is validated,
+	// supports per-agent inheritance, and is rendered in BP3 StableContext.
+	CapAgentResponseDetailV1 = "agent_response_detail_v1"
 	// CapWebSearchUsageV1 means usage events and terminal run usage always
 	// include web_search_calls, including an explicit zero when no hosted
 	// search ran. Older clients may ignore the additive field.
@@ -326,6 +329,7 @@ var Capabilities = []string{
 	CapIMTimelineV1,
 	CapAgentProfileV1,
 	CapAgentAvatarV1,
+	CapAgentResponseDetailV1,
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
 	CapProactiveThreadMode,

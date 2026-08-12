@@ -882,6 +882,7 @@ type AgentLoop struct {
 	projectEntityDir    string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
 	stickyContext       string             // session-scoped facts injected verbatim into system prompt; never truncated
 	outputFormat        string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
+	responseDetail      string             // "concise" / "balanced" / "detailed" — rendered in BP3 StableContext
 	userFilePaths       []UserAttachedPath // paths from user-attached file_ref blocks — auto-approved for tool access
 	// alwaysAllowTools is the per-agent persisted set loaded from the agent's
 	// permissions.always_allow_tools config. Sourced from
@@ -1128,6 +1129,7 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 		browserObsMaxChars:     defaultBrowserObservationMaxChars,
 		maxRecentImages:        defaultMaxRecentImages,
 		maxRecentBrowserImages: defaultMaxRecentBrowserImages,
+		responseDetail:         "balanced",
 	}
 }
 
@@ -1262,6 +1264,14 @@ func (a *AgentLoop) ModelTier() string {
 // EffortTier returns the currently-configured unified effort tier.
 func (a *AgentLoop) EffortTier() string {
 	return a.effortTier
+}
+
+// ResponseDetail returns the provider-neutral visible-answer detail profile.
+func (a *AgentLoop) ResponseDetail() string {
+	if a == nil || a.responseDetail == "" {
+		return "balanced"
+	}
+	return a.responseDetail
 }
 
 // ServiceTier returns the configured process-global OpenAI processing lane.
@@ -1960,6 +1970,13 @@ func (a *AgentLoop) SetReasoningEffort(effort string) {
 // the runner call sites (mirrors SetReasoningEffort).
 func (a *AgentLoop) SetEffortTier(tier string) {
 	a.effortTier = tier
+}
+
+// SetResponseDetail sets the visible-answer detail profile rendered into BP3.
+// Callers validate persisted config; the prompt builder still falls back to
+// balanced defensively if an invalid transient value reaches this boundary.
+func (a *AgentLoop) SetResponseDetail(detail string) {
+	a.responseDetail = detail
 }
 
 // SetServiceTier sets the process-global OpenAI processing lane. The request
@@ -3212,6 +3229,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		StickyContext:       a.stickyContext,
 		ModelID:             modelID,
 		OutputFormat:        a.outputFormat,
+		ResponseDetail:      a.ResponseDetail(),
 		QuestionUIAvailable: QuestionAskerFrom(ctx) != nil,
 		FastMode:            a.executionProfileID != "",
 	})
