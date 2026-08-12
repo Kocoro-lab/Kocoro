@@ -1314,6 +1314,18 @@ func TestBuildSystemPrompt_ResponseDetailWordBudgetIsLanguageNeutral(t *testing.
 	}
 }
 
+func TestBuildSystemPrompt_KoeResponseDetailPreservesRequestedDeliverables(t *testing.T) {
+	parts := BuildSystemPrompt(PromptOptions{OutputFormat: "koe", ResponseDetail: "concise"})
+	for _, want := range []string{"reports", "tables", "links", "file details"} {
+		if !strings.Contains(parts.StableContext, want) {
+			t.Fatalf("response-detail carve-out missing %q: %q", want, parts.StableContext)
+		}
+	}
+	if !strings.Contains(parts.VolatileContext, "Keep long reports, tables, code, links, and file details") {
+		t.Fatalf("koe delivery contract missing from volatile context: %q", parts.VolatileContext)
+	}
+}
+
 // TestBuildSystemPrompt_CommunicatingSection_Present verifies the static
 // system prompt includes the user-communication section that instructs the
 // model to emit preamble text blocks. Asserts the section header and several

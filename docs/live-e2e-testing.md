@@ -64,6 +64,14 @@ go test ./test/e2e \
   -run '^TestLive_(MidRunProgressNotesReachTheUser|DedicatedContentSearchAvoidsShell|BusinessErrorStopsWithoutRetry|ChannelDeliveryMetadataShapesReply|IsolatedMCPAllowlist_FullPath)$' \
   -count=1 -v -timeout=12m
 
+# Paid response-style A/B: 2 models x 3 prompts x 3 styles = 18 calls.
+SHANNON_E2E_LIVE=1 \
+KOCORO_RESPONSE_DETAIL_AB=1 \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+go test ./test/e2e \
+  -run '^TestLive_ResponseDetailAcrossProviders$' \
+  -count=1 -v -timeout=12m
+
 KOE_LIVE_TEXT_FULL_PATH_E2E=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
 go test ./internal/koe \
