@@ -86,6 +86,8 @@ retry. `decline` carries no answers.
 | `sse_event.tool.completed.json` | `server.go sseEventHandler.OnToolResult` | same |
 | `sse_event.usage.json` | `server.go sseEventHandler.OnUsage` | `web_search_usage_v1`: live usage always includes `web_search_calls`, including zero |
 | `sse_event.done.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | `web_search_usage_v1`: terminal usage always includes `web_search_calls`; optional fields omitted here: `partial`, `failure_code`, `message_start_index`, `message_end_index` (all omitempty, soft-failure metadata) |
+| `sse_event.done.partial.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | explicit soft-stop result: usable reply plus `partial: true` and stable `failure_code`; UI must not render it as verified completion |
+| `bus_event.agent_reply.partial.json` | `runner.go RunAgent` after the final session save | persisted soft-stop reply on the broadcast bus; carries the same `partial`/`failure_code` classification as the per-request done payload |
 | `sse_event.done.with_deliverable.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | `message_idempotency_receipt_v2`: an empty chat reply plus daemon-validated `present_deliverable` metadata. A client that persists a local artifact requires this receipt before deleting its retained source |
 | `bus_event.cloud_progress.json` | `bus_handler.go OnCloudProgress` | counts-only today; a future `items` array extension will be additive + capability-gated |
 | `bus_event.suggestion_ready.json` | `runner.go fireSuggestionAfterRun` | post-turn suggested next user prompt |
