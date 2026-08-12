@@ -81,6 +81,10 @@ type ReconnectScheduler struct {
 
 	// after schedules fn to run after d and returns a cancel func. Swapped in
 	// tests for a deterministic clock.
+	//
+	// It is called while s.mu is held, so fn MUST run asynchronously —
+	// time.AfterFunc does. A substitute that invokes fn inline would deadlock
+	// on the re-entrant lock in fire.
 	after func(d time.Duration, fn func()) func()
 }
 
