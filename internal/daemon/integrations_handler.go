@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -91,6 +92,41 @@ func (s *Server) integrationsCloudReady(w http.ResponseWriter) bool {
 // constant if a provider ever needs more.
 const maxIntegrationConnectBodyBytes = 64 << 10
 
+// maxIntegrationConnectLogBodyBytes caps each response-derived value quoted
+// in the connect-failure log: the parsed error/message fields and the raw
+// body fallback when the body doesn't parse as the Cloud error shape (e.g.
+// an HTML page from an intermediary). Failure bodies on the contract path
+// are tiny ({"error","message"}); when this binds the log value ends
+// truncated — bump the constant if a diagnosis ever needs more.
+const maxIntegrationConnectLogBodyBytes = 2 << 10
+
+func truncateForConnectLog(s string) string {
+	if len(s) > maxIntegrationConnectLogBodyBytes {
+		return s[:maxIntegrationConnectLogBodyBytes]
+	}
+	return s
+}
+
+// logIntegrationConnectFailure records a structured warn log for a failed
+// connect passthrough so provider/status/error-code/message are diagnosable
+// offline (Desktop only shows the message in a dialog). Response-side content
+// only: the request body may carry credentials and is never logged; the Cloud
+// contract keeps connect failure bodies ({"error": "<code>", "message":
+// "<detail>"}) credential-free.
+func logIntegrationConnectFailure(provider string, status int, body []byte, elapsed time.Duration) {
+	var parsed struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil && (parsed.Error != "" || parsed.Message != "") {
+		log.Printf("daemon: WARNING: integration connect rejected by cloud provider=%s status=%d error=%q message=%q elapsed_ms=%d",
+			provider, status, truncateForConnectLog(parsed.Error), truncateForConnectLog(parsed.Message), elapsed.Milliseconds())
+		return
+	}
+	log.Printf("daemon: WARNING: integration connect rejected by cloud provider=%s status=%d body=%q elapsed_ms=%d",
+		provider, status, truncateForConnectLog(string(body)), elapsed.Milliseconds())
+}
+
 // handleConnectIntegration proxies POST /integrations/{provider}/connect to
 // Cloud, forwarding the client's JSON body verbatim. OAuth providers send no
 // body and get back {connection_id, oauth_url} the renderer opens to complete
@@ -127,10 +163,16 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 	if len(bytes.TrimSpace(reqBody)) == 0 {
 		reqBody = nil
 	}
+	start := time.Now()
 	status, body, err := s.deps.GW.IntegrationConnect(r.Context(), provider, reqBody)
 	if err != nil {
+		log.Printf("daemon: WARNING: integration connect transport failure provider=%s err=%v elapsed_ms=%d",
+			provider, err, time.Since(start).Milliseconds())
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
+	}
+	if status >= 400 {
+		logIntegrationConnectFailure(provider, status, body, time.Since(start))
 	}
 	writeCloudPassthrough(w, status, body)
 	if status >= 200 && status < 300 {

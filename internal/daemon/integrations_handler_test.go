@@ -1,11 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -211,6 +214,9 @@ func TestHandleConnectIntegration_RefreshGate(t *testing.T) {
 		toolsFetched := make(chan struct{}, 1)
 		s, cloud := newServer(http.StatusUnauthorized, `{"error":"invalid access token"}`, toolsFetched)
 		defer cloud.Close()
+		var logBuf bytes.Buffer
+		log.SetOutput(&logBuf)
+		defer log.SetOutput(os.Stderr)
 		rr := httptest.NewRecorder()
 		s.handleConnectIntegration(rr, connectReq())
 		if rr.Code != http.StatusUnauthorized {
@@ -218,6 +224,20 @@ func TestHandleConnectIntegration_RefreshGate(t *testing.T) {
 		}
 		if rr.Body.String() != `{"error":"invalid access token"}` {
 			t.Errorf("error body not passed through verbatim: %s", rr.Body.String())
+		}
+		// The failure log must carry provider/status/error for offline
+		// diagnosis, and must never contain request-body content — the
+		// connect body carries long-lived credentials.
+		logged := logBuf.String()
+		for _, want := range []string{"integration connect rejected by cloud", "provider=shopify", "status=401", `error="invalid access token"`} {
+			if !strings.Contains(logged, want) {
+				t.Errorf("failure log missing %q (log: %s)", want, logged)
+			}
+		}
+		for _, leak := range []string{"shpat_x", "s.myshopify.com", "access_token"} {
+			if strings.Contains(logged, leak) {
+				t.Errorf("failure log leaked request-body content %q (log: %s)", leak, logged)
+			}
 		}
 		select {
 		case <-toolsFetched:
