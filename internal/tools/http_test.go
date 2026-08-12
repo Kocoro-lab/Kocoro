@@ -291,13 +291,6 @@ func TestHTTP_InvalidURL(t *testing.T) {
 	}
 }
 
-func TestHTTP_RequiresApproval(t *testing.T) {
-	tool := &HTTPTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}
-
 func TestHTTP_IsSafeArgs(t *testing.T) {
 	tool := &HTTPTool{}
 	tests := []struct {

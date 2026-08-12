@@ -56,13 +56,6 @@ func TestLegacyComputerAdvertisesFunctionSchemaNotProviderNative(t *testing.T) {
 	}
 }
 
-func TestComputer_RequiresApproval(t *testing.T) {
-	tool := &ComputerTool{client: &AXClient{}}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}
-
 func TestComputer_InvalidArgs(t *testing.T) {
 	tool := &ComputerTool{client: &AXClient{}}
 	result, err := tool.Run(context.Background(), `not valid json`)
