@@ -68,6 +68,9 @@ func ValidateAgentModelConfig(c *AgentModelConfig) error {
 	if c.EffortTier != nil && !IsValidEffortTier(*c.EffortTier) {
 		return fmt.Errorf("agent.effort_tier %q is not valid; use one of %s", *c.EffortTier, strings.Join(EffortTierAllowedValues(), ", "))
 	}
+	if c.ResponseDetail != nil && !IsValidResponseDetail(*c.ResponseDetail) {
+		return fmt.Errorf("agent.response_detail %q is not valid; use one of %s", *c.ResponseDetail, strings.Join(ResponseDetailAllowedValues(), ", "))
+	}
 	return nil
 }
 
@@ -89,4 +92,20 @@ func IsValidEffortTier(s string) bool {
 // unset/inherit) for error messages, e.g. `"", "low", "high", "xhigh", "max"`.
 func EffortTierAllowedValues() []string {
 	return []string{`""`, `"low"`, `"high"`, `"xhigh"`, `"max"`}
+}
+
+// IsValidResponseDetail validates a per-agent answer-detail override. Empty
+// means inherit the global profile.
+func IsValidResponseDetail(s string) bool {
+	switch s {
+	case "", "concise", "balanced", "detailed":
+		return true
+	default:
+		return false
+	}
+}
+
+// ResponseDetailAllowedValues renders the closed enum for agent-config errors.
+func ResponseDetailAllowedValues() []string {
+	return []string{`""`, `"concise"`, `"balanced"`, `"detailed"`}
 }

@@ -1816,6 +1816,26 @@ func TestApplyAgentModelOverlayToLoop_EmptyEffortInherits(t *testing.T) {
 	}
 }
 
+func TestApplyAgentModelOverlayToLoop_ResponseDetail(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetResponseDetail("balanced")
+	detailed := "detailed"
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ResponseDetail: &detailed})
+	if got := loop.ResponseDetail(); got != "detailed" {
+		t.Fatalf("ResponseDetail after overlay = %q, want detailed", got)
+	}
+}
+
+func TestApplyAgentModelOverlayToLoop_EmptyResponseDetailInherits(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetResponseDetail("concise")
+	empty := ""
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ResponseDetail: &empty})
+	if got := loop.ResponseDetail(); got != "concise" {
+		t.Fatalf("ResponseDetail after empty overlay = %q, want concise", got)
+	}
+}
+
 func TestResolveKoeExecutionRunFailsClosedWithoutChangingAgentConfig(t *testing.T) {
 	fls := false
 	tests := []struct {
@@ -2109,6 +2129,44 @@ func TestRunAgent_Success_PopulatesMessageIndices(t *testing.T) {
 	}
 	if res.Reply != "hello from fake llm" {
 		t.Errorf("Reply = %q, want %q", res.Reply, "hello from fake llm")
+	}
+}
+
+func TestRunAgent_GlobalResponseDetailReachesProviderPrompt(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "concise reply"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.Config.Agent.ResponseDetail = "concise"
+	defer deps.SessionCache.CloseAll()
+
+	_, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "hi",
+		Source:        "desktop",
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent error: %v", err)
+	}
+	requests := gw.requests()
+	if len(requests) == 0 {
+		t.Fatal("gateway captured no completion request")
+	}
+	found := false
+	for _, request := range requests {
+		for _, message := range request.Messages {
+			if strings.Contains(message.Content.Text(), `<response_detail level="concise">`) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("global response detail missing from provider prompt: %+v", requests)
 	}
 }
 

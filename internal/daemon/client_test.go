@@ -701,6 +701,15 @@ func TestCapabilities_AdvertisesAgentServiceTierV1(t *testing.T) {
 	t.Fatalf("default Capabilities = %v, want to contain %q", Capabilities, CapAgentServiceTierV1)
 }
 
+func TestCapabilities_AdvertisesAgentResponseDetailV1(t *testing.T) {
+	for _, capability := range Capabilities {
+		if capability == CapAgentResponseDetailV1 {
+			return
+		}
+	}
+	t.Fatalf("default Capabilities = %v, want to contain %q", Capabilities, CapAgentResponseDetailV1)
+}
+
 func TestCapabilities_AdvertisesMessageIdempotencyV1(t *testing.T) {
 	found := false
 	for _, capability := range Capabilities {

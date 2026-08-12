@@ -160,6 +160,10 @@ type AgentConfig struct {
 	// while older OpenAI models compress xhigh/max to high).
 	// Empty = unset (Cloud falls back to ReasoningEffort, then provider default).
 	EffortTier string `mapstructure:"effort_tier" yaml:"effort_tier" json:"effort_tier"`
+	// ResponseDetail controls visible answer detail independently from reasoning
+	// effort. It is provider-neutral and rendered into the cacheable BP3 user
+	// context rather than forwarded as a provider request parameter.
+	ResponseDetail string `mapstructure:"response_detail" yaml:"response_detail" json:"response_detail"`
 	// ServiceTier is the process-global OpenAI processing lane. It is kept out
 	// of project/local overlays and named-agent config: Desktop exposes it only
 	// with an exact global OpenAI model. Sealed execution profiles (including
@@ -507,6 +511,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.force_think_tool", false)
 	viper.SetDefault("agent.reasoning_effort", "")
 	viper.SetDefault("agent.effort_tier", "")
+	viper.SetDefault("agent.response_detail", "balanced")
 	viper.SetDefault("agent.service_tier", "")
 	viper.SetDefault("agent.model", "")
 	viper.SetDefault("agent.context_window", 1_000_000)
@@ -912,6 +917,7 @@ type overlayAgentConfig struct {
 	ForceThinkTool         *bool    `yaml:"force_think_tool"`
 	ReasoningEffort        *string  `yaml:"reasoning_effort"`
 	EffortTier             *string  `yaml:"effort_tier"`
+	ResponseDetail         *string  `yaml:"response_detail"`
 	Model                  *string  `yaml:"model"`
 	ContextWindow          *int     `yaml:"context_window"`
 	ObservationWindow      *int     `yaml:"observation_window"`
@@ -973,6 +979,7 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.force_think_tool":                 {Level: "default"},
 		"agent.reasoning_effort":                 {Level: "default"},
 		"agent.effort_tier":                      {Level: "default"},
+		"agent.response_detail":                  {Level: "default"},
 		"agent.service_tier":                     {Level: "default"},
 		"agent.model":                            {Level: "default"},
 		"agent.context_window":                   {Level: "default"},
@@ -1042,6 +1049,9 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.effort_tier") {
 		cfg.Sources["agent.effort_tier"] = src
+	}
+	if viper.IsSet("agent.response_detail") {
+		cfg.Sources["agent.response_detail"] = src
 	}
 	if viper.IsSet("agent.service_tier") {
 		cfg.Sources["agent.service_tier"] = src
@@ -1211,6 +1221,10 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 		if overlay.Agent.EffortTier != nil {
 			cfg.Agent.EffortTier = *overlay.Agent.EffortTier
 			cfg.Sources["agent.effort_tier"] = src
+		}
+		if overlay.Agent.ResponseDetail != nil {
+			cfg.Agent.ResponseDetail = *overlay.Agent.ResponseDetail
+			cfg.Sources["agent.response_detail"] = src
 		}
 		if overlay.Agent.Model != nil {
 			cfg.Agent.Model = *overlay.Agent.Model
@@ -1441,6 +1455,9 @@ func validateConfig(cfg *Config) error {
 	if !IsValidAgentServiceTier(cfg.Agent.ServiceTier) {
 		return fmt.Errorf("invalid agent.service_tier %q: use one of %s", cfg.Agent.ServiceTier, strings.Join(AgentServiceTierAllowedValues(), ", "))
 	}
+	if !IsValidAgentResponseDetail(cfg.Agent.ResponseDetail) {
+		return fmt.Errorf("invalid agent.response_detail %q: use one of %s", cfg.Agent.ResponseDetail, strings.Join(AgentResponseDetailAllowedValues(), ", "))
+	}
 	if cfg.Agent.CompactTimeoutSecs < 0 {
 		return fmt.Errorf("agent.compact_timeout_secs must be >= 0 (0 uses the default)")
 	}
@@ -1513,6 +1530,31 @@ func IsValidAgentServiceTier(s string) bool {
 // AgentServiceTierAllowedValues renders the closed enum for config/API errors.
 func AgentServiceTierAllowedValues() []string {
 	return []string{`""`, `"default"`, `"fast"`}
+}
+
+// IsValidAgentResponseDetail reports whether s is a supported visible-answer
+// detail profile. Empty is accepted for legacy config and resolves to balanced.
+func IsValidAgentResponseDetail(s string) bool {
+	switch s {
+	case "", "concise", "balanced", "detailed":
+		return true
+	default:
+		return false
+	}
+}
+
+// AgentResponseDetailAllowedValues renders the closed enum for config/API errors.
+func AgentResponseDetailAllowedValues() []string {
+	return []string{`""`, `"concise"`, `"balanced"`, `"detailed"`}
+}
+
+// EffectiveAgentResponseDetail maps an omitted legacy value to the product
+// default. Callers use the concrete result when configuring an AgentLoop.
+func EffectiveAgentResponseDetail(s string) string {
+	if s == "" {
+		return "balanced"
+	}
+	return s
 }
 
 // mergeBuiltinMCPServers folds the in-binary BuiltinMCPServers catalog onto

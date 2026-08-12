@@ -2041,6 +2041,11 @@ func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelCo
 	if ac.EffortTier != nil && *ac.EffortTier != "" {
 		loop.SetEffortTier(*ac.EffortTier)
 	}
+	// Per-agent response-detail override. nil OR "" inherits the global
+	// profile already applied on the loop.
+	if ac.ResponseDetail != nil && *ac.ResponseDetail != "" {
+		loop.SetResponseDetail(*ac.ResponseDetail)
+	}
 	// != nil rather than != "": an explicit "" is a meaningful override that
 	// forces mirror mode even when the global agent.language is locked.
 	if ac.Language != nil {
@@ -3665,6 +3670,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if runCfg.Agent.EffortTier != "" {
 		loop.SetEffortTier(runCfg.Agent.EffortTier)
 	}
+	loop.SetResponseDetail(config.EffectiveAgentResponseDetail(runCfg.Agent.ResponseDetail))
 	loop.SetServiceTier(runCfg.Agent.ServiceTier)
 	// Response language: unconditional global baseline ("" = mirror); the
 	// per-agent overlay below may override (including "" to force mirror).

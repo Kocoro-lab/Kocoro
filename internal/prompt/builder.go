@@ -83,6 +83,13 @@ type PromptOptions struct {
 	// channel rendering — not all cloud channels, e.g. Feishu/Lark stay
 	// markdown; see outputFormatForSource). Empty defaults to "markdown".
 	OutputFormat string
+	// ResponseDetail selects the provider-neutral visible-answer detail profile.
+	// It is rendered in StableContext (BP #3), never the shared System prompt.
+	// Empty and unknown values defensively fall back to balanced.
+	ResponseDetail string
+	// SuppressResponseDetail excludes natural-language answer guidance from
+	// internal lanes whose final response has a strict machine-readable schema.
+	SuppressResponseDetail bool
 	// QuestionUIAvailable reports whether this run has a live QuestionAsker.
 	// It is rendered only in VolatileContext so attended/unattended source
 	// differences never perturb the cacheable system prompt.
@@ -349,7 +356,37 @@ func buildStableContext(opts PromptOptions) string {
 		sb.WriteString("## Session\nActive agent context.")
 	}
 
+	if !opts.SuppressResponseDetail {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(responseDetailBlock(opts.ResponseDetail))
+	}
+
 	return sb.String()
+}
+
+func responseDetailBlock(level string) string {
+	var guidance string
+	switch level {
+	case "concise":
+		guidance = "For the final natural-language answer, use the smallest complete form. For a simple informational question, usually stay within about 120 words and use a few sentences or a short list. " +
+			"Omit conversational lead-ins, restatement, summaries, follow-up offers, and generic advice. Include caveats only when material."
+	case "detailed":
+		guidance = "For the final natural-language answer, be complete but bounded. Cover the important context, rationale, caveats, tradeoffs, and concrete details, prioritizing the most useful points. " +
+			"For a simple informational question, usually stay within about 500 words and prefer four to six short paragraphs or a structured equivalent; expand further only when the task genuinely requires it. " +
+			"Avoid repetition, generic filler, and follow-up offers."
+	default:
+		level = "balanced"
+		guidance = "For the final natural-language answer, lead with the answer. Add only context, rationale, caveats, and steps that materially help understanding or action. " +
+			"For a simple informational question, usually stay within about 250 words and prefer two to four short paragraphs or a compact list. " +
+			"Avoid restating the question, repetition, generic filler, and follow-up offers."
+	}
+
+	return "<system-reminder>\n<response_detail level=\"" + level + "\">\n" + guidance + " " +
+		"For languages without whitespace-delimited words, treat the word count as equivalent-length guidance, not as a character limit. " +
+		"A specific response length, structure, or format requested by the user overrides this preference. Do not shorten requested code, documents, reports, tables, translations, links, file details, or other produced artifacts.\n" +
+		"</response_detail>\n</system-reminder>"
 }
 
 func channelDeliveryGuidance(opts PromptOptions) string {

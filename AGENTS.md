@@ -180,6 +180,8 @@ Cloud owns the prompt-cache TTL policy. Preserve `cache_source` as attribution
 normalization. Any future TTL-policy change belongs in the Cloud service and
 must update `docs/cache-strategy.md` in the same rollout.
 
+`agent.response_detail` renders provider-neutral final-answer guidance in BP3 StableContext: global missing/empty resolves to `balanced`, named-agent missing/empty inherits global, and provider request effort is unchanged. Strict machine-readable internal loops suppress it explicitly; normal Fast/Full profiles retain it.
+
 Any in-place message content rewrite that can affect prompt bytes must emit cache-compaction/debug instrumentation so drift remains attributable.
 
 ### Context Management

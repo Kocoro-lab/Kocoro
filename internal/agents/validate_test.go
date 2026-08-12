@@ -96,3 +96,18 @@ func TestIsValidEffortTier(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateAgentModelConfigResponseDetail(t *testing.T) {
+	for _, detail := range []string{"", "concise", "balanced", "detailed"} {
+		value := detail
+		if err := ValidateAgentModelConfig(&AgentModelConfig{ResponseDetail: &value}); err != nil {
+			t.Fatalf("response_detail %q should be valid: %v", detail, err)
+		}
+	}
+	for _, detail := range []string{"default", "short", "BALANCED"} {
+		value := detail
+		if err := ValidateAgentModelConfig(&AgentModelConfig{ResponseDetail: &value}); err == nil {
+			t.Fatalf("response_detail %q should be rejected", detail)
+		}
+	}
+}

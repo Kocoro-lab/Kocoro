@@ -256,6 +256,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	if runCfg.Agent.EffortTier != "" {
 		loop.SetEffortTier(runCfg.Agent.EffortTier)
 	}
+	loop.SetResponseDetail(config.EffectiveAgentResponseDetail(runCfg.Agent.ResponseDetail))
 	// Response language: unconditional global baseline ("" = mirror); the
 	// per-agent overlay below may override (including "" to force mirror).
 	loop.SetResponseLanguage(runCfg.Agent.Language)
@@ -270,6 +271,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		// Per-agent effort override; nil OR "" = inherit the global tier.
 		if ac.EffortTier != nil && *ac.EffortTier != "" {
 			loop.SetEffortTier(*ac.EffortTier)
+		}
+		if ac.ResponseDetail != nil && *ac.ResponseDetail != "" {
+			loop.SetResponseDetail(*ac.ResponseDetail)
 		}
 		// != nil (not != ""): explicit "" forces mirror over a locked global.
 		if ac.Language != nil {

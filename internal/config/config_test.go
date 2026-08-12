@@ -119,6 +119,41 @@ func TestValidateConfig_AgentServiceTier(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_AgentResponseDetail(t *testing.T) {
+	for _, tt := range []struct {
+		value   string
+		wantErr bool
+	}{
+		{"", false},
+		{"concise", false},
+		{"balanced", false},
+		{"detailed", false},
+		{"default", true},
+		{"BALANCED", true},
+	} {
+		t.Run(tt.value, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Agent.ResponseDetail = tt.value
+			err := validateConfig(cfg)
+			if tt.wantErr && (err == nil || !strings.Contains(err.Error(), "response_detail")) {
+				t.Fatalf("validateConfig() error = %v, want response_detail error", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateConfig() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestEffectiveAgentResponseDetail(t *testing.T) {
+	if got := EffectiveAgentResponseDetail(""); got != "balanced" {
+		t.Fatalf("EffectiveAgentResponseDetail(empty) = %q, want balanced", got)
+	}
+	if got := EffectiveAgentResponseDetail("detailed"); got != "detailed" {
+		t.Fatalf("EffectiveAgentResponseDetail(detailed) = %q, want detailed", got)
+	}
+}
+
 func TestAgentConfigSkillDiscoveryEnabled(t *testing.T) {
 	enabled := true
 	disabled := false

@@ -80,6 +80,27 @@ func TestAgentToAPI_Full(t *testing.T) {
 	}
 }
 
+func TestAgentToAPI_ResponseDetailIsRawOverride(t *testing.T) {
+	detail := "detailed"
+	a := &Agent{
+		Name:   "test",
+		Prompt: "hello",
+		Config: &AgentConfig{Agent: &AgentModelConfig{ResponseDetail: &detail}},
+	}
+	api := a.ToAPI()
+	if api.Config == nil || api.Config.Agent == nil || api.Config.Agent.ResponseDetail == nil {
+		t.Fatalf("ToAPI dropped raw response_detail override: %+v", api.Config)
+	}
+	if got := *api.Config.Agent.ResponseDetail; got != detail {
+		t.Fatalf("ToAPI response_detail = %q, want raw override %q", got, detail)
+	}
+
+	a.Config.Agent.ResponseDetail = nil
+	if got := a.ToAPI().Config.Agent.ResponseDetail; got != nil {
+		t.Fatalf("ToAPI synthesized effective response_detail for inherit: %q", *got)
+	}
+}
+
 func TestAgentToAPI_WithProfile_InlinesCategoryLabel(t *testing.T) {
 	a := &Agent{
 		Name:   "test",

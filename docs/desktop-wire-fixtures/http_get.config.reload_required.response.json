@@ -25,6 +25,7 @@
         "min_turns": 0
       },
       "reasoning_effort": "",
+      "response_detail": "",
       "run_event_max_age_days": 0,
       "run_event_retention": 0,
       "service_tier": "",

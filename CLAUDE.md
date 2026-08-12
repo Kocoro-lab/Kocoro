@@ -349,6 +349,7 @@ Invariants:
 - `normalizeToolInput` (`gateway.go`) canonicalizes nested JSON key ordering for byte-stability.
 - Skill allowed-tools = execution-time denial, not schema filtering (tools array stays byte-stable).
 - Skill listing lives in the scaffolded user message, not system prompt.
+- `agent.response_detail` renders provider-neutral final-answer guidance in BP3 StableContext: global missing/empty resolves to `balanced`, named-agent missing/empty inherits global, and provider request effort is unchanged. Strict machine-readable internal loops suppress it explicitly; normal Fast/Full profiles retain it.
 - All in-place `messages[idx].Content` rewrites MUST call `client.LogCacheCompactEvent` — uninstrumented rewrites silently break drift attribution.
 
 ### Context Management

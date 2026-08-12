@@ -1348,6 +1348,7 @@ func (t *openAIComputerTaskToolV1) Run(
 		t.hookRunner,
 	)
 	child.SetSkillDiscovery(false)
+	child.SetSuppressResponseDetail(true)
 	child.SetBypassPermissions(true)
 	child.SetSpecificModel(profile.Model())
 	t.seedChildContextWindow(child, profile, trace)
