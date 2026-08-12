@@ -591,6 +591,10 @@ func mergeSkillMatches(a, b []*skills.Skill) []*skills.Skill {
 // guaranteed to be in the result — even if the small-model call times out,
 // errors, or returns "none".
 func discoverRelevantSkills(ctx context.Context, c ctxwin.Completer, userText string, loaded []*skills.Skill) ([]*skills.Skill, client.Usage) {
+	return discoverRelevantSkillsWithTimeout(ctx, c, userText, loaded, discoveryTimeout)
+}
+
+func discoverRelevantSkillsWithTimeout(ctx context.Context, c ctxwin.Completer, userText string, loaded []*skills.Skill, timeout time.Duration) ([]*skills.Skill, client.Usage) {
 	if len(loaded) == 0 || userText == "" {
 		return nil, client.Usage{}
 	}
@@ -604,7 +608,7 @@ func discoverRelevantSkills(ctx context.Context, c ctxwin.Completer, userText st
 
 	prompt := fmt.Sprintf(discoveryPrompt, catalog.String(), userText)
 
-	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	resp, err := c.Complete(ctx, client.CompletionRequest{
