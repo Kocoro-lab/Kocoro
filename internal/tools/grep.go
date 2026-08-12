@@ -56,7 +56,7 @@ func (t *GrepTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:               "grep",
 		MaxResultSizeChars: 20000,
-		Description: "Search file CONTENTS using a regex pattern. By default returns matching FILE PATHS only (output_mode=files_with_matches) — keeps results small. Set output_mode=content to get matching lines as file:line:text, or output_mode=count for per-file match counts. Use glob to filter files by name pattern." +
+		Description: "Search file CONTENTS using a regex pattern. Directory paths are searched recursively, and missing paths return an explicit error. By default returns matching FILE PATHS only (output_mode=files_with_matches) — keeps results small. Set output_mode=content to get matching lines as file:line:text, or output_mode=count for per-file match counts. Use glob to filter files by name pattern." +
 			agent.DescriptionGuidance,
 		Parameters: map[string]any{
 			"type": "object",
@@ -159,9 +159,9 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		}
 	case "content":
 		if bin == "rg" {
-			cmdArgs = append(cmdArgs, "-n", "--max-count", fmt.Sprintf("%d", grepPerFileMaxCount))
+			cmdArgs = append(cmdArgs, "-n", "-H", "--max-count", fmt.Sprintf("%d", grepPerFileMaxCount))
 		} else {
-			cmdArgs = append(cmdArgs, "-rn", "-I", "-m", fmt.Sprintf("%d", grepPerFileMaxCount))
+			cmdArgs = append(cmdArgs, "-rn", "-H", "-I", "-m", fmt.Sprintf("%d", grepPerFileMaxCount))
 		}
 	case "count":
 		if bin == "rg" {
@@ -215,7 +215,7 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 			return agent.ToolResult{Content: fmt.Sprintf("grep cancelled: %v", runCtx.Err()), IsError: true}, nil
 		}
 		if exitErr, ok := cmdErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return agent.ToolResult{Content: "no matches found"}, nil
+			return agent.ToolResult{Content: "no matches found\n" + grepSearchReceipt(ctx, path, mode, 0, 0, false, args.Offset, false)}, nil
 		}
 		// Exit code 2 in rg/grep covers multiple failure modes: bad regex,
 		// missing paths, permission errors, etc. Classify by stderr content.
@@ -226,7 +226,7 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		case strings.Contains(lower, "permission denied"):
 			return agent.PermissionError(fmt.Sprintf("grep: %s", result)), nil
 		case strings.Contains(lower, "no such file") || strings.Contains(lower, "not found"):
-			return agent.ValidationError(fmt.Sprintf("path not found: %s", result)), nil
+			return definitiveLocalResourceError(fmt.Sprintf("path not found: %s", result)), nil
 		default:
 			return agent.ToolResult{Content: fmt.Sprintf("grep error: %v\n%s", cmdErr, result), IsError: true}, nil
 		}
@@ -252,8 +252,9 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		return agent.ToolResult{Content: fmt.Sprintf("grep output scan error: %v", err), IsError: true}, nil
 	}
 	if len(lines) == 0 {
-		return agent.ToolResult{Content: "no matches found"}, nil
+		return agent.ToolResult{Content: "no matches found\n" + grepSearchReceipt(ctx, path, mode, 0, 0, false, args.Offset, false)}, nil
 	}
+	perFileCapReached := mode == "content" && grepContentPerFileCapReached(lines, grepPerFileMaxCount)
 	if mode == "files_with_matches" {
 		sortGrepFilesByMTime(lines, path)
 	}
@@ -282,8 +283,67 @@ func (t *GrepTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 		}
 		content += fmt.Sprintf("\n[results truncated at %d of %d %s; narrow the search with a more specific pattern or path]", limit, len(lines), unit)
 	}
+	if perFileCapReached {
+		content += fmt.Sprintf("\n[results limited to %d matches per file; narrow the search or use count mode to measure additional matches]", grepPerFileMaxCount)
+	}
+	content += "\n" + grepSearchReceipt(ctx, path, mode, len(lines), len(capped), truncated, offset, perFileCapReached)
 
 	return agent.ToolResult{Content: content}, nil
+}
+
+func grepSearchReceipt(ctx context.Context, path, mode string, observed, returned int, truncated bool, offset int, perFileCapReached bool) string {
+	status := "complete"
+	receiptTruncated := truncated || perFileCapReached
+	if receiptTruncated || offset > 0 {
+		status = "windowed"
+	}
+	recursive := false
+	if info, err := os.Stat(path); err == nil {
+		recursive = info.IsDir()
+	}
+	scope := path
+	if base := cwdctx.FromContext(ctx); base != "" {
+		if rel, err := filepath.Rel(base, path); err == nil &&
+			rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			scope = rel
+		}
+	}
+	resultCount := fmt.Sprintf("total_results=%d", observed)
+	if perFileCapReached {
+		resultCount = fmt.Sprintf("observed_results=%d", observed)
+	}
+	receipt := fmt.Sprintf(
+		"[search receipt] status=%s scope=%q recursive=%t output_mode=%s %s returned=%d truncated=%t",
+		status,
+		filepath.ToSlash(scope),
+		recursive,
+		mode,
+		resultCount,
+		returned,
+		receiptTruncated,
+	)
+	if mode == "content" {
+		receipt += fmt.Sprintf(" per_file_cap=%d per_file_cap_reached=%t", grepPerFileMaxCount, perFileCapReached)
+	}
+	return receipt
+}
+
+func grepContentPerFileCapReached(lines []string, cap int) bool {
+	if cap <= 0 {
+		return false
+	}
+	matchesByFile := make(map[string]int)
+	for _, line := range lines {
+		path, rest, ok := splitGrepContentLine(line)
+		if !ok || !strings.HasPrefix(rest, ":") {
+			continue
+		}
+		matchesByFile[path]++
+		if matchesByFile[path] >= cap {
+			return true
+		}
+	}
+	return false
 }
 
 func splitGrepGlobPatterns(glob string) []string {

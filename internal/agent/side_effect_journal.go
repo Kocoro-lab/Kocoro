@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var (
@@ -36,9 +37,11 @@ type PreparedSideEffectExecution struct {
 	IdempotencyKey string
 }
 
-// SideEffectExecutionJournal persists the dispatch state machine around a
-// material Tool.Run call. Every method must be durable before returning nil.
-// Implementations must not persist raw tool arguments or results.
+// SideEffectExecutionJournal owns the dispatch state machine around a material
+// Tool.Run call. Prepare may stage its no-dispatch identity in the same
+// transaction as the mandatory pre-dispatch checkpoint; MarkDispatching must
+// be durable before returning nil. Terminal methods must be durable before
+// returning nil. Implementations must not persist raw tool arguments or results.
 type SideEffectExecutionJournal interface {
 	Prepare(context.Context, SideEffectExecution) (PreparedSideEffectExecution, error)
 	MarkDispatching(context.Context, string) error
@@ -137,10 +140,25 @@ func sideEffectJournalUnavailableResult(toolName string) ToolResult {
 	))
 }
 
-func sideEffectOutcomeUnknownResult(toolName string) ToolResult {
-	return BusinessError(fmt.Sprintf(
+func sideEffectOutcomeUnknownResult(toolName, detail string) ToolResult {
+	content := fmt.Sprintf(
 		"%s may have changed external state, but its outcome could not be confirmed; review the external system before retrying", toolName,
-	))
+	)
+	if detail = strings.TrimSpace(detail); detail != "" {
+		content += "\n\nTool detail before the outcome became uncertain:\n" + detail
+	}
+	return BusinessError(content)
+}
+
+func sideEffectOutcomeDetail(result ToolResult, runErr error) string {
+	detail := strings.TrimSpace(result.Content)
+	if runErr != nil {
+		if detail != "" {
+			detail += "\n"
+		}
+		detail += "tool error: " + runErr.Error()
+	}
+	return detail
 }
 
 func wrapSideEffectExecutionError(sentinel error, toolName string, cause error) error {

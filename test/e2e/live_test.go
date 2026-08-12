@@ -1,17 +1,19 @@
 package e2e
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,14 +22,18 @@ import (
 
 	daemonpkg "github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
+	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
+	"gopkg.in/yaml.v3"
 )
 
 // Live E2E tests require SHANNON_E2E_LIVE=1.
 // They make real LLM API calls and cost real tokens.
 //
 // Daemon tests use a temporary state directory and random localhost port. The
-// isolated start mode suppresses Cloud WS, watchers, schedulers, MCP connects,
-// and process-global browser cleanup while preserving the real HTTP/agent path.
+// isolated start mode suppresses Cloud WS, watchers, schedulers, credential
+// store access, non-allowlisted MCP connects, and process-global browser cleanup
+// while preserving the real HTTP/agent/provider path.
 
 func TestLive_OneShot_BasicQuery(t *testing.T) {
 	skipUnlessLive(t)
@@ -108,12 +114,15 @@ func TestLive_BundledAgent_Reviewer(t *testing.T) {
 func TestLive_Daemon_MessageAndEditRetry(t *testing.T) {
 	skipUnlessLive(t)
 	bin := testBinary(t)
+	credentialBefore, hasCredentialFingerprint := liveCredentialStoreFingerprint(t)
 	daemon := startIsolatedLiveDaemon(t, bin)
 
 	// Send message
+	messageStarted := time.Now()
 	resp := httpPost(t, daemon.baseURL+"/message", map[string]interface{}{
 		"text": "what is 7+7",
 	})
+	messageLatency := time.Since(messageStarted)
 	sessionID, ok := resp["session_id"].(string)
 	if !ok || sessionID == "" {
 		t.Fatalf("no session_id in response: %v", resp)
@@ -131,10 +140,12 @@ func TestLive_Daemon_MessageAndEditRetry(t *testing.T) {
 	}
 
 	// Edit & retry
+	editStarted := time.Now()
 	editResp := httpPost(t, fmt.Sprintf("%s/sessions/%s/edit", daemon.baseURL, sessionID), map[string]interface{}{
 		"message_index": 0,
 		"new_content":   "what is 9+9",
 	})
+	editLatency := time.Since(editStarted)
 	editReply, _ := editResp["reply"].(string)
 	if !strings.Contains(editReply, "18") {
 		t.Errorf("expected 18 in edit reply, got: %s", editReply)
@@ -146,6 +157,30 @@ func TestLive_Daemon_MessageAndEditRetry(t *testing.T) {
 	if len(messages2) != 2 {
 		t.Errorf("expected 2 messages after edit, got %d", len(messages2))
 	}
+	t.Logf(
+		"real daemon message/edit E2E passed: initial_reply=%q edit_reply=%q messages_before=%d messages_after=%d initial_latency=%s edit_latency=%s total_cost=$%.6f",
+		reply,
+		editReply,
+		len(messages),
+		len(messages2),
+		messageLatency.Round(time.Millisecond),
+		editLatency.Round(time.Millisecond),
+		runResultCost(resp)+runResultCost(editResp),
+	)
+
+	daemon.stop(t)
+	if hasCredentialFingerprint {
+		credentialAfter, ok := liveCredentialStoreFingerprint(t)
+		if !ok || credentialAfter != credentialBefore {
+			t.Fatal("isolated daemon changed the active OS credential-store entry")
+		}
+	}
+}
+
+func runResultCost(result map[string]interface{}) float64 {
+	usage, _ := result["usage"].(map[string]interface{})
+	cost, _ := usage["cost_usd"].(float64)
+	return cost
 }
 
 func TestLive_Daemon_AgentListIncludesBuiltins(t *testing.T) {
@@ -188,10 +223,31 @@ func runShan(t *testing.T, bin string, args ...string) string {
 }
 
 type isolatedLiveDaemon struct {
-	baseURL string
-	cmd     *exec.Cmd
-	done    chan error
-	output  synchronizedBuffer
+	baseURL       string
+	stateDir      string
+	cloudEndpoint string
+	options       isolatedLiveOptions
+	cmd           *exec.Cmd
+	done          chan error
+	output        synchronizedBuffer
+}
+
+type isolatedLiveOptions struct {
+	EffortTier   string
+	AutoApprove  bool
+	MCPAllowlist string
+	MCPServers   map[string]mcp.MCPServerConfig
+}
+
+type isolatedConfigFile struct {
+	Endpoint string `yaml:"endpoint"`
+	Daemon   struct {
+		AutoApprove bool `yaml:"auto_approve"`
+	} `yaml:"daemon"`
+	Agent struct {
+		EffortTier string `yaml:"effort_tier,omitempty"`
+	} `yaml:"agent,omitempty"`
+	MCPServers map[string]mcp.MCPServerConfig `yaml:"mcp_servers,omitempty"`
 }
 
 type synchronizedBuffer struct {
@@ -211,46 +267,36 @@ func (b *synchronizedBuffer) String() string {
 	return b.b.String()
 }
 
-// seedIsolatedDaemonConfig gives the isolated daemon the developer's CLOUD
-// COORDINATES while leaving every piece of real state behind.
-//
-// `--isolated` isolates filesystem state and port ownership; it was never meant
-// to isolate which backend the run talks to. With a bare temp state dir the
-// daemon falls back to the built-in default endpoint plus whatever key the OS
-// credential store holds — so on a machine pointed at a local Cloud stack every
-// live daemon test died with `401 Invalid token`. That was invisible while the
-// suite required SHANNON_E2E_LIVE=1 to run at all.
-//
-// Only endpoint and api_key are copied. Agents, sessions, MCP servers,
-// schedules, and skills stay empty, so the isolation contract is unchanged.
-// auto_approve is set because these runs have no approval UI attached; without
-// it a tool-using test blocks until its timeout.
-//
-// Model settings are deliberately NOT copied. A behavior contract has to mean
-// the same thing on every developer's machine, and agent.model / effort_tier /
-// language are personal choices — measuring this suite against them would make
-// a run's verdict depend on whose laptop it executed on. This was not
-// hypothetical: the same progress-note probe scored 6/6 under one developer's
-// pinned model and 2/8 under the product defaults, so a threshold calibrated on
-// the former would have failed everyone else. These runs therefore exercise the
-// defaults the product actually ships.
-func seedIsolatedDaemonConfig(t *testing.T, stateDir string, extraYAML ...string) {
+// writeIsolatedDaemonConfig persists only non-secret coordinates and explicit
+// test capabilities. The API key is sent separately through stdin and never
+// enters config.yaml, command arguments, environment variables, or logs.
+func writeIsolatedDaemonConfig(t *testing.T, stateDir, endpoint string, options isolatedLiveOptions) {
 	t.Helper()
-	endpoint, apiKey := readCloudConfig(t)
-	if endpoint == "" || apiKey == "" {
-		t.Skip("live E2E skipped: no endpoint/api_key in ~/.shannon/config.yaml")
+	config := isolatedConfigFile{Endpoint: endpoint, MCPServers: options.MCPServers}
+	config.Daemon.AutoApprove = options.AutoApprove
+	config.Agent.EffortTier = options.EffortTier
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal isolated daemon config: %v", err)
 	}
-	config := fmt.Sprintf("endpoint: %q\napi_key: %q\ndaemon:\n  auto_approve: true\n", endpoint, apiKey)
-	for _, extra := range extraYAML {
-		config += extra
+	if bytes.Contains(data, []byte("api_key")) {
+		t.Fatal("isolated daemon config unexpectedly contains an api_key field")
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte(config), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), data, 0o600); err != nil {
 		t.Fatalf("seed isolated daemon config: %v", err)
 	}
 }
 
-func startIsolatedLiveDaemon(t *testing.T, bin string, extraConfigYAML ...string) *isolatedLiveDaemon {
+func startIsolatedLiveDaemon(t *testing.T, bin string, requestedOptions ...isolatedLiveOptions) *isolatedLiveDaemon {
 	t.Helper()
+	if len(requestedOptions) > 1 {
+		t.Fatal("startIsolatedLiveDaemon accepts at most one options value")
+	}
+	var options isolatedLiveOptions
+	if len(requestedOptions) == 1 {
+		options = requestedOptions[0]
+	}
+	endpoint, apiKey := readCloudConfig(t)
 	port := 0
 	for port == 0 || port == 7533 {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -264,15 +310,29 @@ func startIsolatedLiveDaemon(t *testing.T, bin string, extraConfigYAML ...string
 	}
 
 	stateDir := t.TempDir()
-	seedIsolatedDaemonConfig(t, stateDir, extraConfigYAML...)
-	daemon := &isolatedLiveDaemon{baseURL: fmt.Sprintf("http://127.0.0.1:%d", port)}
-	cmd := exec.Command(
-		bin, "daemon", "start", "--isolated",
+	writeIsolatedDaemonConfig(t, stateDir, endpoint, options)
+	daemon := &isolatedLiveDaemon{
+		baseURL:       fmt.Sprintf("http://127.0.0.1:%d", port),
+		stateDir:      stateDir,
+		cloudEndpoint: endpoint,
+		options:       options,
+	}
+	args := []string{
+		"daemon", "start", "--isolated",
 		"--state-dir", stateDir,
 		"--port", strconv.Itoa(port),
-	)
+		"--isolated-api-key-stdin",
+	}
+	if strings.TrimSpace(options.MCPAllowlist) != "" {
+		args = append(args, "--isolated-mcp", options.MCPAllowlist)
+	}
+	cmd := exec.Command(bin, args...)
 	cmd.Stdout = &daemon.output
 	cmd.Stderr = &daemon.output
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("isolated daemon stdin pipe: %v", err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("daemon start: %v", err)
 	}
@@ -280,8 +340,23 @@ func startIsolatedLiveDaemon(t *testing.T, bin string, extraConfigYAML ...string
 	daemon.done = make(chan error, 1)
 	go func() { daemon.done <- cmd.Wait() }()
 	t.Cleanup(func() { daemon.stop(t) })
+	if _, err := io.WriteString(stdin, apiKey); err != nil {
+		daemon.stop(t)
+		t.Fatalf("send isolated daemon credential: %v", err)
+	}
+	if err := stdin.Close(); err != nil {
+		daemon.stop(t)
+		t.Fatalf("close isolated daemon credential pipe: %v", err)
+	}
 	waitForDaemon(t, daemon, 15*time.Second)
 	waitForIsolationMarkers(t, daemon, 3*time.Second)
+	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read isolated config after startup: %v", err)
+	}
+	if bytes.Contains(configBytes, []byte("api_key")) || bytes.Contains(configBytes, []byte(apiKey)) {
+		t.Fatal("isolated daemon persisted its API key")
+	}
 	return daemon
 }
 
@@ -337,6 +412,7 @@ func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout t
 		daemonpkg.IsolationMarkerAutomationDisabled,
 		daemonpkg.IsolationMarkerCloudWSSuppressed,
 		daemonpkg.IsolationMarkerBackgroundDisabled,
+		daemonpkg.IsolationMarkerCredentialStoreDisabled,
 	}
 	// MCP is either fully off or narrowed to an --isolated-mcp allowlist. Both
 	// are contained startups, so accept either marker — but require one of
@@ -444,29 +520,72 @@ func TestLive_GenerateAndEditImage(t *testing.T) {
 	}
 }
 
-// readCloudConfig pulls cloud.endpoint and cloud.api_key from the user's
-// ~/.shannon/config.yaml without depending on internal/config (which would
-// pull in the entire package graph). The format is stable enough for a
-// targeted regex match here.
+// readCloudConfig resolves the explicit live-E2E endpoint and credential. A
+// migrated credential is read from the existing store into process memory; it
+// is never copied into the isolated state directory, environment, arguments,
+// or logs.
 func readCloudConfig(t *testing.T) (endpoint, apiKey string) {
 	t.Helper()
 	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Skipf("UserHomeDir: %v", err)
+		t.Fatalf("resolve live E2E home: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(home, ".shannon", "config.yaml"))
+	shannonDir := filepath.Join(home, ".shannon")
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
 	if err != nil {
-		t.Skipf("~/.shannon/config.yaml: %v", err)
+		t.Fatalf("read live E2E config: %v", err)
 	}
-	endpointRe := regexp.MustCompile(`(?m)^\s*endpoint:\s*"?([^"\s]+)"?\s*$`)
-	apiKeyRe := regexp.MustCompile(`(?m)^\s*api_key:\s*"?([^"\s]+)"?\s*$`)
-	if m := endpointRe.FindSubmatch(data); m != nil {
-		endpoint = string(m[1])
+	var persisted struct {
+		Endpoint string `yaml:"endpoint"`
+		APIKey   string `yaml:"api_key"`
 	}
-	if m := apiKeyRe.FindSubmatch(data); m != nil {
-		apiKey = string(m[1])
+	if err := yaml.Unmarshal(data, &persisted); err != nil {
+		t.Fatalf("parse live E2E config: %v", err)
+	}
+	endpoint = strings.TrimSpace(persisted.Endpoint)
+	apiKey = strings.TrimSpace(persisted.APIKey)
+	if endpoint == "" {
+		t.Fatal("live E2E config has no endpoint")
+	}
+	if apiKey == "" && keychain.Supported() {
+		store, err := keychain.NewOSStoreAt(shannonDir, nil)
+		if err != nil {
+			t.Fatalf("open live E2E credential store: %v", err)
+		}
+		apiKey, err = store.GetAPIKey()
+		if err != nil {
+			t.Fatalf("read live E2E credential store: %v", err)
+		}
+		apiKey = strings.TrimSpace(apiKey)
+	}
+	if apiKey == "" {
+		t.Fatal("live E2E has no configured API key")
 	}
 	return endpoint, apiKey
+}
+
+func liveCredentialStoreFingerprint(t *testing.T) (string, bool) {
+	t.Helper()
+	if !keychain.Supported() {
+		return "", false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve credential-store home: %v", err)
+	}
+	store, err := keychain.NewOSStoreAt(filepath.Join(home, ".shannon"), nil)
+	if err != nil {
+		t.Fatalf("open credential store for fingerprint: %v", err)
+	}
+	userID, apiKey, err := store.GetActiveUserAndKey()
+	if err != nil {
+		t.Fatalf("read credential store for fingerprint: %v", err)
+	}
+	if userID == "" || apiKey == "" {
+		return "", false
+	}
+	digest := sha256.Sum256([]byte(userID + "\x00" + apiKey))
+	return fmt.Sprintf("%x", digest[:]), true
 }
 
 func httpGet(t *testing.T, url string) map[string]interface{} {
@@ -496,4 +615,103 @@ func httpPost(t *testing.T, url string, body map[string]interface{}) map[string]
 		t.Fatalf("decode POST %s: %v", url, err)
 	}
 	return result
+}
+
+type sseFrame struct {
+	Event string
+	Data  []byte
+}
+
+type liveSSERun struct {
+	Frames   []sseFrame
+	Result   map[string]interface{}
+	Duration time.Duration
+	CostUSD  float64
+}
+
+func streamMessage(t *testing.T, baseURL string, body map[string]interface{}) liveSSERun {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal SSE message: %v", err)
+	}
+	requestCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, baseURL+"/message", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("build SSE message request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+
+	started := time.Now()
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("POST SSE message: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 16*1024))
+		t.Fatalf("POST SSE message status=%s body=%s", response.Status, body)
+	}
+
+	run := liveSSERun{}
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	var event string
+	var data strings.Builder
+	dispatch := func() {
+		if event == "" {
+			data.Reset()
+			return
+		}
+		frameData := []byte(strings.TrimSuffix(data.String(), "\n"))
+		run.Frames = append(run.Frames, sseFrame{Event: event, Data: frameData})
+		switch event {
+		case "usage":
+			var usage struct {
+				CostUSD float64 `json:"cost_usd"`
+			}
+			if json.Unmarshal(frameData, &usage) == nil {
+				run.CostUSD += usage.CostUSD
+			}
+		case "done":
+			if err := json.Unmarshal(frameData, &run.Result); err != nil {
+				t.Fatalf("decode SSE done frame: %v; data=%s", err, frameData)
+			}
+		case "error":
+			t.Fatalf("live SSE returned error: %s", frameData)
+		}
+		event = ""
+		data.Reset()
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case line == "":
+			dispatch()
+		case strings.HasPrefix(line, "event:"):
+			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		case strings.HasPrefix(line, "data:"):
+			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			data.WriteByte('\n')
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("read live SSE stream: %v", err)
+	}
+	dispatch()
+	run.Duration = time.Since(started)
+	if run.Result == nil {
+		t.Fatalf("live SSE ended without done frame; events=%v", sseEventNames(run.Frames))
+	}
+	return run
+}
+
+func sseEventNames(frames []sseFrame) []string {
+	names := make([]string, 0, len(frames))
+	for _, frame := range frames {
+		names = append(names, frame.Event)
+	}
+	return names
 }

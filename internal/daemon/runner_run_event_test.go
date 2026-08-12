@@ -50,7 +50,7 @@ func TestRunAgentPersistsUniversalRunEventLogForDesktop(t *testing.T) {
 	if !session.IsValidRunID(runID) || !session.IsValidAttemptID(attemptID) {
 		t.Fatalf("run=%q attempt=%q entries=%v", runID, attemptID, attemptEntries)
 	}
-	eventLog, err := session.NewStore(filepath.Join(deps.ShannonDir, "sessions")).OpenRunEventLog(sessionID, runID, attemptID)
+	eventLog, err := session.NewStore(filepath.Join(deps.ShannonDir, "sessions")).OpenRunEventLog(sessionID, runID, attemptID, session.DefaultRunEventRetention)
 	if err != nil {
 		t.Fatal(err)
 	}

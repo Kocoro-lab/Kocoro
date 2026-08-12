@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 )
 
@@ -72,5 +73,23 @@ func TestDirectoryList_RelativeWorksWithSessionCWD(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "b.txt") {
 		t.Errorf("expected b.txt in listing, got: %s", result.Content)
+	}
+}
+
+func TestDirectoryList_MissingPathIsBusinessError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "observatory-archive")
+	tool := &DirectoryListTool{}
+	result, err := tool.Run(
+		context.Background(),
+		fmt.Sprintf(`{"path":%q,"description":"list observatory archive"}`, path),
+	)
+	if err != nil {
+		t.Fatalf("Run should not return a transport error, got %v", err)
+	}
+	if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness {
+		t.Fatalf("missing path was not classified as non-retryable business failure: %#v", result)
+	}
+	if !strings.HasPrefix(result.Content, "[business error]") {
+		t.Fatalf("missing business-error prefix: %q", result.Content)
 	}
 }

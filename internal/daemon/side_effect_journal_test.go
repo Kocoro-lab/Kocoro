@@ -83,6 +83,41 @@ func TestSessionSideEffectJournalPersistsDigestOnlyAndCheckpointsWithTranscript(
 	}
 }
 
+func TestSessionSideEffectJournalPrepareStagesUntilDispatchBoundary(t *testing.T) {
+	manager := session.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = manager.Close() })
+	sess := manager.NewSessionWithID("side-effect-session-staged-prepare")
+	if err := manager.Save(); err != nil {
+		t.Fatal(err)
+	}
+	journal := newSessionSideEffectJournal(manager, sess, "run_staged_prepare", "attempt_staged_prepare")
+	prepared, err := journal.Prepare(context.Background(), agent.SideEffectExecution{
+		ToolUseID:       "tool-use-staged-prepare",
+		ToolName:        "send_message",
+		ArgumentsSHA256: session.ToolExecutionDigest(`{"body":"private"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := manager.Load(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.ToolExecutions) != 0 {
+		t.Fatalf("Prepare performed a redundant full-session save: %#v", persisted.ToolExecutions)
+	}
+	if err := journal.MarkDispatching(context.Background(), prepared.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err = manager.Load(sess.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.ToolExecutions) != 1 || persisted.ToolExecutions[0].State != session.ToolExecutionDispatching {
+		t.Fatalf("dispatch boundary was not durable: %#v", persisted.ToolExecutions)
+	}
+}
+
 func TestGuardInterruptedToolExecutionsBlocksAmbiguousDispatchAndPersistsWarning(t *testing.T) {
 	manager := session.NewManager(t.TempDir())
 	t.Cleanup(func() { _ = manager.Close() })

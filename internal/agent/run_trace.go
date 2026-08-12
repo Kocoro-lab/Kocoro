@@ -93,6 +93,8 @@ type RunTraceToolOutcome struct {
 	Name                 string        `json:"name"`
 	ArgumentsHMACSHA256  string        `json:"args_hmac_sha256,omitempty"`
 	ResultHMACSHA256     string        `json:"result_hmac_sha256,omitempty"`
+	ResultDigestStage    string        `json:"result_digest_stage,omitempty"`
+	ResultTransformed    bool          `json:"result_transformed,omitempty"`
 	ModelBatchID         int           `json:"model_batch_id"`
 	ModelBatchIndex      int           `json:"model_batch_index"`
 	ModelBatchSize       int           `json:"model_batch_size"`

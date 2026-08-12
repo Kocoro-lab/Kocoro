@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,7 +32,7 @@ func testRunEvent(sessionID string, seq int64, typ agent.RunTraceEventType) RunE
 func openTestRunEventLog(t *testing.T) (*RunEventLog, string) {
 	t.Helper()
 	const sessionID = "session-run-events-001"
-	log, err := NewStore(t.TempDir()).OpenRunEventLog(sessionID, testRunID, testAttemptID)
+	log, err := NewStore(t.TempDir()).OpenRunEventLog(sessionID, testRunID, testAttemptID, DefaultRunEventRetention)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,12 +51,40 @@ func TestRunEventLogAppendReadAndRetryOverlap(t *testing.T) {
 	if err := log.Append(batch); err != nil {
 		t.Fatalf("identical retry overlap: %v", err)
 	}
+	if log.scanCount != 1 {
+		t.Fatalf("steady-state appends rescanned the JSONL file %d times, want 1", log.scanCount)
+	}
 	records, err := log.ReadAll()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(records) != 2 || records[0].Event.Seq != 1 || records[1].Event.Seq != 2 {
 		t.Fatalf("records = %+v", records)
+	}
+}
+
+func TestRunEventLogAppendRescansAfterAnotherInstanceAppends(t *testing.T) {
+	dir := t.TempDir()
+	const sessionID = "session-run-events-cache-001"
+	logA, err := NewStore(dir).OpenRunEventLog(sessionID, testRunID, testAttemptID, DefaultRunEventRetention)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logB, err := NewStore(dir).OpenRunEventLog(sessionID, testRunID, testAttemptID, DefaultRunEventRetention)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := logA.Append([]RunEventRecord{testRunEvent(sessionID, 1, agent.RunTraceEventModelResponse)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := logB.Append([]RunEventRecord{testRunEvent(sessionID, 2, agent.RunTraceEventToolOutcome)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := logA.Append([]RunEventRecord{testRunEvent(sessionID, 3, agent.RunTraceEventTerminal)}); err != nil {
+		t.Fatal(err)
+	}
+	if logA.scanCount != 2 {
+		t.Fatalf("logA scan count = %d, want initial scan plus external-size refresh", logA.scanCount)
 	}
 }
 
@@ -186,11 +215,11 @@ func TestRunEventLogConcurrentIdenticalAppendIsIdempotent(t *testing.T) {
 	storeA := NewStore(dir)
 	storeB := NewStore(dir)
 	const sessionID = "session-run-events-002"
-	logA, err := storeA.OpenRunEventLog(sessionID, testRunID, testAttemptID)
+	logA, err := storeA.OpenRunEventLog(sessionID, testRunID, testAttemptID, DefaultRunEventRetention)
 	if err != nil {
 		t.Fatal(err)
 	}
-	logB, err := storeB.OpenRunEventLog(sessionID, testRunID, testAttemptID)
+	logB, err := storeB.OpenRunEventLog(sessionID, testRunID, testAttemptID, DefaultRunEventRetention)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +253,7 @@ func TestStoreDeleteRemovesRunEventDirectory(t *testing.T) {
 	if err := store.Save(&Session{ID: sessionID, CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	log, err := store.OpenRunEventLog(sessionID, testRunID, testAttemptID)
+	log, err := store.OpenRunEventLog(sessionID, testRunID, testAttemptID, DefaultRunEventRetention)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,5 +266,88 @@ func TestStoreDeleteRemovesRunEventDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(eventDir); !os.IsNotExist(err) {
 		t.Fatalf("run event directory remains: %v", err)
+	}
+}
+
+func TestOpenRunEventLogPrunesOldestAttemptsAcrossRuns(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	const sessionID = "session-run-events-retention-001"
+	for i := 1; i <= 3; i++ {
+		runID := fmt.Sprintf("run1_%032x", i)
+		attemptID := fmt.Sprintf("att1_%032x", i)
+		if _, err := store.OpenRunEventLog(sessionID, runID, attemptID, 2); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	attempts, err := collectRunEventAttempts(filepath.Join(dir, runEventDirName, sessionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("retained attempts = %d, want 2: %+v", len(attempts), attempts)
+	}
+	if attempts[0].attemptID == fmt.Sprintf("att1_%032x", 1) || attempts[1].attemptID == fmt.Sprintf("att1_%032x", 1) {
+		t.Fatal("oldest attempt was not pruned")
+	}
+}
+
+func TestSweepStaleRunEventsRemovesAttemptFilesOnly(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	const sessionID = "session-run-events-age-001"
+	log, err := store.OpenRunEventLog(sessionID, testRunID, testAttemptID, DefaultRunEventRetention)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Append([]RunEventRecord{testRunEvent(sessionID, 1, agent.RunTraceEventTerminal)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(log.incompletePath, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	for _, path := range []string{log.path, log.incompletePath, log.lockPath} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := SweepStaleRunEvents(dir, 24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 3 {
+		t.Fatalf("removed = %d, want 3", removed)
+	}
+	for _, path := range []string{log.path, log.incompletePath, log.lockPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale file remains %s: %v", path, err)
+		}
+	}
+}
+
+func TestNewStoreSweepsOrphanRunEventDirectories(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, runEventDirName)
+	orphan := filepath.Join(root, "orphan-session", testRunID)
+	live := filepath.Join(root, "live-session", testRunID)
+	for _, path := range []string{orphan, live} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(live, testAttemptID+".lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "live-session.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_ = NewStore(dir)
+	if _, err := os.Stat(filepath.Join(root, "orphan-session")); !os.IsNotExist(err) {
+		t.Fatalf("orphan run-event directory remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "live-session")); err != nil {
+		t.Fatalf("live run-event directory removed: %v", err)
 	}
 }

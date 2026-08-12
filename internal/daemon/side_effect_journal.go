@@ -57,14 +57,13 @@ func (j *sessionSideEffectJournal) Prepare(
 	if err != nil {
 		return agent.PreparedSideEffectExecution{}, err
 	}
-	before := cloneToolExecutions(j.session.ToolExecutions)
 	if err := j.session.AddToolExecution(record); err != nil {
 		return agent.PreparedSideEffectExecution{}, err
 	}
-	if err := j.manager.Save(); err != nil {
-		j.session.ToolExecutions = before
-		return agent.PreparedSideEffectExecution{}, fmt.Errorf("persist prepared side-effect execution: %w", err)
-	}
+	// Prepare only stages the no-dispatch record. The mandatory pre-dispatch
+	// checkpoint captures the assistant tool call, then MarkDispatching persists
+	// both pieces in one session save before Tool.Run can begin. A crash before
+	// that save cannot have reached the external tool and needs no recovery row.
 	return agent.PreparedSideEffectExecution{
 		ExecutionID:    record.ExecutionID,
 		IdempotencyKey: record.IdempotencyKey,

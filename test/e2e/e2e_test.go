@@ -8,16 +8,10 @@
 package e2e
 
 import (
-	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sync"
 	"testing"
-	"time"
 )
 
 var builtBinary string
@@ -51,89 +45,31 @@ func testBinary(t *testing.T) string {
 	return builtBinary
 }
 
-// skipUnlessLive gates the live E2E suite on whether this machine can actually
-// reach a Cloud endpoint — not on an opt-in environment variable.
-//
-// The gate used to require SHANNON_E2E_LIVE=1, which meant the default local
-// `go test ./...` never exercised a single real model call. Prompt and tool
-// changes were therefore validated only by string assertions, and a measured
-// behavior regression (mid-run progress notes dropping from 67% to 17% of runs)
-// passed every test in the repository. Inverting the gate costs a developer
-// with a configured endpoint nothing and gives CI the same silence it had
-// before, because CI has no endpoint to find.
-//
-// SHANNON_E2E_LIVE=1 still forces the suite on without probing (unchanged
-// semantics for release runs); =0 forces it off for a fast local iteration.
+// neutralTempDir avoids exposing the test function name inside a path that is
+// placed in a model-visible prompt. t.TempDir includes that name, which can
+// leak the expected behavior into an otherwise natural live probe.
+func neutralTempDir(t *testing.T, pattern string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", pattern)
+	if err != nil {
+		t.Fatalf("create neutral temporary directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove neutral temporary directory: %v", err)
+		}
+	})
+	return dir
+}
+
+// skipUnlessLive keeps real-provider calls behind explicit authorization.
+// Reachability and local credentials are prerequisites, not consent to spend
+// quota or execute tools against external systems.
 func skipUnlessLive(t *testing.T) {
 	t.Helper()
-	if reason := liveGateReason(); reason != "" {
-		t.Skip(reason)
+	if os.Getenv("SHANNON_E2E_LIVE") != "1" {
+		t.Skip("live E2E skipped: set SHANNON_E2E_LIVE=1 to authorize real provider calls")
 	}
-}
-
-var (
-	liveGateOnce   sync.Once
-	liveGateResult string
-)
-
-func liveGateReason() string {
-	switch os.Getenv("SHANNON_E2E_LIVE") {
-	case "1":
-		return ""
-	case "0":
-		return "SHANNON_E2E_LIVE=0 disables live E2E tests"
-	}
-	liveGateOnce.Do(func() { liveGateResult = probeLiveEndpoint() })
-	return liveGateResult
-}
-
-// probeLiveEndpoint reads the endpoint and key straight off disk and opens one
-// TCP connection. It deliberately never touches the OS credential store: a
-// keychain read from a freshly built test binary can raise a blocking
-// authorization dialog, which would turn `go test ./...` into something that
-// hangs waiting for a click.
-func probeLiveEndpoint() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "live E2E skipped: cannot resolve home directory"
-	}
-	data, err := os.ReadFile(filepath.Join(home, ".shannon", "config.yaml"))
-	if err != nil {
-		return "live E2E skipped: no ~/.shannon/config.yaml (set SHANNON_E2E_LIVE=1 to force)"
-	}
-	endpoint := firstYAMLScalar(data, `(?m)^\s*endpoint:\s*"?([^"\s]+)"?\s*$`)
-	apiKey := firstYAMLScalar(data, `(?m)^api_key:\s*"?([^"\s]+)"?\s*$`)
-	if endpoint == "" || apiKey == "" {
-		return "live E2E skipped: no endpoint/api_key configured (set SHANNON_E2E_LIVE=1 to force)"
-	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Host == "" {
-		return "live E2E skipped: unparseable endpoint in config.yaml"
-	}
-	host := parsed.Host
-	if parsed.Port() == "" {
-		if parsed.Scheme == "https" {
-			host = net.JoinHostPort(host, "443")
-		} else {
-			host = net.JoinHostPort(host, "80")
-		}
-	}
-	conn, err := net.DialTimeout("tcp", host, 2*time.Second)
-	if err != nil {
-		// A configured-but-unreachable endpoint is the common local case (the
-		// Cloud stack is not running). Skipping with the reason beats failing
-		// every live test with a connection error.
-		return fmt.Sprintf("live E2E skipped: %s is not reachable (%v)", host, err)
-	}
-	_ = conn.Close()
-	return ""
-}
-
-func firstYAMLScalar(data []byte, pattern string) string {
-	if m := regexp.MustCompile(pattern).FindSubmatch(data); m != nil {
-		return string(m[1])
-	}
-	return ""
 }
 
 func repoRoot() string {

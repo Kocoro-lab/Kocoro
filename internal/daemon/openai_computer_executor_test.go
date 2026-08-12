@@ -9,6 +9,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/guicontrol"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -570,12 +573,19 @@ func (r *openAIComputerDaemonRuntimeProbe) PlanOpenAIComputerTaskInitialObservat
 func trustedOpenAIComputerProfileForDaemon(
 	t *testing.T,
 ) *client.ExecutionProfile {
+	return trustedOpenAIComputerProfileForDaemonModel(t, "gpt-5.6-sol")
+}
+
+func trustedOpenAIComputerProfileForDaemonModel(
+	t *testing.T,
+	model string,
+) *client.ExecutionProfile {
 	t.Helper()
 	canonical := map[string]any{
 		"schema_version":              1,
 		"contract_revision":           1,
 		"provider":                    "openai",
-		"model":                       "gpt-5.6-sol",
+		"model":                       model,
 		"api_surface":                 "openai_responses",
 		"execution_mode":              "native_computer",
 		"tool_contract":               "openai.computer.v1",
@@ -604,7 +614,7 @@ func trustedOpenAIComputerProfileForDaemon(
 		context.Background(),
 		client.ResolveExecutionProfileRequest{
 			SchemaVersion: 1,
-			SpecificModel: "gpt-5.6-sol",
+			SpecificModel: model,
 			Capability:    client.ExecutionProfileCapabilityComputer,
 		},
 	)
@@ -3975,6 +3985,67 @@ func TestOpenAIComputerTaskToolSeedsChildBudgetFromSealedModelContextWindow(
 	}
 	if len(llm.requests) != 2 {
 		t.Fatalf("child provider calls = %d, want 2", len(llm.requests))
+	}
+}
+
+func TestOpenAIComputerTaskToolTracesUnknownChildContextWindowFallback(
+	t *testing.T,
+) {
+	logDir := t.TempDir()
+	auditor, err := audit.NewAuditLogger(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := trustedOpenAIComputerProfileForDaemonModel(
+		t,
+		"future-native-computer-profile",
+	)
+	child := agent.NewAgentLoop(
+		nil,
+		agent.NewToolRegistry(),
+		"large",
+		"",
+		4,
+		2000,
+		200,
+		nil,
+		auditor,
+		nil,
+	)
+	tool := &openAIComputerTaskToolV1{contextWindowFallback: 320_000}
+	trace := newOpenAIComputerTraceV1(auditor, daemonGUIWorkflowRequest{
+		SessionID: "session-child-context-window-fallback",
+	})
+	tool.seedChildContextWindow(child, profile, trace)
+	if tokens, explicit := child.ContextWindow(); tokens != 320_000 || explicit {
+		t.Fatalf("child context window = (%d, %t), want (320000, false)", tokens, explicit)
+	}
+	if err := auditor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(logDir, "audit.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry struct {
+		Event        string `json:"event"`
+		InputSummary string `json:"input_summary"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Event != openAIComputerTraceEventNameV1 {
+		t.Fatalf("trace event = %q", entry.Event)
+	}
+	var payload openAIComputerTraceEventV1
+	if err := json.Unmarshal([]byte(entry.InputSummary), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Phase != "child_context_window" || payload.Status != "fallback" ||
+		payload.FailureCode != "model_context_window_unknown" ||
+		payload.ContextWindowTokens != 320_000 ||
+		payload.ContextWindowSource != "config_fallback" {
+		t.Fatalf("fallback trace = %+v", payload)
 	}
 }
 

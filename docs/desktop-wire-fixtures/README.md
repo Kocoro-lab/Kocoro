@@ -86,8 +86,10 @@ retry. `decline` carries no answers.
 | `sse_event.tool.completed.json` | `server.go sseEventHandler.OnToolResult` | same |
 | `sse_event.usage.json` | `server.go sseEventHandler.OnUsage` | `web_search_usage_v1`: live usage always includes `web_search_calls`, including zero |
 | `sse_event.done.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | `web_search_usage_v1`: terminal usage always includes `web_search_calls`; optional fields omitted here: `partial`, `failure_code`, `message_start_index`, `message_end_index` (all omitempty, soft-failure metadata) |
-| `sse_event.done.partial.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | explicit soft-stop result: usable reply plus `partial: true` and stable `failure_code`; `message_start_index` / `message_end_index` are omitted here because both are zero-value `omitempty`; UI must not render it as verified completion |
+| `sse_event.done.partial.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | explicit soft-stop result: usable reply plus `partial: true` and stable `failure_code`; this constructed fixture leaves `message_start_index` / `message_end_index` at zero so `omitempty` removes them, while a live soft-stop result normally populates both; UI must not render it as verified completion |
+| `bus_event.agent_reply.json` | `runner.go RunAgent` after the final session save | canonical clean persisted reply; `partial` and `failure_code` are absent |
 | `bus_event.agent_reply.partial.json` | `runner.go RunAgent` after the final session save | persisted soft-stop reply on the broadcast bus; carries the same `partial`/`failure_code` classification as the per-request done payload |
+| `bus_event.agent_error.json` | `runner.go RunAgent` hard-error path after saving the friendly error stub | failed run notification; unlike `agent_reply`, always carries a non-empty `failure_code` plus diagnostic and user-facing error strings |
 | `sse_event.done.with_deliverable.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | `message_idempotency_receipt_v2`: an empty chat reply plus daemon-validated `present_deliverable` metadata. A client that persists a local artifact requires this receipt before deleting its retained source |
 | `bus_event.cloud_progress.json` | `bus_handler.go OnCloudProgress` | counts-only today; a future `items` array extension will be additive + capability-gated |
 | `bus_event.suggestion_ready.json` | `runner.go fireSuggestionAfterRun` | post-turn suggested next user prompt |
@@ -95,10 +97,13 @@ retry. `decline` carries no answers.
 | `bus_event.computer_use.activity.json` | `guicontrol.Coordinator` through the `Server` event sink | Dotted event type `computer_use.activity`; schema v1 redacted activity payload. `coordinator_instance_id` is immutable for one daemon coordinator process, while `revision` is coordinator-owned and independent from the SSE event ID. Pointer geometry is bound to `topology_id` + `topology_generation`. Nullable result/path/pointer/failure fields never carry action content. |
 | `bus_event.computer_use.activity.scroll.json` | same | Verified Accessibility scroll activity. It pins `action_kind: scroll`, `execution_path: accessibility`, and an explicit null pointer so Desktop never invents a click/move pulse for a semantic AX scroll. |
 
-`failure_code` is an open string enum on terminal run payloads. Consumers may
-localize known values, but must preserve forward compatibility by decoding an
-unknown non-empty value and showing a generic partial/failure fallback instead
-of rejecting or dropping the event.
+`agent_reply` includes `failure_code` only when `partial` is true;
+`agent_error` always includes a non-empty `failure_code`. The value is an open
+string enum on terminal run payloads. Current producer values are declared in
+`internal/runstatus/runstatus.go`. Consumers may localize known values, but
+must preserve forward compatibility by decoding an unknown non-empty value and
+showing a generic partial/failure fallback instead of rejecting or dropping
+the event.
 
 ### Computer-use control plane
 

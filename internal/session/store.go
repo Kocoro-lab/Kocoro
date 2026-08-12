@@ -507,6 +507,7 @@ func NewStore(dir string) *Store {
 	s := &Store{dir: dir}
 	if _, loaded := orphanSweepDone.LoadOrStore(filepath.Clean(dir), true); !loaded {
 		s.SweepOrphanCompactionSnapshots()
+		s.SweepOrphanRunEvents()
 	}
 	idx, err := OpenIndex(dir)
 	if err == nil {

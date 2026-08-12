@@ -50,12 +50,16 @@ import (
 )
 
 type Server struct {
-	port       int
-	client     *Client
-	deps       *ServerDeps
-	server     *http.Server
-	isolated   bool
-	listenerMu sync.Mutex // protects listener
+	port     int
+	client   *Client
+	deps     *ServerDeps
+	server   *http.Server
+	isolated bool
+	// isolatedMCPAllowlist is the immutable process-start policy applied before
+	// every MCP registration, including config reloads. An empty value means no
+	// MCP server may start in isolated mode.
+	isolatedMCPAllowlist string
+	listenerMu           sync.Mutex // protects listener
 	// toolRefreshMu serializes in-place re-registration of the live registry's
 	// gateway/integration tools (RebuildAuthSensitiveTools + RefreshIntegrationTools).
 	// Without it, overlapping refreshes (e.g. sign-in + a connect/delete async
@@ -619,6 +623,13 @@ func (s *Server) SetIsolated(isolated bool) {
 	s.isolated = isolated
 }
 
+// SetIsolatedMCPAllowlist pins the MCP capability boundary for an isolated
+// process. It must be set before Start; reloads reapply the same allowlist to
+// freshly loaded config before any server registration or browser preflight.
+func (s *Server) SetIsolatedMCPAllowlist(allowlist string) {
+	s.isolatedMCPAllowlist = allowlist
+}
+
 // SetOnReload sets a callback invoked after config reload to restart watchers/heartbeat.
 func (s *Server) SetOnReload(fn func()) {
 	s.onReload = fn
@@ -693,7 +704,7 @@ func (s *Server) SetConsequentialRiskHTTPAuthorizer(authorizer func(*http.Reques
 }
 
 func (s *Server) liveAPIKey(cfg *config.Config) string {
-	if s != nil && s.auth != nil && s.deps != nil && s.deps.GW != nil {
+	if s != nil && s.deps != nil && s.deps.GW != nil && (s.isolated || s.auth != nil) {
 		return s.deps.GW.APIKey()
 	}
 	if cfg == nil {
@@ -707,7 +718,7 @@ func (s *Server) configWithLiveAPIKey(cfg *config.Config) *config.Config {
 		return nil
 	}
 	out := config.Clone(cfg)
-	if s != nil && s.auth != nil && s.deps != nil && s.deps.GW != nil {
+	if s != nil && s.deps != nil && s.deps.GW != nil && (s.isolated || s.auth != nil) {
 		out.APIKey = s.deps.GW.APIKey()
 	}
 	return out
@@ -1167,14 +1178,17 @@ func (s *Server) startBackgroundServices(ctx context.Context) func() {
 	// history. Bound their lifetime independently of session deletion so an
 	// old but still-listed session cannot retain full-history copies forever.
 	days := 0
+	runEventDays := 0
 	if s.deps != nil {
 		s.deps.mu.RLock()
 		if s.deps.Config != nil {
 			days = s.deps.Config.Agent.CompactionSnapshotMaxAgeDays
+			runEventDays = s.deps.Config.Agent.RunEventMaxAgeDays
 		}
 		s.deps.mu.RUnlock()
 	}
 	s.startCompactionSnapshotSweep(days)
+	s.startRunEventSweep(runEventDays)
 
 	// One-time agent pull on startup: applies the cloud mirror to local disk
 	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
@@ -7392,6 +7406,9 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("config load failed: %v", err))
 		return
+	}
+	if s.isolated {
+		RestrictMCPServersToAllowlist(newCfg, s.isolatedMCPAllowlist)
 	}
 	turningRecommendationsOff := skillRecommendationsEnabled(oldCfg) && !skillRecommendationsEnabled(newCfg)
 	s.skillRecommendationsOff.Store(!skillRecommendationsEnabled(newCfg))

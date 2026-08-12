@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -20,6 +22,11 @@ const (
 	RunEventSchemaVersion           = 1
 	RunEventIncompleteSchemaVersion = 1
 	runEventDirName                 = ".run-events"
+	// DefaultRunEventRetention covers roughly a month of daily attempts for a
+	// long-lived interactive session. When it binds, only older observation-only
+	// logs are deleted; session history and recovery state are untouched. Raise
+	// agent.run_event_retention when a longer diagnostic window is required.
+	DefaultRunEventRetention = 32
 
 	RunEventIncompleteCategoryLock       = "lock_failed"
 	RunEventIncompleteCategoryOpen       = "open_failed"
@@ -65,15 +72,21 @@ type RunEventIncompleteMarker struct {
 // only: recovery and side-effect replay decisions remain authoritative in the
 // session checkpoint, never in this log.
 type RunEventLog struct {
+	mu             sync.Mutex
 	path           string
 	lockPath       string
 	incompletePath string
 	sessionID      string
 	runID          string
 	attemptID      string
+	cacheReady     bool
+	cachedSize     int64
+	lastSeq        int64
+	bySeq          map[int64][]byte
+	scanCount      int // package tests pin steady-state append complexity
 }
 
-func (s *Store) OpenRunEventLog(sessionID, runID, attemptID string) (*RunEventLog, error) {
+func (s *Store) OpenRunEventLog(sessionID, runID, attemptID string, maxAttempts int) (*RunEventLog, error) {
 	if _, err := s.safeSessionPath(sessionID); err != nil {
 		return nil, err
 	}
@@ -87,20 +100,221 @@ func (s *Store) OpenRunEventLog(sessionID, runID, attemptID string) (*RunEventLo
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create run event directory: %w", err)
 	}
-	return &RunEventLog{
+	log := &RunEventLog{
 		path:           filepath.Join(dir, attemptID+".jsonl"),
 		lockPath:       filepath.Join(dir, attemptID+".lock"),
 		incompletePath: filepath.Join(dir, attemptID+".incomplete"),
 		sessionID:      sessionID,
 		runID:          runID,
 		attemptID:      attemptID,
-	}, nil
+	}
+	// Materialize the attempt identity before pruning so the current attempt is
+	// counted and explicitly protected even before its first event is flushed.
+	lockFile, err := os.OpenFile(log.lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("create run event lock: %w", err)
+	}
+	if err := lockFile.Close(); err != nil {
+		return nil, fmt.Errorf("close run event lock: %w", err)
+	}
+	if maxAttempts > 0 {
+		pruneRunEventAttempts(filepath.Join(s.dir, runEventDirName, sessionID), runID, attemptID, maxAttempts)
+	}
+	return log, nil
+}
+
+type runEventAttemptFiles struct {
+	runID     string
+	attemptID string
+	modTime   time.Time
+	paths     []string
+	lockPath  string
+}
+
+func collectRunEventAttempts(sessionRoot string) ([]runEventAttemptFiles, error) {
+	runs, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return nil, err
+	}
+	groups := make(map[string]*runEventAttemptFiles)
+	for _, run := range runs {
+		if !run.IsDir() || !IsValidRunID(run.Name()) {
+			continue
+		}
+		runDir := filepath.Join(sessionRoot, run.Name())
+		files, err := os.ReadDir(runDir)
+		if err != nil {
+			continue
+		}
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			name := file.Name()
+			var attemptID string
+			switch {
+			case strings.HasSuffix(name, ".jsonl"):
+				attemptID = strings.TrimSuffix(name, ".jsonl")
+			case strings.HasSuffix(name, ".incomplete"):
+				attemptID = strings.TrimSuffix(name, ".incomplete")
+			case strings.HasSuffix(name, ".lock"):
+				attemptID = strings.TrimSuffix(name, ".lock")
+			default:
+				continue
+			}
+			if !IsValidAttemptID(attemptID) {
+				continue
+			}
+			key := run.Name() + "\x00" + attemptID
+			group := groups[key]
+			if group == nil {
+				group = &runEventAttemptFiles{
+					runID: run.Name(), attemptID: attemptID,
+					lockPath: filepath.Join(runDir, attemptID+".lock"),
+				}
+				groups[key] = group
+			}
+			path := filepath.Join(runDir, name)
+			group.paths = append(group.paths, path)
+			if info, infoErr := file.Info(); infoErr == nil && info.ModTime().After(group.modTime) {
+				group.modTime = info.ModTime()
+			}
+		}
+	}
+	attempts := make([]runEventAttemptFiles, 0, len(groups))
+	for _, group := range groups {
+		attempts = append(attempts, *group)
+	}
+	sort.Slice(attempts, func(i, j int) bool {
+		if attempts[i].modTime.Equal(attempts[j].modTime) {
+			if attempts[i].runID == attempts[j].runID {
+				return attempts[i].attemptID < attempts[j].attemptID
+			}
+			return attempts[i].runID < attempts[j].runID
+		}
+		return attempts[i].modTime.Before(attempts[j].modTime)
+	})
+	return attempts, nil
+}
+
+func removeRunEventAttempt(attempt runEventAttemptFiles) int {
+	hadLock := false
+	for _, path := range attempt.paths {
+		if path == attempt.lockPath {
+			hadLock = true
+			break
+		}
+	}
+	lockFile, err := os.OpenFile(attempt.lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return 0
+	}
+	if err := fslock.TryLock(lockFile.Fd()); err != nil {
+		lockFile.Close()
+		return 0
+	}
+	removed := 0
+	for _, path := range attempt.paths {
+		if path == attempt.lockPath {
+			continue
+		}
+		if err := os.Remove(path); err == nil {
+			removed++
+		}
+	}
+	_ = fslock.Unlock(lockFile.Fd())
+	_ = lockFile.Close()
+	if err := os.Remove(attempt.lockPath); err == nil && hadLock {
+		removed++
+	}
+	return removed
+}
+
+func pruneRunEventAttempts(sessionRoot, protectedRunID, protectedAttemptID string, keep int) {
+	if keep <= 0 {
+		return
+	}
+	attempts, err := collectRunEventAttempts(sessionRoot)
+	if err != nil || len(attempts) <= keep {
+		return
+	}
+	remaining := len(attempts)
+	for _, attempt := range attempts {
+		if remaining <= keep {
+			break
+		}
+		if attempt.runID == protectedRunID && attempt.attemptID == protectedAttemptID {
+			continue
+		}
+		if removeRunEventAttempt(attempt) > 0 {
+			remaining--
+		}
+	}
+}
+
+// SweepStaleRunEvents removes observation-only attempt files older than
+// maxAge from one sessions directory. It never touches session JSON or replay
+// state. Active attempts are skipped when their advisory lock is held.
+func SweepStaleRunEvents(sessionsDir string, maxAge time.Duration) (int, error) {
+	if sessionsDir == "" || maxAge <= 0 {
+		return 0, nil
+	}
+	root := filepath.Join(filepath.Clean(sessionsDir), runEventDirName)
+	sessions, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, entry := range sessions {
+		if !entry.IsDir() {
+			continue
+		}
+		attempts, err := collectRunEventAttempts(filepath.Join(root, entry.Name()))
+		if err != nil {
+			continue
+		}
+		for _, attempt := range attempts {
+			if !attempt.modTime.IsZero() && attempt.modTime.Before(cutoff) {
+				removed += removeRunEventAttempt(attempt)
+			}
+		}
+	}
+	return removed, nil
+}
+
+// SweepOrphanRunEvents removes per-session observation directories whose
+// authoritative session JSON no longer exists. NewStore gates this to the
+// first construction per sessions directory so it runs before normal traffic.
+func (s *Store) SweepOrphanRunEvents() {
+	root := filepath.Join(s.dir, runEventDirName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		sessionPath, err := s.safeSessionPath(entry.Name())
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+			_ = os.RemoveAll(filepath.Join(root, entry.Name()))
+		}
+	}
 }
 
 func (l *RunEventLog) withLock(fn func() error) error {
 	if l == nil {
 		return errors.New("run event log is nil")
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	lockFile, err := os.OpenFile(l.lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("open run event lock: %w", err)
@@ -111,6 +325,37 @@ func (l *RunEventLog) withLock(fn func() error) error {
 	}
 	defer fslock.Unlock(lockFile.Fd())
 	return fn()
+}
+
+// refreshAppendCache scans only on first use or after another RunEventLog
+// instance changed the file size. The daemon normally owns one instance per
+// attempt, so steady-state appends validate against this in-memory canonical
+// index instead of reparsing the full JSONL file on every checkpoint. The
+// advisory file lock remains the cross-process authority; a concurrent writer
+// changes the size and forces a rescan before this instance appends again.
+func (l *RunEventLog) refreshAppendCache(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if l.cacheReady && info.Size() == l.cachedSize {
+		return nil
+	}
+	records, bySeq, err := l.scanAndRepair(file)
+	if err != nil {
+		l.cacheReady = false
+		return err
+	}
+	info, err = file.Stat()
+	if err != nil {
+		l.cacheReady = false
+		return err
+	}
+	l.cacheReady = true
+	l.cachedSize = info.Size()
+	l.lastSeq = int64(len(records))
+	l.bySeq = bySeq
+	return nil
 }
 
 func (l *RunEventLog) validateRecord(record RunEventRecord) error {
@@ -175,6 +420,7 @@ func (l *RunEventLog) clearIncomplete() error {
 }
 
 func (l *RunEventLog) scanAndRepair(file *os.File) ([]RunEventRecord, map[int64][]byte, error) {
+	l.scanCount++
 	if _, err := file.Seek(0, 0); err != nil {
 		return nil, nil, err
 	}
@@ -260,11 +506,11 @@ func (l *RunEventLog) Append(batch []RunEventRecord) error {
 		}
 		defer file.Close()
 		category = RunEventIncompleteCategoryScan
-		records, bySeq, err := l.scanAndRepair(file)
-		if err != nil {
+		if err := l.refreshAppendCache(file); err != nil {
 			return fail(err)
 		}
-		lastSeq := int64(len(records))
+		lastSeq := l.lastSeq
+		pendingBySeq := make(map[int64][]byte)
 		var encoded bytes.Buffer
 		for _, record := range batch {
 			category = RunEventIncompleteCategoryValidation
@@ -276,7 +522,11 @@ func (l *RunEventLog) Append(batch []RunEventRecord) error {
 			if err != nil {
 				return fail(err)
 			}
-			if prior, exists := bySeq[record.Event.Seq]; exists {
+			prior, exists := l.bySeq[record.Event.Seq]
+			if !exists {
+				prior, exists = pendingBySeq[record.Event.Seq]
+			}
+			if exists {
 				if !bytes.Equal(prior, canonical) {
 					category = RunEventIncompleteCategoryValidation
 					return fail(fmt.Errorf("conflicting duplicate run event sequence %d", record.Event.Seq))
@@ -289,7 +539,7 @@ func (l *RunEventLog) Append(batch []RunEventRecord) error {
 			}
 			encoded.Write(canonical)
 			encoded.WriteByte('\n')
-			bySeq[record.Event.Seq] = canonical
+			pendingBySeq[record.Event.Seq] = canonical
 			lastSeq = record.Event.Seq
 		}
 		payload := encoded.Bytes()
@@ -307,6 +557,17 @@ func (l *RunEventLog) Append(batch []RunEventRecord) error {
 		category = RunEventIncompleteCategorySync
 		if err := file.Sync(); err != nil {
 			return fail(fmt.Errorf("sync run event log: %w", err))
+		}
+		for seq, canonical := range pendingBySeq {
+			l.bySeq[seq] = canonical
+		}
+		l.lastSeq = lastSeq
+		if info, statErr := file.Stat(); statErr == nil {
+			l.cachedSize = info.Size()
+		} else {
+			// The append is durable, but without a size identity the next call
+			// must rebuild the cache before trusting it.
+			l.cacheReady = false
 		}
 		category = RunEventIncompleteCategoryClear
 		if err := l.clearIncomplete(); err != nil {
@@ -362,6 +623,20 @@ func (l *RunEventLog) ReadAll() ([]RunEventRecord, error) {
 		loaded, _, err := l.scanAndRepair(file)
 		if err != nil {
 			return err
+		}
+		if info, statErr := file.Stat(); statErr == nil {
+			l.cacheReady = true
+			l.cachedSize = info.Size()
+			l.lastSeq = int64(len(loaded))
+			l.bySeq = make(map[int64][]byte, len(loaded))
+			for _, record := range loaded {
+				canonical, encodeErr := canonicalRunEvent(record)
+				if encodeErr != nil {
+					l.cacheReady = false
+					return encodeErr
+				}
+				l.bySeq[record.Event.Seq] = canonical
+			}
 		}
 		records = loaded
 		return nil

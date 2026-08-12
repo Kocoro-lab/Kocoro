@@ -105,16 +105,18 @@ func representativeKoeSystems() (fastSystem, fullSystem string) {
 // empty-result honesty section. Each traces to a production incident; the
 // budget guards drift, not these clauses.
 //
-// Raised again to 9900/10700 to hold the full ## Text output section. Its
+// Raised again to hold the full ## Text output and ## Error Handling sections. The
 // compression into a single bullet cost a measured behavior collapse — at
 // effort_tier max, mid-run progress notes went from 6/6 runs to 0/6 — and three
 // rewrites of that bullet recovered only 0/6, 2/6, 2/6. Restoring the section
 // verbatim recovered 6/6. The section's effect is cumulative across its
-// clauses, so it is not compressible clause-by-clause without re-measuring;
-// TestLive_MidRunProgressNotesReachTheUser is the standing check.
+// clauses, so it is not compressible clause-by-clause without re-measuring.
+// Error handling showed the same failure mode: after a classified missing-file
+// result, the compact rule still allowed adjacent-directory shell searches and
+// a 60-second timeout. The live behavior probes are the standing checks.
 const (
-	fastSystemCharBudget = 9900
-	fullSystemCharBudget = 10700
+	fastSystemCharBudget = 11200
+	fullSystemCharBudget = 12000
 )
 
 // TestRepresentativeSystemPromptStaysWithinBudget is the standing guard against
@@ -151,6 +153,10 @@ func TestRepresentativeSystemPromptKeepsIncidentBackedClauses(t *testing.T) {
 		{"progress-note trigger list", "when you find something"},
 		{"tool calls are invisible to the user", "Assume users can't see most tool calls"},
 		{"operational preamble", "give one brief user-facing preamble"},
+		{"dedicated content search", "grep (not grep/rg)"},
+		{"validation error no identical retry", "Do not retry with the same arguments"},
+		{"named scope boundary", "Do not broaden filters or query adjacent endpoints"},
+		{"unclassified error handling", "No prefix"},
 	} {
 		if !strings.Contains(fastSystem, clause.phrase) {
 			t.Errorf("Koe Fast System dropped the %s clause (%q)", clause.name, clause.phrase)

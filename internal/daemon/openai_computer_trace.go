@@ -44,6 +44,8 @@ type openAIComputerTraceEventV1 struct {
 	CacheCreationTokens   int     `json:"cache_creation_tokens,omitempty"`
 	CacheCreation5mTokens int     `json:"cache_creation_5m_tokens,omitempty"`
 	CacheCreation1hTokens int     `json:"cache_creation_1h_tokens,omitempty"`
+	ContextWindowTokens   int     `json:"context_window_tokens,omitempty"`
+	ContextWindowSource   string  `json:"context_window_source,omitempty"`
 	DurationMS            int64   `json:"duration_ms"`
 
 	// Capture diagnostics are written as a separate structured audit event.

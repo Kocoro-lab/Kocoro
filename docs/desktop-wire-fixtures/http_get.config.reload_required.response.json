@@ -25,6 +25,8 @@
         "min_turns": 0
       },
       "reasoning_effort": "",
+      "run_event_max_age_days": 0,
+      "run_event_retention": 0,
       "service_tier": "",
       "stream_idle_timeout_secs": 0,
       "temperature": 0,

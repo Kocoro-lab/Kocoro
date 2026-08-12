@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -509,13 +510,14 @@ type openAIComputerTaskToolV1 struct {
 	appPolicy       *ComputerUseAppPolicyStore
 	handler         agent.EventHandler
 
-	modelTier   string
-	shannonDir  string
-	maxIter     int
-	maxTokens   int
-	resultTrunc int
-	argsTrunc   int
-	taskTimeout time.Duration
+	modelTier             string
+	shannonDir            string
+	maxIter               int
+	maxTokens             int
+	contextWindowFallback int
+	resultTrunc           int
+	argsTrunc             int
+	taskTimeout           time.Duration
 	// Tests may shorten this private first-response window. Production keeps
 	// exactly one retry so a provider-side stall cannot consume the whole task.
 	initialResponseTimeout  time.Duration
@@ -1348,9 +1350,7 @@ func (t *openAIComputerTaskToolV1) Run(
 	child.SetSkillDiscovery(false)
 	child.SetBypassPermissions(true)
 	child.SetSpecificModel(profile.Model())
-	if contextWindow, ok := agent.LookupModelContextWindow(profile.Model()); ok {
-		child.SetContextWindow(contextWindow)
-	}
+	t.seedChildContextWindow(child, profile, trace)
 	child.SetExecutionProfile(profile)
 	child.SetOpenAIComputerBatchExecutor(runner)
 	child.SetForceInitialToolUse(true)
@@ -1802,6 +1802,36 @@ func (t *openAIComputerTaskToolV1) Run(
 		agent.ComputerUseTaskCompleted,
 		stats.TaskEffect,
 	), nil
+}
+
+func (t *openAIComputerTaskToolV1) seedChildContextWindow(
+	child *agent.AgentLoop,
+	profile *client.ExecutionProfile,
+	trace *openAIComputerTraceV1,
+) {
+	if child == nil || profile == nil {
+		return
+	}
+	if contextWindow, ok := agent.LookupModelContextWindow(profile.Model()); ok {
+		child.SetContextWindow(contextWindow)
+		return
+	}
+	fallback := t.contextWindowFallback
+	if fallback > 0 {
+		child.SetContextWindow(fallback)
+	}
+	log.Printf(
+		"daemon: computer child context-window catalog miss model=%q fallback_tokens=%d",
+		profile.Model(),
+		fallback,
+	)
+	trace.record(openAIComputerTraceEventV1{
+		Phase:               "child_context_window",
+		Status:              "fallback",
+		FailureCode:         "model_context_window_unknown",
+		ContextWindowTokens: fallback,
+		ContextWindowSource: "config_fallback",
+	})
 }
 
 // The child shares approvals and usage reporting with the parent transport,

@@ -597,7 +597,8 @@ func (*wireFixtureProbeTool) Run(context.Context, string) (agent.ToolResult, err
 // contract through the real RunAgent producer: a clean persisted reply must
 // not put partial or failure_code on the broadcast bus.
 func TestWireFixture_AgentReplyClean_Bus(t *testing.T) {
-	const reply = "The requested work is complete."
+	fixture := loadWireFixture(t, "bus_event.agent_reply.json")
+	reply := fixture["text"].(string)
 	gw := &fakeGatewayBackend{reply: reply}
 	ts := httptest.NewServer(gw.handler())
 	defer ts.Close()
@@ -625,13 +626,58 @@ func TestWireFixture_AgentReplyClean_Bus(t *testing.T) {
 
 	evt := waitBusEvent(t, sub, EventAgentReply)
 	produced := parseJSONMap(t, evt.Payload)
-	if produced["text"] != reply || produced["source"] != "heartbeat" {
-		t.Fatalf("agent_reply lost clean fields: %#v", produced)
+	if sessionID, ok := produced["session_id"].(string); !ok || sessionID == "" {
+		t.Fatalf("agent_reply session_id missing or empty: %#v", produced["session_id"])
 	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
 	for _, key := range []string{"partial", "failure_code"} {
 		if _, exists := produced[key]; exists {
 			t.Fatalf("clean agent_reply unexpectedly contains %q: %#v", key, produced)
 		}
+	}
+}
+
+func TestWireFixture_AgentError_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.agent_error.json")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "synthetic upstream rejection", http.StatusTeapot)
+	}))
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.EventBus = NewEventBus()
+	defer deps.SessionCache.CloseAll()
+	sub := deps.EventBus.Subscribe()
+	defer deps.EventBus.Unsubscribe(sub)
+
+	result, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "fail this fixture run",
+		Source:        fixture["source"].(string),
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err == nil || result == nil || result.FailureCode != runstatus.CodeUnexpected {
+		t.Fatalf("RunAgent hard-error result=%+v err=%v", result, err)
+	}
+
+	evt := waitBusEvent(t, sub, EventAgentError)
+	produced := parseJSONMap(t, evt.Payload)
+	if sessionID, ok := produced["session_id"].(string); !ok || sessionID == "" {
+		t.Fatalf("agent_error session_id missing or empty: %#v", produced["session_id"])
+	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		Error         string `json:"error"`
+		FriendlyError string `json:"friendly_error"`
+		FailureCode   string `json:"failure_code"`
+	}
+	if err := json.Unmarshal(evt.Payload, &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.Error == "" || consumer.FriendlyError == "" || consumer.FailureCode == "" {
+		t.Fatalf("consumer decode lost error fields: %+v", consumer)
 	}
 }
 

@@ -134,6 +134,8 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 		"cache_creation_tokens":    true,
 		"cache_creation_5m_tokens": true,
 		"cache_creation_1h_tokens": true,
+		"context_window_tokens":    true,
+		"context_window_source":    true,
 		"duration_ms":              true,
 	}
 	for key := range payload {

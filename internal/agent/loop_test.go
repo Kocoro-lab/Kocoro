@@ -2364,6 +2364,63 @@ func TestAgentLoop_AlternateCallDoesNotConsumeCorrectedAppRetry(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_ValidCorrectedAppCallIsOrderIndependent(t *testing.T) {
+	malformed := *toolCall("computer_use",
+		`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`)
+	valid := *toolCall("computer_use",
+		`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`)
+	for _, tc := range []struct {
+		name  string
+		calls []client.FunctionCall
+	}{
+		{name: "malformed then valid", calls: []client.FunctionCall{malformed, valid}},
+		{name: "valid then malformed", calls: []client.FunctionCall{valid, malformed}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			computerUse := &mockComputerUseRecoveryTool{}
+			callCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callCount++
+				switch callCount {
+				case 1:
+					json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+						toolCall("computer_use", malformed.ArgumentsString()), 10, 5))
+				case 2:
+					response := nativeResponse("", "tool_use", nil, 10, 5)
+					response.ToolCalls = tc.calls
+					json.NewEncoder(w).Encode(response)
+				case 3:
+					json.NewEncoder(w).Encode(nativeResponse(
+						"Browser task completed.", "end_turn", nil, 10, 5))
+				default:
+					t.Errorf("unexpected LLM call %d", callCount)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+
+			reg := NewToolRegistry()
+			reg.Register(computerUse)
+			loop := NewAgentLoop(
+				client.NewGatewayClient(server.URL, ""),
+				reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+			)
+			result, _, err := loop.Run(
+				context.Background(),
+				"Use computer use to open a browser",
+				nil,
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if result != "Browser task completed." || computerUse.runs != 2 || callCount != 3 {
+				t.Fatalf("result=%q runs=%d calls=%d", result, computerUse.runs, callCount)
+			}
+		})
+	}
+}
+
 func TestAgentLoop_MalformedCorrectedAppCallConsumesRetry(t *testing.T) {
 	computerUse := &mockComputerUseRecoveryTool{}
 	callCount := 0
@@ -2375,38 +2432,15 @@ func TestAgentLoop_MalformedCorrectedAppCallConsumesRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 		switch callCount {
-		case 1:
+		case 1, 2:
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
 				toolCall("computer_use",
 					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
 				10, 5))
-		case 2:
-			response := nativeResponse("", "tool_use", nil, 10, 5)
-			response.ToolCalls = []client.FunctionCall{
-				*toolCall("computer_use",
-					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
-				*toolCall("computer_use",
-					`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
-			}
-			json.NewEncoder(w).Encode(response)
 		case 3:
 			finalRequest = request
-			encoded, err := json.Marshal(request.Messages)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if strings.Count(string(encoded), "retry computer_use") > 1 {
-				json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-					toolCall("computer_use",
-						`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
-					10, 5))
-				return
-			}
 			json.NewEncoder(w).Encode(nativeResponse(
 				"The requested app target remains unresolved.", "end_turn", nil, 10, 5))
-		case 4:
-			json.NewEncoder(w).Encode(nativeResponse(
-				"The stale retry instruction caused an extra model iteration.", "end_turn", nil, 10, 5))
 		default:
 			t.Errorf("unexpected LLM call %d", callCount)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -2420,12 +2454,7 @@ func TestAgentLoop_MalformedCorrectedAppCallConsumesRetry(t *testing.T) {
 		client.NewGatewayClient(server.URL, ""),
 		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
 	)
-	result, _, err := loop.Run(
-		context.Background(),
-		"Use computer use to open a browser",
-		nil,
-		nil,
-	)
+	result, _, err := loop.Run(context.Background(), "Use computer use to open a browser", nil, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -4114,8 +4143,8 @@ func TestAgentLoop_CloudDelegateLock(t *testing.T) {
 // exploration where most queries naturally return zero on misses.
 func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 	wantSubstrings := []string{
-		"deterministic file/search query",
-		"An empty result is final",
+		"For search/filesystem queries",
+		"an empty result IS the answer. Do not retry",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4132,8 +4161,8 @@ func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 // synthetic single-lookup versus batch-enumeration distinction.
 func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 	wantSubstrings := []string{
-		"unnamed list-style integration scope",
-		"one focused scope diversification",
+		"integrations with list-and-enumerate semantics",
+		"try ONE focused diversification",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4149,8 +4178,8 @@ func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 // the model to cross-account/folder-hunt past the user's contract.
 func TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope(t *testing.T) {
 	wantSubstrings := []string{
-		"user-named scope",
-		"An empty result is final",
+		"specific resource the user explicitly named",
+		"the user-specified contract is the boundary. Do not broaden filters",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4166,7 +4195,7 @@ func TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope(t *testing.T) {
 // semantics AND must name the http tool as an empty-is-the-answer case,
 // so the model does not repurpose scope-hunting for arbitrary HTTP.
 func TestCoreRules_EmptyResultRule_ExcludesHTTPTool(t *testing.T) {
-	if !strings.Contains(coreOperationalRules, "exact HTTP endpoint") {
+	if !strings.Contains(coreOperationalRules, "arbitrary HTTP endpoints (the http tool)") {
 		t.Error("empty-result rule should keep exact HTTP endpoints in the final-empty category")
 	}
 	// Must NOT contain the over-broad "external APIs" framing the
@@ -4211,7 +4240,7 @@ func TestNamedAgentPromptIncludesCoreRules(t *testing.T) {
 		"Never claim done, fixed, sent, saved, scheduled, deployed, read, seen, or verified without direct evidence",
 		"Read existing state before modifying it",
 		"## Tools",
-		"Diagnose a failure before changing approach",
+		"When a tool returns an error, use the prefix to decide your response",
 	}
 	for _, s := range required {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -5773,7 +5802,7 @@ func TestAgentLoop_SkillListingPreservesMultimodal(t *testing.T) {
 }
 
 // TestForceStopExit_PersistenceBaseline pins the existing behavior of
-// runForceStopTurn with respect to the run transcript. When the loop
+// runToolDisabledTurn with respect to the run transcript. When the loop
 // detector force-stops a run with several tool rounds already executed,
 // the full transcript — every tool_use + matching tool_result + the
 // synthesis user prompt + the synthesis assistant response — must all be
@@ -5797,7 +5826,7 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 			json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
 				toolCallWithID("mock_tool", `{"same":"args"}`, fmt.Sprintf("toolu_%d", llmCallCount)), 10, 5))
 		default:
-			// Synthesis turn after runForceStopTurn injects "[system] <reason>".
+			// Synthesis turn after runToolDisabledTurn injects "[system] <reason>".
 			json.NewEncoder(w).Encode(nativeResponse(synthesisText, "end_turn", nil, 10, 5))
 		}
 	}))
@@ -5871,8 +5900,8 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 	}
 
 	// Somewhere before the synthesis there must be a "[system]" reason
-	// message (the runForceStopTurn-injected reason). This proves the
-	// synthesis turn actually ran through runForceStopTurn and was saved.
+	// message (the runToolDisabledTurn-injected reason). This proves the
+	// synthesis turn actually ran through runToolDisabledTurn and was saved.
 	sawSystemReason := false
 	for _, msg := range msgs[:len(msgs)-1] {
 		if msg.Role == "user" && strings.HasPrefix(msg.Content.Text(), "[system] ") {
@@ -5881,7 +5910,7 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 		}
 	}
 	if !sawSystemReason {
-		t.Error("expected a [system] reason message injected by runForceStopTurn, none found")
+		t.Error("expected a [system] reason message injected by runToolDisabledTurn, none found")
 	}
 }
 
@@ -6110,7 +6139,7 @@ func TestForceStopExit_DetectorPath_SynthesisPromptShape(t *testing.T) {
 // TestForceStopExit_MaxNudgesPath_SynthesisPromptShape verifies the second
 // force-stop entry point (maxNudges=3 accumulated → escalation). 6 error
 // calls with distinct args trip SameToolError LoopNudge 3 times, the
-// nudge budget is exhausted, runForceStopTurn fires with the
+// nudge budget is exhausted, runToolDisabledTurn fires with the
 // "multiple approaches failed — nudges exceeded" detector note. The
 // synthesis prompt must carry the same structured report shape.
 func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
@@ -6123,7 +6152,7 @@ func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
 		if llmCallCount <= 8 {
 			// 8 failing-tool calls trigger SameToolError nudges at 6,7,8 →
 			// 3 nudges within the rolling window (maxNudges=3, nudgeWindowIters=5)
-			// → runForceStopTurn escalation.
+			// → runToolDisabledTurn escalation.
 			// sameToolErrThreshold=6 (v2): nudge fires at errCount >= 6.
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
 				toolCall("failing_tool", fmt.Sprintf(`{"attempt":%d}`, llmCallCount)), 10, 5))
@@ -6261,7 +6290,7 @@ func TestForceStopExit_DetectorPath_EmitsForceStopAudit(t *testing.T) {
 
 // TestForceStopExit_MaxIter_DoesNotEmitForceStopAudit locks the
 // separation between detector-driven stops and maxIter exits. Both
-// share runForceStopTurn for synthesis UX, but they are distinct
+// share runToolDisabledTurn for synthesis UX, but they are distinct
 // failure classes; conflating them in audit telemetry would make the
 // `grep "event":"force_stop"` observation signal over-count detector
 // stops. maxIter path must NOT emit the force_stop event.

@@ -57,6 +57,12 @@ func (t *DirectoryListTool) Run(ctx context.Context, argsJSON string) (agent.Too
 
 	entries, err := os.ReadDir(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return definitiveLocalResourceError(fmt.Sprintf("directory_list: path not found: %s", path)), nil
+		}
+		if os.IsPermission(err) {
+			return agent.PermissionError(fmt.Sprintf("cannot list %s: permission denied", path)), nil
+		}
 		return agent.ToolResult{Content: fmt.Sprintf("error: %v", err), IsError: true}, nil
 	}
 

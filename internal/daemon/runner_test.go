@@ -1657,9 +1657,11 @@ func TestPlaywrightTurnStartProbeAction(t *testing.T) {
 		{"degraded connected cdp unattended schedule", mcp.StateDegraded, true, cdpCfg, true, "schedule", playwrightProbeSkipRelaunch},
 		{"degraded connected cdp unattended webhook", mcp.StateDegraded, true, cdpCfg, true, "webhook", playwrightProbeSkipRelaunch},
 
-		// No live client: ProbeNow would reconnect+relaunch, so skip.
+		// No live client: ProbeNow would reconnect+relaunch, so skip. A connected
+		// client with stale Disconnected health is the async-connect window and
+		// must probe so the first Run gets the rebuilt MCP registry.
 		{"disconnected (user closed chrome)", mcp.StateDisconnected, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
-		{"disconnected even if connected flag set", mcp.StateDisconnected, true, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
+		{"disconnected health with newly connected client", mcp.StateDisconnected, true, cdpCfg, true, "kocoro", playwrightProbeRun},
 		{"degraded but not connected (post-discovery disconnect)", mcp.StateDegraded, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
 
 		// Probe runs: keep_alive=true warms Chrome; Healthy/non-CDP are

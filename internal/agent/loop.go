@@ -399,17 +399,16 @@ func describeContentBlocks(blocks []client.ContentBlock) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
-// auditForceStopEmptySynthesis records one row per empty force-stop
-// synthesis response so triage can attribute "user only got the canned
-// fallback" to a concrete upstream shape: finish_reason (max_tokens vs
-// end_turn drives different fixes), token spend, latency, block shapes,
-// and the effort configuration the attempt ran with (attempt=initial keeps
-// the run's config; attempt=recovery is the degraded-effort retry).
+// auditToolDisabledEmptySynthesis records one row per empty terminal synthesis
+// response so triage can attribute "user only got the canned fallback" to a
+// concrete upstream shape: finish_reason, token spend, latency, block shapes,
+// and the effort configuration the attempt ran with. Kind distinguishes an
+// abnormal force stop from a clean definitive-result synthesis.
 // Content-free: block-shape descriptors and counters only, never thinking
 // text. Motivated by the 2026-08-06 schedule incident (session
 // 2026-08-06-1e187cbe4b2e): a 232s synthesis turn returned no visible text
 // and nothing recorded why.
-func (a *AgentLoop) auditForceStopEmptySynthesis(attempt string, resp *client.CompletionResponse, req client.CompletionRequest, elapsed time.Duration) {
+func (a *AgentLoop) auditToolDisabledEmptySynthesis(kind, attempt string, resp *client.CompletionResponse, req client.CompletionRequest, elapsed time.Duration) {
 	if a.auditor == nil {
 		return
 	}
@@ -420,7 +419,7 @@ func (a *AgentLoop) auditForceStopEmptySynthesis(attempt string, resp *client.Co
 	a.auditor.Log(audit.AuditEntry{
 		Timestamp: time.Now(),
 		SessionID: a.sessionID,
-		Event:     "force_stop_empty_synthesis",
+		Event:     kind + "_empty_synthesis",
 		InputSummary: fmt.Sprintf("attempt=%s model=%s finish_reason=%s effort_tier=%s reasoning_effort=%s thinking=%s",
 			attempt, resp.Model, resp.FinishReason, req.EffortTier, req.ReasoningEffort, thinking),
 		OutputSummary: fmt.Sprintf("input_tokens=%d output_tokens=%d latency_ms=%d blocks=%s",
@@ -520,12 +519,29 @@ const coreOperationalRules = `
 - Treat a successful result with a clear receipt or returned object as evidence. When it is ambiguous, use the narrowest independent verification.
 - For sensitive personal discovery, check only the obvious scoped sources before asking. Exhaustive exploration is appropriate only inside a user-scoped project or dataset.
 
+## Tool Selection
+
+Prefer dedicated tools over bash when one fits: file_read (not cat/head/tail), file_edit (not sed/awk), glob (not find — find scans the whole filesystem and can take minutes), grep (not grep/rg), directory_list (not ls), screenshot (not screencapture). Reserve bash for shell-only operations. Tool capabilities and parameters live in the tools[] array — discover them there.
+
 ## Progress and Stopping
 - Track the requested outcome, constraints, required evidence, completed evidence, remaining gaps, side effects, and failed-approach fingerprints.
 - After each result, continue only when a required item remains and the next action has a specific expected contribution. Stop as soon as the outcome and minimum trustworthy evidence are complete.
-- Diagnose a failure before changing approach. A bracketed prefix on a tool result names its class: retry [transient error] once; repair the arguments on [validation error]; do not retry [business error], [permission error], or outcome-unknown failures.
-- An empty result is final for a user-named scope, exact HTTP endpoint, or deterministic file/search query. For an unnamed list-style integration scope, one focused scope diversification is allowed; then stop.
 - After three materially different failed approaches to the same blocker, report the evidence and the smallest user action or external change required.
+
+## Error Handling
+
+When a tool returns an error, use the prefix to decide your response:
+- **[transient error]**: A timeout or network failure. Retry once with the same arguments. If it fails again, report the issue to the user.
+- **[validation error]**: Your arguments were wrong. Fix them before retrying. Do not retry with the same arguments.
+- **[business error]**: The requested resource or state is unavailable, or a policy or constraint prevents the operation. Do NOT retry the same scope — explain the blocker and suggest a relevant alternative when one exists.
+- **[permission error]**: Access was denied. Escalate to the user — they may need to grant permissions or provide credentials.
+- **No prefix**: Treat as non-retryable unless the error message clearly suggests transience (e.g., "connection reset").
+
+When a tool returns no results but IsError is false, distinguish "empty = the answer" from "empty = wrong implicit scope":
+- For search/filesystem queries (grep, glob, directory_list, file_read on a literal path), an empty result IS the answer. Do not retry.
+- For arbitrary HTTP endpoints (the http tool) or any specific resource the user explicitly named (e.g. "my work calendar", "this Notion database", "folder X"), an empty result IS the answer — the user-specified contract is the boundary. Do not broaden filters or query adjacent endpoints.
+- ONLY for integrations with list-and-enumerate semantics (Google Calendar, Google Drive, Gmail/mail, Notion) AND when the user did NOT name a specific scope, an empty result on the default or first-queried scope is often a scope artifact, not a definitive "no data" answer. In that case try ONE focused diversification: list sub-resources (e.g., list_calendars after get_events returns empty on the default calendar), broaden a filter that was implicitly narrow, or query an adjacent endpoint. If that also returns empty, conclude "not found" and state explicitly what you tried so the search boundary is verifiable.
+- Never retry the identical call with identical arguments on an empty result — that is superstition, not diagnosis.
 
 ## Evidence
 - Never claim done, fixed, sent, saved, scheduled, deployed, read, seen, or verified without direct evidence from the real call path in this turn.
@@ -1044,6 +1060,10 @@ type AgentLoop struct {
 	// machine. nil preserves the legacy execution path for callers that have
 	// not installed a persistent journal.
 	sideEffectJournal SideEffectExecutionJournal
+	// sideEffectDispatchPersisted runs after the journal has durably saved the
+	// pre-dispatch checkpoint. Daemon uses it to consume drained mailbox rows
+	// only after their text and dispatch boundary share a durable session save.
+	sideEffectDispatchPersisted func()
 
 	// tracker is the per-Run phase state machine. Created at Run() entry,
 	// set to PhaseDone + AssertClean via defer on exit. Reads are safe from
@@ -1130,6 +1150,10 @@ func (a *AgentLoop) SetCheckpointFunc(fn CheckpointFunc) {
 // the caller-owned in-progress marker before MarkDispatching and Tool.Run.
 func (a *AgentLoop) SetSideEffectExecutionJournal(journal SideEffectExecutionJournal) {
 	a.sideEffectJournal = journal
+}
+
+func (a *AgentLoop) SetSideEffectDispatchPersistedFunc(fn func()) {
+	a.sideEffectDispatchPersisted = fn
 }
 
 // SetCheckpointMinInterval sets a debounce window between checkpoint
@@ -2727,11 +2751,13 @@ func (a *AgentLoop) SetEnableStreaming(enable bool) {
 // toolExecResult holds the output of a single tool.Run() call.
 // Used to collect results from parallel tool execution.
 type toolExecResult struct {
-	result   ToolResult
-	elapsed  time.Duration
-	err      error
-	name     string // tool name; used by applyAggregateCap to skip Unlimited tools
-	executed bool   // Tool.Run was entered; synthetic admissions and skipped siblings stay false
+	result                      ToolResult
+	elapsed                     time.Duration
+	err                         error
+	name                        string // tool name; used by applyAggregateCap to skip Unlimited tools
+	executed                    bool   // Tool.Run was entered; synthetic admissions and skipped siblings stay false
+	sideEffectResultDigest      string // exact digest stored by the durable side-effect journal
+	sideEffectResultTransformed bool
 }
 
 // approvedToolCall tracks a tool call that passed permission checks and pre-hooks.
@@ -3609,7 +3635,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		}
 		emptyPostToolRetries  int // one recovery turn when tools ran but the model returned no visible final
 		emptyPostToolRecovery bool
-		// forceStopEmptyRecoveryUsed caps the force-stop empty-synthesis
+		// toolDisabledEmptyRecoveryUsed caps the terminal empty-synthesis
 		// recovery at one degraded-effort attempt per Run. Deliberately
 		// independent of emptyPostToolRetries (the main-loop empty-response
 		// retry): a single Run can consume both budgets, worst case two
@@ -3617,23 +3643,23 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// by completeWithRetry) — acceptable because the force-stop turn is
 		// the last chance to hand the user real content instead of the
 		// canned fallback line.
-		forceStopEmptyRecoveryUsed  bool
-		computerUseOwnsTurn         bool
-		computerUseNeedsApps        bool
-		computerUseAlternateOnly    bool
-		computerUseAppsRecoveryUsed bool
-		afterCheckpoint             bool
-		checkpointDone              bool
-		nudges                      = newNudgeWindow(maxNudges, nudgeWindowIters)
-		hallucinationNudges         int
-		lastPromptTokens            int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
-		lastOutputTokens            int    // actual output tokens from last LLM response
-		compactionSummary           string // cached summary from compaction
-		compactionSummaryIter       int    // iteration compactionSummary was generated in; preflight reuse is scoped to the same iteration (stale summaries lack the newest turns)
-		compactionApplied           bool   // true once messages have been shaped
-		shapeNoopLogged             bool   // once-per-Run stderr note for the designed ShapeHistory no-op retry path
-		reactiveCompacted           bool   // true once reactive compaction fired (never resets)
-		summaryFailures             int    // consecutive summary failures; backs off after 3
+		toolDisabledEmptyRecoveryUsed bool
+		computerUseOwnsTurn           bool
+		computerUseNeedsApps          bool
+		computerUseAlternateOnly      bool
+		computerUseAppsRecoveryUsed   bool
+		afterCheckpoint               bool
+		checkpointDone                bool
+		nudges                        = newNudgeWindow(maxNudges, nudgeWindowIters)
+		hallucinationNudges           int
+		lastPromptTokens              int    // total prompt tokens (input + cache_read + cache_creation) from last LLM response; cached tokens still consume the model's context window
+		lastOutputTokens              int    // actual output tokens from last LLM response
+		compactionSummary             string // cached summary from compaction
+		compactionSummaryIter         int    // iteration compactionSummary was generated in; preflight reuse is scoped to the same iteration (stale summaries lack the newest turns)
+		compactionApplied             bool   // true once messages have been shaped
+		shapeNoopLogged               bool   // once-per-Run stderr note for the designed ShapeHistory no-op retry path
+		reactiveCompacted             bool   // true once reactive compaction fired (never resets)
+		summaryFailures               int    // consecutive summary failures; backs off after 3
 		// lastSummaryFailureIter records the iteration of the most recent summary
 		// failure; summaryBackedOff measures the cool-off distance from this iter.
 		// Zero value is fine: the `summaryFailures >= maxSummaryFailures` guard
@@ -3809,14 +3835,14 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		req.SpecificModel = model
 	}
 
-	// runForceStopTurn issues the final non-tool LLM turn after the loop
-	// detector decided to stop. It preserves the live agent config so this
-	// turn behaves like every other turn (MaxTokens, Thinking, SpecificModel,
-	// Temperature, ReasoningEffort) and substitutes a neutral fallback when
-	// the model returns empty text, so callers never see a blank bubble.
-	// Tools are intentionally omitted to force a text-only response.
-	runForceStopTurn := func(reason string, fallback string, outcomeCode runstatus.Code) (string, error) {
-		// Frame the force-stop reason so the model doesn't hallucinate
+	// runToolDisabledTurn issues a final non-tool LLM turn after either an
+	// abnormal loop stop or a clean definitive tool result. It preserves the
+	// live agent config and substitutes a neutral fallback when the provider
+	// returns empty text, so callers never see a blank bubble. SynthesisKind and
+	// synthesisPhase keep normal terminal results out of force-stop telemetry.
+	runToolDisabledTurn := func(reason string, fallback string, outcomeCode runstatus.Code, partial bool, synthesisKind string, synthesisPhase TurnPhase) (string, error) {
+		synthesisLabel := strings.ReplaceAll(synthesisKind, "_", " ")
+		// Frame the terminal reason so the model doesn't hallucinate
 		// about WHETHER its tools ran. The detector fires AFTER tool
 		// execution — every tool_use the model emitted before this point
 		// has already executed and its result is in the conversation
@@ -3835,11 +3861,10 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			),
 		})
 		markInjected()
-		// Pre-ForceStop: the loop-detector verdict + accumulated tool state
+		// Before synthesis, the terminal decision + accumulated tool state
 		// are durable; mark dirty so the checkpoint hook saves before the
-		// final LLM call, then fire it. PhaseForceStop is idle-counted so
-		// the watchdog still observes the final LLM call — this is
-		// intentional. If the ForceStop itself stalls, a second idle_soft
+		// final LLM call, then fire it. The synthesis phase is idle-counted so
+		// the watchdog still observes the final LLM call. If it stalls, a second idle_soft
 		// event fires (seq bumps on every Enter), which is the correct
 		// behavior: the ForceStop is our last-resort stop-the-bleeding
 		// turn and its LLM call deserves the same liveness guarantee as
@@ -3850,32 +3875,32 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		captureRunMessages()
 		if computerProfileCheckpointPending {
 			if err := a.checkpointNow(ctx); err != nil {
-				return "", fmt.Errorf("persist computer profile activation before force stop: %w", err)
+				return "", fmt.Errorf("persist computer profile activation before %s synthesis: %w", synthesisLabel, err)
 			}
 			computerProfileCheckpointPending = false
 		} else {
 			a.maybeCheckpoint(ctx)
 		}
 		if a.tracker != nil {
-			a.tracker.Enter(PhaseForceStop)
+			a.tracker.Enter(synthesisPhase)
 		}
 
 		// Short-session fallback: if the prompt is over preflight threshold but
 		// len(messages) <= MinShapeable, ShapeHistory below is gated off but
 		// a single huge user message can still be rune-safely truncated.
-		applyShortSessionTruncate("force_stop")
+		applyShortSessionTruncate(synthesisKind)
 
-		// Pre-flight guard for the force-stop final turn. Same rationale as the
+		// Pre-flight guard for the final synthesis turn. Same rationale as the
 		// main loop guard above. We do NOT gate on compactionApplied here:
-		// force-stop is the last-resort turn and especially must not 400.
+		// a terminal synthesis especially must not 400.
 		// MinShapeable gate matches the main-loop site — without enough
 		// messages, ShapeHistory is a no-op and the summary call wastes tokens.
 		if shouldPreflightCompact(messages, a.contextWindow, a.estOverhead()) && len(messages) > ctxwin.MinShapeable() {
-			a.emitCompactionStatus(runstatus.CodeCompactionStarted, "force_stop")
+			a.emitCompactionStatus(runstatus.CodeCompactionStarted, synthesisKind)
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus("preflight_compaction",
-					fmt.Sprintf("force-stop turn estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
-						ctxwin.EstimateTokens(messages), a.estOverhead(), preflightCompactThreshold*100, a.contextWindow))
+					fmt.Sprintf("%s synthesis estimate %d (+%d overhead) tokens >= %.0f%% of %d cap",
+						synthesisLabel, ctxwin.EstimateTokens(messages), a.estOverhead(), preflightCompactThreshold*100, a.contextWindow))
 			}
 			emergencyMessages := cloneMessages(messages)
 			compressOldToolResults(ctx, emergencyMessages, 1, 100, nil, latestUserText)
@@ -3887,17 +3912,17 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			if sumErr == nil {
 				shaped = ctxwin.ShapeHistoryTracked(emergencyMessages, strings.TrimSpace(summary), a.contextWindow, a.estOverhead())
 			} else {
-				// Summary failed on the force-stop fallback path: emit telemetry
+				// Summary failed on the terminal fallback path: emit telemetry
 				// (parity with main-loop preflight at line ~2279) so this last-resort
 				// degradation is visible. ShapeHistory without summary still drops
 				// middle messages. (See 2026-05-11 GPT review F3.)
-				a.recordCompactionFailure("force_stop_summary_failure", sumErr)
+				a.recordCompactionFailure(synthesisKind+"_summary_failure", sumErr)
 				shaped = ctxwin.ShapeHistoryTracked(emergencyMessages, "", a.contextWindow, a.estOverhead())
 			}
-			if _, applied := applyShapedHistory(shaped, "force_stop", "force_stop_preflight"); applied {
+			if _, applied := applyShapedHistory(shaped, synthesisKind, synthesisKind+"_preflight"); applied {
 				captureRunMessages()
 			}
-			a.emitCompactionStatus(runstatus.CodeCompactionFinished, "force_stop")
+			a.emitCompactionStatus(runstatus.CodeCompactionFinished, synthesisKind)
 		}
 
 		req := client.CompletionRequest{
@@ -3919,8 +3944,8 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		}
 		consumeOrdinaryOpenAIContinuation(&req)
 		if a.executionProfile != nil || a.computerProfile.ProfileID != "" {
-			// General ep1 profiles validate the exact computer schema on
-			// every completion, including force-stop synthesis turns.
+			// General ep1 profiles validate the exact computer schema on every
+			// completion, including tool-disabled synthesis turns.
 			req.Tools = toolSchemas
 			// The schema must remain present for ep1 validation, but this is a
 			// synthesis-only turn. Explicitly prohibit another tool call so a
@@ -3931,7 +3956,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		finalResp, err := a.completeWithRetryClient(ctx, terminalLLM, req)
 		if err != nil {
 			captureRunMessages()
-			// Hard-idle during ForceStop is still a soft/partial outcome,
+			// Hard-idle during terminal synthesis is still a soft/partial outcome,
 			// not a hard error — the decision to stop was already durable
 			// (MarkDirty fired before the call). Match the main-loop
 			// classification at loop.go's AwaitingLLM cancel path.
@@ -3959,7 +3984,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			text = strings.TrimSpace(recoverVisibleTextFromBlocks(finalResp))
 		}
 		if text == "" {
-			a.auditForceStopEmptySynthesis("initial", finalResp, req, time.Since(synthesisStart))
+			a.auditToolDisabledEmptySynthesis(synthesisKind, "initial", finalResp, req, time.Since(synthesisStart))
 			// One recovery attempt with reasoning stripped: an empty
 			// synthesis on a reasoning-heavy config is most plausibly the
 			// thinking budget swallowing the answer, so the retry hands
@@ -3967,31 +3992,31 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			// (kfp1 Koe fast / ep1 computer) own their model+reasoning
 			// configuration — never override them; they keep the
 			// single-attempt behavior. Budget semantics documented at the
-			// forceStopEmptyRecoveryUsed declaration.
+			// toolDisabledEmptyRecoveryUsed declaration.
 			sealed := a.executionProfileID != "" || a.executionProfile != nil || a.computerProfile.ProfileID != ""
-			if !sealed && !forceStopEmptyRecoveryUsed &&
+			if !sealed && !toolDisabledEmptyRecoveryUsed &&
 				requestBudget.snapshot().TerminalDispatches < requestBudgetTerminalDispatchLimit {
-				forceStopEmptyRecoveryUsed = true
+				toolDisabledEmptyRecoveryUsed = true
 				a.emitRunTrace(RunTraceEvent{
 					Type: RunTraceEventRetry,
 					Retry: &RunTraceRetry{
-						Kind: "force_stop_empty_synthesis", Attempt: 2,
+						Kind: synthesisKind + "_empty_synthesis", Attempt: 2,
 						ReasonCategory: "empty_response",
 					},
 				})
 				if rs, ok := a.handler.(RunStatusHandler); ok {
 					rs.OnRunStatus("empty_response_retry",
-						"force-stop synthesis returned no visible text; retrying once with reasoning disabled")
+						synthesisLabel+" synthesis returned no visible text; retrying once with reasoning disabled")
 				}
 				retryReq := req
 				retryReq.Thinking = nil
 				retryReq.ReasoningEffort = ""
 				retryReq.EffortTier = "low"
 				// The recovery is a distinct LLM wait and owns a fresh watchdog
-				// interval. Enter bumps the phase sequence even when the phase
-				// remains ForceStop, rearming both soft and hard idle timers.
+				// interval. Enter bumps the phase sequence even when the phase remains
+				// unchanged, rearming both soft and hard idle timers.
 				if a.tracker != nil {
-					a.tracker.Enter(PhaseForceStop)
+					a.tracker.Enter(synthesisPhase)
 				}
 				retryStart := time.Now()
 				retryResp, retryErr := a.completeWithRetryClient(ctx, terminalLLM, retryReq)
@@ -4025,7 +4050,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 						a.auditor.Log(audit.AuditEntry{
 							Timestamp: time.Now(),
 							SessionID: a.sessionID,
-							Event:     "force_stop_synthesis_recovery_failed",
+							Event:     synthesisKind + "_synthesis_recovery_failed",
 							InputSummary: fmt.Sprintf("error_class=%s",
 								recoveryErrorClass),
 							OutputSummary: fmt.Sprintf("latency_ms=%d",
@@ -4042,7 +4067,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 						text = strings.TrimSpace(recoverVisibleTextFromBlocks(retryResp))
 					}
 					if text == "" {
-						a.auditForceStopEmptySynthesis("recovery", retryResp, retryReq, time.Since(retryStart))
+						a.auditToolDisabledEmptySynthesis(synthesisKind, "recovery", retryResp, retryReq, time.Since(retryStart))
 					}
 				}
 			}
@@ -4053,15 +4078,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// Persist via buildAssistantMessage so thinking/redacted_thinking
 		// blocks survive session persistence (AGENTS.md Thinking Blocks).
 		// stripUnexecutedAssistantCalls removes hallucinated tool_use AND
-		// native computer_call blocks first — force-stop never executes
+		// native computer_call blocks first — terminal synthesis never executes
 		// calls, and an unpaired call in history breaks next-turn replay.
 		messages = append(messages, buildAssistantMessage(stripUnexecutedAssistantCalls(persistResp), text))
 		stampMessage()
 		captureRunMessages()
-		// Every force-stop exit is abnormal: the loop detector terminated
-		// the run early, so this is never a clean success regardless of
-		// whether the model produced final text.
-		setRunStatus(outcomeCode, true)
+		setRunStatus(outcomeCode, partial)
 		if a.handler != nil {
 			a.handler.OnText(text)
 		}
@@ -4073,10 +4095,13 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 
 	budgetFallback := "I stopped after reaching this request's provider budget. The result may be incomplete."
 	runBudgetStop := func(cause error) (string, error) {
-		text, synthErr := runForceStopTurn(
+		text, synthErr := runToolDisabledTurn(
 			"The request-scoped provider budget was reached. Do not call tools. Summarize only completed work and clearly identify anything unfinished.",
 			budgetFallback,
 			runstatus.CodeBudgetExhausted,
+			true,
+			"force_stop",
+			PhaseForceStop,
 		)
 		if synthErr != nil {
 			text = budgetFallback
@@ -4135,7 +4160,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	// entry so post-merge observation can count detector-driven stops with
 	// `grep '"event":"force_stop"' ~/.shannon/logs/audit.log | wc -l`.
 	// Intentionally NOT called from the maxIter synthesis path
-	// (runForceStopTurn is shared but maxIter is a distinct failure class
+	// (runToolDisabledTurn is shared but maxIter is a distinct failure class
 	// — conflating them would make the grep over-count detector stops).
 	auditDetectorForceStop := func(detectorNote string) {
 		if a.auditor == nil {
@@ -5977,6 +6002,7 @@ iterationLoop:
 
 		var worstAction LoopAction
 		var worstMsg string
+		stopFurtherTools := false
 		if batchLoopBlocked {
 			worstAction = LoopNudge
 			worstMsg = batchLoopMessage + " No tool in this batch executed. Use a different action, answer from existing evidence, or report the blocker."
@@ -6032,10 +6058,14 @@ iterationLoop:
 		// Arguments are normalized (compact JSON) to handle whitespace/key-order variance.
 		seenCalls := make(map[string]bool, len(toolCalls))
 		computerUseOwnsGUIResponse := false
+		validComputerUseCorrectionInResponse := false
 		for _, call := range toolCalls {
 			if call.Name == "computer_use" {
 				computerUseOwnsGUIResponse = true
-				break
+				if computerUseNeedsApps &&
+					computerUseCallHasControlledAppsAndPolicy(call.ArgumentsString()) {
+					validComputerUseCorrectionInResponse = true
+				}
 			}
 		}
 
@@ -6101,12 +6131,13 @@ iterationLoop:
 				if blockedByMissingComputerUseApps {
 					if fc.Name == "computer_use" {
 						blocked = computerUseAppsCorrectionRejectedResult()
-						// The retry allowance is consumed by this malformed correction.
-						// Close every desktop-control path now instead of advertising a
-						// correction the same run would keep rejecting.
-						computerUseOwnsTurn = true
-						computerUseNeedsApps = false
-						computerUseAlternateOnly = false
+						if !validComputerUseCorrectionInResponse {
+							// A response containing only malformed corrections consumes the
+							// retry. A valid sibling remains eligible regardless of call order.
+							computerUseOwnsTurn = true
+							computerUseNeedsApps = false
+							computerUseAlternateOnly = false
+						}
 					} else {
 						blocked = computerUseAppsRequiredResult()
 					}
@@ -6323,7 +6354,7 @@ iterationLoop:
 			// defense in depth, but malformed or incomplete calls should never
 			// create empty side effects (for example bash({}) or notify({})) or
 			// waste a remote MCP/gateway round-trip.
-			if validationResult, valid := ValidateToolArgumentPresence(tool.Info(), argsStr); !valid {
+			if validationResult, valid := validateFrameworkToolArguments(tool, argsStr); !valid {
 				a.logAudit(fc.Name, argsStr, validationResult.Content, "validation", false, 0, nil)
 				callMeta[idx].resolution = "rejected"
 				callMeta[idx].resolved = true
@@ -6500,7 +6531,8 @@ iterationLoop:
 				a.handler,
 				latestUserText,
 				sideEffectBatchHooks{
-					journal: a.sideEffectJournal,
+					journal:           a.sideEffectJournal,
+					dispatchPersisted: a.sideEffectDispatchPersisted,
 					checkpointPrepared: func(checkpointCtx context.Context) error {
 						// The assistant tool_call is already in messages at this point.
 						// Capture it before the caller persists InProgress, then require
@@ -6594,6 +6626,9 @@ iterationLoop:
 
 			er := execResults[idx]
 			result := er.result
+			if result.StopFurtherTools {
+				stopFurtherTools = true
+			}
 			elapsed := er.elapsed
 			retryWithAppsNoEffect := er.err == nil &&
 				fc.Name == "computer_use" &&
@@ -6683,6 +6718,15 @@ iterationLoop:
 				traceOutcome = callMeta[idx].resolution
 			}
 			digest := sha256.Sum256([]byte(result.Content))
+			resultDigest := hex.EncodeToString(digest[:])
+			resultDigestStage := ""
+			resultTransformed := false
+			if er.sideEffectResultDigest != "" {
+				resultDigest = er.sideEffectResultDigest
+				resultDigestStage = executionprofile.ToolResultDigestStageToolRun
+				resultTransformed = er.sideEffectResultTransformed || result.Content != er.result.Content ||
+					result.IsError != er.result.IsError || er.err != nil
+			}
 			a.recordToolOutcomeEvidence(executionprofile.ToolOutcomeEvidence{
 				ToolCallID:         transcriptCallID,
 				ToolName:           fc.Name,
@@ -6692,7 +6736,9 @@ iterationLoop:
 				PermissionApproved: callMeta[idx].wasApproved,
 				SideEffect:         callMeta[idx].sideEffect && er.executed,
 				ArgumentsDigest:    callMeta[idx].argsDigest,
-				ResultDigest:       hex.EncodeToString(digest[:]),
+				ResultDigest:       resultDigest,
+				ResultDigestStage:  resultDigestStage,
+				ResultTransformed:  resultTransformed,
 			})
 
 			var executionBatchIndex *int
@@ -6708,6 +6754,8 @@ iterationLoop:
 					Name:                 fc.Name,
 					ArgumentsHMACSHA256:  a.runTrace.digest(normalizeJSON(fc.Arguments)),
 					ResultHMACSHA256:     a.runTrace.digest(result.Content),
+					ResultDigestStage:    resultDigestStage,
+					ResultTransformed:    resultTransformed,
 					ModelBatchID:         i + 1,
 					ModelBatchIndex:      idx,
 					ModelBatchSize:       len(toolCalls),
@@ -7027,6 +7075,21 @@ iterationLoop:
 			return text, usage, nil
 		}
 
+		if stopFurtherTools {
+			text, err := runToolDisabledTurn(
+				"A local read-only tool returned a definitive result for the requested resource. Do not call more tools or broaden the scope. Answer the user from that result without naming tools, internal error prefixes, or runtime mechanics.",
+				"The requested local resource was not found.",
+				runstatus.CodeNone,
+				false,
+				"definitive_result",
+				PhaseAwaitingLLM,
+			)
+			if err != nil {
+				return "", usage, err
+			}
+			return text, usage, nil
+		}
+
 		// Cloud result bypass: render the deliverable directly to the user
 		// without an additional LLM summarization turn. The full result is
 		// already recorded in messages[] for follow-up context.
@@ -7056,7 +7119,7 @@ iterationLoop:
 		)
 		if worstAction == LoopForceStop {
 			auditDetectorForceStop(worstMsg)
-			text, err := runForceStopTurn(buildForceStopReason(worstMsg), forceStopFallback, runstatus.CodeIterationLimit)
+			text, err := runToolDisabledTurn(buildForceStopReason(worstMsg), forceStopFallback, runstatus.CodeIterationLimit, true, "force_stop", PhaseForceStop)
 			if err != nil {
 				return "", usage, err
 			}
@@ -7067,10 +7130,13 @@ iterationLoop:
 				// Escalate: too many nudges within the rolling window → force stop
 				const escalationNote = "multiple approaches failed — nudges exceeded"
 				auditDetectorForceStop(escalationNote)
-				text, err := runForceStopTurn(
+				text, err := runToolDisabledTurn(
 					buildForceStopReason(escalationNote),
 					forceStopFallback,
 					runstatus.CodeIterationLimit,
+					true,
+					"force_stop",
+					PhaseForceStop,
 				)
 				if err != nil {
 					return "", usage, err
@@ -7140,13 +7206,16 @@ iterationLoop:
 	// chains (browser/research workflows) never update lastText, so without
 	// this synthesis users see either stale mid-reasoning or an empty
 	// string after many productive tool calls.
-	text, synthErr := runForceStopTurn(
+	text, synthErr := runToolDisabledTurn(
 		buildMaxIterReason(),
 		fmt.Sprintf("I reached the iteration safety cap after %d turns and couldn't finalize a report.", iterationCount),
 		runstatus.CodeIterationLimit,
+		true,
+		"force_stop",
+		PhaseForceStop,
 	)
 	if synthErr == nil {
-		// runForceStopTurn already handled the partial CodeIterationLimit
+		// runToolDisabledTurn already handled the partial CodeIterationLimit
 		// status, message append, and OnText.
 		return text, usage, ErrMaxIterReached
 	}

@@ -1941,8 +1941,8 @@ func shouldSkipPlaywrightProbeChromeRelaunch(before mcp.ServerHealth, cfg mcp.MC
 type playwrightTurnStartAction int
 
 const (
-	// playwrightProbeSkipNoClient: no live client to probe (Disconnected or
-	// never connected). ProbeNow would fire attemptReconnect → relaunch Chrome;
+	// playwrightProbeSkipNoClient: no live client to probe. ProbeNow would fire
+	// attemptReconnect → relaunch Chrome;
 	// on-demand recovery at tool dispatch handles Chrome instead.
 	playwrightProbeSkipNoClient playwrightTurnStartAction = iota
 	// playwrightProbeSkipRelaunch: a client is connected but this is the CDP +
@@ -1960,8 +1960,11 @@ const (
 // keep_alive=false Degraded idle state (ProbeNow → maybeRelaunchDegradedCDPChrome
 // would pop a blank window). Everything else probes: keep_alive=true warms
 // Chrome, Healthy/non-CDP probes are health refreshes whose relaunch is a no-op.
+// A live client whose supervisor state is still Disconnected is the short
+// async-connect window before the connect callback completes its first probe;
+// probing there is required so this Run snapshots the rebuilt MCP registry.
 func playwrightTurnStartProbeAction(before mcp.ServerHealth, playwrightLive bool, cfg mcp.MCPServerConfig, hasCfg bool, req RunAgentRequest) playwrightTurnStartAction {
-	if before.State == mcp.StateDisconnected || !playwrightLive {
+	if !playwrightLive {
 		return playwrightProbeSkipNoClient
 	}
 	if hasCfg && shouldSkipPlaywrightProbeChromeRelaunch(before, cfg, req) {
@@ -2507,7 +2510,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// visible Chrome window on its own. Two guards keep that invariant:
 		//
 		//   (1) Skip entirely when there is no live client to probe
-		//       (mgr.IsConnected == false). ProbeNow on a Disconnected
+		//       (mgr.IsConnected == false). ProbeNow without a client
 		//       server fires attemptReconnect → relaunch Chrome.
 		//
 		//   (2) For CDP + keep_alive=false, skip the relaunch even when a
@@ -2536,7 +2539,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		case playwrightProbeSkipRelaunch:
 			log.Printf("daemon: skipping Playwright turn-start Chrome relaunch (CDP keep_alive=false; Chrome launches on demand at tool dispatch)")
 		case playwrightProbeSkipNoClient:
-			// No live client (Disconnected, or never connected). ProbeNow would
+			// No live client. ProbeNow would
 			// fire attemptReconnect → relaunch Chrome; skip it. On-demand recovery
 			// at tool dispatch (mcp_tool.go ensureChromeDebugPort) launches Chrome
 			// when the agent actually invokes a browser tool.
@@ -3185,7 +3188,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	combinedHandler := &multiHandler{handlers: []agent.EventHandler{handler, bus}}
 	var runEvents *runEventCollector
 	if !req.Ephemeral {
-		eventLog, err := sessMgr.OpenRunEventLog(sess.ID, req.RunID, req.AttemptID)
+		eventLog, err := sessMgr.OpenRunEventLog(sess.ID, req.RunID, req.AttemptID, cfg.Agent.RunEventRetention)
 		if err != nil {
 			return nil, fmt.Errorf("open agent run event log: %w", err)
 		}
@@ -3509,24 +3512,25 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			)
 		}
 		reg.Register(&openAIComputerTaskToolV1{
-			gateway:         deps.GW,
-			resolveProfile:  resolveProfile,
-			childTools:      childComputerTools,
-			workflow:        guiWorkflow,
-			runtime:         openAIComputerRuntime,
-			preview:         deps.ComputerUsePreview,
-			appPolicy:       guiWorkflow.appPolicy,
-			handler:         handler,
-			modelTier:       "large",
-			shannonDir:      deps.ShannonDir,
-			maxIter:         runCfg.Agent.MaxIterations,
-			maxTokens:       runCfg.Agent.MaxTokens,
-			resultTrunc:     runCfg.Tools.ResultTruncation,
-			argsTrunc:       runCfg.Tools.ArgsTruncation,
-			postBatchSettle: waitOpenAIComputerPostBatchSettleV1,
-			permissions:     &runCfg.Permissions,
-			auditor:         deps.Auditor,
-			hookRunner:      deps.HookRunner,
+			gateway:               deps.GW,
+			resolveProfile:        resolveProfile,
+			childTools:            childComputerTools,
+			workflow:              guiWorkflow,
+			runtime:               openAIComputerRuntime,
+			preview:               deps.ComputerUsePreview,
+			appPolicy:             guiWorkflow.appPolicy,
+			handler:               handler,
+			modelTier:             "large",
+			shannonDir:            deps.ShannonDir,
+			maxIter:               runCfg.Agent.MaxIterations,
+			maxTokens:             runCfg.Agent.MaxTokens,
+			contextWindowFallback: runCfg.Agent.ContextWindow,
+			resultTrunc:           runCfg.Tools.ResultTruncation,
+			argsTrunc:             runCfg.Tools.ArgsTruncation,
+			postBatchSettle:       waitOpenAIComputerPostBatchSettleV1,
+			permissions:           &runCfg.Permissions,
+			auditor:               deps.Auditor,
+			hookRunner:            deps.HookRunner,
 		})
 	}
 	defer guiWorkflow.EndTurn()
@@ -3541,6 +3545,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			req.RunID,
 			req.AttemptID,
 		))
+		loop.SetSideEffectDispatchPersistedFunc(consumeDrainedMailbox)
 	}
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
@@ -4020,7 +4025,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		turnUsage = up
 	}
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
-	loop.SetCheckpointFunc(func(context.Context) error {
+	loop.SetCheckpointFunc(func(checkpointCtx context.Context) error {
 		// EventLog is an observation stream, not recovery authority. Attempt to
 		// align it with the checkpoint, but never let corrupt/failed telemetry
 		// block the session transcript or side-effect ledger from becoming durable.
@@ -4035,6 +4040,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		sess.InProgress = true
 		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+		if agent.CheckpointReasonFromContext(checkpointCtx) == agent.CheckpointReasonSideEffectPrepared {
+			// The session journal's immediately-following MarkDispatching save
+			// persists this staged transcript and dispatch state atomically.
+			return nil
+		}
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
 			// Return the error so AgentLoop.maybeCheckpoint keeps the

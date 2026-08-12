@@ -39,7 +39,8 @@ const (
 	ErrCategoryTransient ErrorCategory = "transient"
 	// ErrCategoryValidation indicates the tool arguments were invalid. Fix before retrying.
 	ErrCategoryValidation ErrorCategory = "validation"
-	// ErrCategoryBusiness indicates a policy or constraint violation. Do not retry.
+	// ErrCategoryBusiness indicates a definitive resource, domain, or policy
+	// boundary that repeating the same call cannot repair. Do not retry unchanged.
 	ErrCategoryBusiness ErrorCategory = "business"
 	// ErrCategoryPermission indicates access was denied. Escalate to user.
 	ErrCategoryPermission ErrorCategory = "permission"
@@ -157,6 +158,12 @@ type ToolResult struct {
 	//
 	// Takes precedence over TerminalUserMessage. Ignored unless StopAgentLoop.
 	TerminalUserSuppressed bool `json:"-"`
+	// StopFurtherTools requests one final tool-disabled synthesis turn after this
+	// result is recorded. It is narrower than StopAgentLoop: the runtime still
+	// asks for a user-facing answer, but no subsequent tool call is admitted.
+	// Set it only for a definitive, non-transient boundary where changing tools
+	// cannot satisfy the same scoped request.
+	StopFurtherTools bool `json:"-"`
 }
 
 type GUIObservationOutcome struct {
@@ -221,6 +228,17 @@ func ValidateToolArguments(info ToolInfo, argsJSON string) (ToolResult, bool) {
 // ValidateToolArguments after decoding their typed structs.
 func ValidateToolArgumentPresence(info ToolInfo, argsJSON string) (ToolResult, bool) {
 	return validateToolArguments(info, argsJSON, false)
+}
+
+// validateFrameworkToolArguments applies the strict zero-value contract to
+// local tools before approval and side-effect journaling. Remote MCP/gateway
+// schemas retain presence-only validation because false, zero, and empty values
+// may be meaningful to APIs Kocoro does not own.
+func validateFrameworkToolArguments(tool Tool, argsJSON string) (ToolResult, bool) {
+	if source, ok := tool.(ToolSourcer); ok && source.ToolSource() != SourceLocal {
+		return ValidateToolArgumentPresence(tool.Info(), argsJSON)
+	}
+	return ValidateToolArguments(tool.Info(), argsJSON)
 }
 
 func validateToolArguments(info ToolInfo, argsJSON string, rejectZero bool) (ToolResult, bool) {

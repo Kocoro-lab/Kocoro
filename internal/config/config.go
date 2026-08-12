@@ -242,6 +242,16 @@ type AgentConfig struct {
 	// default and named-agent sessions. The daemon sweeps once at startup; age
 	// expiry overrides the oldest-snapshot pin. 0 disables the age sweep.
 	CompactionSnapshotMaxAgeDays int `mapstructure:"compaction_snapshot_max_age_days" yaml:"compaction_snapshot_max_age_days" json:"compaction_snapshot_max_age_days"`
+	// RunEventRetention bounds observation-only attempt logs per session. The
+	// oldest attempts are removed when a new attempt opens; durable transcript,
+	// side-effect recovery state, and audit records are separate and unchanged.
+	// 0 disables count pruning. Default 32 covers a practical diagnostic window
+	// without letting a long-lived IM route accumulate files indefinitely.
+	RunEventRetention int `mapstructure:"run_event_retention" yaml:"run_event_retention" json:"run_event_retention"`
+	// RunEventMaxAgeDays bounds run-event JSONL, incomplete markers, and lock
+	// files across default and named-agent sessions. The daemon sweeps once at
+	// startup. 0 disables age cleanup.
+	RunEventMaxAgeDays int `mapstructure:"run_event_max_age_days" yaml:"run_event_max_age_days" json:"run_event_max_age_days"`
 	// CompactTimeoutSecs bounds one manual TUI /compact pass: persist-learnings
 	// plus a summarize that may fold an oversized transcript into up to nine
 	// sequential small-tier calls. When it binds, /compact fails with a
@@ -510,6 +520,8 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.compaction_snapshot_retention", 1)
 	viper.SetDefault("agent.compact_timeout_secs", 300)
 	viper.SetDefault("agent.compaction_snapshot_max_age_days", 14)
+	viper.SetDefault("agent.run_event_retention", 32)
+	viper.SetDefault("agent.run_event_max_age_days", 14)
 	viper.SetDefault("agent.interrupted_resume_max_age_hours", 4) // staleness window for auto-resume; see Config.Agent.InterruptedResumeMaxAgeHours
 	viper.SetDefault("agent.interrupted_resume_enabled", true)
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
@@ -669,7 +681,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
-	hydrateAPIKeyFromKeychain(&cfg, dir)
+	if !credentialStoreDisabledForProcess() {
+		hydrateAPIKeyFromKeychain(&cfg, dir)
+	}
 	if cfg.apiKeyFromKeychain {
 		// Keep the hydrated key in-process for older call sites that read
 		// viper directly. Save still strips it back out, so Keychain remains
@@ -973,6 +987,8 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.interrupted_resume_max_attempts":  {Level: "default"},
 		"agent.interrupted_resume_max_age_hours": {Level: "default"},
 		"agent.interrupted_resume_enabled":       {Level: "default"},
+		"agent.run_event_retention":              {Level: "default"},
+		"agent.run_event_max_age_days":           {Level: "default"},
 		"agent.bash_concurrency_enabled":         {Level: "default"},
 		"tools.bash_timeout":                     {Level: "default"},
 		"tools.bash_max_timeout":                 {Level: "default"},
@@ -1068,6 +1084,12 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.interrupted_resume_enabled") {
 		cfg.Sources["agent.interrupted_resume_enabled"] = src
+	}
+	if viper.IsSet("agent.run_event_retention") {
+		cfg.Sources["agent.run_event_retention"] = src
+	}
+	if viper.IsSet("agent.run_event_max_age_days") {
+		cfg.Sources["agent.run_event_max_age_days"] = src
 	}
 	if viper.IsSet("agent.bash_concurrency_enabled") {
 		cfg.Sources["agent.bash_concurrency_enabled"] = src
@@ -1444,6 +1466,12 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Agent.InterruptedResumeMaxAgeHours < 0 {
 		return fmt.Errorf("agent.interrupted_resume_max_age_hours (%d) must be >= 0 (0 = default)", cfg.Agent.InterruptedResumeMaxAgeHours)
+	}
+	if cfg.Agent.RunEventRetention < 0 {
+		return fmt.Errorf("agent.run_event_retention (%d) must be >= 0 (0 = disabled)", cfg.Agent.RunEventRetention)
+	}
+	if cfg.Agent.RunEventMaxAgeDays < 0 {
+		return fmt.Errorf("agent.run_event_max_age_days (%d) must be >= 0 (0 = disabled)", cfg.Agent.RunEventMaxAgeDays)
 	}
 	if cfg.Agent.WarmSetMaxSchemas < 0 {
 		return fmt.Errorf("agent.warm_set_max_schemas (%d) must be >= 0 (0 = default)", cfg.Agent.WarmSetMaxSchemas)

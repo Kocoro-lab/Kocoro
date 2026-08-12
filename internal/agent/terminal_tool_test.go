@@ -285,6 +285,83 @@ func TestAgentLoop_TerminalToolUserMessageReplacesModelFacingContent(t *testing.
 	assertNativeToolPairs(t, loop.RunMessages())
 }
 
+type definitiveResultTool struct{ runs atomic.Int32 }
+
+func (t *definitiveResultTool) Info() ToolInfo {
+	return ToolInfo{Name: "read_named_resource", Parameters: map[string]any{"type": "object"}}
+}
+func (*definitiveResultTool) RequiresApproval() bool { return false }
+func (t *definitiveResultTool) Run(context.Context, string) (ToolResult, error) {
+	t.runs.Add(1)
+	result := BusinessError("the requested file does not exist")
+	result.StopFurtherTools = true
+	return result, nil
+}
+
+type definitiveResultClient struct {
+	calls          atomic.Int32
+	loop           *AgentLoop
+	synthesisPhase TurnPhase
+}
+
+func (c *definitiveResultClient) Complete(_ context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
+	call := c.calls.Add(1)
+	switch call {
+	case 1:
+		if len(req.Tools) == 0 {
+			panic("initial request omitted tools")
+		}
+		return &client.CompletionResponse{FinishReason: "tool_use", ContentBlocks: []client.ContentBlock{
+			{Type: "tool_use", ID: "missing-resource", Name: "read_named_resource", Input: json.RawMessage(`{}`)},
+		}}, nil
+	case 2:
+		if len(req.Tools) != 0 {
+			panic("terminal synthesis still exposed tools")
+		}
+		c.synthesisPhase, _, _ = c.loop.tracker.Current()
+		return &client.CompletionResponse{OutputText: "The requested file does not exist.", FinishReason: "end_turn"}, nil
+	default:
+		panic("definitive result allowed an extra completion")
+	}
+}
+
+func (c *definitiveResultClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+func TestAgentLoop_DefinitiveResultGetsOneToolDisabledSynthesis(t *testing.T) {
+	llm := &definitiveResultClient{}
+	tool := &definitiveResultTool{}
+	reg := NewToolRegistry()
+	reg.Register(tool)
+	loop := NewAgentLoop(llm, reg, "medium", t.TempDir(), 8, 2000, 200, nil, nil, nil)
+	llm.loop = loop
+
+	result, _, err := loop.Run(context.Background(), "read the named file", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "The requested file does not exist." {
+		t.Fatalf("result=%q", result)
+	}
+	if llm.calls.Load() != 2 || tool.runs.Load() != 1 {
+		t.Fatalf("completion calls=%d tool runs=%d, want 2 and 1", llm.calls.Load(), tool.runs.Load())
+	}
+	if llm.synthesisPhase != PhaseAwaitingLLM {
+		t.Fatalf("definitive synthesis phase=%s, want awaiting_llm", llm.synthesisPhase)
+	}
+	status := loop.LastRunStatus()
+	if status.Partial || status.FailureCode != "" {
+		t.Fatalf("run status=%+v, want clean terminal synthesis", status)
+	}
+	for _, message := range loop.RunMessages() {
+		if message.Role == "assistant" && strings.Contains(message.Content.Text(), "[business error]") {
+			t.Fatalf("raw business error leaked into assistant answer: %q", message.Content.Text())
+		}
+	}
+	assertNativeToolPairs(t, loop.RunMessages())
+}
+
 type terminalSilentCardTool struct{}
 
 func (terminalSilentCardTool) Info() ToolInfo {

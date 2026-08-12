@@ -96,6 +96,8 @@ agent:
   interrupted_resume_enabled: true # gate daemon-start auto-continuation entirely. false leaves interrupted checkpoints in place without any automatic execution.
   compaction_snapshot_retention: 1 # prior live-context rollback JSON files kept per session; the full transcript is separate and unchanged. Inline images are omitted. 0 disables snapshots.
   compaction_snapshot_max_age_days: 14 # daemon-start age sweep across default and named-agent snapshots. 0 disables age cleanup.
+  run_event_retention: 32        # observation-only run attempts retained per session; oldest attempts are pruned when a new one opens. 0 disables count pruning.
+  run_event_max_age_days: 14     # daemon-start cleanup for run-event JSONL, incomplete markers, and stale lock files across default and named agents. 0 disables age cleanup.
   compact_timeout_secs: 300 # deadline for one manual TUI /compact pass (persist-learnings + summarize, incl. sequential fold). Raise on slow gateways; 0 uses the default.
 
   # Skill matching

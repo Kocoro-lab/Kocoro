@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 )
 
@@ -93,6 +94,10 @@ type journalWriteTool struct {
 	runErr     error
 	ctxCapture SideEffectExecutionContext
 }
+
+type journalRemoteWriteTool struct{ *journalWriteTool }
+
+func (*journalRemoteWriteTool) ToolSource() ToolSource { return SourceMCP }
 
 func (*journalWriteTool) Info() ToolInfo {
 	return ToolInfo{Name: "journal_write", Parameters: map[string]any{"type": "object"}}
@@ -178,8 +183,51 @@ func TestExecuteBatches_SideEffectJournalOrdersDurableBoundary(t *testing.T) {
 	if len(journal.resultDigests) != 1 || len(journal.resultDigests[0]) != 64 {
 		t.Fatalf("result digests = %v", journal.resultDigests)
 	}
+	if results[0].sideEffectResultDigest != journal.resultDigests[0] {
+		t.Fatalf("execution digest %q diverged from journal %q", results[0].sideEffectResultDigest, journal.resultDigests[0])
+	}
 	if results[0].result.Content != "created" {
 		t.Fatalf("result = %+v", results[0].result)
+	}
+}
+
+func TestAgentLoop_SideEffectEvidencePinsJournalDigestBeforeResultShaping(t *testing.T) {
+	llm := &legacyJournalLoopClient{}
+	journal := &recordingSideEffectJournal{}
+	rawResult := "created\n" + strings.Repeat("A", 600)
+	tool := &journalWriteTool{journal: journal, result: ToolResult{Content: rawResult}}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	handler := &runTraceRecorder{}
+	loop := NewAgentLoop(llm, registry, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+	loop.SetSideEffectExecutionJournal(journal)
+	loop.SetCheckpointFunc(func(context.Context) error { return nil })
+
+	if text, _, err := loop.Run(context.Background(), "create it", nil, nil); err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v)", text, err)
+	}
+	journal.mu.Lock()
+	if len(journal.resultDigests) != 1 {
+		journal.mu.Unlock()
+		t.Fatalf("journal digests = %v", journal.resultDigests)
+	}
+	wantDigest := journal.resultDigests[0]
+	journal.mu.Unlock()
+
+	evidence := loop.ExecutionEvidence()
+	if len(evidence.ToolOutcomes) != 1 {
+		t.Fatalf("tool evidence = %+v", evidence.ToolOutcomes)
+	}
+	outcome := evidence.ToolOutcomes[0]
+	if outcome.ResultDigest != wantDigest || outcome.ResultDigestStage != executionprofile.ToolResultDigestStageToolRun || !outcome.ResultTransformed {
+		t.Fatalf("tool evidence digest provenance = %+v, want digest %q", outcome, wantDigest)
+	}
+	toolEvents := toolRunTraceEvents(handler.events)
+	if len(toolEvents) != 1 || toolEvents[0].Tool == nil ||
+		toolEvents[0].Tool.ResultDigestStage != executionprofile.ToolResultDigestStageToolRun ||
+		!toolEvents[0].Tool.ResultTransformed {
+		t.Fatalf("tool trace digest provenance = %+v", toolEvents)
 	}
 }
 
@@ -377,19 +425,39 @@ func TestExecuteBatches_ToolErrorPersistenceUsesExplicitNoEffectEvidence(t *test
 	explicit.SideEffectKnownNoEffect = true
 	for _, tc := range []struct {
 		name      string
-		result    ToolResult
+		tool      Tool
 		wantEvent string
 	}{
-		{name: "validation category alone", result: ValidationError("remote rejected after partial work"), wantEvent: "committed"},
-		{name: "explicit marker", result: explicit, wantEvent: "failed_no_effect"},
+		{
+			name:      "local structured validation",
+			tool:      &journalWriteTool{result: ValidationError("rejected before local mutation")},
+			wantEvent: "failed_no_effect",
+		},
+		{
+			name: "remote validation remains conservative",
+			tool: &journalRemoteWriteTool{journalWriteTool: &journalWriteTool{
+				result: ValidationError("remote rejected after partial work"),
+			}},
+			wantEvent: "committed",
+		},
+		{
+			name:      "explicit marker",
+			tool:      &journalWriteTool{result: explicit},
+			wantEvent: "failed_no_effect",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			journal := &recordingSideEffectJournal{}
-			tool := &journalWriteTool{journal: journal, result: tc.result}
+			switch tool := tc.tool.(type) {
+			case *journalWriteTool:
+				tool.journal = journal
+			case *journalRemoteWriteTool:
+				tool.journal = journal
+			}
 			results := make([]toolExecResult, 1)
 			err := executeBatches(
 				context.Background(),
-				[][]approvedToolCall{{journalApprovedCall(tool, 0)}},
+				[][]approvedToolCall{{journalApprovedCall(tc.tool, 0)}},
 				results, nil, nil, "",
 				sideEffectBatchHooks{
 					journal: journal,

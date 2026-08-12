@@ -1,11 +1,13 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // progressNoteEffortTier pins the run to the Max reasoning tier, because that
@@ -20,19 +22,14 @@ import (
 // either pass everything or flake on healthy builds. Max separates them
 // completely. It is also a shipped product tier (Deep/Max in the UI), not an
 // internal knob, so this measures a configuration real users select.
-const progressNoteEffortTier = "agent:\n  effort_tier: max\n"
+const progressNoteEffortTier = "max"
 
-// With 100% vs 0% separation, 4 samples requiring 2 hits passes ~99% of the
-// time on a healthy prompt and catches a fully-collapsed one every time.
-//
-// An earlier 8/3 threshold was calibrated against a different measurement
-// (67% vs 17%, taken on one developer's pinned model) and would have failed on
-// the product defaults. Recalibrating it is the whole reason this file pins
-// both the tier and the sample size instead of inheriting whatever the machine
-// happens to be configured for.
+// Six real-provider samples are still a bounded release probe, not a population
+// estimate. Require a clear majority and report the observed rate, latency, and
+// cost instead of deriving an unsupported confidence claim from 6/6.
 const (
-	progressNoteSamples = 4
-	progressNoteMinRuns = 2
+	progressNoteSamples = 6
+	progressNoteMinRuns = 4
 )
 
 // TestLive_MidRunProgressNotesReachTheUser is a behavior contract, not a string
@@ -50,7 +47,10 @@ const (
 func TestLive_MidRunProgressNotesReachTheUser(t *testing.T) {
 	skipUnlessLive(t)
 	bin := testBinary(t)
-	daemon := startIsolatedLiveDaemon(t, bin, progressNoteEffortTier)
+	daemon := startIsolatedLiveDaemon(t, bin, isolatedLiveOptions{
+		EffortTier:  progressNoteEffortTier,
+		AutoApprove: true, // bounded fixture reads; no external or paid tools requested
+	})
 	probeDir := writeProgressNoteFixture(t)
 
 	prompt := fmt.Sprintf(
@@ -58,64 +58,58 @@ func TestLive_MidRunProgressNotesReachTheUser(t *testing.T) {
 			"lines of the largest one, then summarize what you found.", probeDir)
 
 	runsWithNote := 0
+	var totalCost float64
+	var totalLatency time.Duration
 	for i := 0; i < progressNoteSamples; i++ {
-		resp := httpPost(t, daemon.baseURL+"/message", map[string]interface{}{"text": prompt})
-		sessionID, _ := resp["session_id"].(string)
-		if sessionID == "" {
-			t.Fatalf("run %d: no session_id in response: %v", i, resp)
-		}
-		session := httpGet(t, fmt.Sprintf("%s/sessions/%s", daemon.baseURL, sessionID))
-		notes := midRunAssistantNotes(session)
+		run := streamMessage(t, daemon.baseURL, map[string]interface{}{"text": prompt, "source": "kocoro"})
+		totalCost += run.CostUSD
+		totalLatency += run.Duration
+		notes := deliveredMidRunNotes(run.Frames)
 		if len(notes) > 0 {
 			runsWithNote++
-			t.Logf("run %d: %d mid-run note(s), first: %q", i, len(notes), truncateForLog(notes[0]))
+			t.Logf("run %d: delivered=%d latency=%s cost=$%.6f first=%q", i+1, len(notes), run.Duration.Round(time.Millisecond), run.CostUSD, truncateForLog(notes[0]))
 		} else {
-			t.Logf("run %d: silent until the final answer", i)
+			t.Logf("run %d: delivered=0 latency=%s cost=$%.6f events=%v", i+1, run.Duration.Round(time.Millisecond), run.CostUSD, sseEventNames(run.Frames))
 		}
 	}
+	t.Logf("observed progress delivery=%d/%d total_latency=%s total_cost=$%.6f", runsWithNote, progressNoteSamples, totalLatency.Round(time.Millisecond), totalCost)
 
 	if runsWithNote < progressNoteMinRuns {
 		t.Errorf("only %d/%d multi-step runs surfaced a mid-run progress note (want >= %d); "+
-			"the ## Communication progress-note trigger has probably narrowed again",
+			"the ## Text output progress-note contract has probably regressed",
 			runsWithNote, progressNoteSamples, progressNoteMinRuns)
 	}
 }
 
-// midRunAssistantNotes returns user-visible text emitted while the turn is still
-// working: text blocks on assistant messages that also carry a tool call. The
-// final answer is excluded by construction, since it has no tool_use beside it.
-func midRunAssistantNotes(session map[string]interface{}) []string {
-	messages, _ := session["messages"].([]interface{})
+// deliveredMidRunNotes reads the real per-request wire. A note counts only if
+// assistant_text reached the SSE client before done and a later tool event
+// proves the run was still working after that delivery.
+func deliveredMidRunNotes(frames []sseFrame) []string {
 	var notes []string
-	for _, raw := range messages {
-		message, ok := raw.(map[string]interface{})
-		if !ok || message["role"] != "assistant" {
+	for i, frame := range frames {
+		if frame.Event != "assistant_text" {
 			continue
 		}
-		blocks, ok := message["content"].([]interface{})
-		if !ok {
-			continue // plain string content is the final answer
-		}
-		var text []string
-		hasToolUse := false
-		for _, rawBlock := range blocks {
-			block, ok := rawBlock.(map[string]interface{})
-			if !ok {
-				continue
+		toolAfter := false
+		for _, later := range frames[i+1:] {
+			if later.Event == "done" {
+				break
 			}
-			// tool_use blocks carry an input object and omit an explicit type.
-			if _, isToolUse := block["input"]; isToolUse {
-				hasToolUse = true
-				continue
-			}
-			if block["type"] == "text" {
-				if body := strings.TrimSpace(fmt.Sprint(block["text"])); body != "" {
-					text = append(text, body)
-				}
+			if later.Event == "tool" {
+				toolAfter = true
+				break
 			}
 		}
-		if hasToolUse {
-			notes = append(notes, text...)
+		if !toolAfter {
+			continue
+		}
+		var payload struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(frame.Data, &payload) == nil {
+			if text := strings.TrimSpace(payload.Text); text != "" {
+				notes = append(notes, text)
+			}
 		}
 	}
 	return notes
@@ -123,7 +117,7 @@ func midRunAssistantNotes(session map[string]interface{}) []string {
 
 func writeProgressNoteFixture(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := neutralTempDir(t, "project-notes-*")
 	files := map[string]string{
 		"notes.md":   "latency review notes\n",
 		"a.txt":      "alpha\n",

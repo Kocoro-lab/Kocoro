@@ -205,6 +205,7 @@ func executeBatches(
 type sideEffectBatchHooks struct {
 	journal            SideEffectExecutionJournal
 	checkpointPrepared func(context.Context) error
+	dispatchPersisted  func()
 }
 
 func prepareApprovedToolCall(
@@ -245,6 +246,9 @@ func prepareApprovedToolCall(
 			ErrSideEffectJournalUnavailable, ac.fc.Name, err,
 		)
 	}
+	if hooks.dispatchPersisted != nil {
+		hooks.dispatchPersisted()
+	}
 	return &prepared, nil
 }
 
@@ -272,12 +276,15 @@ func runApprovedToolCall(
 				executionResult.elapsed = 0
 				return
 			}
+			digest := sideEffectResultDigest(executionResult.result, nil)
+			executionResult.sideEffectResultDigest = digest
 			_ = journal.MarkOutcomeUnknown(
 				context.WithoutCancel(ctx),
 				prepared.ExecutionID,
-				sideEffectResultDigest(executionResult.result, nil),
+				digest,
 			)
-			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+			executionResult.sideEffectResultTransformed = true
+			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, executionResult.result.Content)
 			fatalErr = wrapSideEffectExecutionError(
 				ErrSideEffectOutcomeUnknown, ac.fc.Name,
 				fmt.Errorf("tool panicked"),
@@ -306,6 +313,7 @@ func runApprovedToolCall(
 	}
 
 	digest := sideEffectResultDigest(executionResult.result, executionResult.err)
+	executionResult.sideEffectResultDigest = digest
 	journalCtx := context.WithoutCancel(ctx)
 	failed := executionResult.err != nil || executionResult.result.IsError
 	if !failed {
@@ -313,7 +321,8 @@ func runApprovedToolCall(
 			return executionResult, nil
 		} else {
 			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
-			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+			executionResult.sideEffectResultTransformed = true
+			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 			executionResult.err = nil
 			return executionResult, wrapSideEffectExecutionError(
 				ErrSideEffectOutcomeUnknown, ac.fc.Name, err,
@@ -321,7 +330,8 @@ func runApprovedToolCall(
 		}
 	}
 
-	knownNoEffect := executionResult.result.SideEffectKnownNoEffect
+	knownNoEffect := executionResult.result.SideEffectKnownNoEffect ||
+		localValidationRejectedBeforeEffect(ac.tool, executionResult.result)
 	explicitUnknown := executionResult.err != nil || executionResult.result.SideEffectOutcomeUnknown
 	if outcome := executionResult.result.ComputerUseOutcome; outcome != nil &&
 		outcome.Validate() == nil {
@@ -330,7 +340,8 @@ func runApprovedToolCall(
 	}
 	if explicitUnknown {
 		markErr := journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
-		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+		executionResult.sideEffectResultTransformed = true
+		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 		executionResult.err = nil
 		return executionResult, wrapSideEffectExecutionError(
 			ErrSideEffectOutcomeUnknown, ac.fc.Name, markErr,
@@ -341,7 +352,8 @@ func runApprovedToolCall(
 			return executionResult, nil
 		} else {
 			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
-			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+			executionResult.sideEffectResultTransformed = true
+			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 			executionResult.err = nil
 			return executionResult, wrapSideEffectExecutionError(
 				ErrSideEffectOutcomeUnknown, ac.fc.Name, err,
@@ -357,10 +369,26 @@ func runApprovedToolCall(
 		return executionResult, nil
 	} else {
 		_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
-		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name)
+		executionResult.sideEffectResultTransformed = true
+		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 		executionResult.err = nil
 		return executionResult, wrapSideEffectExecutionError(
 			ErrSideEffectOutcomeUnknown, ac.fc.Name, err,
 		)
 	}
+}
+
+// localValidationRejectedBeforeEffect converts the structured local-tool
+// validation contract into durable no-effect evidence. Builtin validation is
+// required to happen before any mutation; remote MCP/gateway validation errors
+// are deliberately excluded because their category may be inferred from a
+// provider response after dispatch.
+func localValidationRejectedBeforeEffect(tool Tool, result ToolResult) bool {
+	if !result.IsError || result.ErrorCategory != ErrCategoryValidation {
+		return false
+	}
+	if source, ok := tool.(ToolSourcer); ok {
+		return source.ToolSource() == SourceLocal
+	}
+	return true
 }

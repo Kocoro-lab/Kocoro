@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	daemonpkg "github.com/Kocoro-lab/ShanClaw/internal/daemon"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
 )
 
@@ -28,7 +29,7 @@ func TestRestrictMCPServersToAllowlist(t *testing.T) {
 			name:        "empty allowlist keeps MCP fully disabled",
 			allowlist:   "",
 			wantKept:    nil,
-			wantEnabled: map[string]bool{"playwright": true, "google-workspace": true, "already-off": false},
+			wantEnabled: map[string]bool{"playwright": false, "google-workspace": false, "already-off": false},
 		},
 		{
 			name:        "named server survives, every other server is disabled",
@@ -63,7 +64,7 @@ func TestRestrictMCPServersToAllowlist(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := isolatedMCPTestConfig()
-			kept := restrictMCPServersToAllowlist(cfg, tt.allowlist)
+			kept := daemonpkg.RestrictMCPServersToAllowlist(cfg, tt.allowlist)
 
 			if len(kept) != len(tt.wantKept) {
 				t.Fatalf("kept = %v, want %v", kept, tt.wantKept)
@@ -72,17 +73,6 @@ func TestRestrictMCPServersToAllowlist(t *testing.T) {
 				if kept[i] != name {
 					t.Fatalf("kept = %v, want %v", kept, tt.wantKept)
 				}
-			}
-			// The empty-allowlist case is a no-op on the config: the caller
-			// never starts MCP, so rewriting Disabled would be a lie about
-			// what the run was asked to do.
-			if tt.allowlist == "" {
-				for name, serverCfg := range cfg.MCPServers {
-					if serverCfg.Disabled != (name == "already-off") {
-						t.Errorf("empty allowlist mutated %s (Disabled=%v)", name, serverCfg.Disabled)
-					}
-				}
-				return
 			}
 			for name, wantEnabled := range tt.wantEnabled {
 				if enabled := !cfg.MCPServers[name].Disabled; enabled != wantEnabled {
@@ -94,7 +84,7 @@ func TestRestrictMCPServersToAllowlist(t *testing.T) {
 }
 
 func TestRestrictMCPServersToAllowlistHandlesNilConfig(t *testing.T) {
-	if kept := restrictMCPServersToAllowlist(nil, "playwright"); kept != nil {
+	if kept := daemonpkg.RestrictMCPServersToAllowlist(nil, "playwright"); kept != nil {
 		t.Errorf("nil config should keep MCP off, got %v", kept)
 	}
 }

@@ -100,6 +100,13 @@ func RunPendingMigrations(shannonDir string) {
 		state.Applied = map[string]migrationRecord{}
 	}
 	for _, m := range registeredMigrations {
+		// Isolated live-E2E daemons receive their credential through a pipe.
+		// Never copy a plaintext fixture key into the process-global macOS /
+		// Windows credential store (or the Linux credential file), and do not
+		// record the migration as applied when its body was deliberately skipped.
+		if credentialStoreDisabledForProcess() && m.ID() == migrationIDAPIKeyToKeychain {
+			continue
+		}
 		if _, ok := state.Applied[m.ID()]; ok {
 			continue
 		}
