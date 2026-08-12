@@ -385,7 +385,7 @@ go test ./internal/agents/ -v              # agent loader
 go test ./internal/schedule/ -v            # schedule CRUD
 go test ./test/ -v                         # E2E: vision pipeline, persist learnings
 go test ./test/e2e/ -v                     # E2E offline (CI)
-SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v  # E2E live (run before each release)
+SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v  # E2E live (run before each release)
 go build ./...
 ```
 

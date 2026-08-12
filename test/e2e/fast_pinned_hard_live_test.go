@@ -1,3 +1,5 @@
+//go:build live
+
 package e2e
 
 // Hard-tier extension of the Fast-pinned vs Full A/B: probes where Fast's
@@ -11,11 +13,11 @@ package e2e
 // Run (after the moderate lane finishes — never concurrently, latency
 // numbers would contaminate each other):
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_HARD=1 go test ./test/e2e/ -run TestLive_FastPinnedHardTier -timeout 120m -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_HARD=1 go test -tags=live ./test/e2e/ -run TestLive_FastPinnedHardTier -timeout 120m -v
 //
 // Release qualification:
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_HARD=1 KOCORO_FAST_PINNED_HARD_SAMPLE=release KOCORO_FAST_PINNED_HARD_REPETITIONS=15 go test ./test/e2e/ -run TestLive_FastPinnedHardTier -timeout 120m -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_HARD=1 KOCORO_FAST_PINNED_HARD_SAMPLE=release KOCORO_FAST_PINNED_HARD_REPETITIONS=15 go test -tags=live ./test/e2e/ -run TestLive_FastPinnedHardTier -timeout 120m -v
 
 import (
 	"context"

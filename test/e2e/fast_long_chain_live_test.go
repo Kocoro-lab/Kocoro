@@ -8,11 +8,11 @@ package e2e
 //
 // Paid smoke (three repetitions by default):
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_LONG_CHAIN_LIVE=1 go test ./test/e2e -run TestLive_FastLongChainMechanism -count=1 -timeout 60m -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_LONG_CHAIN_LIVE=1 go test -tags=live ./test/e2e -run TestLive_FastLongChainMechanism -count=1 -timeout 60m -v
 //
 // Paid release qualification (exactly fifteen repetitions):
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_LONG_CHAIN_LIVE=1 KOCORO_FAST_LONG_CHAIN_SAMPLE=release go test ./test/e2e -run TestLive_FastLongChainMechanism -count=1 -timeout 60m -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_LONG_CHAIN_LIVE=1 KOCORO_FAST_LONG_CHAIN_SAMPLE=release go test -tags=live ./test/e2e -run TestLive_FastLongChainMechanism -count=1 -timeout 60m -v
 
 import (
 	"context"

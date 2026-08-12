@@ -38,8 +38,10 @@ capabilities remain real and must be bounded explicitly:
   heartbeat, scheduler, sync, marketplace warming, memory services, migration
   recovery, and interrupted-turn auto-resume are disabled.
 
-Real-provider tests never infer consent from a reachable endpoint or installed
-credential. `SHANNON_E2E_LIVE=1` is required on every paid live lane.
+Live and release-qualification harnesses are excluded from the default test
+build. Pass `-tags=live` to compile them. Real-provider tests never infer
+consent from a reachable endpoint or installed credential;
+`SHANNON_E2E_LIVE=1` is still required on every paid live lane.
 
 Do not use `shan daemon stop` or `shan daemon status` for an isolated child;
 those commands intentionally target the production daemon. Verify the child
@@ -54,13 +56,13 @@ Run the opt-in suites on macOS with the Koe audio dependencies installed:
 ```bash
 SHANNON_E2E_LIVE=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
-go test ./test/e2e \
+go test -tags=live ./test/e2e \
   -run '^TestLive_Daemon_(MessageAndEditRetry|AgentListIncludesBuiltins)$' \
   -count=1 -v -timeout=5m
 
 SHANNON_E2E_LIVE=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
-go test ./test/e2e \
+go test -tags=live ./test/e2e \
   -run '^TestLive_(MidRunProgressNotesReachTheUser|DedicatedContentSearchAvoidsShell|BusinessErrorStopsWithoutRetry|ChannelDeliveryMetadataShapesReply|IsolatedMCPAllowlist_FullPath)$' \
   -count=1 -v -timeout=12m
 

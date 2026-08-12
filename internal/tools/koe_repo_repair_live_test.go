@@ -1,3 +1,5 @@
+//go:build live
+
 package tools
 
 import (
@@ -29,7 +31,7 @@ import (
 //	KOE_REPO_REPAIR_LANE=luna_fast \
 //	KOE_FAST_QUALIFICATION_ENDPOINT=http://127.0.0.1:18080 \
 //	KOE_FAST_QUALIFICATION_API_KEY=... \
-//	go test ./internal/tools -run TestKoeRepoRepairLive_AgentLoop -v -count=1
+//	go test -tags=live ./internal/tools -run TestKoeRepoRepairLive_AgentLoop -v -count=1
 //
 // The controlled Sonnet reference uses the same command with
 // KOE_REPO_REPAIR_LANE=sonnet_reference. This is a benchmark pin only; product

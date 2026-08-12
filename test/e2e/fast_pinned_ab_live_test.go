@@ -1,3 +1,5 @@
+//go:build live
+
 package e2e
 
 // Fast-pinned vs Full A/B on moderately complex tasks.
@@ -16,11 +18,11 @@ package e2e
 //
 // Run:
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 go test ./test/e2e/ -run TestLive_FastPinnedVsFullAB -timeout 60m -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 go test -tags=live ./test/e2e/ -run TestLive_FastPinnedVsFullAB -timeout 60m -v
 //
 // Release qualification:
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 KOCORO_FAST_PINNED_AB_SAMPLE=release KOCORO_FAST_PINNED_AB_REPETITIONS=15 go test ./test/e2e/ -run TestLive_FastPinnedVsFullAB -timeout 60m -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 KOCORO_FAST_PINNED_AB_SAMPLE=release KOCORO_FAST_PINNED_AB_REPETITIONS=15 go test -tags=live ./test/e2e/ -run TestLive_FastPinnedVsFullAB -timeout 60m -v
 
 import (
 	"context"

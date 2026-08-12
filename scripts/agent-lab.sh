@@ -57,7 +57,7 @@ run_offline_lane() {
   run_check harness_self_test go test ./test/e2e \
     -run '^TestOffline_(AgentLabPythonHarness|AgentLabScriptsParse|AgentLabLaneReferencesResolve|ProviderQualificationRejectsUndersizedReleaseSample)$' \
     -count=1 -v
-	  run_check quality_harness_self_test go test ./test/e2e \
+	  run_check quality_harness_self_test go test -tags=live ./test/e2e \
 	    -run '^TestOffline_AgentLabQuality(ContractValidators|QualificationFailsClosed|LaneRequiresExplicitPaidGate|LaneRejectsUndersizedReleaseSample)$' \
 	    -count=1 -v
 }
@@ -118,7 +118,7 @@ run_quality_lane() {
     KOCORO_AGENT_LAB_QUALITY_SAMPLE="$sample" \
     KOCORO_AGENT_LAB_QUALITY_REPETITIONS="$repetitions" \
     KOCORO_AGENT_LAB_QUALITY_OUTPUT="$output_dir/general-purpose-quality.json" \
-    go test ./test/e2e -run '^TestLive_AgentLabGeneralPurposeQuality$' \
+    go test -tags=live ./test/e2e -run '^TestLive_AgentLabGeneralPurposeQuality$' \
     -count=1 -v -timeout=60m
 }
 

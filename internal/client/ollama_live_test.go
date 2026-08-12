@@ -1,3 +1,5 @@
+//go:build live
+
 package client
 
 import (
@@ -12,7 +14,7 @@ import (
 // Live integration tests against a real Ollama instance.
 //
 // Run with:
-//   OLLAMA_LIVE=1 go test ./internal/client/ -run TestOllamaLive -v -timeout 300s
+//   OLLAMA_LIVE=1 go test -tags=live ./internal/client/ -run TestOllamaLive -v -timeout 300s
 //
 // Override defaults:
 //   OLLAMA_ENDPOINT=http://localhost:11434  OLLAMA_MODEL=gemma4:31b  OLLAMA_LIVE=1 go test ...

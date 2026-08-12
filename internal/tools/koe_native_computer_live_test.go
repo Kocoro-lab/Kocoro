@@ -1,3 +1,5 @@
+//go:build live
+
 package tools
 
 import (
@@ -22,7 +24,7 @@ import (
 //
 //	KOE_NATIVE_COMPUTER_LIVE=1 \
 //	TOOLSEARCH_CLOUD_ENDPOINT=http://127.0.0.1:18080 \
-//	go test ./internal/tools -run TestKoeNativeComputerLive -v -count=1
+//	go test -tags=live ./internal/tools -run TestKoeNativeComputerLive -v -count=1
 func TestKoeNativeComputerLive(t *testing.T) {
 	if os.Getenv("KOE_NATIVE_COMPUTER_LIVE") != "1" {
 		t.Skip("set KOE_NATIVE_COMPUTER_LIVE=1 to run the isolated native-computer E2E")

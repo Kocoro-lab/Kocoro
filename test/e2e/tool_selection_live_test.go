@@ -1,3 +1,5 @@
+//go:build live
+
 package e2e
 
 import (

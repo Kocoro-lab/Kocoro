@@ -202,7 +202,7 @@ go test ./internal/agents/ -v
 go test ./internal/schedule/ -v
 go test ./test/ -v
 go test ./test/e2e/ -v
-SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v
+SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v
 go build ./...
 ```
 
