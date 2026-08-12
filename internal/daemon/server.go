@@ -7344,12 +7344,27 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 	if len(retry) == 0 {
 		return
 	}
-	defaultTimeout := time.Duration(cfg.MCP.DefaultConnectTimeoutSecs) * time.Second
-	if defaultTimeout <= 0 {
-		defaultTimeout = 60 * time.Second
-	}
+	defaultTimeout := MCPConnectTimeout(cfg)
 	capturedSup := sup
 	capturedMgr := mgr
+	// This call IS the user's explicit retry signal, so re-arm every server it
+	// covers: one that already burned through its automatic attempts must get
+	// a fresh streak rather than being permanently written off.
+	for name := range retry {
+		s.deps.ForgetMCPReconnect(name)
+	}
+	onResult := buildMCPConnectResult(s.deps.liveMCPReconnectSink(), MCPConnectHooks{
+		IsCurrent: func() bool {
+			_, _, depsSup := s.deps.Snapshot()
+			return depsSup == capturedSup
+		},
+		AuditFail: s.auditMCPConnectFailure,
+		OnConnected: func(name string) {
+			capturedSup.ProbeNow(name)
+			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+		},
+		Label: "reload retry",
+	})
 	go func() {
 		// Final stale-check before spawning subprocesses: a fast follow-up
 		// reload may have swapped deps between scheduling this goroutine
@@ -7359,20 +7374,7 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 		if depsSup != capturedSup {
 			return
 		}
-		capturedMgr.StartConnectAll(s.ctx, retry, defaultTimeout, func(name string, connErr error) {
-			_, _, depsSup := s.deps.Snapshot()
-			if depsSup != capturedSup {
-				return // deps swapped by a newer reload — drop stale result.
-			}
-			if connErr != nil {
-				log.Printf("[mcp] %s: reload retry failed: %v", name, connErr)
-				s.auditMCPConnectFailure(name, connErr)
-				return
-			}
-			log.Printf("[mcp] %s: reload retry succeeded; probing supervisor", name)
-			capturedSup.ProbeNow(name)
-			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
-		})
+		capturedMgr.StartConnectAll(s.ctx, retry, defaultTimeout, onResult)
 	}()
 }
 
@@ -7461,6 +7463,10 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		newSupervisor := mcp.NewSupervisor(newMCPMgr)
 		newSupervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
 		newSupervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
+			// The supervisor reconnected this server behind our back (it takes
+			// the same in-flight slot and never calls onResult), so the ladder
+			// would otherwise stay spent on a now-healthy server.
+			s.deps.ForgetMCPReconnect(serverName)
 			if serverName == "playwright" {
 				tools.CleanupPlaywrightReconnect(ctx, newMCPMgr)
 			}
@@ -7539,23 +7545,26 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		// trigger a supervisor probe which transitions state to Healthy and
 		// fires OnChange → RebuildRegistryForHealth → MCP tools appear in
 		// the live registry.
-		if startMCP != nil {
-			capturedSupervisor := newSupervisor
-			capturedMgr := newMCPMgr
-			go startMCP(s.ctx, func(name string, connErr error) {
+		capturedSupervisor := newSupervisor
+		capturedMgr := newMCPMgr
+		onResult, scheduler := NewMCPReconnectWiring(s.ctx, capturedMgr, MCPConnectTimeout(newCfg), MCPConnectHooks{
+			IsCurrent: func() bool {
 				_, _, depsSup := s.deps.Snapshot()
-				if depsSup != capturedSupervisor {
-					return // deps swapped by a newer reload — drop result.
-				}
-				if connErr != nil {
-					log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
-					s.auditMCPConnectFailure(name, connErr)
-					return
-				}
-				log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
+				return depsSup == capturedSupervisor
+			},
+			AuditFail: s.auditMCPConnectFailure,
+			OnConnected: func(name string) {
 				capturedSupervisor.ProbeNow(name)
 				tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
-			})
+			},
+		})
+		// Retries belong to the manager generation that spawned them, so the
+		// swap that stops the superseded ladder is UNCONDITIONAL — gating it on
+		// startMCP would tie an ownership invariant to whether there happened
+		// to be anything to connect.
+		s.deps.SwapMCPReconnectScheduler(scheduler)
+		if startMCP != nil {
+			go startMCP(s.ctx, onResult)
 		}
 	} else {
 		// Config changed but MCP servers didn't — update config and refresh

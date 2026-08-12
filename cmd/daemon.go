@@ -375,12 +375,12 @@ var daemonStartCmd = &cobra.Command{
 		if isolated {
 			if len(isolatedMCPAllowed) > 0 {
 				log.Printf("%s %s", daemon.IsolationMarkerMCPAllowlisted, strings.Join(isolatedMCPAllowed, ","))
-				startDaemonMCPServices(ctx, deps, mcpMgr, startMCP, auditor)
+				startDaemonMCPServices(ctx, deps, cfg, mcpMgr, startMCP, auditor)
 			} else {
 				log.Print(daemon.IsolationMarkerMCPDisabled)
 			}
 		} else {
-			startDaemonMCPServices(ctx, deps, mcpMgr, startMCP, auditor)
+			startDaemonMCPServices(ctx, deps, cfg, mcpMgr, startMCP, auditor)
 		}
 
 		if !cfg.Daemon.AutoApprove {
@@ -1415,6 +1415,7 @@ func truncateReply(s string, n int) string {
 func startDaemonMCPServices(
 	ctx context.Context,
 	deps *daemon.ServerDeps,
+	cfg *config.Config,
 	mcpMgr *mcp.ClientManager,
 	startMCP tools.StartMCPFunc,
 	auditor *audit.AuditLogger,
@@ -1422,6 +1423,10 @@ func startDaemonMCPServices(
 	supervisor := mcp.NewSupervisor(mcpMgr)
 	supervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
 	supervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
+		// The supervisor reconnected this server behind our back (it takes the
+		// same in-flight slot and never calls onResult), so the ladder would
+		// otherwise stay spent on a now-healthy server.
+		deps.ForgetMCPReconnect(serverName)
 		if serverName == "playwright" {
 			tools.CleanupPlaywrightReconnect(ctx, mcpMgr)
 		}
@@ -1457,29 +1462,36 @@ func startDaemonMCPServices(
 	if startMCP == nil {
 		return
 	}
-	go startMCP(ctx, func(name string, connErr error) {
-		_, _, depsSup := deps.Snapshot()
-		if depsSup != supervisor {
-			return
-		}
-		if connErr != nil {
-			log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
-			if auditor != nil {
-				auditor.Log(audit.AuditEntry{
-					Timestamp:     time.Now(),
-					ToolName:      "mcp_connect",
-					InputSummary:  "mcp_servers." + name,
-					OutputSummary: connErr.Error(),
-					Decision:      "error",
-					Approved:      false,
-				})
+	// A failed startup connect is recoverable: the scheduler retries it with
+	// backoff instead of leaving the server enabled-but-dead until the next
+	// daemon restart. Owned by deps so a later /config/reload stops this
+	// generation's ladder when it swaps the manager.
+	onResult, reconnect := daemon.NewMCPReconnectWiring(ctx, mcpMgr, daemon.MCPConnectTimeout(cfg), daemon.MCPConnectHooks{
+		IsCurrent: func() bool {
+			_, _, depsSup := deps.Snapshot()
+			return depsSup == supervisor
+		},
+		AuditFail: func(name string, connErr error) {
+			if auditor == nil {
+				return
 			}
-			return
-		}
-		log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
-		supervisor.ProbeNow(name)
-		tools.PostConnectDisconnectIfDiscoveryOnly(mcpMgr, name)
+			auditor.Log(audit.AuditEntry{
+				Timestamp:     time.Now(),
+				ToolName:      "mcp_connect",
+				InputSummary:  "mcp_servers." + name,
+				OutputSummary: connErr.Error(),
+				Decision:      "error",
+				Approved:      false,
+			})
+		},
+		OnConnected: func(name string) {
+			supervisor.ProbeNow(name)
+			tools.PostConnectDisconnectIfDiscoveryOnly(mcpMgr, name)
+		},
 	})
+	deps.SwapMCPReconnectScheduler(reconnect)
+
+	go startMCP(ctx, onResult)
 }
 
 type daemonAutomation struct {

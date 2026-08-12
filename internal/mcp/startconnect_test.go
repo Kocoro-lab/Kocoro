@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -133,20 +134,26 @@ func TestStartConnectAll_DedupesInFlightConnect(t *testing.T) {
 	// before the second StartConnectAll fires.
 	time.Sleep(50 * time.Millisecond)
 
-	// Second call against same mgr + same server: must be a no-op (the
-	// onResult would normally fire fast for "sleep 30" because Initialize
-	// errors out as soon as ctx times out, but the dedup skip path returns
-	// without calling onResult).
-	secondFired := make(chan struct{}, 1)
+	// Second call against same mgr + same server: must not spawn anything.
+	//
+	// The skip is REPORTED rather than silent (ErrConnectInFlight) so a caller
+	// that re-arms on its own result — the reconnect scheduler — isn't left
+	// waiting for a callback that never comes when the slot is held by
+	// Supervisor.attemptReconnect, which has no onResult of its own.
+	// Asserting the sentinel is strictly stronger than the old "no callback"
+	// check: that one couldn't distinguish "skipped" from "callback lost".
+	secondErr := make(chan error, 1)
 	mgr.StartConnectAll(context.Background(), servers, 30*time.Second, func(name string, err error) {
-		secondFired <- struct{}{}
+		secondErr <- err
 	})
 
 	select {
-	case <-secondFired:
-		t.Fatal("second StartConnectAll for in-flight server fired onResult — dedup failed, would have spawned a duplicate subprocess")
-	case <-time.After(500 * time.Millisecond):
-		// good: skipped silently.
+	case err := <-secondErr:
+		if !errors.Is(err, ErrConnectInFlight) {
+			t.Fatalf("second StartConnectAll for in-flight server actually dialed (err=%v) — dedup failed, would have spawned a duplicate subprocess", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second StartConnectAll neither dialed nor reported the skip; a scheduler waiting on this result would stall")
 	}
 
 	// Drain first call's eventual onResult so the test goroutine cleans up.
