@@ -593,6 +593,48 @@ func (*wireFixtureProbeTool) Run(context.Context, string) (agent.ToolResult, err
 	return agent.ToolResult{Content: "fixture probe complete"}, nil
 }
 
+// TestWireFixture_AgentReplyClean_Bus verifies the complementary omitempty
+// contract through the real RunAgent producer: a clean persisted reply must
+// not put partial or failure_code on the broadcast bus.
+func TestWireFixture_AgentReplyClean_Bus(t *testing.T) {
+	const reply = "The requested work is complete."
+	gw := &fakeGatewayBackend{reply: reply}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.EventBus = NewEventBus()
+	defer deps.SessionCache.CloseAll()
+	sub := deps.EventBus.Subscribe()
+	defer deps.EventBus.Unsubscribe(sub)
+
+	// heartbeat is intentionally autonomous: it suppresses detached smart-title
+	// and suggestion work, so neither can outlive RunAgent and race cleanup of
+	// the BypassRouting temporary session directory.
+	result, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "finish this request",
+		Source:        "heartbeat",
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent clean result error: %v", err)
+	}
+	if result == nil || result.Partial || result.FailureCode != runstatus.CodeNone {
+		t.Fatalf("RunAgent returned unexpected clean status: %+v", result)
+	}
+
+	evt := waitBusEvent(t, sub, EventAgentReply)
+	produced := parseJSONMap(t, evt.Payload)
+	if produced["text"] != reply || produced["source"] != "heartbeat" {
+		t.Fatalf("agent_reply lost clean fields: %#v", produced)
+	}
+	for _, key := range []string{"partial", "failure_code"} {
+		if _, exists := produced[key]; exists {
+			t.Fatalf("clean agent_reply unexpectedly contains %q: %#v", key, produced)
+		}
+	}
+}
+
 // TestWireFixture_AgentReplyPartial_Bus drives a real RunAgent through its
 // max-iteration soft-stop path and captures the EventBus payload emitted only
 // after the transcript is saved. The scripted gateway supplies one tool call
@@ -650,6 +692,9 @@ func TestWireFixture_AgentReplyPartial_Bus(t *testing.T) {
 	sub := deps.EventBus.Subscribe()
 	defer deps.EventBus.Unsubscribe(sub)
 
+	// heartbeat is intentionally autonomous: it suppresses detached smart-title
+	// and suggestion work, so neither can outlive RunAgent and race cleanup of
+	// the BypassRouting temporary session directory.
 	result, err := RunAgent(context.Background(), deps, RunAgentRequest{
 		Text:          "continue until the requested work is complete",
 		Source:        fixture["source"].(string),
