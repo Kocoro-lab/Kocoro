@@ -99,17 +99,29 @@ func TestWatchdog_RearmsOnPhaseTransition(t *testing.T) {
 	tr.Enter(PhaseAwaitingLLM)
 
 	var softCount atomic.Int32
+	softFires := make(chan struct{}, 2)
 	stop := runWatchdogWithTick(context.Background(), tr,
 		20*time.Millisecond, 0, fastTick,
-		func(TurnPhase, time.Duration) { softCount.Add(1) },
+		func(TurnPhase, time.Duration) {
+			softCount.Add(1)
+			softFires <- struct{}{}
+		},
 		nil, nil)
 	defer stop()
 
-	time.Sleep(60 * time.Millisecond) // first soft fires
-	tr.Enter(PhaseRetryingLLM)        // leave idle-counted
-	time.Sleep(30 * time.Millisecond) // no fires while retrying
-	tr.Enter(PhaseAwaitingLLM)        // re-enter idle — seq bumps, re-arm
-	time.Sleep(60 * time.Millisecond) // second soft fires
+	waitForSoft := func(stage string) {
+		t.Helper()
+		select {
+		case <-softFires:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for %s soft fire; count=%d", stage, softCount.Load())
+		}
+	}
+
+	waitForSoft("first")
+	tr.Enter(PhaseRetryingLLM) // leave idle-counted
+	tr.Enter(PhaseAwaitingLLM) // re-enter idle — seq bumps, re-arm
+	waitForSoft("second")
 
 	if n := softCount.Load(); n != 2 {
 		t.Fatalf("want 2 soft fires across two phase instances, got %d", n)

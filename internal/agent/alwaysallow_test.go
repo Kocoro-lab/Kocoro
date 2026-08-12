@@ -527,3 +527,16 @@ func TestSwitchAgent_ResetsResponseLanguage(t *testing.T) {
 		t.Errorf("after SwitchAgent, responseLanguage should be reset to \"\"; got %q", loop.responseLanguage)
 	}
 }
+
+// TestSwitchAgent_PreservesResponseDetail pins the ordering contract used by
+// TUI and one-shot CLI callers, which inject response detail before switching.
+func TestSwitchAgent_PreservesResponseDetail(t *testing.T) {
+	loop, _ := newApprovalProbeLoop(t, nil)
+	loop.SetResponseDetail("concise")
+
+	loop.SwitchAgent("new prompt", "/tmp/mem", nil, "", nil)
+
+	if got := loop.ResponseDetail(); got != "concise" {
+		t.Fatalf("after SwitchAgent, response detail = %q, want concise", got)
+	}
+}
