@@ -280,6 +280,15 @@ func (m *ClientManager) StartConnectAll(parentCtx context.Context, servers map[s
 			release, ok := m.tryReserveInFlight(name)
 			if !ok {
 				log.Printf("[mcp] %s: connect already in flight, skipping duplicate StartConnectAll attempt", name)
+				// Report the skip instead of returning silently. The pending
+				// attempt usually calls onResult itself, but NOT when the slot
+				// is held by Supervisor.attemptReconnect → ClientManager
+				// .Reconnect, which has no onResult. A caller that re-arms on
+				// its own result (the reconnect scheduler) would otherwise
+				// stall here with nothing left to wake it.
+				if onResult != nil {
+					onResult(name, ErrConnectInFlight)
+				}
 				return
 			}
 			defer release()

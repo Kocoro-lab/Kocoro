@@ -1423,6 +1423,10 @@ func startDaemonMCPServices(
 	supervisor := mcp.NewSupervisor(mcpMgr)
 	supervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
 	supervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
+		// The supervisor reconnected this server behind our back (it takes the
+		// same in-flight slot and never calls onResult), so the ladder would
+		// otherwise stay spent on a now-healthy server.
+		deps.ForgetMCPReconnect(serverName)
 		if serverName == "playwright" {
 			tools.CleanupPlaywrightReconnect(ctx, mcpMgr)
 		}

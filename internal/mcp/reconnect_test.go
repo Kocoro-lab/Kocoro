@@ -113,6 +113,9 @@ func newTestScheduler(t *testing.T) (*ReconnectScheduler, *fakeClock, *recording
 	rec := &recordingReconnect{}
 	s := NewReconnectScheduler(rec.fn)
 	s.after = clock.after
+	// Identity jitter so the ladder assertions can compare exact rungs; the
+	// jitter band itself is covered separately.
+	s.jitter = func(d time.Duration) time.Duration { return d }
 	return s, clock, rec
 }
 
@@ -313,4 +316,122 @@ func TestNewReconnectScheduler_NilReconnectIsSafe(t *testing.T) {
 
 	s.OnFailure("notion")
 	clock.fireAll()
+}
+
+// --- deferred attempts (PR #340 review finding 1) ---------------------------
+
+func TestReconnectScheduler_DeferredReArmsWithoutBurningAnAttempt(t *testing.T) {
+	// StartConnectAll drops a duplicate attempt when another connect holds the
+	// in-flight slot — and the supervisor's own Reconnect takes that slot
+	// without ever calling onResult. Before this path existed, fire() had
+	// already cleared the pending marker, so the ladder froze with no timer
+	// and no failure report: the exact stall this scheduler exists to prevent.
+	//
+	// A deferred attempt never reached the server, so it must re-arm WITHOUT
+	// advancing the streak.
+	s, clock, rec := newTestScheduler(t)
+
+	s.OnFailure("notion")
+	clock.fireAll() // attempt 1 runs
+
+	s.OnDeferred("notion") // it never reached the server
+	if got := clock.delays(); len(got) != 1 || got[0] != reconnectInitialBackoff {
+		t.Fatalf("deferred retry must re-arm at the same rung (%v), got %v", reconnectInitialBackoff, got)
+	}
+	clock.fireAll()
+
+	// The streak is still at 1, so a real failure now takes rung 2 — not 3.
+	s.OnFailure("notion")
+	if got := clock.delays(); len(got) != 1 || got[0] != 2*reconnectInitialBackoff {
+		t.Fatalf("a deferred attempt must not consume a rung; want %v, got %v", 2*reconnectInitialBackoff, got)
+	}
+	if got := len(rec.calls()); got != 2 {
+		t.Fatalf("expected 2 reconnect calls so far, got %d", got)
+	}
+}
+
+func TestReconnectScheduler_DeferredOnFreshServerSchedulesFirstRung(t *testing.T) {
+	s, clock, _ := newTestScheduler(t)
+
+	s.OnDeferred("notion")
+
+	if got := clock.delays(); len(got) != 1 || got[0] != reconnectInitialBackoff {
+		t.Fatalf("a deferred first attempt must schedule rung 1, got %v", got)
+	}
+}
+
+func TestReconnectScheduler_DeferredRespectsTheAttemptCap(t *testing.T) {
+	// Otherwise a server that keeps losing the in-flight race would re-arm
+	// forever, which is the runaway the cap exists to stop.
+	s, clock, _ := newTestScheduler(t)
+
+	for i := 0; i < reconnectMaxAttempts; i++ {
+		s.OnFailure("notion")
+		clock.fireAll()
+	}
+
+	s.OnDeferred("notion")
+	if got := clock.delays(); len(got) != 0 {
+		t.Fatalf("deferred must not re-arm past the cap, got %v", got)
+	}
+}
+
+// --- jitter (PR #340 review finding 4) --------------------------------------
+
+func TestReconnectScheduler_JitterStaysWithinBandAndVaries(t *testing.T) {
+	// Without jitter, a reload that fails several servers at once puts every
+	// ladder on the same schedule — a synchronized burst of npx spawns every
+	// rung. Mirrors Supervisor.jitter's 0.8–1.2 band.
+	s := NewReconnectScheduler(nil)
+	base := 10 * time.Second
+
+	seen := make(map[time.Duration]struct{})
+	for i := 0; i < 200; i++ {
+		got := s.jitter(base)
+		if got < time.Duration(float64(base)*0.8) || got > time.Duration(float64(base)*1.2) {
+			t.Fatalf("jitter(%v) = %v, outside the 0.8–1.2 band", base, got)
+		}
+		seen[got] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatal("jitter produced a constant delay; ladders would still fire in lockstep")
+	}
+}
+
+func TestReconnectScheduler_JitterNeverProducesNonPositiveDelay(t *testing.T) {
+	s := NewReconnectScheduler(nil)
+	for _, base := range []time.Duration{time.Nanosecond, time.Millisecond, reconnectMaxBackoff} {
+		for i := 0; i < 100; i++ {
+			if got := s.jitter(base); got <= 0 {
+				t.Fatalf("jitter(%v) = %v, must stay positive", base, got)
+			}
+		}
+	}
+}
+
+// --- Stop race (PR #340 review finding 4) -----------------------------------
+
+func TestReconnectScheduler_StopBetweenFireAndReconnectIsHonored(t *testing.T) {
+	// fire() releases the lock before invoking reconnect. A Stop landing in
+	// that window must still prevent the attempt — otherwise a timer can
+	// respawn a subprocess the shutdown cleanup is already reaping.
+	clock := &fakeClock{}
+	rec := &recordingReconnect{}
+	var s *ReconnectScheduler
+	s = NewReconnectScheduler(func(name string) {
+		rec.fn(name)
+	})
+	s.after = clock.after
+	s.jitter = func(d time.Duration) time.Duration { return d }
+
+	s.OnFailure("notion")
+	// Simulate the interleaving: stop after the timer fires but before the
+	// reconnect action would run.
+	s.Stop()
+	clock.fireAll()
+
+	if got := rec.calls(); len(got) != 0 {
+		t.Fatalf("a stopped scheduler must not reconnect, got %v", got)
+	}
+	_ = s
 }

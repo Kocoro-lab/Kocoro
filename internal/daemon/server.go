@@ -7340,10 +7340,7 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 	if len(retry) == 0 {
 		return
 	}
-	defaultTimeout := time.Duration(cfg.MCP.DefaultConnectTimeoutSecs) * time.Second
-	if defaultTimeout <= 0 {
-		defaultTimeout = 60 * time.Second
-	}
+	defaultTimeout := MCPConnectTimeout(cfg)
 	capturedSup := sup
 	capturedMgr := mgr
 	// This call IS the user's explicit retry signal, so re-arm every server it
@@ -7362,6 +7359,7 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 			capturedSup.ProbeNow(name)
 			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
 		},
+		Label: "reload retry",
 	})
 	go func() {
 		// Final stale-check before spawning subprocesses: a fast follow-up
@@ -7461,6 +7459,10 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		newSupervisor := mcp.NewSupervisor(newMCPMgr)
 		newSupervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
 		newSupervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
+			// The supervisor reconnected this server behind our back (it takes
+			// the same in-flight slot and never calls onResult), so the ladder
+			// would otherwise stay spent on a now-healthy server.
+			s.deps.ForgetMCPReconnect(serverName)
 			if serverName == "playwright" {
 				tools.CleanupPlaywrightReconnect(ctx, newMCPMgr)
 			}
@@ -7539,23 +7541,25 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		// trigger a supervisor probe which transitions state to Healthy and
 		// fires OnChange → RebuildRegistryForHealth → MCP tools appear in
 		// the live registry.
+		capturedSupervisor := newSupervisor
+		capturedMgr := newMCPMgr
+		onResult, scheduler := NewMCPReconnectWiring(s.ctx, capturedMgr, MCPConnectTimeout(newCfg), MCPConnectHooks{
+			IsCurrent: func() bool {
+				_, _, depsSup := s.deps.Snapshot()
+				return depsSup == capturedSupervisor
+			},
+			AuditFail: s.auditMCPConnectFailure,
+			OnConnected: func(name string) {
+				capturedSupervisor.ProbeNow(name)
+				tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+			},
+		})
+		// Retries belong to the manager generation that spawned them, so the
+		// swap that stops the superseded ladder is UNCONDITIONAL — gating it on
+		// startMCP would tie an ownership invariant to whether there happened
+		// to be anything to connect.
+		s.deps.SwapMCPReconnectScheduler(scheduler)
 		if startMCP != nil {
-			capturedSupervisor := newSupervisor
-			capturedMgr := newMCPMgr
-			onResult, scheduler := NewMCPReconnectWiring(s.ctx, capturedMgr, MCPConnectTimeout(newCfg), MCPConnectHooks{
-				IsCurrent: func() bool {
-					_, _, depsSup := s.deps.Snapshot()
-					return depsSup == capturedSupervisor
-				},
-				AuditFail: s.auditMCPConnectFailure,
-				OnConnected: func(name string) {
-					capturedSupervisor.ProbeNow(name)
-					tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
-				},
-			})
-			// Retries belong to the manager that spawned them; installing the
-			// new scheduler stops the superseded one.
-			s.deps.SwapMCPReconnectScheduler(scheduler)
 			go startMCP(s.ctx, onResult)
 		}
 	} else {

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 type reconnectSink interface {
 	OnFailure(serverName string)
 	OnSuccess(serverName string)
+	OnDeferred(serverName string)
 }
 
 // MCPConnectHooks are the surface-specific hooks around the shared
@@ -29,6 +31,19 @@ type MCPConnectHooks struct {
 	// OnConnected runs after a successful connect (supervisor probe and the
 	// discovery-only disconnect). Optional.
 	OnConnected func(serverName string)
+	// Label distinguishes the entry point in the daemon log ("async" for
+	// startup and the reload rebuild, "reload retry" for the explicit user
+	// retry). Sharing one callback collapsed those into one wording, which
+	// made the two paths indistinguishable when diagnosing a stuck server.
+	// Empty defaults to "async".
+	Label string
+}
+
+func (c MCPConnectHooks) label() string {
+	if c.Label == "" {
+		return "async"
+	}
+	return c.Label
 }
 
 // buildMCPConnectResult returns the onResult callback passed to
@@ -45,8 +60,19 @@ func buildMCPConnectResult(sink reconnectSink, cb MCPConnectHooks) func(serverNa
 		if cb.IsCurrent != nil && !cb.IsCurrent() {
 			return // deps swapped by a newer reload — drop result.
 		}
+		if errors.Is(err, mcp.ErrConnectInFlight) {
+			// Not a failure: the attempt never reached the server because
+			// another connect held the slot. Re-arm without spending a rung
+			// and without an audit row — auditing this as a connect error
+			// would misattribute a scheduling collision as a broken server.
+			log.Printf("[mcp] %s: %s connect deferred (another attempt in flight)", serverName, cb.label())
+			if sink != nil {
+				sink.OnDeferred(serverName)
+			}
+			return
+		}
 		if err != nil {
-			log.Printf("[mcp] %s: async connect failed: %v", serverName, err)
+			log.Printf("[mcp] %s: %s connect failed: %v", serverName, cb.label(), err)
 			if cb.AuditFail != nil {
 				cb.AuditFail(serverName, err)
 			}
@@ -55,7 +81,7 @@ func buildMCPConnectResult(sink reconnectSink, cb MCPConnectHooks) func(serverNa
 			}
 			return
 		}
-		log.Printf("[mcp] %s: async connect succeeded; probing supervisor", serverName)
+		log.Printf("[mcp] %s: %s connect succeeded; probing supervisor", serverName, cb.label())
 		if sink != nil {
 			sink.OnSuccess(serverName)
 		}
@@ -153,6 +179,15 @@ func NewMCPReconnectWiring(
 			// deliberately shut down.
 			return
 		}
+		// Deliberately NOT filtered by tools.ShouldSkipReloadRetry, unlike
+		// retryDisconnectedEnabledMCPServers. That filter exists to stop a
+		// reload from relaunching Chrome for a discovery-only server that was
+		// disconnected ON PURPOSE after a successful connect — its signal is a
+		// non-empty tool cache. This ladder only ever arms on a REPORTED
+		// FAILURE, where no tools were cached and the disconnect was not
+		// intentional, so the filter would evaluate false anyway. A
+		// discovery-only server that genuinely fails to connect should be
+		// retried like any other.
 		// StartConnectAll's own inFlight set collapses this with any attempt
 		// already running for the same server.
 		mgr.StartConnectAll(ctx, map[string]mcp.MCPServerConfig{serverName: cfg}, defaultTimeout, onResult)

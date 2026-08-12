@@ -1,10 +1,18 @@
 package mcp
 
 import (
+	"errors"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 )
+
+// ErrConnectInFlight reports that a connect attempt was skipped because another
+// attempt for the same server was already running. It is NOT a connection
+// failure: nothing was tried, so callers must re-arm without counting it
+// against a retry budget.
+var ErrConnectInFlight = errors.New("mcp: connect already in flight")
 
 // Reconnect pacing. A failed async connect used to be terminal: the result
 // callback logged it, audited it, and returned, so a server that lost the
@@ -86,6 +94,11 @@ type ReconnectScheduler struct {
 	// time.AfterFunc does. A substitute that invokes fn inline would deadlock
 	// on the re-entrant lock in fire.
 	after func(d time.Duration, fn func()) func()
+
+	// jitter spreads a rung so several ladders armed by the same event (a
+	// reload that fails four servers, a laptop resume) don't fire in lockstep
+	// and spawn their subprocesses simultaneously. Mirrors Supervisor.jitter.
+	jitter func(d time.Duration) time.Duration
 }
 
 type reconnectEntry struct {
@@ -106,6 +119,17 @@ func NewReconnectScheduler(reconnect func(serverName string)) *ReconnectSchedule
 			t := time.AfterFunc(d, fn)
 			return func() { t.Stop() }
 		},
+		jitter: func(d time.Duration) time.Duration {
+			// 0.8–1.2×, same band as Supervisor.jitter.
+			j := time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
+			if j <= 0 {
+				// Sub-nanosecond rungs truncate to zero, which would turn the
+				// timer into a hot loop. Production rungs start at 5s, so this
+				// only guards synthetic inputs.
+				return d
+			}
+			return j
+		},
 	}
 }
 
@@ -113,6 +137,27 @@ func NewReconnectScheduler(reconnect func(serverName string)) *ReconnectSchedule
 // retry. It is a no-op when the scheduler is stopped, when a retry for this
 // server is already pending, or when the server has exhausted its attempts.
 func (s *ReconnectScheduler) OnFailure(serverName string) {
+	s.schedule(serverName, true)
+}
+
+// OnDeferred re-arms serverName WITHOUT advancing the streak. Used when an
+// attempt never reached the server because another connect held the in-flight
+// slot (`ErrConnectInFlight`).
+//
+// This is load-bearing, not a nicety: `Supervisor.attemptReconnect` takes that
+// slot via `ClientManager.Reconnect` and never reports through onResult. Since
+// fire() clears the pending marker before invoking the action, a dropped
+// attempt would otherwise leave the ladder with no timer and no failure
+// report — frozen, which is the very stall this scheduler exists to prevent.
+// A deferred attempt is not evidence the server is failing, so it must not
+// consume a rung either.
+func (s *ReconnectScheduler) OnDeferred(serverName string) {
+	s.schedule(serverName, false)
+}
+
+// schedule arms the next retry for serverName. advance distinguishes a real
+// failure (consumes a rung) from a deferred attempt (re-arms the same rung).
+func (s *ReconnectScheduler) schedule(serverName string, advance bool) {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
@@ -123,25 +168,39 @@ func (s *ReconnectScheduler) OnFailure(serverName string) {
 		entry = &reconnectEntry{}
 		s.servers[serverName] = entry
 	}
-	// A pending retry already covers this failure. Two reports for the same
+	// A pending retry already covers this report. Two reports for the same
 	// server can legitimately arrive close together (async connect result plus
 	// a supervisor probe); firing both would race for the same process group.
 	if entry.cancel != nil {
 		s.mu.Unlock()
 		return
 	}
+	// The cap bounds deferrals too — a server that keeps losing the in-flight
+	// race would otherwise re-arm forever.
 	if entry.attempts >= s.maxTries {
 		s.mu.Unlock()
-		log.Printf("[mcp] %s: giving up automatic reconnect after %d attempts; reload or re-enable the server to retry", serverName, entry.attempts)
+		if advance {
+			log.Printf("[mcp] %s: giving up automatic reconnect after %d attempts; reload or re-enable the server to retry", serverName, entry.attempts)
+		}
 		return
 	}
-	entry.attempts++
-	delay := reconnectBackoff(entry.attempts)
-	attempt := entry.attempts
+	if advance {
+		entry.attempts++
+	}
+	// A deferral before any failure still schedules the first rung.
+	rung := entry.attempts
+	if rung < 1 {
+		rung = 1
+	}
+	delay := s.jitter(reconnectBackoff(rung))
 	entry.cancel = s.after(delay, func() { s.fire(serverName) })
 	s.mu.Unlock()
 
-	log.Printf("[mcp] %s: scheduling reconnect attempt %d/%d in %v", serverName, attempt, s.maxTries, delay)
+	if advance {
+		log.Printf("[mcp] %s: scheduling reconnect attempt %d/%d in %v", serverName, rung, s.maxTries, delay)
+	} else {
+		log.Printf("[mcp] %s: reconnect attempt %d/%d deferred (connect already in flight); retrying in %v", serverName, rung, s.maxTries, delay)
+	}
 }
 
 // fire runs one retry. It clears the pending marker first so a failure
@@ -158,9 +217,20 @@ func (s *ReconnectScheduler) fire(serverName string) {
 	reconnect := s.reconnect
 	s.mu.Unlock()
 
-	if reconnect != nil {
-		reconnect(serverName)
+	if reconnect == nil {
+		return
 	}
+	// Re-check under the lock immediately before acting. Stop() can land in
+	// the window between releasing the lock above and this call, and
+	// ClientManager.Close has no closed flag — a connect that slipped through
+	// would repopulate m.clients after the cleanup reaped it.
+	s.mu.Lock()
+	stopped := s.stopped
+	s.mu.Unlock()
+	if stopped {
+		return
+	}
+	reconnect(serverName)
 }
 
 // OnSuccess clears the failure streak for serverName so a later failure
