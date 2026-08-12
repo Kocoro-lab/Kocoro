@@ -45,10 +45,30 @@ func testBinary(t *testing.T) string {
 	return builtBinary
 }
 
+// neutralTempDir avoids exposing the test function name inside a path that is
+// placed in a model-visible prompt. t.TempDir includes that name, which can
+// leak the expected behavior into an otherwise natural live probe.
+func neutralTempDir(t *testing.T, pattern string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", pattern)
+	if err != nil {
+		t.Fatalf("create neutral temporary directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove neutral temporary directory: %v", err)
+		}
+	})
+	return dir
+}
+
+// skipUnlessLive keeps real-provider calls behind explicit authorization.
+// Reachability and local credentials are prerequisites, not consent to spend
+// quota or execute tools against external systems.
 func skipUnlessLive(t *testing.T) {
 	t.Helper()
 	if os.Getenv("SHANNON_E2E_LIVE") != "1" {
-		t.Skip("skipping live E2E test (set SHANNON_E2E_LIVE=1 to run)")
+		t.Skip("live E2E skipped: set SHANNON_E2E_LIVE=1 to authorize real provider calls")
 	}
 }
 

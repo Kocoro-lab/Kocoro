@@ -1,10 +1,26 @@
+//go:build promptaudit
+
+// This file is a reporting tool, not a test suite, so it is excluded from the
+// default build. Run it explicitly:
+//
+//	go test -tags promptaudit ./internal/agent -run TestSystemPromptAudit -v
+//
+// It is kept as a Go test rather than a command because it needs package-level
+// access to coreOperationalRules / contrastExamples* / buildStaticSystem, and
+// because KOCORO_PROMPT_AUDIT_OUTPUT feeds the agent-lab panel's prompt
+// workbench (scripts/build_prompt_workbench.py reads the JSON it writes).
+
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
 )
@@ -25,10 +41,6 @@ func TestSystemPromptAudit(t *testing.T) {
 		t.Skip("audit dump skipped in -short mode")
 	}
 
-	// Realistic one-shot CLI baseline using the real production constants:
-	// defaultPersona + coreOperationalRules + contrastExamplesCore is the
-	// BasePrompt assembled in AgentLoop.Run (line ~999).
-	basePrompt := defaultPersona + coreOperationalRules + contrastExamplesCore
 	t.Logf("--- BasePrompt constants ---")
 	dumpConst(t, "  defaultPersona", defaultPersona)
 	dumpConst(t, "  coreOperationalRules", coreOperationalRules)
@@ -36,24 +48,104 @@ func TestSystemPromptAudit(t *testing.T) {
 	dumpConst(t, "  cloudDelegationGuidance (conditional)", cloudDelegationGuidance)
 	dumpConst(t, "  contrastExamplesCloud (conditional)", contrastExamplesCloud)
 
-	// Default gateway + native-thinking Direct set. The exhaustive production
-	// registration matrix is pinned by tools.TestRegisteredLocalToolExposureMatrix;
-	// `think` is intentionally absent because default native thinking skips it.
-	tools := []string{
-		"archive_extract", "archive_inspect", "ask_user_question", "bash",
-		"clipboard", "directory_list", "docx_to_text", "file_edit",
-		"file_read", "file_write", "glob", "grep", "http", "memory_append",
-		"notify", "pdf_to_text", "pptx_to_text", "present_deliverable",
-		"schedule_list", "schedule_show", "system_info", "tool_search",
-		"use_skill", "xlsx_to_text",
-	}
+	// Tool sets and deferred catalogs live in promptbudget_test.go so the
+	// standing budget guard and this report can never describe different
+	// prompts.
+	fullTools := representativeFullTools()
+	fastTools := representativeFastTools()
+	commonDeferred := representativeCommonDeferred()
+	fastDeferred := representativeFastDeferred()
+	// Compose from the final provider-visible names, matching AgentLoop.Run.
+	// Native thinking keeps think out of this representative request.
+	fullBasePrompt := defaultPersona + operationalRulesForToolNames(fullTools) + contrastExamplesCore
+	fastBasePrompt := defaultPersona + operationalRulesForToolNames(fastTools) + contrastExamplesCore
 	parts := prompt.BuildSystemPrompt(prompt.PromptOptions{
-		BasePrompt:     basePrompt,
-		LocalToolNames: tools,
-		MemoryDir:      "/Users/test/.shannon/agents/sample",
-		ModelID:        "medium",
-		OutputFormat:   "markdown",
+		BasePrompt:       fastBasePrompt,
+		LocalToolNames:   fastTools,
+		GatewayToolNames: []string{"web_fetch", "web_search"},
+		DeferredTools:    fastDeferred,
+		MemoryDir:        "/Users/test/.shannon/agents/sample",
+		ModelID:          "medium",
+		OutputFormat:     "markdown",
 	})
+	full := prompt.BuildSystemPrompt(prompt.PromptOptions{
+		BasePrompt:       fullBasePrompt,
+		LocalToolNames:   fullTools,
+		GatewayToolNames: []string{"web_fetch", "web_search"},
+		DeferredTools:    commonDeferred,
+		MemoryDir:        "/Users/test/.shannon/agents/sample",
+		ModelID:          "medium",
+		OutputFormat:     "koe",
+	})
+	fast := prompt.BuildSystemPrompt(prompt.PromptOptions{
+		BasePrompt:       fastBasePrompt,
+		LocalToolNames:   fastTools,
+		GatewayToolNames: []string{"web_fetch", "web_search"},
+		DeferredTools:    fastDeferred,
+		MemoryDir:        "/Users/test/.shannon/agents/sample",
+		ModelID:          "medium",
+		OutputFormat:     "koe",
+		FastMode:         true,
+	})
+	fullSystem := full.System + cloudDelegationGuidance + contrastExamplesCloud
+	// Budget enforcement lives in TestRepresentativeSystemPromptStaysWithinBudget
+	// (no build tag) so it runs on every `go test ./...`. This file is a report
+	// generator and must never be the only thing standing between the prompt and
+	// re-inflation.
+	// Representative attended Desktop scenario: full Direct set, question UI
+	// live, markdown output. This is the non-voice Kocoro assembly the
+	// workbench shows next to the two Koe modes.
+	desktop := prompt.BuildSystemPrompt(prompt.PromptOptions{
+		BasePrompt:          fullBasePrompt,
+		LocalToolNames:      fullTools,
+		GatewayToolNames:    []string{"web_fetch", "web_search"},
+		DeferredTools:       commonDeferred,
+		MemoryDir:           "/Users/test/.shannon/agents/sample",
+		ModelID:             "medium",
+		OutputFormat:        "markdown",
+		QuestionUIAvailable: true,
+	})
+	desktopSystem := desktop.System + cloudDelegationGuidance + contrastExamplesCloud
+
+	if outputPath := strings.TrimSpace(os.Getenv("KOCORO_PROMPT_AUDIT_OUTPUT")); outputPath != "" {
+		artifact := map[string]any{
+			"schema_version": "kocoro.prompt_audit.v1",
+			"generated_at":   time.Now().UTC().Format(time.RFC3339Nano),
+			"assumptions": []string{
+				"Kocoro default persona with the production core rules and core contrast examples.",
+				"Representative production local-tool set plus the default web openers; per-user MCP, integrations, instructions, memory content, working directory, and sticky context are intentionally absent.",
+				"Koe Fast keeps uncommon schema-heavy local tools behind tool_search; Full keeps their ordinary exposure. The exact system and stable-context layers therefore differ by final provider-visible capabilities.",
+			},
+			"layers": map[string]string{
+				"default_persona":           defaultPersona,
+				"core_operational_rules":    coreOperationalRules,
+				"core_contrast_examples":    contrastExamplesCore,
+				"kocoro_base_prompt":        fullBasePrompt,
+				"kocoro_full_base_prompt":   fullBasePrompt,
+				"kocoro_fast_base_prompt":   fastBasePrompt,
+				"cloud_delegation_guidance": cloudDelegationGuidance,
+				"cloud_contrast_examples":   contrastExamplesCloud,
+			},
+			"koe_full": map[string]string{
+				"system":           fullSystem,
+				"stable_context":   full.StableContext,
+				"volatile_context": full.VolatileContext,
+			},
+			"koe_fast": map[string]string{
+				"system":           fast.System,
+				"stable_context":   fast.StableContext,
+				"volatile_context": fast.VolatileContext,
+			},
+			"kocoro_desktop": map[string]string{
+				"system":           desktopSystem,
+				"stable_context":   desktop.StableContext,
+				"volatile_context": desktop.VolatileContext,
+			},
+		}
+		if err := writePromptAuditArtifact(outputPath, artifact); err != nil {
+			t.Fatalf("write prompt audit artifact: %v", err)
+		}
+	}
 
 	t.Logf("--- Assembled system prompt ---")
 	t.Logf("  System total:    %d chars / ~%.0f tokens", len(parts.System), tokensFromChars(len(parts.System)))
@@ -118,24 +210,20 @@ func TestSystemPromptAudit(t *testing.T) {
 	t.Logf("  total redundancy candidates: %d", flagged)
 }
 
-func TestCoreOperationalRulesDoNotSuppressOperationalPreambles(t *testing.T) {
-	for _, forbidden := range []string{
-		"No reasoning preamble.",
-		"Never apologize for, comment on, or explain your own tool calls.",
-		"Reserve narration for reporting the result after the action is complete.",
-	} {
-		if strings.Contains(coreOperationalRules+contrastExamplesCore, forbidden) {
-			t.Errorf("runtime prompt still contains preamble-suppressing instruction %q", forbidden)
-		}
+func writePromptAuditArtifact(path string, artifact any) error {
+	body, err := json.MarshalIndent(artifact, "", "  ")
+	if err != nil {
+		return err
 	}
-
-	const requiredPreambleGuard = "give one brief user-facing preamble and continue with the tool calls in the same response"
-	if !strings.Contains(coreOperationalRules+contrastExamplesCore, requiredPreambleGuard) {
-		t.Errorf("runtime prompt missing operational-preamble guard %q", requiredPreambleGuard)
+	body = append(body, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
 	}
-	if !strings.Contains(coreOperationalRules, "Do not apologize for routine tool use.") {
-		t.Error("runtime prompt missing routine tool-use apology guard")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		return err
 	}
+	return os.Rename(tmp, path)
 }
 
 func dumpConst(t *testing.T, label, content string) {

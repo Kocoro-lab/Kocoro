@@ -37,6 +37,31 @@ func TestCodeFromError_ClassifiesProviderFailures(t *testing.T) {
 	}
 }
 
+func TestCodeFromError_ClassifiesRequestBudgetExhaustion(t *testing.T) {
+	err := errors.New("agent provider request budget exhausted: class=main reason=normal_dispatch_limit")
+	if got := CodeFromError(err); got != CodeBudgetExhausted {
+		t.Fatalf("CodeFromError() = %q, want %q", got, CodeBudgetExhausted)
+	}
+	if got := FriendlyMessageFromError(err); got != friendlyMessages[CodeBudgetExhausted] {
+		t.Fatalf("FriendlyMessageFromError() = %q", got)
+	}
+}
+
+func TestCodeFromError_ClassifiesSideEffectBoundaries(t *testing.T) {
+	tests := []struct {
+		err  error
+		want Code
+	}{
+		{errors.New("agent: side-effect execution outcome unknown"), CodeSideEffectOutcomeUnknown},
+		{errors.New("agent: side-effect execution journal unavailable"), CodeSideEffectJournalUnavailable},
+	}
+	for _, test := range tests {
+		if got := CodeFromError(test.err); got != test.want {
+			t.Fatalf("CodeFromError(%q) = %q, want %q", test.err, got, test.want)
+		}
+	}
+}
+
 // TestCodeFromError_TransportShapes pins that every transport-layer shape
 // surfaced by the gateway client labels as CodeNetworkInterrupted, not the
 // generic CodeUnexpected. Shares client.TransportErrorShape with the retry

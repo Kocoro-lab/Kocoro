@@ -121,7 +121,7 @@ func TestAgentLoop_MemoryPreflightStrippedFromMultimodalRunMessages(t *testing.T
 	}
 }
 
-func TestAgentLoop_MemoryPreflightForceHelperOnlyOnFirstConversationTurn(t *testing.T) {
+func TestAgentLoop_MemoryPreflightNeverForcesHelper(t *testing.T) {
 	run := func(t *testing.T, history []client.Message) bool {
 		t.Helper()
 		llm := &budgetCaptureLLMClient{responses: []*client.CompletionResponse{{
@@ -142,8 +142,8 @@ func TestAgentLoop_MemoryPreflightForceHelperOnlyOnFirstConversationTurn(t *test
 		return got
 	}
 
-	if !run(t, nil) {
-		t.Fatal("first conversation user message should force helper preflight")
+	if run(t, nil) {
+		t.Fatal("first conversation user message must stay behind the cheap memory gate")
 	}
 	history := []client.Message{{Role: "user", Content: client.NewTextContent("earlier")}}
 	if run(t, history) {
@@ -205,21 +205,24 @@ func TestAgentLoop_MemoryPreflightAuditTraceOmitsContent(t *testing.T) {
 		}
 	}
 	var decoded struct {
-		Attempted       bool   `json:"attempted"`
-		ForceHelper     bool   `json:"force_helper"`
-		HelperUsed      bool   `json:"helper_used"`
-		IntentSource    string `json:"intent_source"`
-		IntentsCount    int    `json:"intents_count"`
-		Queried         bool   `json:"queried"`
-		ResultsCount    int    `json:"results_count"`
-		ContextReturned bool   `json:"context_returned"`
-		ContextInjected bool   `json:"context_injected"`
-		Outcome         string `json:"outcome"`
+		Attempted        bool   `json:"attempted"`
+		ForceHelper      bool   `json:"force_helper"`
+		HelperUsed       bool   `json:"helper_used"`
+		IntentSource     string `json:"intent_source"`
+		IntentsCount     int    `json:"intents_count"`
+		Queried          bool   `json:"queried"`
+		ResultsCount     int    `json:"results_count"`
+		ContextReturned  bool   `json:"context_returned"`
+		ContextInjected  bool   `json:"context_injected"`
+		HelperDurationMs int64  `json:"helper_duration_ms"`
+		QueryDurationMs  int64  `json:"query_duration_ms"`
+		TotalDurationMs  int64  `json:"total_duration_ms"`
+		Outcome          string `json:"outcome"`
 	}
 	if err := json.Unmarshal([]byte(summary), &decoded); err != nil {
 		t.Fatalf("decode memory_preflight summary: %v", err)
 	}
-	if !decoded.Attempted || !decoded.ForceHelper || !decoded.HelperUsed || decoded.IntentSource != "helper" {
+	if !decoded.Attempted || decoded.ForceHelper || !decoded.HelperUsed || decoded.IntentSource != "helper" {
 		t.Fatalf("unexpected trace flags: %+v", decoded)
 	}
 	if decoded.IntentsCount != 1 || !decoded.Queried || decoded.ResultsCount != 1 || !decoded.ContextReturned || !decoded.ContextInjected {

@@ -643,6 +643,12 @@ func TestCompactionSnapshotConfig_Defaults(t *testing.T) {
 	if cfg.Agent.CompactionSnapshotMaxAgeDays != 14 {
 		t.Errorf("CompactionSnapshotMaxAgeDays = %d, want 14", cfg.Agent.CompactionSnapshotMaxAgeDays)
 	}
+	if cfg.Agent.RunEventRetention != 32 {
+		t.Errorf("RunEventRetention = %d, want 32", cfg.Agent.RunEventRetention)
+	}
+	if cfg.Agent.RunEventMaxAgeDays != 14 {
+		t.Errorf("RunEventMaxAgeDays = %d, want 14", cfg.Agent.RunEventMaxAgeDays)
+	}
 }
 
 func TestPromptSuggestionConfig_OverlayMerge(t *testing.T) {
@@ -921,6 +927,26 @@ func TestConfig_InterruptedResumeMaxAgeNegativeRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "interrupted_resume_max_age_hours") {
 		t.Errorf("expected error to mention interrupted_resume_max_age_hours, got %v", err)
+	}
+}
+
+func TestConfig_RunEventRetentionNegativeRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Config)
+		want string
+	}{
+		{"count", func(cfg *Config) { cfg.Agent.RunEventRetention = -1 }, "run_event_retention"},
+		{"age", func(cfg *Config) { cfg.Agent.RunEventMaxAgeDays = -1 }, "run_event_max_age_days"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			tc.set(cfg)
+			err := validateConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateConfig() error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

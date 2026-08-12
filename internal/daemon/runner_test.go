@@ -659,6 +659,11 @@ func TestIsSoftRunError(t *testing.T) {
 		{"context.Canceled", context.Canceled, true},
 		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
 		{"ErrMaxIterReached", agent.ErrMaxIterReached, true},
+		{"ErrRequestBudgetExhausted", agent.ErrRequestBudgetExhausted, true},
+		{"wrapped ErrRequestBudgetExhausted", fmt.Errorf("turn stopped: %w", agent.ErrRequestBudgetExhausted), true},
+		{"ErrSideEffectOutcomeUnknown", agent.ErrSideEffectOutcomeUnknown, true},
+		{"wrapped ErrSideEffectOutcomeUnknown", fmt.Errorf("turn stopped: %w", agent.ErrSideEffectOutcomeUnknown), true},
+		{"ErrSideEffectJournalUnavailable", agent.ErrSideEffectJournalUnavailable, false},
 		{"ErrHardIdleTimeout", agent.ErrHardIdleTimeout, true},
 		{"wrapped ErrHardIdleTimeout", fmt.Errorf("turn aborted: %w", agent.ErrHardIdleTimeout), true},
 		{"wrapped Canceled", errors.Join(errors.New("loop"), context.Canceled), true},
@@ -1260,6 +1265,16 @@ type fakeGatewayBackend struct {
 	usage    *client.Usage // optional; when set, every completion echoes this usage
 }
 
+type rejectingSuggestionClient struct{}
+
+func (rejectingSuggestionClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	return nil, agent.ErrRequestBudgetExhausted
+}
+
+func (rejectingSuggestionClient) CompleteStream(context.Context, client.CompletionRequest, func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return nil, agent.ErrRequestBudgetExhausted
+}
+
 func (g *fakeGatewayBackend) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1312,7 +1327,7 @@ func TestFireSuggestionAfterRun_AppendsAssistantReplyToMain(t *testing.T) {
 		ModelTier: "medium",
 	}
 
-	fireSuggestionAfterRun(context.Background(), deps,
+	fireSuggestionAfterRun(context.Background(), deps, deps.GW,
 		"test-agent", "sess1",
 		main, // SpeculationEnabled removed
 		"I'll fix the test in foo.go")
@@ -1343,6 +1358,30 @@ func TestFireSuggestionAfterRun_AppendsAssistantReplyToMain(t *testing.T) {
 	}
 }
 
+func TestFireSuggestionAfterRun_UsesOriginatingBudgetClient(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "must not be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+	deps := &ServerDeps{
+		GW:          client.NewGatewayClient(ts.URL, "test-key"),
+		Suggestions: agent.NewSuggestionState(),
+	}
+	main := client.CompletionRequest{
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("continue")}},
+		ModelTier: "medium",
+	}
+
+	fireSuggestionAfterRun(context.Background(), deps, rejectingSuggestionClient{},
+		"test-agent", "budgeted-session", main, "finished")
+
+	if got := len(gw.requests()); got != 0 {
+		t.Fatalf("raw gateway bypassed originating budget: calls=%d", got)
+	}
+	if _, ok := deps.Suggestions.Get("budgeted-session"); ok {
+		t.Fatal("budget-rejected suggestion was published")
+	}
+}
+
 // TestFireSuggestionAfterRun_EmptyReplySkipsAll guards against the case
 // where loop.Run returned empty text (tool-only turn, partial result).
 // Firing a suggestion with no assistant reply produces a misleading
@@ -1361,7 +1400,7 @@ func TestFireSuggestionAfterRun_EmptyReplySkipsAll(t *testing.T) {
 		ModelTier: "medium",
 	}
 
-	fireSuggestionAfterRun(context.Background(), deps,
+	fireSuggestionAfterRun(context.Background(), deps, deps.GW,
 		"test-agent", "sess1",
 		main,
 		"") // empty assistantReply
@@ -1429,7 +1468,7 @@ func TestFireSuggestionAfterRun_StaleGoroutineDoesNotResurrect(t *testing.T) {
 	// handler until we send on startResp.
 	done := make(chan struct{})
 	go func() {
-		fireSuggestionAfterRun(context.Background(), deps,
+		fireSuggestionAfterRun(context.Background(), deps, deps.GW,
 			"test-agent", "sess1",
 			main,
 			"I just replied to you")
@@ -1618,9 +1657,11 @@ func TestPlaywrightTurnStartProbeAction(t *testing.T) {
 		{"degraded connected cdp unattended schedule", mcp.StateDegraded, true, cdpCfg, true, "schedule", playwrightProbeSkipRelaunch},
 		{"degraded connected cdp unattended webhook", mcp.StateDegraded, true, cdpCfg, true, "webhook", playwrightProbeSkipRelaunch},
 
-		// No live client: ProbeNow would reconnect+relaunch, so skip.
+		// No live client: ProbeNow would reconnect+relaunch, so skip. A connected
+		// client with stale Disconnected health is the async-connect window and
+		// must probe so the first Run gets the rebuilt MCP registry.
 		{"disconnected (user closed chrome)", mcp.StateDisconnected, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
-		{"disconnected even if connected flag set", mcp.StateDisconnected, true, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
+		{"disconnected health with newly connected client", mcp.StateDisconnected, true, cdpCfg, true, "kocoro", playwrightProbeRun},
 		{"degraded but not connected (post-discovery disconnect)", mcp.StateDegraded, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
 
 		// Probe runs: keep_alive=true warms Chrome; Healthy/non-CDP are
@@ -1826,11 +1867,22 @@ func TestApplyKoeModeAdmissionUsesSelectedMode(t *testing.T) {
 			wantDecision: executionprofile.AdmissionModeSelectedFull,
 		},
 		{
-			name: "structured reason cannot override selected fast",
+			name: "recognized full reason makes selected fast fail closed",
 			req: RunAgentRequest{
 				Source: "koe", ExecutionMode: executionprofile.ModeFast,
 				RequestedExecutionMode: stringPtr("fast"),
 				FullReason:             executionprofile.FullReasonProductionIncident,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantReason:   executionprofile.FullReasonProductionIncident,
+			wantDecision: executionprofile.AdmissionFastReasonConflict,
+		},
+		{
+			name: "unknown reason does not upgrade selected fast",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr("fast"),
+				FullReason:             "lots_of_tools",
 			},
 			wantMode:     executionprofile.ModeFast,
 			wantDecision: executionprofile.AdmissionModeSelectedFast,

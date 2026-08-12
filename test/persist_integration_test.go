@@ -13,8 +13,11 @@ import (
 )
 
 // TestPersistLearningsIntegration tests PersistLearnings with a real LLM call.
-// Requires SHANNON_API_KEY or valid config. Skip if not available.
+// It requires an explicit live-test gate plus SHANNON_API_KEY or valid config.
 func TestPersistLearningsIntegration(t *testing.T) {
+	if os.Getenv("SHANNON_E2E_LIVE") != "1" {
+		t.Skip("set SHANNON_E2E_LIVE=1 to run paid PersistLearnings integration tests")
+	}
 	cfg, err := config.Load()
 	if err != nil || cfg.APIKey == "" {
 		t.Skip("skipping: no API key configured")

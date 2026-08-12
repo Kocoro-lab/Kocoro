@@ -86,12 +86,25 @@ retry. `decline` carries no answers.
 | `sse_event.tool.completed.json` | `server.go sseEventHandler.OnToolResult` | same |
 | `sse_event.usage.json` | `server.go sseEventHandler.OnUsage` | `web_search_usage_v1`: live usage always includes `web_search_calls`, including zero |
 | `sse_event.done.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | `web_search_usage_v1`: terminal usage always includes `web_search_calls`; optional fields omitted here: `partial`, `failure_code`, `message_start_index`, `message_end_index` (all omitempty, soft-failure metadata) |
+| `sse_event.done.partial.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | explicit soft-stop result: usable reply plus `partial: true` and stable `failure_code`; this constructed fixture leaves `message_start_index` / `message_end_index` at zero so `omitempty` removes them, while a live soft-stop result normally populates both; UI must not render it as verified completion |
+| `bus_event.agent_reply.json` | `runner.go RunAgent` after the final session save | canonical clean persisted reply; `partial` and `failure_code` are absent |
+| `bus_event.agent_reply.partial.json` | `runner.go RunAgent` after the final session save | persisted soft-stop reply on the broadcast bus; carries the same `partial`/`failure_code` classification as the per-request done payload |
+| `bus_event.schedule_run.partial.json` | `scheduler.go runWithLifecycle` after a soft-stop scheduled run | explicit `partial` terminal phase plus `partial`/`failure_code` and retained usage; older clients ignore the unknown phase instead of rendering green success |
+| `bus_event.agent_error.json` | `runner.go RunAgent` hard-error path after saving the friendly error stub | failed run notification; unlike `agent_reply`, always carries a non-empty `failure_code` plus diagnostic and user-facing error strings |
 | `sse_event.done.with_deliverable.json` | `server.go handleMessageSSE` (marshals `RunAgentResult`) | `message_idempotency_receipt_v2`: an empty chat reply plus daemon-validated `present_deliverable` metadata. A client that persists a local artifact requires this receipt before deleting its retained source |
 | `bus_event.cloud_progress.json` | `bus_handler.go OnCloudProgress` | counts-only today; a future `items` array extension will be additive + capability-gated |
 | `bus_event.suggestion_ready.json` | `runner.go fireSuggestionAfterRun` | post-turn suggested next user prompt |
 | `bus_event.deliverable.json` | `bus_handler.go makeDeliverableEventHandler` | daemon-validated local regular-file metadata emitted by `present_deliverable`; Desktop dedupes live/replay/history records by `id` |
 | `bus_event.computer_use.activity.json` | `guicontrol.Coordinator` through the `Server` event sink | Dotted event type `computer_use.activity`; schema v1 redacted activity payload. `coordinator_instance_id` is immutable for one daemon coordinator process, while `revision` is coordinator-owned and independent from the SSE event ID. Pointer geometry is bound to `topology_id` + `topology_generation`. Nullable result/path/pointer/failure fields never carry action content. |
 | `bus_event.computer_use.activity.scroll.json` | same | Verified Accessibility scroll activity. It pins `action_kind: scroll`, `execution_path: accessibility`, and an explicit null pointer so Desktop never invents a click/move pulse for a semantic AX scroll. |
+
+`agent_reply` includes `failure_code` only when `partial` is true;
+`agent_error` always includes a non-empty `failure_code`. The value is an open
+string enum on terminal run payloads. Current producer values are declared in
+`internal/runstatus/runstatus.go`. Consumers may localize known values, but
+must preserve forward compatibility by decoding an unknown non-empty value and
+showing a generic partial/failure fallback instead of rejecting or dropping
+the event.
 
 ### Computer-use control plane
 
@@ -159,8 +172,8 @@ auto-runs again under the same key.
 | `local_screenshot_window_success.json` | `screenshot_window.go handleScreenshotWindow` (200 branch) | `{"image_base64":…,"width":…,"height":…}`; anchors key names consumed by Desktop's `CaptureWindowResult` |
 | `message_foreground_hint_request.json` | Desktop → `POST /message` | `RunAgentRequest` with `foreground_hint` populated; `source: "kocoro"` is the quick-panel source string; `foreground_hint` is folded into `StickyContext` by the runner, never forwarded to Cloud |
 | `message_idempotency_request.json` | Desktop → `POST /message` | Crash-safe primary request with a client-minted `session_id` + stable `idempotency_key`; decoded and validated by the daemon and emitted by Desktop's production request builder |
-| `message_koe_execution_fast_request.json` | Koe → `POST /message` | `source=koe` fast request: semantic `execution_mode` + `requested_execution_mode` claim plus client-minted lineage ids (`logical_task_id`, `execution_run_id`). No provider/model/profile fields — the daemon re-decides admission and resolves the profile itself |
-| `message_koe_execution_full_request.json` | Koe → `POST /message` | Full-mode follow-up: adds `full_reason` (closed vocabulary), `parent_run_id` lineage, and the untrusted `inherited_execution_mode` claim (admission clears it; only ledger validation restores the Full floor) |
+| `message_koe_execution_fast_request.json` | Koe → `POST /message` | `source=koe` request: Koe pins `execution_mode` + `requested_execution_mode` to Fast and supplies client-minted lineage ids (`logical_task_id`, `execution_run_id`). No provider/model/profile fields — the daemon admits the request and resolves the profile itself |
+| `message_koe_execution_full_request.json` | Koe → `POST /message` | Compatibility fixture for a follow-up inheriting an already validated Full run: adds `full_reason`, `parent_run_id` lineage, and the untrusted `inherited_execution_mode` claim (admission clears it; only ledger validation restores the Full floor) |
 | `sse_event.done.with_execution_run.json` | `handleMessageSSE` `event: done` | `RunAgentResult` carrying the validated `execution_run` (lineage ids + the resolved kfp1 profile incl. `resolution_reason`) and hosted-search usage; Koe records it into the call ledger for follow-up/cancel routing |
 | `sse_event.skill.recommendation.v1.json` | `server.go handleEvents` | Device-targeted, account-bound Desktop capability card. It is deliberately not an EventBus replay event: only the authenticated account + declared Desktop device's current SSE stream receives it. |
 | `http_post.skill_recommendation_continue.request.json` | Desktop → `POST /skill-recommendations/{id}/continue` | The single **Install and continue** action: account/device/session-bound claim carrying the directed card token. Daemon installs the offer-time descriptor, enables it for the current Agent, records a receipt, then resumes attended SSE. |

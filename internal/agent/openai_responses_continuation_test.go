@@ -166,10 +166,10 @@ func TestAgentLoopOrdinaryOpenAIResponsesContinuesToolResult(t *testing.T) {
 }
 
 func TestAgentLoopOrdinaryOpenAIResponsesKeepsToolResultBeforeLoopNudge(t *testing.T) {
-	// With the consecutive-duplicate threshold at 3, request 4 carries the
-	// nudge and the fourth identical tool call triggers request 5's force-stop.
-	responses := make([]*client.CompletionResponse, 0, 5)
-	for index := 1; index <= 4; index++ {
+	// With the stable read-only threshold at 3, request 4 carries the nudge.
+	// The recovery window is covered separately by the atomic-admission tests.
+	responses := make([]*client.CompletionResponse, 0, 4)
+	for index := 1; index <= 3; index++ {
 		response := ordinaryOpenAIToolResponse(
 			"openai",
 			"gpt-5.6-sol",
@@ -218,8 +218,8 @@ func TestAgentLoopOrdinaryOpenAIResponsesKeepsToolResultBeforeLoopNudge(t *testi
 	}
 
 	requests := llm.requests
-	if len(requests) != 5 {
-		t.Fatalf("completion requests = %d, want 5", len(requests))
+	if len(requests) != 4 {
+		t.Fatalf("completion requests = %d, want 4", len(requests))
 	}
 	if len(llm.responses) != 0 {
 		t.Fatalf("scripted responses remaining = %d, want 0", len(llm.responses))

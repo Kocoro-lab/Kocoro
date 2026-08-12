@@ -16,6 +16,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	// DefaultAgentMaxIterations is an emergency fuse, not a normal completion
+	// budget. Progress, errors, cancellation, and resource watchdogs should end
+	// ordinary runs well before this point. Operators can lower it per agent when
+	// a bounded environment needs a stricter cost ceiling.
+	DefaultAgentMaxIterations = 256
+	DefaultAgentMaxTokens     = 0
+)
+
 // ConfigSource tracks which file a config value came from.
 type ConfigSource struct {
 	File  string
@@ -173,6 +182,15 @@ type AgentConfig struct {
 	// screenshots (scoped by tool); user uploads + non-GUI images stay under
 	// MaxRecentImages. Default 1; 0 disables the browser-scoped filter.
 	MaxRecentBrowserImages int `mapstructure:"max_recent_browser_images" yaml:"max_recent_browser_images" json:"max_recent_browser_images"`
+	// WarmSetMaxSchemas / WarmSetMaxSchemaTokens cap the session warm set of
+	// deferred tool schemas loaded via tool_search (count / estimated tokens).
+	// When a cap binds, the least-recently-loaded schema is evicted and its
+	// next call pays one extra tool_search round trip. Raise for very large
+	// MCP catalogs. Session-level infrastructure — deliberately not part of
+	// the per-agent overlay. Defaults 16 / 8000; values < 1 fall back to the
+	// defaults.
+	WarmSetMaxSchemas      int `mapstructure:"warm_set_max_schemas" yaml:"warm_set_max_schemas" json:"warm_set_max_schemas"`
+	WarmSetMaxSchemaTokens int `mapstructure:"warm_set_max_schema_tokens" yaml:"warm_set_max_schema_tokens" json:"warm_set_max_schema_tokens"`
 	// IdleSoftTimeoutSecs / IdleHardTimeoutSecs: turn-level watchdog measured
 	// against explicit "idle-counted" phases of the agent loop (waiting on an
 	// LLM response). Other phases (tool execution, approval wait, compaction
@@ -224,6 +242,16 @@ type AgentConfig struct {
 	// default and named-agent sessions. The daemon sweeps once at startup; age
 	// expiry overrides the oldest-snapshot pin. 0 disables the age sweep.
 	CompactionSnapshotMaxAgeDays int `mapstructure:"compaction_snapshot_max_age_days" yaml:"compaction_snapshot_max_age_days" json:"compaction_snapshot_max_age_days"`
+	// RunEventRetention bounds observation-only attempt logs per session. The
+	// oldest attempts are removed when a new attempt opens; durable transcript,
+	// side-effect recovery state, and audit records are separate and unchanged.
+	// 0 disables count pruning. Default 32 covers a practical diagnostic window
+	// without letting a long-lived IM route accumulate files indefinitely.
+	RunEventRetention int `mapstructure:"run_event_retention" yaml:"run_event_retention" json:"run_event_retention"`
+	// RunEventMaxAgeDays bounds run-event JSONL, incomplete markers, and lock
+	// files across default and named-agent sessions. The daemon sweeps once at
+	// startup. 0 disables age cleanup.
+	RunEventMaxAgeDays int `mapstructure:"run_event_max_age_days" yaml:"run_event_max_age_days" json:"run_event_max_age_days"`
 	// CompactTimeoutSecs bounds one manual TUI /compact pass: persist-learnings
 	// plus a summarize that may fold an oversized transcript into up to nine
 	// sequential small-tier calls. When it binds, /compact fails with a
@@ -458,10 +486,11 @@ func Load() (*Config, error) {
 	viper.SetDefault("api_key", "")
 	viper.SetDefault("model_tier", "medium")
 	viper.SetDefault("auto_update_check", true)
-	// agent.max_iterations: bumped 25 → 40 — typical "refactor 12 files" or
-	// "batch-process 20 attachments" tasks routinely need >25 iterations.
-	// User-configurable per agent; this is just the default.
-	viper.SetDefault("agent.max_iterations", 40)
+	// agent.max_iterations is a high emergency fuse, not the normal task budget.
+	// Long, demonstrably progressing workflows may legitimately require dozens
+	// of model/tool rounds; loop detection, watchdogs, cancellation, and context
+	// budgeting are the primary controls. User-configurable per agent.
+	viper.SetDefault("agent.max_iterations", DefaultAgentMaxIterations)
 	viper.SetDefault("agent.system_event_cap", 20)
 	viper.SetDefault("agent.reply_route_index_cap", 256)
 	viper.SetDefault("agent.temperature", 0)
@@ -471,7 +500,7 @@ func Load() (*Config, error) {
 	// The legacy 32000 constant capped Sonnet 4.6 / Opus 4.6 / Haiku 4.5
 	// at half their physical 64K output limit; the model-aware default
 	// lifts that cap without forcing users to learn this knob.
-	viper.SetDefault("agent.max_tokens", 0)
+	viper.SetDefault("agent.max_tokens", DefaultAgentMaxTokens)
 	viper.SetDefault("agent.thinking", true)
 	viper.SetDefault("agent.thinking_mode", "adaptive")
 	viper.SetDefault("agent.thinking_budget", 10000)
@@ -491,6 +520,8 @@ func Load() (*Config, error) {
 	viper.SetDefault("agent.compaction_snapshot_retention", 1)
 	viper.SetDefault("agent.compact_timeout_secs", 300)
 	viper.SetDefault("agent.compaction_snapshot_max_age_days", 14)
+	viper.SetDefault("agent.run_event_retention", 32)
+	viper.SetDefault("agent.run_event_max_age_days", 14)
 	viper.SetDefault("agent.interrupted_resume_max_age_hours", 4) // staleness window for auto-resume; see Config.Agent.InterruptedResumeMaxAgeHours
 	viper.SetDefault("agent.interrupted_resume_enabled", true)
 	viper.SetDefault("agent.bash_concurrency_enabled", true) // Phase C: Desktop now consumes tool_use_id on tool_status events, safe to enable concurrent bash batches by default.
@@ -506,6 +537,8 @@ func Load() (*Config, error) {
 	// loop re-sends each iteration. observation_window=0 disables the window.
 	viper.SetDefault("agent.observation_window", 3)
 	viper.SetDefault("agent.max_recent_images", 50)
+	viper.SetDefault("agent.warm_set_max_schemas", 16)
+	viper.SetDefault("agent.warm_set_max_schema_tokens", 8000)
 	viper.SetDefault("agent.max_recent_browser_images", 1)
 	// Prompt suggestion (post-turn ghost text). Enabled by default —
 	// the daemon runs a forked completion call after each turn to
@@ -648,7 +681,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
-	hydrateAPIKeyFromKeychain(&cfg, dir)
+	if !credentialStoreDisabledForProcess() {
+		hydrateAPIKeyFromKeychain(&cfg, dir)
+	}
 	if cfg.apiKeyFromKeychain {
 		// Keep the hydrated key in-process for older call sites that read
 		// viper directly. Save still strips it back out, so Keychain remains
@@ -944,12 +979,16 @@ func buildDefaultSources() map[string]ConfigSource {
 		"agent.observation_window":               {Level: "default"},
 		"agent.max_recent_images":                {Level: "default"},
 		"agent.max_recent_browser_images":        {Level: "default"},
+		"agent.warm_set_max_schemas":             {Level: "default"},
+		"agent.warm_set_max_schema_tokens":       {Level: "default"},
 		"agent.idle_soft_timeout_secs":           {Level: "default"},
 		"agent.idle_hard_timeout_secs":           {Level: "default"},
 		"agent.stream_idle_timeout_secs":         {Level: "default"},
 		"agent.interrupted_resume_max_attempts":  {Level: "default"},
 		"agent.interrupted_resume_max_age_hours": {Level: "default"},
 		"agent.interrupted_resume_enabled":       {Level: "default"},
+		"agent.run_event_retention":              {Level: "default"},
+		"agent.run_event_max_age_days":           {Level: "default"},
 		"agent.bash_concurrency_enabled":         {Level: "default"},
 		"tools.bash_timeout":                     {Level: "default"},
 		"tools.bash_max_timeout":                 {Level: "default"},
@@ -1022,6 +1061,12 @@ func markGlobalSources(cfg *Config, file string) {
 	if viper.IsSet("agent.max_recent_browser_images") {
 		cfg.Sources["agent.max_recent_browser_images"] = src
 	}
+	if viper.IsSet("agent.warm_set_max_schemas") {
+		cfg.Sources["agent.warm_set_max_schemas"] = src
+	}
+	if viper.IsSet("agent.warm_set_max_schema_tokens") {
+		cfg.Sources["agent.warm_set_max_schema_tokens"] = src
+	}
 	if viper.IsSet("agent.idle_soft_timeout_secs") {
 		cfg.Sources["agent.idle_soft_timeout_secs"] = src
 	}
@@ -1039,6 +1084,12 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.interrupted_resume_enabled") {
 		cfg.Sources["agent.interrupted_resume_enabled"] = src
+	}
+	if viper.IsSet("agent.run_event_retention") {
+		cfg.Sources["agent.run_event_retention"] = src
+	}
+	if viper.IsSet("agent.run_event_max_age_days") {
+		cfg.Sources["agent.run_event_max_age_days"] = src
 	}
 	if viper.IsSet("agent.bash_concurrency_enabled") {
 		cfg.Sources["agent.bash_concurrency_enabled"] = src
@@ -1415,6 +1466,18 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.Agent.InterruptedResumeMaxAgeHours < 0 {
 		return fmt.Errorf("agent.interrupted_resume_max_age_hours (%d) must be >= 0 (0 = default)", cfg.Agent.InterruptedResumeMaxAgeHours)
+	}
+	if cfg.Agent.RunEventRetention < 0 {
+		return fmt.Errorf("agent.run_event_retention (%d) must be >= 0 (0 = disabled)", cfg.Agent.RunEventRetention)
+	}
+	if cfg.Agent.RunEventMaxAgeDays < 0 {
+		return fmt.Errorf("agent.run_event_max_age_days (%d) must be >= 0 (0 = disabled)", cfg.Agent.RunEventMaxAgeDays)
+	}
+	if cfg.Agent.WarmSetMaxSchemas < 0 {
+		return fmt.Errorf("agent.warm_set_max_schemas (%d) must be >= 0 (0 = default)", cfg.Agent.WarmSetMaxSchemas)
+	}
+	if cfg.Agent.WarmSetMaxSchemaTokens < 0 {
+		return fmt.Errorf("agent.warm_set_max_schema_tokens (%d) must be >= 0 (0 = default)", cfg.Agent.WarmSetMaxSchemaTokens)
 	}
 	if cfg.Cloud.StreamIdleTimeoutSecs < 0 {
 		return fmt.Errorf("cloud.stream_idle_timeout_secs (%d) must be >= 0 (0 = disabled)", cfg.Cloud.StreamIdleTimeoutSecs)

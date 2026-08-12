@@ -51,7 +51,7 @@ func TestValidateDaemonStartModeRequiresContainedIsolation(t *testing.T) {
 }
 
 func TestDaemonLiveE2EFlagsAreHidden(t *testing.T) {
-	for _, name := range []string{"isolated", "port", "state-dir"} {
+	for _, name := range []string{"isolated", "port", "state-dir", "isolated-mcp", "isolated-api-key-stdin"} {
 		flag := daemonStartCmd.Flags().Lookup(name)
 		if flag == nil {
 			t.Fatalf("daemon start flag --%s is not registered", name)
@@ -60,6 +60,30 @@ func TestDaemonLiveE2EFlagsAreHidden(t *testing.T) {
 			t.Errorf("daemon start flag --%s is public, want hidden test-harness control", name)
 		}
 	}
+}
+
+func TestReadIsolatedAPIKey(t *testing.T) {
+	t.Run("reads without logging or rewriting", func(t *testing.T) {
+		got, err := readIsolatedAPIKey(strings.NewReader("  test-credential\n"))
+		if err != nil {
+			t.Fatalf("readIsolatedAPIKey: %v", err)
+		}
+		if got != "test-credential" {
+			t.Fatalf("credential = %q, want exact trimmed value", got)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		if _, err := readIsolatedAPIKey(strings.NewReader(" \n")); err == nil || !strings.Contains(err.Error(), "empty credential") {
+			t.Fatalf("error = %v, want empty credential", err)
+		}
+	})
+
+	t.Run("bounded", func(t *testing.T) {
+		if _, err := readIsolatedAPIKey(strings.NewReader(strings.Repeat("x", 16*1024+1))); err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("error = %v, want size bound", err)
+		}
+	})
 }
 
 // TestPrintMemoryStatus_Shapes smoke-tests the three wire shapes the

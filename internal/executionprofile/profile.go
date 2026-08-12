@@ -77,6 +77,8 @@ type Profile struct {
 // ToolOutcomeEvidence is the durable, provider-neutral record of one tool
 // outcome. It intentionally stores only hashes and decisions, never provider
 // response ids, hidden reasoning, raw arguments, or raw tool output.
+const ToolResultDigestStageToolRun = "tool_run"
+
 type ToolOutcomeEvidence struct {
 	ToolCallID         string `json:"tool_call_id"`
 	ToolName           string `json:"tool_name"`
@@ -87,6 +89,11 @@ type ToolOutcomeEvidence struct {
 	SideEffect         bool   `json:"side_effect,omitempty"`
 	ArgumentsDigest    string `json:"arguments_digest,omitempty"`
 	ResultDigest       string `json:"result_digest,omitempty"`
+	// ResultDigestStage identifies which representation was hashed. Journaled
+	// side effects use the exact Tool.Run result before display/context shaping
+	// so this digest matches the authoritative execution ledger.
+	ResultDigestStage string `json:"result_digest_stage,omitempty"`
+	ResultTransformed bool   `json:"result_transformed,omitempty"`
 }
 
 type DeliverableEvidence struct {

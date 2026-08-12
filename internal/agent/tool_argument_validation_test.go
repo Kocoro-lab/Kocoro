@@ -1,9 +1,21 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
+
+type frameworkArgumentTool struct{ source ToolSource }
+
+func (t *frameworkArgumentTool) Info() ToolInfo {
+	return ToolInfo{Name: "framework_args", Required: []string{"content"}}
+}
+func (*frameworkArgumentTool) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{}, nil
+}
+func (*frameworkArgumentTool) RequiresApproval() bool   { return false }
+func (t *frameworkArgumentTool) ToolSource() ToolSource { return t.source }
 
 func TestValidateToolArguments(t *testing.T) {
 	info := ToolInfo{
@@ -72,5 +84,17 @@ func TestValidateToolArgumentPresenceAllowsPresentZeroValues(t *testing.T) {
 		if valid || !result.IsError || result.ErrorCategory != ErrCategoryValidation {
 			t.Fatalf("missing/null required field was accepted: args=%s result=%#v", args, result)
 		}
+	}
+}
+
+func TestFrameworkValidationRejectsLocalZeroBeforeDispatch(t *testing.T) {
+	local := &frameworkArgumentTool{source: SourceLocal}
+	if result, valid := validateFrameworkToolArguments(local, `{"content":""}`); valid || result.ErrorCategory != ErrCategoryValidation {
+		t.Fatalf("local empty required value accepted: valid=%v result=%#v", valid, result)
+	}
+
+	remote := &frameworkArgumentTool{source: SourceMCP}
+	if result, valid := validateFrameworkToolArguments(remote, `{"content":""}`); !valid || result.IsError {
+		t.Fatalf("remote present empty value rejected: valid=%v result=%#v", valid, result)
 	}
 }

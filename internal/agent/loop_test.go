@@ -21,6 +21,7 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/permissions"
 	"github.com/Kocoro-lab/ShanClaw/internal/prompt"
@@ -1104,38 +1105,15 @@ func TestTopTools(t *testing.T) {
 	})
 }
 
-func TestEffectiveMaxIter(t *testing.T) {
-	a := &AgentLoop{maxIter: 25}
-
-	// No GUI tools: use default
-	if got := a.effectiveMaxIter(map[string]int{"bash": 3}); got != 25 {
-		t.Errorf("coding tasks: expected 25, got %d", got)
+func TestNewAgentLoop_DefaultsToEmergencyIterationFuse(t *testing.T) {
+	loop := NewAgentLoop(nil, nil, "medium", "", 0, 0, 0, nil, nil, nil)
+	if got := loop.MaxIterations(); got != 256 {
+		t.Fatalf("default max iterations = %d, want emergency fuse 256", got)
 	}
 
-	// GUI tool present: bump to 75
-	if got := a.effectiveMaxIter(map[string]int{"screenshot": 1, "bash": 2}); got != 75 {
-		t.Errorf("GUI tasks: expected 75, got %d", got)
-	}
-
-	// User set high limit: keep it
-	a.maxIter = 100
-	if got := a.effectiveMaxIter(map[string]int{"screenshot": 1}); got != 100 {
-		t.Errorf("high user limit: expected 100, got %d", got)
-	}
-
-	// Empty toolsUsed: use default
-	a.maxIter = 25
-	if got := a.effectiveMaxIter(map[string]int{}); got != 25 {
-		t.Errorf("empty tools: expected 25, got %d", got)
-	}
-
-	// Playwright MCP browser_* tools: bump to 75 via isGUIToolName prefix match.
-	// The loop detector already covered browser_* via isGUIToolName but
-	// effectiveMaxIter was still reading the literal GUITools map, so real
-	// playwright workflows never got the higher iteration budget.
-	a.maxIter = 25
-	if got := a.effectiveMaxIter(map[string]int{"browser_navigate": 1, "browser_snapshot": 2}); got != 75 {
-		t.Errorf("playwright browser_* tasks: expected 75, got %d", got)
+	loop.SetMaxIterations(12)
+	if got := loop.MaxIterations(); got != 12 {
+		t.Fatalf("explicit max iterations = %d, want 12", got)
 	}
 }
 
@@ -1281,8 +1259,9 @@ func (m *mockCountingTool) IsReadOnlyCall(string) bool {
 }
 
 type mockComputerUseRecoveryTool struct {
-	runs int
-	args []string
+	runs                       int
+	args                       []string
+	alwaysRequiresCorrectedApp bool
 }
 
 func (m *mockComputerUseRecoveryTool) Info() ToolInfo {
@@ -1310,10 +1289,12 @@ func (m *mockComputerUseRecoveryTool) Run(
 ) (ToolResult, error) {
 	m.runs++
 	m.args = append(m.args, args)
-	if m.runs == 1 {
+	if m.runs == 1 || m.alwaysRequiresCorrectedApp {
 		return ToolResult{
 			Content: "computer_use_error: initial_target_required\n" +
-				"recovery: retry computer_use once with controlled_apps and foreground_policy",
+				"message: the requested app target could not be resolved\n" +
+				"recovery: retry computer_use once with controlled_apps and foreground_policy\n" +
+				"detail: requested app is not installed",
 			IsError: true,
 			ComputerUseOutcome: &ComputerUseTaskOutcome{
 				Status:      ComputerUseTaskNotCompleted,
@@ -1330,6 +1311,89 @@ func (m *mockComputerUseRecoveryTool) Run(
 			Effect: ComputerUseCommitKnown,
 		},
 	}, nil
+}
+
+func TestAgentLoop_SecondCorrectedAppFailureDoesNotOfferAnotherRetry(t *testing.T) {
+	computerUse := &mockComputerUseRecoveryTool{alwaysRequiresCorrectedApp: true}
+	callCount := 0
+	var finalRequest client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var request client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		switch callCount {
+		case 1:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 3:
+			finalRequest = request
+			encoded, err := json.Marshal(request.Messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(string(encoded), "retry computer_use once") > 1 {
+				json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+					toolCall("computer_use",
+						`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+					10, 5))
+				return
+			}
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The requested app is not installed.", "end_turn", nil, 10, 5))
+		case 4:
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The retry instruction caused an extra model iteration.", "end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(
+		context.Background(),
+		"Use computer use to open a browser",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "The requested app is not installed." ||
+		computerUse.runs != 2 || callCount != 3 {
+		t.Fatalf("result=%q runs=%d calls=%d", result, computerUse.runs, callCount)
+	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript,
+		"no further corrected computer_use retry or alternate desktop-control path is available in this run") {
+		t.Fatalf("spent retry still offered another correction: %s", transcript)
+	}
+	if !strings.Contains(transcript, "report the unresolved app target honestly") ||
+		!strings.Contains(transcript, "detail: requested app is not installed") {
+		t.Fatalf("terminal recovery lost guidance or producer detail: %s", transcript)
+	}
+	if strings.Count(transcript, "retry computer_use once") != 1 {
+		t.Fatalf("spent retry retained contradictory recovery guidance: %s", transcript)
+	}
 }
 
 func (m *mockComputerUseRecoveryTool) RequiresApproval() bool { return false }
@@ -1628,148 +1692,6 @@ func (m *mockCloudTreeTool) Run(context.Context, string) (ToolResult, error) {
 func (m *mockCloudTreeTool) RequiresApproval() bool { return false }
 func (m *mockCloudTreeTool) IsReadOnlyCall(string) bool {
 	return true
-}
-
-// TestAgentLoop_CrossIterDedup_SanitizedReplay verifies that cached results
-// go through sanitizeResult before being stored, so replayed content doesn't
-// leak raw base64 blobs into context.
-func TestAgentLoop_CrossIterDedup_SanitizedReplay(t *testing.T) {
-	// A long base64-like blob that sanitizeResult should replace
-	blob := strings.Repeat("iVBORw0KGgoAAAANSUhEUg", 50) // ~1100 chars
-	rawContent := "Screenshot: data:image/png;base64," + blob
-
-	tool := &mockCountingTool{name: "mock_tool", content: rawContent}
-
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		switch callCount {
-		case 1:
-			// Iter 1: call mock_tool → returns base64 content
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("mock_tool", `{"cmd":"screenshot"}`), 10, 5))
-		case 2:
-			// Iter 2: call mock_tool again with same args → should get sanitized cached result
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("mock_tool", `{"cmd":"screenshot"}`), 10, 5))
-		default:
-			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
-		}
-	}))
-	defer server.Close()
-
-	gw := client.NewGatewayClient(server.URL, "")
-	reg := NewToolRegistry()
-	reg.Register(tool)
-	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-
-	result, _, err := loop.Run(context.Background(), "test", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != "Done." {
-		t.Errorf("expected 'Done.', got %q", result)
-	}
-	// Tool should only execute once — second call returns cached result
-	if tool.runs != 1 {
-		t.Errorf("expected tool to execute 1 time, got %d", tool.runs)
-	}
-}
-
-// TestAgentLoop_CrossIterDedup_PersistentAcrossIterations verifies that the
-// cross-iteration cache persists across non-consecutive iterations:
-// iter 1 calls tool_a, iter 2 calls tool_b, iter 3 calls tool_a again → cached.
-func TestAgentLoop_CrossIterDedup_PersistentAcrossIterations(t *testing.T) {
-	toolA := &mockCountingTool{name: "tool_a", content: "result A"}
-	toolB := &mockCountingTool{name: "tool_b", content: "result B"}
-
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		switch callCount {
-		case 1:
-			// Iter 1: call tool_a
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("tool_a", `{"x":1}`), 10, 5))
-		case 2:
-			// Iter 2: call tool_b (different tool)
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("tool_b", `{"x":2}`), 10, 5))
-		case 3:
-			// Iter 3: call tool_a again with same args → should be cached
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("tool_a", `{"x":1}`), 10, 5))
-		default:
-			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
-		}
-	}))
-	defer server.Close()
-
-	gw := client.NewGatewayClient(server.URL, "")
-	reg := NewToolRegistry()
-	reg.Register(toolA)
-	reg.Register(toolB)
-	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-
-	result, _, err := loop.Run(context.Background(), "test", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != "Done." {
-		t.Errorf("expected 'Done.', got %q", result)
-	}
-	// tool_a should execute only once (iter 1); iter 3 returns cached
-	if toolA.runs != 1 {
-		t.Errorf("expected tool_a to execute 1 time, got %d", toolA.runs)
-	}
-	// tool_b should execute once (iter 2)
-	if toolB.runs != 1 {
-		t.Errorf("expected tool_b to execute 1 time, got %d", toolB.runs)
-	}
-}
-
-func TestAgentLoop_StateAwareCache_BrowserWriteInvalidatesSnapshot(t *testing.T) {
-	snapshotTool := &mockCountingTool{name: "browser_snapshot", content: "snapshot"}
-	navigateTool := &mockCountingTool{name: "browser_navigate", content: "navigated"}
-
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		switch callCount {
-		case 1:
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("browser_snapshot", `{}`), 10, 5))
-		case 2:
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("browser_navigate", `{"url":"https://example.com"}`), 10, 5))
-		case 3:
-			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
-				toolCall("browser_snapshot", `{}`), 10, 5))
-		default:
-			json.NewEncoder(w).Encode(nativeResponse("Done.", "end_turn", nil, 10, 5))
-		}
-	}))
-	defer server.Close()
-
-	gw := client.NewGatewayClient(server.URL, "")
-	reg := NewToolRegistry()
-	reg.Register(snapshotTool)
-	reg.Register(navigateTool)
-	loop := NewAgentLoop(gw, reg, "medium", "", 25, 2000, 200, nil, nil, nil)
-
-	result, _, err := loop.Run(context.Background(), "test browser state cache", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != "Done." {
-		t.Errorf("expected 'Done.', got %q", result)
-	}
-	if snapshotTool.runs != 2 {
-		t.Errorf("expected browser_snapshot to execute twice after navigation, got %d", snapshotTool.runs)
-	}
-	if navigateTool.runs != 1 {
-		t.Errorf("expected browser_navigate to execute once, got %d", navigateTool.runs)
-	}
 }
 
 func TestAgentLoop_StateAwareCache_FileWriteInvalidatesRead(t *testing.T) {
@@ -2312,8 +2234,13 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 		content: "must not run",
 	}
 	callCount := 0
+	var finalRequest client.CompletionRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
+		var request client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
 		switch callCount {
 		case 1:
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
@@ -2325,6 +2252,7 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 				toolCall("browser_navigate", `{"url":"https://example.com"}`),
 				10, 5))
 		case 3:
+			finalRequest = request
 			json.NewEncoder(w).Encode(nativeResponse(
 				"Stopped until the app target is supplied.",
 				"end_turn", nil, 10, 5,
@@ -2360,6 +2288,188 @@ func TestAgentLoop_InitialTargetRequiredStillBlocksAlternateControl(t *testing.T
 			computerUse.runs,
 			browserNavigate.runs,
 		)
+	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript, "alternate desktop-control tools remain blocked") ||
+		strings.Contains(transcript, "corrected_app_retry_rejected") {
+		t.Fatalf("alternate call consumed the corrected-app retry: %s", transcript)
+	}
+}
+
+func TestAgentLoop_AlternateCallDoesNotConsumeCorrectedAppRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		toolName string
+		args     string
+	}{
+		{name: "browser", toolName: "browser_navigate", args: `{"url":"https://example.com"}`},
+		{name: "tool search", toolName: "tool_search", args: `{"query":"browser desktop control"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			computerUse := &mockComputerUseRecoveryTool{}
+			alternate := &mockCountingTool{name: tc.toolName, content: "must not run"}
+			callCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callCount++
+				switch callCount {
+				case 1:
+					json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+						toolCall("computer_use", `{"task":"open the browser","description":"open browser"}`),
+						10, 5))
+				case 2:
+					response := nativeResponse("", "tool_use", nil, 10, 5)
+					response.ToolCalls = []client.FunctionCall{
+						*toolCall(tc.toolName, tc.args),
+						*toolCall("computer_use", `{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`),
+					}
+					json.NewEncoder(w).Encode(response)
+				case 3:
+					json.NewEncoder(w).Encode(nativeResponse(
+						"Browser task completed.", "end_turn", nil, 10, 5))
+				default:
+					t.Errorf("unexpected LLM call %d", callCount)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+
+			reg := NewToolRegistry()
+			reg.Register(computerUse)
+			reg.Register(alternate)
+			loop := NewAgentLoop(
+				client.NewGatewayClient(server.URL, ""),
+				reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+			)
+			result, _, err := loop.Run(
+				context.Background(),
+				"Use computer use to open a browser",
+				nil,
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if result != "Browser task completed." ||
+				computerUse.runs != 2 || alternate.runs != 0 || callCount != 3 {
+				t.Fatalf(
+					"result=%q computer runs=%d alternate runs=%d calls=%d",
+					result, computerUse.runs, alternate.runs, callCount,
+				)
+			}
+		})
+	}
+}
+
+func TestAgentLoop_ValidCorrectedAppCallIsOrderIndependent(t *testing.T) {
+	malformed := *toolCall("computer_use",
+		`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`)
+	valid := *toolCall("computer_use",
+		`{"task":"open the browser","controlled_apps":["Google Chrome"],"foreground_policy":"foreground_allowed","description":"open browser"}`)
+	for _, tc := range []struct {
+		name  string
+		calls []client.FunctionCall
+	}{
+		{name: "malformed then valid", calls: []client.FunctionCall{malformed, valid}},
+		{name: "valid then malformed", calls: []client.FunctionCall{valid, malformed}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			computerUse := &mockComputerUseRecoveryTool{}
+			callCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callCount++
+				switch callCount {
+				case 1:
+					json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+						toolCall("computer_use", malformed.ArgumentsString()), 10, 5))
+				case 2:
+					response := nativeResponse("", "tool_use", nil, 10, 5)
+					response.ToolCalls = tc.calls
+					json.NewEncoder(w).Encode(response)
+				case 3:
+					json.NewEncoder(w).Encode(nativeResponse(
+						"Browser task completed.", "end_turn", nil, 10, 5))
+				default:
+					t.Errorf("unexpected LLM call %d", callCount)
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+
+			reg := NewToolRegistry()
+			reg.Register(computerUse)
+			loop := NewAgentLoop(
+				client.NewGatewayClient(server.URL, ""),
+				reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+			)
+			result, _, err := loop.Run(
+				context.Background(),
+				"Use computer use to open a browser",
+				nil,
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if result != "Browser task completed." || computerUse.runs != 2 || callCount != 3 {
+				t.Fatalf("result=%q runs=%d calls=%d", result, computerUse.runs, callCount)
+			}
+		})
+	}
+}
+
+func TestAgentLoop_MalformedCorrectedAppCallConsumesRetry(t *testing.T) {
+	computerUse := &mockComputerUseRecoveryTool{}
+	callCount := 0
+	var finalRequest client.CompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var request client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		switch callCount {
+		case 1, 2:
+			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
+				toolCall("computer_use",
+					`{"task":"open the browser","foreground_policy":"foreground_allowed","description":"open browser"}`),
+				10, 5))
+		case 3:
+			finalRequest = request
+			json.NewEncoder(w).Encode(nativeResponse(
+				"The requested app target remains unresolved.", "end_turn", nil, 10, 5))
+		default:
+			t.Errorf("unexpected LLM call %d", callCount)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reg := NewToolRegistry()
+	reg.Register(computerUse)
+	loop := NewAgentLoop(
+		client.NewGatewayClient(server.URL, ""),
+		reg, "medium", "", 25, 2000, 200, nil, nil, nil,
+	)
+	result, _, err := loop.Run(context.Background(), "Use computer use to open a browser", nil, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result != "The requested app target remains unresolved." ||
+		computerUse.runs != 1 || callCount != 3 {
+		t.Fatalf("result=%q runs=%d calls=%d", result, computerUse.runs, callCount)
+	}
+	encoded, err := json.Marshal(finalRequest.Messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(encoded)
+	if !strings.Contains(transcript, "corrected_app_retry_rejected") ||
+		!strings.Contains(transcript, "no further computer_use retry or alternate desktop-control path is available in this run") {
+		t.Fatalf("malformed correction did not close recovery paths: %s", transcript)
 	}
 }
 
@@ -4033,9 +4143,8 @@ func TestAgentLoop_CloudDelegateLock(t *testing.T) {
 // exploration where most queries naturally return zero on misses.
 func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 	wantSubstrings := []string{
-		"search/filesystem", // names the preserved case
-		"IS the answer",     // the canonical outcome for search
-		"grep", "glob",      // concrete tool examples reach the agent
+		"For search/filesystem queries",
+		"an empty result IS the answer. Do not retry",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4052,12 +4161,8 @@ func TestCoreRules_EmptyResultRule_KeepsSearchCase(t *testing.T) {
 // synthetic single-lookup versus batch-enumeration distinction.
 func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 	wantSubstrings := []string{
-		"list-and-enumerate semantics", // names the new case
-		"scope artifact",               // distinguishes from real empty
-		"list_calendars",               // concrete synthetic example
-		"ONE",                          // permits exactly one diversification
-		"Google Calendar",              // explicit integration list (no broad "external APIs")
-		"Notion",
+		"integrations with list-and-enumerate semantics",
+		"try ONE focused diversification",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4073,8 +4178,8 @@ func TestCoreRules_EmptyResultRule_AddsDiversificationCase(t *testing.T) {
 // the model to cross-account/folder-hunt past the user's contract.
 func TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope(t *testing.T) {
 	wantSubstrings := []string{
-		"user explicitly named",   // names the protected case
-		"user-specified contract", // frames the boundary
+		"specific resource the user explicitly named",
+		"the user-specified contract is the boundary. Do not broaden filters",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4090,12 +4195,8 @@ func TestCoreRules_EmptyResultRule_ProtectsUserSpecifiedScope(t *testing.T) {
 // semantics AND must name the http tool as an empty-is-the-answer case,
 // so the model does not repurpose scope-hunting for arbitrary HTTP.
 func TestCoreRules_EmptyResultRule_ExcludesHTTPTool(t *testing.T) {
-	// Must name http explicitly in the "empty IS the answer" column.
-	if !strings.Contains(coreOperationalRules, "arbitrary HTTP endpoints") {
-		t.Error("empty-result rule should explicitly name 'arbitrary HTTP endpoints' as an empty-is-the-answer case")
-	}
-	if !strings.Contains(coreOperationalRules, "http tool") {
-		t.Error("empty-result rule should name the http tool by tool identifier")
+	if !strings.Contains(coreOperationalRules, "arbitrary HTTP endpoints (the http tool)") {
+		t.Error("empty-result rule should keep exact HTTP endpoints in the final-empty category")
 	}
 	// Must NOT contain the over-broad "external APIs" framing the
 	// previous draft used — that phrasing sweeps http in.
@@ -4121,15 +4222,25 @@ func TestCoreRules_EmptyResultRule_NoContradictoryOldPhrasing(t *testing.T) {
 	}
 }
 
+func TestCoreRules_LeaveReplyLanguageToFinalDirective(t *testing.T) {
+	if strings.Contains(coreOperationalRules, "Reply in the language") ||
+		strings.Contains(coreOperationalRules, "latest substantive message") {
+		t.Fatal("core rules contain a second reply-language authority")
+	}
+	if !strings.Contains(coreOperationalRules, "Preserve product names") {
+		t.Fatal("core rules lost the original-form preservation contract")
+	}
+}
+
 func TestNamedAgentPromptIncludesCoreRules(t *testing.T) {
 	// coreOperationalRules must contain key behavioral constraints.
 	// If any of these are missing, named agents lose critical guardrails.
 	required := []string{
-		"Always use tools to perform actions",
-		"NEVER claim you see, read, or completed something without a tool call",
-		"file_read before file_edit",
-		"## Tool Selection",
-		"## Error Handling",
+		"Use tools to perform actions",
+		"Never claim done, fixed, sent, saved, scheduled, deployed, read, seen, or verified without direct evidence",
+		"Read existing state before modifying it",
+		"## Tools",
+		"When a tool returns an error, use the prefix to decide your response",
 	}
 	for _, s := range required {
 		if !strings.Contains(coreOperationalRules, s) {
@@ -4410,12 +4521,10 @@ func TestForceStop_EmptySynthesis_RecoversTextFromBlocks(t *testing.T) {
 	}
 }
 
-// TestForceStop_EmptySynthesis_LowEffortRecovery: a bare-empty synthesis
-// response gets exactly one recovery attempt with reasoning stripped
-// (EffortTier=low, Thinking=nil, ReasoningEffort="") while the FIRST
-// synthesis request keeps the run's original configuration. The empty
-// initial attempt must leave a force_stop_empty_synthesis audit row.
-func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
+// TestForceStop_EmptySynthesis_SingleTerminalFallback verifies that an empty
+// terminal synthesis consumes the sole terminal dispatch and falls back
+// deterministically without issuing a second provider request.
+func TestForceStop_EmptySynthesis_SingleTerminalFallback(t *testing.T) {
 	var (
 		mu       sync.Mutex
 		requests []client.CompletionRequest
@@ -4446,11 +4555,11 @@ func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "Recovered after retry." {
-		t.Errorf("expected recovery-turn text, got %q", result)
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Errorf("expected deterministic fallback, got %q", result)
 	}
-	if *callCount != 6 {
-		t.Fatalf("expected 6 LLM calls (synthesis + 1 recovery), got %d", *callCount)
+	if *callCount != 5 {
+		t.Fatalf("expected 5 LLM calls with one terminal synthesis, got %d", *callCount)
 	}
 
 	mu.Lock()
@@ -4460,20 +4569,6 @@ func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
 		t.Errorf("first synthesis attempt must keep original config; got effort_tier=%q thinking=%v reasoning=%q",
 			first.EffortTier, first.Thinking, first.ReasoningEffort)
 	}
-	retry := requests[5]
-	if retry.EffortTier != "low" {
-		t.Errorf("recovery attempt EffortTier: got %q, want \"low\"", retry.EffortTier)
-	}
-	if retry.Thinking != nil {
-		t.Errorf("recovery attempt must disable thinking, got %+v", retry.Thinking)
-	}
-	if retry.ReasoningEffort != "" {
-		t.Errorf("recovery attempt must clear ReasoningEffort, got %q", retry.ReasoningEffort)
-	}
-	if len(retry.Tools) != 0 {
-		t.Errorf("recovery attempt must not carry tools, got %d", len(retry.Tools))
-	}
-
 	rows := forceStopEmptySynthesisRows(t, logDir)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 force_stop_empty_synthesis audit row, got %d", len(rows))
@@ -4491,11 +4586,9 @@ func TestForceStop_EmptySynthesis_LowEffortRecovery(t *testing.T) {
 	}
 }
 
-// TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit: when both the
-// synthesis attempt and the single recovery attempt return no visible text,
-// the deterministic fallback is used, the recovery budget binds at one, and
-// BOTH empty attempts leave audit rows (attempt=initial, attempt=recovery).
-func TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit(t *testing.T) {
+// TestForceStop_EmptySynthesis_FallbackAndAudit verifies that the sole
+// terminal synthesis falls back deterministically when it returns no text.
+func TestForceStop_EmptySynthesis_FallbackAndAudit(t *testing.T) {
 	server, callCount := forceStopServer(t, func(int) client.CompletionResponse {
 		return nativeResponse("", "end_turn", nil, 10, 0)
 	}, nil, nil)
@@ -4517,23 +4610,19 @@ func TestForceStop_EmptySynthesis_DoubleEmpty_FallbackAndAudit(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !strings.Contains(result, "synthesis produced no output") {
-		t.Errorf("expected deterministic fallback after double-empty, got %q", result)
+		t.Errorf("expected deterministic fallback, got %q", result)
 	}
-	if *callCount != 6 {
-		t.Errorf("recovery budget must bind at one attempt: expected 6 LLM calls, got %d", *callCount)
+	if *callCount != 5 {
+		t.Errorf("expected 5 LLM calls with one terminal synthesis, got %d", *callCount)
 	}
 
 	rows := forceStopEmptySynthesisRows(t, logDir)
-	if len(rows) != 2 {
-		t.Fatalf("expected 2 force_stop_empty_synthesis audit rows, got %d", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 force_stop_empty_synthesis audit row, got %d", len(rows))
 	}
 	in0, _ := rows[0]["input_summary"].(string)
-	in1, _ := rows[1]["input_summary"].(string)
 	if !strings.Contains(in0, "attempt=initial") {
 		t.Errorf("first row missing attempt=initial: %q", in0)
-	}
-	if !strings.Contains(in1, "attempt=recovery") || !strings.Contains(in1, "effort_tier=low") {
-		t.Errorf("second row missing attempt=recovery/effort_tier=low: %q", in1)
 	}
 }
 
@@ -4666,12 +4755,9 @@ func TestForceStop_EmptySynthesis_StripsHallucinatedComputerCall(t *testing.T) {
 	}
 }
 
-// TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack: when
-// the degraded-effort recovery call itself fails on a non-cancellation error
-// (e.g. non-retryable 400), the run must still hand back the deterministic
-// fallback AND leave a content-free force_stop_synthesis_recovery_failed
-// audit row — otherwise the recovery failure is invisible in triage.
-func TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack(t *testing.T) {
+// TestForceStop_EmptySynthesis_SkipsRecoveryCall verifies that an empty
+// terminal synthesis cannot trigger a second provider dispatch.
+func TestForceStop_EmptySynthesis_SkipsRecoveryCall(t *testing.T) {
 	server, callCount := forceStopServer(t, func(call int) client.CompletionResponse {
 		return nativeResponse("", "end_turn", nil, 10, 0)
 	}, nil, nil)
@@ -4707,33 +4793,20 @@ func TestForceStop_EmptySynthesis_RecoveryCallFails_AuditsAndFallsBack(t *testin
 	if !strings.Contains(result, "synthesis produced no output") {
 		t.Errorf("expected deterministic fallback, got %q", result)
 	}
-	_ = callCount
+	if *callCount != 5 || calls != 5 {
+		t.Fatalf("expected 5 LLM calls with no recovery dispatch, got server=%d wrapper=%d", *callCount, calls)
+	}
 
-	var failedRow map[string]any
 	for _, e := range readAuditLines(t, logDir) {
 		if e["event"] == "force_stop_synthesis_recovery_failed" {
-			failedRow = e
-			break
+			t.Fatal("unexpected force_stop_synthesis_recovery_failed audit row without a recovery dispatch")
 		}
-	}
-	if failedRow == nil {
-		t.Fatal("expected force_stop_synthesis_recovery_failed audit row")
-	}
-	in, _ := failedRow["input_summary"].(string)
-	if !strings.Contains(in, "error_class=HTTP 400") {
-		t.Errorf("audit row missing error_class: %q", in)
-	}
-	if strings.Contains(in, "bad request") {
-		t.Errorf("audit row must be content-free (no response body): %q", in)
 	}
 }
 
-// TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback verifies
-// that the optional degraded-effort recovery cannot make the force-stop
-// outcome worse. Once the initial synthesis completed successfully (but
-// empty), a watchdog cancellation of the recovery must still persist and
-// return the deterministic fallback under the original force-stop reason.
-func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.T) {
+// TestForceStop_EmptySynthesis_DoesNotStartRecoveryHardIdle verifies that the
+// terminal cap prevents an empty synthesis from starting a recovery request.
+func TestForceStop_EmptySynthesis_DoesNotStartRecoveryHardIdle(t *testing.T) {
 	var callCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := callCount.Add(1)
@@ -4774,8 +4847,8 @@ func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.
 	if !strings.Contains(result, "synthesis produced no output") {
 		t.Fatalf("expected deterministic fallback, got %q", result)
 	}
-	if got := callCount.Load(); got != 6 {
-		t.Fatalf("expected 6 LLM calls (synthesis + recovery), got %d", got)
+	if got := callCount.Load(); got != 5 {
+		t.Fatalf("expected 5 LLM calls with no recovery dispatch, got %d", got)
 	}
 
 	status := loop.LastRunStatus()
@@ -4793,27 +4866,16 @@ func TestForceStop_EmptySynthesis_RecoveryHardIdle_PreservesFallback(t *testing.
 			last.Role, last.Content.Text())
 	}
 
-	var failedRow map[string]any
 	for _, e := range readAuditLines(t, logDir) {
 		if e["event"] == "force_stop_synthesis_recovery_failed" {
-			failedRow = e
-			break
+			t.Fatal("unexpected recovery failure audit row without a recovery dispatch")
 		}
-	}
-	if failedRow == nil {
-		t.Fatal("expected force_stop_synthesis_recovery_failed audit row")
-	}
-	in, _ := failedRow["input_summary"].(string)
-	if !strings.Contains(in, "error_class=hard_idle_timeout") {
-		t.Errorf("audit row missing hard-idle error class: %q", in)
 	}
 }
 
-// TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget verifies that the
-// optional recovery owns a fresh ForceStop watchdog interval. The initial
-// synthesis and recovery each fit within idleHardTimeout, but their combined
-// latency does not.
-func TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget(t *testing.T) {
+// TestForceStop_EmptySynthesis_SlowTerminalStillSkipsRecovery verifies that a
+// successful-but-empty terminal request consumes the only terminal dispatch.
+func TestForceStop_EmptySynthesis_SlowTerminalStillSkipsRecovery(t *testing.T) {
 	var callCount atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := callCount.Add(1)
@@ -4841,13 +4903,13 @@ func TestForceStop_EmptySynthesis_RecoveryRearmsWatchdogBudget(t *testing.T) {
 
 	result, _, err := loop.Run(context.Background(), "do something", nil, nil)
 	if err != nil {
-		t.Fatalf("expected recovery within fresh watchdog budget, got error: %v", err)
+		t.Fatalf("expected deterministic fallback, got error: %v", err)
 	}
-	if result != "Recovered with fresh budget." {
-		t.Fatalf("expected recovered text, got %q", result)
+	if !strings.Contains(result, "synthesis produced no output") {
+		t.Fatalf("expected deterministic fallback, got %q", result)
 	}
-	if got := callCount.Load(); got != 6 {
-		t.Fatalf("expected 6 LLM calls (synthesis + recovery), got %d", got)
+	if got := callCount.Load(); got != 5 {
+		t.Fatalf("expected 5 LLM calls with no recovery dispatch, got %d", got)
 	}
 
 	status := loop.LastRunStatus()
@@ -5740,7 +5802,7 @@ func TestAgentLoop_SkillListingPreservesMultimodal(t *testing.T) {
 }
 
 // TestForceStopExit_PersistenceBaseline pins the existing behavior of
-// runForceStopTurn with respect to the run transcript. When the loop
+// runToolDisabledTurn with respect to the run transcript. When the loop
 // detector force-stops a run with several tool rounds already executed,
 // the full transcript — every tool_use + matching tool_result + the
 // synthesis user prompt + the synthesis assistant response — must all be
@@ -5764,7 +5826,7 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 			json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
 				toolCallWithID("mock_tool", `{"same":"args"}`, fmt.Sprintf("toolu_%d", llmCallCount)), 10, 5))
 		default:
-			// Synthesis turn after runForceStopTurn injects "[system] <reason>".
+			// Synthesis turn after runToolDisabledTurn injects "[system] <reason>".
 			json.NewEncoder(w).Encode(nativeResponse(synthesisText, "end_turn", nil, 10, 5))
 		}
 	}))
@@ -5838,8 +5900,8 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 	}
 
 	// Somewhere before the synthesis there must be a "[system]" reason
-	// message (the runForceStopTurn-injected reason). This proves the
-	// synthesis turn actually ran through runForceStopTurn and was saved.
+	// message (the runToolDisabledTurn-injected reason). This proves the
+	// synthesis turn actually ran through runToolDisabledTurn and was saved.
 	sawSystemReason := false
 	for _, msg := range msgs[:len(msgs)-1] {
 		if msg.Role == "user" && strings.HasPrefix(msg.Content.Text(), "[system] ") {
@@ -5848,7 +5910,157 @@ func TestForceStopExit_PersistenceBaseline(t *testing.T) {
 		}
 	}
 	if !sawSystemReason {
-		t.Error("expected a [system] reason message injected by runForceStopTurn, none found")
+		t.Error("expected a [system] reason message injected by runToolDisabledTurn, none found")
+	}
+}
+
+type changingReadOnlyTool struct {
+	name    string
+	results []string
+	runs    int
+}
+
+func (t *changingReadOnlyTool) Info() ToolInfo {
+	return ToolInfo{
+		Name:        t.name,
+		Description: "return changing job status",
+		Parameters:  map[string]any{"type": "object", "properties": map[string]any{}},
+	}
+}
+
+func (t *changingReadOnlyTool) Run(context.Context, string) (ToolResult, error) {
+	index := t.runs
+	t.runs++
+	if index >= len(t.results) {
+		index = len(t.results) - 1
+	}
+	return ToolResult{Content: t.results[index]}, nil
+}
+
+func (*changingReadOnlyTool) RequiresApproval() bool            { return false }
+func (*changingReadOnlyTool) IsReadOnlyCall(string) bool        { return true }
+func (*changingReadOnlyTool) HasMaterialSideEffect(string) bool { return false }
+
+func TestAgentLoopReadOnlyPollingChangingOutcomeReachesCompletion(t *testing.T) {
+	llmCallCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCallCount++
+		if llmCallCount <= 5 {
+			json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("job_status", `{"id":"job-1"}`, fmt.Sprintf("status_%d", llmCallCount)), 10, 5))
+			return
+		}
+		json.NewEncoder(w).Encode(nativeResponse("job complete", "end_turn", nil, 10, 5))
+	}))
+	defer server.Close()
+
+	tool := &changingReadOnlyTool{
+		name:    "job_status",
+		results: []string{"queued", "starting", "running 25%", "running 60%", "complete"},
+	}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), registry, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(false)
+	loop.SetHandler(&mockHandler{approveResult: true})
+
+	result, _, err := loop.Run(context.Background(), "wait for the job", nil, nil)
+	if err != nil {
+		t.Fatalf("polling run failed: %v", err)
+	}
+	if result != "job complete" || tool.runs != 5 || llmCallCount != 6 {
+		t.Fatalf("changing outcomes must reach normal completion: result=%q tool_runs=%d llm_calls=%d", result, tool.runs, llmCallCount)
+	}
+}
+
+func TestAgentLoopCriticalReadLoopBlocksWholeBatchBeforeExecution(t *testing.T) {
+	llmCallCount := 0
+	var recoveryRequest client.CompletionRequest
+	var recoveryDecodeErr error
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		llmCallCount++
+		if llmCallCount == 7 {
+			if recoveryDecodeErr = json.NewDecoder(r.Body).Decode(&recoveryRequest); recoveryDecodeErr != nil {
+				http.Error(w, "invalid recovery request", http.StatusBadRequest)
+				return
+			}
+		}
+		switch {
+		case llmCallCount <= 5:
+			json.NewEncoder(w).Encode(nativeResponseWithID("", "tool_use",
+				toolCallWithID("job_status", `{"id":"job-atomic"}`, fmt.Sprintf("status_%d", llmCallCount)), 10, 5))
+		case llmCallCount == 6 || llmCallCount == 7:
+			json.NewEncoder(w).Encode(multiToolResponse("", []client.FunctionCall{
+				{ID: fmt.Sprintf("side_%d", llmCallCount), Name: "side_effect_probe", Arguments: json.RawMessage(`{"value":"must-not-run"}`)},
+				{ID: fmt.Sprintf("status_%d", llmCallCount), Name: "job_status", Arguments: json.RawMessage(`{"id":"job-atomic"}`)},
+			}, 10, 5))
+		default:
+			json.NewEncoder(w).Encode(nativeResponse("partial: loop blocked before further execution", "end_turn", nil, 10, 5))
+		}
+	}))
+	defer server.Close()
+
+	statusTool := &changingReadOnlyTool{name: "job_status", results: []string{"running"}}
+	sideEffectTool := &mockTool{name: "side_effect_probe"}
+	registry := NewToolRegistry()
+	registry.Register(statusTool)
+	registry.Register(sideEffectTool)
+	loop := NewAgentLoop(client.NewGatewayClient(server.URL, ""), registry, "medium", "", 25, 2000, 200, nil, nil, nil)
+	loop.SetEnableStreaming(false)
+	loop.SetHandler(&mockHandler{approveResult: true})
+
+	result, _, err := loop.Run(context.Background(), "monitor without spinning", nil, nil)
+	if err != nil {
+		t.Fatalf("atomic loop run failed: %v", err)
+	}
+	if result != "partial: loop blocked before further execution" {
+		t.Fatalf("unexpected synthesis result: %q", result)
+	}
+	if statusTool.runs != 5 {
+		t.Fatalf("critical sixth and recovery calls must not execute; status runs=%d", statusTool.runs)
+	}
+	if sideEffectTool.runs.Load() != 0 {
+		t.Fatalf("unrelated earlier sibling executed despite batch veto: runs=%d", sideEffectTool.runs.Load())
+	}
+	if llmCallCount != 8 {
+		t.Fatalf("expected 5 observations + 2 blocked recovery responses + synthesis, got %d LLM calls", llmCallCount)
+	}
+	if recoveryDecodeErr != nil {
+		t.Fatalf("decode recovery request: %v", recoveryDecodeErr)
+	}
+	toolNames := map[string]bool{}
+	for _, schema := range recoveryRequest.Tools {
+		toolNames[schemaName(schema)] = true
+	}
+	if !toolNames["job_status"] || !toolNames["side_effect_probe"] {
+		t.Fatalf("recovery response did not retain normal tools: %v", toolNames)
+	}
+}
+
+func TestStreamToolStarterDisablesSpeculationAfterLoopWarning(t *testing.T) {
+	detector := NewLoopDetector()
+	for range readOnlyStableNudgeAt {
+		detector.RecordOutcome("job_status", `{"id":"job-stream"}`, false, "", "", "running", true, false)
+	}
+	tool := &changingReadOnlyTool{name: "job_status", results: []string{"running"}}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(nil, registry, "medium", "", 25, 2000, 200, nil, nil, nil)
+	starter := newStreamToolStarter(
+		context.Background(),
+		loop,
+		registry,
+		registry.Schemas(),
+		nil,
+		detector,
+	)
+	starter.Start(client.FunctionCall{
+		ID:        "streamed_status",
+		Name:      "job_status",
+		Arguments: json.RawMessage(`{"id":"job-stream"}`),
+	}, nil)
+	if tool.runs != 0 {
+		t.Fatalf("warned loop history must disable speculative execution, runs=%d", tool.runs)
 	}
 }
 
@@ -5903,13 +6115,17 @@ func TestForceStopExit_DetectorPath_SynthesisPromptShape(t *testing.T) {
 		t.Fatalf("synthesis request body was not captured (expected 4 LLM calls, got %d)", llmCallCount)
 	}
 
-	// The synthesis request must carry the structured report prompt
-	// AND the detector verdict (escaped in JSON, so check a plain substring).
+	// The synthesis request must carry the outcome/evidence report contract
+	// and the detector verdict (escaped in JSON, so check plain substrings).
 	wantMarkers := []string{
+		`**Outcome**`,
 		`**Task**`,
+		`**Evidence**`,
 		`**Done**`,
-		`**Pending**`,
-		`**Partial answer**`,
+		`**Pending / blocked**`,
+		`**Answer**`,
+		`outcome unknown`,
+		`not evidence that the task succeeded`,
 		`Do not request any more tools.`,
 		`identical arguments`, // from ConsecutiveDup's message
 	}
@@ -5923,7 +6139,7 @@ func TestForceStopExit_DetectorPath_SynthesisPromptShape(t *testing.T) {
 // TestForceStopExit_MaxNudgesPath_SynthesisPromptShape verifies the second
 // force-stop entry point (maxNudges=3 accumulated → escalation). 6 error
 // calls with distinct args trip SameToolError LoopNudge 3 times, the
-// nudge budget is exhausted, runForceStopTurn fires with the
+// nudge budget is exhausted, runToolDisabledTurn fires with the
 // "multiple approaches failed — nudges exceeded" detector note. The
 // synthesis prompt must carry the same structured report shape.
 func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
@@ -5936,7 +6152,7 @@ func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
 		if llmCallCount <= 8 {
 			// 8 failing-tool calls trigger SameToolError nudges at 6,7,8 →
 			// 3 nudges within the rolling window (maxNudges=3, nudgeWindowIters=5)
-			// → runForceStopTurn escalation.
+			// → runToolDisabledTurn escalation.
 			// sameToolErrThreshold=6 (v2): nudge fires at errCount >= 6.
 			json.NewEncoder(w).Encode(nativeResponse("", "tool_use",
 				toolCall("failing_tool", fmt.Sprintf(`{"attempt":%d}`, llmCallCount)), 10, 5))
@@ -5971,10 +6187,13 @@ func TestForceStopExit_MaxNudgesPath_SynthesisPromptShape(t *testing.T) {
 	}
 
 	wantMarkers := []string{
+		`**Outcome**`,
 		`**Task**`,
+		`**Evidence**`,
 		`**Done**`,
-		`**Pending**`,
-		`**Partial answer**`,
+		`**Pending / blocked**`,
+		`**Answer**`,
+		`outcome unknown`,
 		`nudges exceeded`, // from the escalation path's detector note
 	}
 	for _, marker := range wantMarkers {
@@ -6071,7 +6290,7 @@ func TestForceStopExit_DetectorPath_EmitsForceStopAudit(t *testing.T) {
 
 // TestForceStopExit_MaxIter_DoesNotEmitForceStopAudit locks the
 // separation between detector-driven stops and maxIter exits. Both
-// share runForceStopTurn for synthesis UX, but they are distinct
+// share runToolDisabledTurn for synthesis UX, but they are distinct
 // failure classes; conflating them in audit telemetry would make the
 // `grep "event":"force_stop"` observation signal over-count detector
 // stops. maxIter path must NOT emit the force_stop event.
@@ -6664,6 +6883,7 @@ func TestAgentLoop_CaptureSentRequest_AlsoDeepCopiesOnWrite(t *testing.T) {
 func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
 	loop := &AgentLoop{tools: NewToolRegistry()}
 	loop.tools.Register(&fakeThinkTool{})
+	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
 	got := loop.operationalRules()
 	if got != coreOperationalRules {
 		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when think registered; len got=%d want=%d", len(got), len(coreOperationalRules))
@@ -6675,6 +6895,7 @@ func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
 // while other sections remain intact and spacing stays clean.
 func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
 	loop := &AgentLoop{tools: NewToolRegistry()}
+	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
 	// Intentionally do NOT register think.
 	got := loop.operationalRules()
 
@@ -6685,8 +6906,8 @@ func TestOperationalRules_StripsBulletWhenThinkUnregistered(t *testing.T) {
 		t.Error("'### Planning' header must not appear when think unregistered")
 	}
 	// Surrounding sections must remain.
-	if !strings.Contains(got, "## Approach") {
-		t.Error("pre-planning '## Approach' section missing")
+	if !strings.Contains(got, "## Objective") {
+		t.Error("pre-planning '## Objective' section missing")
 	}
 	if !strings.Contains(got, "## Skills") {
 		t.Error("post-planning '## Skills' section missing")
@@ -6720,10 +6941,28 @@ func TestOperationalRules_NilRegistryStripsBullet(t *testing.T) {
 	}
 }
 
+func TestOperationalRules_StripsSkillGuidanceWhenUseSkillIsNotCallable(t *testing.T) {
+	got := operationalRulesForToolNames([]string{"think"})
+	if strings.Contains(got, "## Skills") || strings.Contains(got, "call use_skill") {
+		t.Fatal("skill guidance must not advertise a tool absent from final provider schemas")
+	}
+	if !strings.Contains(got, "### Planning") {
+		t.Fatal("unrelated callable tool guidance was removed")
+	}
+}
+
 // fakeThinkTool is a minimal Tool used in tests that need a registry where
 // `think` is present without depending on the real ThinkTool implementation
 // (which lives in internal/tools, downstream of internal/agent).
 type fakeThinkTool struct{}
+
+type fakeNamedTool struct{ name string }
+
+func (f *fakeNamedTool) Info() ToolInfo { return ToolInfo{Name: f.name, Description: "stub for tests"} }
+func (f *fakeNamedTool) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{Content: "stub"}, nil
+}
+func (f *fakeNamedTool) RequiresApproval() bool { return false }
 
 func (f *fakeThinkTool) Info() ToolInfo {
 	return ToolInfo{Name: "think", Description: "stub for tests"}
@@ -7996,5 +8235,30 @@ func TestLooksLikeUnverifiedActionClaimZeroToolGate(t *testing.T) {
 		if !looksLikeUnverifiedActionClaim(text) {
 			t.Errorf("performed-action claim not flagged in zero-tool run: %q", text)
 		}
+	}
+}
+
+// durableCompactionCheckpoint must persist only shapes ShapeHistory produced
+// (anchor + marker-prefixed summary). A clone that shrank through local
+// tool-result compression alone has no marker; persisting it would be
+// rejected by HistoryForLoop on the next load and waste a full archive
+// rebuild (live repro: TestLive_Compaction_SurvivesAcrossTheBoundary).
+func TestDurableCompactionCheckpointRequiresMarker(t *testing.T) {
+	anchor := client.Message{Role: "user", Content: client.NewTextContent("Remember build id a3f9c21b")}
+	summary := client.Message{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "prior work…")}
+	failedSummary := client.Message{Role: "user", Content: client.NewTextContent(ctxwin.CompactionSummaryPrefix + "(summary unavailable)")}
+	tail := client.Message{Role: "assistant", Content: client.NewTextContent("OK")}
+
+	if got := durableCompactionCheckpoint([]client.Message{anchor, summary, tail}); got == nil {
+		t.Fatal("shaped checkpoint with marker was rejected")
+	}
+	if got := durableCompactionCheckpoint([]client.Message{anchor, failedSummary, tail}); got == nil {
+		t.Fatal("failed-summary checkpoint still carries the marker and must persist")
+	}
+	if got := durableCompactionCheckpoint([]client.Message{anchor, tail}); got != nil {
+		t.Fatalf("marker-less locally-compressed clone must not become durable: %+v", got)
+	}
+	if got := durableCompactionCheckpoint(nil); got != nil {
+		t.Fatalf("empty capture must not become durable: %+v", got)
 	}
 }

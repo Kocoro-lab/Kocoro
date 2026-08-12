@@ -68,7 +68,11 @@ type MCPServerConfig struct {
 // never replies — without this bound the call blocks the turn indefinitely
 // (2026-07-29: google-workspace sat 6.5 min on a dead pipe). 300s matches
 // the Codex (DEFAULT_TOOL_TIMEOUT) and Hermes MCP defaults.
-const DefaultToolCallTimeout = 300 * time.Second
+const (
+	DefaultToolCallTimeout          = 300 * time.Second
+	mcpClientGracefulCloseTimeout   = 2 * time.Second
+	mcpClientForcedCloseWaitTimeout = 4 * time.Second
+)
 
 // RemoteTool represents a tool discovered from an MCP server.
 type RemoteTool struct {
@@ -739,12 +743,10 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 
 // Close shuts down all connected MCP servers in parallel.
 //
-// For stdio servers we cancel the per-server cmdCtx FIRST, which sends
-// SIGTERM to the entire process group (npx → npm → node mcp-remote) via
-// processGroupCmdFunc's custom cmd.Cancel hook. Only then do we call
-// c.Close() — mcp-go's Stdio.Close runs cmd.Wait() and would block
-// indefinitely if the subprocess is one that ignores stdin EOF (every
-// OAuth-bridged server, mcp-remote being the canonical example).
+// Stdio servers first get a short graceful-close window so servers that own
+// detached resources, such as a browser process, can release them on stdin
+// EOF. If Close does not return, cancelling the per-server cmdCtx sends
+// SIGTERM to the entire process group (npx → npm → node mcp-remote).
 func (m *ClientManager) Close() {
 	m.mu.Lock()
 	clients := make(map[string]mcpclient.MCPClient, len(m.clients))
@@ -759,23 +761,59 @@ func (m *ClientManager) Close() {
 	}
 	m.mu.Unlock()
 
-	// Phase 1: SIGTERM every stdio process group. Doing this before c.Close()
-	// lets cmd.Wait() return quickly once the group dies.
-	for _, cancel := range cancellers {
+	var wg sync.WaitGroup
+	for name, c := range clients {
+		cancel := cancellers[name]
+		wg.Add(1)
+		go func(name string, c mcpclient.MCPClient, cancel context.CancelFunc) {
+			defer wg.Done()
+			closeManagedMCPClient(name, c, cancel, mcpClientGracefulCloseTimeout)
+		}(name, c, cancel)
+	}
+	for name, cancel := range cancellers {
+		if _, ok := clients[name]; !ok && cancel != nil {
+			cancel()
+		}
+	}
+	wg.Wait()
+}
+
+func closeManagedMCPClient(name string, c mcpclient.MCPClient, cancel context.CancelFunc, gracefulTimeout time.Duration) {
+	if c == nil {
+		if cancel != nil {
+			cancel()
+		}
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = c.Close()
+		close(done)
+	}()
+
+	timer := time.NewTimer(gracefulTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		if cancel != nil {
+			cancel()
+		}
+		return
+	case <-timer.C:
+		if cancel == nil {
+			log.Printf("[mcp] %s: graceful close timed out with no subprocess canceller", name)
+			return
+		}
 		cancel()
 	}
 
-	// Phase 2: close each client. c.Close still calls cmd.Wait, which now
-	// returns within the cmd.WaitDelay backstop instead of blocking forever.
-	var wg sync.WaitGroup
-	for _, c := range clients {
-		wg.Add(1)
-		go func(c mcpclient.MCPClient) {
-			defer wg.Done()
-			_ = c.Close()
-		}(c)
+	forcedTimer := time.NewTimer(mcpClientForcedCloseWaitTimeout)
+	defer forcedTimer.Stop()
+	select {
+	case <-done:
+	case <-forcedTimer.C:
+		log.Printf("[mcp] %s: client close still blocked after subprocess cancellation", name)
 	}
-	wg.Wait()
 }
 
 // ConfigFor returns the config for a server, if any.
@@ -808,11 +846,10 @@ func (m *ClientManager) Disconnect(serverName string) {
 	cmdCancel := m.cancellers[serverName]
 	delete(m.cancellers, serverName)
 	m.mu.Unlock()
-	if cmdCancel != nil {
-		cmdCancel()
-	}
 	if ok && c != nil {
-		_ = c.Close()
+		closeManagedMCPClient(serverName, c, cmdCancel, mcpClientGracefulCloseTimeout)
+	} else if cmdCancel != nil {
+		cmdCancel()
 	}
 }
 

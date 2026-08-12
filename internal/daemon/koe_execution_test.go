@@ -97,19 +97,21 @@ func TestFullAdmissionRunsBeforeFastToFullFork(t *testing.T) {
 	rawFast := "fast"
 	rawFull := "full"
 
-	selectedFast := RunAgentRequest{
+	contradictoryFast := RunAgentRequest{
 		Source: "koe", ExecutionMode: executionprofile.ModeFull,
 		RequestedExecutionMode: &rawFast,
 		FullReason:             executionprofile.FullReasonProductionIncident,
 		LogicalTaskID:          "burst:t01",
 		ExecutionRunID:         "ker1_fast",
 	}
-	applyKoeModeAdmission(&selectedFast)
-	if selectedFast.ExecutionMode != executionprofile.ModeFast {
-		t.Fatalf("diagnostic reason overrode selected Fast: %+v", selectedFast.ModeAdmission)
+	applyKoeModeAdmission(&contradictoryFast)
+	if contradictoryFast.ExecutionMode != executionprofile.ModeFull ||
+		contradictoryFast.ModeAdmission.AdmittedFullReason != executionprofile.FullReasonProductionIncident ||
+		contradictoryFast.ModeAdmission.DecisionReason != executionprofile.AdmissionFastReasonConflict {
+		t.Fatalf("contradictory Fast did not fail closed: %+v", contradictoryFast.ModeAdmission)
 	}
-	if got := decideKoeFollowUp(active, selectedFast); got != koeFollowUpInject {
-		t.Fatalf("selected Fast fork = %q, want inject on the existing Fast run", got)
+	if got := decideKoeFollowUp(active, contradictoryFast); got != koeFollowUpChild {
+		t.Fatalf("contradictory Fast fork = %q, want isolated Full child run", got)
 	}
 
 	selectedFull := RunAgentRequest{

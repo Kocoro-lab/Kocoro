@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 func assertReadOnly(t *testing.T, tool agent.Tool, argsJSON string, expected bool) {
@@ -129,6 +130,31 @@ func TestReadOnly_MCPTool_NotImplemented(t *testing.T) {
 func TestReadOnly_ServerTool_NotImplemented(t *testing.T) {
 	tool := &ServerTool{}
 	if _, ok := agent.Tool(tool).(agent.ReadOnlyChecker); ok {
-		t.Error("ServerTool should NOT implement ReadOnlyChecker")
+		t.Error("ServerTool should not opt metered gateway calls into speculative read-only execution")
+	}
+}
+
+func TestMaterialSideEffect_ServerTool_SourceAware(t *testing.T) {
+	gateway := NewServerTool(client.ServerToolSchema{Name: "web_search"}, nil)
+	integration := NewIntegrationTool(client.ServerToolSchema{Name: "slack_post"}, nil)
+	checker, ok := agent.Tool(gateway).(agent.MaterialSideEffectChecker)
+	if !ok {
+		t.Fatal("ServerTool must implement MaterialSideEffectChecker")
+	}
+	if checker.HasMaterialSideEffect(`{}`) {
+		t.Error("gateway research tool must not enter the durable write journal")
+	}
+	for _, name := range []string{"web_crawl", "page_screenshot", "lp_visual_analyze", "lp_batch_analyze"} {
+		material := NewServerTool(client.ServerToolSchema{Name: name}, nil)
+		if !material.HasMaterialSideEffect(`{}`) {
+			t.Errorf("%s starts durable provider work and must remain journaled", name)
+		}
+	}
+	if !integration.HasMaterialSideEffect(`{}`) {
+		t.Error("unannotated integration tool must remain a material side effect")
+	}
+	unknownGateway := NewServerTool(client.ServerToolSchema{Name: "future_mutating_tool"}, nil)
+	if !unknownGateway.HasMaterialSideEffect(`{}`) {
+		t.Error("unallowlisted gateway tool must fail closed as material")
 	}
 }

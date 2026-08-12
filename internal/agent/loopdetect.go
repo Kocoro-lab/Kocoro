@@ -17,12 +17,30 @@ const (
 	LoopForceStop                   // force final response without tools
 )
 
+const loopForceStopOutcomeCaveat = "Further tool calls are blocked for this run. The stop itself is not evidence of success. Preserve completed results; treat unverified completion or side effects as partial, blocked, or outcome unknown."
+
+const (
+	readOnlyStableNudgeAt    = 3
+	readOnlyStableBlockAfter = 5
+	pingPongNudgeAt          = 6
+	pingPongBlockAfter       = 8
+	webStableNudgeAt         = 5
+	webStableBlockAfter      = 7
+)
+
+func loopForceStopNote(detail string) string {
+	return strings.TrimSpace(detail) + " " + loopForceStopOutcomeCaveat
+}
+
 // ToolCallRecord tracks a single tool invocation for loop detection.
 type ToolCallRecord struct {
 	Name            string
 	ArgsHash        string // hex-encoded hash of raw args
 	TopicHash       string // hex-encoded hash of normalized args (web tools)
 	ResultSig       string // domain signature from results (web tools)
+	OutcomeSig      string // stable signature of the complete tool outcome
+	IsReadOnly      bool   // identical read args may still make progress when outcomes change
+	TrustsProgress  bool   // tool explicitly guarantees distinct outcomes prove bounded state-machine progress
 	IsError         bool
 	ErrorSig        string // first 100 chars of error for grouping
 	IsNonActionable bool   // search returned no useful results (no matches, binary noise, errors)
@@ -34,6 +52,15 @@ type ToolCallRecord struct {
 	IsEmptyThinkInput bool
 }
 
+// BoundedProgressTool opts a stateful tool into strict distinct-outcome
+// progress detection. Implementations must represent a bounded state machine
+// where every successful call advances that state and returns durable evidence
+// of the new state. Arbitrary external create/send/delete tools must not opt in:
+// fresh provider ids alone do not make repeated mutations safe.
+type BoundedProgressTool interface {
+	TrustsDistinctOutcomeProgress() bool
+}
+
 // LoopDetector uses a sliding window of recent tool calls to detect stuck loops.
 //
 // Nine detection paths (checked in order, first match wins):
@@ -42,11 +69,12 @@ type ToolCallRecord struct {
 //   - ConsecutiveDuplicate: back-to-back identical calls (catches web_search→web_search)
 //   - ExactDuplicate: same name+argsHash spread across window (catches read→edit→read→edit→read)
 //   - SameToolError: same tool returns errors N+ times in window
-//   - FamilyNoProgress: tools in the same family, counted by topic similarity
-//     (3 same-topic → nudge, 5 → stronger nudge, 7 → force stop)
-//     Fallback: same-tool count when topic tracking unavailable (5 → nudge, 7 → force stop)
+//   - FamilyNoProgress: tools in the same family, counted by topic or result
+//     similarity (stable web results → nudge at 5 and block call 8 before
+//     dispatch; same-topic calls with changing results use the broader 5/8/12 budget)
+//     Fallback: same-tool count when topic tracking unavailable (8 → nudge, 12 → force stop)
 //   - SearchEscalation: trailing unproductive search-family calls
-//     (5 unproductive → nudge, 8 unproductive → force stop)
+//     (7 unproductive → nudge, 12 unproductive → force stop)
 //   - NoProgress: same tool called M+ times regardless of args (skip visual/search tools,
 //     semi-repeatable tools like bash get a higher threshold)
 //
@@ -67,7 +95,7 @@ type LoopDetector struct {
 	sameToolErrThreshold int
 	noProgressThreshold  int
 
-	repeatableTools          map[string]bool
+	repeatableTools         map[string]bool
 	semiRepeatableTools     map[string]bool // higher NoProgress threshold (e.g. bash)
 	semiRepeatableThreshold int             // nudge threshold for semi-repeatable tools
 	// Note: force-stop = threshold*2 = 24 exceeds historySize (20), so the
@@ -95,7 +123,7 @@ type LoopDetector struct {
 }
 
 // GUITools are tools that indicate GUI automation tasks.
-// Used by both LoopDetector (exempt from NoProgress) and effectiveMaxIter (higher limit).
+// Used by LoopDetector to recognize GUI observation/action workflows.
 // Note: the literal "browser" key covers the legacy in-process browser tool.
 // Real MCP playwright tool names (browser_navigate, browser_snapshot, …) are
 // handled via isGUIToolName, which also prefix-matches "browser_".
@@ -146,6 +174,15 @@ var repeatableGUITools = map[string]bool{
 // editing the literal below.
 var dupExemptTools = map[string]bool{
 	"use_skill": true,
+}
+
+// windowDupExemptTools contains observation tools whose identical arguments
+// do not imply identical state when another action occurred between calls.
+// Consecutive duplicates remain protected by the stricter detector above, so
+// snapshot-only polling still stops while snapshot → click → snapshot remains
+// a valid state-observation workflow.
+var windowDupExemptTools = map[string]bool{
+	"browser_snapshot": true,
 }
 
 // isRepeatableToolName reports whether a tool naturally repeats across a
@@ -259,6 +296,32 @@ var writeVerbs = map[string]bool{
 // Fail-closed: ambiguous names (run_* / execute_* — could be SELECT or
 // INSERT) go through writeVerbs so the count-based guard stays engaged.
 // Names whose verb sits at position 3 or later are treated as writes.
+// mintedResourceNouns are resources a "get" typically MINTS or CONSUMES
+// rather than reads: fetching one changes server state (a fresh token, an
+// acquired lock, a burned nonce). A read-verb name touching one of these is
+// treated as mutating so the loop detector applies the tighter side-effect
+// budget (force at call 4, not the read-only 6). Deliberately narrow:
+// ambiguous nouns (session, key, url alone) stay read-only — the regression
+// corpus in loopdetect_readname_regression_test.go pins both directions.
+var mintedResourceNouns = map[string]bool{
+	"token": true, "tokens": true, "lock": true, "locks": true,
+	"lease": true, "leases": true, "nonce": true, "otp": true,
+	"credential": true, "credentials": true, "secret": true, "secrets": true,
+	"ticket": true, "tickets": true,
+}
+
+// consumedWorkItemNouns complete the queue-consuming "next <work item>"
+// pattern (get_next_job dequeues; get_next_page paginates and stays read).
+var consumedWorkItemNouns = map[string]bool{
+	"task": true, "job": true, "message": true, "item": true,
+}
+
+// urlMinterQualifiers complete the presigned-URL pattern: get_upload_url /
+// get_signed_url mint a capability, while a bare get_url stays read-only.
+var urlMinterQualifiers = map[string]bool{
+	"upload": true, "signed": true, "presigned": true,
+}
+
 func isReadMCPName(name string) bool {
 	tokens := strings.FieldsFunc(strings.ToLower(name), func(r rune) bool {
 		return r == '_' || r == '-'
@@ -276,7 +339,23 @@ func isReadMCPName(name string) bool {
 			hasRead = true
 		}
 	}
-	return hasRead
+	if !hasRead {
+		return false
+	}
+	// Mint/consume layer scans EVERY token — the resource noun can sit past
+	// position 3 (get_upload_url, google_auth_get_access_token).
+	for i, tok := range tokens {
+		if mintedResourceNouns[tok] {
+			return false
+		}
+		if tok == "next" && i+1 < len(tokens) && consumedWorkItemNouns[tokens[i+1]] {
+			return false
+		}
+		if urlMinterQualifiers[tok] && i+1 < len(tokens) && tokens[i+1] == "url" {
+			return false
+		}
+	}
+	return true
 }
 
 // NewLoopDetector creates a detector with production defaults.
@@ -294,9 +373,9 @@ func NewLoopDetector() *LoopDetector {
 	return &LoopDetector{
 		history:                 make([]ToolCallRecord, 0, 20),
 		historySize:             20,
-		consecDupThreshold:      3, // v2: 2 → 3 (was over-strict for re-search/re-fetch)
-		exactDupThreshold:       5, // v2: 3 → 5 (refactor read→edit→read iteration is common)
-		sameToolErrThreshold:    6, // v2: 4 → 6 (cross-args retry needs more headroom)
+		consecDupThreshold:      3,  // v2: 2 → 3 (was over-strict for re-search/re-fetch)
+		exactDupThreshold:       5,  // v2: 3 → 5 (refactor read→edit→read iteration is common)
+		sameToolErrThreshold:    6,  // v2: 4 → 6 (cross-args retry needs more headroom)
 		noProgressThreshold:     12, // v2: 8 → 12 (legitimate research uses many same-tool calls)
 		repeatableTools:         repeatableGUITools,
 		semiRepeatableTools:     semiRepeatableProdTools,
@@ -307,6 +386,21 @@ func NewLoopDetector() *LoopDetector {
 
 // Record adds a tool call to the sliding window.
 func (ld *LoopDetector) Record(name, argsJSON string, isError bool, errMsg string, resultSig string, isNonActionable bool) {
+	ld.RecordOutcome(name, argsJSON, isError, errMsg, resultSig, "[legacy-static-outcome]", false, isNonActionable)
+}
+
+// RecordOutcome adds a tool call together with the execution outcome used to
+// distinguish a stuck observation loop from legitimate polling. Exact repeated
+// mutations deliberately remain argument-based: repeating the same write is
+// dangerous even when a provider returns fresh ids or timestamps. The generic
+// same-tool counter recognizes changing outcomes only for read-only tools or
+// explicit BoundedProgressTool state machines, and then requires every argument
+// and every successful outcome in the window to be distinct.
+func (ld *LoopDetector) RecordOutcome(name, argsJSON string, isError bool, errMsg string, resultSig string, outcomeSig string, isReadOnly bool, isNonActionable bool) {
+	ld.recordOutcome(name, argsJSON, isError, errMsg, resultSig, outcomeSig, isReadOnly, false, isNonActionable)
+}
+
+func (ld *LoopDetector) recordOutcome(name, argsJSON string, isError bool, errMsg string, resultSig string, outcomeSig string, isReadOnly bool, trustsProgress bool, isNonActionable bool) {
 	topicHash := ""
 	if toolFamily(name) != "" {
 		normalized := normalizeWebQuery(argsJSON)
@@ -319,6 +413,9 @@ func (ld *LoopDetector) Record(name, argsJSON string, isError bool, errMsg strin
 		ArgsHash:          hashArgs(argsJSON),
 		TopicHash:         topicHash,
 		ResultSig:         resultSig,
+		OutcomeSig:        outcomeSig,
+		IsReadOnly:        isReadOnly,
+		TrustsProgress:    trustsProgress,
 		IsError:           isError,
 		ErrorSig:          truncateErrSig(errMsg, 100),
 		IsNonActionable:   isNonActionable,
@@ -363,6 +460,56 @@ func (ld *LoopDetector) Record(name, argsJSON string, isError bool, errMsg strin
 	}
 }
 
+// CheckBefore evaluates only patterns that can be proven from completed prior
+// outcomes. It is intentionally limited to read-only observations: mutating
+// calls have separate replay/idempotency admission, and predicting an unseen
+// read result too early would hide legitimate progress. A stable observation
+// gets one warning window before the sixth identical call is blocked.
+func (ld *LoopDetector) CheckBefore(name, argsJSON string, isReadOnly bool) (LoopAction, string) {
+	if !isReadOnly || dupExemptTools[name] || len(ld.history) == 0 {
+		return LoopContinue, ""
+	}
+	argsHash := hashArgs(argsJSON)
+	if count := stableReadOnlyActionTail(ld.history, name, argsHash); count >= readOnlyStableBlockAfter {
+		return LoopForceStop, fmt.Sprintf(
+			"Blocked %s before execution: the same read-only action returned an identical outcome %d times and exhausted its warning window.",
+			name, count)
+	}
+	if pingPongNoProgressCount(ld.history) >= pingPongBlockAfter &&
+		pingPongWouldContinue(ld.history, name, argsHash) {
+		return LoopForceStop, fmt.Sprintf(
+			"Blocked %s before execution: it would continue an outcome-stable two-action loop after %d completed calls.",
+			name, pingPongBlockAfter)
+	}
+	if toolFamily(name) == "web" {
+		if count := stableWebResultTail(ld.history); count >= webStableBlockAfter {
+			return LoopForceStop, fmt.Sprintf(
+				"Blocked %s before execution: %d consecutive web calls returned the same sources despite changed arguments.",
+				name, count)
+		}
+	}
+	return LoopContinue, ""
+}
+
+// ShouldDisableSpeculation prevents a streamed read from executing before the
+// provider's full batch is available whenever the prior history is already in
+// a warned no-progress state. The normal batch admission can then veto every
+// sibling atomically before any tool starts.
+func (ld *LoopDetector) ShouldDisableSpeculation() bool {
+	if len(ld.history) == 0 {
+		return false
+	}
+	last := ld.history[len(ld.history)-1]
+	if stableReadOnlyActionTail(ld.history, last.Name, last.ArgsHash) >= readOnlyStableNudgeAt {
+		return true
+	}
+	if pingPongNoProgressCount(ld.history) >= pingPongNudgeAt {
+		return true
+	}
+	return toolFamily(last.Name) == "web" &&
+		stableWebResultTail(ld.history) >= webStableNudgeAt
+}
+
 // Check evaluates all detectors for the named tool.
 // Returns the most severe action and an appropriate message.
 func (ld *LoopDetector) Check(name string) (LoopAction, string) {
@@ -383,7 +530,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		if n >= 2 &&
 			h[n-1].Name == "think" && h[n-1].IsEmptyThinkInput &&
 			h[n-2].Name == "think" && h[n-2].IsEmptyThinkInput {
-			return LoopForceStop, "Two consecutive `think` calls had empty input. Your reasoning likely already lives in the native thinking block — produce your answer or call a different tool now."
+			return LoopForceStop, loopForceStopNote("Two consecutive `think` calls had empty input. Further empty reasoning calls cannot add evidence.")
 		}
 	}
 
@@ -431,11 +578,19 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	consecCount := 0
 	consecErrCount := 0
 	consecValidationErrCount := 0
+	consecSameOutcomeCount := 0
+	latestOutcome := ld.history[len(ld.history)-1].OutcomeSig
+	outcomeTailOpen := latestOutcome != ""
 	for i := len(ld.history) - 1; i >= 0; i-- {
 		if ld.history[i].Name != name || ld.history[i].ArgsHash != latestHash {
 			break
 		}
 		consecCount++
+		if outcomeTailOpen && ld.history[i].OutcomeSig == latestOutcome {
+			consecSameOutcomeCount++
+		} else {
+			outcomeTailOpen = false
+		}
 		if ld.history[i].IsError {
 			consecErrCount++
 			if isValidationErrorSig(ld.history[i].ErrorSig) {
@@ -459,10 +614,10 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// (which is calibrated for flaky retries, not parameter-shape
 	// mistakes) and force-stop immediately.
 	if !dupExemptTools[name] && consecValidationErrCount >= 3 && consecValidationErrCount == consecCount {
-		return LoopForceStop, fmt.Sprintf(
+		return LoopForceStop, loopForceStopNote(fmt.Sprintf(
 			"Tool %s rejected your arguments %d times in a row with the same validation error: %q. "+
-				"Retrying with identical arguments will not succeed — fix the arguments or ask the user for guidance.",
-			name, consecCount, ld.history[len(ld.history)-1].ErrorSig)
+				"Retrying with identical arguments cannot succeed.",
+			name, consecCount, ld.history[len(ld.history)-1].ErrorSig))
 	}
 
 	if !dupExemptTools[name] && consecCount > 0 && !recovered {
@@ -470,14 +625,40 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		if consecErrCount == consecCount {
 			threshold = ld.consecDupThreshold * 2 // Rule 2: all-errors budget
 		}
-		if consecCount >= threshold+1 {
-			return LoopForceStop, fmt.Sprintf(
-				"You have called %s with identical arguments %d times in a row. Stop retrying and provide your answer now.", name, consecCount)
+		effectiveCount := consecCount
+		if ld.history[len(ld.history)-1].IsReadOnly && consecErrCount == 0 {
+			effectiveCount = consecSameOutcomeCount
 		}
-		if consecCount >= threshold {
+		if ld.history[len(ld.history)-1].IsReadOnly && consecErrCount == 0 {
+			if effectiveCount >= readOnlyStableBlockAfter+1 {
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You called %s with identical arguments and outcomes %d times in a row without new evidence.", name, effectiveCount))
+			}
+			if effectiveCount == readOnlyStableNudgeAt {
+				return LoopNudge, fmt.Sprintf(
+					"You've called %s %d times consecutively without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, effectiveCount)
+			}
+		} else if effectiveCount >= threshold+1 {
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You called %s with identical arguments and outcomes %d times in a row without new evidence.", name, effectiveCount))
+		} else if effectiveCount >= threshold {
 			return LoopNudge, fmt.Sprintf(
-				"You've called %s %d times consecutively with identical arguments. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, consecCount)
+				"You've called %s %d times consecutively without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a different approach.", name, effectiveCount)
 		}
+	}
+
+	// 1a-post. Ping-pong no-progress: A -> B -> A -> B with stable outcomes
+	// on both sides. This catches loops that evade same-tool consecutive checks
+	// while preserving productive alternation whenever either observation
+	// changes. Six calls nudge; pre-dispatch admission blocks the ninth call
+	// after one recovery window. Ten completed calls are a defensive fallback
+	// for callers that use the detector without admission.
+	if count := pingPongNoProgressCount(ld.history); count >= pingPongBlockAfter+2 {
+		return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+			"You alternated between the same two tool actions %d times without a changed outcome.", count))
+	} else if count == pingPongNudgeAt {
+		return LoopNudge, fmt.Sprintf(
+			"You've alternated between the same two tool actions %d times without a changed outcome. Use the evidence already returned or change strategy.", count)
 	}
 
 	// 1b. Window-based exact duplicate — catches spread-out repeats
@@ -501,18 +682,37 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			}
 		}
 	}
-	if !dupExemptTools[name] && !exactRecovered {
+	dupSameOutcomeCount := 0
+	if latestOutcome != "" {
+		for i := len(ld.history) - 1; i >= 0; i-- {
+			rec := ld.history[i]
+			if rec.Name != name || rec.ArgsHash != latestHash {
+				continue
+			}
+			if rec.OutcomeSig != latestOutcome {
+				break
+			}
+			dupSameOutcomeCount++
+		}
+	}
+	if !dupExemptTools[name] && !windowDupExemptTools[name] && !exactRecovered {
 		threshold := ld.exactDupThreshold
 		if dupCount > 0 && dupErrCount == dupCount {
 			threshold = ld.exactDupThreshold * 2 // all-errors budget
 		}
-		if dupCount >= threshold*2 {
-			return LoopForceStop, fmt.Sprintf(
-				"You have called %s with identical arguments %d times. Stop retrying and provide your answer now.", name, dupCount)
+		effectiveCount := dupCount
+		if ld.history[len(ld.history)-1].IsReadOnly && dupErrCount == 0 {
+			effectiveCount = dupSameOutcomeCount
 		}
-		if dupCount >= threshold {
+		if effectiveCount >= threshold*2 {
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You called %s with identical arguments and outcomes %d times without new evidence.", name, effectiveCount))
+		}
+		isReadOnlyLatest := ld.history[len(ld.history)-1].IsReadOnly && dupErrCount == 0
+		if (!isReadOnlyLatest && effectiveCount >= threshold) ||
+			(isReadOnlyLatest && effectiveCount == threshold && consecCount < effectiveCount) {
 			return LoopNudge, fmt.Sprintf(
-				"You've called %s %d times with identical arguments. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a fundamentally different approach.", name, dupCount)
+				"You've called %s %d times without a changed outcome. Inspect the latest result first. If it completes the task, use it and answer now; otherwise try a fundamentally different approach.", name, effectiveCount)
 		}
 	}
 
@@ -526,8 +726,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		}
 	}
 	if errCount >= ld.sameToolErrThreshold*2 {
-		return LoopForceStop, fmt.Sprintf(
-			"Tool %s has failed %d times. Stop using it and provide your answer now.", name, errCount)
+		return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+			"Tool %s failed %d times and no reliable recovery is available in this run.", name, errCount))
 	}
 	if errCount >= ld.sameToolErrThreshold {
 		return LoopNudge, fmt.Sprintf(
@@ -584,6 +784,12 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		if sameResultCount > progressCount {
 			progressCount = sameResultCount
 		}
+		if family == "web" {
+			if stableCount := stableWebResultTail(ld.history); stableCount >= webStableBlockAfter+1 {
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You made %d consecutive web calls with changed arguments, but they returned the same sources.", stableCount))
+			}
+		}
 
 		// For repeatable tools (browser_*, screenshot, computer_use, accessibility, computer),
 		// a stable result_sig is a weak "no progress" signal: SPA workflows and
@@ -609,7 +815,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 
 		if repeatableResultOnly {
 			if progressCount >= 15 {
-				return LoopForceStop, familyNoProgressMessage(family, progressCount, familyCount, 2)
+				return LoopForceStop, loopForceStopNote(familyNoProgressMessage(family, progressCount, familyCount, 2))
 			}
 			// Below 15: silent. No nudge tier — see rationale above.
 		} else {
@@ -617,7 +823,7 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			// (3 different queries on the same topic) is a legitimate pattern;
 			// the old thresholds nudged the model immediately on a 3rd query.
 			if progressCount >= 12 {
-				return LoopForceStop, familyNoProgressMessage(family, progressCount, familyCount, 2)
+				return LoopForceStop, loopForceStopNote(familyNoProgressMessage(family, progressCount, familyCount, 2))
 			}
 			if progressCount >= 8 {
 				return LoopNudge, familyNoProgressMessage(family, progressCount, familyCount, 1)
@@ -644,8 +850,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			// where there's no URL or web topic to dedupe by). Real research
 			// sessions can hit a single tool 6-10 times legitimately.
 			if sameToolInFamily >= 12 {
-				return LoopForceStop, fmt.Sprintf(
-					"You have called %s %d times without meaningful progress. Provide your answer now.", name, sameToolInFamily)
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You called %s %d times without meaningful progress.", name, sameToolInFamily))
 			}
 			if sameToolInFamily >= 8 {
 				return LoopNudge, fmt.Sprintf(
@@ -673,8 +879,8 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 		// (e.g. "find this obscure error string") legitimately need many
 		// query variants before finding a hit.
 		if unproductiveStreak >= 12 {
-			return LoopForceStop, fmt.Sprintf(
-				"You have made %d consecutive unproductive search calls. Stop searching and use what you have, or ask the user for guidance.", unproductiveStreak)
+			return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+				"You made %d consecutive unproductive search calls without finding useful evidence.", unproductiveStreak))
 		}
 		if unproductiveStreak >= 7 {
 			return LoopNudge, fmt.Sprintf(
@@ -693,9 +899,11 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// Batch-tolerant tools (http) additionally get a uniqueness gate: when
 	// ≥50% of same-name calls carry distinct argsHash, treat the stream as
 	// legitimate enumeration (e.g. paging an API, polling distinct URLs) and
-	// fall through to the remaining detectors. Generic NoProgress for
-	// think/file_*/grep/glob stays fully active — those tools still need
-	// "called repeatedly with unique args" caught as a spin signal.
+	// fall through to the remaining detectors. Read-only tools and explicit
+	// BoundedProgressTool state machines earn the same relief only with stronger
+	// evidence: every same-name call in the window succeeded, and both its
+	// arguments and complete outcome are unique. Stable/empty outcomes and
+	// arbitrary write tools therefore stay under this guard.
 	if !isRepeatableToolName(ld.repeatableTools, name) && family != "search" {
 		count := 0
 		seen := make(map[string]struct{}, ld.historySize)
@@ -710,10 +918,11 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 			threshold = ld.semiRepeatableThreshold
 		}
 		batchGated := ld.batchTolerant[name] && count > 0 && len(seen)*2 >= count
-		if !batchGated {
+		progressGated := count >= threshold && hasStrictOutcomeProgress(ld.history, name)
+		if !batchGated && !progressGated {
 			if count >= threshold*2 {
-				return LoopForceStop, fmt.Sprintf(
-					"You have called %s %d times without meaningful progress. Provide your answer now.", name, count)
+				return LoopForceStop, loopForceStopNote(fmt.Sprintf(
+					"You called %s %d times without meaningful progress.", name, count))
 			}
 			if count >= threshold {
 				return LoopNudge, fmt.Sprintf(
@@ -732,6 +941,164 @@ func (ld *LoopDetector) Check(name string) (LoopAction, string) {
 	// threshold — see plan 2026-05-14-thinking-blocks-alignment.md
 	// post-mortem). Removed 2026-05.
 	return LoopContinue, ""
+}
+
+// hasStrictOutcomeProgress recognizes a dependent/enumerated sequence without
+// trusting a volatile receipt for repeated mutations. Every same-name record in
+// the active window must be a success with a new argument identity and a new
+// complete-outcome identity. Any duplicate, missing evidence, or error keeps the
+// ordinary NoProgress thresholds active.
+func hasStrictOutcomeProgress(history []ToolCallRecord, name string) bool {
+	seenArgs := make(map[string]struct{})
+	seenOutcomes := make(map[string]struct{})
+	count := 0
+	for _, record := range history {
+		if record.Name != name {
+			continue
+		}
+		count++
+		if record.IsError || (!record.IsReadOnly && !record.TrustsProgress) || record.ArgsHash == "" || record.OutcomeSig == "" {
+			return false
+		}
+		if _, duplicate := seenArgs[record.ArgsHash]; duplicate {
+			return false
+		}
+		if _, duplicate := seenOutcomes[record.OutcomeSig]; duplicate {
+			return false
+		}
+		seenArgs[record.ArgsHash] = struct{}{}
+		seenOutcomes[record.OutcomeSig] = struct{}{}
+	}
+	return count > 1
+}
+
+func stableReadOnlyActionTail(history []ToolCallRecord, name, argsHash string) int {
+	if len(history) == 0 {
+		return 0
+	}
+	latestOutcome := ""
+	count := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		record := history[i]
+		if record.Name != name || record.ArgsHash != argsHash || !record.IsReadOnly || record.IsError || record.OutcomeSig == "" {
+			break
+		}
+		if latestOutcome == "" {
+			latestOutcome = record.OutcomeSig
+		} else if record.OutcomeSig != latestOutcome {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func stableWebResultTail(history []ToolCallRecord) int {
+	if len(history) == 0 {
+		return 0
+	}
+	latestResult := ""
+	count := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		record := history[i]
+		if toolFamily(record.Name) != "web" ||
+			!record.IsReadOnly || record.IsError || record.ResultSig == "" {
+			break
+		}
+		if latestResult == "" {
+			latestResult = record.ResultSig
+		} else if record.ResultSig != latestResult {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func pingPongWouldContinue(history []ToolCallRecord, name, argsHash string) bool {
+	if len(history) < 2 {
+		return false
+	}
+	expected := history[len(history)-2]
+	return expected.Name == name && expected.ArgsHash == argsHash
+}
+
+func pingPongNoProgressCount(history []ToolCallRecord) int {
+	if len(history) < 4 {
+		return 0
+	}
+	last := history[len(history)-1]
+	previous := history[len(history)-2]
+	if sameToolAction(last, previous) {
+		return 0
+	}
+
+	outcomeSet := [2]bool{}
+	outcomes := [2]string{}
+	count := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		record := history[i]
+		slot := count % 2
+		expected := last
+		if slot == 1 {
+			expected = previous
+		}
+		if !sameToolAction(record, expected) {
+			break
+		}
+		// Alternating failures use the existing error recovery budgets, which
+		// deliberately allow flaky calls more room than successful no-progress
+		// observations. Do not let the ping-pong path bypass that policy.
+		if record.IsError {
+			return 0
+		}
+		if record.IsReadOnly && !record.IsError {
+			if record.OutcomeSig == "" {
+				return 0
+			}
+			if outcomeSet[slot] && outcomes[slot] != record.OutcomeSig {
+				return 0
+			}
+			outcomeSet[slot] = true
+			outcomes[slot] = record.OutcomeSig
+		}
+		count++
+	}
+	if count < 4 || count%2 != 0 {
+		return 0
+	}
+	return count
+}
+
+func sameToolAction(left, right ToolCallRecord) bool {
+	return left.Name == right.Name && left.ArgsHash == right.ArgsHash
+}
+
+func isLoopReadOnlyCall(tool Tool, name, argsJSON string) bool {
+	if tool == nil {
+		return false
+	}
+	if readOnly, ok := tool.(ReadOnlyChecker); ok && readOnly.IsReadOnlyCall(argsJSON) {
+		return true
+	}
+	if source, ok := tool.(ToolSourcer); ok {
+		switch source.ToolSource() {
+		case SourceMCP:
+			return name == "browser_snapshot" || isReadMCPName(name)
+		case SourceGateway, SourceIntegration:
+			return false
+		}
+	}
+	if name == "browser_snapshot" {
+		return true
+	}
+	// Local argument-aware tools such as bash and process deliberately keep
+	// IsReadOnlyCall false to prevent speculative execution, while their
+	// materiality checker can still prove an individual poll is observational.
+	if material, ok := tool.(MaterialSideEffectChecker); ok {
+		return !material.HasMaterialSideEffect(argsJSON)
+	}
+	return false
 }
 
 // latestRecoveredAfterSameArgsErrors reports whether the latest same-name,
@@ -806,7 +1173,7 @@ func familyNoProgressMessage(family string, progressCount, familyCount, stage in
 	case "search", "web":
 		switch stage {
 		case 2:
-			return fmt.Sprintf("You have made %d web calls with %d on the same topic. Return your collected results now.", familyCount, progressCount)
+			return fmt.Sprintf("You made %d web calls with %d on the same topic without obtaining new evidence.", familyCount, progressCount)
 		case 1:
 			return fmt.Sprintf("You've searched the same topic %d times. Summarize what you've found and present it to the user. Do not search again.", progressCount)
 		default:
@@ -815,7 +1182,7 @@ func familyNoProgressMessage(family string, progressCount, familyCount, stage in
 	case "browser", "gui":
 		switch stage {
 		case 2:
-			return fmt.Sprintf("You have repeated the same UI action %d times across %d browser-family calls without the page state advancing. Report the current state to the user now.", progressCount, familyCount)
+			return fmt.Sprintf("You repeated the same UI action %d times across %d browser-family calls without the page state advancing.", progressCount, familyCount)
 		case 1:
 			return fmt.Sprintf("You've repeated the same UI action %d times without progress. Stop clicking — summarize the current page state for the user and wait for direction.", progressCount)
 		default:
@@ -824,7 +1191,7 @@ func familyNoProgressMessage(family string, progressCount, familyCount, stage in
 	default:
 		switch stage {
 		case 2:
-			return fmt.Sprintf("You have called tools in the same family %d times (%d on the same target) without progress. Provide your answer now.", familyCount, progressCount)
+			return fmt.Sprintf("You called tools in the same family %d times (%d on the same target) without progress.", familyCount, progressCount)
 		case 1:
 			return fmt.Sprintf("You've repeated the same action %d times without progress. Summarize what you have and report back to the user.", progressCount)
 		default:

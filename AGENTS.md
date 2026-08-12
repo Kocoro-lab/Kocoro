@@ -159,7 +159,7 @@ Memory sidecar lifecycle belongs to the daemon. CLI/TUI attach or probe; they do
 
 `/local/auth/*` endpoints proxy to Shannon Cloud `/api/v1/auth/*`. `AuthManager` (`internal/daemon/auth.go`) owns the state machine (`signed_out` / `pending_verification` / `logging_in` / `bootstrapping_key` / `signed_in`); transitions emit `auth_state_changed` on the event bus. WS connection runs only in `signed_in` — `WSController.Start` / `Stop` are the only allowed call sites for spinning the reconnect loop. api_key is the source-of-truth credential and lives in the credential store (service `ai.kocoro.daemon.api_key` — macOS Keychain / Windows Credential Manager / Linux file store at ~/.shannon/credentials.json 0600); access_token / refresh_token are RAM only. On platforms without a credential store (i.e. `!keychain.Supported()`) `AuthManager` is nil, the endpoints respond 503 `platform_unsupported`, and the legacy `cfg.APIKey` path continues to drive WS. Linux IaC caveat: the yaml→store migration moves `api_key` out of config.yaml; config-managed yaml that re-adds it gets re-stripped each launch. See `internal/skills/bundled/skills/kocoro/references/auth.md` for the full endpoint matrix and recovery scenarios.
 
-Implicit episodic preflight is in-message-only: it may inject private memory into the current request, but it must never persist to transcripts, replay, or summaries. Audit only content-free counts/status/error class.
+Episodic recall is model-driven: production CLI, TUI, and daemon paths expose `memory_recall` and `session_search` directly and must not install the implicit small-model preflight. Use structured recall once per concrete target; route unnamed references to session search and stop after structured no-data instead of retrying relation variants.
 
 ### Session Sync
 
@@ -208,7 +208,7 @@ Koe tests link cgo audio deps. On macOS, install them with `brew install opus op
 
 Schedule tests use temp directories and do not write to the real LaunchAgents directory. Run live E2E before releases.
 
-Koe live E2E uses the hidden, foreground-only daemon isolation flags documented in `docs/live-e2e-testing.md`. It isolates filesystem state and port ownership, suppresses Cloud/background automation, and leaves OS credential stores and agent tool capabilities shared with the user account.
+Koe/live E2E uses the hidden, foreground-only daemon isolation flags documented in `docs/live-e2e-testing.md`. It isolates filesystem state, port ownership, and credential-store access; the authorized API key is piped into process memory. It suppresses Cloud/background automation. Agent tool capabilities remain real, while MCP is disabled unless an explicit startup allowlist is applied before registration and on reload.
 
 ## Build And Release
 

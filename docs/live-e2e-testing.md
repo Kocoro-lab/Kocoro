@@ -11,24 +11,35 @@ directory and a random non-default localhost port:
 ./shan daemon start \
   --isolated \
   --state-dir /absolute/path/to/temp-state \
-  --port 17533
+  --port 17533 \
+  --isolated-api-key-stdin
 ```
 
-`--isolated`, `--state-dir`, and `--port` are paired test-harness controls, not
-supported operator configuration. Isolated startup rejects detach, force, port
-`7533`, relative or missing state directories, and Desktop RPC.
+The harness writes the authorized API key to the child's stdin pipe and closes
+it immediately. It never puts the key in config.yaml, argv, environment
+variables, or logs. `--isolated`, `--state-dir`, `--port`,
+`--isolated-api-key-stdin`, and `--isolated-mcp` are hidden test-harness
+controls, not supported operator configuration. Isolated startup rejects
+detach, force, port `7533`, relative or missing state directories, Desktop RPC,
+and a persisted `api_key`.
 
-The mode is state-isolated, not credential- or capability-isolated:
+The mode isolates filesystem state and credential-store access. Tool
+capabilities remain real and must be bounded explicitly:
 
-- On macOS and Windows, the OS credential store is process-global. A paid live
-  run can use the existing daemon API key even though filesystem state is
-  temporary. Never print, copy, or persist that credential.
+- Config loading skips OS credential reads and the yaml-to-keychain migration.
+  The authorized key exists only in parent/child process memory for the run.
 - The request path retains the normal local and provider tool registry. Only run
   authorized, bounded prompts because request-triggered tools can still have
   external side effects.
-- Cloud WS, MCP connections and browser cleanup, watchers, heartbeat, scheduler,
-  sync, marketplace warming, memory services, migration recovery, and
-  interrupted-turn auto-resume are disabled.
+- MCP is disabled unless `--isolated-mcp` names servers present in the temporary
+  config. The allowlist is applied before registration/browser preflight and is
+  reapplied on every config reload. Unknown names fail closed.
+- Cloud WS, non-allowlisted MCP connections, browser cleanup, watchers,
+  heartbeat, scheduler, sync, marketplace warming, memory services, migration
+  recovery, and interrupted-turn auto-resume are disabled.
+
+Real-provider tests never infer consent from a reachable endpoint or installed
+credential. `SHANNON_E2E_LIVE=1` is required on every paid live lane.
 
 Do not use `shan daemon stop` or `shan daemon status` for an isolated child;
 those commands intentionally target the production daemon. Verify the child
@@ -46,6 +57,12 @@ PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
 go test ./test/e2e \
   -run '^TestLive_Daemon_(MessageAndEditRetry|AgentListIncludesBuiltins)$' \
   -count=1 -v -timeout=5m
+
+SHANNON_E2E_LIVE=1 \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+go test ./test/e2e \
+  -run '^TestLive_(MidRunProgressNotesReachTheUser|DedicatedContentSearchAvoidsShell|BusinessErrorStopsWithoutRetry|ChannelDeliveryMetadataShapesReply|IsolatedMCPAllowlist_FullPath)$' \
+  -count=1 -v -timeout=12m
 
 KOE_LIVE_TEXT_FULL_PATH_E2E=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \

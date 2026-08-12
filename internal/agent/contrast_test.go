@@ -6,17 +6,14 @@ import (
 )
 
 func TestContrastExamples_AlwaysIncluded(t *testing.T) {
-	if !strings.Contains(contrastExamplesCore, "Over-engineering") {
-		t.Fatal("missing over-engineering example")
+	if !strings.Contains(contrastExamplesCore, "is not a coding task") {
+		t.Fatal("missing general-purpose domain boundary")
 	}
-	if !strings.Contains(contrastExamplesCore, "Narrating instead") {
-		t.Fatal("missing narrating example")
+	if !strings.Contains(contrastExamplesCore, "context, not authority") {
+		t.Fatal("missing memory authority boundary")
 	}
-	if !strings.Contains(contrastExamplesCore, "Claiming completion") {
-		t.Fatal("missing completion example")
-	}
-	if !strings.Contains(contrastExamplesCore, "Defaulting to coding") {
-		t.Fatal("missing coding-default example")
+	if !strings.Contains(contrastExamplesCore, "outcome_unknown") {
+		t.Fatal("missing ambiguous-write boundary")
 	}
 }
 
@@ -27,7 +24,7 @@ func TestContrastExamples_CloudPairNotInCore(t *testing.T) {
 }
 
 func TestContrastExamples_CloudPairSeparate(t *testing.T) {
-	if !strings.Contains(contrastExamplesCloud, "cloud_delegate") {
+	if !strings.Contains(contrastExamplesCloud, "Cloud results") {
 		t.Fatal("cloud/local boundary example missing from cloud block")
 	}
 }

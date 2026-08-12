@@ -33,8 +33,14 @@ func TestDecideModeAdmissionContract(t *testing.T) {
 			wantDecision: AdmissionModeSelectedFull,
 		},
 		{
-			name: "reason cannot override selected fast",
+			name: "recognized full reason makes selected fast fail closed",
 			mode: "fast", reason: string(FullReasonProductionIncident),
+			wantMode: ModeFull, wantReason: FullReasonProductionIncident,
+			wantDecision: AdmissionFastReasonConflict,
+		},
+		{
+			name: "unknown reason cannot upgrade selected fast",
+			mode: "fast", reason: "lots_of_tools",
 			wantMode: ModeFast, wantDecision: AdmissionModeSelectedFast,
 		},
 		{
@@ -97,7 +103,7 @@ func TestDecideModeAdmissionNeverReadsTaskProse(t *testing.T) {
 	}
 	for _, task := range tasks {
 		_ = task
-		got := DecideModeAdmission("fast", string(FullReasonProductionIncident))
+		got := DecideModeAdmission("fast", string(FullReasonNone))
 		if got.AdmittedMode != ModeFast {
 			t.Errorf("task prose unexpectedly affected admission: %+v", got)
 		}

@@ -196,6 +196,21 @@ func extractResultSignature(content string) string {
 	return strings.Join(urls, ",")
 }
 
+// toolOutcomeSignature returns a non-reversible identity for a complete tool
+// result. JSON is canonicalized so key ordering alone does not manufacture
+// progress; non-JSON output is hashed verbatim because whitespace and text can
+// be meaningful state for observation tools.
+func toolOutcomeSignature(content string) string {
+	canonical := content
+	var decoded any
+	if json.Unmarshal([]byte(content), &decoded) == nil {
+		if encoded, err := json.Marshal(decoded); err == nil {
+			canonical = string(encoded)
+		}
+	}
+	return hashArgs(canonical)
+}
+
 // isNonActionableSearch returns true if a search-family tool returned results
 // that don't help the model make progress: no matches, binary-only matches,
 // or errors. Productive searches (actual source code hits) return false.

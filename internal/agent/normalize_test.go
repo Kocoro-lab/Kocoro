@@ -93,3 +93,14 @@ func TestNormalizeStructuredToolCallPreamble_PreservesMeaningfulText(t *testing.
 		t.Fatalf("expected meaningful text to be preserved, got %q", got)
 	}
 }
+
+func TestToolOutcomeSignatureCanonicalizesJSONObjects(t *testing.T) {
+	a := toolOutcomeSignature(`{"status":"running","progress":25}`)
+	b := toolOutcomeSignature(`{ "progress": 25, "status": "running" }`)
+	if a != b {
+		t.Fatalf("semantically identical JSON outcomes must share a signature: %q != %q", a, b)
+	}
+	if a == toolOutcomeSignature(`{"status":"running","progress":60}`) {
+		t.Fatal("changed progress must produce a different outcome signature")
+	}
+}

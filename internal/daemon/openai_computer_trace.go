@@ -17,25 +17,36 @@ const openAIComputerTraceEventNameV1 = "computer_use_trace_v1"
 // executor control path and timing without model text, typed text, coordinates,
 // AX values, window titles, screenshots, response IDs, or provider call IDs.
 type openAIComputerTraceEventV1 struct {
-	SchemaVersion      int    `json:"schema_version"`
-	Phase              string `json:"phase"`
-	Status             string `json:"status"`
-	Attempt            int    `json:"attempt,omitempty"`
-	BatchIndex         int    `json:"batch_index,omitempty"`
-	ActionIndex        int    `json:"action_index,omitempty"`
-	ActionCount        int    `json:"action_count,omitempty"`
-	ActionType         string `json:"action_type,omitempty"`
-	AppBundleID        string `json:"app_bundle_id,omitempty"`
-	ExecutionLane      string `json:"execution_lane,omitempty"`
-	ForegroundFallback bool   `json:"foreground_fallback,omitempty"`
-	FallbackReason     string `json:"fallback_reason,omitempty"`
-	FrontmostClass     string `json:"frontmost_class,omitempty"`
-	CommitState        string `json:"commit_state,omitempty"`
-	FailureCode        string `json:"failure_code,omitempty"`
-	ModelCalls         int    `json:"model_calls,omitempty"`
-	ModelTimeouts      int    `json:"model_timeouts,omitempty"`
-	BatchCount         int    `json:"batch_count,omitempty"`
-	DurationMS         int64  `json:"duration_ms"`
+	SchemaVersion         int     `json:"schema_version"`
+	Phase                 string  `json:"phase"`
+	Status                string  `json:"status"`
+	Attempt               int     `json:"attempt,omitempty"`
+	BatchIndex            int     `json:"batch_index,omitempty"`
+	ActionIndex           int     `json:"action_index,omitempty"`
+	ActionCount           int     `json:"action_count,omitempty"`
+	ActionType            string  `json:"action_type,omitempty"`
+	AppBundleID           string  `json:"app_bundle_id,omitempty"`
+	ExecutionLane         string  `json:"execution_lane,omitempty"`
+	ForegroundFallback    bool    `json:"foreground_fallback,omitempty"`
+	FallbackReason        string  `json:"fallback_reason,omitempty"`
+	FrontmostClass        string  `json:"frontmost_class,omitempty"`
+	CommitState           string  `json:"commit_state,omitempty"`
+	FailureCode           string  `json:"failure_code,omitempty"`
+	ModelCalls            int     `json:"model_calls,omitempty"`
+	ModelTimeouts         int     `json:"model_timeouts,omitempty"`
+	BatchCount            int     `json:"batch_count,omitempty"`
+	LLMCalls              int     `json:"llm_calls,omitempty"`
+	InputTokens           int     `json:"input_tokens,omitempty"`
+	OutputTokens          int     `json:"output_tokens,omitempty"`
+	TotalTokens           int     `json:"total_tokens,omitempty"`
+	CostUSD               float64 `json:"cost_usd,omitempty"`
+	CacheReadTokens       int     `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens   int     `json:"cache_creation_tokens,omitempty"`
+	CacheCreation5mTokens int     `json:"cache_creation_5m_tokens,omitempty"`
+	CacheCreation1hTokens int     `json:"cache_creation_1h_tokens,omitempty"`
+	ContextWindowTokens   int     `json:"context_window_tokens,omitempty"`
+	ContextWindowSource   string  `json:"context_window_source,omitempty"`
+	DurationMS            int64   `json:"duration_ms"`
 
 	// Capture diagnostics are written as a separate structured audit event.
 	// Keeping them out of this JSON prevents the audit logger's intentionally

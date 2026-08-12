@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -91,15 +92,37 @@ func newOpenAIComputerInitialResponseClientV1(
 	}
 }
 
+func newOpenAIComputerPrivateGatewayV1(
+	ctx context.Context,
+	delegate client.LLMClient,
+	window time.Duration,
+	attempts int,
+) *openAIComputerInitialResponseClientV1 {
+	return newOpenAIComputerInitialResponseClientV1(
+		agent.WrapNestedLLMClientFromContext(ctx, delegate),
+		window,
+		attempts,
+	)
+}
+
 func (c *openAIComputerInitialResponseClientV1) complete(
 	ctx context.Context,
 	invoke func(context.Context) (*client.CompletionResponse, error),
 ) (*client.CompletionResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	if c.completed {
 		c.modelCalls++
 		c.mu.Unlock()
-		return invoke(ctx)
+		response, err := invoke(ctx)
+		if errors.Is(err, agent.ErrRequestBudgetExhausted) {
+			c.mu.Lock()
+			c.modelCalls--
+			c.mu.Unlock()
+		}
+		return response, err
 	}
 	if c.unavailable != nil {
 		unavailable := c.unavailable
@@ -117,6 +140,10 @@ func (c *openAIComputerInitialResponseClientV1) complete(
 		if err == nil {
 			c.completed = true
 			return response, nil
+		}
+		if errors.Is(err, agent.ErrRequestBudgetExhausted) {
+			c.modelCalls--
+			return nil, err
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -393,6 +420,45 @@ func openAIComputerNoEffectInterventionResultV1(
 	)
 }
 
+func openAIComputerRequestBudgetExhaustedResultV1(
+	detail string,
+	effect agent.ComputerUseCommitEffect,
+) agent.ToolResult {
+	detail = strings.Join(strings.Fields(
+		boundOpenAIComputerObservationDetailV1(detail),
+	), " ")
+	if detail == "" {
+		detail = "the shared provider request budget was exhausted"
+	}
+	if effect == agent.ComputerUseCommitKnown ||
+		effect == agent.ComputerUseCommitUnknown {
+		result := openAIComputerTaskUnverifiedResultV1(
+			"request_budget_exhausted_after_action",
+			detail,
+			effect,
+		)
+		result.IsError = true
+		result.ErrorCategory = agent.ErrCategoryBusiness
+		result.SideEffectOutcomeUnknown =
+			effect == agent.ComputerUseCommitUnknown
+		return result
+	}
+	result := withOpenAIComputerTaskFailureOutcomeV1(
+		agent.BusinessError(
+			"computer_use_error: request_budget_exhausted_before_action\n"+
+				"message: Computer Use stopped before a native input action because the shared provider request budget was exhausted\n"+
+				"recovery: do not retry computer_use or start another provider-backed desktop-control path in this turn\n"+
+				"detail: "+detail,
+		),
+		agent.ComputerUseTaskNotCompleted,
+		agent.ComputerUseCommitNone,
+		"request_budget_exhausted_before_action",
+		agent.ComputerUseRecoveryNone,
+	)
+	result.SideEffectKnownNoEffect = true
+	return result
+}
+
 func openAIComputerPreActionRecoveryV1(
 	appPreparationMayHaveOccurred bool,
 ) string {
@@ -444,13 +510,14 @@ type openAIComputerTaskToolV1 struct {
 	appPolicy       *ComputerUseAppPolicyStore
 	handler         agent.EventHandler
 
-	modelTier   string
-	shannonDir  string
-	maxIter     int
-	maxTokens   int
-	resultTrunc int
-	argsTrunc   int
-	taskTimeout time.Duration
+	modelTier             string
+	shannonDir            string
+	maxIter               int
+	maxTokens             int
+	contextWindowFallback int
+	resultTrunc           int
+	argsTrunc             int
+	taskTimeout           time.Duration
 	// Tests may shorten this private first-response window. Production keeps
 	// exactly one retry so a provider-side stall cannot consume the whole task.
 	initialResponseTimeout  time.Duration
@@ -772,7 +839,7 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 				"controlled_apps": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Optional macOS app names whose UI the executor may read or change. Exclude any app named only as the frontmost app to preserve.",
+					"description": "Optional canonical installed macOS app names or bundle identifiers whose UI the executor may read or change. Do not translate app names (for example, use Weather or System Settings). Exclude any app named only as the frontmost app to preserve.",
 				},
 				"foreground_policy": map[string]any{
 					"type": "string",
@@ -913,13 +980,13 @@ func (t *openAIComputerTaskToolV1) Run(
 				agent.BusinessError(
 					"computer_use_error: app_resolution_failed\n"+
 						"message: Computer Use could not resolve the requested app target\n"+
-						"recovery: "+openAIComputerPreActionRecoveryV1(false)+"\n"+
+						"recovery: retry computer_use once in this turn with corrected canonical installed app names or bundle identifiers in controlled_apps; do not switch to another desktop-control tool\n"+
 						"detail: "+err.Error(),
 				),
 				agent.ComputerUseTaskNotCompleted,
 				agent.ComputerUseCommitNone,
 				"app_resolution_failed",
-				agent.ComputerUseRecoveryAlternateControl,
+				agent.ComputerUseRecoveryRetryWithApps,
 			), nil
 		}
 		trace.record(openAIComputerTraceEventV1{
@@ -1262,7 +1329,8 @@ func (t *openAIComputerTaskToolV1) Run(
 	runner.trace = trace
 	runner.observationRetry = retryObservation
 	runner.postBatchSettle = t.postBatchSettle
-	privateGateway := newOpenAIComputerInitialResponseClientV1(
+	privateGateway := newOpenAIComputerPrivateGatewayV1(
+		ctx,
 		t.gateway,
 		t.initialResponseTimeout,
 		t.initialResponseAttempts,
@@ -1282,10 +1350,15 @@ func (t *openAIComputerTaskToolV1) Run(
 	child.SetSkillDiscovery(false)
 	child.SetBypassPermissions(true)
 	child.SetSpecificModel(profile.Model())
+	t.seedChildContextWindow(child, profile, trace)
 	child.SetExecutionProfile(profile)
 	child.SetOpenAIComputerBatchExecutor(runner)
 	child.SetForceInitialToolUse(true)
-	child.SetHandler(openAIComputerChildHandlerV1{parent: t.handler})
+	childUsage := &agent.UsageAccumulator{}
+	child.SetHandler(openAIComputerChildHandlerV1{
+		parent: t.handler,
+		usage:  childUsage,
+	})
 	child.SetStickyContext(
 		"execution_role=private_openai_native_computer\n" +
 			"Complete the user's entire desktop goal with the native computer tool. " +
@@ -1354,13 +1427,23 @@ func (t *openAIComputerTaskToolV1) Run(
 	)
 	stats := runner.BatchStatsV1()
 	providerStats := privateGateway.StatsV1()
+	childLLMUsage := childUsage.Snapshot().LLM
 	providerEvent := openAIComputerTraceEventV1{
-		Phase:         "private_executor",
-		Status:        "completed",
-		ModelCalls:    providerStats.ModelCalls,
-		ModelTimeouts: providerStats.ModelTimeouts,
-		BatchCount:    stats.Batches,
-		DurationMS:    time.Since(providerStarted).Milliseconds(),
+		Phase:                 "private_executor",
+		Status:                "completed",
+		ModelCalls:            providerStats.ModelCalls,
+		ModelTimeouts:         providerStats.ModelTimeouts,
+		BatchCount:            stats.Batches,
+		LLMCalls:              childLLMUsage.LLMCalls,
+		InputTokens:           childLLMUsage.InputTokens,
+		OutputTokens:          childLLMUsage.OutputTokens,
+		TotalTokens:           childLLMUsage.TotalTokens,
+		CostUSD:               childLLMUsage.CostUSD,
+		CacheReadTokens:       childLLMUsage.CacheReadTokens,
+		CacheCreationTokens:   childLLMUsage.CacheCreationTokens,
+		CacheCreation5mTokens: childLLMUsage.CacheCreation5mTokens,
+		CacheCreation1hTokens: childLLMUsage.CacheCreation1hTokens,
+		DurationMS:            time.Since(providerStarted).Milliseconds(),
 	}
 	if err != nil {
 		var initialUnavailable *openAIComputerInitialResponseUnavailableV1
@@ -1379,6 +1462,31 @@ func (t *openAIComputerTaskToolV1) Run(
 		}
 	}
 	trace.record(providerEvent)
+	if err != nil && errors.Is(err, agent.ErrRequestBudgetExhausted) {
+		failureCode := "request_budget_exhausted_before_action"
+		status := "failed"
+		if stats.TaskEffect == agent.ComputerUseCommitKnown ||
+			stats.TaskEffect == agent.ComputerUseCommitUnknown {
+			failureCode = "request_budget_exhausted_after_action"
+			status = "completed_unverified"
+		}
+		trace.record(openAIComputerTraceEventV1{
+			Phase:       "task",
+			Status:      status,
+			FailureCode: failureCode,
+			DurationMS:  time.Since(taskStarted).Milliseconds(),
+		})
+		detail := err.Error()
+		if (stats.TaskEffect == agent.ComputerUseCommitKnown ||
+			stats.TaskEffect == agent.ComputerUseCommitUnknown) &&
+			strings.TrimSpace(reply) != "" {
+			detail += "\nchild_summary: " + reply
+		}
+		return openAIComputerRequestBudgetExhaustedResultV1(
+			detail,
+			stats.TaskEffect,
+		), nil
+	}
 	if stats.TaskEffect == agent.ComputerUseCommitUnknown &&
 		(err != nil || !stats.LastBatchHadFreshObservation) {
 		failureCode := stats.LastFailureCode
@@ -1696,10 +1804,41 @@ func (t *openAIComputerTaskToolV1) Run(
 	), nil
 }
 
+func (t *openAIComputerTaskToolV1) seedChildContextWindow(
+	child *agent.AgentLoop,
+	profile *client.ExecutionProfile,
+	trace *openAIComputerTraceV1,
+) {
+	if child == nil || profile == nil {
+		return
+	}
+	if contextWindow, ok := agent.LookupModelContextWindow(profile.Model()); ok {
+		child.SetContextWindow(contextWindow)
+		return
+	}
+	fallback := t.contextWindowFallback
+	if fallback > 0 {
+		child.SetContextWindow(fallback)
+	}
+	log.Printf(
+		"daemon: computer child context-window catalog miss model=%q fallback_tokens=%d",
+		profile.Model(),
+		fallback,
+	)
+	trace.record(openAIComputerTraceEventV1{
+		Phase:               "child_context_window",
+		Status:              "fallback",
+		FailureCode:         "model_context_window_unknown",
+		ContextWindowTokens: fallback,
+		ContextWindowSource: "config_fallback",
+	})
+}
+
 // The child shares approvals and usage reporting with the parent transport,
 // while its intermediate narration stays inside the single parent tool card.
 type openAIComputerChildHandlerV1 struct {
 	parent agent.EventHandler
+	usage  *agent.UsageAccumulator
 }
 
 func (h openAIComputerChildHandlerV1) OnToolCall(string, string, string) {}
@@ -1714,6 +1853,9 @@ func (h openAIComputerChildHandlerV1) OnCloudAgent(string, string, string) {}
 func (h openAIComputerChildHandlerV1) OnCloudProgress(int, int)            {}
 func (h openAIComputerChildHandlerV1) OnCloudPlan(string, string, bool)    {}
 func (h openAIComputerChildHandlerV1) OnUsage(usage agent.TurnUsage) {
+	if h.usage != nil {
+		h.usage.Add(usage)
+	}
 	if h.parent != nil {
 		h.parent.OnUsage(usage)
 	}

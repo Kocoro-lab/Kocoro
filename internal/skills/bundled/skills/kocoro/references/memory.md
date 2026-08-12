@@ -120,58 +120,28 @@ Memory:    disabled (tlm_binary_too_old)
 Repair:    bundle_version= compatibility=incompatible sub_code=no_manifest
 ```
 
-## Implicit episodic preflight
+## Model-driven episodic recall
 
-Before the first main-model call on a memory-relevant turn, the daemon runs
-a preflight: a small-tier helper compiles `QueryIntent`s via forced
-`tool_use`, the sidecar resolves them, and a `<private_memory>` block is
-injected into the current user message before it reaches the main model.
-Many memory questions are answered on turn 0 without an explicit
-`memory_recall` invocation.
+The main model calls `memory_recall` when the answer depends on the user's
+private past. There is no hidden classifier or memory pre-fetch before an
+ordinary turn.
 
-- Fires only when sidecar status is `Ready`. With sidecar unavailable, the
-  agent falls back to the `memory_recall` tool's degraded path described
-  below.
-- The `<private_memory>` block is in-message-only — never persisted to the
-  session transcript, never replayed, and stripped from compaction summaries
-  at every `GenerateSummary` site.
-- Both implicit preflight and explicit `memory_recall` consume the sidecar's
-  per-group `evidence_tier`: `corroborated` may be stated plainly as a past
-  record; `singleton`, `derived`, `text`, and missing/unknown tiers must be
-  qualified. Current user statements and verified current observations take
-  precedence; recorded values are never silently replaced with training
-  knowledge. Exhaustive answers retain relevant weaker items with hedging,
-  while space-limited summaries prioritize corroborated items. Tier labels,
-  support counts, event IDs, and other raw provenance stay internal unless the
-  user asks for them; translate strength into natural confidence wording
-  instead of quoting field names, bracketed markers, or counts.
-- Audit event `memory_preflight` records a content-free trace:
-  `attempted` / `helper_used` / `intents_count` / `results_count` /
-  `context_injected` / `outcome` / `error_class` / `http_status`. Query
-  text, anchor mentions, relation labels, and recalled content are never
-  logged.
-- Debug dump: restarting the daemon with `SHANNON_PREFLIGHT_DUMP=1` appends
-  every injected `<private_memory>` block verbatim to
-  `~/.shannon/logs/preflight_dump.jsonl` (`{timestamp, session_id, context}`
-  rows, file 0600). This is the only record of what the block contained —
-  use it to attribute "did the model ever see fact X" incidents, keep it
-  off in normal operation, and delete the file after debugging (it holds
-  private memory content).
-- Outcomes worth tracing (the rich set is set inside the preflight; loop.go
-  only fills `Outcome` if still empty):
-  - `context_injected` — happy path, model received the block
-  - `context_returned` — preflight produced a block but injection was
-    skipped upstream (rare)
-  - `no_results` — intents compiled but the sidecar found nothing
-  - `no_context` — results returned but every group was filtered
-  - `no_intents` / `helper_declined` / `gate_declined` — preflight
-    intentionally skipped (greeting / task-text / non-memory prompt)
-  - `query_timeout` — sidecar exceeded its per-intent budget
-  - `helper_error` — small-tier helper call failed; cross-reference
-    `error_class` (`no_tool_call`, `wrong_tool`, `invalid_tool_args`,
-    `nil_response`, `unknown`)
-  - `memory_unavailable` / `helper_unavailable` / `querier_unavailable` —
-    degraded path; agent fell back to the explicit `memory_recall` tool
+- Natural questions such as a person's email or a prior project detail do not
+  need to say “remember” or “recall”.
+- Use `memory_recall` once for each concrete named anchor or target. The tool
+  consumes the sidecar's per-group `evidence_tier`: `corroborated` may be
+  stated plainly as a past record; `singleton`, `derived`, `text`, and
+  missing/unknown tiers must be qualified.
+- For an unnamed reference such as “my doctor” or “that plan”, use
+  `session_search` to recover the concrete name or raw wording instead of
+  inventing a graph anchor.
+- If structured recall returns no direct answer, do not retry the same target
+  with alternative relation names or modes. Use one focused session search
+  only when transcript wording can resolve the missing detail.
+- Current user statements and verified current observations take precedence;
+  recorded values are never silently replaced with training knowledge. Tier
+  labels, support counts, event IDs, and other raw provenance stay internal
+  unless the user asks for them.
 
 ## Behavior when memory is unavailable
 

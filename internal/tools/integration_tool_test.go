@@ -29,6 +29,9 @@ func TestIntegrationTool_Metadata(t *testing.T) {
 	if tool.ToolSource() != agent.SourceIntegration {
 		t.Errorf("ToolSource = %q, want %q", tool.ToolSource(), agent.SourceIntegration)
 	}
+	if _, ok := agent.Tool(tool).(agent.ReadOnlyChecker); ok {
+		t.Error("server tools must not couple journal materiality to speculative read-only execution")
+	}
 }
 
 // TestIntegrationTool_Run_HitsIntegrationEndpoint verifies the tool proxies to
@@ -57,6 +60,252 @@ func TestIntegrationTool_Run_HitsIntegrationEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "p1") {
 		t.Errorf("expected output to contain 'p1', got %q", result.Content)
+	}
+}
+
+func TestIntegrationTool_PostDispatchResponseLossIsOutcomeUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "slack_post_message"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want outcome unknown", result)
+	}
+	if result.IsRetryable || result.ErrorCategory != "" {
+		t.Fatalf("outcome unknown must not be retryable: %#v", result)
+	}
+	if strings.Contains(result.Content, server.URL) {
+		t.Fatalf("outcome-unknown diagnostic leaked gateway URL: %q", result.Content)
+	}
+}
+
+func TestIntegrationTool_MalformedSuccessResponseIsOutcomeUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":`))
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "notion_create_page"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"title":"x"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want outcome unknown", result)
+	}
+}
+
+func TestIntegrationTool_ConnectionRefusedIsTransientNoEffect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	baseURL := server.URL
+	server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "slack_post_message"},
+		client.NewGatewayClient(baseURL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want known pre-dispatch failure", result)
+	}
+	if result.ErrorCategory != agent.ErrCategoryTransient || !result.IsRetryable {
+		t.Fatalf("result = %#v, want retryable transient", result)
+	}
+	if !result.SideEffectKnownNoEffect {
+		t.Fatalf("result = %#v, want explicit no-effect marker", result)
+	}
+}
+
+func TestIntegrationTool_HTTPStatusPolicy(t *testing.T) {
+	tests := []struct {
+		status       int
+		wantUnknown  bool
+		wantCategory agent.ErrorCategory
+		wantRetry    bool
+	}{
+		{status: http.StatusBadRequest, wantCategory: agent.ErrCategoryValidation},
+		{status: http.StatusUnprocessableEntity, wantCategory: agent.ErrCategoryValidation},
+		{status: http.StatusUnauthorized, wantCategory: agent.ErrCategoryPermission},
+		{status: http.StatusForbidden, wantCategory: agent.ErrCategoryPermission},
+		{status: http.StatusNotFound, wantCategory: agent.ErrCategoryBusiness},
+		{status: http.StatusConflict, wantUnknown: true},
+		{status: http.StatusRequestTimeout, wantUnknown: true},
+		{status: http.StatusInternalServerError, wantUnknown: true},
+		{status: http.StatusBadGateway, wantUnknown: true},
+		{status: http.StatusNotImplemented, wantUnknown: true},
+		{status: http.StatusGatewayTimeout, wantUnknown: true},
+		{status: http.StatusTooManyRequests, wantCategory: agent.ErrCategoryTransient, wantRetry: true},
+		{status: http.StatusServiceUnavailable, wantUnknown: true},
+	}
+	for _, tt := range tests {
+		t.Run(http.StatusText(tt.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(`{"error":"cloud rejected request"}`))
+			}))
+			defer server.Close()
+
+			tool := NewIntegrationTool(
+				client.ServerToolSchema{Name: "slack_post_message"},
+				client.NewGatewayClient(server.URL, ""),
+			)
+			result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if !result.IsError || result.SideEffectOutcomeUnknown != tt.wantUnknown {
+				t.Fatalf("result = %#v, want unknown=%t", result, tt.wantUnknown)
+			}
+			if result.ErrorCategory != tt.wantCategory || result.IsRetryable != tt.wantRetry {
+				t.Fatalf("result = %#v, want category=%q retry=%t", result, tt.wantCategory, tt.wantRetry)
+			}
+			wantNoEffect := !tt.wantUnknown
+			if result.SideEffectKnownNoEffect != wantNoEffect {
+				t.Fatalf("SideEffectKnownNoEffect = %t, want %t", result.SideEffectKnownNoEffect, wantNoEffect)
+			}
+		})
+	}
+}
+
+func TestMaterialServerTool_PreCancelledContextDoesNotDispatch(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(toolExecResp(true, map[string]any{"ok": true}, nil))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	tools := []*ServerTool{
+		NewIntegrationTool(client.ServerToolSchema{Name: "slack_post_message"}, gw),
+		NewServerTool(client.ServerToolSchema{Name: "web_crawl"}, gw),
+	}
+	for _, tool := range tools {
+		t.Run(tool.Info().Name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			result, err := tool.Run(ctx, `{}`)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if !result.IsError || result.SideEffectOutcomeUnknown || result.IsRetryable ||
+				!result.SideEffectKnownNoEffect {
+				t.Fatalf("result = %#v, want cancelled/no-effect", result)
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("gateway calls = %d, want 0", calls)
+	}
+}
+
+func TestIntegrationTool_CreateRequestFailureIsNonRetryableNoEffect(t *testing.T) {
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "slack_post_message"},
+		client.NewGatewayClient("://invalid-base-url", ""),
+	)
+	result, err := tool.Run(context.Background(), `{"channel":"c","text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.IsRetryable || result.ErrorCategory != agent.ErrCategoryBusiness ||
+		!result.SideEffectKnownNoEffect || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want non-retryable pre-dispatch no-effect", result)
+	}
+}
+
+func TestIntegrationTool_ProviderValidationTextIsNotKnownNoEffect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(toolExecResp(false, nil, strPtr("validation error: provider rejected content")))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	tools := []*ServerTool{
+		NewIntegrationTool(client.ServerToolSchema{Name: "notion_create_page"}, gw),
+		NewServerTool(client.ServerToolSchema{Name: "web_crawl"}, gw),
+	}
+	for _, tool := range tools {
+		t.Run(tool.Info().Name, func(t *testing.T) {
+			result, err := tool.Run(context.Background(), `{}`)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if !result.IsError || result.ErrorCategory != "" || result.SideEffectKnownNoEffect {
+				t.Fatalf("result = %#v, want ordinary provider error without no-effect evidence", result)
+			}
+		})
+	}
+}
+
+func TestGatewayNonMaterialTool_TransportLossStaysOrdinaryError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	tool := NewServerTool(
+		client.ServerToolSchema{Name: "web_search"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"query":"x"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want ordinary read-only transport error", result)
+	}
+}
+
+func TestGatewayMaterialTool_ResponseLossIsOutcomeUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	tool := NewServerTool(
+		client.ServerToolSchema{Name: "web_crawl"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"url":"https://example.test"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !result.SideEffectOutcomeUnknown || result.IsRetryable {
+		t.Fatalf("result = %#v, want non-retryable outcome unknown", result)
 	}
 }
 

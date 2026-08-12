@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/cwdctx"
 )
 
@@ -39,6 +40,24 @@ func TestGrep_FindsMatches(t *testing.T) {
 	}
 }
 
+func TestGrep_MissingPathIsBusinessError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "observatory-archive")
+	tool := &GrepTool{}
+	result, err := tool.Run(
+		context.Background(),
+		fmt.Sprintf(`{"pattern":"PULSAR-904","path":%q,"description":"search archive"}`, missing),
+	)
+	if err != nil {
+		t.Fatalf("Run should not return a transport error, got %v", err)
+	}
+	if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness {
+		t.Fatalf("missing path was not classified as non-retryable business failure: %#v", result)
+	}
+	if !strings.HasPrefix(result.Content, "[business error]") {
+		t.Fatalf("missing business-error prefix: %q", result.Content)
+	}
+}
+
 // TestGrep_FindsMatches_ContentMode is the explicit opt-in for the old
 // behavior — file:line:text with match content. Required to keep grep
 // useful for "what does the matching line say" use cases.
@@ -58,6 +77,38 @@ func TestGrep_FindsMatches_ContentMode(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "hello world") {
 		t.Errorf("content mode must include matching line text; got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "[search receipt] status=complete") ||
+		!strings.Contains(result.Content, "recursive=true output_mode=content") ||
+		!strings.Contains(result.Content, "total_results=1 returned=1 truncated=false") ||
+		!strings.Contains(result.Content, "per_file_cap=50 per_file_cap_reached=false") {
+		t.Errorf("content result lacked a complete coverage receipt: %s", result.Content)
+	}
+}
+
+func TestGrep_ContentPerFileCapIsReportedAsWindowed(t *testing.T) {
+	tmp := t.TempDir()
+	content := strings.Repeat("needle\n", grepPerFileMaxCount+10)
+	if err := os.WriteFile(filepath.Join(tmp, "many.txt"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := &GrepTool{}
+	result, err := tool.Run(context.Background(),
+		fmt.Sprintf(`{"pattern":"needle","path":%q,"output_mode":"content","description":"test per-file cap"}`, tmp))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "[search receipt] status=windowed") ||
+		!strings.Contains(result.Content, "observed_results=50 returned=50 truncated=true") ||
+		!strings.Contains(result.Content, "per_file_cap=50 per_file_cap_reached=true") {
+		t.Fatalf("per-file cap was reported as complete: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "total_results=") {
+		t.Fatalf("capped result claimed an exact total: %s", result.Content)
 	}
 }
 
@@ -175,6 +226,10 @@ func TestGrep_NoMatchesReturnsSuccess(t *testing.T) {
 	if !strings.Contains(strings.ToLower(result.Content), "no matches") {
 		t.Errorf("expected 'no matches' message, got: %s", result.Content)
 	}
+	if !strings.Contains(result.Content, "[search receipt] status=complete") ||
+		!strings.Contains(result.Content, "total_results=0 returned=0 truncated=false") {
+		t.Errorf("no-match result lacked a complete coverage receipt: %s", result.Content)
+	}
 }
 
 // TestGrep_GlobalLineCap: when a single search produces more than max_results
@@ -224,6 +279,10 @@ func TestGrep_GlobalLineCap(t *testing.T) {
 	}
 	if !hasTruncation {
 		t.Errorf("expected truncation notice, got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "[search receipt] status=windowed") ||
+		!strings.Contains(result.Content, "returned=20 truncated=true") {
+		t.Errorf("truncated result lacked a windowed coverage receipt: %s", result.Content)
 	}
 }
 

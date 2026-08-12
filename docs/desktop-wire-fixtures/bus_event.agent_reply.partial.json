@@ -1,0 +1,8 @@
+{
+  "agent": "",
+  "source": "heartbeat",
+  "session_id": "f3b2a1c0-9d8e-4f5a-b6c7-d8e9f0a1b2c3",
+  "text": "Partial answer: the requested work is not complete.",
+  "partial": true,
+  "failure_code": "iteration_limit"
+}

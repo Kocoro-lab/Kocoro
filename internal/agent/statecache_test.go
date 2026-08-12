@@ -1,17 +1,10 @@
 package agent
 
-import (
-	"context"
-	"encoding/json"
-	"testing"
-)
+import "testing"
 
 func TestResolveCallStateTraits(t *testing.T) {
-	t.Run("browser read is cacheable", func(t *testing.T) {
+	t.Run("browser observation reads browser state", func(t *testing.T) {
 		traits := resolveCallStateTraits("browser_snapshot", `{}`)
-		if !traits.Cacheable {
-			t.Fatal("expected browser_snapshot to be cacheable")
-		}
 		if len(traits.Reads) != 1 || traits.Reads[0].Domain != StateDomainBrowser {
 			t.Fatalf("expected browser read traits, got %+v", traits)
 		}
@@ -27,69 +20,25 @@ func TestResolveCallStateTraits(t *testing.T) {
 		}
 	})
 
-	t.Run("bash is unknown write", func(t *testing.T) {
+	t.Run("bash writes process session state", func(t *testing.T) {
 		traits := resolveCallStateTraits("bash", `{"command":"pwd"}`)
-		if !traits.UnknownWrite {
-			t.Fatal("expected bash to be treated as an unknown write")
-		}
 		if len(traits.Writes) != 1 || traits.Writes[0].Domain != StateDomainProcess {
 			t.Fatalf("unexpected bash traits: %+v", traits)
 		}
 	})
 }
 
-func TestBuildStateAwareCacheKeyChangesAfterVersionBump(t *testing.T) {
+// A tracked write must move the shape-context fingerprint to a new generation
+// so tree-result shaping never treats a post-write observation as a repeat of
+// the pre-write one.
+func TestShapeContextKeyChangesAfterVersionBump(t *testing.T) {
 	tracker := newStateVersionTracker()
 	traits := resolveCallStateTraits("file_read", `{"path":"/tmp/example.txt"}`)
 
-	before := buildStateAwareCacheKey("file_read", json.RawMessage(`{"path":"/tmp/example.txt"}`), traits, tracker)
-	if before == "" {
-		t.Fatal("expected initial cache key")
-	}
-
+	before := shapeContextKey("file_read", traits, tracker)
 	tracker.bump([]StateRef{{Domain: StateDomainFilesystem, Scope: "/tmp/example.txt"}})
-	after := buildStateAwareCacheKey("file_read", json.RawMessage(`{"path":"/tmp/example.txt"}`), traits, tracker)
-	if after == "" {
-		t.Fatal("expected post-write cache key")
-	}
+	after := shapeContextKey("file_read", traits, tracker)
 	if before == after {
-		t.Fatalf("expected cache key to change after version bump, got %q", before)
+		t.Fatalf("expected shape-context key to change after version bump, got %q", before)
 	}
 }
-
-func TestStatefulGUIObservationsBypassFallbackReadCache(t *testing.T) {
-	for _, name := range []string{"computer_use", "accessibility"} {
-		t.Run(name, func(t *testing.T) {
-			tool := statefulReadCacheProbe{name: name}
-			traits := resolveFallbackReadStateTraits(tool, `{"action":"get_app_state"}`)
-			if traits.Cacheable || len(traits.Reads) != 0 {
-				t.Fatalf("stateful GUI observation entered fallback read cache: %+v", traits)
-			}
-			if !tool.IsReadOnlyCall(`{"action":"get_app_state"}`) {
-				t.Fatal("cache bypass must not remove read-only/safe classification")
-			}
-		})
-	}
-
-	ordinary := statefulReadCacheProbe{name: "ordinary_read"}
-	traits := resolveFallbackReadStateTraits(ordinary, `{}`)
-	if !traits.Cacheable || len(traits.Reads) != 1 {
-		t.Fatalf("ordinary read-only fallback unexpectedly disabled: %+v", traits)
-	}
-}
-
-type statefulReadCacheProbe struct {
-	name string
-}
-
-func (tool statefulReadCacheProbe) Info() ToolInfo {
-	return ToolInfo{Name: tool.name}
-}
-
-func (statefulReadCacheProbe) Run(context.Context, string) (ToolResult, error) {
-	return ToolResult{}, nil
-}
-
-func (statefulReadCacheProbe) RequiresApproval() bool { return false }
-
-func (statefulReadCacheProbe) IsReadOnlyCall(string) bool { return true }

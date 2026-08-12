@@ -282,6 +282,18 @@ func TestMemoryTool_Info(t *testing.T) {
 	if !strings.Contains(info.Description, "past records") {
 		t.Fatal("description should mandate user-facing 'past records' wording")
 	}
+	for _, routingRule := range []string{
+		"Use this first for private facts about a named person or project",
+		"nickname or name fragment is a valid concrete anchor",
+		"Call once for each concrete anchor/target",
+		"answer from it without a confirming session_search",
+		"use session_search first",
+		"do not retry the same target with alternate relation spellings or modes",
+	} {
+		if !strings.Contains(info.Description, routingRule) {
+			t.Errorf("description missing model-driven routing rule %q", routingRule)
+		}
+	}
 	for _, rule := range []string{
 		"evidence_tier",
 		"corroborated",

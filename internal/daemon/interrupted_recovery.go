@@ -26,9 +26,11 @@ type interruptedTurnCandidate struct {
 }
 
 var (
-	errInterruptedRecoverySuperseded = errors.New("interrupted recovery superseded")
-	errInterruptedRecoveryStale      = errors.New("interrupted recovery stale")
-	errInterruptedRecoveryExhausted  = errors.New("interrupted recovery exhausted")
+	errInterruptedRecoverySuperseded     = errors.New("interrupted recovery superseded")
+	errInterruptedRecoveryStale          = errors.New("interrupted recovery stale")
+	errInterruptedRecoveryExhausted      = errors.New("interrupted recovery exhausted")
+	errInterruptedRecoveryInvalidRun     = errors.New("interrupted recovery has invalid run identity")
+	errInterruptedRecoveryReviewRequired = errors.New("interrupted recovery requires side-effect review")
 )
 
 // discoverInterruptedTurns scans the default and named-agent session stores.
@@ -229,6 +231,7 @@ func buildInterruptedResumeRequest(candidate interruptedTurnCandidate, maxAttemp
 		CloudMessageID:                       state.CloudMessageID,
 		IMStatusContext:                      append(json.RawMessage(nil), state.IMStatusContext...),
 		Participants:                         append([]string(nil), state.Participants...),
+		RunID:                                state.RunID,
 		ExecutionMode:                        state.ExecutionRun.Profile.RequestedMode,
 		LogicalTaskID:                        state.ExecutionRun.LogicalTaskID,
 		ExecutionRunID:                       state.ExecutionRun.RunID,
@@ -299,6 +302,14 @@ func (s *Server) resumeInterruptedCandidate(ctx context.Context, candidate inter
 		case errors.Is(runErr, executionprofile.ErrInvalidPersistedRun):
 			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
 				"checkpoint execution profile is invalid; no model call was made")
+			return
+		case errors.Is(runErr, errInterruptedRecoveryInvalidRun):
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_abandoned",
+				"checkpoint run identity is invalid; no model call was made")
+			return
+		case errors.Is(runErr, errInterruptedRecoveryReviewRequired):
+			emitInterruptedRecoveryStatus(s.deps, candidate, "interrupted_turn_review_required",
+				"an external action may have completed; it was not retried and no model call was made")
 			return
 		}
 		log.Printf("daemon: interrupted turn resume failed session=%s agent=%s: %v",

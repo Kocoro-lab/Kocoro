@@ -254,24 +254,34 @@ func TestLive_Compaction_SurvivesAcrossTheBoundary(t *testing.T) {
 		"internal/session/store.go",
 		"internal/mcp/client.go",
 		"internal/agent/loopdetect.go",
+		"internal/agent/deferred.go",
+		"internal/agent/warmset.go",
 	}
 	root := repoRoot()
+	sessionsDir := filepath.Join(agentsDir, agentName, "sessions")
+	store := session.NewStore(sessionsDir)
+	defer store.Close()
 	compacted := false
 	for _, rel := range inflaters {
 		run(fmt.Sprintf("Read the file %s and reply with one sentence about what it does.", filepath.Join(root, rel)))
 		if handler.sawStatus("proactive_compaction") || handler.sawStatus("preflight_compaction") {
-			compacted = true
-			break
+			// A pass that only applied local tool-result compression (shape
+			// no-op) fires the status but deliberately persists no durable
+			// checkpoint — that shape has no compacted-history marker and
+			// would be rejected on the next load. Keep inflating until a real
+			// shape lands one.
+			if sess, err := store.Load(sessionID); err == nil &&
+				sess.CompactionCheckpoint != nil && len(sess.CompactionCheckpoint.Messages) > 0 {
+				compacted = true
+				break
+			}
 		}
 	}
 	if !compacted {
-		t.Fatalf("no compaction fired after %d file reads at a %d-token window; statuses=%v",
+		t.Fatalf("no compaction persisted a live checkpoint after %d file reads at a %d-token window; statuses=%v",
 			len(inflaters), compactionProbeWindow, handler.snapshotStatuses())
 	}
 
-	sessionsDir := filepath.Join(agentsDir, agentName, "sessions")
-	store := session.NewStore(sessionsDir)
-	defer store.Close()
 	beforeFollowup, err := store.Load(sessionID)
 	if err != nil {
 		t.Fatalf("load compacted session: %v", err)

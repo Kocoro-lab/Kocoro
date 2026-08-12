@@ -183,6 +183,11 @@ const (
 	// master-detail session list on the full contract so an older daemon cannot
 	// silently ignore the query and return every session for the agent.
 	CapScheduleSessionFilterV1 = "schedule_session_filter_v1"
+	// CapScheduleRunPartialV1 — schedule_run uses the explicit "partial"
+	// terminal phase and carries partial/failure_code when RunAgent returns a
+	// useful soft-stop result. Older clients ignore the unknown phase instead of
+	// rendering it as a clean success.
+	CapScheduleRunPartialV1 = "schedule_run_partial_v1"
 	// CapAgentDefaultCWDV1 — named-agent cwd writes are validated before any
 	// mutation, invalid persisted cwd is surfaced as a non-fatal warning, and
 	// cross-device agent sync treats cwd as device-local (never pushed or
@@ -334,6 +339,7 @@ var Capabilities = []string{
 	CapSessionsScopeAll,
 	CapSessionProjectsV1,
 	CapScheduleSessionFilterV1,
+	CapScheduleRunPartialV1,
 	CapAgentDefaultCWDV1,
 	CapRemoteControlV1,
 	CapRemoteSessionTimelineV1,
