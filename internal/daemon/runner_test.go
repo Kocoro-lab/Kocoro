@@ -288,40 +288,32 @@ func TestRunAgentRequest_Validate_WithInvalidCWD(t *testing.T) {
 	}
 }
 
-func TestComputeRouteKey_BypassRouting(t *testing.T) {
-	req := RunAgentRequest{Agent: "my-agent", BypassRouting: true}
-	if got := ComputeRouteKey(req); got != "" {
-		t.Errorf("ComputeRouteKey with BypassRouting=true returned %q, want empty", got)
-	}
-}
-
-func TestComputeRouteKey_AgentWithoutBypass(t *testing.T) {
-	req := RunAgentRequest{Agent: "my-agent"}
-	if got := ComputeRouteKey(req); got != "agent:my-agent" {
-		t.Errorf("ComputeRouteKey returned %q, want %q", got, "agent:my-agent")
-	}
-}
-
-func TestComputeRouteKey_WebhookWithNamedAgentBypassesRoute(t *testing.T) {
-	req := RunAgentRequest{Agent: "ops-bot", Source: "webhook", Channel: "github"}
-	if got := ComputeRouteKey(req); got != "" {
-		t.Errorf("ComputeRouteKey returned %q, want empty route", got)
-	}
-}
-
-func TestComputeRouteKey_ScheduleWithNamedAgentKeepsAgentRoute(t *testing.T) {
-	req := RunAgentRequest{Agent: "ops-bot", Source: ChannelSchedule, Channel: "schedule-daily"}
-	if got := ComputeRouteKey(req); got != "agent:ops-bot" {
-		t.Errorf("ComputeRouteKey returned %q, want %q", got, "agent:ops-bot")
-	}
-}
-
-func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
+func TestComputeRouteKey(t *testing.T) {
 	tests := []struct {
 		name string
 		req  RunAgentRequest
 		want string
 	}{
+		{
+			name: "bypass routing",
+			req:  RunAgentRequest{Agent: "my-agent", BypassRouting: true},
+			want: "",
+		},
+		{
+			name: "named agent",
+			req:  RunAgentRequest{Agent: "my-agent"},
+			want: "agent:my-agent",
+		},
+		{
+			name: "named webhook bypasses route",
+			req:  RunAgentRequest{Agent: "ops-bot", Source: "webhook", Channel: "github"},
+			want: "",
+		},
+		{
+			name: "named schedule keeps agent route",
+			req:  RunAgentRequest{Agent: "ops-bot", Source: ChannelSchedule, Channel: "schedule-daily"},
+			want: "agent:ops-bot",
+		},
 		{
 			name: "wecom group default agent",
 			req:  RunAgentRequest{Source: ChannelWeCom, Channel: ChannelWeCom, ThreadID: "g:group-a"},
@@ -343,7 +335,7 @@ func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
 			want: "agent:ops-bot:wecom:g:group-a",
 		},
 		{
-			name: "session id wins over messaging thread",
+			name: "session id wins over agent and messaging thread",
 			req:  RunAgentRequest{Agent: "ops-bot", SessionID: "sess-123", Source: ChannelWeCom, Channel: ChannelWeCom, ThreadID: "g:group-a"},
 			want: "session:sess-123",
 		},
@@ -352,46 +344,70 @@ func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
 			req:  RunAgentRequest{Source: ChannelSlack, Channel: "#general"},
 			want: "default:slack:%23general",
 		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := ComputeRouteKey(tt.req); got != tt.want {
-				t.Errorf("ComputeRouteKey(%+v) = %q, want %q", tt.req, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestComputeRouteKey_NamedAgentMultiSession(t *testing.T) {
-	tests := []struct {
-		name string
-		req  RunAgentRequest
-		want string
-	}{
 		{
-			name: "session_id resumes the exact session",
-			req:  RunAgentRequest{Agent: "ops-bot", SessionID: "sess-abc"},
-			want: "session:sess-abc",
-		},
-		{
-			name: "new_session forks — no plain key (D2 unlock)",
+			name: "named new session bypasses cache",
 			req:  RunAgentRequest{Agent: "ops-bot", NewSession: true},
 			want: "",
 		},
 		{
-			name: "no session_id, no new_session resumes latest interactive (plain key)",
-			req:  RunAgentRequest{Agent: "ops-bot"},
-			want: "agent:ops-bot",
-		},
-		{
-			name: "default agent new_session still forks",
+			name: "default new session bypasses cache",
 			req:  RunAgentRequest{NewSession: true},
 			want: "",
 		},
 		{
-			name: "named agent new_session does not override an explicit session_id",
+			name: "explicit session overrides new session",
 			req:  RunAgentRequest{Agent: "ops-bot", NewSession: true, SessionID: "sess-xyz"},
 			want: "session:sess-xyz",
+		},
+		{
+			name: "line channel",
+			req:  RunAgentRequest{Source: "line", Channel: "group-abc"},
+			want: "default:line:group-abc",
+		},
+		{
+			name: "web source bypasses cache",
+			req:  RunAgentRequest{Source: "web", Channel: "session-1"},
+			want: "",
+		},
+		{
+			name: "webhook bypasses cache",
+			req:  RunAgentRequest{Source: "webhook", Channel: "hook-1"},
+			want: "",
+		},
+		{
+			name: "cron bypasses cache",
+			req:  RunAgentRequest{Source: "cron", Channel: "job-1"},
+			want: "",
+		},
+		{
+			name: "default schedule bypasses cache",
+			req:  RunAgentRequest{Source: ChannelSchedule, Channel: "sched-1"},
+			want: "",
+		},
+		{
+			name: "empty context",
+			req:  RunAgentRequest{},
+			want: "",
+		},
+		{
+			name: "shanclaw explicit session",
+			req:  RunAgentRequest{Source: "shanclaw", SessionID: "sess-xyz"},
+			want: "session:sess-xyz",
+		},
+		{
+			name: "slack channel splits by sender",
+			req:  RunAgentRequest{Source: ChannelSlack, Channel: "C123", Sender: "U-alice"},
+			want: "default:slack:C123:U-alice",
+		},
+		{
+			name: "named slack channel splits by sender",
+			req:  RunAgentRequest{Agent: "ops-bot", Source: ChannelSlack, Channel: "C123", Sender: "U-alice"},
+			want: "agent:ops-bot:slack:C123:U-alice",
+		},
+		{
+			name: "slack thread overrides sender",
+			req:  RunAgentRequest{Source: ChannelSlack, Channel: "C123", ThreadID: "T-9", Sender: "U-alice"},
+			want: "default:slack:T-9",
 		},
 	}
 	for _, tt := range tests {
