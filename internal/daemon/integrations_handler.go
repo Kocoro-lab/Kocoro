@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -91,6 +92,53 @@ func (s *Server) integrationsCloudReady(w http.ResponseWriter) bool {
 // constant if a provider ever needs more.
 const maxIntegrationConnectBodyBytes = 64 << 10
 
+// maxIntegrationConnectLogBodyBytes caps each response-derived value quoted
+// in the connect-failure log: the parsed error/message fields and the raw
+// body fallback when the body doesn't parse as the Cloud error shape (e.g.
+// an HTML page from an intermediary). Failure bodies on the contract path
+// are tiny ({"error","message"}); when this binds the log value ends
+// truncated — bump the constant if a diagnosis ever needs more. The cap is
+// per-field, so a pathological error+message pair still yields a ~4 KiB line.
+const maxIntegrationConnectLogBodyBytes = 2 << 10
+
+func truncateForConnectLog(s string) string {
+	if len(s) > maxIntegrationConnectLogBodyBytes {
+		return s[:maxIntegrationConnectLogBodyBytes]
+	}
+	return s
+}
+
+// logIntegrationConnectFailure records a structured warn log for a failed
+// connect passthrough so provider/status/error-code/message are diagnosable
+// offline (Desktop only shows the message in a dialog). Response-side content
+// only: the request body may carry credentials and is never logged. The
+// parsed branch is safe by contract (Cloud keeps {"error": "<code>",
+// "message": "<detail>"} failure bodies credential-free); a NON-contract body
+// carries no such guarantee — an intermediary or framework validation error
+// can echo request input (e.g. a pydantic 422 quotes the submitted value) —
+// so the raw body is quoted only when the request had no body to echo
+// (OAuth connects); token-mode failures degrade to the body length. provider
+// is an untrusted percent-decoded path segment, so it is %q-quoted everywhere
+// to keep newline injection out of the log stream.
+func logIntegrationConnectFailure(provider string, status int, body []byte, requestHadBody bool, elapsed time.Duration) {
+	var parsed struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil && (parsed.Error != "" || parsed.Message != "") {
+		log.Printf("daemon: WARNING: integration connect rejected by cloud provider=%q status=%d error=%q message=%q elapsed_ms=%d",
+			truncateForConnectLog(provider), status, truncateForConnectLog(parsed.Error), truncateForConnectLog(parsed.Message), elapsed.Milliseconds())
+		return
+	}
+	if requestHadBody {
+		log.Printf("daemon: WARNING: integration connect rejected by cloud provider=%q status=%d unparsed_body_len=%d elapsed_ms=%d",
+			truncateForConnectLog(provider), status, len(body), elapsed.Milliseconds())
+		return
+	}
+	log.Printf("daemon: WARNING: integration connect rejected by cloud provider=%q status=%d body=%q elapsed_ms=%d",
+		truncateForConnectLog(provider), status, truncateForConnectLog(string(body)), elapsed.Milliseconds())
+}
+
 // handleConnectIntegration proxies POST /integrations/{provider}/connect to
 // Cloud, forwarding the client's JSON body verbatim. OAuth providers send no
 // body and get back {connection_id, oauth_url} the renderer opens to complete
@@ -127,10 +175,16 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 	if len(bytes.TrimSpace(reqBody)) == 0 {
 		reqBody = nil
 	}
+	start := time.Now()
 	status, body, err := s.deps.GW.IntegrationConnect(r.Context(), provider, reqBody)
 	if err != nil {
+		log.Printf("daemon: WARNING: integration connect transport failure provider=%q err=%v elapsed_ms=%d",
+			truncateForConnectLog(provider), err, time.Since(start).Milliseconds())
 		writeError(w, http.StatusBadGateway, "cloud request failed: "+err.Error())
 		return
+	}
+	if status < 200 || status >= 300 {
+		logIntegrationConnectFailure(provider, status, body, reqBody != nil, time.Since(start))
 	}
 	writeCloudPassthrough(w, status, body)
 	if status >= 200 && status < 300 {
