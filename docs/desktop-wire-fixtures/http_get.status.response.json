@@ -26,6 +26,7 @@
     "sessions_scope_all",
     "session_projects_v1",
     "schedule_session_filter_v1",
+    "schedule_run_partial_v1",
     "agent_default_cwd_v1",
     "remote_control_v1",
     "remote_session_timeline_v1",

@@ -1227,6 +1227,14 @@ func shouldEmitReplyBanner(source string) bool {
 	return !isAutonomousLocalSource(source)
 }
 
+// shouldEmitLocalReplyBanner leaves completion presentation to a client that
+// accepted the authoritative agent_reply event. Only a genuinely detached run
+// falls back to a local OS banner; it must never emit a generic notification
+// event that Desktop could confuse with an agent-authored notify tool call.
+func shouldEmitLocalReplyBanner(source string, replyEventDeliveries int) bool {
+	return replyEventDeliveries == 0 && shouldEmitReplyBanner(source)
+}
+
 // promptSuggestionSources is the allow-list of request sources whose post-turn
 // prompt-suggestion fork has a UI consumer:
 //   - "desktop": Kocoro Desktop's foreground chat. The Desktop client's message
@@ -4356,6 +4364,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// save failed, the conversation is not on disk and downstream
 		// consumers (e.g. desktop schedule notifications that click through
 		// to the session) would point at a session that cannot be loaded.
+		replyEventDeliveries := 0
 		if saveErr == nil && deps.EventBus != nil {
 			payload := map[string]any{
 				"agent":      agentName,
@@ -4371,17 +4380,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				payload["failure_code"] = status.FailureCode
 			}
 			payloadBytes, _ := json.Marshal(payload)
-			deps.EventBus.Emit(Event{Type: EventAgentReply, Payload: payloadBytes})
+			replyEventDeliveries = deps.EventBus.EmitTo(Event{Type: EventAgentReply, Payload: payloadBytes})
 
-			// Reply-complete banner: routes through tools.SendBanner so it honors
-			// the same Desktop-handler-or-osascript-fallback contract as the
-			// notify tool. Skip when there is nothing to show or the source
-			// already delivers the reply elsewhere (cloud channels) or fires
-			// autonomously and would spam (heartbeat/watcher/mcp). The osascript
-			// fallback is macOS-only — skip the call on other platforms to keep
-			// headless Linux daemons silent instead of log-spamming a missing
-			// binary on every turn.
-			if runtime.GOOS == "darwin" && result != "" && shouldEmitReplyBanner(req.Source) {
+			// Reply-complete banner: an attached client owns presentation after it
+			// accepts the authoritative agent_reply event. Only a detached run uses
+			// the direct OS fallback; routing this automatic banner through the
+			// notification event would make it indistinguishable from an
+			// agent-authored notify tool call. Autonomous and cloud sources remain
+			// silent, and the fallback remains macOS-only.
+			if runtime.GOOS == "darwin" && result != "" &&
+				shouldEmitLocalReplyBanner(req.Source, replyEventDeliveries) {
 				title := "Kocoro"
 				if agentName != "" {
 					// Prefer the user-facing display_name over the opaque
@@ -4393,7 +4401,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					title = "Kocoro · " + label
 				}
 				body := truncate(stripMarkdownLite(audit.RedactSecrets(result)), 140)
-				if err := tools.SendBanner(ctx, title, body, false); err != nil {
+				if err := tools.SendLocalBanner(ctx, title, body, false); err != nil {
 					log.Printf("daemon: reply-complete banner failed (session=%s): %v", sess.ID, err)
 				}
 			}

@@ -37,6 +37,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
 	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
+	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -774,6 +775,50 @@ func TestWireFixture_AgentReplyPartial_Bus(t *testing.T) {
 	}
 }
 
+func TestWireFixture_ScheduleRunPartial_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.schedule_run.partial.json")
+	bus := NewEventBus()
+	s := &Scheduler{deps: &ServerDeps{EventBus: bus}}
+	sched := schedule.Schedule{
+		ID:    fixture["schedule_id"].(string),
+		Agent: fixture["agent"].(string),
+	}
+	result := &RunAgentResult{
+		SessionID:   fixture["session_id"].(string),
+		Partial:     true,
+		FailureCode: runstatus.CodeIterationLimit,
+	}
+	usageFixture := fixture["usage"].(map[string]any)
+	usage := ScheduleRunUsage{
+		InputTokens:  int(usageFixture["input_tokens"].(float64)),
+		OutputTokens: int(usageFixture["output_tokens"].(float64)),
+		TotalTokens:  int(usageFixture["total_tokens"].(float64)),
+		CostUSD:      usageFixture["cost_usd"].(float64),
+	}
+
+	s.emitScheduleRunWithStatus("partial", sched, result.SessionID, nil, usage, result)
+	events := bus.EventsSince(0)
+	if len(events) != 1 || events[0].Type != EventScheduleRun {
+		t.Fatalf("expected one schedule_run event, got %+v", events)
+	}
+	produced := parseJSONMap(t, events[0].Payload)
+	produced["ts"] = fixture["ts"]
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		Phase       string `json:"phase"`
+		Partial     *bool  `json:"partial"`
+		FailureCode string `json:"failure_code"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.Phase != "partial" || consumer.Partial == nil || !*consumer.Partial ||
+		consumer.FailureCode != string(runstatus.CodeIterationLimit) {
+		t.Fatalf("consumer decode lost partial schedule metadata: %+v", consumer)
+	}
+}
+
 // TestWireFixture_DoneWithDeliverable pins the stronger idempotency receipt a
 // client requires before deleting its retained source after persisting a deliverable.
 func TestWireFixture_DoneWithDeliverable(t *testing.T) {
@@ -1124,6 +1169,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	}
 	if !has(CapScheduleSessionFilterV1) {
 		t.Fatalf("capabilities lost %q: %v", CapScheduleSessionFilterV1, *status.Capabilities)
+	}
+	if !has(CapScheduleRunPartialV1) {
+		t.Fatalf("capabilities lost %q: %v", CapScheduleRunPartialV1, *status.Capabilities)
 	}
 	if !has(CapWebSearchUsageV1) {
 		t.Fatalf("capabilities lost %q: %v", CapWebSearchUsageV1, *status.Capabilities)

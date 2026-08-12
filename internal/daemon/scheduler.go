@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/adhocore/gronx"
 )
@@ -256,9 +257,9 @@ func scheduleRunUsageFromResult(r *RunAgentResult) ScheduleRunUsage {
 	}
 }
 
-// runWithLifecycle emits started/succeeded/failed schedule_run events around
-// fn. Extracted so tests can verify lifecycle emission without spinning up
-// the full RunAgent stack.
+// runWithLifecycle emits started/succeeded/partial/failed schedule_run events
+// around fn. Extracted so tests can verify lifecycle emission without spinning
+// up the full RunAgent stack.
 func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAgentResult, error)) {
 	s.emitScheduleRun("started", sched, "", nil)
 
@@ -299,10 +300,14 @@ func (s *Scheduler) runWithLifecycle(sched schedule.Schedule, fn func() (*RunAge
 
 	if runErr != nil {
 		log.Printf("scheduler: agent run failed for schedule %s: %v", sched.ID, runErr)
-		s.emitScheduleRunWithUsage("failed", sched, sessionID, runErr, usage)
+		s.emitScheduleRunWithStatus("failed", sched, sessionID, runErr, usage, result)
 		return
 	}
-	s.emitScheduleRunWithUsage("succeeded", sched, sessionID, nil, usage)
+	phase := "succeeded"
+	if result != nil && result.Partial {
+		phase = "partial"
+	}
+	s.emitScheduleRunWithStatus(phase, sched, sessionID, nil, usage, result)
 
 	ws := s.proactiveSender
 	if ws == nil && s.deps != nil && s.deps.WSClient != nil {
@@ -324,6 +329,14 @@ func (s *Scheduler) emitScheduleRun(phase string, sched schedule.Schedule, sessi
 // payload when zero so failed runs that never reached an LLM call don't
 // emit misleading zero-value usage counters.
 func (s *Scheduler) emitScheduleRunWithUsage(phase string, sched schedule.Schedule, sessionID string, runErr error, usage ScheduleRunUsage) {
+	s.emitScheduleRunWithStatus(phase, sched, sessionID, runErr, usage, nil)
+}
+
+// emitScheduleRunWithStatus adds the terminal run classification when a
+// RunAgentResult is available. Older consumers safely ignore the additive
+// fields and, importantly, ignore the new "partial" phase instead of
+// presenting a soft stop as a successful schedule completion.
+func (s *Scheduler) emitScheduleRunWithStatus(phase string, sched schedule.Schedule, sessionID string, runErr error, usage ScheduleRunUsage, result *RunAgentResult) {
 	if s == nil || s.deps == nil {
 		return
 	}
@@ -339,6 +352,12 @@ func (s *Scheduler) emitScheduleRunWithUsage(phase string, sched schedule.Schedu
 	}
 	if !usage.isZero() {
 		payload["usage"] = usage
+	}
+	if result != nil && result.Partial {
+		payload["partial"] = true
+		if result.FailureCode != runstatus.CodeNone {
+			payload["failure_code"] = result.FailureCode
+		}
 	}
 	emitBusJSON(s.deps.EventBus, EventScheduleRun, payload)
 }
