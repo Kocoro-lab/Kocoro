@@ -33,6 +33,22 @@ jobs:
       - name: Check doc references resolve
         run: bash scripts/check-doc-links.sh
 
+      - name: AGENTS.md stays under the harness injection budget
+        # Harnesses that read AGENTS.md do so under a byte budget shared across
+        # every such file from the repo root down (32 KiB by default), and an
+        # over-budget file is truncated from the TAIL with no marker in the
+        # injected text. The reader cannot tell it got a partial file, so this
+        # has to be caught here rather than noticed later. 24 KB leaves room for
+        # the per-directory files a harness may also pull in.
+        run: |
+          size=$(wc -c < AGENTS.md)
+          if [ "$size" -gt 24576 ]; then
+            echo "AGENTS.md is ${size}B, over the 24576B ceiling."
+            echo "Harnesses truncate from the tail silently — cut prose, not rules."
+            exit 1
+          fi
+          echo "AGENTS.md ${size}B, within budget"
+
   test:
     # macos-latest matches the project's release.yml and the development
     # target. ShanClaw ships a meaningful set of macOS-only tools

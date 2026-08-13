@@ -6,6 +6,12 @@ history, or any subsystem not listed here. This file carries only rules you can
 act on, plus the symbols and constants to grep. If the two disagree, `CLAUDE.md`
 and the code win.
 
+**Keep this file under 24 KB.** Harnesses that read `AGENTS.md` do so under a byte
+budget shared across every such file from the repo root down (32 KiB by default),
+and an over-budget file is truncated **from the tail, with no marker in the injected
+text** — the reader cannot tell it got a partial file, and the sections at the bottom
+are simply gone. CI asserts the ceiling; if you need more room, cut prose, not rules.
+
 Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production path:
 daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WebSocket,
 receives channel messages, runs the agent loop locally with full tool access, and
@@ -130,6 +136,9 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 
 ## Wire Contracts
 
+- **The surface list is `docs/cloud-contract-surface.md`** — what this repo owes Shannon
+  Cloud and Kocoro Desktop, with the counterpart symbol for each. Read it before changing
+  anything that crosses a process boundary.
 - Payloads decoded by UI clients are pinned by fixtures in
   `docs/desktop-wire-fixtures/`, verified by `internal/daemon/wire_fixtures_test.go`
   through the REAL producer path. Change a payload → update fixture + test in the
