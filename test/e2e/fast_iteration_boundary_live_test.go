@@ -1,10 +1,12 @@
+//go:build live
+
 package e2e
 
 // Paid Fast-profile boundary probe for the production AgentLoop.
 //
 // Run:
 //
-//	SHANNON_E2E_LIVE=1 KOCORO_FAST_ITERATION_BOUNDARY=1 go test ./test/e2e -run TestLive_FastIterationBoundary -count=1 -v
+//	SHANNON_E2E_LIVE=1 KOCORO_FAST_ITERATION_BOUNDARY=1 go test -tags=live ./test/e2e -run TestLive_FastIterationBoundary -count=1 -v
 
 import (
 	"context"

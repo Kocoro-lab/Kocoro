@@ -1,3 +1,5 @@
+//go:build live
+
 package e2e
 
 import (
@@ -8,6 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"net"
 	"net/http"
@@ -24,6 +30,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
 	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
+	_ "golang.org/x/image/webp"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,27 +42,91 @@ import (
 // store access, non-allowlisted MCP connects, and process-global browser cleanup
 // while preserving the real HTTP/agent/provider path.
 
-func TestLive_OneShot_BasicQuery(t *testing.T) {
+func TestLive_OneShotCoreAndBundledAgentsSmoke(t *testing.T) {
 	skipUnlessLive(t)
 	bin := testBinary(t)
 
-	out := runShan(t, bin, "what is 2+1")
-	if !strings.Contains(out, "3") {
-		t.Errorf("expected answer containing '3', got: %s", out)
+	tests := []struct {
+		name    string
+		args    []string
+		prepare func(t *testing.T) (cwd string, verify func(t *testing.T, result map[string]interface{}))
+	}{
+		{
+			name: "core_reasoning",
+			args: []string{
+				`Calculate 37 * 41. Return exactly one JSON object with this schema: {"schema":"kocoro-live-smoke-v1","product":<integer>,"parity":"odd or even"}.`,
+			},
+			prepare: func(t *testing.T) (string, func(*testing.T, map[string]interface{})) {
+				return "", func(t *testing.T, result map[string]interface{}) {
+					requireJSONNumber(t, result, "product", 1517)
+					requireJSONString(t, result, "parity", "odd")
+				}
+			},
+		},
+		{
+			name: "explorer_reads_project_facts",
+			args: []string{
+				"--agent", "explorer",
+				`Inspect service.yaml and dependencies.txt in the current directory. Return exactly one JSON object with this schema: {"schema":"kocoro-live-smoke-v1","service":<string>,"port":<integer>,"dependency":<string>,"source_files":[<strings>]}. Do not infer values without reading the files.`,
+			},
+			prepare: func(t *testing.T) (string, func(*testing.T, map[string]interface{})) {
+				cwd := neutralTempDir(t, "live-smoke-explorer-*")
+				writeLiveSmokeFixture(t, cwd, "service.yaml", "service: aurora-ledger\nport: 43127\ndependency_ref: dependencies.txt\n")
+				writeLiveSmokeFixture(t, cwd, "dependencies.txt", "primary=quartz-index-v7\n")
+				return cwd, func(t *testing.T, result map[string]interface{}) {
+					requireJSONString(t, result, "service", "aurora-ledger")
+					requireJSONNumber(t, result, "port", 43127)
+					requireJSONString(t, result, "dependency", "quartz-index-v7")
+					requireJSONStringSet(t, result, "source_files", []string{"dependencies.txt", "service.yaml"})
+				}
+			},
+		},
+		{
+			name: "reviewer_finds_concrete_bug_without_editing",
+			args: []string{
+				"--agent", "reviewer",
+				`Review review_target.go in the current directory for its primary correctness bug. Return exactly one JSON object with this schema: {"schema":"kocoro-live-smoke-v1","symbol":<string>,"severity":"high or medium or low","actual_expression":<string>,"correct_expression":<string>,"failure_condition":<string>}. Do not modify the file.`,
+			},
+			prepare: func(t *testing.T) (string, func(*testing.T, map[string]interface{})) {
+				cwd := neutralTempDir(t, "live-smoke-reviewer-*")
+				const source = "package ledger\n\n// Remaining returns unspent capacity.\nfunc Remaining(total, used uint64) uint64 {\n\treturn used - total\n}\n"
+				writeLiveSmokeFixture(t, cwd, "review_target.go", source)
+				return cwd, func(t *testing.T, result map[string]interface{}) {
+					requireJSONString(t, result, "symbol", "Remaining")
+					severity, _ := result["severity"].(string)
+					if severity != "high" && severity != "medium" {
+						t.Errorf("severity = %q, want high or medium", severity)
+					}
+					requireJSONString(t, result, "actual_expression", "used - total")
+					requireJSONString(t, result, "correct_expression", "total - used")
+					failure, _ := result["failure_condition"].(string)
+					failure = strings.ToLower(failure)
+					if !strings.Contains(failure, "used") || !strings.Contains(failure, "total") ||
+						(!strings.Contains(failure, "<") && !strings.Contains(failure, "less")) {
+						t.Errorf("failure_condition = %q, want the used < total underflow condition", result["failure_condition"])
+					}
+					got, err := os.ReadFile(filepath.Join(cwd, "review_target.go"))
+					if err != nil {
+						t.Fatalf("read reviewer fixture after run: %v", err)
+					}
+					if string(got) != source {
+						t.Fatal("reviewer modified review_target.go")
+					}
+				}
+			},
+		},
 	}
-	// Should use Anthropic model, not GPT fallback
-	if strings.Contains(out, "gpt-5-mini") {
-		t.Error("should not fall back to gpt-5-mini — check cache_break fix")
-	}
-}
 
-func TestLive_OneShot_AutoApproveToolUse(t *testing.T) {
-	skipUnlessLive(t)
-	bin := testBinary(t)
-
-	out := runShan(t, bin, "-y", "list files in the current directory")
-	if !strings.Contains(out, "directory_list") && !strings.Contains(out, "bash") {
-		t.Error("expected tool call (directory_list or bash)")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cwd, verify := tt.prepare(t)
+			out := runShanInDir(t, cwd, bin, tt.args...)
+			if strings.Contains(out, "gpt-5-mini") {
+				t.Error("should not fall back to gpt-5-mini — check cache_break fix")
+			}
+			result := decodeLiveSmokeResult(t, out)
+			verify(t, result)
+		})
 	}
 }
 
@@ -79,35 +150,6 @@ func TestLive_OneShot_SessionCWD(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, expected) && !strings.Contains(out, tmpDir) {
 		t.Errorf("expected CWD %q or %q in output, got: %s", expected, tmpDir, out)
-	}
-}
-
-func TestLive_BundledAgent_Explorer(t *testing.T) {
-	skipUnlessLive(t)
-	bin := testBinary(t)
-
-	out := runShan(t, bin, "--agent", "explorer", "what files are in this project")
-	// Explorer should use read-only tools
-	if strings.Contains(out, "file_write") || strings.Contains(out, "file_edit") {
-		t.Error("explorer should not use write tools")
-	}
-}
-
-func TestLive_BundledAgent_Reviewer(t *testing.T) {
-	skipUnlessLive(t)
-	bin := testBinary(t)
-
-	out := runShan(t, bin, "--agent", "reviewer", "review main.go")
-	// The OnText / OnPreamble split (a398ecd, v0.1.3) stopped surfacing tool-call
-	// names in one-shot stdout — only assistant text reaches the user. Assert the
-	// reviewer actually engaged with the file by checking it cited something only
-	// readable from the source: cmd.Execute() (the only symbol main.go references).
-	// A length floor guards against trivially-short refusals or stub responses.
-	if len(out) < 200 {
-		t.Errorf("reviewer output too short (%d bytes); likely did not engage with file: %s", len(out), out)
-	}
-	if !strings.Contains(out, "cmd.Execute") && !strings.Contains(out, "main.go") && !strings.Contains(out, "package main") {
-		t.Errorf("reviewer output lacks evidence of having read main.go (no mention of cmd.Execute / main.go / package main): %s", out)
 	}
 }
 
@@ -212,7 +254,15 @@ func TestLive_Daemon_AgentListIncludesBuiltins(t *testing.T) {
 
 func runShan(t *testing.T, bin string, args ...string) string {
 	t.Helper()
+	return runShanInDir(t, "", bin, args...)
+}
+
+func runShanInDir(t *testing.T, dir, bin string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command(bin, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stdout
@@ -220,6 +270,72 @@ func runShan(t *testing.T, bin string, args ...string) string {
 		t.Fatalf("shan %v failed: %v\n%s", args, err, stdout.String())
 	}
 	return stdout.String()
+}
+
+func writeLiveSmokeFixture(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("write live smoke fixture %s: %v", name, err)
+	}
+}
+
+func decodeLiveSmokeResult(t *testing.T, output string) map[string]interface{} {
+	t.Helper()
+	for offset := 0; offset < len(output); {
+		relative := strings.IndexByte(output[offset:], '{')
+		if relative < 0 {
+			break
+		}
+		start := offset + relative
+		var result map[string]interface{}
+		if err := json.NewDecoder(strings.NewReader(output[start:])).Decode(&result); err == nil {
+			if result["schema"] == "kocoro-live-smoke-v1" {
+				return result
+			}
+		}
+		offset = start + 1
+	}
+	t.Fatalf("output did not contain a valid kocoro-live-smoke-v1 JSON object: %s", output)
+	return nil
+}
+
+func requireJSONString(t *testing.T, result map[string]interface{}, key, want string) {
+	t.Helper()
+	got, ok := result[key].(string)
+	if !ok || got != want {
+		t.Errorf("%s = %#v, want %q", key, result[key], want)
+	}
+}
+
+func requireJSONNumber(t *testing.T, result map[string]interface{}, key string, want float64) {
+	t.Helper()
+	got, ok := result[key].(float64)
+	if !ok || got != want {
+		t.Errorf("%s = %#v, want %v", key, result[key], want)
+	}
+}
+
+func requireJSONStringSet(t *testing.T, result map[string]interface{}, key string, want []string) {
+	t.Helper()
+	values, ok := result[key].([]interface{})
+	if !ok || len(values) != len(want) {
+		t.Errorf("%s = %#v, want exactly %v", key, result[key], want)
+		return
+	}
+	got := make(map[string]bool, len(values))
+	for _, value := range values {
+		s, ok := value.(string)
+		if !ok {
+			t.Errorf("%s contains non-string value %#v", key, value)
+			return
+		}
+		got[filepath.Base(s)] = true
+	}
+	for _, value := range want {
+		if !got[value] {
+			t.Errorf("%s = %#v, missing %q", key, result[key], value)
+		}
+	}
 }
 
 type isolatedLiveDaemon struct {
@@ -450,74 +566,134 @@ func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout t
 	t.Fatalf("isolated daemon did not confirm contained startup\n%s", daemon.output.String())
 }
 
-// TestLive_GenerateAndEditImage exercises the v0.1.4 generate_image +
-// edit_image pipeline against the configured Shannon Cloud endpoint. It
-// bypasses the agent loop's per-call approval gate (which legitimately blocks
-// image tools under -y) and calls the production HTTP client directly,
-// validating the wire contract end-to-end. This is a paid live test; current
-// cost expectations are maintained in the private QA process.
-func TestLive_GenerateAndEditImage(t *testing.T) {
+// TestLive_ImageGenerateEditQuality exercises the production image and CDN
+// path, then applies deterministic color/layout oracles to one deliberately
+// simple generation and edit. It is not a general perceptual-quality score.
+func TestLive_ImageGenerateEditQuality(t *testing.T) {
 	skipUnlessLive(t)
+	if os.Getenv("KOCORO_IMAGE_QUALITY_LIVE") != "1" {
+		t.Skip("set KOCORO_IMAGE_QUALITY_LIVE=1 to run the paid image quality E2E")
+	}
+	sample := strings.TrimSpace(os.Getenv("KOCORO_IMAGE_QUALITY_SAMPLE"))
+	if sample == "" {
+		sample = "comparison"
+	}
+	repetitions := 1
+	switch sample {
+	case "comparison":
+	case "release":
+		repetitions = 5
+	default:
+		t.Fatalf("KOCORO_IMAGE_QUALITY_SAMPLE must be comparison or release, got %q", sample)
+	}
 
 	endpoint, apiKey := readCloudConfig(t)
 	if endpoint == "" || apiKey == "" {
-		t.Skip("cloud.endpoint / cloud.api_key not configured in ~/.shannon/config.yaml")
+		t.Fatal("cloud.endpoint / cloud.api_key not configured in ~/.shannon/config.yaml")
 	}
 	client := images.NewClient(endpoint, apiKey, &http.Client{Timeout: 180 * time.Second})
 
-	// Generate a tiny low-quality image to keep cost minimal.
-	genCtx, genCancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer genCancel()
-	gen, err := client.Generate(genCtx, images.GenerateRequest{
-		Prompt:  "a red circle on white background, simple flat design",
-		Size:    "1024x1024",
-		Quality: "low",
-		N:       1,
-	})
-	if err != nil {
-		// A 404 means this gateway has no image endpoint deployed — an
-		// environment state (e.g. stale local Cloud image), not a code
-		// regression in this repo. Every other error stays fatal.
-		if errors.Is(err, images.ErrEndpointNotFound) {
-			t.Skipf("image endpoint not deployed at this gateway: %v", err)
-		}
-		t.Fatalf("Generate: %v", err)
-	}
-	if len(gen.Images) != 1 {
-		t.Fatalf("Generate: expected 1 image, got %d", len(gen.Images))
-	}
-	if !strings.HasPrefix(gen.Images[0].URL, "https://static.kocoro.ai/") {
-		t.Errorf("Generate: expected https://static.kocoro.ai/ URL, got: %s", gen.Images[0].URL)
-	}
-	if gen.Model != "gpt-image-2" {
-		t.Errorf("Generate: expected gpt-image-2 model, got: %s", gen.Model)
-	}
-	if gen.Images[0].SizeBytes <= 0 {
-		t.Errorf("Generate: expected positive size_bytes, got: %d", gen.Images[0].SizeBytes)
-	}
+	allPassed := true
+	for repetition := 1; repetition <= repetitions; repetition++ {
+		if !t.Run(fmt.Sprintf("repetition_%d", repetition), func(t *testing.T) {
+			genCtx, genCancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer genCancel()
+			gen, err := client.Generate(genCtx, images.GenerateRequest{
+				Prompt:  "a single solid red circle centered on a plain pure white background, flat geometric design, no text, no shadow, no other objects",
+				Size:    "1024x1024",
+				Quality: "low",
+				N:       1,
+			})
+			if err != nil {
+				if errors.Is(err, images.ErrEndpointNotFound) {
+					t.Fatalf("image endpoint not deployed at the configured gateway: %v", err)
+				}
+				t.Fatalf("Generate: %v", err)
+			}
+			if len(gen.Images) != 1 {
+				t.Fatalf("Generate: expected 1 image, got %d", len(gen.Images))
+			}
+			if !strings.HasPrefix(gen.Images[0].URL, "https://static.kocoro.ai/") {
+				t.Fatalf("Generate: expected https://static.kocoro.ai/ URL, got: %s", gen.Images[0].URL)
+			}
+			if gen.Model != "gpt-image-2" {
+				t.Fatalf("Generate: expected gpt-image-2 model, got: %s", gen.Model)
+			}
+			if gen.Images[0].SizeBytes <= 0 {
+				t.Fatalf("Generate: expected positive size_bytes, got: %d", gen.Images[0].SizeBytes)
+			}
+			source := downloadLiveImage(t, gen.Images[0].URL)
+			if source.Bounds().Dx() != 1024 || source.Bounds().Dy() != 1024 {
+				t.Fatalf("Generate: dimensions = %dx%d, want 1024x1024", source.Bounds().Dx(), source.Bounds().Dy())
+			}
+			if err := validateGeneratedImageSemantics(source); err != nil {
+				t.Fatalf("Generate semantic oracle: %v", err)
+			}
 
-	// Edit using the URL we just generated — round-trips the CDN allowlist.
-	editCtx, editCancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer editCancel()
-	edit, err := client.Edit(editCtx, images.EditRequest{
-		Prompt:    "add a small blue square in the bottom-right corner",
-		ImageURLs: []string{gen.Images[0].URL},
-		Size:      "1024x1024",
-		Quality:   "low",
-		N:         1,
-	})
+			editCtx, editCancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer editCancel()
+			edit, err := client.Edit(editCtx, images.EditRequest{
+				Prompt:    "keep the image unchanged except add one small solid blue square entirely inside the bottom-right quadrant, no text",
+				ImageURLs: []string{gen.Images[0].URL},
+				Size:      "1024x1024",
+				Quality:   "low",
+				N:         1,
+			})
+			if err != nil {
+				t.Fatalf("Edit: %v", err)
+			}
+			if len(edit.Images) != 1 {
+				t.Fatalf("Edit: expected 1 image, got %d", len(edit.Images))
+			}
+			if !strings.HasPrefix(edit.Images[0].URL, "https://static.kocoro.ai/") {
+				t.Fatalf("Edit: expected https://static.kocoro.ai/ URL, got: %s", edit.Images[0].URL)
+			}
+			if edit.Images[0].URL == gen.Images[0].URL {
+				t.Fatal("Edit returned the source URL")
+			}
+			edited := downloadLiveImage(t, edit.Images[0].URL)
+			if err := validateEditedImageSemantics(source, edited); err != nil {
+				t.Fatalf("Edit semantic oracle: %v", err)
+			}
+		}) {
+			allPassed = false
+		}
+	}
+	if !allPassed {
+		t.FailNow()
+	}
+	t.Logf("image quality E2E passed: sample=%s repetitions=%d paid_calls=%d", sample, repetitions, repetitions*2)
+}
+
+func downloadLiveImage(t *testing.T, url string) image.Image {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		t.Fatalf("Edit: %v", err)
+		t.Fatalf("build image download request: %v", err)
 	}
-	if len(edit.Images) != 1 {
-		t.Fatalf("Edit: expected 1 image, got %d", len(edit.Images))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("download image: %v", err)
 	}
-	if !strings.HasPrefix(edit.Images[0].URL, "https://static.kocoro.ai/") {
-		t.Errorf("Edit: expected https://static.kocoro.ai/ URL, got: %s", edit.Images[0].URL)
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		t.Fatalf("download image status = %s", response.Status)
 	}
-	if edit.Images[0].URL == gen.Images[0].URL {
-		t.Errorf("Edit returned identical URL to source — server may have shortcut without editing")
+	const maximumImageBytes = 25 << 20
+	data, err := io.ReadAll(io.LimitReader(response.Body, maximumImageBytes+1))
+	if err != nil {
+		t.Fatalf("read image: %v", err)
 	}
+	if len(data) > maximumImageBytes {
+		t.Fatalf("downloaded image exceeds %d bytes", maximumImageBytes)
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode image with content type %q: %v", response.Header.Get("Content-Type"), err)
+	}
+	return decoded
 }
 
 // readCloudConfig resolves the explicit live-E2E endpoint and credential. A

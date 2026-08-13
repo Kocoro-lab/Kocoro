@@ -26,6 +26,30 @@ func TestRegisteredLocalToolExposureMatrix(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	reg, _, cleanup := RegisterLocalTools(nil, nil)
 	t.Cleanup(cleanup)
+	approvalRequired := map[string]bool{
+		"file_read":       true,
+		"file_write":      true,
+		"file_edit":       true,
+		"glob":            true,
+		"grep":            true,
+		"bash":            true,
+		"directory_list":  true,
+		"archive_extract": true,
+		"http":            true,
+		"clipboard":       true,
+		"notify":          true,
+		"process":         true,
+		"applescript":     true,
+		"accessibility":   true,
+		"computer_use":    true,
+		"ghostty":         true,
+		"browser":         true,
+		"screenshot":      true,
+		"computer":        true,
+		"schedule_create": true,
+		"schedule_update": true,
+		"schedule_remove": true,
+	}
 
 	want := map[string]agent.ToolExposure{
 		"use_skill":           agent.ToolExposureDirect,
@@ -78,6 +102,9 @@ func TestRegisteredLocalToolExposureMatrix(t *testing.T) {
 			t.Fatalf("registered local tool %q is missing from the exposure matrix", name)
 		}
 		assertExposure(t, tool, exposure)
+		if got, expected := tool.RequiresApproval(), approvalRequired[name]; got != expected {
+			t.Errorf("%s RequiresApproval() = %t, want %t", name, got, expected)
+		}
 	}
 }
 

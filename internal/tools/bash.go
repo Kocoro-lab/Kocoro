@@ -181,18 +181,8 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	//     to a higher value for slow integration suites; never 0/unset to
 	//     disable (the cap protects UI cards from looking frozen for
 	//     unbounded minutes before SIGKILL fires).
-	maxBashTimeout := 600 * time.Second
-	if t.MaxTimeoutSecs > 0 {
-		maxBashTimeout = time.Duration(t.MaxTimeoutSecs) * time.Second
-	}
-	timeout := 120 * time.Second
-	if t.DefaultTimeoutSecs > 0 {
-		timeout = time.Duration(t.DefaultTimeoutSecs) * time.Second
-	}
-	if args.Timeout > 0 {
-		timeout = time.Duration(args.Timeout) * time.Second
-	}
-	if timeout > maxBashTimeout {
+	timeout, maxBashTimeout, clamped := resolveBashTimeout(args.Timeout, t.DefaultTimeoutSecs, t.MaxTimeoutSecs)
+	if clamped {
 		fmt.Fprintf(os.Stderr, "[bash] requested timeout %v > cap %v; clamping (override via tools.bash_max_timeout)\n", timeout, maxBashTimeout)
 		timeout = maxBashTimeout
 	}
@@ -265,9 +255,7 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	// (sleep, wait, sync, network probes) actually executed — without this,
 	// models can misperceive an empty-stdout success as "the command was
 	// blocked or skipped" and fabricate restrictions to explain it.
-	if elapsed >= time.Second {
-		result = fmt.Sprintf("[command ran for %.1fs]\n%s", elapsed.Seconds(), result)
-	}
+	result = annotateBashElapsed(result, elapsed)
 
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -293,6 +281,28 @@ func (t *BashTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, 
 	}
 
 	return agent.ToolResult{Content: result}, nil
+}
+
+func resolveBashTimeout(requestedSecs, defaultSecs, maxSecs int) (timeout, max time.Duration, clamped bool) {
+	max = 600 * time.Second
+	if maxSecs > 0 {
+		max = time.Duration(maxSecs) * time.Second
+	}
+	timeout = 120 * time.Second
+	if defaultSecs > 0 {
+		timeout = time.Duration(defaultSecs) * time.Second
+	}
+	if requestedSecs > 0 {
+		timeout = time.Duration(requestedSecs) * time.Second
+	}
+	return timeout, max, timeout > max
+}
+
+func annotateBashElapsed(result string, elapsed time.Duration) string {
+	if elapsed < time.Second {
+		return result
+	}
+	return fmt.Sprintf("[command ran for %.1fs]\n%s", elapsed.Seconds(), result)
 }
 
 func (t *BashTool) RequiresApproval() bool { return true }

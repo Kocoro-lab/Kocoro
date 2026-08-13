@@ -97,10 +97,3 @@ func TestClipboard_ReadWrite(t *testing.T) {
 		t.Errorf("expected clipboard content 'shannon-test-clipboard', got: %s", result.Content)
 	}
 }
-
-func TestClipboard_RequiresApproval(t *testing.T) {
-	tool := &ClipboardTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}

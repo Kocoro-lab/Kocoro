@@ -64,7 +64,7 @@ runner_status=0
     KOE_FAST_QUALIFICATION_SEED="$seed" \
     KOE_FAST_QUALIFICATION_MAX_COST_USD="$max_cost" \
     KOE_FAST_QUALIFICATION_PAUSE_MS="$pause_ms" \
-    go test ./internal/tools \
+    go test -tags=live ./internal/tools \
       -run '^TestKoeFastQualificationLive_AgentLoop$' \
       -count=1 -v -timeout=0
 ) 2>&1 | tee "$output_dir/provider-qualification.log" || runner_status="${PIPESTATUS[0]}"

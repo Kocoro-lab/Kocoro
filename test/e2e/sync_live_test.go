@@ -1,3 +1,5 @@
+//go:build live
+
 // test/e2e/sync_live_test.go
 package e2e
 

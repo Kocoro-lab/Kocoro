@@ -31,13 +31,6 @@ func TestScreenshot_Info(t *testing.T) {
 	}
 }
 
-func TestScreenshot_RequiresApproval(t *testing.T) {
-	tool := &ScreenshotTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}
-
 func TestScreenshot_InvalidArgs(t *testing.T) {
 	tool := &ScreenshotTool{}
 	result, err := tool.Run(context.Background(), `not valid json`)

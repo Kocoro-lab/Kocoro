@@ -73,13 +73,6 @@ func TestProcess_List(t *testing.T) {
 	}
 }
 
-func TestProcess_RequiresApproval(t *testing.T) {
-	tool := &ProcessTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}
-
 func TestProcess_IsSafeArgs(t *testing.T) {
 	tool := &ProcessTool{}
 	tests := []struct {

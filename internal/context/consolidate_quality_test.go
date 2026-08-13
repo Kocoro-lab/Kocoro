@@ -1,3 +1,5 @@
+//go:build live
+
 package context
 
 import (
@@ -13,9 +15,17 @@ import (
 // TestConsolidateMemory_LLMQuality calls the real gateway to verify the
 // consolidation prompt produces quality output from realistic duplicated input.
 //
-// Run with: go test ./internal/context/ -run TestConsolidateMemory_LLMQuality -v
-// Requires: SHANNON_ENDPOINT and SHANNON_API_KEY env vars (or ~/.shannon/config.yaml)
+// Run with: SHANNON_E2E_LIVE=1 KOCORO_CONSOLIDATE_MEMORY_QUALITY_LIVE=1 \
+// go test -tags=live ./internal/context/ -run TestConsolidateMemory_LLMQuality -v
+// Requires: SHANNON_ENDPOINT and SHANNON_API_KEY env vars (or ~/.shannon/config.yaml).
 func TestConsolidateMemory_LLMQuality(t *testing.T) {
+	if os.Getenv("KOCORO_CONSOLIDATE_MEMORY_QUALITY_LIVE") != "1" {
+		t.Skip("set KOCORO_CONSOLIDATE_MEMORY_QUALITY_LIVE=1 to authorize the paid memory consolidation quality test")
+	}
+	if os.Getenv("SHANNON_E2E_LIVE") != "1" {
+		t.Fatal("also set SHANNON_E2E_LIVE=1 to authorize real provider calls")
+	}
+
 	endpoint := os.Getenv("SHANNON_ENDPOINT")
 	apiKey := os.Getenv("SHANNON_API_KEY")
 

@@ -92,10 +92,3 @@ func TestAppleScript_InvalidScript(t *testing.T) {
 		t.Error("expected error result for invalid script")
 	}
 }
-
-func TestAppleScript_RequiresApproval(t *testing.T) {
-	tool := &AppleScriptTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}

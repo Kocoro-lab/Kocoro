@@ -80,13 +80,6 @@ func TestGhosttyTool_Info(t *testing.T) {
 	}
 }
 
-func TestGhosttyTool_RequiresApproval(t *testing.T) {
-	tool := &GhosttyTool{tabs: newTabRegistry()}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval() = true")
-	}
-}
-
 func TestGhosttyTool_InvalidAction(t *testing.T) {
 	tool := &GhosttyTool{tabs: newTabRegistry()}
 	result, err := tool.Run(context.Background(), `{"action":"bogus","description":"test invalid action"}`)

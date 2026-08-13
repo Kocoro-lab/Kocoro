@@ -495,13 +495,17 @@ func TestSessionCache_InjectMessage_SameCWDAllowed(t *testing.T) {
 
 func TestSessionCache_CancelRoute(t *testing.T) {
 	sc := NewSessionCache(t.TempDir())
-	defer sc.CloseAll()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		sc.CloseAll()
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sc.mu.Lock()
 	sc.routes["agent:test"] = &routeEntry{
 		cancel: cancel,
-		done:   make(chan struct{}),
+		done:   done,
 	}
 	sc.mu.Unlock()
 

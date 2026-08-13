@@ -581,7 +581,7 @@ func TestResumeInterruptedTurnsRequiresReviewWithoutGatewayCall(t *testing.T) {
 
 func TestResumeInterruptedTurnFailuresPreserveCheckpointAndStopAtLimit(t *testing.T) {
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "temporary gateway failure", http.StatusServiceUnavailable)
+		http.Error(w, "synthetic request failure", http.StatusBadRequest)
 	}))
 	defer gateway.Close()
 

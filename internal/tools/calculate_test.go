@@ -46,6 +46,7 @@ func TestCalculateTool(t *testing.T) {
 
 func TestCalculateToolRejectsUnsafeOrInvalidExpressions(t *testing.T) {
 	tests := []string{
+		"",
 		"1 / 0",
 		"1.5 % 1",
 		"someFunction(2)",
@@ -69,23 +70,5 @@ func TestCalculateToolRejectsUnsafeOrInvalidExpressions(t *testing.T) {
 				t.Fatalf("result=%+v want validation error", result)
 			}
 		})
-	}
-}
-
-func TestCalculateToolRequiresExpression(t *testing.T) {
-	result, err := (&CalculateTool{}).Run(context.Background(), `{}`)
-	if err != nil {
-		t.Fatalf("Run err=%v", err)
-	}
-	if !result.IsError || !strings.HasPrefix(result.Content, "[validation error]") {
-		t.Fatalf("result=%+v want validation error", result)
-	}
-}
-
-func TestRegisterLocalToolsIncludesCalculate(t *testing.T) {
-	reg, _, cleanup := RegisterLocalTools(nil, nil)
-	defer cleanup()
-	if _, ok := reg.Get("calculate"); !ok {
-		t.Fatal("calculate tool not registered")
 	}
 }

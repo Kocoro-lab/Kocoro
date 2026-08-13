@@ -67,13 +67,6 @@ func TestNotify_BuildScript(t *testing.T) {
 	}
 }
 
-func TestNotify_RequiresApproval(t *testing.T) {
-	tool := &NotifyTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}
-
 func TestNotify_DesktopHandler_Delivered(t *testing.T) {
 	tool := &NotifyTool{}
 	var (

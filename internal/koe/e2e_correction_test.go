@@ -1,4 +1,4 @@
-//go:build darwin && cgo
+//go:build darwin && cgo && koe_diagnostic
 
 package koe
 
@@ -21,11 +21,14 @@ package koe
 // stale result with the variant's response.create → observe whether the model
 // speaks the stale result content.
 //
-// Gated: KOE_E2E=1. Mints via the running daemon (KOE_DAEMON_URL, default
+// This is a diagnostic comparison, not a release test: model behavior is
+// tallied for human inspection and does not produce a pass/fail quality gate.
+// The dedicated koe_diagnostic build tag keeps it out of default and release
+// test discovery. It mints via the running daemon (KOE_DAEMON_URL, default
 // http://127.0.0.1:7533) so no raw OPENAI_API_KEY is needed. macOS-only (say).
 //
-//	KOE_E2E=1 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
-//	  go test ./internal/koe/ -run TestKoeCorrectionSuppressionE2E -v -count=1 -timeout=900s
+//	KOE_CORRECTION_SUPPRESSION_DIAGNOSTIC=1 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+//	  go test -tags=koe_diagnostic ./internal/koe/ -run '^TestKoeCorrectionSuppressionDiagnostic$' -v -count=1 -timeout=900s
 
 import (
 	"context"
@@ -54,9 +57,9 @@ const staleResultText = "Done — I set a reminder to call mom at six."
 // user corrected mid-flight. Tests whether a PROMPT change alone is enough.
 const correctionSuppressClause = "IMPORTANT: If the user corrected you, said you misheard, or took back a request while a task was still running, do NOT read that task's result aloud when it comes back — the user no longer wants it. Just briefly acknowledge, and only speak a result the user still wants."
 
-func TestKoeCorrectionSuppressionE2E(t *testing.T) {
-	if os.Getenv("KOE_E2E") != "1" {
-		t.Skip("correction-suppression E2E: set KOE_E2E=1 (mints via the running daemon)")
+func TestKoeCorrectionSuppressionDiagnostic(t *testing.T) {
+	if os.Getenv("KOE_CORRECTION_SUPPRESSION_DIAGNOSTIC") != "1" {
+		t.Skip("correction-suppression diagnostic: set KOE_CORRECTION_SUPPRESSION_DIAGNOSTIC=1 (mints via the running daemon)")
 	}
 	trials := koeEnvInt("KOE_TRIALS", 3)
 	variants := []string{"forced", "plain", "guided"}

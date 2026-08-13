@@ -1,3 +1,5 @@
+//go:build live
+
 package agent
 
 import (
@@ -18,8 +20,8 @@ import (
 // in normal test runs:
 //
 //   TOOLSEARCH_CLOUD_LIVE=1 TOOLSEARCH_CLOUD_ENDPOINT=https://... \
-//     TOOLSEARCH_CLOUD_API_KEY=... go test ./internal/agent -run TestToolSearchLive_Cloud -v
-//   TOOLSEARCH_OLLAMA_LIVE=1 OLLAMA_MODEL=qwen3:4b go test ./internal/agent -run TestToolSearchLive_Ollama -v
+//     TOOLSEARCH_CLOUD_API_KEY=... go test -tags=live ./internal/agent -run TestToolSearchLive_Cloud -v
+//   TOOLSEARCH_OLLAMA_LIVE=1 OLLAMA_MODEL=qwen3:4b go test -tags=live ./internal/agent -run TestToolSearchLive_Ollama -v
 
 type recordingLLMClient struct {
 	inner client.LLMClient

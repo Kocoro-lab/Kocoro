@@ -119,9 +119,11 @@ func TestStore_SaveLoad(t *testing.T) {
 	defer store.Close()
 
 	sess := &Session{
-		ID:    "test-123",
-		Title: "Test session",
-		CWD:   "/tmp/test",
+		ID:      "test-123",
+		Title:   "Test session",
+		CWD:     "/tmp/test",
+		Source:  "slack",
+		Channel: "#general",
 		Messages: []client.Message{
 			{Role: "user", Content: client.NewTextContent("hello")},
 			{Role: "assistant", Content: client.NewTextContent("hi there")},
@@ -138,6 +140,9 @@ func TestStore_SaveLoad(t *testing.T) {
 	}
 	if loaded.Title != "Test session" {
 		t.Errorf("expected 'Test session', got %q", loaded.Title)
+	}
+	if loaded.Source != "slack" || loaded.Channel != "#general" {
+		t.Errorf("source/channel = %q/%q, want slack/#general", loaded.Source, loaded.Channel)
 	}
 	if len(loaded.Messages) != 2 {
 		t.Errorf("expected 2 messages, got %d", len(loaded.Messages))

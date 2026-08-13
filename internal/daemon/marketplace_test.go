@@ -278,24 +278,36 @@ func TestHandleMarketplaceInstallMaliciousBlocked(t *testing.T) {
 	}
 }
 
-// TestHandleMarketplaceInstallUpstreamFailureMaps502 verifies that a
-// failed git clone surfaces as 502 Bad Gateway (upstream problem), not
-// 500 Internal Server Error (local problem). Uses a registry entry with
-// a bogus file:// path that definitely does not exist.
-func TestHandleMarketplaceInstallUpstreamFailureMaps502(t *testing.T) {
+// TestHandleMarketplaceInstallUpstreamFailure verifies that a failed local git
+// clone maps to 502 and retains the underlying cause in the audit log. Retry
+// behavior is covered in the skills package.
+func TestHandleMarketplaceInstallUpstreamFailure(t *testing.T) {
 	registryJSON := `{
 		"version":1,
 		"skills":[{"slug":"demo","name":"demo","description":"d","author":"a","repo":"file:///nonexistent/path/to/repo","ref":"main"}]
 	}`
 	s, _ := newTestServerWithMarketplace(t, registryJSON)
+	logPath, closer := attachTestAuditor(t, s)
 
 	req := httptest.NewRequest("POST", "/skills/marketplace/install/demo", nil)
 	req.SetPathValue("slug", "demo")
 	rr := httptest.NewRecorder()
 	s.handleMarketplaceInstall(rr, req)
+	closer()
 
 	if rr.Code != http.StatusBadGateway {
-		t.Errorf("status = %d, want 502 (upstream clone failure)", rr.Code)
+		t.Fatalf("status = %d, want 502", rr.Code)
+	}
+	entries := readAuditEntries(t, logPath)
+	if len(entries) != 1 {
+		t.Fatalf("got %d audit entries, want 1: %+v", len(entries), entries)
+	}
+	if entries[0]["decision"] != "error" {
+		t.Errorf("decision = %v, want \"error\"", entries[0]["decision"])
+	}
+	out, _ := entries[0]["output_summary"].(string)
+	if !strings.Contains(out, "upstream failure") {
+		t.Errorf("output_summary = %q, want \"upstream failure\" prefix", out)
 	}
 }
 
@@ -1123,41 +1135,5 @@ func TestHandleUploadSkill_AuditsMissingFile(t *testing.T) {
 	}
 	if out, _ := e["output_summary"].(string); !strings.Contains(out, "missing 'file' field") {
 		t.Errorf("output_summary = %q, want \"missing 'file' field\"", out)
-	}
-}
-
-// TestHandleMarketplaceInstall_AuditsUpstreamFailure locks in that the
-// upstream-failure branch (502 path) records the underlying git error in
-// output_summary. This is the case ouikyou hit on 2026-05-18 with docx/pdf
-// against github.com from a Tokyo office network — previously invisible in
-// audit.log.
-func TestHandleMarketplaceInstall_AuditsUpstreamFailure(t *testing.T) {
-	registryJSON := `{
-		"version":1,
-		"skills":[{"slug":"demo","name":"demo","description":"d","author":"a","repo":"file:///nonexistent/path/to/repo","ref":"main"}]
-	}`
-	s, _ := newTestServerWithMarketplace(t, registryJSON)
-	logPath, closer := attachTestAuditor(t, s)
-
-	req := httptest.NewRequest("POST", "/skills/marketplace/install/demo", nil)
-	req.SetPathValue("slug", "demo")
-	rr := httptest.NewRecorder()
-	s.handleMarketplaceInstall(rr, req)
-	closer()
-
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", rr.Code)
-	}
-	entries := readAuditEntries(t, logPath)
-	if len(entries) != 1 {
-		t.Fatalf("got %d audit entries, want 1: %+v", len(entries), entries)
-	}
-	e := entries[0]
-	if e["decision"] != "error" {
-		t.Errorf("decision = %v, want \"error\"", e["decision"])
-	}
-	out, _ := e["output_summary"].(string)
-	if !strings.Contains(out, "upstream failure") {
-		t.Errorf("output_summary = %q, want \"upstream failure\" prefix", out)
 	}
 }

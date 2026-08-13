@@ -1,9 +1,15 @@
+//go:build live
+
 package tools
 
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,14 +24,19 @@ import (
 // This test crosses the real Shan AgentLoop, an isolated Shannon Cloud
 // deployment, the selected Anthropic adapter, and macOS screen capture. It is
 // intentionally gated because it sends a real desktop screenshot to the
-// configured provider and incurs provider cost.
+// configured provider and incurs provider cost. The browser window is a
+// deterministic local page, but macOS chrome and other system UI may still be
+// visible around it.
 //
 //	KOE_NATIVE_COMPUTER_LIVE=1 \
 //	TOOLSEARCH_CLOUD_ENDPOINT=http://127.0.0.1:18080 \
-//	go test ./internal/tools -run TestKoeNativeComputerLive -v -count=1
+//	go test -tags=live ./internal/tools -run TestKoeNativeComputerLive -v -count=1
 func TestKoeNativeComputerLive(t *testing.T) {
 	if os.Getenv("KOE_NATIVE_COMPUTER_LIVE") != "1" {
 		t.Skip("set KOE_NATIVE_COMPUTER_LIVE=1 to run the isolated native-computer E2E")
+	}
+	if runtime.GOOS != "darwin" {
+		t.Fatal("native-computer E2E requires macOS screen capture")
 	}
 	endpoint := strings.TrimSpace(os.Getenv("TOOLSEARCH_CLOUD_ENDPOINT"))
 	if endpoint == "" {
@@ -35,6 +46,8 @@ func TestKoeNativeComputerLive(t *testing.T) {
 	if model == "" {
 		model = "claude-sonnet-5"
 	}
+	const visualToken = "SCREEN-LABEL-731"
+	startControlledComputerPage(t, visualToken)
 
 	recorder := &nativeComputerRecordingClient{
 		inner: client.NewGatewayClient(
@@ -77,15 +90,15 @@ func TestKoeNativeComputerLive(t *testing.T) {
 	defer cancel()
 	result, _, err := loop.Run(
 		ctx,
-		"First call tool_search with select:computer. Then call computer with action screenshot exactly once. Inspect the screenshot and reply with one brief factual observation.",
+		"First call tool_search with select:computer. Then call computer with action screenshot exactly once. Read the large page label in the controlled local test page and reply with that exact label only.",
 		nil,
 		nil,
 	)
 	if err != nil {
 		t.Fatalf("native computer AgentLoop: %v", err)
 	}
-	if strings.TrimSpace(result) == "" {
-		t.Fatal("native computer AgentLoop returned an empty final answer")
+	if !strings.Contains(result, visualToken) {
+		t.Fatalf("native computer result = %q, want screenshot token %q", result, visualToken)
 	}
 	requests, responses, resolves, events := recorder.snapshot()
 	if got := computer.runs.Load(); got != 1 {
@@ -181,6 +194,70 @@ func TestKoeNativeComputerLive(t *testing.T) {
 		len(requests),
 		events,
 	)
+}
+
+func startControlledComputerPage(t *testing.T, token string) {
+	t.Helper()
+	chrome := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+	if _, err := os.Stat(chrome); err != nil {
+		t.Fatalf("native-computer E2E requires Google Chrome: %v", err)
+	}
+	loaded := make(chan struct{}, 1)
+	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case loaded <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(
+			w,
+			`<!doctype html><title>Controlled computer E2E</title><style>html,body{height:100%%;margin:0;background:white}main{height:100%%;display:grid;place-items:center;font:700 84px system-ui;color:#111}</style><main>%s</main>`,
+			token,
+		)
+	}))
+	t.Cleanup(page.Close)
+
+	profile := t.TempDir()
+	cmd := exec.Command(
+		chrome,
+		"--user-data-dir="+profile,
+		"--app="+page.URL,
+		"--window-size=1280,800",
+		"--window-position=0,0",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-background-mode",
+		"--disable-sync",
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start controlled Chrome window: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("controlled Chrome process did not exit within 5s")
+		}
+	})
+
+	select {
+	case <-loaded:
+	case <-time.After(15 * time.Second):
+		t.Fatal("controlled Chrome did not load the local page within 15s")
+	}
+	if err := exec.Command(
+		"osascript",
+		"-e",
+		fmt.Sprintf(`tell application "System Events" to set frontmost of first process whose unix id is %d to true`, cmd.Process.Pid),
+	).Run(); err != nil {
+		t.Logf("could not explicitly focus controlled Chrome process: %v", err)
+	}
+	time.Sleep(750 * time.Millisecond)
 }
 
 type countingNativeComputerTool struct {
