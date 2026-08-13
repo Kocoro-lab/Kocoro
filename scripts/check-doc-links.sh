@@ -23,7 +23,7 @@ done < <(git ls-files 'docs/*contract*.md' 'contracts/*.md' 2>/dev/null)
 
 # Directory prefixes worth checking. Kept to trees whose layout the guides
 # actually assert; widening further mostly adds prose false positives.
-PREFIX='(docs|contracts|infra|scripts)'
+PREFIX='(docs|contracts|infra|scripts|internal/skills/bundled)'
 
 # A reference is excused when one of these appears NEAR it -- not merely
 # somewhere on the same line. These files have multi-kilobyte lines, and a

@@ -34,13 +34,13 @@ notably Voice Front-Brain Authority (`internal/koe`), Provider Architecture
 
 ### Doc Co-Maintenance
 
-Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-facing), and AGENTS.md (external-agent-facing, mirrors structure tree + conventions).
+Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-facing), and AGENTS.md (external-agent-facing: the rules and the greppable symbols, not a second copy of this file).
 
 **Kocoro skill is the AI's source of truth for the daemon HTTP API** — `references/*.md` are injected into the **kocoro agent's** context, so the rule covers only endpoints the agent calls or must understand: every such `mux.HandleFunc(...)` in `internal/daemon/server.go` needs a matching `references/*.md` entry in the same PR. Maps:
 - agents/skills/schedules/config endpoints → `references/{agents,skills,schedules,config}.md`
 - MCP / permissions / project-init / instructions / recipes / session-sync / memory → matching `references/*.md`
 - `/local/auth/*` endpoints → `references/auth.md`
-- `calendar_*` tools (8) + protocol → `references/calendar.md` + `references/desktop-rpc.md` (these skill refs are the public protocol reference); the full design doc `docs/desktop-calendar-rpc.md` is local-only / untracked (rationale + closed-app internals, not shipped)
+- `calendar_*` tools (8) + protocol → `internal/skills/bundled/skills/kocoro/references/calendar.md` + `.../desktop-rpc.md` (these skill refs are the public protocol reference); the full design doc `docs/desktop-calendar-rpc.md` is local-only / untracked (rationale + closed-app internals, not shipped)
 - Protected config fields, tool filter → `SKILL.md` security section
 - Desktop-only transport endpoints the agent never calls → NOT in references; their Desktop↔daemon wire contract lives in `docs/desktop-wire-fixtures/`
 
@@ -375,7 +375,7 @@ Recovered runs are ALWAYS unattended (`IsUnattendedRun()==true` regardless of th
 
 ### Daemon Approval Protocol
 
-- **Interactive** (default): approval round-trips over WS to Ptfrog — the Cloud-relayed first-party approval surface, as opposed to an external channel. The codename is load-bearing on the wire: `ApprovalResolvedPayload.ResolvedBy` (`internal/daemon/types.go`) carries `"ptfrog"` alongside `"slack"` / `"line"`, so do not rename it in code.
+- **Interactive** (default): approval round-trips over WS to Ptfrog — the historical codename for the Cloud-relayed first-party approval surface, as opposed to an external channel. **The name survives only in prose and one field comment; it is NOT on the wire.** `ApprovalResolvedPayload.ResolvedBy` (`internal/daemon/types.go`) is written as `"kocoro"` by the HTTP resolve path (`server.go`) and `"daemon"` by broker-side cleanup (`approval.go`, `question_broker.go`), which is what the pinned fixtures carry. Match a fixture or a writer, never the comment.
 - **Auto-approve** (`daemon.auto_approve` or per-agent): skips the WS round-trip except for unattended-deny-listed tools such as `computer_use` and `screenshot`; the permission engine remains enforced.
 - Synchronous HTTP API handlers auto-approve (localhost-only) except for unattended-deny-listed tools.
 
