@@ -54,11 +54,11 @@
     {
       "id": "mcp_and_browser",
       "change_globs": ["internal/mcp/**", "internal/tools/browser*", "test/e2e/*mcp*", "test/e2e/*playwright*"],
-      "rationale": "Lifecycle and reconnect tests prove mechanisms; the full-path probe proves one allowlisted browser result but not open-web quality.",
+      "rationale": "Mechanism tests cover MCP lifecycle; the paid outcome lane qualifies deterministic cross-page reading and exactly-once form submission without depending on public websites.",
       "deterministic": ["go test ./internal/mcp ./internal/tools"],
-      "comparison": ["SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_IsolatedMCPAllowlist_FullPath$' -count=1"],
-      "release_status": "gap",
-      "release": []
+      "comparison": ["SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_IsolatedMCPAllowlist_FullPath$' -count=1", "SHANNON_E2E_LIVE=1 KOCORO_BROWSER_OUTCOME_LIVE=1 KOCORO_BROWSER_OUTCOME_SAMPLE=comparison go test -tags=live ./test/e2e -run '^TestLive_BrowserOutcomeMatrix$' -count=1"],
+      "release_status": "covered",
+      "release": ["SHANNON_E2E_LIVE=1 KOCORO_BROWSER_OUTCOME_LIVE=1 KOCORO_BROWSER_OUTCOME_SAMPLE=release go test -tags=live ./test/e2e -run '^TestLive_BrowserOutcomeMatrix$' -count=1"]
     },
     {
       "id": "koe_realtime_and_voice",
@@ -72,20 +72,20 @@
     {
       "id": "computer_use",
       "change_globs": ["internal/tools/*computer*", "internal/guicontrol/**", "internal/daemon/*computer*"],
-      "rationale": "Protocol tests do not establish that the model interpreted a screenshot correctly or completed a desktop task.",
+      "rationale": "The live probe now verifies semantic reading of a controlled screenshot, but no release lane yet proves a verified desktop action outcome.",
       "deterministic": ["go test ./internal/tools ./internal/guicontrol ./internal/daemon"],
-      "comparison": ["KOE_NATIVE_COMPUTER_LIVE=1 go test -tags=live ./internal/tools -run '^TestKoeNativeComputerLive$' -count=1"],
+      "comparison": ["KOE_NATIVE_COMPUTER_LIVE=1 TOOLSEARCH_CLOUD_ENDPOINT=http://127.0.0.1:18080 go test -tags=live ./internal/tools -run '^TestKoeNativeComputerLive$' -count=1"],
       "release_status": "gap",
       "release": []
     },
     {
       "id": "image_generation",
       "change_globs": ["internal/images/**", "internal/tools/*image*", "test/e2e/live_test.go"],
-      "rationale": "The current live check covers image transport only; it does not grade generated or edited pixels against the request.",
+      "rationale": "The paid lane checks Cloud/CDN transport plus deterministic red-circle and bottom-right blue-square pixel oracles; it is a narrow regression gate, not a general aesthetic score.",
       "deterministic": ["go test ./internal/images ./internal/tools"],
-      "comparison": ["SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_ImageGenerateEditTransportSmoke$' -count=1"],
-      "release_status": "gap",
-      "release": []
+      "comparison": ["SHANNON_E2E_LIVE=1 KOCORO_IMAGE_QUALITY_LIVE=1 KOCORO_IMAGE_QUALITY_SAMPLE=comparison go test -tags=live ./test/e2e -run '^TestLive_ImageGenerateEditQuality$' -count=1"],
+      "release_status": "covered",
+      "release": ["SHANNON_E2E_LIVE=1 KOCORO_IMAGE_QUALITY_LIVE=1 KOCORO_IMAGE_QUALITY_SAMPLE=release go test -tags=live ./test/e2e -run '^TestLive_ImageGenerateEditQuality$' -count=1 -timeout=20m"]
     },
     {
       "id": "test_harness_and_lanes",

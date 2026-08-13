@@ -75,6 +75,16 @@ go test -tags=live ./test/e2e \
   -run '^TestLive_(MidRunProgressNotesReachTheUser|BusinessErrorStopsWithoutRetry|ChannelDeliveryMetadataShapesReply|IsolatedMCPAllowlist_FullPath)$' \
   -count=1 -v -timeout=12m
 
+# Browser outcome qualification on deterministic local pages. Comparison runs
+# each cross-page-read and form-submit case once; release runs each five times.
+SHANNON_E2E_LIVE=1 \
+KOCORO_BROWSER_OUTCOME_LIVE=1 \
+KOCORO_BROWSER_OUTCOME_SAMPLE=comparison \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+go test -tags=live ./test/e2e \
+  -run '^TestLive_BrowserOutcomeMatrix$' \
+  -count=1 -v -timeout=12m
+
 # Paid production-tool-surface matrix. Comparison is 3 repetitions per case;
 # release is 5 and requires SAMPLE=release. Both require every answer, tool
 # argument, and state oracle to pass; cost is capped and the report is JSON.
@@ -106,13 +116,26 @@ go test -tags=live ./test/e2e \
   -run '^TestLive_ResponseDetailAcrossProviders$' \
   -count=1 -v -timeout=12m
 
-# Paid image transport smoke. This checks the Cloud/CDN wire path and metadata,
-# not prompt adherence, perceptual quality, or edit quality.
+# Paid image transport and narrow semantic check. Comparison makes one
+# generate/edit pair; release makes five. The deterministic pixel oracle checks
+# a simple red-circle generation and blue-square edit, not general aesthetics.
 SHANNON_E2E_LIVE=1 \
+KOCORO_IMAGE_QUALITY_LIVE=1 \
+KOCORO_IMAGE_QUALITY_SAMPLE=comparison \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
 go test -tags=live ./test/e2e \
-  -run '^TestLive_ImageGenerateEditTransportSmoke$' \
-  -count=1 -v -timeout=5m
+  -run '^TestLive_ImageGenerateEditQuality$' \
+  -count=1 -v -timeout=20m
+
+# Opt-in native screenshot semantic probe. The controlled Chrome page dominates
+# the screen, but surrounding macOS UI may still be sent to the provider. This
+# is comparison evidence only because it does not perform a desktop action.
+KOE_NATIVE_COMPUTER_LIVE=1 \
+TOOLSEARCH_CLOUD_ENDPOINT=http://127.0.0.1:18080 \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+go test -tags=live ./internal/tools \
+  -run '^TestKoeNativeComputerLive$' \
+  -count=1 -v -timeout=8m
 
 KOE_LIVE_TEXT_FULL_PATH_E2E=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \

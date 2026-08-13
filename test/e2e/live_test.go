@@ -10,6 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"net"
 	"net/http"
@@ -26,6 +30,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/images"
 	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
 	"github.com/Kocoro-lab/ShanClaw/internal/mcp"
+	_ "golang.org/x/image/webp"
 	"gopkg.in/yaml.v3"
 )
 
@@ -561,76 +566,134 @@ func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout t
 	t.Fatalf("isolated daemon did not confirm contained startup\n%s", daemon.output.String())
 }
 
-// TestLive_ImageGenerateEditTransportSmoke exercises the v0.1.4 generate_image
-// and edit_image transport pipeline against the configured Shannon Cloud endpoint. It
-// bypasses the agent loop's per-call approval gate (which legitimately blocks
-// image tools under -y) and calls the production HTTP client directly,
-// validating request, response metadata, and CDN handoff end-to-end. It does
-// not judge whether either image matches the prompt or has acceptable visual
-// quality. This is a paid live test; current cost expectations are maintained
-// in the private QA process.
-func TestLive_ImageGenerateEditTransportSmoke(t *testing.T) {
+// TestLive_ImageGenerateEditQuality exercises the production image and CDN
+// path, then applies deterministic color/layout oracles to one deliberately
+// simple generation and edit. It is not a general perceptual-quality score.
+func TestLive_ImageGenerateEditQuality(t *testing.T) {
 	skipUnlessLive(t)
+	if os.Getenv("KOCORO_IMAGE_QUALITY_LIVE") != "1" {
+		t.Skip("set KOCORO_IMAGE_QUALITY_LIVE=1 to run the paid image quality E2E")
+	}
+	sample := strings.TrimSpace(os.Getenv("KOCORO_IMAGE_QUALITY_SAMPLE"))
+	if sample == "" {
+		sample = "comparison"
+	}
+	repetitions := 1
+	switch sample {
+	case "comparison":
+	case "release":
+		repetitions = 5
+	default:
+		t.Fatalf("KOCORO_IMAGE_QUALITY_SAMPLE must be comparison or release, got %q", sample)
+	}
 
 	endpoint, apiKey := readCloudConfig(t)
 	if endpoint == "" || apiKey == "" {
-		t.Skip("cloud.endpoint / cloud.api_key not configured in ~/.shannon/config.yaml")
+		t.Fatal("cloud.endpoint / cloud.api_key not configured in ~/.shannon/config.yaml")
 	}
 	client := images.NewClient(endpoint, apiKey, &http.Client{Timeout: 180 * time.Second})
 
-	// Generate a tiny low-quality image to keep cost minimal.
-	genCtx, genCancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer genCancel()
-	gen, err := client.Generate(genCtx, images.GenerateRequest{
-		Prompt:  "a red circle on white background, simple flat design",
-		Size:    "1024x1024",
-		Quality: "low",
-		N:       1,
-	})
-	if err != nil {
-		// A 404 means this gateway has no image endpoint deployed — an
-		// environment state (e.g. stale local Cloud image), not a code
-		// regression in this repo. Every other error stays fatal.
-		if errors.Is(err, images.ErrEndpointNotFound) {
-			t.Skipf("image endpoint not deployed at this gateway: %v", err)
-		}
-		t.Fatalf("Generate: %v", err)
-	}
-	if len(gen.Images) != 1 {
-		t.Fatalf("Generate: expected 1 image, got %d", len(gen.Images))
-	}
-	if !strings.HasPrefix(gen.Images[0].URL, "https://static.kocoro.ai/") {
-		t.Errorf("Generate: expected https://static.kocoro.ai/ URL, got: %s", gen.Images[0].URL)
-	}
-	if gen.Model != "gpt-image-2" {
-		t.Errorf("Generate: expected gpt-image-2 model, got: %s", gen.Model)
-	}
-	if gen.Images[0].SizeBytes <= 0 {
-		t.Errorf("Generate: expected positive size_bytes, got: %d", gen.Images[0].SizeBytes)
-	}
+	allPassed := true
+	for repetition := 1; repetition <= repetitions; repetition++ {
+		if !t.Run(fmt.Sprintf("repetition_%d", repetition), func(t *testing.T) {
+			genCtx, genCancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer genCancel()
+			gen, err := client.Generate(genCtx, images.GenerateRequest{
+				Prompt:  "a single solid red circle centered on a plain pure white background, flat geometric design, no text, no shadow, no other objects",
+				Size:    "1024x1024",
+				Quality: "low",
+				N:       1,
+			})
+			if err != nil {
+				if errors.Is(err, images.ErrEndpointNotFound) {
+					t.Fatalf("image endpoint not deployed at the configured gateway: %v", err)
+				}
+				t.Fatalf("Generate: %v", err)
+			}
+			if len(gen.Images) != 1 {
+				t.Fatalf("Generate: expected 1 image, got %d", len(gen.Images))
+			}
+			if !strings.HasPrefix(gen.Images[0].URL, "https://static.kocoro.ai/") {
+				t.Fatalf("Generate: expected https://static.kocoro.ai/ URL, got: %s", gen.Images[0].URL)
+			}
+			if gen.Model != "gpt-image-2" {
+				t.Fatalf("Generate: expected gpt-image-2 model, got: %s", gen.Model)
+			}
+			if gen.Images[0].SizeBytes <= 0 {
+				t.Fatalf("Generate: expected positive size_bytes, got: %d", gen.Images[0].SizeBytes)
+			}
+			source := downloadLiveImage(t, gen.Images[0].URL)
+			if source.Bounds().Dx() != 1024 || source.Bounds().Dy() != 1024 {
+				t.Fatalf("Generate: dimensions = %dx%d, want 1024x1024", source.Bounds().Dx(), source.Bounds().Dy())
+			}
+			if err := validateGeneratedImageSemantics(source); err != nil {
+				t.Fatalf("Generate semantic oracle: %v", err)
+			}
 
-	// Edit using the URL we just generated — round-trips the CDN allowlist.
-	editCtx, editCancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer editCancel()
-	edit, err := client.Edit(editCtx, images.EditRequest{
-		Prompt:    "add a small blue square in the bottom-right corner",
-		ImageURLs: []string{gen.Images[0].URL},
-		Size:      "1024x1024",
-		Quality:   "low",
-		N:         1,
-	})
+			editCtx, editCancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer editCancel()
+			edit, err := client.Edit(editCtx, images.EditRequest{
+				Prompt:    "keep the image unchanged except add one small solid blue square entirely inside the bottom-right quadrant, no text",
+				ImageURLs: []string{gen.Images[0].URL},
+				Size:      "1024x1024",
+				Quality:   "low",
+				N:         1,
+			})
+			if err != nil {
+				t.Fatalf("Edit: %v", err)
+			}
+			if len(edit.Images) != 1 {
+				t.Fatalf("Edit: expected 1 image, got %d", len(edit.Images))
+			}
+			if !strings.HasPrefix(edit.Images[0].URL, "https://static.kocoro.ai/") {
+				t.Fatalf("Edit: expected https://static.kocoro.ai/ URL, got: %s", edit.Images[0].URL)
+			}
+			if edit.Images[0].URL == gen.Images[0].URL {
+				t.Fatal("Edit returned the source URL")
+			}
+			edited := downloadLiveImage(t, edit.Images[0].URL)
+			if err := validateEditedImageSemantics(source, edited); err != nil {
+				t.Fatalf("Edit semantic oracle: %v", err)
+			}
+		}) {
+			allPassed = false
+		}
+	}
+	if !allPassed {
+		t.FailNow()
+	}
+	t.Logf("image quality E2E passed: sample=%s repetitions=%d paid_calls=%d", sample, repetitions, repetitions*2)
+}
+
+func downloadLiveImage(t *testing.T, url string) image.Image {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		t.Fatalf("Edit: %v", err)
+		t.Fatalf("build image download request: %v", err)
 	}
-	if len(edit.Images) != 1 {
-		t.Fatalf("Edit: expected 1 image, got %d", len(edit.Images))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("download image: %v", err)
 	}
-	if !strings.HasPrefix(edit.Images[0].URL, "https://static.kocoro.ai/") {
-		t.Errorf("Edit: expected https://static.kocoro.ai/ URL, got: %s", edit.Images[0].URL)
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		t.Fatalf("download image status = %s", response.Status)
 	}
-	if edit.Images[0].URL == gen.Images[0].URL {
-		t.Errorf("Edit returned identical URL to source — server may have shortcut without editing")
+	const maximumImageBytes = 25 << 20
+	data, err := io.ReadAll(io.LimitReader(response.Body, maximumImageBytes+1))
+	if err != nil {
+		t.Fatalf("read image: %v", err)
 	}
+	if len(data) > maximumImageBytes {
+		t.Fatalf("downloaded image exceeds %d bytes", maximumImageBytes)
+	}
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode image with content type %q: %v", response.Header.Get("Content-Type"), err)
+	}
+	return decoded
 }
 
 // readCloudConfig resolves the explicit live-E2E endpoint and credential. A
