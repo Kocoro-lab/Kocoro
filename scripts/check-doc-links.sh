@@ -46,7 +46,7 @@ exists_in_checkout() {
 
 fail=0
 checked=0
-missing_guide=0
+found_guide=0
 
 for f in "${FILES[@]}"; do
   if [ ! -f "$f" ]; then
@@ -58,7 +58,7 @@ for f in "${FILES[@]}"; do
     esac
     continue
   fi
-  missing_guide=1
+  found_guide=1
 
   # Match files (extension required) and directories (trailing slash), so an
   # index rewritten from a file list into directory pointers stays covered.
@@ -73,10 +73,8 @@ for f in "${FILES[@]}"; do
     # Globs: report rather than skip, so `checked` never undercounts silently.
     case "$target" in
       *'*'*)
-        # shellcheck disable=SC2086
-        set -- $target
         checked=$((checked + 1))
-        if [ -z "$(git ls-files -- $target | head -1)" ]; then
+        if [ -z "$(git ls-files -- "$target" | head -1)" ]; then
           printf '  DEAD  %s:%s -> %s (glob matches nothing tracked)\n' "$f" "$lineno" "$target"
           fail=1
         fi
@@ -87,9 +85,13 @@ for f in "${FILES[@]}"; do
     exists_in_checkout "$target" && continue
 
     # Excuse must sit within EXCUSE_WINDOW characters of the reference.
-    pos=$(awk -v l="$line" -v t="$target" 'BEGIN{print index(l, t)}')
-    from=$(( pos > EXCUSE_WINDOW ? pos - EXCUSE_WINDOW : 1 ))
-    near=$(printf '%s' "$line" | cut -c "${from}-$((pos + ${#target} + EXCUSE_WINDOW))")
+    # Done with parameter expansion, not awk index() + cut: those disagree about
+    # whether a "position" is a byte or a character (gawk vs mawk, GNU vs BSD
+    # cut), and these guides are dense with em-dashes, arrows and CJK, so the
+    # two offsets drift and produce a spurious DEAD on an excused reference.
+    before=${line%%"$target"*}
+    after=${line#*"$target"}
+    near="${before: -$EXCUSE_WINDOW}${target}${after:0:$EXCUSE_WINDOW}"
 
     if printf '%s' "$near" | grep -qiE "$EXCUSE"; then
       printf '  note  %s:%s -> %s (declared unavailable)\n' "$f" "$lineno" "$target"
@@ -100,7 +102,7 @@ for f in "${FILES[@]}"; do
   done < <(grep -noE "(^|[ (\`\"])${PREFIX}/[A-Za-z0-9._*/-]+(\.(md|json|ya?ml|sh|swift|go|py)|/)" "$f" 2>/dev/null)
 done
 
-if [ "$missing_guide" -eq 0 ]; then
+if [ "$found_guide" -eq 0 ]; then
   printf 'no guide found (expected CLAUDE.md or AGENTS.md at the repo root)\n'
   exit 1
 fi
