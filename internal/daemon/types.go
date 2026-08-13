@@ -99,7 +99,12 @@ type ApprovalResponse struct {
 type ApprovalResolvedPayload struct {
 	RequestID  string           `json:"request_id"`
 	Decision   ApprovalDecision `json:"decision"`
-	ResolvedBy string           `json:"resolved_by"` // "ptfrog", "slack", "line"
+	// Writers: "kocoro" (HTTP resolve, server.go), "daemon" (broker-side
+	// cleanup in approval.go / question_broker.go), or a channel name such as
+	// "slack" / "line". The pinned wire fixtures carry "kocoro" and "daemon".
+	// Not "ptfrog" — that codename predates the current surface and nothing
+	// has emitted it for some time.
+	ResolvedBy string `json:"resolved_by"`
 }
 
 // Channel types

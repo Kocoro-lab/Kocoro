@@ -13,6 +13,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  doc-links:
+    # CLAUDE.md and AGENTS.md cite files by path, and those paths rot quietly:
+    # a doc gets renamed or was never committed, the pointer stays, and the
+    # next reader follows it into nothing. An audit on 2026-08-13 found 20
+    # such references across the four repos, some of them cited as the
+    # authoritative spec for a wire protocol.
+    #
+    # A missing target is allowed when the citing line says so -- a few design
+    # docs are deliberately untracked and live only on a maintainer's machine.
+    # Marking such a reference is what keeps it honest; an unmarked one is a
+    # bug. Pure text work, so ubuntu and no toolchain.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Test the checker
+        # Its failure mode is silence — a broken pattern looks exactly like tidy
+        # guides — so the checker runs against fixtures before it judges the repo.
+        run: bash scripts/check-doc-links-test.sh
+
+      - name: Check doc references resolve
+        run: bash scripts/check-doc-links.sh
+
+      - name: AGENTS.md stays under the harness injection budget
+        # Harnesses that read AGENTS.md do so under a byte budget shared across
+        # every such file from the repo root down (32 KiB by default), and an
+        # over-budget file is truncated from the TAIL with no marker in the
+        # injected text. The reader cannot tell it got a partial file, so this
+        # has to be caught here rather than noticed later. 24 KB leaves room for
+        # the per-directory files a harness may also pull in.
+        run: |
+          size=$(wc -c < AGENTS.md)
+          if [ "$size" -gt 24576 ]; then
+            echo "AGENTS.md is ${size}B, over the 24576B ceiling."
+            echo "Harnesses truncate from the tail silently — cut prose, not rules."
+            exit 1
+          fi
+          echo "AGENTS.md ${size}B, within budget"
+
   test:
     # macos-latest matches the project's release.yml and the development
     # target. ShanClaw ships a meaningful set of macOS-only tools
