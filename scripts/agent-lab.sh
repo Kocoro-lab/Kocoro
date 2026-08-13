@@ -266,7 +266,7 @@ run_offline_lane() {
     TestOffline_AgentLabScriptsParse \
     TestOffline_AgentLabLaneReferencesResolve \
     TestOffline_ProviderQualificationRejectsUndersizedReleaseSample
-  run_check quality_harness_self_test go test -tags=live ./test/e2e \
+  run_check quality_harness_self_test go test ./test/e2e \
     -run '^TestOffline_AgentLab(Quality(ContractValidators|QualificationFailsClosed|LaneRequiresExplicitPaidGate|LaneRejectsUndersizedReleaseSample|LaneReportValidation)|ProviderLaneReportValidation)$' \
     -count=1 -v
   require_tests_executed quality_harness_self_test_execution \

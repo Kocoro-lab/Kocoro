@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 )
 
 const generalOutcomeSchemaVersion = "kocoro.general_agent_outcomes.v1"
@@ -44,6 +47,7 @@ type generalOutcomeExternal struct {
 
 type generalOutcomeOracle struct {
 	ExpectedStatus string                       `json:"expected_status"`
+	StatusMarkers  []string                     `json:"status_markers,omitempty"`
 	Answer         generalOutcomeAnswerOracle   `json:"answer"`
 	Evidence       generalOutcomeEvidenceOracle `json:"evidence"`
 	State          generalOutcomeStateOracle    `json:"state"`
@@ -91,7 +95,7 @@ func loadGeneralOutcomeDataset(t *testing.T) generalOutcomeDataset {
 		t.Fatalf("read general-agent outcome dataset: %v", err)
 	}
 	var dataset generalOutcomeDataset
-	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&dataset); err != nil {
 		t.Fatalf("decode general-agent outcome dataset: %v", err)
@@ -181,6 +185,42 @@ func evaluateGeneralOutcome(task generalOutcomeTask, observed generalOutcomeObse
 	return uniqueGeneralOutcomeFailures(failures)
 }
 
+func deriveGeneralOutcomeStatus(task generalOutcomeTask, observed generalOutcomeObservation) string {
+	for _, effect := range observed.State.Effects {
+		if effect == "outcome_unknown" {
+			return "outcome_unknown"
+		}
+	}
+	lower := strings.ToLower(observed.Answer)
+	for _, marker := range task.Oracle.StatusMarkers {
+		if strings.Contains(lower, strings.ToLower(marker)) {
+			return "blocked"
+		}
+	}
+	return "complete"
+}
+
+func validateGeneralOutcomeToolPath(root, argsJSON string) (agent.ToolResult, bool) {
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), false
+	}
+	if strings.TrimSpace(args.Path) == "" {
+		return agent.ToolResult{}, true
+	}
+	target := args.Path
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(root, target)
+	}
+	relative, err := filepath.Rel(root, filepath.Clean(target))
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return agent.PermissionError("outcome sandbox rejected path outside its temporary root"), false
+	}
+	return agent.ToolResult{}, true
+}
+
 func TestOffline_GeneralAgentOutcomeDatasetContract(t *testing.T) {
 	dataset := loadGeneralOutcomeDataset(t)
 	if dataset.SchemaVersion != generalOutcomeSchemaVersion {
@@ -214,6 +254,12 @@ func TestOffline_GeneralAgentOutcomeDatasetContract(t *testing.T) {
 		}
 		if task.Oracle.ExpectedStatus != "complete" && task.Oracle.ExpectedStatus != "blocked" && task.Oracle.ExpectedStatus != "outcome_unknown" {
 			t.Errorf("task %s has invalid expected_status %q", task.ID, task.Oracle.ExpectedStatus)
+		}
+		if task.Oracle.ExpectedStatus == "blocked" && len(task.Oracle.StatusMarkers) == 0 {
+			t.Errorf("blocked task %s has no status_markers", task.ID)
+		}
+		if task.Oracle.ExpectedStatus != "blocked" && len(task.Oracle.StatusMarkers) != 0 {
+			t.Errorf("non-blocked task %s declares status_markers", task.ID)
 		}
 		answer := task.Oracle.Answer
 		if answer.Exact == "" && len(answer.ContainsAll) == 0 && len(answer.ContainsAny) == 0 {
@@ -258,6 +304,69 @@ func TestOffline_GeneralAgentOutcomeDatasetContract(t *testing.T) {
 		if !present {
 			t.Errorf("dataset missing category %q", category)
 		}
+	}
+}
+
+func TestOffline_GeneralAgentOutcomeStatusDerivation(t *testing.T) {
+	tests := []struct {
+		name     string
+		task     generalOutcomeTask
+		observed generalOutcomeObservation
+		want     string
+	}{
+		{
+			name:     "complete_conflict_answer_may_say_cannot",
+			task:     generalOutcomeTask{Oracle: generalOutcomeOracle{ExpectedStatus: "complete"}},
+			observed: generalOutcomeObservation{Answer: "The sources disagree, so I cannot give one value."},
+			want:     "complete",
+		},
+		{
+			name:     "task_scoped_blocked_marker",
+			task:     generalOutcomeTask{Oracle: generalOutcomeOracle{ExpectedStatus: "blocked", StatusMarkers: []string{"timezone", "?"}}},
+			observed: generalOutcomeObservation{Answer: "Which timezone should 10:00 use?"},
+			want:     "blocked",
+		},
+		{
+			name:     "unrelated_question_mark_does_not_block_complete_task",
+			task:     generalOutcomeTask{Oracle: generalOutcomeOracle{ExpectedStatus: "complete"}},
+			observed: generalOutcomeObservation{Answer: "Saved brief.txt. Anything else?"},
+			want:     "complete",
+		},
+		{
+			name:     "outcome_unknown_effect_wins",
+			task:     generalOutcomeTask{Oracle: generalOutcomeOracle{ExpectedStatus: "outcome_unknown"}},
+			observed: generalOutcomeObservation{State: generalOutcomeState{Effects: map[string]string{"email": "outcome_unknown"}}},
+			want:     "outcome_unknown",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := deriveGeneralOutcomeStatus(tt.task, tt.observed); got != tt.want {
+				t.Fatalf("status = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOffline_GeneralAgentOutcomeSandboxRejectsEscapingPaths(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(filepath.Dir(root), "outside.txt")
+	for _, path := range []string{"../escape.txt", outside} {
+		args, err := json.Marshal(map[string]string{"path": path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, valid := validateGeneralOutcomeToolPath(root, string(args))
+		if valid || !result.IsError || result.ErrorCategory != agent.ErrCategoryPermission {
+			t.Fatalf("path %q was not rejected fail-closed: valid=%t result=%+v", path, valid, result)
+		}
+	}
+	inside, err := json.Marshal(map[string]string{"path": "nested/inside.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, valid := validateGeneralOutcomeToolPath(root, string(inside)); !valid || result.IsError {
+		t.Fatalf("inside path rejected: valid=%t result=%+v", valid, result)
 	}
 }
 

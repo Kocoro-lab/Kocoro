@@ -268,49 +268,6 @@ func (t *generalOutcomeRecordedTool) IsConcurrencySafeCall(args string) bool {
 	return t.IsReadOnlyCall(args)
 }
 
-func validateGeneralOutcomeToolPath(root, argsJSON string) (agent.ToolResult, bool) {
-	var args struct {
-		Path string `json:"path"`
-	}
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), false
-	}
-	if strings.TrimSpace(args.Path) == "" {
-		return agent.ToolResult{}, true
-	}
-	target := args.Path
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(root, target)
-	}
-	relative, err := filepath.Rel(root, filepath.Clean(target))
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return agent.PermissionError("outcome sandbox rejected path outside its temporary root"), false
-	}
-	return agent.ToolResult{}, true
-}
-
-func TestOffline_GeneralAgentOutcomeSandboxRejectsEscapingPaths(t *testing.T) {
-	root := t.TempDir()
-	outside := filepath.Join(filepath.Dir(root), "outside.txt")
-	for _, path := range []string{"../escape.txt", outside} {
-		args, err := json.Marshal(map[string]string{"path": path})
-		if err != nil {
-			t.Fatal(err)
-		}
-		result, valid := validateGeneralOutcomeToolPath(root, string(args))
-		if valid || !result.IsError || result.ErrorCategory != agent.ErrCategoryPermission {
-			t.Fatalf("path %q was not rejected fail-closed: valid=%t result=%+v", path, valid, result)
-		}
-	}
-	inside, err := json.Marshal(map[string]string{"path": "nested/inside.txt"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result, valid := validateGeneralOutcomeToolPath(root, string(inside)); !valid || result.IsError {
-		t.Fatalf("inside path rejected: valid=%t result=%+v", valid, result)
-	}
-}
-
 type generalOutcomeExternalTool struct {
 	name        string
 	description string
@@ -476,7 +433,7 @@ func runGeneralOutcomeTask(t *testing.T, provider client.LLMClient, cfg generalO
 	answer, usage, err := loop.Run(ctx, task.Prompt, nil, nil)
 	observed := sandbox.snapshot(t)
 	observed.Answer = strings.TrimSpace(answer)
-	observed.Status = deriveGeneralOutcomeStatus(observed)
+	observed.Status = deriveGeneralOutcomeStatus(task, observed)
 	sandbox.assertExternalUnchanged(t)
 	failures := evaluateGeneralOutcome(task, observed)
 	if err != nil && !(task.Oracle.ExpectedStatus == "outcome_unknown" && errors.Is(err, agent.ErrSideEffectOutcomeUnknown)) {
@@ -512,22 +469,6 @@ func runGeneralOutcomeTask(t *testing.T, provider client.LLMClient, cfg generalO
 	return run
 }
 
-func deriveGeneralOutcomeStatus(observed generalOutcomeObservation) string {
-	for _, effect := range observed.State.Effects {
-		if effect == "outcome_unknown" {
-			return "outcome_unknown"
-		}
-	}
-	answer := observed.Answer
-	lower := strings.ToLower(answer)
-	for _, marker := range []string{"?", "？", "blocked", "cannot", "could not", "not found", "no record", "permission", "无法", "不能", "未找到", "没有记录", "权限"} {
-		if strings.Contains(lower, strings.ToLower(marker)) {
-			return "blocked"
-		}
-	}
-	return "complete"
-}
-
 func loadGeneralOutcomeLiveConfig(t *testing.T) generalOutcomeLiveConfig {
 	t.Helper()
 	endpoint := strings.TrimSpace(os.Getenv("SHANNON_E2E_ENDPOINT"))
@@ -551,7 +492,7 @@ func loadGeneralOutcomeLiveConfig(t *testing.T) generalOutcomeLiveConfig {
 		specificModel = loaded.Agent.Model
 	}
 	if endpoint == "" || apiKey == "" {
-		t.Fatal("general-agent outcome lane needs configured Cloud endpoint and API key")
+		t.Fatal("general-agent outcome lane needs SHANNON_E2E_ENDPOINT/SHANNON_E2E_API_KEY or configured Cloud credentials; set KOCORO_FORCE_KEYCHAIN_HYDRATE=1 to authorize test-only credential hydration")
 	}
 	sample := strings.TrimSpace(os.Getenv(generalOutcomeSampleEnv))
 	if sample == "" {

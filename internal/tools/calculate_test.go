@@ -46,6 +46,7 @@ func TestCalculateTool(t *testing.T) {
 
 func TestCalculateToolRejectsUnsafeOrInvalidExpressions(t *testing.T) {
 	tests := []string{
+		"",
 		"1 / 0",
 		"1.5 % 1",
 		"someFunction(2)",

@@ -278,13 +278,13 @@ func TestHandleMarketplaceInstallMaliciousBlocked(t *testing.T) {
 	}
 }
 
-// TestHandleMarketplaceInstallUpstreamFailure verifies that transport
-// failures map to 502 and retain the underlying cause in the audit log.
-// Transport retry behavior is covered in the skills package.
+// TestHandleMarketplaceInstallUpstreamFailure verifies that a failed local git
+// clone maps to 502 and retains the underlying cause in the audit log. Retry
+// behavior is covered in the skills package.
 func TestHandleMarketplaceInstallUpstreamFailure(t *testing.T) {
 	registryJSON := `{
 		"version":1,
-		"skills":[{"slug":"demo","name":"demo","description":"d","author":"a","download_url":"://invalid"}]
+		"skills":[{"slug":"demo","name":"demo","description":"d","author":"a","repo":"file:///nonexistent/path/to/repo","ref":"main"}]
 	}`
 	s, _ := newTestServerWithMarketplace(t, registryJSON)
 	logPath, closer := attachTestAuditor(t, s)
