@@ -12,8 +12,13 @@
 
 set -uo pipefail
 
-SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/check-doc-links.sh"
-[ -f "$SCRIPT" ] || { echo "missing $SCRIPT"; exit 1; }
+# Sits beside the script in some repos and under scripts/tests/ in others, so
+# look in both rather than assuming one layout.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for candidate in "$here/check-doc-links.sh" "$here/../check-doc-links.sh"; do
+  [ -f "$candidate" ] && SCRIPT="$(cd "$(dirname "$candidate")" && pwd)/check-doc-links.sh" && break
+done
+[ -n "${SCRIPT:-}" ] || { echo "cannot find check-doc-links.sh near $here"; exit 1; }
 
 pass=0
 fail=0

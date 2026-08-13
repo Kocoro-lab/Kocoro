@@ -33,7 +33,7 @@ jobs:
       - name: Test the checker
         # Its failure mode is silence — a broken pattern looks exactly like tidy
         # guides — so the checker runs against fixtures before it judges the repo.
-        run: bash scripts/tests/check-doc-links-test.sh
+        run: bash scripts/check-doc-links-test.sh
 
       - name: Check doc references resolve
         run: bash scripts/check-doc-links.sh
