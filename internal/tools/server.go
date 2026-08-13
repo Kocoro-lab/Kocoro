@@ -32,10 +32,11 @@ const ladderDetailMaxLen = 200
 // stripping, error classification, usage accounting and result shaping are
 // identical, so both share Run.
 type ServerTool struct {
-	schema  client.ServerToolSchema
-	gateway *client.GatewayClient
-	execute func(ctx context.Context, name string, args map[string]any) (*client.ToolExecuteResponse, error)
-	source  agent.ToolSource
+	schema                client.ServerToolSchema
+	gateway               *client.GatewayClient
+	execute               func(ctx context.Context, name string, args map[string]any) (*client.ToolExecuteResponse, error)
+	source                agent.ToolSource
+	integrationGeneration uint64
 }
 
 // NewServerTool builds a gateway tool (allowlisted server-side tools such as
@@ -56,6 +57,21 @@ func NewServerTool(schema client.ServerToolSchema, gateway *client.GatewayClient
 // caller's connection from the API key and enforces its own access control, so
 // like a gateway tool it does not require local approval.
 func NewIntegrationTool(schema client.ServerToolSchema, gateway *client.GatewayClient) *ServerTool {
+	generation := uint64(0)
+	if gateway != nil {
+		generation, _ = gateway.IntegrationGeneration()
+	}
+	return NewIntegrationToolForGeneration(schema, gateway, generation)
+}
+
+// NewIntegrationToolForGeneration binds a Cloud-returned schema to the exact
+// verified-principal generation used by its list request. Captured tools held by
+// an old AgentLoop or registry clone remain fail-closed after auth mutation.
+func NewIntegrationToolForGeneration(
+	schema client.ServerToolSchema,
+	gateway *client.GatewayClient,
+	generation uint64,
+) *ServerTool {
 	return &ServerTool{
 		schema:  schema,
 		gateway: gateway,
@@ -80,14 +96,17 @@ func NewIntegrationTool(schema client.ServerToolSchema, gateway *client.GatewayC
 					case <-timer.C:
 					}
 				}
-				resp, err = gateway.ExecuteIntegrationToolWithIdentity(ctx, name, args, requestID, idempotencyKey)
+				resp, err = gateway.ExecuteIntegrationToolWithIdentityForGeneration(
+					ctx, name, args, requestID, idempotencyKey, generation,
+				)
 				if err == nil || requestID == "" || attempt == 2 || !integrationCallCanRetryWithSameIdentity(err) {
 					return resp, err
 				}
 			}
 			return resp, err
 		},
-		source: agent.SourceIntegration,
+		source:                agent.SourceIntegration,
+		integrationGeneration: generation,
 	}
 }
 
@@ -262,6 +281,12 @@ func (t *ServerTool) nonMaterialErrorResult(err error) agent.ToolResult {
 			IsError: true,
 		}
 	}
+	var staleGeneration *client.StaleIntegrationGenerationError
+	if errors.As(err, &staleGeneration) {
+		return withKnownNoEffect(agent.BusinessError(
+			"integration tool is no longer authorized for the current signed-in principal; rediscover the live integration tools before retrying",
+		))
+	}
 	var integrationErr *client.IntegrationToolAPIError
 	if errors.As(err, &integrationErr) {
 		return t.integrationAPIErrorResult(integrationErr, false)
@@ -282,10 +307,19 @@ func (t *ServerTool) nonMaterialErrorResult(err error) agent.ToolResult {
 }
 
 func (t *ServerTool) materialErrorResult(err error) agent.ToolResult {
+	var staleGeneration *client.StaleIntegrationGenerationError
+	if errors.As(err, &staleGeneration) {
+		return withKnownNoEffect(agent.BusinessError(
+			"integration tool was invalidated before dispatch because the signed-in principal changed; rediscover the live integration tools before retrying",
+		))
+	}
 	var integrationErr *client.IntegrationToolAPIError
 	if errors.As(err, &integrationErr) {
 		if integrationErr.Code == "call_in_progress" {
-			return t.integrationAPIErrorResult(integrationErr, true)
+			return externalOutcomeUnknown(fmt.Sprintf(
+				"External tool outcome UNKNOWN: the original %s request is still in progress after bounded same-identity polling. Do not resend it or create a new durable request identity; wait or verify its state.",
+				t.schema.Name,
+			))
 		}
 		if integrationCodeMayHaveEffect(integrationErr.Code) {
 			return externalOutcomeUnknown(fmt.Sprintf(
@@ -512,6 +546,18 @@ func classifyServerError(msg string) string {
 
 // ToolSource implements agent.ToolSourcer for deterministic tool ordering.
 func (t *ServerTool) ToolSource() agent.ToolSource { return t.source }
+
+// IntegrationGenerationCurrent is true for non-integration tools and for an
+// integration schema bound to the GatewayClient's live verified principal.
+// Overlay extraction and MCP health rebuilds use it to avoid re-advertising
+// stale tools even though Run also enforces the same boundary before dispatch.
+func (t *ServerTool) IntegrationGenerationCurrent() bool {
+	if t == nil || t.source != agent.SourceIntegration {
+		return true
+	}
+	return t.gateway != nil &&
+		t.gateway.IsIntegrationGenerationCurrent(t.integrationGeneration)
+}
 
 func requiredFieldsFromSchema(parameters map[string]any) []string {
 	if parameters == nil {

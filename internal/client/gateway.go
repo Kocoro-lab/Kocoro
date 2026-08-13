@@ -1328,12 +1328,22 @@ type GatewayClient struct {
 	// If a future caller needs hot-reload semantics, switch this to atomic.Int64.
 	streamIdleTimeout time.Duration
 
-	// keyMu / apiKey support hot-swapping the X-API-Key header on
-	// sign-in / sign-out / WS-401 paths. AuthManager (internal/daemon/auth)
-	// owns the writes via SetAPIKey; all header sites read through
-	// getAPIKey() under an RLock.
-	keyMu  sync.RWMutex
-	apiKey string
+	// keyMu guards both the live X-API-Key and the integration principal
+	// generation. Integration schemas are fetched under one credential/principal
+	// generation and may execute only under that exact generation; coupling both
+	// values under one lock prevents a stale tool from validating against the old
+	// generation and then picking up a newly-swapped account key.
+	keyMu sync.RWMutex
+	// integrationDispatchMu leases the credential/principal generation across
+	// complete auth-bound tool runs, including client retries. Credential
+	// mutation takes the write side before keyMu; readers may therefore call
+	// ordinary Gateway methods (which briefly read keyMu) without lock inversion.
+	integrationDispatchMu         sync.RWMutex
+	apiKey                        string
+	integrationGeneration         uint64
+	integrationPrincipalActive    bool
+	integrationPrincipalAccountID string
+	integrationPrincipalEpoch     uint64
 
 	// channel bindings cache — populated by ListChannelBindings, 60s TTL.
 	// Bindings change rarely (OAuth install / uninstall); short TTL keeps
@@ -1346,8 +1356,10 @@ type GatewayClient struct {
 
 func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
 	return &GatewayClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
+		baseURL:                    baseURL,
+		apiKey:                     apiKey,
+		integrationGeneration:      1,
+		integrationPrincipalActive: true,
 		httpClient: &http.Client{
 			Timeout: 600 * time.Second,
 		},
@@ -1378,10 +1390,90 @@ func (c *GatewayClient) StreamIdleTimeout() time.Duration { return c.streamIdleT
 // (key cleared), and WS 401 recovery. Concurrent in-flight Complete /
 // upload / image calls already captured the previous value via getAPIKey
 // at request-construction time and finish on the previous key.
+//
+// Every call also invalidates the integration principal generation, including
+// a same-byte key re-adoption. AuthManager binds a fresh verified-principal
+// generation only after Cloud has resolved the account. This is the execution
+// backstop for tools captured by an older AgentLoop or registry clone.
 func (c *GatewayClient) SetAPIKey(key string) {
+	c.integrationDispatchMu.Lock()
+	defer c.integrationDispatchMu.Unlock()
 	c.keyMu.Lock()
 	c.apiKey = key
+	c.integrationGeneration++
+	c.integrationPrincipalActive = false
+	c.integrationPrincipalAccountID = ""
+	c.integrationPrincipalEpoch = 0
 	c.keyMu.Unlock()
+}
+
+// BindIntegrationPrincipal advances and activates the integration generation
+// for one verified AuthManager principal epoch. Passing an empty account ID
+// invalidates integration execution. The AuthManager calls this synchronously
+// inside the same state transition that advances VerifiedPrincipal's epoch.
+func (c *GatewayClient) BindIntegrationPrincipal(accountID string, principalEpoch uint64) {
+	if c == nil {
+		return
+	}
+	c.integrationDispatchMu.Lock()
+	defer c.integrationDispatchMu.Unlock()
+	c.keyMu.Lock()
+	c.integrationGeneration++
+	c.integrationPrincipalActive = accountID != ""
+	c.integrationPrincipalAccountID = accountID
+	c.integrationPrincipalEpoch = principalEpoch
+	c.keyMu.Unlock()
+}
+
+// IntegrationGeneration returns the currently active integration principal
+// generation. The boolean is false between credential publication and verified
+// principal binding, and after sign-out.
+func (c *GatewayClient) IntegrationGeneration() (uint64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.integrationGeneration, c.integrationPrincipalActive
+}
+
+// IsIntegrationGenerationCurrent reports whether a fetched schema/tool still
+// belongs to the live verified principal generation.
+func (c *GatewayClient) IsIntegrationGenerationCurrent(generation uint64) bool {
+	if c == nil || generation == 0 {
+		return false
+	}
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.integrationPrincipalActive && c.integrationGeneration == generation
+}
+
+// WithIntegrationGeneration runs fn while holding a generation dispatch lease.
+// Registry refresh uses it for atomic replacement; auth-bound tools keep it for
+// their complete Run, including internal retries. The separate dispatch mutex
+// lets fn call normal Gateway methods that briefly read keyMu without recursive
+// RWMutex deadlock when a credential writer is queued.
+func (c *GatewayClient) WithIntegrationGeneration(generation uint64, fn func()) error {
+	if c == nil {
+		return &StaleIntegrationGenerationError{Expected: generation}
+	}
+	c.integrationDispatchMu.RLock()
+	defer c.integrationDispatchMu.RUnlock()
+	c.keyMu.RLock()
+	if !c.integrationPrincipalActive || generation == 0 || c.integrationGeneration != generation {
+		err := &StaleIntegrationGenerationError{
+			Expected: generation,
+			Current:  c.integrationGeneration,
+			Active:   c.integrationPrincipalActive,
+		}
+		c.keyMu.RUnlock()
+		return err
+	}
+	c.keyMu.RUnlock()
+	if fn != nil {
+		fn()
+	}
+	return nil
 }
 
 // getAPIKey returns the current api_key under read lock. All header-setting
@@ -2729,6 +2821,25 @@ type ToolDispatchError struct {
 	Err               error
 }
 
+// StaleIntegrationGenerationError proves an integration request was rejected
+// locally before dispatch because its schema/tool belonged to a superseded
+// credential or verified-principal generation.
+type StaleIntegrationGenerationError struct {
+	Expected uint64
+	Current  uint64
+	Active   bool
+}
+
+func (e *StaleIntegrationGenerationError) Error() string {
+	if e == nil {
+		return "stale integration principal generation"
+	}
+	return fmt.Sprintf(
+		"stale integration principal generation (expected=%d current=%d active=%t)",
+		e.Expected, e.Current, e.Active,
+	)
+}
+
 // IntegrationToolAPIError preserves the structured integration error code
 // returned by Cloud. APIError remains in the unwrap chain for older callers
 // that only understand status + raw response body.
@@ -2875,26 +2986,39 @@ func (c *GatewayClient) ExecuteTool(ctx context.Context, name string, arguments 
 // registers whatever comes back without a local allowlist. Returns an empty
 // list (not an error) when the feature is disabled or nothing is connected.
 func (c *GatewayClient) ListIntegrationTools(ctx context.Context) ([]ServerToolSchema, error) {
+	tools, _, err := c.ListIntegrationToolsWithGeneration(ctx)
+	return tools, err
+}
+
+// ListIntegrationToolsWithGeneration returns the exact integration principal
+// generation whose API key was attached to the list request. Callers bind every
+// returned ServerTool to this value and re-check it before replacing a registry,
+// so a slow old-account list cannot land after an auth transition.
+func (c *GatewayClient) ListIntegrationToolsWithGeneration(ctx context.Context) ([]ServerToolSchema, uint64, error) {
+	key, generation, err := c.captureIntegrationIdentity(0)
+	if err != nil {
+		return nil, generation, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/integrations/tools", nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, generation, fmt.Errorf("create request: %w", err)
 	}
-	if key := c.getAPIKey(); key != "" {
+	if key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, generation, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+		return nil, generation, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 	var tools []ServerToolSchema
 	if err := json.NewDecoder(resp.Body).Decode(&tools); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, generation, fmt.Errorf("decode response: %w", err)
 	}
-	return tools, nil
+	return tools, generation, nil
 }
 
 // ExecuteIntegrationTool executes a third-party integration tool by name.
@@ -2915,6 +3039,36 @@ func (c *GatewayClient) ExecuteIntegrationToolWithIdentity(
 	arguments map[string]any,
 	requestID string,
 	idempotencyKey string,
+) (*ToolExecuteResponse, error) {
+	return c.executeIntegrationToolWithIdentityForGeneration(
+		ctx, name, arguments, requestID, idempotencyKey, 0,
+	)
+}
+
+// ExecuteIntegrationToolWithIdentityForGeneration executes only when the
+// caller's captured schema/tool generation still matches the active verified
+// principal. Validation and transport dispatch hold the same generation lease,
+// so a credential swap cannot occur between the final check and request send.
+func (c *GatewayClient) ExecuteIntegrationToolWithIdentityForGeneration(
+	ctx context.Context,
+	name string,
+	arguments map[string]any,
+	requestID string,
+	idempotencyKey string,
+	generation uint64,
+) (*ToolExecuteResponse, error) {
+	return c.executeIntegrationToolWithIdentityForGeneration(
+		ctx, name, arguments, requestID, idempotencyKey, generation,
+	)
+}
+
+func (c *GatewayClient) executeIntegrationToolWithIdentityForGeneration(
+	ctx context.Context,
+	name string,
+	arguments map[string]any,
+	requestID string,
+	idempotencyKey string,
+	generation uint64,
 ) (*ToolExecuteResponse, error) {
 	reqBody := ToolExecuteRequest{Arguments: arguments, RequestID: requestID}
 	body, err := json.Marshal(reqBody)
@@ -2938,13 +3092,26 @@ func (c *GatewayClient) ExecuteIntegrationToolWithIdentity(
 	if idempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
-	if key := c.getAPIKey(); key != "" {
-		req.Header.Set("X-API-Key", key)
-	}
 	dispatch := &toolDispatchTrace{}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), dispatch.clientTrace()))
-	resp, err := c.httpClient.Do(req)
+	resp, err := func() (*http.Response, error) {
+		key, _, release, identityErr := c.lockIntegrationIdentity(generation)
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		defer release()
+		if key != "" {
+			req.Header.Set("X-API-Key", key)
+		}
+		// Keep the generation lease through Do: auth mutation cannot complete
+		// between the final generation check and transport dispatch.
+		return c.httpClient.Do(req)
+	}()
 	if err != nil {
+		var staleGeneration *StaleIntegrationGenerationError
+		if errors.As(err, &staleGeneration) {
+			return nil, err
+		}
 		mayHaveDispatched := dispatch.mayHaveDispatched()
 		return nil, &ToolDispatchError{
 			MayHaveDispatched: mayHaveDispatched,
@@ -2986,6 +3153,38 @@ func (c *GatewayClient) ExecuteIntegrationToolWithIdentity(
 		}
 	}
 	return &result, nil
+}
+
+// captureIntegrationIdentity atomically validates one expected principal
+// generation and snapshots the API key used to construct the request. An
+// expected generation of zero is the legacy unbound caller path; it still
+// requires an active integration principal but accepts the current generation.
+func (c *GatewayClient) captureIntegrationIdentity(expected uint64) (string, uint64, error) {
+	key, current, release, err := c.lockIntegrationIdentity(expected)
+	if release != nil {
+		release()
+	}
+	return key, current, err
+}
+
+// lockIntegrationIdentity acquires a read lease that prevents credential or
+// principal mutation until the caller releases it. Integration execution keeps
+// this lease through transport dispatch to close the check/use race.
+func (c *GatewayClient) lockIntegrationIdentity(expected uint64) (string, uint64, func(), error) {
+	if c == nil {
+		return "", 0, nil, &StaleIntegrationGenerationError{Expected: expected}
+	}
+	c.keyMu.RLock()
+	current := c.integrationGeneration
+	if !c.integrationPrincipalActive || expected != 0 && expected != current {
+		c.keyMu.RUnlock()
+		return "", current, nil, &StaleIntegrationGenerationError{
+			Expected: expected,
+			Current:  current,
+			Active:   c.integrationPrincipalActive,
+		}
+	}
+	return c.apiKey, current, c.keyMu.RUnlock, nil
 }
 
 func readResponseBody(resp *http.Response) string {

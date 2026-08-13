@@ -57,7 +57,7 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - **Exposure** (`agent/exposure.go EffectiveToolExposure`): explicit
   `ToolExposure` first, then source default — local Direct; MCP/gateway/
   integration Deferred. `ask_user_question` is explicitly Direct. `web_search` /
-  `web_fetch` are Direct **only when `ToolSource()==SourceGateway`**
+  `web_fetch` / `x_search` are Direct **only when `ToolSource()==SourceGateway`**
   (`tools/exposure.go ServerTool.ToolExposure`); a same-named MCP or integration
   tool keeps its Deferred default so a third-party catalog cannot widen the base
   schema surface. GUI/process automation and calendar/schedule mutations are
@@ -94,11 +94,38 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   integration as known-no-effect; explicit pre-dispatch `provider_unavailable`
   is known-no-effect. Preserve integration provider/model/unit/cost
   usage fields through `ToolResult` and `EmitUsage`.
-  `call_in_progress` means wait/query; never resend a material action.
+  Exhausted material `call_in_progress` polling is `outcome_unknown`, never
+  committed; wait/query and never resend it under a new durable identity.
+- SourceIntegration catalogs are identity-scoped. An API-key swap must first
+  synchronously invalidate captured generations, then clear the whole source
+  without holding the dispatch writer; leave it empty when the new identity's
+  list fails. An ordinary same-identity refresh failure keeps the current
+  catalog. Each ServerTool is bound to the exact credential and
+  verified-principal generation used to list it; stale captured/cloned tools
+  fail before dispatch, and cached overlays must not re-advertise them. Auth,
+  integration, MCP-health, and reload registry build-to-swap transactions share
+  one lock. Auth rebuilds must refresh both GatewayOverlay and PostOverlays,
+  dropping credential-capturing cloud/publish/image tools while preserving
+  calendar and other non-auth post overlays. The six credential-capturing post
+  overlays (`cloud_delegate`, publish/list/retract, generate/edit) must retain
+  their concrete tool types but carry the same generation guard: its lease
+  spans the complete `Run`, including internal retries, and stale clones fail
+  known-no-effect before dispatch. Auth mutations are serialized across
+  accounts and keys.
 - `x_prepare_post` is a local Deferred URL builder, never an X API write. Keep it
   free of OAuth, HTTP, browser openers, and browser/computer automation. It must
   report that nothing was posted and keep draft text and the generated URL out
-  of audit summaries; the user alone clicks the review link and X's Post button.
+  of audit summaries; it is turn-terminal, so same-batch calls are discarded.
+  Local `browser`/`computer_use` and the canonical Playwright MCP adapter block X
+  composer navigation and publish-capable controls while preserving X reads and
+  ordinary links. Canonical Playwright does not expose `browser_run_code` or
+  `browser_evaluate`; in CDP mode its target check and tools/call share one
+  per-server lock, and any observed X target makes publish-capable mutation
+  read-only because home/timeline pages embed a composer. X navigation/reads and
+  non-X mutation remain available. Non-CDP Playwright retains ordinary mutation
+  but cannot claim target-state X protection. Native computer actions delegate through guarded
+  `computer_use`. This boundary does not police arbitrary shell commands or
+  custom MCP servers; the user alone clicks the review link and X's Post button.
 
 ## MCP
 

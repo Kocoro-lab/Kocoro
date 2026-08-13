@@ -973,6 +973,58 @@ func TestExecuteIntegrationTool_ConnectionRefusedIsPreDispatch(t *testing.T) {
 	}
 }
 
+func TestExecuteIntegrationTool_GenerationLeaseSerializesDispatchAndCredentialMutation(t *testing.T) {
+	dispatchEntered := make(chan struct{})
+	releaseDispatch := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "old-key" {
+			t.Errorf("dispatch key = %q, want old-key", got)
+		}
+		close(dispatchEntered)
+		<-releaseDispatch
+		_ = json.NewEncoder(w).Encode(ToolExecuteResponse{Success: true, Output: json.RawMessage(`{"ok":true}`)})
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "old-key")
+	generation, active := gw.IntegrationGeneration()
+	if !active {
+		t.Fatal("initial integration generation is inactive")
+	}
+	executeDone := make(chan error, 1)
+	go func() {
+		_, err := gw.ExecuteIntegrationToolWithIdentityForGeneration(
+			context.Background(), "x_create_post", nil, "request-1", "", generation,
+		)
+		executeDone <- err
+	}()
+	<-dispatchEntered
+
+	mutationStarted := make(chan struct{})
+	mutationDone := make(chan struct{})
+	go func() {
+		close(mutationStarted)
+		gw.SetAPIKey("new-key")
+		close(mutationDone)
+	}()
+	<-mutationStarted
+	select {
+	case <-mutationDone:
+		t.Fatal("credential mutation crossed an in-progress integration dispatch lease")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseDispatch)
+	if err := <-executeDone; err != nil {
+		t.Fatalf("ExecuteIntegrationToolWithIdentityForGeneration: %v", err)
+	}
+	select {
+	case <-mutationDone:
+	case <-time.After(time.Second):
+		t.Fatal("credential mutation remained blocked after dispatch completed")
+	}
+}
+
 func TestExecuteIntegrationTool_MarshalFailureIsTypedPreDispatch(t *testing.T) {
 	gw := NewGatewayClient("http://example.test", "")
 	_, err := gw.ExecuteIntegrationTool(context.Background(), "slack_post_message", map[string]any{

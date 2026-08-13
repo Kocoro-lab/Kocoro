@@ -89,6 +89,7 @@ type ClientManager struct {
 	cancellers   map[string]context.CancelFunc  // server name → ctx.Cancel for the spawned subprocess (stdio only); cancelling it SIGTERMs the whole process group
 	inFlight     map[string]struct{}            // server name → connect goroutine in progress; StartConnectAll/Reconnect skip duplicates
 	reconnectMu  map[string]*sync.Mutex         // per-server reconnect serialization
+	callMu       map[string]*sync.Mutex         // per-server pre-dispatch guard + tools/call serialization
 	supervised   bool                           // when true, skip inline reconnect in CallTool
 	idleTimers   map[string]*time.Timer         // per-server idle disconnect timers
 	needsSetup   map[string]bool                // servers gated by missing readiness marker
@@ -108,6 +109,7 @@ func NewClientManager() *ClientManager {
 		cancellers:  make(map[string]context.CancelFunc),
 		inFlight:    make(map[string]struct{}),
 		reconnectMu: make(map[string]*sync.Mutex),
+		callMu:      make(map[string]*sync.Mutex),
 		needsSetup:  make(map[string]bool),
 	}
 }
@@ -590,6 +592,37 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 // CallTool invokes a tool on the specified MCP server.
 // If the call fails with a connection error, it attempts to reconnect once and retry.
 func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName string, args map[string]any) (string, bool, error) {
+	return m.CallToolGuarded(ctx, serverName, toolName, args, nil)
+}
+
+// CallToolGuarded holds one per-server mutex across an optional pre-dispatch
+// guard and the actual tools/call. The guard is repeated before a replay after
+// reconnect. The canonical Playwright X boundary uses this so another Run
+// cannot navigate the shared browser between target inspection and mutation.
+func (m *ClientManager) CallToolGuarded(
+	ctx context.Context,
+	serverName, toolName string,
+	args map[string]any,
+	guard func() error,
+) (string, bool, error) {
+	if m == nil {
+		return "", true, fmt.Errorf("MCP client manager is nil")
+	}
+	m.mu.Lock()
+	serverCallMu := m.callMu[serverName]
+	if serverCallMu == nil {
+		serverCallMu = &sync.Mutex{}
+		m.callMu[serverName] = serverCallMu
+	}
+	m.mu.Unlock()
+	serverCallMu.Lock()
+	defer serverCallMu.Unlock()
+	if guard != nil {
+		if err := guard(); err != nil {
+			return "", true, err
+		}
+	}
+
 	m.mu.Lock()
 	c, ok := m.clients[serverName]
 	cfg, hasCfg := m.configs[serverName]
@@ -708,6 +741,11 @@ func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName strin
 				// doesn't carry it.
 				log.Printf("[mcp] %s: post-dispatch reconnect failed: %v", serverName, reconnErr)
 			} else if replaySafe {
+				if guard != nil {
+					if guardErr := guard(); guardErr != nil {
+						return "", true, guardErr
+					}
+				}
 				m.mu.Lock()
 				c = m.clients[serverName]
 				m.mu.Unlock()

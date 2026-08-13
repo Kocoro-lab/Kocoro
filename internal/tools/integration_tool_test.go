@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -55,7 +56,9 @@ func (c *integrationIdentityLLM) CompleteStream(
 }
 
 type integrationIdentityJournal struct {
-	prepared agent.SideEffectExecution
+	prepared  agent.SideEffectExecution
+	committed int
+	unknown   int
 }
 
 func (j *integrationIdentityJournal) Prepare(_ context.Context, execution agent.SideEffectExecution) (agent.PreparedSideEffectExecution, error) {
@@ -65,7 +68,9 @@ func (j *integrationIdentityJournal) Prepare(_ context.Context, execution agent.
 	}, nil
 }
 func (*integrationIdentityJournal) MarkDispatching(context.Context, string) error { return nil }
-func (*integrationIdentityJournal) MarkCommitted(context.Context, string, string) error {
+
+func (j *integrationIdentityJournal) MarkCommitted(context.Context, string, string) error {
+	j.committed++
 	return nil
 }
 func (*integrationIdentityJournal) MarkFailedNoEffect(context.Context, string, string) error {
@@ -74,7 +79,8 @@ func (*integrationIdentityJournal) MarkFailedNoEffect(context.Context, string, s
 func (*integrationIdentityJournal) MarkAbandoned(context.Context, string, string) error {
 	return nil
 }
-func (*integrationIdentityJournal) MarkOutcomeUnknown(context.Context, string, string) error {
+func (j *integrationIdentityJournal) MarkOutcomeUnknown(context.Context, string, string) error {
+	j.unknown++
 	return nil
 }
 
@@ -117,6 +123,67 @@ func TestIntegrationTool_Run_HitsIntegrationEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(result.Content, "p1") {
 		t.Errorf("expected output to contain 'p1', got %q", result.Content)
+	}
+}
+
+func TestIntegrationTool_CapturedBeforePrincipalMutationFailsClosedBeforeDispatch(t *testing.T) {
+	var executeCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		executeCalls++
+		_ = json.NewEncoder(w).Encode(toolExecResp(true, map[string]any{"ok": true}, nil))
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "old-key")
+	oldTool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_create_post"},
+		gw,
+	)
+	gw.SetAPIKey("new-key")
+	gw.BindIntegrationPrincipal("account-b", 2)
+
+	result, err := oldTool.Run(context.Background(), `{"text":"must not dispatch"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
+		!result.SideEffectKnownNoEffect || result.SideEffectOutcomeUnknown {
+		t.Fatalf("stale captured tool result = %#v", result)
+	}
+	if executeCalls != 0 {
+		t.Fatalf("stale captured tool dispatched %d request(s)", executeCalls)
+	}
+}
+
+func TestRegisterIntegrationTools_DiscardsSupersededListGeneration(t *testing.T) {
+	listEntered := make(chan struct{})
+	releaseList := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "old-key" {
+			t.Fatalf("list key = %q, want old-key", got)
+		}
+		close(listEntered)
+		<-releaseList
+		_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{{Name: "x_old_catalog"}})
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "old-key")
+	reg := agent.NewToolRegistry()
+	done := make(chan error, 1)
+	go func() {
+		done <- RegisterIntegrationTools(context.Background(), gw, reg)
+	}()
+	<-listEntered
+	gw.SetAPIKey("new-key")
+	gw.BindIntegrationPrincipal("account-b", 2)
+	close(releaseList)
+
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "generation changed") {
+		t.Fatalf("refresh error = %v, want superseded generation", err)
+	}
+	if _, ok := reg.Get("x_old_catalog"); ok {
+		t.Fatal("old-account list landed after principal mutation")
 	}
 }
 
@@ -370,7 +437,7 @@ func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsN
 		{code: "billing_error", status: http.StatusServiceUnavailable, wantUnknown: true},
 		{code: "provider_unavailable", status: http.StatusServiceUnavailable, wantNoEffect: true},
 		{code: "idempotency_conflict", status: http.StatusConflict, wantNoEffect: true},
-		{code: "call_in_progress", status: http.StatusConflict},
+		{code: "call_in_progress", status: http.StatusConflict, wantUnknown: true},
 	} {
 		t.Run(tt.code, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -392,11 +459,53 @@ func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsN
 				t.Fatalf("result = %#v", result)
 			}
 			if tt.code == "call_in_progress" &&
-				(result.ErrorCategory != agent.ErrCategoryBusiness ||
-					!strings.Contains(result.Content, "do not resend")) {
+				(!result.SideEffectOutcomeUnknown ||
+					!strings.Contains(result.Content, "Do not resend")) {
 				t.Fatalf("call_in_progress result = %#v", result)
 			}
 		})
+	}
+}
+
+func TestIntegrationTool_MaterialCallInProgressExhaustionPersistsOutcomeUnknown(t *testing.T) {
+	var requestIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body client.ToolExecuteRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requestIDs = append(requestIDs, body.RequestID)
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "call_in_progress"})
+	}))
+	defer server.Close()
+
+	reg := agent.NewToolRegistry()
+	reg.Register(NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_create_post", Provider: "x"},
+		client.NewGatewayClient(server.URL, ""),
+	))
+	journal := &integrationIdentityJournal{}
+	loop := agent.NewAgentLoop(
+		&integrationIdentityLLM{}, reg, "medium", t.TempDir(),
+		4, 2000, 200, nil, nil, nil,
+	)
+	loop.SetCheckpointFunc(func(context.Context) error { return nil })
+	loop.SetSideEffectExecutionJournal(journal)
+	_, _, err := loop.Run(context.Background(), "post hello", nil, nil)
+	if !errors.Is(err, agent.ErrSideEffectOutcomeUnknown) {
+		t.Fatalf("Run error = %v, want outcome unknown", err)
+	}
+	if journal.committed != 0 || journal.unknown != 1 {
+		t.Fatalf("journal committed=%d unknown=%d, want 0/1", journal.committed, journal.unknown)
+	}
+	if len(requestIDs) != 3 {
+		t.Fatalf("request ids = %#v, want three bounded polls", requestIDs)
+	}
+	for _, requestID := range requestIDs {
+		if requestID != "exec-x-create-1" {
+			t.Fatalf("request ids = %#v, want stable durable identity", requestIDs)
+		}
 	}
 }
 

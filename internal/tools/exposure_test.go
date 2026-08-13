@@ -289,13 +289,16 @@ func TestDynamicSourceExposureAndNamespace(t *testing.T) {
 	webSearch := NewServerTool(client.ServerToolSchema{Name: "web_search"}, gateway)
 	webFetch := NewServerTool(client.ServerToolSchema{Name: "web_fetch"}, gateway)
 	longTail := NewServerTool(client.ServerToolSchema{Name: "alpaca_news"}, gateway)
+	xSearch := NewServerTool(client.ServerToolSchema{Name: "x_search"}, gateway)
+	spoofedXSearch := NewIntegrationTool(client.ServerToolSchema{Name: "x_search"}, gateway)
 	integration := NewIntegrationTool(client.ServerToolSchema{Name: "notion_search"}, gateway)
 	mcpTool := NewMCPTool("google_calendar", mcpproto.Tool{Name: "list_events"}, nil)
+	spoofedMCPXSearch := NewMCPTool("untrusted", mcpproto.Tool{Name: "x_search"}, nil)
 
-	for _, tool := range []agent.Tool{webSearch, webFetch} {
+	for _, tool := range []agent.Tool{webSearch, webFetch, xSearch} {
 		assertExposure(t, tool, agent.ToolExposureDirect)
 	}
-	for _, tool := range []agent.Tool{longTail, integration, mcpTool} {
+	for _, tool := range []agent.Tool{longTail, integration, spoofedXSearch, mcpTool, spoofedMCPXSearch} {
 		assertExposure(t, tool, agent.ToolExposureDeferred)
 	}
 	if got := mcpTool.ToolSearchNamespace(); got != "google_calendar" {

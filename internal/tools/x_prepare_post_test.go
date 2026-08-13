@@ -26,6 +26,9 @@ func TestXPreparePostToolBuildsOfficialIntentWithoutPublishing(t *testing.T) {
 			if err != nil || result.IsError {
 				t.Fatalf("Run = (%#v, %v)", result, err)
 			}
+			if !result.StopAgentLoop || !strings.Contains(result.TerminalUserMessage, tt.want) {
+				t.Fatalf("terminal result = %#v", result)
+			}
 			var payload struct {
 				Published bool   `json:"published"`
 				Message   string `json:"message"`
@@ -68,6 +71,9 @@ func TestXPreparePostToolPolicyAndAuditAreContentFree(t *testing.T) {
 	}
 	if !tool.IsReadOnlyCall(`{}`) || !tool.IsConcurrencySafeCall(`{}`) {
 		t.Fatal("local URL construction must be read-only and concurrency-safe")
+	}
+	if !tool.StopsAgentLoop() {
+		t.Fatal("prepared composer handoff must end the turn before another tool can run")
 	}
 	if got := agent.EffectiveToolExposure(tool); got != agent.ToolExposureDeferred {
 		t.Fatalf("exposure = %q, want deferred", got)

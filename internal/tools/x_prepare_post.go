@@ -42,6 +42,7 @@ func (*XPreparePostTool) Info() agent.ToolInfo {
 func (*XPreparePostTool) RequiresApproval() bool            { return false }
 func (*XPreparePostTool) IsReadOnlyCall(string) bool        { return true }
 func (*XPreparePostTool) IsConcurrencySafeCall(string) bool { return true }
+func (*XPreparePostTool) StopsAgentLoop() bool              { return true }
 
 func (t *XPreparePostTool) Run(_ context.Context, argsJSON string) (agent.ToolResult, error) {
 	if result, valid := agent.ValidateToolArguments(t.Info(), argsJSON); !valid {
@@ -66,6 +67,9 @@ func (t *XPreparePostTool) Run(_ context.Context, argsJSON string) (agent.ToolRe
 	return agent.ToolResult{Content: fmt.Sprintf(
 		`{"published":false,"message":"Nothing was posted. Review the draft on X and click Post yourself.","url":%q,"markdown":"[Review and post on X](%s)"}`,
 		link, link,
+	), StopAgentLoop: true, TerminalUserMessage: fmt.Sprintf(
+		"[Review and post on X](%s)\n\nNothing was posted. Review the draft and click Post on X yourself.",
+		link,
 	)}, nil
 }
 

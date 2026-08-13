@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -390,6 +391,226 @@ func TestMCPTool_Run_NoSupervisor_NoReconnect(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Error("expected error result when server not connected and no supervisor")
+	}
+}
+
+func TestMCPTool_PlaywrightXAutomationGuardBlocksBeforeDispatch(t *testing.T) {
+	originalURLs := playwrightCDPPageURLs
+	originalPreflight := shouldPreflightChromeForTool
+	originalEnsure := ensureChromeDebugPort
+	shouldPreflightChromeForTool = func(int) bool { return false }
+	t.Cleanup(func() {
+		playwrightCDPPageURLs = originalURLs
+		shouldPreflightChromeForTool = originalPreflight
+		ensureChromeDebugPort = originalEnsure
+	})
+
+	run := func(t *testing.T, name, args string, urls func(int) ([]string, error)) (agent.ToolResult, int32) {
+		t.Helper()
+		fake := &countingSuccessClient{}
+		mgr := mcp.NewClientManager()
+		mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+			Command: "dummy",
+			Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+		})
+		mgr.SeedClient("playwright", fake)
+		playwrightCDPPageURLs = urls
+		result, err := NewMCPTool("playwright", mcpgo.Tool{Name: name}, mgr).Run(
+			context.Background(), args,
+		)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return result, fake.callToolCount.Load()
+	}
+
+	t.Run("direct composer navigate", func(t *testing.T) {
+		result, calls := run(t, "browser_navigate", `{"url":"https://x.com/intent/tweet?text=hello"}`,
+			func(int) ([]string, error) { t.Fatal("direct URL guard queried CDP"); return nil, nil })
+		if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness || calls != 0 {
+			t.Fatalf("result=%#v dispatches=%d", result, calls)
+		}
+	})
+
+	t.Run("composer target mutation", func(t *testing.T) {
+		result, calls := run(t, "browser_click", `{"ref":"e1"}`,
+			func(int) ([]string, error) { return []string{"https://x.com/compose/post"}, nil })
+		if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness || calls != 0 {
+			t.Fatalf("result=%#v dispatches=%d", result, calls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		tool string
+		args string
+	}{
+		{name: "home inline composer type", tool: "browser_type", args: `{"element":"Post text","ref":"e42","text":"draft"}`},
+		{name: "home inline composer click", tool: "browser_click", args: `{"element":"Post","ref":"e43"}`},
+	} {
+		t.Run(tc.name+" blocked by X target not element token", func(t *testing.T) {
+			result, calls := run(t, tc.tool, tc.args,
+				func(int) ([]string, error) { return []string{"https://x.com/home"}, nil })
+			if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness || calls != 0 ||
+				!strings.Contains(result.Content, "inline composer") {
+				t.Fatalf("result=%#v dispatches=%d", result, calls)
+			}
+		})
+	}
+
+	t.Run("explicit composer hint survives URL failure", func(t *testing.T) {
+		result, calls := run(t, "browser_click", `{"element":"[data-testid=tweetButton]"}`,
+			func(int) ([]string, error) { return nil, fmt.Errorf("CDP unavailable") })
+		if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness || calls != 0 {
+			t.Fatalf("result=%#v dispatches=%d", result, calls)
+		}
+	})
+
+	t.Run("unverifiable target fails closed", func(t *testing.T) {
+		result, calls := run(t, "browser_click", `{"ref":"e1"}`,
+			func(int) ([]string, error) { return nil, fmt.Errorf("CDP unavailable") })
+		if !result.IsError || result.ErrorCategory != agent.ErrCategoryTransient || calls != 0 ||
+			strings.Contains(result.Content, "X composer automation") {
+			t.Fatalf("result=%#v dispatches=%d", result, calls)
+		}
+	})
+
+	t.Run("non-CDP ordinary mutation remains available", func(t *testing.T) {
+		fake := &countingSuccessClient{}
+		mgr := mcp.NewClientManager()
+		mgr.SeedConfig("playwright", mcp.MCPServerConfig{Command: "dummy", Args: []string{"--headless"}})
+		mgr.SeedClient("playwright", fake)
+		result, err := NewMCPTool("playwright", mcpgo.Tool{Name: "browser_click"}, mgr).Run(
+			context.Background(), `{"ref":"e1"}`,
+		)
+		if err != nil || result.IsError || fake.callToolCount.Load() != 1 {
+			t.Fatalf("result=%#v err=%v dispatches=%d", result, err, fake.callToolCount.Load())
+		}
+	})
+
+	for _, name := range []string{"browser_run_code", "browser_evaluate"} {
+		t.Run(name+" arbitrary code bypass disabled", func(t *testing.T) {
+			result, calls := run(t, name,
+				`{"code":"await page.goto('https://x.com/compose/post'); await page.getByTestId('tweetButton').click()"}`,
+				func(int) ([]string, error) { t.Fatal("unrestricted code guard queried CDP"); return nil, nil })
+			if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness || calls != 0 ||
+				!strings.Contains(result.Content, "disabled") {
+				t.Fatalf("result=%#v dispatches=%d", result, calls)
+			}
+		})
+	}
+
+	t.Run("Chrome is ready before target inspection", func(t *testing.T) {
+		ready := false
+		shouldPreflightChromeForTool = func(int) bool { return true }
+		ensureChromeDebugPort = func(int) error { ready = true; return nil }
+		result, calls := run(t, "browser_click", `{"ref":"e1"}`,
+			func(int) ([]string, error) {
+				if !ready {
+					t.Fatal("target URLs inspected before dedicated Chrome preflight")
+				}
+				return []string{"https://example.com/read"}, nil
+			})
+		shouldPreflightChromeForTool = func(int) bool { return false }
+		ensureChromeDebugPort = originalEnsure
+		if result.IsError || calls != 1 {
+			t.Fatalf("result=%#v dispatches=%d", result, calls)
+		}
+	})
+
+	t.Run("composer observation remains available", func(t *testing.T) {
+		result, calls := run(t, "browser_snapshot", `{}`,
+			func(int) ([]string, error) { t.Fatal("observation guard queried CDP"); return nil, nil })
+		if result.IsError || calls != 1 {
+			t.Fatalf("result=%#v dispatches=%d", result, calls)
+		}
+	})
+
+	t.Run("ordinary X navigation remains available", func(t *testing.T) {
+		result, calls := run(t, "browser_navigate", `{"url":"https://x.com/home"}`,
+			func(int) ([]string, error) { t.Fatal("ordinary navigate queried CDP"); return nil, nil })
+		if result.IsError || calls != 1 {
+			t.Fatalf("result=%#v dispatches=%d", result, calls)
+		}
+	})
+}
+
+type orderedCallClient struct {
+	successCallToolClient
+	mu    sync.Mutex
+	calls []string
+}
+
+func (c *orderedCallClient) CallTool(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	c.mu.Lock()
+	c.calls = append(c.calls, req.Params.Name)
+	c.mu.Unlock()
+	return c.successCallToolClient.CallTool(ctx, req)
+}
+
+func (c *orderedCallClient) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...)
+}
+
+func TestMCPTool_PlaywrightTargetCheckAndCallAreSerializedAcrossRuns(t *testing.T) {
+	originalURLs := playwrightCDPPageURLs
+	originalPreflight := shouldPreflightChromeForTool
+	playwrightCDPPageURLs = originalURLs
+	shouldPreflightChromeForTool = func(int) bool { return false }
+	t.Cleanup(func() {
+		playwrightCDPPageURLs = originalURLs
+		shouldPreflightChromeForTool = originalPreflight
+	})
+
+	guardEntered := make(chan struct{})
+	releaseGuard := make(chan struct{})
+	playwrightCDPPageURLs = func(int) ([]string, error) {
+		close(guardEntered)
+		<-releaseGuard
+		return []string{"https://example.com/read"}, nil
+	}
+
+	client := &orderedCallClient{}
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("playwright", mcp.MCPServerConfig{
+		Command: "dummy",
+		Args:    []string{"--cdp-endpoint", "http://127.0.0.1:9223"},
+	})
+	mgr.SeedClient("playwright", client)
+	mutation := NewMCPTool("playwright", mcpgo.Tool{Name: "browser_click"}, mgr)
+	tabSwitch := NewMCPTool("playwright", mcpgo.Tool{Name: "browser_tabs"}, mgr)
+
+	mutationDone := make(chan agent.ToolResult, 1)
+	go func() {
+		result, _ := mutation.Run(context.Background(), `{"ref":"e1"}`)
+		mutationDone <- result
+	}()
+	<-guardEntered
+
+	tabDone := make(chan agent.ToolResult, 1)
+	tabStarted := make(chan struct{})
+	go func() {
+		close(tabStarted)
+		result, _ := tabSwitch.Run(context.Background(), `{"action":"select","index":1}`)
+		tabDone <- result
+	}()
+	<-tabStarted
+	time.Sleep(25 * time.Millisecond)
+	if got := client.snapshot(); len(got) != 0 {
+		t.Fatalf("another Run dispatched between target check and mutation: %v", got)
+	}
+	close(releaseGuard)
+
+	if result := <-mutationDone; result.IsError {
+		t.Fatalf("mutation failed: %#v", result)
+	}
+	if result := <-tabDone; result.IsError {
+		t.Fatalf("tab switch failed: %#v", result)
+	}
+	if got := client.snapshot(); len(got) != 2 || got[0] != "browser_click" || got[1] != "browser_tabs" {
+		t.Fatalf("dispatch order = %v, want guarded mutation before competing Run", got)
 	}
 }
 

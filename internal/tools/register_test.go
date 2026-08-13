@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -171,6 +172,26 @@ func TestRegisterServerTools_AllowlistFiltering(t *testing.T) {
 	}
 }
 
+func TestRegisterIntegrationTools_TransientListFailurePreservesCurrentIdentityCatalog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/integrations/tools" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		http.Error(w, "temporary outage", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "same-key")
+	reg := agent.NewToolRegistry()
+	reg.Register(NewIntegrationTool(client.ServerToolSchema{Name: "x_mentions"}, gw))
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err == nil {
+		t.Fatal("expected transient integration list failure")
+	}
+	if _, ok := reg.Get("x_mentions"); !ok {
+		t.Fatal("ordinary same-identity refresh failure deleted the current catalog")
+	}
+}
+
 func TestExtractGatewayTools(t *testing.T) {
 	reg := agent.NewToolRegistry()
 	gw := client.NewGatewayClient("http://test", "key")
@@ -221,6 +242,8 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	mgr := mcp.NewClientManager()
 	mgr.SeedToolCache("playwright", []mcp.RemoteTool{
 		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_navigate"}},
+		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_run_code"}},
+		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_evaluate"}},
 	})
 
 	reg := RebuildRegistryForHealth(baseline, nil, nil, healthStates, mgr, nil)
@@ -229,6 +252,11 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	}
 	if _, ok := reg.Get("browser_navigate"); !ok {
 		t.Error("browser_navigate should be registered from healthy Playwright")
+	}
+	for _, name := range []string{"browser_run_code", "browser_evaluate"} {
+		if _, ok := reg.Get(name); ok {
+			t.Errorf("%s must be hidden from the canonical Playwright adapter", name)
+		}
 	}
 	// accessibility reads the AX tree of native apps (e.g. WeChat) — playwright
 	// cannot, so it must survive Playwright (regression: it was wrongly removed).
@@ -239,6 +267,26 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("%s must NOT be removed when Playwright is present", name)
 		}
+	}
+}
+
+func TestRebuildRegistryForHealth_DoesNotReviveStaleIntegrationGeneration(t *testing.T) {
+	baseline := agent.NewToolRegistry()
+	gw := client.NewGatewayClient("http://test", "old-key")
+	stale := NewIntegrationTool(client.ServerToolSchema{Name: "x_mentions"}, gw)
+	gw.SetAPIKey("new-key")
+	gw.BindIntegrationPrincipal("account-b", 2)
+
+	reg := RebuildRegistryForHealth(
+		baseline,
+		[]agent.Tool{stale},
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if _, ok := reg.Get("x_mentions"); ok {
+		t.Fatal("MCP/overlay rebuild revived a stale integration generation")
 	}
 }
 

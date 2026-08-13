@@ -34,7 +34,12 @@ const listDefaultLimit = 20
 // --- list_my_published_files ---
 
 type ListPublishedFilesTool struct {
-	client listUploader
+	client    listUploader
+	authGuard *authSensitiveToolGuard
+}
+
+func (t *ListPublishedFilesTool) setAuthSensitiveToolGuard(guard *authSensitiveToolGuard) {
+	t.authGuard = guard
 }
 
 func NewListPublishedFilesTool(client listUploader) *ListPublishedFilesTool {
@@ -93,6 +98,12 @@ func (t *ListPublishedFilesTool) Info() agent.ToolInfo {
 }
 
 func (t *ListPublishedFilesTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	return runAuthSensitiveTool(t.authGuard, func() (agent.ToolResult, error) {
+		return t.run(ctx, argsJSON)
+	})
+}
+
+func (t *ListPublishedFilesTool) run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args listPublishedArgs
 	if strings.TrimSpace(argsJSON) != "" {
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
@@ -169,7 +180,12 @@ var _ agent.ReadOnlyChecker = (*ListPublishedFilesTool)(nil)
 // --- retract_published_file ---
 
 type RetractPublishedFileTool struct {
-	client retractUploader
+	client    retractUploader
+	authGuard *authSensitiveToolGuard
+}
+
+func (t *RetractPublishedFileTool) setAuthSensitiveToolGuard(guard *authSensitiveToolGuard) {
+	t.authGuard = guard
 }
 
 func NewRetractPublishedFileTool(client retractUploader) *RetractPublishedFileTool {
@@ -218,6 +234,12 @@ func (t *RetractPublishedFileTool) Info() agent.ToolInfo {
 }
 
 func (t *RetractPublishedFileTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	return runAuthSensitiveTool(t.authGuard, func() (agent.ToolResult, error) {
+		return t.run(ctx, argsJSON)
+	})
+}
+
+func (t *RetractPublishedFileTool) run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args retractArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil

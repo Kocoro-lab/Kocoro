@@ -49,6 +49,7 @@ var (
 		mgr.Disconnect("playwright")
 	}
 	stopPlaywrightChromeAndWaitFn = mcp.StopCDPChromeAndWait
+	rebuildRegistryForHealthFn    = tools.RebuildRegistryForHealth
 )
 
 var validIdempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{8,128}$`)
@@ -1697,15 +1698,21 @@ type ServerDeps struct {
 	RecordConfigMutation func(config.MutationRevisions)
 	GW                   *client.GatewayClient
 	Registry             *agent.ToolRegistry
-	MCPManager           *mcp.ClientManager  // live MCP connections; swapped on reload
-	Supervisor           *mcp.Supervisor     // MCP health supervisor; swapped on reload
+	// toolRegistryMutationMu is the build-to-swap authority for every live
+	// registry and cached-overlay mutation. Auth refresh, integration refresh,
+	// MCP health callbacks, and config reloads must hold it from their layer
+	// snapshot through Registry replacement so an old build cannot land after a
+	// credential or manager transition.
+	toolRegistryMutationMu sync.Mutex
+	MCPManager             *mcp.ClientManager // live MCP connections; swapped on reload
+	Supervisor             *mcp.Supervisor    // MCP health supervisor; swapped on reload
 	// MCPReconnect schedules bounded retries for servers whose async connect
 	// failed. Owned by the MCPManager generation that spawned it, so it is
 	// swapped (and the old one stopped) alongside MCPManager on reload —
 	// letting a superseded ladder keep firing would resurrect connections on
 	// a manager nothing can reach.
-	MCPReconnect *mcp.ReconnectScheduler
-	Cleanup      func() // closes MCP connections; swapped on reload
+	MCPReconnect         *mcp.ReconnectScheduler
+	Cleanup              func()              // closes MCP connections; swapped on reload
 	BaselineReg          *agent.ToolRegistry // local-only tools; refreshed on reload
 	GatewayOverlay       []agent.Tool        // cached gateway tools; refreshed on reload
 	PostOverlays         []agent.Tool        // cloud_delegate etc.; refreshed on reload
@@ -1814,12 +1821,58 @@ func (d *ServerDeps) ShutdownCleanup() {
 func (d *ServerDeps) WriteLock()   { d.mu.Lock() }
 func (d *ServerDeps) WriteUnlock() { d.mu.Unlock() }
 
+// LockToolRegistryMutation serializes the complete layer-build-to-live-swap
+// transaction across auth, integration, MCP health, and reload paths.
+func (d *ServerDeps) LockToolRegistryMutation() func() {
+	if d == nil {
+		return func() {}
+	}
+	d.toolRegistryMutationMu.Lock()
+	return d.toolRegistryMutationMu.Unlock
+}
+
 // RebuildLayers returns the cached rebuild layers under read lock.
 func (d *ServerDeps) RebuildLayers() (*agent.ToolRegistry, []agent.Tool, []agent.Tool, *mcp.ClientManager) {
 	d.mu.RLock()
 	bl, gw, po, mgr := d.BaselineReg, d.GatewayOverlay, d.PostOverlays, d.MCPManager
 	d.mu.RUnlock()
 	return bl, gw, po, mgr
+}
+
+// RebuildRegistryForMCPHealth rebuilds and swaps the live registry under the
+// process-wide tool-registry transaction lock. The supervisor identity is
+// checked after acquiring the lock, so a callback queued by a superseded MCP
+// generation cannot publish its cached catalog after reload.
+func (d *ServerDeps) RebuildRegistryForMCPHealth(expected *mcp.Supervisor) (*agent.ToolRegistry, bool) {
+	if d == nil || expected == nil {
+		return nil, false
+	}
+	unlock := d.LockToolRegistryMutation()
+	defer unlock()
+
+	d.mu.RLock()
+	if d.Supervisor != expected || d.BaselineReg == nil {
+		d.mu.RUnlock()
+		return nil, false
+	}
+	baseline := d.BaselineReg
+	gatewayOverlay := append([]agent.Tool(nil), d.GatewayOverlay...)
+	postOverlays := append([]agent.Tool(nil), d.PostOverlays...)
+	mgr := d.MCPManager
+	d.mu.RUnlock()
+
+	rebuilt := rebuildRegistryForHealthFn(
+		baseline, gatewayOverlay, postOverlays,
+		expected.HealthStates(), mgr, expected,
+	)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.Supervisor != expected {
+		return nil, false
+	}
+	d.Registry = rebuilt
+	return rebuilt, true
 }
 
 // cleanupPlaywrightAfterTurn runs at the end of every RunAgent invocation
