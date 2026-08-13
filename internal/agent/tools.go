@@ -190,6 +190,7 @@ type GUIObservationOutcome struct {
 type ToolUsage struct {
 	Provider     string
 	Model        string
+	CostModel    string
 	InputTokens  int
 	OutputTokens int
 	TotalTokens  int

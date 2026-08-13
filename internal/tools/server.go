@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
@@ -58,9 +59,48 @@ func NewIntegrationTool(schema client.ServerToolSchema, gateway *client.GatewayC
 	return &ServerTool{
 		schema:  schema,
 		gateway: gateway,
-		execute: gateway.ExecuteIntegrationTool,
-		source:  agent.SourceIntegration,
+		execute: func(ctx context.Context, name string, args map[string]any) (*client.ToolExecuteResponse, error) {
+			requestID := ""
+			idempotencyKey := ""
+			if execution, ok := agent.SideEffectExecutionFromContext(ctx); ok {
+				requestID = execution.ExecutionID
+				idempotencyKey = execution.IdempotencyKey
+			} else if invocation, ok := agent.ToolInvocationFromContext(ctx); ok {
+				requestID = invocation.ToolUseID
+			}
+			var resp *client.ToolExecuteResponse
+			var err error
+			for attempt, delay := range []time.Duration{0, 250 * time.Millisecond, 750 * time.Millisecond} {
+				if delay > 0 {
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return nil, ctx.Err()
+					case <-timer.C:
+					}
+				}
+				resp, err = gateway.ExecuteIntegrationToolWithIdentity(ctx, name, args, requestID, idempotencyKey)
+				if err == nil || requestID == "" || attempt == 2 || !integrationCallCanRetryWithSameIdentity(err) {
+					return resp, err
+				}
+			}
+			return resp, err
+		},
+		source: agent.SourceIntegration,
 	}
+}
+
+// billing_error and call_in_progress mean Cloud already owns this request id.
+// A bounded in-call retry can finish the same ledger entry without repeating
+// the provider operation. Returning a retryable error to the model would be
+// unsafe because a new tool call receives a different request id.
+func integrationCallCanRetryWithSameIdentity(err error) bool {
+	var integrationErr *client.IntegrationToolAPIError
+	if !errors.As(err, &integrationErr) {
+		return false
+	}
+	return integrationErr.Code == "billing_error" || integrationErr.Code == "call_in_progress"
 }
 
 func (t *ServerTool) Info() agent.ToolInfo {
@@ -113,12 +153,7 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 		if materialSideEffect {
 			return t.materialErrorResult(err), nil
 		}
-		msg := err.Error()
-		prefix := classifyServerError(msg)
-		return agent.ToolResult{
-			Content: fmt.Sprintf("%sserver tool error: %v", prefix, err),
-			IsError: true,
-		}, nil
+		return t.nonMaterialErrorResult(err), nil
 	}
 
 	// Convert server-reported usage (xAI Grok tokens for x_search, SerpAPI
@@ -148,6 +183,7 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 		toolUsage = &agent.ToolUsage{
 			Provider:     u.Provider,
 			Model:        model,
+			CostModel:    u.CostModel,
 			InputTokens:  u.InputTokens,
 			OutputTokens: u.OutputTokens,
 			TotalTokens:  totalTokens,
@@ -156,13 +192,17 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 			UnitType:     u.UnitType,
 		}
 		agent.EmitUsage(ctx, agent.TurnUsage{
+			Provider:     u.Provider,
+			CostModel:    u.CostModel,
 			InputTokens:  u.InputTokens,
 			OutputTokens: u.OutputTokens,
 			TotalTokens:  totalTokens,
 			CostUSD:      u.CostUSD,
 			// Gateway tool calls are not LLM calls from the driving model's
 			// perspective — leave LLMCalls=0 so session LLMCalls stays clean.
-			Model: model,
+			Model:    model,
+			Units:    u.Units,
+			UnitType: u.UnitType,
 		})
 	}
 
@@ -194,7 +234,77 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	return agent.ToolResult{Content: string(resp.Output), Usage: toolUsage}, nil
 }
 
+func (t *ServerTool) reconnectInstruction() string {
+	provider := strings.TrimSpace(t.schema.Provider)
+	switch strings.ToLower(provider) {
+	case "x", "twitter":
+		provider = "X"
+	case "shopify":
+		provider = "Shopify"
+	case "notion":
+		provider = "Notion"
+	case "figma":
+		provider = "Figma"
+	case "slack":
+		provider = "Slack"
+	case "":
+		return "Reconnect the integration in Kocoro Settings → MCP Servers before retrying."
+	}
+	return fmt.Sprintf("Reconnect %s in Kocoro Settings → MCP Servers → %s before retrying.", provider, provider)
+}
+
+func (t *ServerTool) nonMaterialErrorResult(err error) agent.ToolResult {
+	if t.source == agent.SourceGateway {
+		msg := err.Error()
+		prefix := classifyServerError(msg)
+		return agent.ToolResult{
+			Content: fmt.Sprintf("%sserver tool error: %v", prefix, err),
+			IsError: true,
+		}
+	}
+	var integrationErr *client.IntegrationToolAPIError
+	if errors.As(err, &integrationErr) {
+		return t.integrationAPIErrorResult(integrationErr, false)
+	}
+	var dispatchErr *client.ToolDispatchError
+	if errors.As(err, &dispatchErr) {
+		return agent.TransientError(fmt.Sprintf("integration tool %s transport failed: %v", t.schema.Name, err))
+	}
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		msg := fmt.Sprintf("server tool %s returned %d", t.schema.Name, apiErr.StatusCode)
+		if apiErr.StatusCode >= http.StatusInternalServerError || apiErr.StatusCode == http.StatusTooManyRequests {
+			return agent.TransientError(msg)
+		}
+		return agent.BusinessError(msg)
+	}
+	return agent.TransientError(fmt.Sprintf("integration tool %s failed: %v", t.schema.Name, err))
+}
+
 func (t *ServerTool) materialErrorResult(err error) agent.ToolResult {
+	var integrationErr *client.IntegrationToolAPIError
+	if errors.As(err, &integrationErr) {
+		if integrationErr.Code == "call_in_progress" {
+			return t.integrationAPIErrorResult(integrationErr, true)
+		}
+		if integrationCodeMayHaveEffect(integrationErr.Code) {
+			return externalOutcomeUnknown(fmt.Sprintf(
+				"External tool outcome UNKNOWN: Cloud returned %d (%s) after receiving %s. The external action may have taken effect; verify before retrying.",
+				integrationErr.StatusCode, integrationErr.Code, t.schema.Name,
+			))
+		}
+		if integrationCodeProvesNoEffect(integrationErr.Code) ||
+			integrationStatusProvesNoEffect(integrationErr.StatusCode) {
+			return withKnownNoEffect(t.integrationAPIErrorResult(integrationErr, true))
+		}
+		// Billing may fail after the provider committed, and provider transport
+		// failures do not prove the action was rejected. Any structured error
+		// without explicit no-effect evidence therefore remains conservative.
+		return externalOutcomeUnknown(fmt.Sprintf(
+			"External tool outcome UNKNOWN: Cloud returned %d (%s) after receiving %s. The external action may have taken effect; verify before retrying.",
+			integrationErr.StatusCode, integrationErr.Code, t.schema.Name,
+		))
+	}
 	var dispatchErr *client.ToolDispatchError
 	if errors.As(err, &dispatchErr) {
 		if dispatchErr.MayHaveDispatched {
@@ -255,6 +365,82 @@ func (t *ServerTool) materialErrorResult(err error) agent.ToolResult {
 	))
 }
 
+func integrationCodeMayHaveEffect(code string) bool {
+	switch code {
+	case "billing_error", "provider_error", "outcome_unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+func integrationStatusProvesNoEffect(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity,
+		http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
+		http.StatusTooManyRequests:
+		return true
+	default:
+		return false
+	}
+}
+
+func integrationCodeProvesNoEffect(code string) bool {
+	switch code {
+	case "not_connected", "auth_expired", "integration_limit_exceeded",
+		"provider_unavailable", "feature_disabled", "tool_not_allowed",
+		"idempotency_conflict":
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *ServerTool) integrationAPIErrorResult(apiErr *client.IntegrationToolAPIError, material bool) agent.ToolResult {
+	msg := fmt.Sprintf("integration tool %s returned %d", t.schema.Name, apiErr.StatusCode)
+	switch apiErr.Code {
+	case "not_connected":
+		return agent.BusinessError(msg + ": the account is not connected. " + t.reconnectInstruction())
+	case "auth_expired":
+		return agent.BusinessError(msg + ": authorization expired. " + t.reconnectInstruction())
+	case "integration_limit_exceeded":
+		return agent.BusinessError(msg + ": the integration usage limit was reached")
+	case "idempotency_conflict":
+		return agent.ValidationError(msg + ": the request id was reused with different tool arguments")
+	case "billing_error":
+		return agent.BusinessError(msg + ": usage recording is still pending; do not issue a new tool call")
+	case "provider_unavailable":
+		return agent.TransientError(msg + ": the provider is temporarily unavailable")
+	case "outcome_unknown":
+		if material {
+			return externalOutcomeUnknown("External tool outcome UNKNOWN: " + msg)
+		}
+		return agent.BusinessError(msg + ": the provider result or charge could not be confirmed; do not repeat automatically")
+	case "call_in_progress":
+		if material {
+			return agent.BusinessError(msg + ": the original request is still in progress; wait or query its state, and do not resend the action")
+		}
+		return agent.BusinessError(msg + ": the original request is still in progress; do not issue a new tool call")
+	case "feature_disabled":
+		return agent.BusinessError(msg + ": integrations are disabled")
+	case "tool_not_allowed":
+		return agent.PermissionError(msg + ": the integration tool is not allowed")
+	}
+	if apiErr.StatusCode >= http.StatusInternalServerError || apiErr.StatusCode == http.StatusTooManyRequests {
+		return agent.TransientError(msg)
+	}
+	if apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden {
+		return agent.PermissionError(msg)
+	}
+	if apiErr.StatusCode == http.StatusBadRequest || apiErr.StatusCode == http.StatusUnprocessableEntity {
+		return agent.ValidationError(msg)
+	}
+	if material && apiErr.StatusCode == http.StatusConflict {
+		return externalOutcomeUnknown("External tool outcome UNKNOWN: " + msg)
+	}
+	return agent.BusinessError(msg)
+}
+
 func withKnownNoEffect(result agent.ToolResult) agent.ToolResult {
 	result.SideEffectKnownNoEffect = true
 	return result
@@ -271,8 +457,22 @@ func (t *ServerTool) RequiresApproval() bool { return false }
 // out of the durable write journal. Gateway jobs that persist provider state,
 // and integrations without reliable read-only annotations, remain material.
 func (t *ServerTool) HasMaterialSideEffect(string) bool {
+	if t.source == agent.SourceIntegration {
+		if t.schema.MaterialSideEffect != nil {
+			return *t.schema.MaterialSideEffect
+		}
+		return true
+	}
 	policy, registered := gatewayToolPolicies[t.schema.Name]
-	return t.source != agent.SourceGateway || !registered || !policy.noMaterialSideEffect
+	return !registered || !policy.noMaterialSideEffect
+}
+
+// IsConcurrencySafeCall allows trusted observational integration schemas to
+// batch while keeping unannotated and mutating integrations serial.
+func (t *ServerTool) IsConcurrencySafeCall(string) bool {
+	return t.source == agent.SourceIntegration &&
+		t.schema.MaterialSideEffect != nil &&
+		!*t.schema.MaterialSideEffect
 }
 
 // classifyServerError returns the appropriate error prefix based on the error

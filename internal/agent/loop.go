@@ -613,6 +613,8 @@ const contrastExamplesCloud = `
 Cloud results cannot access or modify the user's local environment; never describe delegation as completing local work.`
 
 type TurnUsage struct {
+	Provider              string
+	CostModel             string
 	InputTokens           int
 	OutputTokens          int
 	TotalTokens           int
@@ -620,6 +622,8 @@ type TurnUsage struct {
 	LLMCalls              int
 	WebSearchCalls        int
 	Model                 string // actual model from gateway response
+	Units                 int
+	UnitType              string
 	CacheReadTokens       int
 	CacheCreationTokens   int
 	CacheCreation5mTokens int
@@ -7998,11 +8002,15 @@ func (a *AgentLoop) logAudit(toolName, argsStr, outputSummary, decision string, 
 		DurationMs:    durationMs,
 	}
 	if usage != nil {
+		entry.Provider = usage.Provider
 		entry.InputTokens = usage.InputTokens
 		entry.OutputTokens = usage.OutputTokens
 		entry.TotalTokens = usage.TotalTokens
 		entry.CostUSD = usage.CostUSD
 		entry.Model = usage.Model
+		entry.CostModel = usage.CostModel
+		entry.Units = usage.Units
+		entry.UnitType = usage.UnitType
 	}
 	a.auditor.Log(entry)
 }

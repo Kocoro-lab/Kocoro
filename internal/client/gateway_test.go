@@ -1054,6 +1054,104 @@ func TestExecuteIntegrationTool_HTTPStatusIsTypedAPIError(t *testing.T) {
 	}
 }
 
+func TestListIntegrationTools_MaterialSideEffectOptionalAndUsageFields(t *testing.T) {
+	readOnly := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/integrations/tools":
+			_ = json.NewEncoder(w).Encode([]ServerToolSchema{
+				{Name: "x_read_home", Provider: "x", MaterialSideEffect: &readOnly},
+				{Name: "legacy_tool"},
+			})
+		case "/api/v1/integrations/tools/x_read_home/execute":
+			_ = json.NewEncoder(w).Encode(ToolExecuteResponse{
+				Success: true,
+				Output:  json.RawMessage(`{"ok":true}`),
+				Usage: &ToolUsage{
+					Provider: "x", Model: "x-api-v2", UnitType: "posts",
+					Units: 3, CostUSD: 0.015, CostModel: "x_pay_per_use",
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "")
+	schemas, err := gw.ListIntegrationTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListIntegrationTools: %v", err)
+	}
+	if len(schemas) != 2 || schemas[0].MaterialSideEffect == nil ||
+		*schemas[0].MaterialSideEffect || schemas[0].Provider != "x" ||
+		schemas[1].MaterialSideEffect != nil {
+		t.Fatalf("schemas = %#v", schemas)
+	}
+	resp, err := gw.ExecuteIntegrationTool(context.Background(), "x_read_home", nil)
+	if err != nil {
+		t.Fatalf("ExecuteIntegrationTool: %v", err)
+	}
+	if resp.Usage == nil || resp.Usage.Provider != "x" || resp.Usage.Model != "x-api-v2" ||
+		resp.Usage.UnitType != "posts" || resp.Usage.Units != 3 ||
+		resp.Usage.CostUSD != 0.015 || resp.Usage.CostModel != "x_pay_per_use" {
+		t.Fatalf("usage = %#v", resp.Usage)
+	}
+}
+
+func TestExecuteIntegrationToolWithIdentity_SendsStableIdentity(t *testing.T) {
+	var bodies []ToolExecuteRequest
+	var keys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body ToolExecuteRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		bodies = append(bodies, body)
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		_ = json.NewEncoder(w).Encode(ToolExecuteResponse{Success: true, Output: json.RawMessage(`{"ok":true}`)})
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "")
+	for range 2 {
+		if _, err := gw.ExecuteIntegrationToolWithIdentity(
+			context.Background(), "x_create_post", map[string]any{"text": "hello"},
+			"exec-stable", "idem-stable",
+		); err != nil {
+			t.Fatalf("ExecuteIntegrationToolWithIdentity: %v", err)
+		}
+	}
+	if len(bodies) != 2 || bodies[0].RequestID != "exec-stable" ||
+		bodies[1].RequestID != bodies[0].RequestID ||
+		keys[0] != "idem-stable" || keys[1] != keys[0] {
+		t.Fatalf("bodies=%#v keys=%#v", bodies, keys)
+	}
+}
+
+func TestExecuteIntegrationTool_ParsesStructuredErrorCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"auth_expired","message":"reauthorize"}`))
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "")
+	_, err := gw.ExecuteIntegrationTool(context.Background(), "x_read_home", nil)
+	var integrationErr *IntegrationToolAPIError
+	if !errors.As(err, &integrationErr) {
+		t.Fatalf("error = %T %v, want *IntegrationToolAPIError", err, err)
+	}
+	if integrationErr.StatusCode != http.StatusConflict ||
+		integrationErr.Code != "auth_expired" || integrationErr.Message != "reauthorize" {
+		t.Fatalf("IntegrationToolAPIError = %#v", integrationErr)
+	}
+	var legacy *APIError
+	if !errors.As(err, &legacy) || legacy.StatusCode != http.StatusConflict {
+		t.Fatalf("legacy APIError missing from unwrap chain: %v", err)
+	}
+}
+
 func TestCompletionRequest_MarshalsCacheSourceField(t *testing.T) {
 	req := CompletionRequest{
 		Messages:    []Message{{Role: "user", Content: NewTextContent("hi")}},

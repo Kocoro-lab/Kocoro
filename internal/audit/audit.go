@@ -31,8 +31,8 @@ type AuditEntry struct {
 	Decision      string    `json:"decision,omitempty"`
 	Approved      bool      `json:"approved"`
 	DurationMs    int64     `json:"duration_ms,omitempty"`
-	// Cost fields (populated when tool reports usage, e.g. gateway tools that
-	// call xAI Grok / SerpAPI). Omitted when the tool does not return usage.
+	// Cost fields (populated when tool reports usage, e.g. gateway and
+	// integration tools). Omitted when the tool does not return usage.
 	// TotalTokens is the aggregate; for tools that only report a flat count
 	// (SERP APIs, current Shannon Cloud schema) only TotalTokens is populated.
 	// LLM-backed tools that expose input/output split also fill InputTokens/OutputTokens.
@@ -40,7 +40,11 @@ type AuditEntry struct {
 	OutputTokens        int     `json:"output_tokens,omitempty"`
 	TotalTokens         int     `json:"total_tokens,omitempty"`
 	CostUSD             float64 `json:"cost_usd,omitempty"`
+	Provider            string  `json:"provider,omitempty"`
 	Model               string  `json:"model,omitempty"`
+	CostModel           string  `json:"cost_model,omitempty"`
+	Units               int     `json:"units,omitempty"`
+	UnitType            string  `json:"unit_type,omitempty"`
 	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
 	CacheCreationTokens int     `json:"cache_creation_tokens,omitempty"`
 

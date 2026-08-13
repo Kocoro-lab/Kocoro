@@ -228,9 +228,27 @@ On failure the tool probes FRESH health (never trusts the cached state at error 
 
 `tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`, `RequiresApproval()==false` — Cloud enforces access control). Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
 
+Cloud may add `material_side_effect` to a schema. Its presence is trusted
+policy: `false` keeps observational tools such as X identity reads out of the
+durable mutation journal and permits concurrent batching; absence stays
+fail-closed for older Cloud versions. Every execute body carries a stable
+`request_id` when the agent dispatcher supplies a tool-use identity. Material
+calls additionally send the durable journal's `Idempotency-Key`; read-only
+calls never claim provider idempotency. Structured Cloud error codes preserve
+known outcomes: reconnectable auth errors point to the provider's Settings
+entry, and explicit pre-dispatch `provider_unavailable` is retryable with
+known no effect. Billing/provider-error/unknown post-dispatch failures on
+material tools remain `outcome_unknown`. Integration usage preserves provider, model,
+unit type/count, and cost through the tool result and usage emitter.
+`call_in_progress` is a separate known state: read-only calls may retry after
+waiting, while material calls must wait or query state and never resend the
+action.
+
 #### Integration tools: refresh triggers
 
 Registered on startup + `/config/reload`, refreshed by `RebuildAuthSensitiveTools` (sign-in) and — the immediate path — **`POST /integrations/refresh`** (`Server.RefreshIntegrationTools`; lightweight, does NOT restart MCP). First-time activation is async (a connection goes active only after the browser OAuth completes, out of band), so `connect`/`delete` fire a best-effort refresh but the reliable trigger is Desktop calling `POST /integrations/refresh`. Capability `integration_tools_v1`.
+
+`x_prepare_post` is a separate local Deferred tool, not an integration mutation. It builds `https://x.com/intent/tweet` without OAuth, network access, or a browser opener and reports `published:false`; only the user's explicit link click and later click on X's Post button can publish. Do not replace that consent boundary with browser/computer automation. Its audit summaries omit both draft text and the generated URL.
 
 #### Attachments
 

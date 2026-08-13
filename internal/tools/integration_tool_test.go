@@ -21,6 +21,63 @@ func (f fakeLocalTool) Run(context.Context, string) (agent.ToolResult, error) {
 }
 func (f fakeLocalTool) RequiresApproval() bool { return false }
 
+type integrationIdentityLLM struct{ calls int }
+
+func (c *integrationIdentityLLM) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	c.calls++
+	if c.calls == 1 {
+		return &client.CompletionResponse{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID: "toolu_search_x_create", Name: "tool_search",
+				Arguments: json.RawMessage(`{"query":"select:x_create_post"}`),
+			}},
+		}, nil
+	}
+	if c.calls == 2 {
+		return &client.CompletionResponse{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID: "toolu_x_create_1", Name: "x_create_post",
+				Arguments: json.RawMessage(`{"text":"hello"}`),
+			}},
+		}, nil
+	}
+	return &client.CompletionResponse{OutputText: "done", FinishReason: "stop"}, nil
+}
+
+func (c *integrationIdentityLLM) CompleteStream(
+	ctx context.Context,
+	req client.CompletionRequest,
+	_ func(client.StreamDelta),
+) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+type integrationIdentityJournal struct {
+	prepared agent.SideEffectExecution
+}
+
+func (j *integrationIdentityJournal) Prepare(_ context.Context, execution agent.SideEffectExecution) (agent.PreparedSideEffectExecution, error) {
+	j.prepared = execution
+	return agent.PreparedSideEffectExecution{
+		ExecutionID: "exec-x-create-1", IdempotencyKey: "idem-x-create-1",
+	}, nil
+}
+func (*integrationIdentityJournal) MarkDispatching(context.Context, string) error { return nil }
+func (*integrationIdentityJournal) MarkCommitted(context.Context, string, string) error {
+	return nil
+}
+func (*integrationIdentityJournal) MarkFailedNoEffect(context.Context, string, string) error {
+	return nil
+}
+func (*integrationIdentityJournal) MarkAbandoned(context.Context, string, string) error {
+	return nil
+}
+func (*integrationIdentityJournal) MarkOutcomeUnknown(context.Context, string, string) error {
+	return nil
+}
+
 func TestIntegrationTool_Metadata(t *testing.T) {
 	tool := NewIntegrationTool(client.ServerToolSchema{Name: "notion_search"}, nil)
 	if tool.RequiresApproval() {
@@ -185,6 +242,280 @@ func TestIntegrationTool_HTTPStatusPolicy(t *testing.T) {
 				t.Fatalf("SideEffectKnownNoEffect = %t, want %t", result.SideEffectKnownNoEffect, wantNoEffect)
 			}
 		})
+	}
+}
+
+func TestIntegrationTool_ReadOnlyErrorsHaveKnownOutcome(t *testing.T) {
+	readOnly := false
+	tests := []struct {
+		name        string
+		status      int
+		code        string
+		wantUnknown bool
+		wantRetry   bool
+		wantText    string
+	}{
+		{name: "auth expired", status: http.StatusConflict, code: "auth_expired", wantText: "Settings → MCP Servers → X"},
+		{name: "not connected", status: http.StatusNotFound, code: "not_connected", wantText: "Settings → MCP Servers → X"},
+		{name: "provider unavailable", status: http.StatusServiceUnavailable, code: "provider_unavailable", wantRetry: true},
+		{name: "integration limit", status: http.StatusTooManyRequests, code: "integration_limit_exceeded"},
+		{name: "idempotency conflict", status: http.StatusConflict, code: "idempotency_conflict", wantText: "request id was reused"},
+		{name: "billing error", status: http.StatusServiceUnavailable, code: "billing_error", wantText: "do not issue a new tool call"},
+		{name: "explicit outcome unknown", status: http.StatusConflict, code: "outcome_unknown", wantText: "do not repeat automatically"},
+		{name: "read call in progress", status: http.StatusConflict, code: "call_in_progress", wantText: "do not issue a new tool call"},
+		{name: "unknown conflict", status: http.StatusConflict, code: "unexpected_conflict"},
+		{name: "unknown server error", status: http.StatusBadGateway, code: "upstream_failed", wantRetry: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": tt.code})
+			}))
+			defer server.Close()
+
+			tool := NewIntegrationTool(client.ServerToolSchema{
+				Name: "x_read_home", Provider: "x", MaterialSideEffect: &readOnly,
+			}, client.NewGatewayClient(server.URL, ""))
+			result, err := tool.Run(context.Background(), `{}`)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if !result.IsError || result.SideEffectOutcomeUnknown != tt.wantUnknown ||
+				result.IsRetryable != tt.wantRetry {
+				t.Fatalf("result = %#v", result)
+			}
+			if tt.wantText != "" && !strings.Contains(result.Content, tt.wantText) {
+				t.Fatalf("content = %q, want %q", result.Content, tt.wantText)
+			}
+		})
+	}
+}
+
+func TestIntegrationTool_BillingRecoveryRetriesOnlyWithSameRequestID(t *testing.T) {
+	readOnly := false
+	for _, code := range []string{"billing_error", "call_in_progress"} {
+		t.Run(code, func(t *testing.T) {
+			var requestIDs []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body client.ToolExecuteRequest
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				requestIDs = append(requestIDs, body.RequestID)
+				if len(requestIDs) < 3 {
+					w.WriteHeader(http.StatusConflict)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(client.ToolExecuteResponse{
+					Success: true, Output: json.RawMessage(`{"data":[]}`),
+				})
+			}))
+			defer server.Close()
+
+			tool := NewIntegrationTool(client.ServerToolSchema{
+				Name: "x_mentions", Provider: "x", MaterialSideEffect: &readOnly,
+			}, client.NewGatewayClient(server.URL, ""))
+			ctx := agent.ContextWithToolInvocation(context.Background(), agent.ToolInvocation{
+				ToolName: "x_mentions", ToolUseID: "toolu_stable",
+			})
+			result, err := tool.Run(ctx, `{}`)
+			if err != nil || result.IsError {
+				t.Fatalf("Run = (%#v, %v)", result, err)
+			}
+			if len(requestIDs) != 3 {
+				t.Fatalf("request ids = %#v", requestIDs)
+			}
+			for _, got := range requestIDs {
+				if got != "toolu_stable" {
+					t.Fatalf("request ids = %#v, want one stable identity", requestIDs)
+				}
+			}
+		})
+	}
+}
+
+func TestIntegrationTool_ReconnectInstructionUsesSchemaProvider(t *testing.T) {
+	readOnly := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "auth_expired"})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(client.ServerToolSchema{
+		Name: "notion_search", Provider: "notion", MaterialSideEffect: &readOnly,
+	}, client.NewGatewayClient(server.URL, ""))
+	result, err := tool.Run(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(result.Content, "Settings → MCP Servers → Notion") ||
+		strings.Contains(result.Content, "Servers → X") {
+		t.Fatalf("reconnect content = %q", result.Content)
+	}
+}
+
+func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsNot(t *testing.T) {
+	for _, tt := range []struct {
+		code         string
+		status       int
+		wantUnknown  bool
+		wantNoEffect bool
+	}{
+		{code: "auth_expired", status: http.StatusConflict, wantNoEffect: true},
+		{code: "unexpected_conflict", status: http.StatusConflict, wantUnknown: true},
+		{code: "outcome_unknown", status: http.StatusConflict, wantUnknown: true},
+		{code: "billing_error", status: http.StatusServiceUnavailable, wantUnknown: true},
+		{code: "provider_unavailable", status: http.StatusServiceUnavailable, wantNoEffect: true},
+		{code: "idempotency_conflict", status: http.StatusConflict, wantNoEffect: true},
+		{code: "call_in_progress", status: http.StatusConflict},
+	} {
+		t.Run(tt.code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": tt.code})
+			}))
+			defer server.Close()
+
+			tool := NewIntegrationTool(
+				client.ServerToolSchema{Name: "x_create_post"},
+				client.NewGatewayClient(server.URL, ""),
+			)
+			result, err := tool.Run(context.Background(), `{"text":"hello"}`)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if result.SideEffectOutcomeUnknown != tt.wantUnknown ||
+				result.SideEffectKnownNoEffect != tt.wantNoEffect {
+				t.Fatalf("result = %#v", result)
+			}
+			if tt.code == "call_in_progress" &&
+				(result.ErrorCategory != agent.ErrCategoryBusiness ||
+					!strings.Contains(result.Content, "do not resend")) {
+				t.Fatalf("call_in_progress result = %#v", result)
+			}
+		})
+	}
+}
+
+func TestIntegrationTool_ReadOnlyUsesToolUseIDAndEmitsFullUsage(t *testing.T) {
+	readOnly := false
+	var requestID, idempotencyKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body client.ToolExecuteRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requestID = body.RequestID
+		idempotencyKey = r.Header.Get("Idempotency-Key")
+		_ = json.NewEncoder(w).Encode(client.ToolExecuteResponse{
+			Success: true,
+			Output:  json.RawMessage(`{"posts":[]}`),
+			Usage: &client.ToolUsage{
+				Provider: "x", Model: "x-api-v2", UnitType: "posts",
+				Units: 2, CostUSD: 0.01, CostModel: "x_pay_per_use",
+			},
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(client.ServerToolSchema{
+		Name: "x_read_home", Provider: "x", MaterialSideEffect: &readOnly,
+	}, client.NewGatewayClient(server.URL, ""))
+	var emitted agent.TurnUsage
+	ctx := agent.ContextWithToolInvocation(context.Background(), agent.ToolInvocation{
+		ToolName: "x_read_home", ToolUseID: "toolu_x_read_1",
+	})
+	ctx = agent.WithUsageEmit(ctx, func(usage agent.TurnUsage) { emitted = usage })
+	result, err := tool.Run(ctx, `{}`)
+	if err != nil || result.IsError {
+		t.Fatalf("Run = (%#v, %v)", result, err)
+	}
+	if requestID != "toolu_x_read_1" || idempotencyKey != "" {
+		t.Fatalf("request_id=%q idempotency-key=%q", requestID, idempotencyKey)
+	}
+	if result.Usage == nil || result.Usage.Provider != "x" ||
+		result.Usage.Model != "x-api-v2" || result.Usage.UnitType != "posts" ||
+		result.Usage.Units != 2 || result.Usage.CostUSD != 0.01 ||
+		result.Usage.CostModel != "x_pay_per_use" {
+		t.Fatalf("result usage = %#v", result.Usage)
+	}
+	if emitted.Provider != "x" || emitted.Model != "x-api-v2" ||
+		emitted.UnitType != "posts" || emitted.Units != 2 || emitted.CostUSD != 0.01 ||
+		emitted.CostModel != "x_pay_per_use" {
+		t.Fatalf("emitted usage = %#v", emitted)
+	}
+}
+
+func TestIntegrationTool_ReadOnlyDoesNotReuseIdentityAcrossCalls(t *testing.T) {
+	readOnly := false
+	var requestIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body client.ToolExecuteRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requestIDs = append(requestIDs, body.RequestID)
+		_ = json.NewEncoder(w).Encode(client.ToolExecuteResponse{
+			Success: true, Output: json.RawMessage(`{"posts":[]}`),
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(client.ServerToolSchema{
+		Name: "x_read_home", Provider: "x", MaterialSideEffect: &readOnly,
+	}, client.NewGatewayClient(server.URL, ""))
+	for _, toolUseID := range []string{"toolu_x_read_1", "toolu_x_read_2"} {
+		ctx := agent.ContextWithToolInvocation(context.Background(), agent.ToolInvocation{
+			ToolName: "x_read_home", ToolUseID: toolUseID,
+		})
+		if result, err := tool.Run(ctx, `{}`); err != nil || result.IsError {
+			t.Fatalf("Run(%s) = (%#v, %v)", toolUseID, result, err)
+		}
+	}
+	if len(requestIDs) != 2 || requestIDs[0] != "toolu_x_read_1" ||
+		requestIDs[1] != "toolu_x_read_2" || requestIDs[0] == requestIDs[1] {
+		t.Fatalf("request IDs = %#v", requestIDs)
+	}
+}
+
+func TestIntegrationTool_MaterialUsesDurableExecutionIdentity(t *testing.T) {
+	var requestID, idempotencyKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body client.ToolExecuteRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requestID = body.RequestID
+		idempotencyKey = r.Header.Get("Idempotency-Key")
+		_ = json.NewEncoder(w).Encode(client.ToolExecuteResponse{
+			Success: true, Output: json.RawMessage(`{"created":true}`),
+		})
+	}))
+	defer server.Close()
+
+	reg := agent.NewToolRegistry()
+	reg.Register(NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_create_post", Provider: "x"},
+		client.NewGatewayClient(server.URL, ""),
+	))
+	journal := &integrationIdentityJournal{}
+	loop := agent.NewAgentLoop(
+		&integrationIdentityLLM{}, reg, "medium", t.TempDir(),
+		4, 2000, 200, nil, nil, nil,
+	)
+	loop.SetCheckpointFunc(func(context.Context) error { return nil })
+	loop.SetSideEffectExecutionJournal(journal)
+	text, _, err := loop.Run(context.Background(), "post hello", nil, nil)
+	if err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v)", text, err)
+	}
+	if journal.prepared.ToolUseID != "toolu_x_create_1" ||
+		requestID != "exec-x-create-1" || idempotencyKey != "idem-x-create-1" {
+		t.Fatalf("prepared=%#v request_id=%q idempotency-key=%q",
+			journal.prepared, requestID, idempotencyKey)
 	}
 }
 

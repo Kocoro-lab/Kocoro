@@ -33,7 +33,7 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 	}
 
 	// Check local tools are registered
-	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "calculate", "current_time", "clipboard", "notify", "present_deliverable", "process", "applescript", "accessibility", "computer_use", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove", "archive_inspect", "archive_extract", "pdf_to_text", "docx_to_text", "xlsx_to_text", "pptx_to_text"} {
+	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "calculate", "current_time", "x_prepare_post", "clipboard", "notify", "present_deliverable", "process", "applescript", "accessibility", "computer_use", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove", "archive_inspect", "archive_extract", "pdf_to_text", "docx_to_text", "xlsx_to_text", "pptx_to_text"} {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("local tool %q not registered", name)
 		}
@@ -46,12 +46,12 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 		}
 	}
 
-	// Total: 38 local + 2 server = 40. doc-extract pdf/docx/xlsx/pptx are
+	// Total: 39 local + 2 server = 41. doc-extract pdf/docx/xlsx/pptx are
 	// pre-existing local extractors; schedule_show, present_deliverable, and
 	// ask_user_question are the additions pinned by this assertion.
 	schemas := reg.Schemas()
-	if len(schemas) != 40 {
-		t.Errorf("expected 40 tools, got %d", len(schemas))
+	if len(schemas) != 41 {
+		t.Errorf("expected 41 tools, got %d", len(schemas))
 	}
 }
 
@@ -75,8 +75,8 @@ func TestRegisterAll_ServerUnavailable(t *testing.T) {
 	}
 
 	schemas := reg.Schemas()
-	if len(schemas) != 38 {
-		t.Errorf("expected 38 local tools, got %d", len(schemas))
+	if len(schemas) != 39 {
+		t.Errorf("expected 39 local tools, got %d", len(schemas))
 	}
 }
 
@@ -118,12 +118,12 @@ func TestRegisterAll_LocalPriority(t *testing.T) {
 		t.Error("web_search should be a server tool")
 	}
 
-	// 38 local + 1 server (bash skipped) = 39. doc-extract pdf/docx/xlsx/pptx
+	// 39 local + 1 server (bash skipped) = 40. doc-extract pdf/docx/xlsx/pptx
 	// are pre-existing local extractors; schedule_show, present_deliverable, and
 	// ask_user_question are the additions pinned by this assertion.
 	schemas := reg.Schemas()
-	if len(schemas) != 39 {
-		t.Errorf("expected 39 tools, got %d", len(schemas))
+	if len(schemas) != 40 {
+		t.Errorf("expected 40 tools, got %d", len(schemas))
 	}
 }
 

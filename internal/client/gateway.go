@@ -2666,14 +2666,17 @@ func (c *GatewayClient) Health(ctx context.Context) error {
 // --- Server tool types (used by tools.RegisterAll) ---
 
 type ServerToolSchema struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
+	Name               string         `json:"name"`
+	Description        string         `json:"description"`
+	Parameters         map[string]any `json:"parameters,omitempty"`
+	Provider           string         `json:"provider,omitempty"`
+	MaterialSideEffect *bool          `json:"material_side_effect,omitempty"`
 }
 
 type ToolExecuteRequest struct {
 	Arguments map[string]any `json:"arguments"`
 	SessionID string         `json:"session_id,omitempty"`
+	RequestID string         `json:"request_id,omitempty"`
 }
 
 type ToolExecuteResponse struct {
@@ -2724,6 +2727,37 @@ type ToolDispatchError struct {
 	MayHaveDispatched bool
 	Retryable         bool
 	Err               error
+}
+
+// IntegrationToolAPIError preserves the structured integration error code
+// returned by Cloud. APIError remains in the unwrap chain for older callers
+// that only understand status + raw response body.
+type IntegrationToolAPIError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	Body       string
+	apiError   *APIError
+}
+
+func (e *IntegrationToolAPIError) Error() string {
+	if e == nil {
+		return "integration tool request failed"
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("integration tool returned %d: %s", e.StatusCode, e.Code)
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("integration tool returned %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("integration tool returned %d", e.StatusCode)
+}
+
+func (e *IntegrationToolAPIError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.apiError
 }
 
 func (e *ToolDispatchError) Error() string {
@@ -2868,7 +2902,21 @@ func (c *GatewayClient) ListIntegrationTools(ctx context.Context) ([]ServerToolS
 // resolves the caller's connection from the API key and proxies to the
 // integration provider. Returns Cloud's status + parsed ToolExecuteResponse.
 func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string, arguments map[string]any) (*ToolExecuteResponse, error) {
-	reqBody := ToolExecuteRequest{Arguments: arguments}
+	return c.ExecuteIntegrationToolWithIdentity(ctx, name, arguments, "", "")
+}
+
+// ExecuteIntegrationToolWithIdentity executes an integration tool with a
+// caller-stable request identity. idempotencyKey is sent only when the caller
+// has a durable side-effect execution record; read-only calls use requestID
+// without claiming provider-level idempotency.
+func (c *GatewayClient) ExecuteIntegrationToolWithIdentity(
+	ctx context.Context,
+	name string,
+	arguments map[string]any,
+	requestID string,
+	idempotencyKey string,
+) (*ToolExecuteResponse, error) {
+	reqBody := ToolExecuteRequest{Arguments: arguments, RequestID: requestID}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, &ToolDispatchError{
@@ -2887,6 +2935,9 @@ func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string,
 		}
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	if key := c.getAPIKey(); key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
@@ -2903,7 +2954,29 @@ func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+		body := readResponseBody(resp)
+		legacy := &APIError{StatusCode: resp.StatusCode, Body: body}
+		var envelope struct {
+			Error     string `json:"error"`
+			Code      string `json:"code"`
+			ErrorCode string `json:"error_code"`
+			Message   string `json:"message"`
+		}
+		_ = json.Unmarshal([]byte(body), &envelope)
+		code := strings.TrimSpace(envelope.ErrorCode)
+		if code == "" {
+			code = strings.TrimSpace(envelope.Code)
+		}
+		if code == "" {
+			code = strings.TrimSpace(envelope.Error)
+		}
+		return nil, &IntegrationToolAPIError{
+			StatusCode: resp.StatusCode,
+			Code:       code,
+			Message:    strings.TrimSpace(envelope.Message),
+			Body:       body,
+			apiError:   legacy,
+		}
 	}
 	var result ToolExecuteResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {

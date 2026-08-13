@@ -86,6 +86,19 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
+- Integration schemas may carry optional trusted `material_side_effect`.
+  `false` means an observational call can batch and bypass the durable mutation
+  journal; missing stays fail-closed for old Cloud. Execute calls carry stable
+  `request_id`; material calls also carry the journal `Idempotency-Key`.
+  Never treat billing/provider-error/unknown post-dispatch errors on a material
+  integration as known-no-effect; explicit pre-dispatch `provider_unavailable`
+  is known-no-effect. Preserve integration provider/model/unit/cost
+  usage fields through `ToolResult` and `EmitUsage`.
+  `call_in_progress` means wait/query; never resend a material action.
+- `x_prepare_post` is a local Deferred URL builder, never an X API write. Keep it
+  free of OAuth, HTTP, browser openers, and browser/computer automation. It must
+  report that nothing was posted and keep draft text and the generated URL out
+  of audit summaries; the user alone clicks the review link and X's Post button.
 
 ## MCP
 

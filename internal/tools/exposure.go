@@ -57,6 +57,10 @@ func (*WaitTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDeferred
 }
 
+func (*XPreparePostTool) ToolExposure() agent.ToolExposure {
+	return agent.ToolExposureDeferred
+}
+
 func (t *ScheduleTool) ToolExposure() agent.ToolExposure {
 	switch t.action {
 	case "create", "update", "remove":
