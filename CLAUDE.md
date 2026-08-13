@@ -18,126 +18,17 @@ Go CLI tool (`shan`) — the runtime for Shannon AI agents. Production stack is 
 
 ## Project Structure
 
-```
-cmd/
-  root.go              # entry, --agent, one-shot, mcp serve
-  daemon.go            # shan daemon start/stop/status; hidden state-isolated live-E2E entrypoint
-  schedule.go          # shan schedule CRUD
-  update.go            # /update command
-  koe.go               # shan koe — voice front-brain (OpenAI Realtime + Desktop control + via-daemon mint); --mic-device/--speaker-device pass CoreAudio device UIDs (from koe.mic_device/speaker_device) that the VPIO backend binds, empty = system default; --barge-in (from koe.barge_in) enables reversible native-S2S floor control by setting KOE_VPIO_BARGE_IN=1 + KOE_NATIVE_FLOOR=1 + KOE_INTERRUPT_RESPONSE=0 via applyBargeInEnv (vpio-only, no-op on gate); koe.persona_source ("global" distill default | "custom" → koe.custom_persona verbatim) selects the spoken persona (daemon buildKoePersona)
+Use Glob/Grep — the layout is `cmd/` (Cobra entry points) plus `internal/<pkg>/`.
+A file-by-file tree used to live here; it was only a projection of the code and
+is not maintained.
 
-internal/
-  daemon/                              # ── PRIMARY PRODUCTION PATH ──
-    server.go          # HTTP API (agents, config, sessions, reload)
-    runner.go          # Run orchestration, session routing, output profiles
-    client.go          # WS client (reconnect, bounded concurrency)
-    router.go          # SessionKey + SessionCache + route locking
-    pending.go         # pendingCore[D] — shared request/resolve lifecycle (approval + question)
-    approval.go        # ApprovalBroker (WS approval round-trip; wire face over pendingCore)
-    question.go        # ask_user_question wire types (QuestionRequest/Response/…)
-    question_broker.go # QuestionBroker + bus hooks + ctx-injected QuestionAsker adapter
-    alwaysallow.go     # Always-allow persistence dispatcher (SSE+WS)
-    types.go           # Shared wire types
-    events.go          # EventBus ring buffer
-    bus_handler.go     # EventHandler → EventBus bridge
-    multi_handler.go   # Fan-out EventHandler wrapper
-    scheduler.go       # Cron tick + scheduleHandler
-    safeguard.go       # ?confirm=true gate for destructive edits + protected-field wall (case-folded)
-    config_patch_validate.go # PATCH /config unknown-key rejection (reflection tree from config.Config)
-    rules.go           # /rules HTTP handlers
-    pidfile.go         # Single-instance flock
-    permissions.go     # System permission probes (see permissions_{darwin,other}.go)
-    project_init.go    # /project/init handler
-    memory_audit.go    # memory.AuditLogger → audit.AuditLogger bridge
-    memory_fallback.go # session_search + MEMORY.md fallback
-    launchd_darwin.go  # plist + launchctl (darwin only; stub elsewhere)
-    attachment.go      # Remote file attachments (b64 / extracted / URL)
-    session_cwd.go     # Cloud-source scratch CWD allocator
-    readtracker_cache.go # Per-session ReadTracker cache
-    suggestion_handler.go # GET /suggestion + POST /accept
-    uploads_handler.go # /uploads GET (list) + DELETE (retract) proxies
-    auth.go            # AuthManager state machine (email/password; macOS + Windows + Linux)
-    auth_handlers.go   # /local/auth/* handlers (state, register, login, sign-out, …)
-    ws_controller.go   # WS goroutine start/stop driven by AuthManager
-    desktop_rpc/       # Unix sock reverse-RPC channel to Kocoro Desktop (Calendar RPC v1)
-      types.go         #   Frame / RPCRequest/Result/Error / DesktopEvent + §5.5 string constants
-      codec.go         #   length-prefixed JSON framing (4-byte BE uint32, ≤ 4 MiB body)
-      broker.go        #   DesktopRPCBroker (Request / Resolve / CancelAll; mirrors ApprovalBroker)
-      listener.go      #   Unix sock listen + accept loop + bidirectional method dispatch + system.ping/capabilities responders
-  agent/
-    loop.go              # AgentLoop.Run(), SwitchAgent()
-    tools.go             # Tool interface, ToolRegistry
-    partition.go         # Read-only batching, executeBatches
-    spill.go             # Per-result spill + 200K per-turn aggregate cap
-    toolresult_budget.go # Persisted tool_result replacement state
-    exposure.go          # Explicit Direct/Deferred policy + source defaults
-    toolbudget.go        # Direct-schema diagnostic budget + fingerprints
-    timebasedcompact.go  # Time-based tool_result clearing
-    context_bloat.go     # tool_result_bloat nudge builder
-    deferred.go          # Deferred loading and tool_search protocol paths
-    toolsearch_index.go  # Derived search documents + BM25 index
-    statecache.go        # Tool-result cache keyed by read/write state
-    resultshape.go       # Tree result shaping
-    microcompact.go      # Tier 2 semantic compaction
-    delta.go             # DeltaProvider, TemporalDelta
-    loopdetect.go        # 9 stuck-loop detectors
-    readtracker.go       # Read-before-edit + same-range dedup
-    approval_cache.go    # Per-turn approval cache
-    normalize.go         # Response normalization
-    skill_discovery.go   # Per-turn small-model skill matching
-    phase.go             # Turn phase tracker (fail-closed)
-    watchdog.go          # Idle soft/hard timeout
-    modelcontext.go      # Model-ID → context-window map
-    preflight.go         # legacy/evaluation-only MemoryPreflightFunc hook
-    cachemetric.go       # CacheTracker per-Run stats
-    usage.go             # Per-Run usage aggregation
-    warmset.go           # Deferred-schema warm set
-    suggestion.go        # Forked suggestion call (cache-safe)
-    suggestion_state.go  # Per-session suggestion text/state
-    forkedrequest.go     # BuildForkedRequest (byte-equality contract)
-  agents/                # AGENT.md loader, CRUD, validate, embed.FS builtins
-  keychain/              # Credential store wrapper — macOS Keychain / Windows Credential Manager via go-keyring (backend_keyring.go), Linux file store at ~/.shannon/credentials.json 0600 (backend_linux.go + backend_file.go); api_key source of truth. Other GOOS → ErrUnsupportedPlatform
-  client/                # GatewayClient (Anthropic via Cloud), OllamaClient, SSE, AuthClient (/auth/*)
-  cloudflow/             # /research, /swarm Gateway workflow runner
-  executionprofile/      # Fast/Full execution contracts: DecideModeAdmission (closed vocabulary, fails closed to Full), Profile (opaque Cloud-minted kfp1 fast / ep1 computer ids, ValidateFast/ValidateFull/ValidateComputer), persisted Run + ComputerActivation + Evidence (digests only) with ValidatePersisted — the unit restored from Koe checkpoints. ErrInvalidPersistedRun = fail closed, never resolve a replacement profile
-  heartbeat/             # Per-agent HEARTBEAT.md + alerts
-  watcher/               # Per-agent debounced FS watcher
-  config/                # Config struct, multi-level merge, --setup wizard
-  cwdctx/                # Session-scoped CWD propagation
-  context/               # EstimateTokens, GenerateSummary, PersistLearnings
-  fslock/                # Cross-platform advisory file lock (flock vs LockFileEx); see Cross-Platform Support
-  schedule/              # Schedule CRUD + atomic writes (plist gen lives in daemon/)
-  permissions/           # bash resolution pipeline (see Permission Model below)
-  audit/                 # JSON-lines logger + RedactSecrets
-  hooks/                 # PreToolUse/PostToolUse/SessionStart/Stop
-  instructions/          # LoadInstructions, LoadMemory, LoadCustomCommands
-  prompt/                # BuildSystemPrompt (static/stable/volatile parts)
-  session/               # JSON persistence + SQLite FTS5 index
-  memory/                # Memory sidecar client (UDS, bundle pull, tenant fingerprint)
-  mcp/                   # MCP client manager + JSON-RPC server + Chrome lifecycle
-  runstatus/             # User-facing run state codes + 429 sub-shape parser
-  skills/                # Skill registry, loader, secrets, marketplace (two sources: static registry → /skills/marketplace/*; ClawHub live catalog → /skills/clawhub/*)
-  tools/                 # Tool implementations (see Local Tools below)
-  uploads/               # /api/v1/uploads client (POST/GET/DELETE)
-  images/                # /api/v1/images/{generations,edits} client
-  tui/                   # Bubbletea TUI + /compact + /doctor
-  update/                # GitHub release auto-update
-  sync/                  # Daily session JSON upload to Cloud
-  koe/                   # ── VOICE FRONT-BRAIN (shan koe) ── cgo since audio.go
-    link.go              #   DaemonClient: DoTask/Cancel/ListAgents + MintViaDaemon + SendRealtimeUsage (HTTP to daemon, NEVER imports internal/daemon)
-    agentresolve.go      #   agent name-resolution ladder (exact → bidirectional-substring → semantic-noop → not-found)
-    tools.go             #   7 OpenAI-Realtime voice tools (do_task/cancel/get_status/control_app/switch_agent/stop_speaking/end_call) + Dispatcher + CallState. do_task defaults to exactly one call per response; multiple calls in one response require an explicit user request for parallel execution and each call must carry one disjoint work scope. do_task does not expose execution routing to Realtime: every new request asks for Fast, while daemon-side config/capability failure and a validated inherited Full lineage retain the Full fallback. Ledger-mode cancel targets one task_id, or all_running=true for one atomic stop-everything call (per-task partial failures stay explicit and a failed task stays running). stop_speaking silences only the current output and keeps the call active; end_call is the whole-conversation dismiss/hang-up terminal. Both say nothing and send no function_call_output on the regular response path. Standalone/CLI and Desktop wire onEndCall to their goodbye-earcon + teardown paths. The ASR transcript dismiss backstop is opt-in (KOE_ASR_DISMISS_BACKSTOP=1, default off — ASR stays evidence-only by default) and converges with the model's end_call on realtime.go's handler-local terminal. MapDoTaskOutcome maps a partial do_task run (soft idle/deadline timeout, iteration_limit, force-stop — but NOT user_cancelled, which stays silent) to a canned per-language `incomplete` line and seeds no digest, so a cut run's progress tail is never voiced as the result; the daemon logs `koe voice projection kind=authored|mechanical partial=… failure_code=…` per turn for clean-success provenance.
-    ledger.go            #   call-scoped task lineages: stable task IDs/routes, parallel work, targeted follow-up/cancel, revision state
-    toolloop.go          #   semantic-free per-turn response/tool provenance, four-action continuation budget, newer-turn preemption, replay fuse
-    result_mailbox.go    #   owner-leased asynchronous result queue; batches ready task revisions and retries unacknowledged delivery
-    floor.go             #   reversible native-S2S interruption state machine: pause exact PCM, then choose resume_playback, stop_speaking, accept_turn, or end_call from raw audio without ASR admission; an accepted interruption also truncates the paused assistant item server-side (conversation.item.truncate to the audio actually heard) so the model never treats unspoken text as said
-    audio.go             #   malgo duplex (CoreAudio) + Opus codec + half-duplex gate (cgo deps: brew install opus opusfile pkg-config; PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig)
-    webrtc.go            #   pion mint + SDP + Opus tracks + oai-events data channel + Connect orchestrator (ConnectOptions)
-    realtime.go          #   GA session config (create_response:true auto-respond) + oai-events dispatch + reachy say-and-ask do_task (result is the single function_call_output) + voice_state/usage hooks. requestEndCall owns a handler-local terminal (terminalMu + ending CAS) shared by the model's end_call and the opt-in ASR dismiss backstop: the first request synchronously aborts floor/output, blocks queued or new response creation, cancels a late response.created without reopening playback, then invokes onEndCall for outer teardown. stop_speaking discards only the current output/result announcement and schedules no continuation. Local-commit fallback (manual input_audio_buffer.commit after local speech end) is opt-in via KOE_LOCAL_COMMIT_FALLBACK=1, default off since 2026-07-09 — far-field fragment gate-opens (Reachy) turned commit_empty rejections into spoken "could not hear you" loops; even when enabled, a commit_empty rejection is classified as a fragment and dropped silently (commitEmptySeq short-circuits the ack wait), never ask-to-repeat
-    dismissintent.go     #   isDismissPhrase/normalizeDismissPhrase: closed-vocabulary zh/en/ja classifier used only by the opt-in KOE_ASR_DISMISS_BACKSTOP=1 path; ASR stays evidence-only by default and model-judged end_call remains authoritative. When enabled, accepted phrases converge on realtime.go's requestEndCall terminal rather than firing teardown independently. Ambiguous task-stop words remain model-owned so cancel, stop_speaking, and end_call keep separate scopes. KOE_DISMISS_DETECT=0 kills matching, KOE_DISMISS_PHRASES extends it, and KOE_DISMISS_CONTAIN=0 disables strong-token containment. Tagless pure Go
-    control.go           #   ControlServer: Desktop↔Koe HTTP+SSE (POST /call/start|end|interrupt|mic, GET /events: voice_state[+task_pending/mic]/control_app/call_state/mic_status); optional Bearer auth via KOE_CONTROL_TOKEN env, never argv
-    micwatchdog.go       #   MicSilenceState: pure silent-input watchdog core (clamshell/covered mic → mic_status "silent"/"ok" to Desktop; driver ticker in cmd/koe.go; KOE_MIC_SILENCE_FLOOR/_MS tunable; no restart/rebind by design)
-    earcon.go            #   "ready" + "dismiss" earcons (go:embed assets/{ready,dismiss}.pcm, 48k mono): shared playEarcon() SetSpeaking-gated so it can't self-trigger VAD. PlayReadyEarcon() at emitReadyLocked (KOE_READY_EARCON=0 disables); PlayDismissEarcon() a soft descending goodbye cue in the Desktop endCall path so every hang-up (Esc / menu Stop / end_call tool) signs off (KOE_DISMISS_EARCON=0 disables)
+Primary production path is `internal/daemon/` (HTTP API, WS client, routing,
+approvals/questions, scheduler) driving `internal/agent/` (the loop, tool
+batching, compaction, deferred loading). Cross-package invariants that reading
+one file will NOT tell you are written down below under Key Conventions —
+notably Voice Front-Brain Authority (`internal/koe`), Provider Architecture
+(`internal/executionprofile`), and Cross-Platform Support (`internal/keychain`,
+`internal/fslock`).
 
 ## Key Conventions
 
@@ -164,6 +55,38 @@ Skills listed in `builtinSkills` (`internal/skills/api.go`) are sha256-walk sync
 ### Agent Names
 
 Must match `^[a-z0-9][a-z0-9_-]{0,63}$`. Validated before any path concatenation to prevent traversal.
+
+### Voice Front-Brain Authority
+
+`internal/koe` exposes 7 OpenAI-Realtime tools (`tools.go`). Three of them are
+SEPARATE authorities and must not be collapsed into each other:
+
+- `stop_speaking` — silences only the CURRENT output; the call stays active.
+- `cancel` — targets delegated work by `task_id`, or `all_running=true` for one
+  atomic stop-everything. Per-task partial failures stay explicit and a failed
+  task stays running.
+- `end_call` — the terminal whole-conversation dismiss/hang-up.
+
+Both `stop_speaking` and `end_call` say nothing and send no
+`function_call_output` on the regular response path.
+
+- `do_task` defaults to exactly ONE call per response. Multiple calls in one
+  response require an explicit user request for parallel execution, and each
+  call must carry one disjoint work scope.
+- `do_task` does not expose execution routing to Realtime — see Provider
+  Architecture for the daemon-side Fast/Full decision.
+- `MapDoTaskOutcome` maps a partial run (soft idle/deadline timeout,
+  `iteration_limit`, force-stop — but NOT `user_cancelled`, which stays silent)
+  to a canned per-language `incomplete` line and seeds no digest, so a cut run's
+  progress tail is NEVER voiced as the result.
+- ASR transcripts are asynchronous evidence/logging only. They are not ordinary
+  turn control, not barge-in admission, and not the default dismissal path. The
+  transcript dismiss backstop is opt-in (`KOE_ASR_DISMISS_BACKSTOP=1`, default
+  off) and converges on `realtime.go`'s handler-local terminal rather than
+  firing teardown independently; model-judged `end_call` stays authoritative.
+- An accepted interruption truncates the paused assistant item server-side
+  (`conversation.item.truncate` to the audio actually heard) so the model never
+  treats unspoken text as said.
 
 ### Provider Architecture
 
@@ -214,49 +137,241 @@ Unknown tools → denied (fail-safe). Always-ask gate runs BEFORE the allowlist,
 
 ### Daemon Architecture
 
-| Subsystem | Where | One-line invariant |
-|---|---|---|
-| Desktop RPC channel | `internal/daemon/desktop_rpc/` + `cmd/daemon.go` | Unix domain socket (`~/Library/Application Support/run.shannon.shanclaw/daemon.sock`, 0600 + parent 0700) reverse-RPC to Kocoro Desktop's EventKit. Daemon spawned by Desktop's `DaemonManager` with `--rpc-socket` + `--rpc-pidfile`. Length-prefixed JSON framing (4-byte BE uint32, body ≤ 4 MiB). `DesktopRPCBroker` mirrors `ApprovalBroker` race-safety; single-instance accept. Sock disconnect → `CancelAll` (`desktop_disconnected`); sock listen failure is fatal. `system.ping`/`system.capabilities` bidirectional. ProtocolVersion `1.0.0`; both responder sides return ProtocolMethods byte-identically. Lifecycle is semi-bound: daemon outlives Desktop UI quit (launchd-orphan), Slack/LINE channels keep working until Mac reboot. `launchd_darwin.go` is the npm-CLI standalone path, NOT used by Desktop-bundled deployments. Calendar `calendar_*` tools registered only when the broker exists (`tools.RegisterCalendarTools`); TUI/one-shot/MCP/scheduled paths skip. Protocol reference: kocoro skill `references/desktop-rpc.md` + `references/calendar.md`. |
-| Desktop skill recommendations | `internal/daemon/skill_recommendation.go` + `internal/skills/catalog.go` | Signed-in Desktop requests declaring `skill_install_recommendation_v1` get stable Direct tools `discover_installable_skills` and `offer_skill_installation`. Task-time discovery is binary-pinned and offline: production uses only the embedded high-confidence allowlist (`pptx`, `docx`, `xlsx`, `pdf`, `slack-gif-creator`), never the GitHub/static/ClawHub registries. `slack-gif-creator` installs from its embedded payload; only after explicit acceptance do the four document entries fetch their immutable SHA-256-verified GitHub archive, because their upstream license prohibits bundling. Registration depends only on stable request/config/auth attributes, never `/events` sink liveness; delivery fails closed at call time. The verified principal (account + epoch, `AuthManager.VerifiedPrincipal`) is read ONCE at the `/message` admission boundary and carried on the request — the runner never re-reads the AuthManager. The `/events` sink binds LAZILY on the live stream: the bus subscription is established BEFORE the initial bind (ordering invariant — bind-first would leave a window only the 30s ticker recovers), then a connection opened before auth verifies (Bootstrap `/auth/me` race) binds when `auth_state_changed` lands (keepalive ticker as backstop), replaying still-offered cards; principal transitions (sign-out, account switch, same-account re-login = new epoch, and signed_in→logging_in — cleanup keys on VERIFIED-principal transitions, not user.ID changes) unbind/rebind and invalidate outstanding offers. The kill switch is consulted live inside bind (runtime off→on enables existing connections ≤30s; on→off cannot re-register a sink reload just closed). Card delivery resolves the live sink at emit time but is pinned to the admitting epoch — a transport reconnect within one sign-in follows the new connection; any principal transition fails delivery closed (offer expires, never resurrects). Content-free admission (`principal_verified`/`sink_live`) + registration (`registered=`) log lines attribute missing cards to "tools never registered" vs "model never called them". Offers are account+device directed, persisted with a 24h bearer continuation token, install an immutable catalog snapshot only after acceptance, and resume the original session with a hidden `SystemInjected` follow-up. The success boundary emits only the localized card, not an English assistant bubble. |
-| WS handshake | `client.go` | Sends `User-Agent: kocoro/<ver>` + `X-Kocoro-Daemon-Version` + `X-Kocoro-Capabilities` headers. |
-| Config revision state | `internal/config/revision.go` + `internal/daemon/server.go` | The daemon records the exact global `~/.shannon/config.yaml` revision reflected in memory. GET `/config` and GET `/config/status` report a newer external revision as `reload_required`; internal read-modify-write mutations preserve unknown external edits and never mark bytes they did not load as applied. Project/local overlays are not watched by this signal. Capability: `config_reload_state_v1`. |
-| Built-in MCP catalog | `internal/mcp/builtins.go` + `config.go mergeBuiltinMCPServers` | `BuiltinMCPServers` ships pre-bundled MCP servers (e.g. `intercom`) disabled by default. `config.Load` field-merges the Go catalog onto user yaml: command/args/url from the binary (auto-upgrade); disabled/env/keep_alive plus the user-tunable timeouts and workspace_base (connect_timeout_secs/tool_timeout_secs/workspace_base) persist from yaml. PATCH /config refuses daemon-owned fields on a builtin (`builtin_mcp_immutable`, 409). GET /config/status exposes `mcp_server_info` (`{builtin, display_name, requires_auth?, authorized?}`) so Desktop renders a toggle + OAuth modal without hard-coding the catalog. |
-| MCP async startup | `internal/mcp/client.go StartConnectAll` + `register.go RegisterAllWithBaselineAsync` | Startup and `/config/reload` don't block on MCP handshakes — the registry builds with local+gateway tools synchronously, then per-server connect goroutines fire. A per-server `inFlight` set dedups concurrent attempts. Timeout: `ConnectTimeoutSeconds` > `DefaultConnectTimeoutSecs` > 60s. Success → `Supervisor.ProbeNow` → registry rebuild, tools live. Failed connects are retried by `ServerDeps.MCPReconnect` (see below), and a user re-toggle or `POST /config/reload` still forces an immediate attempt. |
-| MCP reconnect after a failed connect | `internal/mcp/reconnect.go` + `internal/daemon/mcp_reconnect.go` | A failed async connect is NOT terminal. `ReconnectScheduler` retries the one server with exponential backoff (5s → 5min cap, `reconnectMaxAttempts` 6 ≈ 5m15s total), one pending retry per server, streak reset on success. Both entry points — daemon startup (`cmd/daemon.go startDaemonMCPServices`) and the reload rebuild branch (`server.go handleConfigReload`) — share one `buildMCPConnectResult` callback, so recovery behaves identically on both. Retries are OWNED BY THE MANAGER GENERATION: `ServerDeps.SwapMCPReconnectScheduler` stops the superseded ladder when a reload rebuilds the manager, and `ShutdownCleanup` stops it before closing connections (a timer must never respawn a subprocess the cleanup is reaping). A retry re-reads `mgr.ConfigFor` and skips servers deleted or disabled while it was pending. Explicit user action re-arms an exhausted streak via `ForgetMCPReconnect` (the `retryDisconnectedEnabledMCPServers` path). **Why this exists**: rotating an MCP credential rebuilds the manager and respawns the stdio child; when that single attempt lost the race with the SIGTERM'd process group, the server stayed enabled-but-dead until a daemon restart, and the pre-existing retry helper lived only in the `mcpChanged=false` branch where that path could never reach it. |
-| MCP subprocess reaping | `internal/mcp/processgroup_unix.go` + `client.go cancellers` | Stdio MCP subprocesses spawn in their own process group (Setpgid), killed via `-pgid` SIGTERM + 3s SIGKILL backstop. Needed because npx-bridged servers are a process chain (npx → npm exec → node): killing only the direct child orphans a grandchild holding the OAuth loopback port (EADDRINUSE on re-toggle). `Disconnect`/`Close`/`Reconnect` cancel the group before `c.Close()`. |
-| Reload as explicit retry | `server.go retryDisconnectedEnabledMCPServers` | When `/config/reload` runs without an MCP config delta (`mcpChanged=false`), the reload tail fires a fresh `StartConnectAll` for every `disabled: false` server not in `mgr.ConnectedServers()` — otherwise the no-auto-reconnect policy leaves previously-failed servers stuck "enabled" forever. Desktop's "Retry" button maps here. |
-| `delivery_ack` capability | `client.go:SendDeliveryAck` | After `SendReply` succeeds for `MsgTypeMessage`, emit ack so Cloud drops the replay-buffer entry. Reply-failure paths skip the ack so replay is correct. **Per-inbound reply addressing**: a run that absorbed mid-run injected follow-ups completes + acks EACH inbound message under its OWN cloud id — superseded turns via `OnIntermediateAnswer(text, cloudMessageID)` (a real `SendReply`+ack, not an `LLM_OUTPUT` timeline segment), the final answer + co-acks via `RunAgentResult.{ReplyToMessageID,PendingAckMessageIDs}` → `Client.SetReplyPlan` (handleMessage acks every absorbed id ONLY after the final reply is delivered — ack-after-delivery). The injected follow-up's own handler suppresses BOTH its reply and ack via `Client.SuppressReply`; the owning run is solely responsible for acking it, so a reply failure or crash replays it instead of losing the answer. This stops Cloud from collapsing two logically-distinct replies (e.g. group-chat messages from different senders, Slack/Feishu/WeCom/Teams) into one channel message because they shared the primary message_id. The loop tracks the targets via `AgentLoop.SetReplyCloudMessageID` / `ReplyCloudMessageID` / `PendingAckIDs`, advancing them in `commitInjectedTurn`; the error path addresses the failure to the last processed id too (`RunAgent` returns a non-nil result on the post-loop error). |
-| Generic integrations broker | `integrations_handler.go` + `client/gateway.go` | Desktop-renderer-driven cloud proxy (mirrors the Slack/Feishu/WeChat BYOA proxies): `POST /integrations/{provider}/connect`, `GET /integrations`, `GET`/`DELETE /integrations/{id}` forward to Cloud `/api/v1/integrations/*` with the user's API key attached server-side (`integrationsCloudReady` gate + `writeCloudPassthrough`). Cloud owns the per-provider OAuth exchange; the daemon has no public URL for the callback. `connect` forwards the client's JSON body verbatim (64 KiB cap; may carry long-lived credentials — never logged or persisted): OAuth providers send no body and get back `{connection_id, oauth_url}` the renderer opens; token-mode providers (Shopify, `{params:{shop, access_token}}`) get back an active connection directly — no browser, no polling. Capability token `integration_connect_body_v1` (old daemons silently drop the body — Desktop gates its credential form on it). **The kocoro agent never calls these** (OAuth needs a browser round-trip), so — like the Slack BYOA proxy — they are NOT in the kocoro skill references. |
-| Integration tools (local agent) | `tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go` | The local agent loop (`daemon.RunAgent`) does NOT go through Cloud's orchestrator, so Cloud's request-time integration-tool injection never reaches it — the daemon must register the tools itself. `RegisterIntegrationTools` fetches the caller's active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters by active connections + whitelist; local tool names still win on collision) and registers each as a `NewIntegrationTool` (a `ServerTool` variant: `ToolSource()==SourceIntegration`, grouped with gateway tools in both partitioners, `RequiresApproval()==false` — Cloud enforces access control). Execution proxies to Cloud `POST /api/v1/integrations/tools/{name}/execute` (X-API-Key) via `GatewayClient.ExecuteIntegrationTool`, reusing `ServerTool`'s error classification / usage / ladder. Registered on startup + `/config/reload` (alongside `RegisterServerTools`), refreshed by `RebuildAuthSensitiveTools` (sign-in `OnAPIKeyChanged`), and — the immediate path — by **`POST /integrations/refresh`** (`Server.RefreshIntegrationTools` → `RegisterIntegrationTools` only; lightweight, does NOT restart MCP like `/config/reload`). **First-time activation is async** (a connection goes active only after the browser OAuth completes, out of band from the daemon), so `connect`/`delete` fire a best-effort refresh but the reliable trigger is Desktop calling `POST /integrations/refresh` once it confirms the connection is active (Desktop already knows — it renders "已连接"). Capability token `integration_tools_v1`. Requires the two Cloud X-API-Key endpoints above (distinct from the internal `X-Internal-Token` `/internal/integrations/call`). |
-| Attachments | `attachment.go` | Priority `document_b64` → `extracted_text` → URL download. Caps: 500 MB/file, 20/msg, inline doc ≤ 25 MB raw. Capability tokens `inline_document_b64`/`inline_extracted_text` gate these fields. DOCX/XLSX/PPTX/CSV extraction is daemon-local (`doc_extract.go`); Cloud fills PDF `DocumentB64` + transcodes HEIC/AVIF. |
-| Session routing | `router.go` | `ComputeRouteKey` precedence: `PinnedRouteKey` (sticky schedule) → `session:<id>` → thread → sender → plain `agent:<name>` (only when NOT `new_session`) → channel. Web/webhook/cron bypass (always fresh). **Named agents are multi-session** (honor `session_id`/`new_session` like the default agent); the plain `agent:<name>` lane resolves to the latest `kind=interactive` session via `Manager.ResumeLatestMatching(isInteractiveSource)` (never a schedule/IM session). **Schedule `Stateful`** is the single remember-across-runs switch (`schedule.IsSticky`): `false`/legacy-nil → fresh session each run (`NewSession`, `OmitHistory`); `true` → dedicated `agent:<name>:schedule:<id>` / `schedule:<id>` session that accumulates, pinned via `PinnedRouteKey`, with the LLM seeing its history. **Heartbeat** reads/appends the latest `kind=interactive` session (`ResolveLatestSession`/`AppendToSession`); a mid-run session switch hits `ErrSessionChanged` and is dropped silently. |
-| IM connection awareness | `connection_state_cache.go` + `message_origin.go` | Per-platform connection state from Cloud `channel_state_event`s, rendered as a `Connection:` Session-Facts line + new-session `Preamble()`. **Binding axis** (install/token revoked — actionable) is stored SEPARATELY from **transport axis** (transient disconnect) so a transport blip can't mask a revocation; binding wins at render, `Preamble()` is sorted for byte-stable prompts. On existing sessions whose blob lacks a chat_id (`origin==nil`), `stickyFromRequest` still surfaces state via `PlatformLine(source)`. |
-| Smart session titles | `runner.go fireTitleAfterRun` + `internal/context/title_gen.go` | Async small-tier title upgrade at completed turns {1,3} on `TitleAuto` sessions. **Skipped for autonomous local sources** (watcher/heartbeat/mcp via `isAutonomousLocalSource`) so they never relabel the user's interactive session. `DecorateTitle`/`SourceLabel` prefix the brand (`Slack · …`); image+caption user turns keep the caption in the title transcript. |
-| Session share uploads | `daemon/share_handler.go` + `share_async.go` | Render HTML → POST `/api/v1/uploads` with `kind=session_share` (post-upload LIST filters by that kind so concurrent uploads can't bump our row off page 1). publish_to_web uses `kind=other`. Template `<head>` carries OG / Twitter Card / JSON-LD (`internal/share/social_meta.go`). Config: `daemon.share_metadata.{site_name, site_url, default_og_image, twitter_image, logo_url}`. Tool runs are stripped from the page (only prose + images survive); `html-artifact` fences render live in a sandboxed iframe (`internal/share/artifact.go`, **assistant-role messages only** — user/third-party text stays inert escaped markdown to avoid stored-XSS). **The artifact host CSS (`internal/share/templates/artifact_host.css`), the CSP, and the resize bridge are VERBATIM mirrors of `ARTIFACT_HOST_CSS` / `ARTIFACT_CSP` / `buildArtifactSrcdoc` in Kocoro Desktop's `message-list.js` — re-sync when Desktop's artifact design system changes (no cross-repo automated check).** |
-| Output format | `runner.go outputFormatForSource` | `plain` for cloud-distributed channels (slack/line/wecom/wechat/telegram/webhook); `markdown` default. **Feishu/Lark/Teams are cloud sources but use `markdown`** (`markdownCloudSources`) — Feishu/Lark cards render standard markdown, and GFM output re-enables Cloud's `[name](url)` → file-attachment conversion (plain raw URLs are never converted); Teams' Bot Framework message body renders markdown incl. tables, so it must stay `markdown` even though it's in `cloudSourceSet`. **WeChat (iLink) stays `plain`** — Cloud's iLink outbound extracts raw CDN URLs from plain text; do NOT move it to `markdownCloudSources`, since markdown link shells are not part of that public rendering contract. |
-| Tool result sizing | `spill.go` + `toolresult_budget.go` + `context_bloat.go` | Per-result spill at policy threshold (default 50K, grep 20K) → tmp file + 2K preview. `file_read` is `UnlimitedToolResultSizeChars` (no spill); it self-bounds via `fileReadHardCapRunes = 500_000` in the tool itself, with truncation marker. Per-turn 200K-rune aggregate cap skips Unlimited tools. `ToolResultReplacements` + `ToolResultSeen` persisted across checkpoints AND terminal saves. |
-| file_read dedup | `agent/readtracker.go` + `daemon/readtracker_cache.go` | Records `(path, offset, limit, mtime, size)`; re-reads return a stub. Per-session, released via `SessionManager.OnSessionClose`. |
-| Image size guard | `imaging_compress.go` + `oversize_image.go` | Three layers: source-time compression (`EncodeImage` decode→2000×2000→JPEG ladder), wire-time sanitizer (`filterOversizeImages` in `messagesForLLM`), persist-time guard (`SanitizedRunMessages`). |
-| Skill secrets | `skills/secrets.go` | Keychain `com.shannon.skill.<name>` + plaintext index of key NAMES only. Env-var-only injection, scoped to skills activated by `use_skill` in the current run. |
-| Skill marketplace sources | `daemon/server.go` (`s.marketplace` / `s.clawhub`) + `config.MarketplaceConfig` | TWO independent API surfaces, never share a response shape. `/skills/marketplace/*` = static registry (`registry_url`), integer `page` pagination, `{total,page,size,skills}` — **this is the frozen macOS Desktop contract; do not add source-conditional branches here.** `/skills/clawhub/*` = ClawHub live catalog (`clawhub_url`, default `https://clawhub.ai`), opaque `cursor` pagination (`{skills,size,next_cursor}`), plus per-version `/files` + `/file` browsing and `/install/{slug}` via deterministic zip URL. Both back the same `MarketplaceClient` (mode set by constructor) and install to the same on-disk location. **Transient resilience**: every catalog GET (`fetch`/`getJSON`/`getText`) and the zip install download go through `doGETWithRetry` (`marketplace_retry.go`) — retries 429/5xx + network errors with exponential backoff + jitter (honors a numeric `Retry-After`), tuned by `skills.marketplace.max_attempts`/`.retry_base_backoff_secs`. The helper returns the final response on exhaustion so each caller's `status %d` error (and the daemon's 404-vs-503 split) is preserved; 4xx is never retried; the static-registry stale-cache fallback still applies after retries. The install zip download is single-attempt (2-min client; retrying would multiply a hang). **ClawHub reads** additionally have a short-TTL per-URL response cache (`marketplace_cache.go`, `skills.marketplace.clawhub_cache_ttl_secs` default 60s, bounded entries, serve-stale-on-error with cooldown) so burst/repeat browsing doesn't re-hit clawhub.ai; the static registry caches at the `Load()` layer instead. **Default-view resilience** (kills the intermittent "注册表不可达" 503 on the default tab): the daemon's `warmClawHubOnce` (`server.go`, launched from `Start`, gated by `skills.marketplace.clawhub_warm_on_startup` default true) warms the canonical default browse page (`size=20&sort=downloads`, no cursor/query) ONCE at startup — deliberately one-shot, not a poll loop, so an air-gapped / IM-only daemon makes at most one clawhub.ai request (the `viper.GetBool` default is false when `config.Load` hasn't run, so daemon unit tests stay hermetic). `MarketplaceClient` keeps a **view-agnostic last-good first page** (`firstPage`, guarded by `firstPageMu`, max age `clawhubFirstPageMaxAge` 30min): any successful no-query/no-cursor browse is retained and served (single stale page, empty `next_cursor`, handler sets `X-Cache-Stale: true`) when a fresh default first-page fetch fails **for a transient reason** (`isTransientListErr` mirrors `isRetryableStatus`: only 429/5xx + network/parse are transient; every other status — 400/401/403/404/409/410/422/… — surfaces immediately) while its exact-URL cache is cold — so a `size`/`sort` the warm didn't prefetch still degrades to a populated list, not a 503. Deep pages (`cursor` set) / searches (`q` set) have no fallback; a hard-down clawhub before the first successful warm still 503s. **Exclude-installed** (`GET /skills/clawhub?exclude_installed=true`, capability `clawhub_exclude_installed`): opt-in, ClawHub-only (never the frozen `/skills/marketplace/*`). "Installed" is a local-only notion clawhub can't filter on, so `FetchClawHubPageExcludingInstalled` fetches normally then drops installed slugs, **refilling from later pages** bounded by `skills.marketplace.clawhub_exclude_fill_max_pages` (default 5). Cursor is page-granular → a returned page may exceed `size` (last page included whole) and `next_cursor` stays page-aligned (no dup/loss on resume); if the fill cap binds, the page is short/empty with a non-empty cursor and the client must keep paging. |
-| Turn phase tracker | `agent/phase.go` | Only `PhaseAwaitingLLM` and `PhaseForceStop` idle-counted. Fail-closed: panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`. |
-| Idle watchdog | `agent/watchdog.go` + `client/gateway.go` | Two layers. Turn-elapsed: `OnRunStatus("idle_soft")` at `agent.idle_soft_timeout_secs` (default 90), `ctx.Cancel(ErrHardIdleTimeout)` at hard (default 540; opt out via `0` + startup WARN). Streaming chunk-gap: `CompleteStream` returns `ErrStreamIdleTimeout` if no SSE chunk arrives within `agent.stream_idle_timeout_secs` (default 90). The loop short-circuits the streaming→Complete fallback on `ErrStreamIdleTimeout` and `isRetryableLLMError` refuses to retry it. `completeWithRetry` prefers `context.Cause(ctx)`. |
-| Mid-turn checkpoint | runner `applyTurn*` helpers | Fires at three phase-exit boundaries; 2s debounce. Same helpers run from checkpoint, final save, and hard-error save. `session.InProgress` non-zero on reload = crash recovery. |
-| Interrupted-turn auto-resume | `daemon/interrupted_recovery.go` + `session/store.go` markers | Daemon start scans the durable `.in-progress/*.marker` index (one-time header migration for legacy stores) and serially continues checkpoints, newest first. **Policy gates, all load-bearing**: `agent.interrupted_resume_enabled` (default true); staleness window `agent.interrupted_resume_max_age_hours` (default 4 — an older checkpoint carries a user intent whose context is gone and is abandoned, marker cleared, never executed); attempt cap `agent.interrupted_resume_max_attempts` (default 3, persisted before the LLM call). Recovered runs are ALWAYS unattended (`interruptedRecoveryHandler.IsUnattendedRun()==true` regardless of the session's original source) so the unattended deny-list applies. The resume request pins the session's original RouteKey (`buildInterruptedResumeRequest`) so it takes the same route lock as concurrent inbound traffic. Every persistence path — `Store.Save` AND all `Patch*` RMW paths — re-asserts the marker invariant (`syncInterruptedMarker`: on-disk InProgress=true ⟺ marker exists). |
-| Schedule proactive push | `scheduler.go` `broadcastReply` + `broadcast_gate.go` `shouldBroadcast` / `resolveThread` | After a successful run, push is gated by `shouldBroadcast`: explicit `Schedule.Broadcast *bool` wins; else smart default by `CreatedFromSource` (IM sources → push, else silent). **Origin-only delivery**: the push target is always the schedule's snapshotted `IMStatusContext` blob (the channel it was created in); a schedule with no blob (Desktop/TUI/CLI/webhook-created, or IM schedules predating v0.2.1) NEVER pushes — even with `broadcast=on` — wrong-audience delivery beats no delivery, results stay in the session. Cloud mirrors this by dropping (never re-broadcasting) a non-empty blob it cannot honor; only empty-blob proactives (heartbeat, legacy daemons) still broadcast. Tools `schedule_create` / `_update` and `PATCH /schedules/{id}` accept `broadcast: "auto"\|"on"\|"off"` (capability token `schedule_broadcast_gate`). **Thread three-state** (`Schedule.Thread *bool`, parsed via `ParseThreadEnum`, mirrors broadcast): `thread: "auto"\|"on"\|"off"`. `auto` follows session state — stateful (sticky) → one session = one thread; stateless → a fresh top-level message each run. `resolveThread(thread, isSticky, hasBlob)` → `ProactivePayload.UseThread *bool`: explicit `on`/`off` verbatim (ignores stateful); `auto` → `isSticky && hasBlob`. `nil` = anchored thread (current behavior); only `&false` goes top-level. Threadless platforms (LINE/WeCom/Telegram) ignore it. Capability token `proactive_thread_mode` (observability only). |
-| Playwright file:// bridge | `tools/filepreview.go` | Loopback HTTP rewrites `browser_navigate(file://…)`. Symlink-resolved allowlist; loopback-only `r.RemoteAddr` check. |
-| MCP call resilience | `tools/mcp_tool.go` + `mcp/client.go` | Pre-dispatch gate: a supervisor-known-disconnected server is ProbeNow'd BEFORE CallTool instead of discovering the corpse mid-call (2026-07-29: 6.5 min on a dead google-workspace pipe vs a 12 s reconnect). Every tools/call attempt is bounded: per-server `tool_timeout_secs` > `mcp.tool_timeout_secs` (default 300s, `mcp.DefaultToolCallTimeout` — matches peer-agent MCP defaults); an earlier caller deadline still wins. On call failure the tool probes FRESH health (never trusts the cached state at error time), but **post-dispatch re-dispatch is annotation-gated** (`mcp.ToolReplaySafe`): a transport error after dispatch does not prove the server never acted — a stdio server can execute its write and die before responding — so only `readOnlyHint`/`idempotentHint` tools are replayed; everything else returns an explicit outcome-unknown result (`mcp.OutcomeUnknownError`) steering the model to verify before retrying. Live repro pinned in `tools/mcp_tool_live_test.go` (real stdio server commits + exits pre-response; exactly-once dispatch asserted). |
-| MCP artifact paths | `tools/mcp_result_paths.go` + `mcp_tool.go` + daemon `runner.go` | Two-sided fix for server-relative artifact paths (playwright renders links relative to the FIRST advertised root — not the session CWD — which sent the model into a 242 s `find /`). Result side: relative markdown links from servers with known path semantics (built-in table: playwright → first advertised root; user MCPs opt in via `workspace_base`) get a "Saved to: <abs>" annotation ONLY when the joined path exists under the base; unknown servers stay opaque. Input side: browser_take_screenshot without a filename gets a name injected into the per-session artifact scratch (`~/.shannon/tmp/sessions/<id>/`, `cwdctx.WithArtifactDir`, daemon-served runs only — TUI/CLI keep artifacts in the working dir; created lazily, swept by age at daemon startup via `daemon.scratch_max_age_days` default 14); relative filenames resolve there too and parent dirs are MkdirAll'd. browser_snapshot never gets a default filename — omitted filename means the INLINE accessibility snapshot (playwright treats filename as a mode switch), the model's primary page-reading channel. `file_read` misses on relative/`.playwright-mcp` paths carry a just-in-time roots hint instead of letting the model improvise a disk-wide search. **Model-supplied absolute paths always win** (that is how the user addresses a deliverable), so the file-producing tools' descriptions append `fileOutputArgHint` steering the model to bare relative filenames for its own intermediates (2026-08-02: with session CWD=~/Desktop the model wrote browser_snapshot intermediates to absolute Desktop paths the rewrite correctly left alone). |
-| Session sync | `internal/sync/` | Daily upload (opt-in `sync.enabled`). flock + atomic marker. Permanent failure reasons (`size_limit_exceeded`, `load_error`) self-heal on session edit. |
-| Memory client | `internal/memory/` | Daemon owns sidecar lifecycle + 24h bundle pull. `memory_recall` → `Service.Query` over UDS; falls back to `session_search` + MEMORY.md when not `Ready`. API key never on disk — only `sha256[:16]` fingerprint. Schema-mismatch lockout surfaces as `memory.reason=tlm_binary_too_old` on `GET /status` and triggers a one-shot self-heal pull before degrading. `Sidecar.Shutdown` is idempotent, so failed children don't accumulate as orphans. |
-| Episodic recall routing | `prompt/builder.go` + `tools/memory.go` | Production CLI, TUI, and daemon loops expose `memory_recall` directly to the main model; no implicit small-model preflight is installed. Natural private-fact questions trigger structured recall without special wording. Unnamed references route to `session_search`; no-data stops relation/mode retries. Evidence guidance (`MemoryEvidenceGuidance`) lives with the tool that produces `evidence_tier` — the `memory_recall` description in `internal/tools/memory.go` — not in the system prompt. `agent/preflight.go` + `tools/memory_preflight.go` remain evaluation-only compatibility hooks. |
-| Loop detector | `agent/loopdetect.go` | 9 detectors. `dupExemptTools` skip dup detection; all-errors 2× budget; rolling nudge window (max 3 within trailing 5). |
-| Empty-think force-stop | `loopdetect.go` rule "0a" | Two consecutive `think({})` → `LoopForceStop`. Defends against ritual empty think after native interleaved thinking. |
-| Thinking blocks | `client.ContentBlock` + `agent.buildAssistantMessage` | Cloud relays full ordered `content_blocks` incl. `thinking`/`redacted_thinking`. Persisted verbatim; `internal/sync/strip_thinking.go` removes from upload-side copy before size check. Sanitizers in `messagesForLLM` / time-based / micro-compact / `BuildForkedRequest` preserve them. |
-| Conditional `think` tool | `tools/register.go shouldRegisterThinkTool` | Not registered on default gateway+thinking path. Still registered when thinking disabled, Ollama provider, or `ForceThinkTool=true`. `operationalRules()` strips `### Planning` bullet only when think absent, keeping prompt byte-equal otherwise. |
-| Conditional Desktop skill tools | `daemon/runner.go` + `daemon/skill_recommendation.go` | `discover_installable_skills` and `offer_skill_installation` are Direct only for capable signed-in Desktop/Kocoro requests with the feature enabled. They are absent from TUI, one-shot, MCP, schedule, IM, heartbeat, and watcher runs. A disconnected card-event sink does not change schemas; `offer_skill_installation` fails closed when invoked. |
-| Prompt suggestion | `agent/suggestion.go` + `daemon/runner.go` | Forked LLM call after each main turn. **CACHE SAFETY**: byte-equal to main request except 2 appended messages + `SkipCacheWrite: true`. Any other divergence fragments the cache. **Source-gated** (`wantsPromptSuggestion` allow-list): only foreground sources with a UI consumer — `desktop` (the Desktop message bridge POST /message hardcodes it), `kocoro` (handler backfill when Source omitted), `shanclaw` (legacy Desktop alias, one release), `web` — fork a suggestion. IM channels, schedule/cron, and autonomous local sources (heartbeat/watcher/mcp) are skipped (no consumer → dead work + a billed call). Allow-list, not deny-list: new background sources default to skipped. |
-| Email/password auth (macOS + Windows + Linux) | `internal/daemon/auth.go` + `auth_handlers.go` + `ws_controller.go` + `internal/keychain/` | `/local/auth/*` proxy to Cloud `/api/v1/auth/*`. AuthManager state machine drives WS lifecycle — WS runs only in `signed_in`. api_key is the source-of-truth credential in the credential store (`ai.kocoro.daemon.api_key/<user_id>`); the yaml field is migrated away on first launch (with a read-back verify before stripping yaml). The supported-platform set is `keychain.Supported()` (darwin \|\| windows \|\| linux) — it MUST stay in sync with the backend build tags (enforced by `TestSupportedMatchesBuildTag`). On unsupported platforms (anything else): AuthManager nil, endpoints 503 `platform_unsupported`, legacy `cfg.APIKey` path. **Linux uses a file store (`~/.shannon/credentials.json`, 0600), NOT go-keyring's Secret Service** — SS returns success at construction but fails on headless hosts, which would strand the key mid-migration; the file backend is deterministic everywhere. |
+One `####` per subsystem. Each names its code home first, then the invariant.
+
+#### Desktop RPC channel
+
+`internal/daemon/desktop_rpc/` + `cmd/daemon.go`. Unix domain socket reverse-RPC to Kocoro Desktop's EventKit, spawned by Desktop's `DaemonManager` with `--rpc-socket` + `--rpc-pidfile` (the daemon NEVER derives one path from the other). Length-prefixed JSON framing, 4-byte BE uint32, body <= 4 MiB. `DesktopRPCBroker` mirrors `ApprovalBroker` race-safety; single-instance accept. Sock disconnect -> `CancelAll` (`desktop_disconnected`); sock listen failure is fatal. ProtocolVersion `1.0.0`; both responder sides MUST return `ProtocolMethods` byte-identically. Lifecycle is semi-bound: the daemon outlives a Desktop UI quit, so IM channels keep working. `launchd_darwin.go` is the npm-CLI standalone path, NOT used by Desktop-bundled deployments.
+
+#### Desktop skill recommendations
+
+`internal/daemon/skill_recommendation.go` + `internal/skills/catalog.go`. Signed-in Desktop requests declaring `skill_install_recommendation_v1` get Direct tools `discover_installable_skills` + `offer_skill_installation`.
+
+- Task-time discovery is binary-pinned and OFFLINE: production uses only the embedded eligible catalog (`official_catalog.json`), never the GitHub/static/ClawHub registries.
+- Only after explicit acceptance do the document entries fetch their immutable SHA-256-verified GitHub archive — their upstream license prohibits bundling.
+#### Desktop skill recommendations: principal and sink
+
+- The verified principal (`AuthManager.VerifiedPrincipal`) is read ONCE at the `/message` admission boundary and carried on the request; the runner MUST NOT re-read the AuthManager.
+- Ordering invariant: the bus subscription is established BEFORE the initial `/events` sink bind. Bind-first leaves a window only the keepalive ticker recovers.
+- Delivery resolves the live sink at emit time but is pinned to the admitting epoch. Any principal transition (sign-out, account switch, same-account re-login) fails delivery closed — an offer expires and never resurrects.
+
+#### Conditional Desktop skill tools
+
+`daemon/runner.go` + `daemon/skill_recommendation.go`. The two tools above are Direct only for capable signed-in Desktop/Kocoro requests with the feature enabled; absent from TUI, one-shot, MCP, schedule, IM, heartbeat, and watcher runs. A disconnected card-event sink does NOT change schemas — `offer_skill_installation` fails closed when invoked.
+
+#### WS handshake
+
+`client.go`. Sends `User-Agent: kocoro/<ver>` + `X-Kocoro-Daemon-Version` + `X-Kocoro-Capabilities`.
+
+#### `delivery_ack` capability
+
+`client.go:SendDeliveryAck`. After `SendReply` succeeds for `MsgTypeMessage`, emit the ack so Cloud drops the replay-buffer entry. Reply-failure paths MUST skip the ack so replay stays correct.
+
+#### Per-inbound reply addressing
+
+A run that absorbed mid-run injected follow-ups completes + acks EACH inbound message under its OWN cloud id — superseded turns via `OnIntermediateAnswer(text, cloudMessageID)` (a real `SendReply`+ack, not a timeline segment); the final answer + co-acks via `RunAgentResult.{ReplyToMessageID,PendingAckMessageIDs}` -> `Client.SetReplyPlan`. Ack-after-delivery: `handleMessage` acks every absorbed id ONLY after the final reply lands. The injected follow-up's own handler suppresses BOTH its reply and ack via `Client.SuppressReply`; the owning run is solely responsible, so a crash replays it instead of losing the answer. Without this, Cloud collapses two logically-distinct replies (group-chat messages from different senders) into one channel message.
+
+#### Config revision state
+
+`internal/config/revision.go` + `internal/daemon/server.go`. The daemon records the exact global `~/.shannon/config.yaml` revision reflected in memory. GET `/config` and `/config/status` report a newer external revision as `reload_required`. Internal read-modify-write mutations preserve unknown external edits and MUST NOT mark bytes they did not load as applied. Project/local overlays are NOT watched by this signal. Capability `config_reload_state_v1`.
+
+#### Built-in MCP catalog
+
+`internal/mcp/builtins.go` + `config.go mergeBuiltinMCPServers`. `BuiltinMCPServers` ships pre-bundled servers (e.g. `intercom`) disabled by default. `config.Load` field-merges the Go catalog onto user yaml: command/args/url come from the binary (auto-upgrade); disabled/env/keep_alive plus `connect_timeout_secs`/`tool_timeout_secs`/`workspace_base` persist from yaml. `PATCH /config` refuses daemon-owned fields on a builtin (`builtin_mcp_immutable`, 409). `GET /config/status` exposes `mcp_server_info` so Desktop renders a toggle + OAuth modal without hard-coding the catalog.
+
+#### MCP async startup
+
+`internal/mcp/client.go StartConnectAll` + `register.go RegisterAllWithBaselineAsync`. Startup and `/config/reload` do NOT block on MCP handshakes — the registry builds with local+gateway tools synchronously, then per-server connect goroutines fire. A per-server `inFlight` set dedups concurrent attempts. Timeout: `ConnectTimeoutSeconds` > `DefaultConnectTimeoutSecs` > 60s. Success -> `Supervisor.ProbeNow` -> registry rebuild.
+
+#### MCP reconnect after a failed connect
+
+`internal/mcp/reconnect.go` + `internal/daemon/mcp_reconnect.go`. A failed async connect is NOT terminal. `ReconnectScheduler` retries that one server with exponential backoff (5s -> 5min cap, `reconnectMaxAttempts` 6, ~5m15s total), one pending retry per server, streak reset on success. Both entry points — daemon startup (`cmd/daemon.go startDaemonMCPServices`) and the reload rebuild branch (`server.go handleConfigReload`) — MUST share the one `buildMCPConnectResult` callback so recovery behaves identically.
+
+#### MCP reconnect: generation ownership
+
+Retries are OWNED BY THE MANAGER GENERATION: `ServerDeps.SwapMCPReconnectScheduler` stops the superseded ladder when a reload rebuilds the manager, and `ShutdownCleanup` stops it before closing connections — a timer must never respawn a subprocess the cleanup is reaping. A retry re-reads `mgr.ConfigFor` and skips servers deleted or disabled while it was pending. Explicit user action re-arms an exhausted streak via `ForgetMCPReconnect`.
+
+**Why this exists**: rotating an MCP credential rebuilds the manager and respawns the stdio child; when that single attempt lost the race with the SIGTERM'd process group, the server stayed enabled-but-dead until a daemon restart.
+
+#### MCP subprocess reaping
+
+`internal/mcp/processgroup_unix.go` + `client.go cancellers`. Stdio MCP subprocesses spawn in their own process group (Setpgid), killed via `-pgid` SIGTERM + 3s SIGKILL backstop. Needed because npx-bridged servers are a process chain (npx -> npm exec -> node): killing only the direct child orphans a grandchild holding the OAuth loopback port (EADDRINUSE on re-toggle). `Disconnect`/`Close`/`Reconnect` cancel the group before `c.Close()`.
+
+#### Reload as explicit retry
+
+`server.go retryDisconnectedEnabledMCPServers`. When `/config/reload` runs without an MCP config delta (`mcpChanged=false`), the reload tail fires a fresh `StartConnectAll` for every `disabled: false` server not in `mgr.ConnectedServers()` — otherwise the no-auto-reconnect policy leaves previously-failed servers stuck "enabled" forever. Desktop's "Retry" button maps here.
+
+#### MCP call resilience
+
+`tools/mcp_tool.go` + `mcp/client.go`. Pre-dispatch gate: a supervisor-known-disconnected server is ProbeNow'd BEFORE CallTool instead of discovering the corpse mid-call (2026-07-29: 6.5 min on a dead google-workspace pipe vs a 12s reconnect). Every tools/call attempt is bounded: per-server `tool_timeout_secs` > `mcp.tool_timeout_secs` (default 300s, `mcp.DefaultToolCallTimeout`); an earlier caller deadline still wins.
+
+#### MCP call resilience: replay gating
+
+On failure the tool probes FRESH health (never trusts the cached state at error time), but **post-dispatch re-dispatch is annotation-gated** (`mcp.ToolReplaySafe`): a transport error after dispatch does NOT prove the server never acted — a stdio server can execute its write and die before responding. Only `readOnlyHint`/`idempotentHint` tools are replayed; everything else returns `mcp.OutcomeUnknownError` steering the model to verify before retrying. Timeouts and protocol errors are never retried. Live repro pinned in `tools/mcp_tool_live_test.go`.
+
+#### MCP artifact paths
+
+`tools/mcp_result_paths.go` + `mcp_tool.go` + daemon `runner.go`. Two-sided fix for server-relative artifact paths (playwright renders links relative to the FIRST advertised root, not the session CWD, which once sent the model into a 242s `find /`).
+
+- Result side: relative markdown links from servers with known path semantics (built-in table: playwright; user MCPs opt in via `workspace_base`) get a "Saved to: <abs>" annotation ONLY when the joined path exists under the base. Unknown servers stay opaque.
+- Input side: `browser_take_screenshot` without a filename gets one injected into the per-session artifact scratch (`~/.shannon/tmp/sessions/<id>/`, `cwdctx.WithArtifactDir`, daemon-served runs only; swept at startup by `daemon.scratch_max_age_days`, default 14).
+#### MCP artifact paths: filename rules
+
+- `browser_snapshot` NEVER gets a default filename — an omitted filename means the INLINE accessibility snapshot, the model's primary page-reading channel.
+- **Model-supplied absolute paths always win** — that is how the user addresses a deliverable. File-producing tool descriptions append `fileOutputArgHint` steering the model to bare relative filenames for its own intermediates.
+
+#### Generic integrations broker
+
+`integrations_handler.go` + `client/gateway.go`. `POST /integrations/{provider}/connect`, `GET /integrations`, `GET`/`DELETE /integrations/{id}` forward to Cloud `/api/v1/integrations/*` with the user's API key attached server-side. Cloud owns the per-provider OAuth exchange; the daemon has no public callback URL. `connect` forwards the client's JSON body verbatim (64 KiB cap; **may carry long-lived credentials — never log or persist it**). OAuth providers send no body and get `{connection_id, oauth_url}`; token-mode providers get an active connection directly. Capability `integration_connect_body_v1`. **The kocoro agent never calls these** (OAuth needs a browser), so they are NOT in the kocoro skill references.
+
+#### Integration tools (local agent)
+
+`tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`, `RequiresApproval()==false` — Cloud enforces access control). Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
+
+#### Integration tools: refresh triggers
+
+Registered on startup + `/config/reload`, refreshed by `RebuildAuthSensitiveTools` (sign-in) and — the immediate path — **`POST /integrations/refresh`** (`Server.RefreshIntegrationTools`; lightweight, does NOT restart MCP). First-time activation is async (a connection goes active only after the browser OAuth completes, out of band), so `connect`/`delete` fire a best-effort refresh but the reliable trigger is Desktop calling `POST /integrations/refresh`. Capability `integration_tools_v1`.
+
+#### Attachments
+
+`attachment.go`. Priority `document_b64` -> `extracted_text` -> URL download. Caps: 500 MB/file, 20/msg, inline doc <= 25 MB raw. Capabilities `inline_document_b64`/`inline_extracted_text` gate these fields. DOCX/XLSX/PPTX/CSV extraction is daemon-local (`doc_extract.go`); Cloud fills PDF `DocumentB64` + transcodes HEIC/AVIF.
+
+#### Session routing
+
+`router.go`. `ComputeRouteKey` precedence: `PinnedRouteKey` (sticky schedule) -> `session:<id>` -> thread -> sender -> plain `agent:<name>` (only when NOT `new_session`) -> channel. Web/webhook/cron bypass (always fresh).
+
+#### Session routing: multi-session and schedules
+
+**Named agents are multi-session** (they honor `session_id`/`new_session` like the default agent); the plain `agent:<name>` lane resolves to the latest `kind=interactive` session via `Manager.ResumeLatestMatching(isInteractiveSource)`, never a schedule/IM session. **Schedule `Stateful`** is the single remember-across-runs switch (`schedule.IsSticky`): `false`/legacy-nil -> fresh session each run; `true` -> dedicated accumulating session pinned via `PinnedRouteKey`. **Heartbeat** reads/appends the latest `kind=interactive` session; a mid-run session switch hits `ErrSessionChanged` and is dropped silently.
+
+#### IM connection awareness
+
+`connection_state_cache.go` + `message_origin.go`. Per-platform connection state from Cloud `channel_state_event`s, rendered as a `Connection:` Session-Facts line + new-session `Preamble()`. **Binding axis** (install/token revoked — actionable) is stored SEPARATELY from **transport axis** (transient disconnect) so a blip cannot mask a revocation; binding wins at render, and `Preamble()` is sorted for byte-stable prompts.
+
+#### Smart session titles
+
+`runner.go fireTitleAfterRun` + `internal/context/title_gen.go`. Async small-tier title upgrade at completed turns {1,3} on `TitleAuto` sessions. **Skipped for autonomous local sources** (watcher/heartbeat/mcp via `isAutonomousLocalSource`) so they never relabel the user's interactive session. `DecorateTitle`/`SourceLabel` prefix the brand (`Slack - ...`).
+
+#### Session share uploads
+
+`daemon/share_handler.go` + `share_async.go`. Render HTML -> `POST /api/v1/uploads` with `kind=session_share` (post-upload LIST filters by that kind so concurrent uploads cannot bump our row off page 1). publish_to_web uses `kind=other`. Tool runs are stripped from the page (prose + images only); `html-artifact` fences render in a sandboxed iframe (`internal/share/artifact.go`, **assistant-role messages only** — user/third-party text stays inert escaped markdown to avoid stored XSS).
+
+#### Session share: artifact host mirror
+
+**The artifact host CSS (`internal/share/templates/artifact_host.css`), the CSP, and the resize bridge are VERBATIM mirrors of `ARTIFACT_HOST_CSS` / `ARTIFACT_CSP` / `buildArtifactSrcdoc` in Kocoro Desktop's `message-list.js` — re-sync when Desktop's artifact design system changes. There is no cross-repo automated check.**
+
+#### Output format
+
+`runner.go outputFormatForSource`. `plain` for cloud-distributed channels; `markdown` default. **Feishu/Lark/Teams are cloud sources but use `markdown`** (`markdownCloudSources`) — their cards render standard markdown, and GFM re-enables Cloud's `[name](url)` -> file-attachment conversion. **WeChat (iLink) stays `plain`** — Cloud's iLink outbound extracts raw CDN URLs from plain text; do NOT move it into `markdownCloudSources`.
+
+#### Tool result sizing
+
+`spill.go` + `toolresult_budget.go` + `context_bloat.go`. Per-result spill at policy threshold (`DefaultMaxToolResultSizeChars` 50K, grep 20K) -> tmp file + 2K preview. `file_read` is `UnlimitedToolResultSizeChars` (no spill); it self-bounds via `fileReadHardCapRunes = 500_000` with a truncation marker. Per-turn 200K-rune aggregate cap (`aggregateCapThreshold`) skips Unlimited tools. `ToolResultReplacements` + `ToolResultSeen` persist across checkpoints AND terminal saves.
+
+#### file_read dedup
+
+`agent/readtracker.go` + `daemon/readtracker_cache.go`. Records `(path, offset, limit, mtime, size)`; re-reads return a stub. Per-session, released via `SessionManager.OnSessionClose`.
+
+#### Image size guard
+
+`imaging_compress.go` + `oversize_image.go`. Three layers: source-time compression (`EncodeImage` decode -> 2000x2000 -> JPEG ladder), wire-time sanitizer (`filterOversizeImages` in `messagesForLLM`), persist-time guard (`SanitizedRunMessages`). Any new image path MUST pass through all three before reaching the LLM or session JSON.
+
+#### Skill secrets
+
+`skills/secrets.go`. Keychain `com.shannon.skill.<name>` + a plaintext index of key NAMES only. Env-var-only injection, scoped to skills activated by `use_skill` in the current run.
+
+#### Skill marketplace sources
+
+`daemon/server.go` (`s.marketplace` / `s.clawhub`) + `config.MarketplaceConfig`. TWO independent API surfaces that MUST NEVER share a response shape:
+
+- `/skills/marketplace/*` = static registry (`registry_url`), integer `page` pagination, `{total,page,size,skills}`. **This is the frozen macOS Desktop contract — do not add source-conditional branches here.**
+- `/skills/clawhub/*` = ClawHub live catalog (`clawhub_url`, default `https://clawhub.ai`), opaque `cursor` pagination (`{skills,size,next_cursor}`), plus per-version `/files` + `/file` browsing and `/install/{slug}`.
+
+Both back the same `MarketplaceClient` (mode set by constructor) and install to the same on-disk location.
+
+#### Skill marketplace: retry policy
+
+**Transient resilience**: every catalog GET and the zip install download go through `doGETWithRetry` (`marketplace_retry.go`) — retries 429/5xx + network errors with exponential backoff + jitter (honors a numeric `Retry-After`), tuned by `skills.marketplace.max_attempts` / `.retry_base_backoff_secs`. **4xx is never retried.** The helper returns the final response on exhaustion so each caller's `status %d` error is preserved. The install zip download is single-attempt — retrying would multiply a hang.
+
+#### Skill marketplace: ClawHub caching
+
+**ClawHub caching**: short-TTL per-URL response cache (`marketplace_cache.go`, `skills.marketplace.clawhub_cache_ttl_secs` default 60), serve-stale-on-error. `warmClawHubOnce` warms the canonical default browse page ONCE at startup (`clawhub_warm_on_startup`, default true) — deliberately one-shot, so an air-gapped daemon makes at most one clawhub.ai request. A view-agnostic last-good first page (`clawhubFirstPageMaxAge` 30min) is served when a fresh fetch fails **for a transient reason only**: `isTransientListErr` mirrors `isRetryableStatus`, so 429/5xx + network/parse degrade to a stale page while 400/401/403/404/409/410/422 surface immediately. Deep pages and searches have no fallback.
+
+#### Skill marketplace: exclude-installed
+
+**Exclude-installed** (`GET /skills/clawhub?exclude_installed=true`, capability `clawhub_exclude_installed`): opt-in, ClawHub-only, NEVER the frozen `/skills/marketplace/*`. "Installed" is local-only, so `FetchClawHubPageExcludingInstalled` fetches normally then drops installed slugs, refilling from later pages bounded by `skills.marketplace.clawhub_exclude_fill_max_pages` (default 5). Cursor is page-granular, so a returned page may exceed `size` and `next_cursor` stays page-aligned; **if the fill cap binds the page is short or empty with a non-empty cursor and the client MUST keep paging.**
+
+#### Turn phase tracker
+
+`agent/phase.go`. Only `PhaseAwaitingLLM` and `PhaseForceStop` are idle-counted. Fail-closed: panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`.
+
+#### Idle watchdog
+
+`agent/watchdog.go` + `client/gateway.go`. Two layers. Turn-elapsed: `OnRunStatus("idle_soft")` at `agent.idle_soft_timeout_secs` (default 90), `ctx.Cancel(ErrHardIdleTimeout)` at `agent.idle_hard_timeout_secs` (default 540; opt out via `0` + startup WARN). Streaming chunk-gap: `CompleteStream` returns `ErrStreamIdleTimeout` if no SSE chunk arrives within `agent.stream_idle_timeout_secs` (default 90). The loop short-circuits the streaming->Complete fallback on `ErrStreamIdleTimeout` and `isRetryableLLMError` refuses to retry it.
+
+#### Mid-turn checkpoint
+
+runner `applyTurn*` helpers. Fires at three phase-exit boundaries; 2s debounce. The same helpers run from checkpoint, final save, and hard-error save. `session.InProgress` non-zero on reload = crash recovery.
+
+#### Interrupted-turn auto-resume
+
+`daemon/interrupted_recovery.go` + `session/store.go` markers. Daemon start scans the durable `.in-progress/*.marker` index and serially continues checkpoints, newest first. **Policy gates, all load-bearing**:
+
+- `agent.interrupted_resume_enabled` (default true).
+- Staleness window `agent.interrupted_resume_max_age_hours` (default 4) — an older checkpoint carries a user intent whose context is gone; it is abandoned, marker cleared, NEVER executed.
+- Attempt cap `agent.interrupted_resume_max_attempts` (default 3), persisted BEFORE the LLM call.
+
+#### Interrupted-turn resume: run invariants
+
+Recovered runs are ALWAYS unattended (`IsUnattendedRun()==true` regardless of the session's original source) so the unattended deny-list applies. The resume request pins the session's original RouteKey so it takes the same route lock as concurrent inbound traffic. Every persistence path — `Store.Save` AND all `Patch*` RMW paths — re-asserts the marker invariant (`syncInterruptedMarker`: on-disk InProgress=true <=> marker exists).
+
+#### Schedule proactive push
+
+`scheduler.go broadcastReply` + `broadcast_gate.go shouldBroadcast` / `resolveThread`. After a successful run, push is gated by `shouldBroadcast`: explicit `Schedule.Broadcast *bool` wins, else a smart default by `CreatedFromSource` (IM sources -> push, else silent).
+
+#### Schedule proactive push: origin-only delivery
+
+**Origin-only delivery**: the push target is ALWAYS the schedule's snapshotted `IMStatusContext` blob. A schedule with no blob (Desktop/TUI/CLI/webhook-created) NEVER pushes, even with `broadcast=on` — wrong-audience delivery beats no delivery, and results stay in the session. Cloud mirrors this by dropping a non-empty blob it cannot honor.
+
+#### Schedule proactive push: thread mode
+
+**Thread three-state** (`Schedule.Thread *bool`, `ParseThreadEnum`): `auto` follows session state (stateful -> one thread; stateless -> fresh top-level each run); `on`/`off` are verbatim. `resolveThread(thread, isSticky, hasBlob)` -> `ProactivePayload.UseThread *bool`; `nil` = anchored thread (current behavior) and only `&false` goes top-level. Threadless platforms (LINE/WeCom/Telegram) ignore it. Capabilities `schedule_broadcast_gate`, `proactive_thread_mode` (observability only).
+
+#### Playwright file:// bridge
+
+`tools/filepreview.go`. Loopback HTTP rewrites `browser_navigate(file://...)`. Fail-closed: symlink-resolved allowlist, loopback-only `r.RemoteAddr` check, random tokens, no directory listing, teardown on session close.
+
+#### Session sync
+
+`internal/sync/`. Daily upload (opt-in `sync.enabled`). flock + atomic marker. Permanent failure reasons (`size_limit_exceeded`, `load_error`) self-heal on session edit.
+
+#### Memory client
+
+`internal/memory/`. The daemon owns sidecar lifecycle + the 24h bundle pull. `memory_recall` -> `Service.Query` over UDS; falls back to `session_search` + MEMORY.md when not `Ready`. **The API key never hits disk** — only a `sha256[:16]` fingerprint. Schema-mismatch lockout surfaces as `memory.reason=tlm_binary_too_old` on `GET /status` and triggers a one-shot self-heal pull before degrading. `Sidecar.Shutdown` is idempotent so failed children do not accumulate as orphans.
+
+#### Episodic recall routing
+
+`prompt/builder.go` + `tools/memory.go`. Production CLI, TUI, and daemon loops expose `memory_recall` directly to the main model; no implicit small-model preflight is installed. Unnamed references route to `session_search`; no-data stops relation/mode retries. Evidence guidance (`MemoryEvidenceGuidance`) lives with the tool that produces `evidence_tier` — the `memory_recall` description — NOT in the system prompt. `agent/preflight.go` + `tools/memory_preflight.go` remain evaluation-only hooks.
+
+#### Loop detector
+
+`agent/loopdetect.go`. 9 detectors. `dupExemptTools` skip dup detection; all-errors 2x budget; rolling nudge window (max 3 within trailing 5). Rule "0a" empty-think force-stop: two consecutive `think({})` -> `LoopForceStop`, defending against ritual empty think after native interleaved thinking.
+
+#### Thinking blocks
+
+`client.ContentBlock` + `agent.buildAssistantMessage`. Cloud relays full ordered `content_blocks` incl. `thinking`/`redacted_thinking`. Persisted verbatim; `internal/sync/strip_thinking.go` removes them from the upload-side copy before the size check. Sanitizers in `messagesForLLM` / time-based / micro-compact / `BuildForkedRequest` MUST preserve them.
+
+#### Conditional `think` tool
+
+`tools/register.go shouldRegisterThinkTool`. Not registered on the default gateway+thinking path. Still registered when thinking is disabled, on the Ollama provider, or with `ForceThinkTool=true`. `operationalRules()` strips the `### Planning` bullet only when think is absent, keeping the prompt byte-equal otherwise.
+
+#### Prompt suggestion
+
+`agent/suggestion.go` + `daemon/runner.go`. Forked LLM call after each main turn. **CACHE SAFETY**: byte-equal to the main request except 2 appended messages + `SkipCacheWrite: true`. Any other divergence fragments the cache. **Source-gated** (`wantsPromptSuggestion` / `promptSuggestionSources`): only foreground sources with a UI consumer — `desktop`, `kocoro`, `shanclaw` (legacy Desktop alias), `web`. IM channels, schedule/cron, and autonomous local sources are skipped (no consumer = dead work + a billed call). It is an ALLOW-list, so new background sources default to skipped.
+
+#### Email/password auth (macOS + Windows + Linux)
+
+`internal/daemon/auth.go` + `auth_handlers.go` + `ws_controller.go` + `internal/keychain/`. `/local/auth/*` proxy to Cloud `/api/v1/auth/*`. The AuthManager state machine drives WS lifecycle — WS runs only in `signed_in`, and `WSController.Start`/`Stop` are the ONLY allowed call sites for spinning the reconnect loop. api_key is the source-of-truth credential in the credential store (`ai.kocoro.daemon.api_key/<user_id>`); the yaml field is migrated away on first launch, with a read-back verify before stripping yaml. The supported-platform set is `keychain.Supported()` and MUST stay in sync with the backend build tags (enforced by `TestSupportedMatchesBuildTag`). On unsupported platforms: AuthManager nil, endpoints 503 `platform_unsupported`, legacy `cfg.APIKey` path.
 
 ### Daemon Approval Protocol
 
@@ -363,7 +478,7 @@ Invariants:
 - **Reactive evidence floor**: a context-length 400 proves the prompt exceeds the window, so the reactive path floors its calibration at `window − estimate + 1` — shaping engages even with no usage sample this Run.
 - **Summary quality validation**: `GenerateSummary` audits its candidate at compaction scale (history has a droppable middle): labeled section structure must be present and identifier-shaped tokens scanned from the droppable middle (long hex, URLs, unix paths, host:port, long numbers; ≤12 unique) must appear verbatim. One retry carries the failure reasons; whatever it still misses is appended mechanically under `## Exact identifiers (auto-preserved)`. Short histories keep single-call prose behavior.
 - **Post-compaction file restoration**: after an applied PROACTIVE or PREFLIGHT compaction, the loop re-reads the most recently read files (session `ReadTracker`) and appends them as one system-reminder user message before the task reanchor — 5 files / ~5K tokens each / ~50K total, and the payload must keep the calibrated estimate under the 90% trigger line (it may consume part of the hysteresis band). MEMORY.md/AGENT.md excluded; reads surviving in the kept tail (including prior `## [restored]` blocks) skipped. The REACTIVE path deliberately skips restoration — its 400-evidence floor is only a lower bound and `reactiveCompacted` makes a second overflow terminal; its reanchor variant instead tells the model to re-read what it needs.
-- **Pre-compaction snapshot**: every applied compaction (proactive/preflight/reactive/force-stop, plus TUI `/compact`) hands the exact pre-replacement model-live state to an injected snapshotter before the durable checkpoint changes — with `<private_memory>` stripped inside `snapshotBeforeCompaction`. The lossless transcript is already safe in `Session.Messages`; the snapshot preserves the prior checkpoint + in-flight tail byte-for-byte for summary rollback/diagnosis. Before the synchronous JSON write, `session.Store.SaveCompactionSnapshot` copies block content and replaces every top-level or tool-result-nested image with a text marker, so screenshot base64 never reaches rollback files and the active vision trajectory is not mutated. Snapshots live at `<sessions-dir>/.compaction-snapshots/<session-id>/` (`agent.compaction_snapshot_retention` default 1, 0 disables; configured retention >=2 pins the OLDEST snapshot and evicts from the second-oldest up). A daemon-start sweep across default and named-agent scopes removes files older than `agent.compaction_snapshot_max_age_days` (default 14, 0 disables); age expiry overrides the oldest pin, while empty per-session directories remain to avoid racing writers. `Store.Delete` removes the session's snapshot dir and store startup still removes orphan dirs. Best-effort: snapshot errors are logged, never fail compaction; no read/restore tooling ships yet, so recovery is manual.
+- **Pre-compaction snapshot**: every applied compaction (proactive/preflight/reactive/force-stop, plus TUI `/compact`) hands the exact pre-replacement model-live state to a snapshotter before the durable checkpoint changes. Two MUSTs on the way out: `<private_memory>` is stripped inside `snapshotBeforeCompaction`, and `session.Store.SaveCompactionSnapshot` replaces every top-level or tool-result-nested image with a text marker so screenshot base64 never reaches rollback files and the active vision trajectory is not mutated. Stored at `<sessions-dir>/.compaction-snapshots/<session-id>/`; `agent.compaction_snapshot_retention` (default 1, 0 disables; >=2 pins the OLDEST and evicts from the second-oldest up), `agent.compaction_snapshot_max_age_days` (default 14, 0 disables; age expiry overrides the oldest pin). Best-effort — snapshot errors are logged and NEVER fail a compaction. No read/restore tooling ships yet, so recovery is manual.
 - **Reactive compaction** on context-length error: emergency compress + single retry; `reactiveCompacted` prevents loops. Summarize input is budgeted in TOKENS, not bytes: `summarizeInputCapTokens=150_000` against the small tier's 200K window, converted to a byte ceiling via `conservativeBytesPerToken=2.5` (a measured floor — live small tier bills JSON at 2.60 bytes/token, CJK 2.71, Go source 3.43, English prose 4.78). Do NOT gate this on `EstimateTokens`: its 3.5 chars/token is representative, not conservative, and the previous byte cap (540_000, documented as "≈180K tokens") actually billed 213,719 against a 200K window, so every compaction 400'd and the session grew ~2K tokens per failed turn instead of shrinking (2026-08-05 production incident). `warnIfDenserThanSafetyFloor` logs when billed tokens fall below the floor so the next drift is diagnosable; a transcript over the cap is no longer head+tail-truncated — it is split into tool-pair-preserving chunks and sequentially folded into a running summary (max `maxSummaryFoldChunks`, oldest elided beyond that), with the final chunk going through the normal structured two-phase prompt. Any fold failure degrades to the old rune-safe head+tail single call.
 - **Failure telemetry**: `recordCompactionFailure` emits `OnRunStatus("compaction_failed")` + audit row. 10 phase tags cover force-stop, proactive, preflight, reactive, and emergency paths.
 - **Tiered result compression**: newest 8 tool-result messages stay full; distance 8-19 uses Tier 2 (up to two semantic summaries per pass for eligible results >2,000 chars, otherwise 300-char head+tail); distance >=20 normally uses Tier 1 metadata. Already-compressed blocks stay byte-stable, and Tier 2 floor tools (`file_read`, `grep`, `glob`, `directory_list`, `browser_*`) never degrade to Tier 1. Tier-2 semantic summaries carry a head-clipped current-task line (`latestUserText`, ≤240 runes) so the summarizer prioritizes task-relevant details.
