@@ -8,36 +8,6 @@ import (
 	"testing"
 )
 
-func TestOffline_AgentLabPythonHarness(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 unavailable; comparison harness requires python3")
-	}
-	// The koe mode-classifier comparison harness and its tests were removed with
-	// the routing lane. Skip rather than fail so this stays a working slot for
-	// the next Python harness instead of a green run over an empty discovery.
-	if _, err := os.Stat(filepath.Join(repoRoot(), "scripts", "tests")); os.IsNotExist(err) {
-		t.Skip("no scripts/tests directory; no Python harness to self-test")
-	}
-	command := exec.Command(
-		python,
-		"-m",
-		"unittest",
-		"discover",
-		"-s",
-		filepath.Join(repoRoot(), "scripts", "tests"),
-		"-p",
-		"test_*.py",
-		"-v",
-	)
-	command.Env = append(os.Environ(), "PYTHONDONTWRITEBYTECODE=1")
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Python harness self-test: %v\n%s", err, output)
-	}
-	t.Logf("Python harness self-test:\n%s", output)
-}
-
 func TestOffline_AgentLabScriptsParse(t *testing.T) {
 	bash, err := exec.LookPath("bash")
 	if err != nil {

@@ -1,0 +1,100 @@
+{
+  "schema_version": "1",
+  "policy": {
+    "deterministic": "Run on every matching change and in the default test lane.",
+    "comparison": "Paid, explicitly gated trend evidence. It may compare a change but cannot qualify a release.",
+    "release": "Paid, explicitly gated and fail-closed. A missing release lane is recorded as a gap, not inferred from green smoke tests."
+  },
+  "entries": [
+    {
+      "id": "general_agent_prompt",
+      "change_globs": ["internal/prompt/**", "internal/agent/**", "internal/executionprofile/**"],
+      "rationale": "Prompt and loop changes can alter ordinary answers, tool use, completion evidence, latency, and cost.",
+      "deterministic": ["go test ./internal/prompt ./internal/agent ./internal/executionprofile"],
+      "comparison": ["SHANNON_E2E_LIVE=1 KOCORO_AGENT_LAB_QUALITY_LIVE=1 KOCORO_AGENT_LAB_QUALITY_SAMPLE=smoke KOCORO_AGENT_LAB_QUALITY_REPETITIONS=3 go test -tags=live ./test/e2e -run '^TestLive_AgentLabGeneralPurposeQuality$' -count=1", "SHANNON_E2E_LIVE=1 KOCORO_GENERAL_OUTCOME_LIVE=1 KOCORO_GENERAL_OUTCOME_SAMPLE=comparison KOCORO_GENERAL_OUTCOME_REPETITIONS=1 go test -tags=live ./test/e2e -run '^TestLive_GeneralAgentOutcomeDataset$' -count=1"],
+      "release_status": "covered",
+      "release": ["SHANNON_E2E_LIVE=1 KOCORO_AGENT_LAB_QUALITY_LIVE=1 KOCORO_AGENT_LAB_QUALITY_SAMPLE=release KOCORO_AGENT_LAB_QUALITY_REPETITIONS=15 go test -tags=live ./test/e2e -run '^TestLive_AgentLabGeneralPurposeQuality$' -count=1", "SHANNON_E2E_LIVE=1 KOCORO_GENERAL_OUTCOME_LIVE=1 KOCORO_GENERAL_OUTCOME_SAMPLE=release KOCORO_GENERAL_OUTCOME_REPETITIONS=5 go test -tags=live ./test/e2e -run '^TestLive_GeneralAgentOutcomeDataset$' -count=1"]
+    },
+    {
+      "id": "tool_contracts_and_descriptions",
+      "change_globs": ["internal/tools/**", "internal/agent/tools.go", "internal/prompt/**/tool*"],
+      "rationale": "A schema or description change must preserve argument validity, narrow tool choice, verified results, and side-effect state.",
+      "deterministic": ["go test ./internal/tools ./internal/agent"],
+      "comparison": ["SHANNON_E2E_LIVE=1 KOCORO_TOOL_CHOICE_LIVE=1 KOCORO_TOOL_CHOICE_SAMPLE=comparison KOCORO_TOOL_CHOICE_REPETITIONS=3 go test -tags=live ./test/e2e -run '^TestLive_ToolChoiceMatrix$' -count=1"],
+      "release_status": "covered",
+      "release": ["SHANNON_E2E_LIVE=1 KOCORO_TOOL_CHOICE_LIVE=1 KOCORO_TOOL_CHOICE_SAMPLE=release KOCORO_TOOL_CHOICE_REPETITIONS=5 go test -tags=live ./test/e2e -run '^TestLive_ToolChoiceMatrix$' -count=1"]
+    },
+    {
+      "id": "fast_full_routing",
+      "change_globs": ["internal/executionprofile/**", "internal/tools/koe_fast*", "test/e2e/fast_*"],
+      "rationale": "Fast/Full changes need equivalent outcomes before latency or cost improvements count.",
+      "deterministic": ["go test ./internal/executionprofile ./internal/tools"],
+      "comparison": ["SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 KOCORO_FAST_PINNED_AB_SAMPLE=comparison KOCORO_FAST_PINNED_AB_REPETITIONS=3 go test -tags=live ./test/e2e -run '^TestLive_FastPinnedVsFullAB$' -count=1"],
+      "release_status": "covered",
+      "release": ["SHANNON_E2E_LIVE=1 KOCORO_FAST_PINNED_AB=1 KOCORO_FAST_PINNED_AB_SAMPLE=release KOCORO_FAST_PINNED_AB_REPETITIONS=15 go test -tags=live ./test/e2e -run '^TestLive_FastPinnedVsFullAB$' -count=1"]
+    },
+    {
+      "id": "memory_and_compaction",
+      "change_globs": ["internal/context/**", "internal/memory/**", "internal/agent/*compact*", "test/e2e/*memory*", "test/e2e/*compaction*"],
+      "rationale": "Memory changes must preserve facts, trust boundaries, retrieval routing, and state across a compaction boundary.",
+      "deterministic": ["go test ./internal/context ./internal/memory ./internal/agent"],
+      "comparison": ["SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_MemoryAnswerFidelity$' -count=1", "SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_Compaction_SurvivesAcrossTheBoundary$' -count=1"],
+      "release_status": "gap",
+      "release": []
+    },
+    {
+      "id": "daemon_and_channel_delivery",
+      "change_globs": ["internal/daemon/**", "internal/client/*channel*", "cmd/**", "test/e2e/*channel*", "test/e2e/*progress*"],
+      "rationale": "Daemon changes need protocol/state coverage plus a real streamed reply; current channel probes do not prove remote delivery.",
+      "deterministic": ["go test ./internal/daemon ./internal/client ./cmd"],
+      "comparison": ["SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_ChannelDeliveryMetadataShapesReply$' -count=1", "SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_MidRunProgressNotesReachTheUser$' -count=1"],
+      "release_status": "gap",
+      "release": []
+    },
+    {
+      "id": "mcp_and_browser",
+      "change_globs": ["internal/mcp/**", "internal/tools/browser*", "test/e2e/*mcp*", "test/e2e/*playwright*"],
+      "rationale": "Lifecycle and reconnect tests prove mechanisms; the full-path probe proves one allowlisted browser result but not open-web quality.",
+      "deterministic": ["go test ./internal/mcp ./internal/tools"],
+      "comparison": ["SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_IsolatedMCPAllowlist_FullPath$' -count=1"],
+      "release_status": "gap",
+      "release": []
+    },
+    {
+      "id": "koe_realtime_and_voice",
+      "change_globs": ["internal/koe/**", "internal/tools/koe_*"],
+      "rationale": "Realtime probes cover synthetic audio and mocked result routing; no lane qualifies physical microphone, speaker, AEC, or barge-in behavior.",
+      "deterministic": ["go test ./internal/koe ./internal/tools"],
+      "comparison": ["KOE_LIVE_TEXT_FULL_PATH_E2E=1 go test -tags=live ./internal/koe -run '^TestKoeLiveFullPathMatrixE2E$' -count=1"],
+      "release_status": "gap",
+      "release": []
+    },
+    {
+      "id": "computer_use",
+      "change_globs": ["internal/tools/*computer*", "internal/guicontrol/**", "internal/daemon/*computer*"],
+      "rationale": "Protocol tests do not establish that the model interpreted a screenshot correctly or completed a desktop task.",
+      "deterministic": ["go test ./internal/tools ./internal/guicontrol ./internal/daemon"],
+      "comparison": ["KOE_NATIVE_COMPUTER_LIVE=1 go test -tags=live ./internal/tools -run '^TestKoeNativeComputerLive$' -count=1"],
+      "release_status": "gap",
+      "release": []
+    },
+    {
+      "id": "image_generation",
+      "change_globs": ["internal/images/**", "internal/tools/*image*", "test/e2e/live_test.go"],
+      "rationale": "The current live check covers image transport only; it does not grade generated or edited pixels against the request.",
+      "deterministic": ["go test ./internal/images ./internal/tools"],
+      "comparison": ["SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e -run '^TestLive_ImageGenerateEditTransportSmoke$' -count=1"],
+      "release_status": "gap",
+      "release": []
+    },
+    {
+      "id": "test_harness_and_lanes",
+      "change_globs": ["test/**", "scripts/agent-lab.sh", "docs/live-e2e-testing.md"],
+      "rationale": "Harness changes must compile both build-tag surfaces and keep paid/release lanes explicit and fail-closed.",
+      "deterministic": ["go test ./...", "go test -tags=live ./test/e2e ./internal/koe ./internal/tools -run '^$'", "go build ./..."],
+      "comparison": [],
+      "release_status": "not_applicable",
+      "release": []
+    }
+  ]
+}

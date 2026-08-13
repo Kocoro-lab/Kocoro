@@ -41,10 +41,10 @@ const (
 	// 15 all-pass bounds the per-cell failure rate under ~18% (95% CI)
 	// and pooled arms far tighter; 30 doubled the cost for little
 	// marginal evidence. Comparison runs stay at 3-5.
-	agentLabQualityReleaseRepetitions    = 15
-	agentLabQualityDefaultSeed           = int64(20260807)
-	agentLabQualityResearchURL           = "https://www.iana.org/help/example-domains"
-	agentLabQualityDeferredMarker        = "AGENT_LAB_DEFERRED_731"
+	agentLabQualityReleaseRepetitions = 15
+	agentLabQualityDefaultSeed        = int64(20260807)
+	agentLabQualityResearchURL        = "https://www.iana.org/help/example-domains"
+	agentLabQualityDeferredMarker     = "AGENT_LAB_DEFERRED_731"
 )
 
 type agentLabQualityConfig struct {
@@ -310,6 +310,15 @@ func TestLive_AgentLabGeneralPurposeQuality(t *testing.T) {
 		t.Fatalf("quality gate failed: correct=%d completed=%d failures=%v report=%s",
 			report.CorrectRuns, report.Completed, report.Failures, cfg.outputPath)
 	}
+	if !report.ComparisonQualifying {
+		t.Fatalf("quality comparison did not qualify: usage_observed=%t cost_observed=%t cost_usd=%.8f max_cost_usd=%.8f repetitions=%d report=%s",
+			report.UsageObserved, report.CostObserved, report.ReportedCostUSD,
+			report.MaxCostUSD, report.RepetitionsPerCase, cfg.outputPath)
+	}
+	if cfg.sample == "release" && !report.ReleaseQualifying {
+		t.Fatalf("quality release did not qualify: repetitions=%d minimum=%d report=%s",
+			report.RepetitionsPerCase, report.MinimumReleaseRepetitions, cfg.outputPath)
+	}
 	t.Logf("agent_lab_quality complete runs=%d repetitions=%d comparison_qualifying=%t release_qualifying=%t p50_ms=%d p95_ms=%d p99_ms=%d cost_usd=%.8f report=%s",
 		report.Completed, report.RepetitionsPerCase, report.ComparisonQualifying,
 		report.ReleaseQualifying, report.LatencyP50Millis, report.LatencyP95Millis,
@@ -450,7 +459,7 @@ func TestOffline_AgentLabQualityQualificationFailsClosed(t *testing.T) {
 	jobs = buildAgentLabQualityJobs(1, cfg.repetitions, cfg.seed)
 	results = repeatAgentLabQualityFixture(jobs)
 	if report := newAgentLabQualityReport(cfg, jobs, results); report.ReleaseQualifying {
-		t.Fatalf("29 repetitions unexpectedly release-qualified")
+		t.Fatalf("%d repetitions unexpectedly release-qualified", agentLabQualityReleaseRepetitions-1)
 	}
 
 	cfg.sample = "release"
@@ -459,7 +468,12 @@ func TestOffline_AgentLabQualityQualificationFailsClosed(t *testing.T) {
 	results = repeatAgentLabQualityFixture(jobs)
 	report = newAgentLabQualityReport(cfg, jobs, results)
 	if !report.ReleaseQualifying {
-		t.Fatalf("30 complete passing repetitions did not release-qualify: %+v", report)
+		t.Fatalf("%d complete passing repetitions did not release-qualify: %+v", agentLabQualityReleaseRepetitions, report)
+	}
+	costLimited := cfg
+	costLimited.maxCostUSD = report.ReportedCostUSD / 2
+	if overBudget := newAgentLabQualityReport(costLimited, jobs, results); overBudget.ComparisonQualifying || overBudget.ReleaseQualifying {
+		t.Fatalf("over-budget report unexpectedly qualified: %+v", overBudget)
 	}
 	results[0].Correct = false
 	results[0].Failures = []string{"fixture_failure"}
@@ -489,15 +503,177 @@ func TestOffline_AgentLabQualityLaneRejectsUndersizedReleaseSample(t *testing.T)
 		"AGENT_LAB_LANE=quality_live",
 		"KOCORO_AGENT_LAB_QUALITY_LIVE=1",
 		"KOCORO_AGENT_LAB_QUALITY_SAMPLE=release",
-		"KOCORO_AGENT_LAB_QUALITY_REPETITIONS=14",
+		fmt.Sprintf("KOCORO_AGENT_LAB_QUALITY_REPETITIONS=%d", agentLabQualityReleaseRepetitions-1),
 	)
 	output, err := command.CombinedOutput()
 	if err == nil {
 		t.Fatal("undersized release quality sample unexpectedly ran")
 	}
-	if !strings.Contains(string(output), "REPETITIONS >= 15") {
+	if !strings.Contains(string(output), fmt.Sprintf("REPETITIONS >= %d", agentLabQualityReleaseRepetitions)) {
 		t.Fatalf("undersized quality release error is not actionable: %s", output)
 	}
+}
+
+func TestOffline_AgentLabQualityLaneReportValidation(t *testing.T) {
+	tests := []struct {
+		name            string
+		completed       int
+		reportedCostUSD float64
+		testOutput      string
+		wantError       string
+	}{
+		{
+			name:       "valid_report_and_executed_test",
+			completed:  3,
+			testOutput: "=== RUN   TestLive_AgentLabGeneralPurposeQuality\n--- PASS: TestLive_AgentLabGeneralPurposeQuality (0.00s)\nPASS",
+		},
+		{
+			name:       "incomplete_report",
+			completed:  2,
+			testOutput: "=== RUN   TestLive_AgentLabGeneralPurposeQuality\n--- PASS: TestLive_AgentLabGeneralPurposeQuality (0.00s)\nPASS",
+			wantError:  "does not equal scheduled",
+		},
+		{
+			name:       "skipped_test",
+			completed:  3,
+			testOutput: "=== RUN   TestLive_AgentLabGeneralPurposeQuality\n--- SKIP: TestLive_AgentLabGeneralPurposeQuality (0.00s)\nPASS",
+			wantError:  "did not execute",
+		},
+		{
+			name:            "over_budget_report",
+			completed:       3,
+			reportedCostUSD: 6,
+			testOutput:      "=== RUN   TestLive_AgentLabGeneralPurposeQuality\n--- PASS: TestLive_AgentLabGeneralPurposeQuality (0.00s)\nPASS",
+			wantError:       "exceeds max_cost_usd",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeBin := writeAgentLabFakeGo(t)
+			reportedCostUSD := tc.reportedCostUSD
+			if reportedCostUSD == 0 {
+				reportedCostUSD = 0.01
+			}
+			report := map[string]any{
+				"schema_version":        "kocoro.agent_lab_quality.v1",
+				"complete":              tc.completed == 3,
+				"sample":                "smoke",
+				"repetitions_per_case":  3,
+				"seed":                  1,
+				"scheduled":             3,
+				"completed":             tc.completed,
+				"correct_runs":          tc.completed,
+				"comparison_qualifying": true,
+				"release_qualifying":    false,
+				"usage_observed":        true,
+				"cost_observed":         true,
+				"reported_cost_usd":     reportedCostUSD,
+				"max_cost_usd":          5.0,
+				"runs":                  make([]map[string]any, tc.completed),
+				"cases":                 []map[string]any{{"runs": tc.completed}},
+				"failures":              []any{},
+			}
+			encoded, err := json.Marshal(report)
+			if err != nil {
+				t.Fatalf("marshal fake report: %v", err)
+			}
+			command := exec.Command(filepath.Join(repoRoot(), "scripts", "agent-lab.sh"), t.TempDir())
+			command.Env = append(os.Environ(),
+				"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"AGENT_LAB_LANE=quality_live",
+				"KOCORO_AGENT_LAB_QUALITY_LIVE=1",
+				"KOCORO_AGENT_LAB_QUALITY_SAMPLE=smoke",
+				"KOCORO_AGENT_LAB_QUALITY_REPETITIONS=3",
+				"KOCORO_AGENT_LAB_QUALITY_SEED=1",
+				"AGENT_LAB_FAKE_REPORT="+string(encoded),
+				"AGENT_LAB_FAKE_TEST_OUTPUT="+tc.testOutput,
+			)
+			output, err := command.CombinedOutput()
+			if tc.wantError == "" && err != nil {
+				t.Fatalf("quality lane rejected valid report and executed test: %v\n%s", err, output)
+			}
+			if tc.wantError != "" && err == nil {
+				t.Fatalf("quality lane unexpectedly accepted %s", tc.name)
+			}
+			if tc.wantError != "" && !strings.Contains(string(output), tc.wantError) {
+				t.Fatalf("quality lane error is not actionable; want %q in:\n%s", tc.wantError, output)
+			}
+		})
+	}
+}
+
+func TestOffline_AgentLabProviderLaneReportValidation(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq unavailable; provider qualification runner requires jq")
+	}
+	for _, tc := range []struct {
+		name              string
+		reportRepetitions int
+		costFailures      int
+		wantError         string
+	}{
+		{name: "valid_report", reportRepetitions: 1},
+		{name: "mismatched_repetitions", reportRepetitions: 2, wantError: "repetitions_per_cell"},
+		{name: "cost_failure", reportRepetitions: 1, costFailures: 1, wantError: "failure counts are non-zero"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeBin := writeAgentLabFakeGo(t)
+			report := map[string]any{
+				"schema_version":                      4,
+				"complete":                            true,
+				"completed":                           1,
+				"scheduled":                           1,
+				"seed":                                1,
+				"repetitions_per_cell":                tc.reportRepetitions,
+				"smoke":                               true,
+				"sample_qualifying":                   false,
+				"gate_passed":                         true,
+				"correctness_gate_passed":             true,
+				"performance_gate_passed":             nil,
+				"contract_failure_count":              0,
+				"runtime_failure_count":               0,
+				"duplicate_side_effect_failure_count": 0,
+				"cost_failure_count":                  tc.costFailures,
+				"runs":                                []map[string]any{{}},
+			}
+			encoded, err := json.Marshal(report)
+			if err != nil {
+				t.Fatalf("marshal fake provider report: %v", err)
+			}
+			command := exec.Command(filepath.Join(repoRoot(), "scripts", "agent-lab.sh"), t.TempDir())
+			command.Env = append(os.Environ(),
+				"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+				"AGENT_LAB_LANE=provider_live",
+				"KOE_PROVIDER_AGENTLOOP_E2E=1",
+				"KOE_PROVIDER_SAMPLE=smoke",
+				"KOE_PROVIDER_REPETITIONS=1",
+				"KOE_PROVIDER_SEED=1",
+				"AGENT_LAB_FAKE_REPORT="+string(encoded),
+				"AGENT_LAB_FAKE_TEST_OUTPUT==== RUN   TestKoeFastQualificationLive_AgentLoop\n--- PASS: TestKoeFastQualificationLive_AgentLoop (0.00s)\nPASS",
+			)
+			output, err := command.CombinedOutput()
+			if tc.wantError == "" && err != nil {
+				t.Fatalf("provider lane rejected valid report: %v\n%s", err, output)
+			}
+			if tc.wantError != "" && err == nil {
+				t.Fatalf("provider lane accepted %s", tc.name)
+			}
+			if tc.wantError != "" && !strings.Contains(string(output), tc.wantError) {
+				t.Fatalf("provider lane error is not actionable; want %q in:\n%s", tc.wantError, output)
+			}
+		})
+	}
+}
+
+func writeAgentLabFakeGo(t *testing.T) string {
+	t.Helper()
+	fakeBin := t.TempDir()
+	fakeGo := filepath.Join(fakeBin, "go")
+	content := "#!/bin/sh\nreport_path=\"${KOCORO_AGENT_LAB_QUALITY_OUTPUT:-${KOE_FAST_QUALIFICATION_OUTPUT:-}}\"\nprintf '%s\\n' \"$AGENT_LAB_FAKE_REPORT\" > \"$report_path\"\nprintf '%s\\n' \"$AGENT_LAB_FAKE_TEST_OUTPUT\"\n"
+	if err := os.WriteFile(fakeGo, []byte(content), 0o700); err != nil {
+		t.Fatalf("write fake go: %v", err)
+	}
+	return fakeBin
 }
 
 func loadAgentLabQualityConfig(t *testing.T) agentLabQualityConfig {
@@ -1009,8 +1185,8 @@ func newAgentLabQualityReport(
 			"Exercises the production AgentLoop and real configured provider with response_cache_policy=off; it does not exercise daemon routing or Desktop rendering.",
 			"The research tool is deterministic, read-only, and bounded to one synthetic tool result backed by the reported IANA URL; the gate does not measure open-web retrieval freshness.",
 			"Email quality is non-delivery text generation only; no external account or send tool is registered.",
-			"Three repetitions per case qualify comparison evidence; release qualification fails closed below 30 complete repetitions per case.",
-			"Release qualification also requires every run correct and provider token and cost observations present.",
+			fmt.Sprintf("%d repetitions per case qualify comparison evidence; release qualification fails closed below %d complete repetitions per case.", agentLabQualityComparisonRepetitions, agentLabQualityReleaseRepetitions),
+			"Comparison and release qualification also require every run correct, provider token and cost observations present, and reported cost within the configured cap.",
 		},
 	}
 	var latencies []int64
@@ -1044,10 +1220,12 @@ func newAgentLabQualityReport(
 	}
 	report.Cases = summarizeAgentLabQualityCases(results)
 	allCorrect := report.Complete && report.CorrectRuns == report.Completed && report.Completed > 0
+	withinCostCap := report.MaxCostUSD > 0 && report.ReportedCostUSD <= report.MaxCostUSD
 	report.ComparisonQualifying = allCorrect &&
+		report.UsageObserved && report.CostObserved && withinCostCap &&
 		cfg.repetitions >= agentLabQualityComparisonRepetitions
 	report.ReleaseQualifying = cfg.sample == "release" && allCorrect &&
-		report.UsageObserved && report.CostObserved &&
+		report.UsageObserved && report.CostObserved && withinCostCap &&
 		cfg.repetitions >= agentLabQualityReleaseRepetitions
 	return report
 }

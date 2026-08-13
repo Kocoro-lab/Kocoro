@@ -54,6 +54,15 @@ speaker behavior, AEC, user barge-in, or Desktop UI integration.
 Run the opt-in suites on macOS with the Koe audio dependencies installed:
 
 ```bash
+# Core one-shot plus bundled Explorer/Reviewer smoke. The fixture-backed
+# structured oracles check exact results; this is still a smoke, not a broad
+# general-agent quality score.
+SHANNON_E2E_LIVE=1 \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+go test -tags=live ./test/e2e \
+  -run '^TestLive_OneShotCoreAndBundledAgentsSmoke$' \
+  -count=1 -v -timeout=5m
+
 SHANNON_E2E_LIVE=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
 go test -tags=live ./test/e2e \
@@ -63,23 +72,68 @@ go test -tags=live ./test/e2e \
 SHANNON_E2E_LIVE=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
 go test -tags=live ./test/e2e \
-  -run '^TestLive_(MidRunProgressNotesReachTheUser|DedicatedContentSearchAvoidsShell|BusinessErrorStopsWithoutRetry|ChannelDeliveryMetadataShapesReply|IsolatedMCPAllowlist_FullPath)$' \
+  -run '^TestLive_(MidRunProgressNotesReachTheUser|BusinessErrorStopsWithoutRetry|ChannelDeliveryMetadataShapesReply|IsolatedMCPAllowlist_FullPath)$' \
   -count=1 -v -timeout=12m
+
+# Paid production-tool-surface matrix. Comparison is 3 repetitions per case;
+# release is 5 and requires SAMPLE=release. Both require every answer, tool
+# argument, and state oracle to pass; cost is capped and the report is JSON.
+SHANNON_E2E_LIVE=1 \
+KOCORO_TOOL_CHOICE_LIVE=1 \
+KOCORO_TOOL_CHOICE_SAMPLE=comparison \
+KOCORO_TOOL_CHOICE_REPETITIONS=3 \
+go test -tags=live ./test/e2e \
+  -run '^TestLive_ToolChoiceMatrix$' \
+  -count=1 -v -timeout=30m
+
+# General-agent outcome dataset: 24 writing, extraction/planning, file,
+# research-honesty, clarification, recovery, and everyday/voice-style tasks.
+# Tools and side effects are sandboxed; the provider and AgentLoop are real.
+# Set SAMPLE=release and REPETITIONS=5 for release qualification.
+SHANNON_E2E_LIVE=1 \
+KOCORO_GENERAL_OUTCOME_LIVE=1 \
+KOCORO_GENERAL_OUTCOME_SAMPLE=comparison \
+KOCORO_GENERAL_OUTCOME_REPETITIONS=1 \
+go test -tags=live ./test/e2e \
+  -run '^TestLive_GeneralAgentOutcomeDataset$' \
+  -count=1 -v -timeout=60m
 
 # Paid response-style A/B: 2 models x 3 prompts x 3 styles = 18 calls.
 SHANNON_E2E_LIVE=1 \
 KOCORO_RESPONSE_DETAIL_AB=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
-go test ./test/e2e \
+go test -tags=live ./test/e2e \
   -run '^TestLive_ResponseDetailAcrossProviders$' \
   -count=1 -v -timeout=12m
 
+# Paid image transport smoke. This checks the Cloud/CDN wire path and metadata,
+# not prompt adherence, perceptual quality, or edit quality.
+SHANNON_E2E_LIVE=1 \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+go test -tags=live ./test/e2e \
+  -run '^TestLive_ImageGenerateEditTransportSmoke$' \
+  -count=1 -v -timeout=5m
+
 KOE_LIVE_TEXT_FULL_PATH_E2E=1 \
 PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
-go test ./internal/koe \
+go test -tags=live ./internal/koe \
   -run '^TestKoeLiveFullPathMatrixE2E$' \
   -count=1 -v -timeout=12m
+
+# Human-read diagnostic only. The behavior tally is intentionally not a
+# release gate and is absent unless the dedicated build tag is supplied.
+KOE_CORRECTION_SUPPRESSION_DIAGNOSTIC=1 \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig \
+go test -tags=koe_diagnostic ./internal/koe \
+  -run '^TestKoeCorrectionSuppressionDiagnostic$' \
+  -count=1 -v -timeout=15m
 ```
+
+The machine-readable change-to-eval map is
+`test/e2e/testdata/change_impact_manifest.json`. Each entry separates the
+deterministic lane, paid comparison evidence, and release qualification. A
+`release_status` of `gap` is intentional and must not be promoted from a green
+probe or mechanism test.
 
 The Realtime call-creation POST is never automatically replayed after an error.
 The public API does not document idempotency for this endpoint, so a failed

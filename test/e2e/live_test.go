@@ -37,27 +37,91 @@ import (
 // store access, non-allowlisted MCP connects, and process-global browser cleanup
 // while preserving the real HTTP/agent/provider path.
 
-func TestLive_OneShot_BasicQuery(t *testing.T) {
+func TestLive_OneShotCoreAndBundledAgentsSmoke(t *testing.T) {
 	skipUnlessLive(t)
 	bin := testBinary(t)
 
-	out := runShan(t, bin, "what is 2+1")
-	if !strings.Contains(out, "3") {
-		t.Errorf("expected answer containing '3', got: %s", out)
+	tests := []struct {
+		name    string
+		args    []string
+		prepare func(t *testing.T) (cwd string, verify func(t *testing.T, result map[string]interface{}))
+	}{
+		{
+			name: "core_reasoning",
+			args: []string{
+				`Calculate 37 * 41. Return exactly one JSON object with this schema: {"schema":"kocoro-live-smoke-v1","product":<integer>,"parity":"odd or even"}.`,
+			},
+			prepare: func(t *testing.T) (string, func(*testing.T, map[string]interface{})) {
+				return "", func(t *testing.T, result map[string]interface{}) {
+					requireJSONNumber(t, result, "product", 1517)
+					requireJSONString(t, result, "parity", "odd")
+				}
+			},
+		},
+		{
+			name: "explorer_reads_project_facts",
+			args: []string{
+				"--agent", "explorer",
+				`Inspect service.yaml and dependencies.txt in the current directory. Return exactly one JSON object with this schema: {"schema":"kocoro-live-smoke-v1","service":<string>,"port":<integer>,"dependency":<string>,"source_files":[<strings>]}. Do not infer values without reading the files.`,
+			},
+			prepare: func(t *testing.T) (string, func(*testing.T, map[string]interface{})) {
+				cwd := neutralTempDir(t, "live-smoke-explorer-*")
+				writeLiveSmokeFixture(t, cwd, "service.yaml", "service: aurora-ledger\nport: 43127\ndependency_ref: dependencies.txt\n")
+				writeLiveSmokeFixture(t, cwd, "dependencies.txt", "primary=quartz-index-v7\n")
+				return cwd, func(t *testing.T, result map[string]interface{}) {
+					requireJSONString(t, result, "service", "aurora-ledger")
+					requireJSONNumber(t, result, "port", 43127)
+					requireJSONString(t, result, "dependency", "quartz-index-v7")
+					requireJSONStringSet(t, result, "source_files", []string{"dependencies.txt", "service.yaml"})
+				}
+			},
+		},
+		{
+			name: "reviewer_finds_concrete_bug_without_editing",
+			args: []string{
+				"--agent", "reviewer",
+				`Review review_target.go in the current directory for its primary correctness bug. Return exactly one JSON object with this schema: {"schema":"kocoro-live-smoke-v1","symbol":<string>,"severity":"high or medium or low","actual_expression":<string>,"correct_expression":<string>,"failure_condition":<string>}. Do not modify the file.`,
+			},
+			prepare: func(t *testing.T) (string, func(*testing.T, map[string]interface{})) {
+				cwd := neutralTempDir(t, "live-smoke-reviewer-*")
+				const source = "package ledger\n\n// Remaining returns unspent capacity.\nfunc Remaining(total, used uint64) uint64 {\n\treturn used - total\n}\n"
+				writeLiveSmokeFixture(t, cwd, "review_target.go", source)
+				return cwd, func(t *testing.T, result map[string]interface{}) {
+					requireJSONString(t, result, "symbol", "Remaining")
+					severity, _ := result["severity"].(string)
+					if severity != "high" && severity != "medium" {
+						t.Errorf("severity = %q, want high or medium", severity)
+					}
+					requireJSONString(t, result, "actual_expression", "used - total")
+					requireJSONString(t, result, "correct_expression", "total - used")
+					failure, _ := result["failure_condition"].(string)
+					failure = strings.ToLower(failure)
+					if !strings.Contains(failure, "used") || !strings.Contains(failure, "total") ||
+						(!strings.Contains(failure, "<") && !strings.Contains(failure, "less")) {
+						t.Errorf("failure_condition = %q, want the used < total underflow condition", result["failure_condition"])
+					}
+					got, err := os.ReadFile(filepath.Join(cwd, "review_target.go"))
+					if err != nil {
+						t.Fatalf("read reviewer fixture after run: %v", err)
+					}
+					if string(got) != source {
+						t.Fatal("reviewer modified review_target.go")
+					}
+				}
+			},
+		},
 	}
-	// Should use Anthropic model, not GPT fallback
-	if strings.Contains(out, "gpt-5-mini") {
-		t.Error("should not fall back to gpt-5-mini — check cache_break fix")
-	}
-}
 
-func TestLive_OneShot_AutoApproveToolUse(t *testing.T) {
-	skipUnlessLive(t)
-	bin := testBinary(t)
-
-	out := runShan(t, bin, "-y", "list files in the current directory")
-	if !strings.Contains(out, "directory_list") && !strings.Contains(out, "bash") {
-		t.Error("expected tool call (directory_list or bash)")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cwd, verify := tt.prepare(t)
+			out := runShanInDir(t, cwd, bin, tt.args...)
+			if strings.Contains(out, "gpt-5-mini") {
+				t.Error("should not fall back to gpt-5-mini — check cache_break fix")
+			}
+			result := decodeLiveSmokeResult(t, out)
+			verify(t, result)
+		})
 	}
 }
 
@@ -81,35 +145,6 @@ func TestLive_OneShot_SessionCWD(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, expected) && !strings.Contains(out, tmpDir) {
 		t.Errorf("expected CWD %q or %q in output, got: %s", expected, tmpDir, out)
-	}
-}
-
-func TestLive_BundledAgent_Explorer(t *testing.T) {
-	skipUnlessLive(t)
-	bin := testBinary(t)
-
-	out := runShan(t, bin, "--agent", "explorer", "what files are in this project")
-	// Explorer should use read-only tools
-	if strings.Contains(out, "file_write") || strings.Contains(out, "file_edit") {
-		t.Error("explorer should not use write tools")
-	}
-}
-
-func TestLive_BundledAgent_Reviewer(t *testing.T) {
-	skipUnlessLive(t)
-	bin := testBinary(t)
-
-	out := runShan(t, bin, "--agent", "reviewer", "review main.go")
-	// The OnText / OnPreamble split (a398ecd, v0.1.3) stopped surfacing tool-call
-	// names in one-shot stdout — only assistant text reaches the user. Assert the
-	// reviewer actually engaged with the file by checking it cited something only
-	// readable from the source: cmd.Execute() (the only symbol main.go references).
-	// A length floor guards against trivially-short refusals or stub responses.
-	if len(out) < 200 {
-		t.Errorf("reviewer output too short (%d bytes); likely did not engage with file: %s", len(out), out)
-	}
-	if !strings.Contains(out, "cmd.Execute") && !strings.Contains(out, "main.go") && !strings.Contains(out, "package main") {
-		t.Errorf("reviewer output lacks evidence of having read main.go (no mention of cmd.Execute / main.go / package main): %s", out)
 	}
 }
 
@@ -214,7 +249,15 @@ func TestLive_Daemon_AgentListIncludesBuiltins(t *testing.T) {
 
 func runShan(t *testing.T, bin string, args ...string) string {
 	t.Helper()
+	return runShanInDir(t, "", bin, args...)
+}
+
+func runShanInDir(t *testing.T, dir, bin string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command(bin, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stdout
@@ -222,6 +265,72 @@ func runShan(t *testing.T, bin string, args ...string) string {
 		t.Fatalf("shan %v failed: %v\n%s", args, err, stdout.String())
 	}
 	return stdout.String()
+}
+
+func writeLiveSmokeFixture(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("write live smoke fixture %s: %v", name, err)
+	}
+}
+
+func decodeLiveSmokeResult(t *testing.T, output string) map[string]interface{} {
+	t.Helper()
+	for offset := 0; offset < len(output); {
+		relative := strings.IndexByte(output[offset:], '{')
+		if relative < 0 {
+			break
+		}
+		start := offset + relative
+		var result map[string]interface{}
+		if err := json.NewDecoder(strings.NewReader(output[start:])).Decode(&result); err == nil {
+			if result["schema"] == "kocoro-live-smoke-v1" {
+				return result
+			}
+		}
+		offset = start + 1
+	}
+	t.Fatalf("output did not contain a valid kocoro-live-smoke-v1 JSON object: %s", output)
+	return nil
+}
+
+func requireJSONString(t *testing.T, result map[string]interface{}, key, want string) {
+	t.Helper()
+	got, ok := result[key].(string)
+	if !ok || got != want {
+		t.Errorf("%s = %#v, want %q", key, result[key], want)
+	}
+}
+
+func requireJSONNumber(t *testing.T, result map[string]interface{}, key string, want float64) {
+	t.Helper()
+	got, ok := result[key].(float64)
+	if !ok || got != want {
+		t.Errorf("%s = %#v, want %v", key, result[key], want)
+	}
+}
+
+func requireJSONStringSet(t *testing.T, result map[string]interface{}, key string, want []string) {
+	t.Helper()
+	values, ok := result[key].([]interface{})
+	if !ok || len(values) != len(want) {
+		t.Errorf("%s = %#v, want exactly %v", key, result[key], want)
+		return
+	}
+	got := make(map[string]bool, len(values))
+	for _, value := range values {
+		s, ok := value.(string)
+		if !ok {
+			t.Errorf("%s contains non-string value %#v", key, value)
+			return
+		}
+		got[filepath.Base(s)] = true
+	}
+	for _, value := range want {
+		if !got[value] {
+			t.Errorf("%s = %#v, missing %q", key, result[key], value)
+		}
+	}
 }
 
 type isolatedLiveDaemon struct {
@@ -452,13 +561,15 @@ func waitForIsolationMarkers(t *testing.T, daemon *isolatedLiveDaemon, timeout t
 	t.Fatalf("isolated daemon did not confirm contained startup\n%s", daemon.output.String())
 }
 
-// TestLive_GenerateAndEditImage exercises the v0.1.4 generate_image +
-// edit_image pipeline against the configured Shannon Cloud endpoint. It
+// TestLive_ImageGenerateEditTransportSmoke exercises the v0.1.4 generate_image
+// and edit_image transport pipeline against the configured Shannon Cloud endpoint. It
 // bypasses the agent loop's per-call approval gate (which legitimately blocks
 // image tools under -y) and calls the production HTTP client directly,
-// validating the wire contract end-to-end. This is a paid live test; current
-// cost expectations are maintained in the private QA process.
-func TestLive_GenerateAndEditImage(t *testing.T) {
+// validating request, response metadata, and CDN handoff end-to-end. It does
+// not judge whether either image matches the prompt or has acceptable visual
+// quality. This is a paid live test; current cost expectations are maintained
+// in the private QA process.
+func TestLive_ImageGenerateEditTransportSmoke(t *testing.T) {
 	skipUnlessLive(t)
 
 	endpoint, apiKey := readCloudConfig(t)
