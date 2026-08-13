@@ -1,5 +1,3 @@
-//go:build darwin && cgo
-
 package koe
 
 import (
@@ -22,9 +20,12 @@ import (
 // function_call_output, then response.create). In production sendFn is the data
 // channel SendText; in tests it captures.
 type eventHandler struct {
-	disp   *Dispatcher
-	state  *CallState
-	audio  *AudioIO // nil in unit tests; the production half-duplex gate target
+	disp  *Dispatcher
+	state *CallState
+	// audio is nil in unit tests; the production half-duplex gate target. Always
+	// assign it through normalizeAudioController — a typed-nil implementation
+	// would defeat the `h.audio != nil` guards below (see audiocontroller.go).
+	audio  AudioController
 	sendFn func(any) error
 	// respBusy is true while a realtime response is generating. The serialized
 	// sender must not send response.create while one is active (GA rejects it with
@@ -587,7 +588,7 @@ var (
 	responseRequestSeq atomic.Uint64
 )
 
-func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error) *eventHandler {
+func newEventHandler(disp *Dispatcher, state *CallState, audio AudioController, sendFn func(any) error) *eventHandler {
 	mailbox := NewResultMailbox()
 	if state != nil {
 		mailbox.BeginBurst(state.BurstID())
@@ -595,12 +596,12 @@ func newEventHandler(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn 
 	return newEventHandlerWithMailbox(disp, state, audio, sendFn, mailbox, nil)
 }
 
-func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *AudioIO, sendFn func(any) error, mailbox *ResultMailbox, canAnnounce func() bool) *eventHandler {
+func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio AudioController, sendFn func(any) error, mailbox *ResultMailbox, canAnnounce func() bool) *eventHandler {
 	if mailbox == nil {
 		mailbox = NewResultMailbox()
 	}
 	h := &eventHandler{
-		disp: disp, state: state, audio: audio, sendFn: sendFn,
+		disp: disp, state: state, audio: normalizeAudioController(audio), sendFn: sendFn,
 		respReq:       make(chan responseCreateRequest, 8),
 		loopRespReq:   make(chan responseCreateRequest, 1),
 		respCreated:   make(chan struct{}, 1),
