@@ -1097,6 +1097,45 @@ func TestServer_PatchConfigAcceptsEmptyEffortTier(t *testing.T) {
 	}
 }
 
+func TestServer_PatchConfigResponseDetail(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		value      string
+		wantStatus int
+		wantYAML   bool
+	}{
+		{name: "concise", value: "concise", wantStatus: http.StatusOK, wantYAML: true},
+		{name: "balanced", value: "balanced", wantStatus: http.StatusOK, wantYAML: true},
+		{name: "detailed", value: "detailed", wantStatus: http.StatusOK, wantYAML: true},
+		{name: "invalid default", value: "default", wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			shannonDir := t.TempDir()
+			configPath := filepath.Join(shannonDir, "config.yaml")
+			if err := os.WriteFile(configPath, []byte("model_tier: medium\n"), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			srv := NewServer(0, nil, &ServerDeps{ShannonDir: shannonDir}, "test")
+			rec := httptest.NewRecorder()
+			body := fmt.Sprintf(`{"agent":{"response_detail":%q}}`, tt.value)
+			req := httptest.NewRequest(http.MethodPatch, "/config", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			srv.handlePatchConfig(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status code = %d, want %d, body=%s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			data, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatalf("read config: %v", err)
+			}
+			hasValue := strings.Contains(string(data), "response_detail: "+tt.value)
+			if hasValue != tt.wantYAML {
+				t.Fatalf("config response_detail persisted=%t, want %t; yaml=%s", hasValue, tt.wantYAML, data)
+			}
+		})
+	}
+}
+
 func TestServer_PatchConfigRejectsInvalidServiceTier(t *testing.T) {
 	shannonDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("model_tier: medium\n"), 0o600); err != nil {

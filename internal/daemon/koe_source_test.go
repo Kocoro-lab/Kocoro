@@ -84,6 +84,18 @@ func TestKoeBannerAndTitlePreservation(t *testing.T) {
 	}
 }
 
+func TestShouldEmitLocalReplyBanner_ClientOwnsDeliveredReply(t *testing.T) {
+	if shouldEmitLocalReplyBanner("desktop", 1) {
+		t.Fatal("a delivered agent_reply must suppress the daemon's generic completion banner")
+	}
+	if !shouldEmitLocalReplyBanner("desktop", 0) {
+		t.Fatal("a detached desktop run must retain the local completion fallback")
+	}
+	if shouldEmitLocalReplyBanner("heartbeat", 0) {
+		t.Fatal("autonomous heartbeat runs must remain silent when detached")
+	}
+}
+
 func TestKoeCacheSource(t *testing.T) {
 	if got := cacheSourceFromDaemonSource("koe"); got != "koe" {
 		t.Errorf("cacheSourceFromDaemonSource(\"koe\") = %q, want \"koe\"", got)

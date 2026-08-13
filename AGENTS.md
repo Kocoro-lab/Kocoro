@@ -1,224 +1,369 @@
-# Kocoro Project Guide
+# Kocoro Project Guide (AGENTS.md)
 
-## What This Is
+**Condensed mirror of `CLAUDE.md` for external coding agents. `CLAUDE.md` in this
+directory is the full guide** — open it for reasoning, wire details, incident
+history, or any subsystem not listed here. This file carries only rules you can
+act on, plus the symbols and constants to grep. If the two disagree, `CLAUDE.md`
+and the code win.
 
-Kocoro is the Go CLI/runtime for Shannon AI agents. The main production path is daemon + Kocoro Desktop + Shannon Cloud: the daemon connects to Cloud over WebSocket, receives channel messages, runs the agent loop locally with full tool access, and streams results back. It also supports interactive TUI, one-shot CLI, MCP server mode, and local scheduled tasks.
+**Keep this file under 24 KB.** Harnesses that read `AGENTS.md` do so under a byte
+budget shared across every such file from the repo root down (32 KiB by default),
+and an over-budget file is truncated **from the tail, with no marker in the injected
+text** — the reader cannot tell it got a partial file, and the sections at the bottom
+are simply gone. CI asserts the ceiling; if you need more room, cut prose, not rules.
+
+Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production path:
+daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WebSocket,
+receives channel messages, runs the agent loop locally with full tool access, and
+streams back. Also TUI, one-shot CLI, MCP server, local scheduled tasks.
+
+Layout: `cmd/` (Cobra) + `internal/<pkg>/`; use Glob/Grep. Production path is
+`internal/daemon/` driving `internal/agent/`.
 
 ## Working Rules
 
-- Use the Go version declared in go.mod as source of truth.
-- Prefer existing repo patterns over new abstractions. Keep changes small and directly tied to the task.
+- `go.mod` is the source of truth for the Go version.
+- Prefer existing repo patterns over new abstractions; keep changes tied to the task.
 - Verify API response bodies, not just status codes.
-- Do not create parallel `_enhanced` variants; update existing code in place.
-- For risky behavior changes, preserve operator-visible flags, rollback paths, and focused tests.
-- When touching dependency or generated-code surfaces, test locally before pushing.
-- When adding small hardcoded caps, document the workload, binding symptom, and override path. Prefer config defaults for caps power users may need to lift.
+- No parallel `_enhanced` variants — update existing code in place.
+- For risky behavior changes, preserve operator-visible flags, rollback paths, focused tests.
+- Test locally before pushing when touching dependency or generated-code surfaces.
+- New `const max[A-Z]\w+ = <small_int>`: the comment MUST name (1) the workload
+  justifying the value, (2) the symptom when it binds, (3) the override path.
+  Prefer `viper.SetDefault(...)` for caps a power user might lift. Re-check
+  small-int caps on model-family upgrades — 200K-era defaults bind silently at 1M.
 
-## Module Map
+## Doc Co-Maintenance
 
-- cmd: CLI entry points for one-shot, daemon, scheduling, update, and MCP serve.
-- internal/daemon: primary production path; HTTP API server, WebSocket client, routing, approvals + structured user questions (`pending.go` `pendingCore[D]` shared by `ApprovalBroker` and `QuestionBroker`), events, launchd, attachments, session CWD, memory fallback, suggestions, Desktop skill-install recommendations (`skill_recommendation.go`), email/password auth (`auth.go` / `auth_handlers.go` / `ws_controller.go`), Desktop RPC reverse-channel (`desktop_rpc/` subpackage — Unix sock listener + length-prefixed JSON codec + DesktopRPCBroker for Calendar RPC v1).
-- internal/agent: core loop; tool batching, compaction, spill/budget state, deferred loading, state cache, read tracking, approvals, phase/watchdog, thinking handling, prompt suggestions, forked requests.
-- internal/koe: macOS native speech-to-speech voice front brain; one first-person Kocoro identity; Realtime tool authority; bounded continuation; call-scoped task ledger with one `do_task` per response by default and explicit, disjoint scopes for parallel calls; asynchronous result mailbox; and reversible raw-audio native-floor barge-in. Keep `stop_speaking` (current output), `cancel` (delegated work), and terminal `end_call` (voice session) as separate authorities. ASR transcripts remain asynchronous evidence/logging, not ordinary-turn, barge-in-admission, or default dismissal control.
-- internal/tools: local, gateway, cloud, schedule, publish/upload, image, memory, MCP, and document tools.
-- internal/keychain: credential store wrapper for daemon api_key — macOS Keychain / Windows Credential Manager via go-keyring (backend_keyring.go), Linux file store at ~/.shannon/credentials.json 0600 (backend_linux.go + backend_file.go); `keychain.Supported()` = darwin||windows||linux, other platforms return ErrUnsupportedPlatform. Constructor `NewOSStoreAt(dir, logger)`; callers pass config.ShannonDir().
-- internal/client: gateway/SSE/Ollama clients plus AuthClient (`/api/v1/auth/*` REST wrapper).
-- internal/session: session persistence, lifecycle, titles, and SQLite FTS index.
-- internal/config: config loading, merging, settings, and setup.
-- internal/skills: skill registry, bundled skills, marketplace install, provenance, secrets, validation. Marketplace has two independent API surfaces: `/skills/marketplace/*` (static registry, integer-page pagination — the frozen macOS Desktop contract) and `/skills/clawhub/*` (ClawHub live catalog, opaque cursor pagination + per-version file browsing).
-- internal/memory: sidecar client/supervisor, bundle puller, tenant safety, audit, service orchestration.
-- internal/sync: opt-in session sync; locking, markers, scanning, batching, upload, backoff.
-- internal/mcp: MCP client/server and browser profile lifecycle.
-- internal/permissions: command permission model and safety checks.
-- internal/runstatus, audit, hooks, prompt, instructions, context, schedule, tui, update: supporting runtime surfaces.
-- test/e2e contains offline and live E2E coverage.
+Feature changes update `README.md`, `CLAUDE.md`, and this file.
 
-## Critical Invariants
+**The bundled `kocoro` skill is the AI-facing source of truth for the daemon HTTP
+API.** Every `mux.HandleFunc(...)` in `internal/daemon/server.go` the agent calls
+needs a matching `internal/skills/bundled/skills/kocoro/references/*.md` entry in
+the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
+`docs/desktop-wire-fixtures/`.
 
-### Kocoro Skill Docs
+## Tools
 
-The bundled `kocoro` skill is the AI-facing source of truth for daemon HTTP APIs, config fields, and workflows. Any new daemon endpoint, endpoint behavior change, config surface, or user-facing workflow must update the matching bundled skill reference in the same change. Missing references cause agents to invent API workarounds.
+- **Required fields**: every `Run()` MUST check each `ToolInfo.Required` field is
+  non-zero right after `json.Unmarshal` and return `agent.ValidationError(...)`,
+  NOT a bare `ToolResult{IsError: true}`. Go's decoder cannot distinguish missing
+  from zero, so a missing string arrives as `""` and `os.WriteFile` accepts it.
+  The `[validation error]` prefix is load-bearing — `LoopDetector.isValidationErrorSig`
+  force-stops on 3 consecutive, far below the all-errors 2x `ConsecutiveDup` budget.
+- **Priority**: local > MCP > gateway, deduped by name. MCP-vs-MCP collisions
+  resolve to the alphabetically-first server (`RebuildRegistryForHealth`); the
+  shadowed tool is logged, never registered.
+- **Exposure** (`agent/exposure.go EffectiveToolExposure`): explicit
+  `ToolExposure` first, then source default — local Direct; MCP/gateway/
+  integration Deferred. `ask_user_question` is explicitly Direct. `web_search` /
+  `web_fetch` are Direct **only when `ToolSource()==SourceGateway`**
+  (`tools/exposure.go ServerTool.ToolExposure`); a same-named MCP or integration
+  tool keeps its Deferred default so a third-party catalog cannot widen the base
+  schema surface. GUI/process automation and calendar/schedule mutations are
+  Deferred; calendar/schedule reads stay Direct.
+- `tool_search` uses deterministic BM25 (`agent/toolsearch_index.go`,
+  `toolSearchDefaultLimit` 8) with exact `select:` lookup. The 16K Direct-schema
+  budget is a regression diagnostic and MUST NEVER reclassify tools at runtime.
+- Skill `allowed-tools` is execution-time denial, NOT schema filtering — the tools
+  array stays byte-stable for the prompt cache. `agent.SkillExempt` (`think`,
+  `tool_search`, `use_skill`) is for pure infrastructure only; do NOT exempt
+  side-effecting tools.
+- **Concurrency**: the dispatcher batches by `IsConcurrencySafeCall`, not
+  `IsReadOnlyCall`; tools without a `ConcurrencySafeChecker` fall back to their
+  `IsReadOnlyCall` value. `BashTool` implements it in `tools/bash_concurrency.go`,
+  gated by `agent.bash_concurrency_enabled` (default true): only a strict
+  read-only leading token AND no shell metacharacters (incl. `\n` / `\r`) is
+  eligible; everything else stays in a size-1 serial batch.
+- `tool_status` running/completed carry `tool_use_id` (capability
+  `tool_use_id_events`).
+- Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
+  model-written). The daemon does NOT block on a missing one; UI clients MUST use
+  `description?.trim() || fallback`, NOT nullish coalescing.
 
-### Builtin Skills
+## MCP
 
-Bundled skills are overlaid into the user skill directory on startup and user edits are overwritten. Fork under a new skill name to customize. The hidden generative UI skill emits `html-artifact` blocks for Desktop's sandboxed WKWebView; session-share pages render the same blocks in a sandboxed iframe via `internal/share/artifact.go` (host CSS/CSP/bridge mirrored verbatim from Desktop — see CLAUDE.md). Shared pages strip tool runs (prose + images only).
+- Probe and reconnect a supervisor-known-disconnected server BEFORE dispatch.
+- Every tools/call is bounded by per-server `tool_timeout_secs` >
+  `mcp.tool_timeout_secs` (`mcp.DefaultToolCallTimeout` 300s); an earlier caller
+  deadline still wins.
+- A post-dispatch transport failure repairs the connection but re-dispatches ONLY
+  `mcp.ToolReplaySafe` tools (read-only/idempotent annotations) — a transport
+  error after dispatch does NOT prove the server never acted, since a stdio server
+  can commit its write and die before responding. Everything else returns
+  `mcp.OutcomeUnknownError`. Timeouts and protocol errors are never retried.
+- A failed async connect is NOT terminal: `ReconnectScheduler`
+  (`internal/mcp/reconnect.go`) retries with backoff (5s → 5min,
+  `reconnectMaxAttempts` 6). Retries are owned by the manager generation —
+  `SwapMCPReconnectScheduler` stops a superseded ladder on reload and
+  `ShutdownCleanup` stops it before closing connections, so a timer never respawns
+  a subprocess the cleanup is reaping. `ForgetMCPReconnect` re-arms an exhausted
+  streak.
+- Stdio subprocesses spawn in their own process group, killed via `-pgid` SIGTERM
+  + 3s SIGKILL — npx-bridged servers are a process chain.
+- Artifact paths: servers with known path semantics (playwright, or any
+  `workspace_base`) get "Saved to:" absolute annotations for files that verifiably
+  exist. Screenshot filenames default into `~/.shannon/tmp/sessions/<id>/` (swept
+  by `daemon.scratch_max_age_days`, default 14). **`browser_snapshot` NEVER gets a
+  default filename** — omitting it returns the inline accessibility snapshot.
+  Model-supplied absolute paths always win.
 
-`internal/daemon/skill_filter.go` maintains a `desktopOnlySkills` registry. Daemon filters these out of the per-request skill list when `req.Source` is a cloud-distributed channel (Feishu / Lark / WeCom / Slack / LINE / Telegram / webhook), keeping the use_skill tool registry, scaffolded listing, and semantic discovery consistent. Filter is applied once on the producer side immediately after `LoadGlobalSkills` so all consumers see the same view. Drift test (`skill_filter_test.go`) walks the `desktopOnlySkills × cloudSourceSet` cross product.
-
-### Agent Names
-
-Agent names must match `^[a-z0-9][a-z0-9_-]{0,63}$`. Validate before path construction.
-
-### Tool Registry
-
-Tool priority is local tools, then MCP tools, then gateway tools. Deduplicate by name; MCP-vs-MCP name collisions resolve to the alphabetically-first server (sorted iteration, stable across rebuilds) and the shadowed tool is logged. Skill `allowed-tools` is enforced at execution time, not by schema filtering, to keep prompt-cache tool arrays stable.
-
-MCP tool dispatch is resilience-guarded: a supervisor-known-disconnected server is probed and reconnected before the call is sent (never dispatch onto a known-dead connection), every tools/call attempt is bounded by per-server `tool_timeout_secs` falling back to `mcp.tool_timeout_secs` (default 300s), and a post-dispatch transport failure always repairs the connection but re-dispatches ONLY tools whose MCP annotations mark them read-only or idempotent — a transport error after dispatch does not prove the server never acted (a stdio server can execute its write and die before responding), so unannotated tools surface an explicit outcome-unknown result instead of a blind retry. Timeouts and protocol errors are never retried. Artifact paths from file-producing MCP servers are made unambiguous on both sides: results from servers with known path semantics (playwright, or any server with `workspace_base`) get "Saved to:" absolute-path annotations for files that verifiably exist, and screenshot output filenames default into the per-session artifact scratch dir (`~/.shannon/tmp/sessions/<id>/`, created lazily, swept by age at daemon startup) on daemon-served runs so intermediates stay out of user-visible folders. browser_snapshot never receives a default filename — its filename is a mode switch and omitting it returns the accessibility snapshot inline, the model's primary page-reading channel.
-
-Skill-exempt tools must be pure infrastructure with no external side effects. Do not exempt side-effecting tools from skill restrictions.
-
-Tool exposure resolves per tool: explicit `ToolExposure` first, then source
-defaults. Local tools default Direct; MCP, gateway, and integration tools
-default Deferred. `tool_search` discovers cold Deferred tools through
-deterministic BM25 over canonical name, description, schema, source, and
-namespace metadata, with exact `select:` lookup for known names. Schema-size
-budgets are regression diagnostics only and must never reclassify tools at
-runtime.
-
-### Tool Concurrency
-
-The dispatcher batches tool calls by `IsConcurrencySafeCall`, not `IsReadOnlyCall`. Tools without an explicit `ConcurrencySafeChecker` implementation fall back to their `IsReadOnlyCall` value — so file_read / grep / glob etc. keep batching concurrently as before, and writers stay serial. Adding the new interface to one tool has no effect on any other tool's grouping.
-
-`BashTool` implements `IsConcurrencySafeCall` via `internal/tools/bash_concurrency.go`. It is gated by `agent.bash_concurrency_enabled` (default `true` in Phase C — Desktop consumes the `tool_use_id_events` capability so id-keyed cards stay correct under concurrent batches). When the flag is on, commands whose first token is in a strict read-only whitelist AND contain no shell metacharacters (including `\n` / `\r`) are eligible for the concurrent batch. Everything else — `&&` / pipes / redirects / command substitution, plus any non-whitelisted leading token (`git push`, `npm install`, `curl`, `rm`, `git remote add`, `go env -w`, ...) — stays in a size-1 serial batch.
-
-Tool events on the SSE/WS wire (`tool_status` running + completed) include a `tool_use_id` field so multi-tool-in-flight UIs (e.g. parallel bash) can pair them correctly. The daemon advertises this on the WS handshake via the `tool_use_id_events` capability token.
-
-### Tool Required-Field Validation
-
-Every tool's `Run()` MUST explicitly check that each field listed in `ToolInfo.Required` is non-zero immediately after `json.Unmarshal`, and return `agent.ValidationError(...)` (NOT a bare `ToolResult{Content: ..., IsError: true}`) on failure. Go's json decoder cannot distinguish "field missing" from "field present with zero value" on a strongly-typed struct, so a missing required string arrives as `""` and downstream syscalls happily accept it. The 2026-05-13 production stuck loop was a `file_write` with no `content` that wrote 0 bytes, returned `IsError=false`, truncated the user's file, and trapped the model into a 16-call retry spin.
-
-The `[validation error]` prefix that `ValidationError` injects is load-bearing: `LoopDetector.isValidationErrorSig` short-circuits a same-tool + same-args + 3-consecutive `[validation error]` run to `LoopForceStop`, well below the all-errors 2x ConsecutiveDup budget at call #7.
-
-### Providers
-
-The default provider is the Cloud gateway client. Ollama uses an OpenAI-compatible local client. Both implement complete and streaming completion paths; keep provider-specific behavior behind those interfaces.
-
-### Permissions
-
-Permission ordering is load-bearing:
+## Permissions and Approvals
 
 ```text
-hard-block constants -> denied commands -> compound splitting -> always-ask gates -> allowed commands -> default safe -> approval + safe checker
+hard-block -> denied commands -> compound splitting -> always-ask gates
+  -> allowed commands -> default safe -> approval + safe checker
 ```
 
-Always-ask runs before allowlists. High-risk prefixes and destructive git/rm patterns cannot be silenced by config alone.
+- Always-ask runs BEFORE allowlists, so adding a high-risk command to
+  `allowed_commands` is a no-op. Unknown tools are denied.
+- "Always Allow" on an always-ask command is honored once and NEVER persisted
+  (enforced at write time in `cmd/daemon.go` + `server.go`, at runtime in
+  `loop.go checkPermissionAndApproval`).
+- `HandleAlwaysAllowDecision` (`alwaysallow.go`) is the single decision path
+  shared by SSE and WS so transports cannot drift.
+- Two deny-lists in `internal/agent/tools.go`: `autoApprovalDenyList`
+  (`DisallowsAutoApproval`) = `computer`, `accessibility`, `applescript`,
+  `ghostty`; `unattendedAutoApprovalDenyList` (`DisallowsUnattendedAutoApproval`)
+  = those four plus `computer_use` and `screenshot`.
+- `computer_use` is deliberately absent from the FIRST list — its persisted global
+  grant IS the product's Computer Use permission, honored even unattended, scoped
+  BY NAME via `unattendedGrantHonored`. A blanket "any persisted always-allow"
+  rule would silently re-open unattended desktop capture for `screenshot`. Legacy
+  GUI names can never use the global grant; `computer_use` is rejected at
+  per-agent scope (`agents.ValidateAgentPermissionsConfig`) as the grant is
+  global-only.
 
-Always Allow uses one shared decision path for streaming and WebSocket approval flows. High-risk paid/public tools must refuse persisted auto-approval. Always-ask shell commands may be allowed once, but that decision must not be persisted.
+## Wire Contracts
 
-### Daemon Routing
+- **The surface list is `docs/cloud-contract-surface.md`** — what this repo owes Shannon
+  Cloud and Kocoro Desktop, with the counterpart symbol for each. Read it before changing
+  anything that crosses a process boundary.
+- Payloads decoded by UI clients are pinned by fixtures in
+  `docs/desktop-wire-fixtures/`, verified by `internal/daemon/wire_fixtures_test.go`
+  through the REAL producer path. Change a payload → update fixture + test in the
+  SAME PR.
+- Every cross-version contract change mints a capability token in `Capabilities`
+  (`internal/daemon/client.go`), surfaced on the WS handshake and `GET /status`.
+  Clients gate on tokens — NEVER version sniffing or decode-failure probing.
+- New event domains use dotted types with a common envelope; existing flat types
+  are additive-only, never repurposed.
+- `ApprovalBroker` and `QuestionBroker` are thin faces over ONE shared
+  `pendingCore[D]` (`pending.go`). A third interaction kind MUST build on it — do
+  NOT copy a broker.
+- `ask_user_question` gates on `CanPresentQuestionUI` / `questionUISources`, an
+  ALLOW-list, NOT the approval predicate: every source without a question UI
+  DECLINES, because a question has no safe auto-answer. Slack/Feishu/Lark/Teams/
+  LINE render approval cards but have NO question channel. Capability `question_v1`.
+- `delivery_ack`: ack an inbound message only AFTER reply delivery succeeds.
+  Reply-failure paths skip the ack so replay stays correct.
 
-The daemon is the production integration point for Cloud channels. Route precedence is explicit session, threaded route, per-sender route, agent route, then legacy channel route. Routed managers are long-lived; bypass/heartbeat paths use short-lived managers. Tool status `running` is emitted only when execution actually starts.
+## Daemon Routing
 
-Capabilities are advertised during the WebSocket handshake. Add a capability token in the same PR that ships an optional protocol feature. `delivery_ack` means the daemon acknowledges an inbound message only after reply delivery succeeds, so Cloud can safely drop it from replay.
+- Precedence: explicit session, threaded route, per-sender route, agent route,
+  legacy channel route. Named agents are multi-session. Routed managers are
+  long-lived; bypass/heartbeat use short-lived managers. `tool_status` `running`
+  fires only when execution actually starts.
+- Config reload is revision-based over ONLY `~/.shannon/config.yaml`
+  (`config_reload_state_v1`). Never infer project/local overlays are watched, and
+  never advance the applied revision after an unrelated internal mutation.
+- Schedule proactive push: `broadcast` (`auto`/`on`/`off`) gates whether a run
+  pushes to IM. **The target is always the channel the schedule was created in**
+  (snapshotted `im_status_context`), so a schedule created outside an IM chat
+  NEVER pushes, even with `broadcast=on`. `thread` resolves to
+  `ProactivePayload.UseThread *bool`: `nil` means anchored (current behavior),
+  only explicit off goes top-level. Capabilities `schedule_broadcast_gate` /
+  `proactive_thread_mode` are observability only.
+- Output profiles, not per-channel syntax: `markdown` default, `plain` for
+  Cloud-distributed channels. Feishu/Lark/Teams are cloud sources that stay
+  `markdown` (`markdownCloudSources`); WeChat (iLink) stays `plain`.
 
-Global config reload observability is revision-based: only `~/.shannon/config.yaml` participates in `config_reload_state_v1`. Never infer that project/local overlays are watched, and never advance the applied revision by re-reading after an unrelated internal mutation.
+## Turn Lifecycle and Context
 
-Schedule proactive push has two independent three-state knobs (`auto`/`on`/`off`, set via natural language through `schedule_create`/`schedule_update`). `broadcast` gates whether a successful run pushes to IM at all; the push target is always the channel the schedule was created in (its snapshotted `im_status_context` blob) — schedules created outside an IM chat have no target and never push, even with `broadcast=on`. `thread` controls IM thread anchoring: `auto` follows session state (stateful → one thread, stateless → each run top-level), `on`/`off` force it. The daemon resolves `thread` to `ProactivePayload.UseThread *bool` and sends it to Cloud; `nil` means current behavior (anchored thread) and only an explicit off goes top-level. Platforms without threads ignore it. Capability tokens `schedule_broadcast_gate` and `proactive_thread_mode` are observability only.
+- Only `PhaseAwaitingLLM` / `PhaseForceStop` count as idle (`agent/phase.go`;
+  fail-closed, panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`).
+  Defaults: `agent.idle_soft_timeout_secs` 90, `agent.idle_hard_timeout_secs` 540,
+  `agent.stream_idle_timeout_secs` 90.
+- Mid-turn checkpoints run after tool batches, after reactive compaction, and
+  before force-stop; the final save rebuilds from the same baseline.
+- Interrupted turns auto-resume at daemon start (newest first, serial) only within
+  `agent.interrupted_resume_max_age_hours` (default 4) — older checkpoints are
+  abandoned, NEVER executed. `agent.interrupted_resume_max_attempts` (default 3)
+  persists BEFORE the LLM call. Recovered runs ALWAYS classify as unattended so
+  the deny-list applies, and pin the session's original route key.
+- `agent.context_window` (default 1_000_000) is only a seed;
+  `maybeAutoAdjustContextWindow` resets it from `response.model` via
+  `agent/modelcontext.go` unless a per-agent override locks it.
+- Keep proactive / pre-flight / reactive compaction as SEPARATE gates so context
+  errors do not cascade. Thresholds are absolute-buffer complements of the
+  fractional lines (`compactAbsoluteBufferTokens`), sized so a compaction cannot
+  immediately re-trigger; see CLAUDE.md for the exact formulas.
+- Estimate-based gates MUST share the trigger's scale via `estOverheadTokens`,
+  persisted in `Session.CompactionCalibration` and restored through
+  `SetEstOverheadState` with model-pin and registry-fingerprint validation.
+- Summarizer input is budgeted in TOKENS (`summarizeInputCapTokens` 150_000 via
+  `conservativeBytesPerToken` 2.5). **Do NOT gate this on `EstimateTokens`** — its
+  3.5 chars/token is representative, not conservative. Over-cap transcripts fold
+  chunk by chunk (tool pairs atomic, `maxSummaryFoldChunks`) with head+tail fallback.
+- Compaction NEVER rewrites the lossless `Session.Messages`;
+  `Session.CompactionCheckpoint` is the separate model-live state. Proactive and
+  pre-flight re-inject recently read files; reactive skips restoration. Every
+  applied compaction snapshots pre-replacement state with `<private_memory>`
+  stripped and images replaced by text markers; snapshot failures never block it.
+- Tool-result budgeting: per-result spill (`DefaultMaxToolResultSizeChars` 50K,
+  grep 20K), per-turn `aggregateCapThreshold` 200K runes, persisted
+  replacement/seen maps surviving turns and crash recovery. `file_read` is
+  `UnlimitedToolResultSizeChars`, self-bounding at `fileReadHardCapRunes` 500_000.
+- Images/attachments: source-time compression, wire-time `filterOversizeImages`,
+  persist-time `SanitizedRunMessages`. Any new path MUST pass all three. Caps:
+  500 MB/file, 20/msg, inline doc <= 25 MB raw.
+- Thinking blocks: preserve `thinking` / `redacted_thinking` in order; sanitizers,
+  compaction, fork builders, and persistence MUST NOT rewrite them. Strip only
+  before sync upload (`internal/sync/strip_thinking.go`). The local `think` tool is
+  skipped on the default gateway+thinking path (`shouldRegisterThinkTool`) but
+  stays for disabled-thinking, Ollama, or `ForceThinkTool=true`.
 
-### Output Profiles
+## Prompt Cache and Suggestions
 
-Use output profiles rather than per-channel syntax. `markdown` is default; `plain` is for Cloud-distributed channels where Cloud owns final rendering.
+- Cloud owns TTL policy. Preserve `cache_source` as attribution, never a
+  Kocoro-side TTL selector, and preserve `normalizeToolInput` canonicalization.
+  Skill listing lives in the scaffolded user message, not the system prompt.
+- Any in-place `messages[idx].Content` rewrite MUST call
+  `client.LogCacheCompactEvent` — uninstrumented rewrites break drift attribution.
+- `agent.response_detail` renders provider-neutral final-answer guidance in BP3
+  StableContext: global missing/empty → `balanced`, named-agent missing/empty
+  inherits global, provider request effort unchanged. Strict machine-readable
+  internal loops suppress it explicitly.
+- The suggestion fork MUST be byte-equal to the main request except the appended
+  assistant reply, suggestion prompt, `SkipCacheWrite`, and debug-only fork kind.
+  Do not change tools, max tokens, thinking budget, or ordering. Source-gated by
+  `wantsPromptSuggestion` / `promptSuggestionSources`: only `desktop`, `kocoro`,
+  `shanclaw` (legacy Desktop alias), `web`. It is an ALLOW-list, so new background
+  sources default to skipped.
 
-### Tool Result Budgeting
+## Skills
 
-Three layers protect context:
+- `builtinSkills` (`internal/skills/api.go`: `kocoro`, `kocoro-generative-ui`) are
+  sha256-walk synced from `embed.FS` every startup — user edits are WIPED. Fork
+  under a different name.
+- `internal/daemon/skill_filter.go` filters `desktopOnlySkills` from the
+  per-request list on cloud-distributed sources, applied ONCE producer-side right
+  after `LoadGlobalSkills` so registry, listing, and semantic discovery stay
+  consistent. Drift test `skill_filter_test.go`.
+- Skill-install recommendation discovery is binary-pinned and OFFLINE: production
+  uses only the embedded eligible catalog (`official_catalog.json`), never the
+  GitHub/static/ClawHub registries.
+- Two marketplace surfaces that MUST NEVER share a response shape:
+  `/skills/marketplace/*` (static registry, integer-page — **the frozen macOS
+  Desktop contract; do not add source-conditional branches**) and
+  `/skills/clawhub/*` (live catalog, opaque cursor). Catalog GETs retry 429/5xx +
+  network via `doGETWithRetry`; **4xx is never retried**. `isTransientListErr`
+  mirrors `isRetryableStatus`. `exclude_installed` is ClawHub-only and
+  page-granular: when `skills.marketplace.clawhub_exclude_fill_max_pages`
+  (default 5) binds, the page is short or empty with a non-empty cursor and the
+  client MUST keep paging.
+- Skill secrets: Keychain `com.shannon.skill.<name>` + a plaintext index of key
+  NAMES only, env-var-only injection scoped to the current run's `use_skill`.
 
-- Single large results spill to disk and are replaced with previews.
-- Per-turn aggregate output spills the largest results until under budget.
-- Persisted replacement/seen maps survive turns, final saves, and crash recovery.
+## Memory, Sync, Browser Bridge
 
-Keep bloat run-status events, read-before-edit tracking, and same-range file-read dedup working when changing tool execution or persistence.
+- Sidecar lifecycle belongs to the daemon; CLI/TUI attach or probe, never spawn.
+  **API key bytes MUST never hit disk or audit logs** — only a `sha256[:16]`
+  fingerprint.
+- Episodic recall is model-driven: production paths expose `memory_recall` and
+  `session_search` directly and MUST NOT install the implicit small-model
+  preflight. Route unnamed references to session search; stop after a structured
+  no-data instead of retrying relation variants.
+- Session sync is opt-in: single Run entry point, flock, atomic markers,
+  per-session ACKs. Permanent failures remain until the source session changes.
+- Browser file previews stay fail-closed: only effective session CWD and attached
+  paths, symlinks resolved on both sides, random tokens, no directory listing,
+  teardown on session close.
 
-### Images And Attachments
+## Config, Locking, Cross-Platform
 
-Image size safety has source-time compression, wire-time sanitization, and persist-time guards. Any new image/attachment path must pass through the same protection before reaching the LLM or session JSON.
+- Merge order: global → project → local project. Scalars override, lists
+  merge/dedup, structs merge field-by-field. MCP env var casing is preserved by
+  direct YAML re-read.
+- Persistent JSON indexes use write-temp + rename + an exclusive lock via
+  `internal/fslock`, NOT raw `syscall.Flock`. **Never delete lock files** — that
+  splits locks across inodes. Rename targets are read lock-free and never locked
+  directly; a mandatory `LockFileEx` on the destination would block
+  rename-over-open on Windows.
+- Cross-compiles to macOS / Linux / Windows with `CGO_ENABLED=0`. Build-tagged:
+  `internal/fslock` (flock vs `LockFileEx`), per-package `*_proc_{unix,windows}.go`
+  (`Setpgid`+`Kill(-pid)` vs `CREATE_NEW_PROCESS_GROUP`+`taskkill /T /F`),
+  `cmd/proc_signal_{unix,windows}.go`,
+  `internal/memory/bundle_link_{unix,windows}.go` (symlink vs directory junction),
+  `internal/keychain/backend_{keyring,linux,other}.go`.
+- Runtime callers MUST gate on `keychain.Supported()` (darwin||windows||linux),
+  never a raw `runtime.GOOS == "darwin"`; kept in sync with build tags by
+  `TestSupportedMatchesBuildTag`. Pass `config.ShannonDir()` to `NewOSStoreAt`.
+  Linux uses a deterministic 0600 file store, NOT go-keyring's Secret Service,
+  which reports success at construction then fails every read/write headless.
+- **Do not reintroduce raw `syscall.Flock` / `syscall.Kill` / `Setpgid` /
+  `os.Symlink` outside a `_unix.go` file** — it breaks the Windows build or fails
+  unprivileged there.
+- macOS-only GUI tools, including `computer_use`, gate on
+  `runtime.GOOS != "darwin"` with a clean error; `notify` is exempt.
 
-### Turn Lifecycle
+## Auth
 
-The agent loop exposes explicit phases. Only LLM-wait and force-stop phases count as idle for the watchdog. Mid-turn checkpoints run after tool batches, reactive compaction, and before force-stop; final save rebuilds from the same baseline so turns are not double-persisted.
+`/local/auth/*` proxies to Cloud `/api/v1/auth/*`. `AuthManager`
+(`internal/daemon/auth.go`) owns the state machine and emits `auth_state_changed`.
+**WS runs ONLY in `signed_in`, and `WSController.Start` / `Stop` are the only
+allowed call sites for the reconnect loop.** api_key is the source-of-truth
+credential in the credential store (`ai.kocoro.daemon.api_key`); access/refresh
+tokens are RAM only. On `!keychain.Supported()`: `AuthManager` nil, endpoints 503
+`platform_unsupported`, legacy `cfg.APIKey` drives WS. The yaml→store migration
+strips `api_key` from `config.yaml` on every launch, so config-managed yaml that
+re-adds it keeps getting stripped. Endpoint matrix:
+`internal/skills/bundled/skills/kocoro/references/auth.md`.
 
-Interrupted turns auto-resume at daemon start (newest first, serial) but only within the `agent.interrupted_resume_max_age_hours` staleness window (default 4h) — older checkpoints are abandoned, never executed. Recovered runs always classify as unattended so the unattended tool deny-list applies, and they pin the session's original route key so concurrent inbound traffic for the same session is serialized. `agent.interrupted_resume_enabled: false` disables auto-resume entirely.
+## Anti-Hallucination
 
-### Thinking Blocks
+Keep random XML tool-execution delimiters and strip fabricated tool calls. In
+attended runs preserve model-authored preambles; a silent first tool batch may
+surface a local tool's required `description` without exposing other arguments.
+External tool descriptions and generic `purpose` fields are NEVER runtime fallback
+text. Unattended runs remain silent.
 
-When native thinking is enabled, preserve assistant `thinking` and `redacted_thinking` content blocks in order across the conversation trajectory. Sanitizers, compaction, fork builders, and session persistence must not rewrite them. Strip thinking only before session sync upload.
+## Voice Front-Brain
 
-The local `think` tool is skipped on the default gateway + native-thinking path, but remains available when thinking is disabled, with Ollama, or with the force flag.
-
-### Browser Preview Bridge
-
-File previews served to browser automation must stay fail-closed: allow only effective session CWD and attached paths, resolve symlinks on both sides, use random tokens, avoid directory listing, and tear down on session close.
-
-### Config Merge
-
-Global config, project config, and local project config merge in that order. Scalars override, lists merge/dedup, structs merge field-by-field. MCP server env var casing is preserved by direct YAML re-read.
-
-### Atomic Writes
-
-Persistent JSON indexes use write-temp, rename, and an exclusive lock (via `internal/fslock`, not raw `syscall.Flock`) on a stable lock file. Never delete lock files; doing so can split locks across different inodes. Rename targets are read lock-free (the rename is atomic), and never locked directly — a mandatory `LockFileEx` on the destination would block the rename-over-open on Windows.
-
-### Cross-Platform Support
-
-The daemon cross-compiles to macOS / Linux / Windows with `CGO_ENABLED=0`. POSIX-only syscalls live behind build tags: file locking goes through `internal/fslock` (`flock` vs `LockFileEx`); process-group kill uses per-package `*_proc_{unix,windows}.go` helpers (`Setpgid`+`Kill(-pid)` vs `CREATE_NEW_PROCESS_GROUP`+`taskkill /T /F`); `shan daemon stop` uses `cmd/proc_signal_{unix,windows}.go`; the memory bundle `current` pointer uses `internal/memory/bundle_link_{unix,windows}.go` (symlink vs unprivileged directory junction); the daemon api_key credential store uses `internal/keychain/backend_keyring.go` (`darwin || windows`, go-keyring → Keychain / Credential Manager), `backend_linux.go` (`linux`, file store via `backend_file.go` at ~/.shannon/credentials.json 0600), and `backend_other.go` (returns `ErrUnsupportedPlatform`), with runtime callers gating on `keychain.Supported()` (darwin||windows||linux) and passing `config.ShannonDir()` to `NewOSStoreAt` (Linux uses a deterministic file store, NOT go-keyring's Secret Service which fails headless). macOS-only GUI tools, including `computer_use`, gate on `runtime.GOOS != "darwin"` with a clean error (except `notify`, which keeps its cross-platform Desktop route). Do not reintroduce raw `syscall.Flock`/`syscall.Kill`/`Setpgid`/`os.Symlink` outside a `_unix.go` file — it breaks the Windows build or fails unprivileged on Windows.
-
-### Memory
-
-Memory sidecar lifecycle belongs to the daemon. CLI/TUI attach or probe; they do not spawn unless explicitly designed to. API key bytes must never hit disk or audit logs; only content-free state and fingerprints are logged.
-
-### Auth (macOS + Windows + Linux)
-
-`/local/auth/*` endpoints proxy to Shannon Cloud `/api/v1/auth/*`. `AuthManager` (`internal/daemon/auth.go`) owns the state machine (`signed_out` / `pending_verification` / `logging_in` / `bootstrapping_key` / `signed_in`); transitions emit `auth_state_changed` on the event bus. WS connection runs only in `signed_in` — `WSController.Start` / `Stop` are the only allowed call sites for spinning the reconnect loop. api_key is the source-of-truth credential and lives in the credential store (service `ai.kocoro.daemon.api_key` — macOS Keychain / Windows Credential Manager / Linux file store at ~/.shannon/credentials.json 0600); access_token / refresh_token are RAM only. On platforms without a credential store (i.e. `!keychain.Supported()`) `AuthManager` is nil, the endpoints respond 503 `platform_unsupported`, and the legacy `cfg.APIKey` path continues to drive WS. Linux IaC caveat: the yaml→store migration moves `api_key` out of config.yaml; config-managed yaml that re-adds it gets re-stripped each launch. See `internal/skills/bundled/skills/kocoro/references/auth.md` for the full endpoint matrix and recovery scenarios.
-
-Implicit episodic preflight is in-message-only: it may inject private memory into the current request, but it must never persist to transcripts, replay, or summaries. Audit only content-free counts/status/error class.
-
-### Session Sync
-
-Session sync is opt-in. It uses a single Run entry point, flock, atomic marker writes, per-session ACKs, and persistent failed-entry bookkeeping. Permanent failures remain until the source session changes.
-
-### Prompt Suggestions
-
-Suggestion generation is a forked request after a successful main turn. Cache safety invariant: the fork must be byte-equal to the main request except for the appended assistant reply, suggestion prompt, skip-cache-write flag, and debug-only fork kind. Do not change tools, max tokens, thinking budget, or ordering in the fork. The fork is also source-gated (`wantsPromptSuggestion` allow-list in `daemon/runner.go`): only foreground sources with a UI consumer — `desktop`, `kocoro`, `web` — generate a suggestion; IM channels, schedule/cron, and autonomous local sources (heartbeat/watcher/mcp) are skipped. It is an allow-list, so any new background source defaults to skipped.
-
-### Wire Contracts
-
-Payloads decoded by UI clients (bus events, per-request SSE events, HTTP responses) are pinned by canonical fixtures in `docs/desktop-wire-fixtures/` and verified by `internal/daemon/wire_fixtures_test.go`, which emits through the real producer path and decodes producer bytes into consumer-shaped structs. Change a payload → update fixture + test in the same PR. Cross-version contract changes mint a capability token in `Capabilities` (`internal/daemon/client.go`; surfaced on the WS handshake and `GET /status`) — clients gate on tokens, never version-sniff. New event domains use dotted namespaced types with a common envelope; existing flat types are additive-only and never repurposed. See the kocoro skill `references/events.md` for full rules.
-
-### Prompt Cache
-
-Cloud owns the prompt-cache TTL policy. Preserve `cache_source` as attribution
-(not a Kocoro-side TTL selector) and preserve canonical tool input
-normalization. Any future TTL-policy change belongs in the Cloud service and
-must update `docs/cache-strategy.md` in the same rollout.
-
-Any in-place message content rewrite that can affect prompt bytes must emit cache-compaction/debug instrumentation so drift remains attributable.
-
-### Context Management
-
-Context-window defaults are only seeds; model responses may auto-adjust the active window unless a per-agent override explicitly locks it. Preserve proactive, pre-flight, and reactive compaction as separate gates so context errors do not cascade. Estimate-based gates must stay calibrated against real prompt usage (estimator overhead) and share the trigger's scale; compactions land below the trigger (hysteresis) so one compaction cannot immediately re-trigger. The calibration sample persists in the session checkpoint (overhead + model + tool-registry fingerprint) and is restored onto fresh daemon loops with model/registry validation. Compaction summaries are audited before acceptance (section structure + verbatim identifier preservation, one retry, mechanical identifier backstop). Applied proactive and pre-flight compactions re-inject the most recently read files from disk within a budget that stays under the trigger line; the reactive (post-400) path deliberately skips restoration because its evidence floor is only a lower bound and a second overflow there is terminal. Tier-2 micro-summaries carry a head-clipped current-task line so semantic compression prioritizes task-relevant details. Compaction never rewrites the lossless `Session.Messages` transcript; daemon auto-compaction and TUI `/compact` persist a separate model-live checkpoint (summary + retained tail, bound to an exclusive raw archive index), and rewind/reset invalidates it. Every applied compaction snapshots the exact pre-replacement live state to disk (daemon/TUI-wired, bounded retention with the oldest snapshot pinned, private-memory blocks stripped, removed on session deletion) as best-effort rollback material; snapshot failures never block a compaction. Transcripts over the summarizer input cap are folded chunk by chunk (tool pairs kept atomic, bounded fold count, head+tail fallback on any fold failure). On large context windows the compaction trigger/landing/preflight lines are absolute-buffer complements of the fractional thresholds, keeping the hysteresis band wide enough for the post-compaction restoration payload.
-
-### Anti-Hallucination
-
-Keep random XML tool execution delimiters and strip fabricated tool calls. For attended runs, preserve model-authored preambles; if the first tool batch is silent, a local tool may surface its required user-facing `description` without exposing other arguments. External tool descriptions are never used as runtime fallback text. Unattended runs remain silent.
+`internal/koe`, macOS native speech-to-speech. Keep `stop_speaking` (current
+output), `cancel` (delegated work, by `task_id` or `all_running=true`), and
+terminal `end_call` (whole session) as SEPARATE authorities. `do_task` defaults to
+exactly one call per response; parallel calls need an explicit user request and
+disjoint scopes. `MapDoTaskOutcome` maps a partial run to a canned `incomplete`
+line and seeds no digest, so a cut run's progress tail is never voiced as the
+result. ASR transcripts stay asynchronous evidence — not turn control, not
+barge-in admission, not default dismissal.
 
 ## Tests
 
 ```bash
-go test ./...
-go test ./internal/agent/ -v
-go test ./internal/daemon/ -v
-go test ./internal/agents/ -v
-go test ./internal/schedule/ -v
-go test ./test/ -v
-go test ./test/e2e/ -v
-SHANNON_E2E_LIVE=1 go test ./test/e2e/ -v
+go test ./...                                          # or ./internal/{agent,daemon,agents,schedule}/ -v
+go test ./test/ -v && go test ./test/e2e/ -v
+SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v   # live suite; the build tag is required
 go build ./...
 ```
 
-Koe tests link cgo audio deps. On macOS, install them with `brew install opus opusfile pkg-config` and set `PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find the Homebrew files.
+Koe tests link cgo audio deps: `brew install opus opusfile pkg-config`, and set
+`PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find them.
+Schedule tests use temp dirs and MUST NOT write to the real LaunchAgents directory.
 
-Schedule tests use temp directories and do not write to the real LaunchAgents directory. Run live E2E before releases.
+Live E2E uses the hidden foreground-only isolation flags in
+`docs/live-e2e-testing.md`. `--isolated` isolates filesystem state, port ownership,
+AND credential-store access (it calls `config.DisableCredentialStoreForProcess`,
+so config load skips OS credential reads and the yaml→keychain migration); the
+authorized key is piped in via `--isolated-api-key-stdin`. Cloud/background
+automation is suppressed, agent tool capabilities stay real, and MCP is disabled
+unless `--isolated-mcp` supplies an explicit startup allowlist.
 
-Koe live E2E uses the hidden, foreground-only daemon isolation flags documented in `docs/live-e2e-testing.md`. It isolates filesystem state and port ownership, suppresses Cloud/background automation, and leaves OS credential stores and agent tool capabilities shared with the user account.
+## Build and Release
 
-## Build And Release
-
-- GoReleaser builds releases.
-- The npm package is `@kocoro/kocoro`.
-- Default version bumps are patch-only unless explicitly directed otherwise.
-- Release flow: tag, push tag, let CI build and publish.
-
-## Tools
-
-Core local tools include file ops, archive inspect/extract, document extraction, shell/system, macOS GUI, schedules, memory, and skills. Common openers and compact local utilities are Direct; uncommon mutations are Deferred and loaded through `tool_search` when needed. On daemon runs, `computer_use` is the Deferred, high-level native-GUI contract discoverable through `tool_search` on the ordinary parent model. The parent keeps its configured model; only an invoked desktop task lazily resolves `openai.computer.v1` and starts a private OpenAI Responses trajectory. One exact task app binds background-first: semantic press/scroll and ordinary target-bound input stay in the background lane, while `foreground_allowed` may activate the app only for an action without an exact background primitive. Multi-app tasks retain foreground switching. The private trajectory owns screenshots, foreground coordinate pointer actions, typing, re-observation, continuation, and internal state/frame authority. NSWorkspace + CGWindow supplies exact target identity when AX is incomplete. Ambient physical interference requires a fresh exact observation before another mutation; explicit Pause/Take Over/Stop keeps user-owned quiescence. The whole task serializes on the shared GUI-operation lock. Unattended runs can invoke it ONLY via an explicit persisted GLOBAL `computer_use` always-allow grant. The legacy `computer` / `accessibility` / `applescript` / `ghostty` wrappers cannot be persisted as Always Allow and remain denied for unattended execution; daemon parent runs remove the legacy GUI wrappers and reject shell `osascript` / `cliclick`. The standalone `screenshot` tool remains separate, approval-required, and denied unattended. Runtime-conditional tools include session search, cloud delegation, publish/list/retract uploads, image generation/editing, and deferred tool search.
-
-Every approval-required tool must expose a short human-readable description or equivalent purpose field for approval UI. Destructive or paid/public cloud tools require approval.
+- GoReleaser builds releases; npm package is `@kocoro/kocoro`.
+- **Versioning is PATCH-only by default** — do not bump minor/major unless asked.
+- Release: tag, push tag, CI builds and publishes.
+- `docs/` is gitignored by default; tracked docs are allowlisted in `.gitignore`.
+  Add new docs there before committing.

@@ -600,6 +600,39 @@ func TestDeferredToolNames_IncludesExplicitDeferredLocals(t *testing.T) {
 	}
 }
 
+func TestDeferredToolNamesForRun_KoeFastColdsOnlyHeavyLongTail(t *testing.T) {
+	reg := NewToolRegistry()
+	for _, name := range []string{
+		"archive_extract", "archive_inspect", "ask_user_question", "bash",
+		"calculate", "cloud_delegate", "directory_list", "docx_to_text",
+		"file_edit", "file_read", "file_write", "glob", "grep", "http",
+		"memory_append", "memory_recall", "notify", "pdf_to_text",
+		"pptx_to_text", "present_deliverable", "schedule_list", "session_search",
+		"system_info", "use_skill", "xlsx_to_text",
+	} {
+		reg.Register(&mockTool{name: name})
+	}
+
+	full := deferredToolNamesForRun(reg, false)
+	fast := deferredToolNamesForRun(reg, true)
+	for name := range koeFastColdTools {
+		if full[name] {
+			t.Errorf("ordinary run unexpectedly deferred %q", name)
+		}
+		if !fast[name] {
+			t.Errorf("Koe Fast run did not defer %q", name)
+		}
+	}
+	for _, name := range []string{
+		"memory_recall", "session_search", "file_read", "file_write", "file_edit",
+		"grep", "glob", "directory_list", "calculate", "schedule_list", "notify",
+	} {
+		if fast[name] {
+			t.Errorf("Koe Fast colded common opener %q", name)
+		}
+	}
+}
+
 func TestDeferredToolNames_MCPBrowserToolsFollowSourceDefault(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(&mockMCPTool{name: "browser_click"})

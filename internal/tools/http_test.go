@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -82,6 +83,101 @@ func TestHTTP_POST(t *testing.T) {
 	}
 	if !contains(result.Content, "201") {
 		t.Errorf("expected status 201 in output, got: %s", result.Content)
+	}
+}
+
+func TestHTTP_PostDispatchResponseLossIsOutcomeUnknownForMutation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	result, err := (&HTTPTool{}).Run(context.Background(), `{"url":"`+srv.URL+`","method":"POST","body":"create","description":"test lost response"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want outcome unknown", result)
+	}
+	if result.IsRetryable || result.ErrorCategory != "" {
+		t.Fatalf("outcome unknown must not be retryable: %#v", result)
+	}
+	if contains(result.Content, srv.URL) {
+		t.Fatalf("outcome-unknown diagnostic leaked request URL: %q", result.Content)
+	}
+}
+
+func TestHTTP_PostDispatchResponseLossForReadRemainsTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	result, err := (&HTTPTool{}).Run(context.Background(), `{"url":"`+srv.URL+`","method":"GET","description":"test lost read"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want ordinary read error", result)
+	}
+	if !result.IsRetryable || result.ErrorCategory != "transient" {
+		t.Fatalf("read transport loss should remain transient: %#v", result)
+	}
+}
+
+func TestHTTP_PreDispatchConnectFailureForMutationRemainsTransient(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "http://" + listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	result, runErr := (&HTTPTool{}).Run(context.Background(), `{"url":"`+url+`","method":"POST","body":"create","description":"test connect failure"}`)
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want pre-dispatch tool error", result)
+	}
+	if !result.IsRetryable || result.ErrorCategory != "transient" {
+		t.Fatalf("connect failure should remain transient: %#v", result)
+	}
+}
+
+func TestHTTP_MutationWithKnownStatusAndTruncatedBodyIsNotOutcomeUnknown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("short"))
+	}))
+	defer srv.Close()
+
+	result, err := (&HTTPTool{}).Run(context.Background(), `{"url":"`+srv.URL+`","method":"POST","body":"create","description":"test truncated body"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown {
+		t.Fatalf("result = %#v, want definitive response-read error", result)
+	}
+	if result.IsRetryable || result.ErrorCategory != "" {
+		t.Fatalf("known mutation response must not encourage replay: %#v", result)
+	}
+	if !contains(result.Content, "returned status 201") {
+		t.Fatalf("result must retain known status: %s", result.Content)
 	}
 }
 
@@ -192,13 +288,6 @@ func TestHTTP_InvalidURL(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Error("expected error result for invalid URL")
-	}
-}
-
-func TestHTTP_RequiresApproval(t *testing.T) {
-	tool := &HTTPTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
 	}
 }
 

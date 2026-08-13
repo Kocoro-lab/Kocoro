@@ -73,6 +73,8 @@ type InterruptedTurn struct {
 	IMStatusContext json.RawMessage        `json:"im_status_context,omitempty"`
 	Participants    []string               `json:"participants,omitempty"`
 	ResumeAttempts  int                    `json:"resume_attempts,omitempty"`
+	RunID           string                 `json:"run_id,omitempty"`
+	AttemptID       string                 `json:"attempt_id,omitempty"`
 	ExecutionRun    executionprofile.Run   `json:"execution_run,omitempty"`
 	ExecutionConfig *agent.ExecutionConfig `json:"execution_config,omitempty"`
 	UpdatedAt       time.Time              `json:"updated_at"`
@@ -134,6 +136,10 @@ type Session struct {
 	// resolved profile metadata plus validated tool/deliverable evidence; no
 	// provider-native response ids or hidden reasoning are persisted.
 	ExecutionRuns []executionprofile.Run `json:"execution_runs,omitempty"`
+	// ToolExecutions is the durable boundary around material side effects. It
+	// stores only opaque identifiers and SHA-256 digests, never tool arguments
+	// or results. Recovery treats any non-terminal dispatch as unsafe to replay.
+	ToolExecutions []ToolExecutionRecord `json:"tool_executions,omitempty"`
 	// Pinned sticks the session to the top of the list regardless of
 	// recency. Set/cleared via PATCH /sessions/{id} {"pinned": bool}.
 	Pinned bool `json:"pinned,omitempty"`
@@ -501,6 +507,7 @@ func NewStore(dir string) *Store {
 	s := &Store{dir: dir}
 	if _, loaded := orphanSweepDone.LoadOrStore(filepath.Clean(dir), true); !loaded {
 		s.SweepOrphanCompactionSnapshots()
+		s.SweepOrphanRunEvents()
 	}
 	idx, err := OpenIndex(dir)
 	if err == nil {
@@ -829,6 +836,20 @@ func (s *Store) SavePreservingUpdatedAt(sess *Session) error {
 }
 
 func (s *Store) save(sess *Session, touchUpdatedAt bool) error {
+	if err := sess.ValidateToolExecutions(); err != nil {
+		return err
+	}
+	originalToolExecutions := append([]ToolExecutionRecord(nil), sess.ToolExecutions...)
+	saveSucceeded := false
+	defer func() {
+		if !saveSucceeded {
+			sess.ToolExecutions = originalToolExecutions
+		}
+	}()
+	if err := sess.ReconcileToolExecutionCheckpoints(time.Now()); err != nil {
+		return err
+	}
+	sess.TrimTerminalToolExecutions(MaxRetainedTerminalToolExecutions)
 	if touchUpdatedAt {
 		sess.UpdatedAt = s.nextUpdatedAt()
 	}
@@ -885,6 +906,7 @@ func (s *Store) save(sess *Session, touchUpdatedAt bool) error {
 	if s.index != nil {
 		s.index.UpsertSession(sess) // best-effort, don't fail save on index error
 	}
+	saveSucceeded = true
 	return nil
 }
 
@@ -1107,6 +1129,9 @@ func (s *Store) Load(id string) (*Session, error) {
 	if sess.SchemaVersion == 0 {
 		sess.SchemaVersion = 1
 	}
+	if err := sess.ValidateToolExecutions(); err != nil {
+		return nil, err
+	}
 	// Sessions created before schedule_id was introduced already persisted a
 	// stable channel in the form "schedule-<id>". Recover that association at
 	// load time so the new filter includes legacy history without rewriting
@@ -1192,6 +1217,7 @@ func (s *Store) Delete(id string) error {
 	// (full pre-drop history); deleting the session must not leave them
 	// behind. Best-effort: the session file itself is already gone.
 	os.RemoveAll(filepath.Join(s.dir, compactionSnapshotDirName, id))
+	os.RemoveAll(filepath.Join(s.dir, runEventDirName, id))
 
 	if s.index != nil {
 		s.index.DeleteSession(id) // best-effort

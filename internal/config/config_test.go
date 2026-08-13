@@ -119,6 +119,41 @@ func TestValidateConfig_AgentServiceTier(t *testing.T) {
 	}
 }
 
+func TestValidateConfig_AgentResponseDetail(t *testing.T) {
+	for _, tt := range []struct {
+		value   string
+		wantErr bool
+	}{
+		{"", false},
+		{"concise", false},
+		{"balanced", false},
+		{"detailed", false},
+		{"default", true},
+		{"BALANCED", true},
+	} {
+		t.Run(tt.value, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Agent.ResponseDetail = tt.value
+			err := validateConfig(cfg)
+			if tt.wantErr && (err == nil || !strings.Contains(err.Error(), "response_detail")) {
+				t.Fatalf("validateConfig() error = %v, want response_detail error", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateConfig() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestEffectiveAgentResponseDetail(t *testing.T) {
+	if got := EffectiveAgentResponseDetail(""); got != "balanced" {
+		t.Fatalf("EffectiveAgentResponseDetail(empty) = %q, want balanced", got)
+	}
+	if got := EffectiveAgentResponseDetail("detailed"); got != "detailed" {
+		t.Fatalf("EffectiveAgentResponseDetail(detailed) = %q, want detailed", got)
+	}
+}
+
 func TestAgentConfigSkillDiscoveryEnabled(t *testing.T) {
 	enabled := true
 	disabled := false
@@ -643,6 +678,12 @@ func TestCompactionSnapshotConfig_Defaults(t *testing.T) {
 	if cfg.Agent.CompactionSnapshotMaxAgeDays != 14 {
 		t.Errorf("CompactionSnapshotMaxAgeDays = %d, want 14", cfg.Agent.CompactionSnapshotMaxAgeDays)
 	}
+	if cfg.Agent.RunEventRetention != 32 {
+		t.Errorf("RunEventRetention = %d, want 32", cfg.Agent.RunEventRetention)
+	}
+	if cfg.Agent.RunEventMaxAgeDays != 14 {
+		t.Errorf("RunEventMaxAgeDays = %d, want 14", cfg.Agent.RunEventMaxAgeDays)
+	}
 }
 
 func TestPromptSuggestionConfig_OverlayMerge(t *testing.T) {
@@ -921,6 +962,26 @@ func TestConfig_InterruptedResumeMaxAgeNegativeRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "interrupted_resume_max_age_hours") {
 		t.Errorf("expected error to mention interrupted_resume_max_age_hours, got %v", err)
+	}
+}
+
+func TestConfig_RunEventRetentionNegativeRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Config)
+		want string
+	}{
+		{"count", func(cfg *Config) { cfg.Agent.RunEventRetention = -1 }, "run_event_retention"},
+		{"age", func(cfg *Config) { cfg.Agent.RunEventMaxAgeDays = -1 }, "run_event_max_age_days"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{}
+			tc.set(cfg)
+			err := validateConfig(cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateConfig() error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

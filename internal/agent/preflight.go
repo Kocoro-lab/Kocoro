@@ -12,8 +12,8 @@ type MemoryPreflightFunc func(ctx context.Context, query string, opts MemoryPref
 
 type MemoryPreflightOptions struct {
 	// ForceHelper asks the implementation to run its small-model compiler even
-	// when cheap lexical gates do not fire. Callers should use it sparingly, for
-	// example on the first user message of a memory-enabled conversation.
+	// when cheap lexical gates do not fire. Production turns leave this false;
+	// it exists for explicit diagnostics and targeted evaluation only.
 	ForceHelper bool
 	Trace       *MemoryPreflightTrace
 }
@@ -27,16 +27,19 @@ type MemoryPreflightResult struct {
 // memory preflight. It must never contain the user query, anchors, relation
 // labels selected by the helper, or recalled memory text.
 type MemoryPreflightTrace struct {
-	Attempted       bool
-	ForceHelper     bool
-	HelperUsed      bool
-	IntentSource    string
-	IntentsCount    int
-	Queried         bool
-	ResultsCount    int
-	ContextReturned bool
-	ContextInjected bool
-	Outcome         string
-	ErrorClass      string
-	HTTPStatus      int
+	Attempted        bool
+	ForceHelper      bool
+	HelperUsed       bool
+	HelperDurationMs int64
+	IntentSource     string
+	IntentsCount     int
+	Queried          bool
+	QueryDurationMs  int64
+	ResultsCount     int
+	ContextReturned  bool
+	ContextInjected  bool
+	TotalDurationMs  int64
+	Outcome          string
+	ErrorClass       string
+	HTTPStatus       int
 }

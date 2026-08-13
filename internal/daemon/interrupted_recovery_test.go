@@ -98,6 +98,7 @@ func interruptedExecutionConfigA() *agent.ExecutionConfig {
 		Thinking:              &client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096},
 		ReasoningEffort:       "high",
 		EffortTier:            "xhigh",
+		ResponseDetail:        "detailed",
 		ServiceTier:           "fast",
 		ResponseLanguage:      "中文",
 		Temperature:           0.27,
@@ -113,6 +114,7 @@ func applyInterruptedExecutionConfigB(loop *agent.AgentLoop) {
 	loop.SetModelTier("small")
 	loop.SetThinking(&client.ThinkingConfig{Type: "adaptive"})
 	loop.SetReasoningEffort("low")
+	loop.SetResponseDetail("concise")
 	loop.SetEffortTier("low")
 	loop.SetServiceTier("default")
 	loop.SetResponseLanguage("English")
@@ -140,6 +142,109 @@ func TestInterruptedExecutionConfigCloneIsDeep(t *testing.T) {
 	original.ExecutionConfig.Thinking.BudgetTokens = 2
 	if req.ExecutionConfig == nil || req.ExecutionConfig.Thinking.BudgetTokens != 4096 {
 		t.Fatalf("resume request retained candidate config ownership: %+v", req.ExecutionConfig)
+	}
+}
+
+func TestInterruptedRecoveryKeepsRunIDAndMintsAttemptPerClaim(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const (
+		id        = "recovery-run-identity-001"
+		runID     = "run1_0123456789abcdef0123456789abcdef"
+		attemptID = "att1_0123456789abcdef0123456789abcdef"
+	)
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{
+		Source: "desktop", RunID: runID, AttemptID: attemptID,
+	})
+
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	claim := func(candidate interruptedTurnCandidate) (*session.Session, RunAgentRequest) {
+		mgr := session.NewManager(dir)
+		sess, err := mgr.Resume(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := buildInterruptedResumeRequest(candidate, 3, 4*time.Hour)
+		if req.RunID != runID || req.AttemptID != "" {
+			t.Fatalf("candidate identity = run %q attempt %q", req.RunID, req.AttemptID)
+		}
+		if err := claimInterruptedResume(mgr, sess, &req, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := mgr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return sess, req
+	}
+
+	firstSession, first := claim(candidates[0])
+	if first.RunID != runID || first.AttemptID == "" || first.AttemptID == attemptID ||
+		firstSession.InterruptedTurn.AttemptID != first.AttemptID {
+		t.Fatalf("first recovered identity req=%+v state=%+v", first, firstSession.InterruptedTurn)
+	}
+	secondCandidate := interruptedTurnCandidate{
+		SessionID: id, StoreDir: dir, State: cloneInterruptedTurn(*firstSession.InterruptedTurn),
+		UpdatedAt: firstSession.UpdatedAt,
+	}
+	_, second := claim(secondCandidate)
+	if second.RunID != runID || second.AttemptID == first.AttemptID {
+		t.Fatalf("second recovered identity = run %q attempt %q; first=%q", second.RunID, second.AttemptID, first.AttemptID)
+	}
+}
+
+func TestInterruptedRecoveryMintsRunIDForLegacyCheckpoint(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const id = "recovery-run-legacy-001"
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{Source: "desktop"})
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := buildInterruptedResumeRequest(candidates[0], 3, 4*time.Hour)
+	if err := claimInterruptedResume(mgr, sess, &req, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !session.IsValidRunID(req.RunID) || !session.IsValidAttemptID(req.AttemptID) ||
+		sess.InterruptedTurn.RunID != req.RunID || sess.InterruptedTurn.AttemptID != req.AttemptID {
+		t.Fatalf("legacy identity req=%+v state=%+v", req, sess.InterruptedTurn)
+	}
+}
+
+func TestInterruptedRecoveryAbandonsInvalidRunIDBeforeExecution(t *testing.T) {
+	shannonDir := t.TempDir()
+	dir := filepath.Join(shannonDir, "sessions")
+	const id = "recovery-run-invalid-001"
+	writeInterruptedSession(t, dir, id, &session.InterruptedTurn{Source: "desktop", RunID: "not-canonical"})
+	candidates, err := discoverInterruptedTurns(shannonDir)
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	mgr := session.NewManager(dir)
+	defer mgr.Close()
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := buildInterruptedResumeRequest(candidates[0], 3, 4*time.Hour)
+	if err := claimInterruptedResume(mgr, sess, &req, ""); !errors.Is(err, errInterruptedRecoveryInvalidRun) {
+		t.Fatalf("claim error = %v", err)
+	}
+	persisted, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.InProgress || persisted.InterruptedTurn != nil {
+		t.Fatalf("invalid run identity remained recoverable: %+v", persisted)
 	}
 }
 
@@ -410,9 +515,73 @@ func TestResumeInterruptedTurnsAbandonsExhaustedWithoutGatewayCall(t *testing.T)
 	}
 }
 
+func TestResumeInterruptedTurnsRequiresReviewWithoutGatewayCall(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "must not be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	defer deps.SessionCache.CloseAll()
+	const id = "recovery-side-effect-review-001"
+	dir := filepath.Join(deps.ShannonDir, "sessions")
+	state := &session.InterruptedTurn{
+		Source:    "desktop",
+		RunID:     "run1_00000000000000000000000000000001",
+		AttemptID: "att1_00000000000000000000000000000001",
+	}
+	writeInterruptedSession(t, dir, id, state)
+	mgr := session.NewManager(dir)
+	sess, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := session.NewToolExecutionRecordFromDigest(
+		state.RunID,
+		state.AttemptID,
+		"create_record",
+		"tool-side-effect-review",
+		session.ToolExecutionDigest(`{"value":1}`),
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AddToolExecution(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.MarkToolExecutionDispatching(record.ExecutionID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+	_ = mgr.Close()
+
+	(&Server{deps: deps}).resumeInterruptedTurns(context.Background())
+	if requests := gw.requests(); len(requests) != 0 {
+		t.Fatalf("review-required recovery called gateway %d times", len(requests))
+	}
+
+	mgr = session.NewManager(dir)
+	defer mgr.Close()
+	persisted, err := mgr.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.InProgress || persisted.InterruptedTurn != nil {
+		t.Fatalf("review-required recovery marker not cleared: %#v", persisted.InterruptedTurn)
+	}
+	if got := persisted.ToolExecutions[0].State; got != session.ToolExecutionOutcomeUnknown {
+		t.Fatalf("tool execution state = %q", got)
+	}
+	if got := persisted.Messages[len(persisted.Messages)-1].Content.Text(); !strings.Contains(got, "was not retried") {
+		t.Fatalf("review warning = %q", got)
+	}
+}
+
 func TestResumeInterruptedTurnFailuresPreserveCheckpointAndStopAtLimit(t *testing.T) {
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "temporary gateway failure", http.StatusServiceUnavailable)
+		http.Error(w, "synthetic request failure", http.StatusBadRequest)
 	}))
 	defer gateway.Close()
 

@@ -351,7 +351,7 @@ func TestAgentLoop_MaxTokens_RecoveryCounterExhausts(t *testing.T) {
 		callCount++
 		// First 4 calls each return a truncated trailing tool_use. After the
 		// 4th the recovery budget (3) is exhausted and the loop must trigger
-		// runForceStopTurn, which omits tools and asks for a final text reply.
+		// runToolDisabledTurn, which omits tools and asks for a final text reply.
 		// Call #5 (the force-stop turn) returns a clean end_turn so the loop
 		// can produce a non-empty final answer.
 		if callCount >= 5 {

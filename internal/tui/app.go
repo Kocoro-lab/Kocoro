@@ -248,10 +248,9 @@ type Model struct {
 	hookRunner          *hooks.HookRunner
 	customCommands      map[string]string // name → prompt content from commands/*.md
 	bypassPermissions   bool
-	agentOverride       *agents.Agent    // per-agent override for re-application after async tool load
-	loadedSkills        []*skills.Skill  // skills for current agent (survives loop re-creation)
-	skillsPtr           *[]*skills.Skill // pointer into use_skill tool's skills slice
-	memPreflight        tools.MemoryPreflightQuerier
+	agentOverride       *agents.Agent      // per-agent override for re-application after async tool load
+	loadedSkills        []*skills.Skill    // skills for current agent (survives loop re-creation)
+	skillsPtr           *[]*skills.Skill   // pointer into use_skill tool's skills slice
 	remoteCleanup       func()             // cleanup for MCP connections from async load
 	cancelRun           context.CancelFunc // cancels the running agent loop
 	injectCh            chan agent.InjectedMessage
@@ -458,7 +457,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// register with a typed-nil MemoryQuerier so the tool falls back to
 	// session_search + MEMORY.md.
 	var memQuerier tools.MemoryQuerier
-	var memPreflightQuerier tools.MemoryPreflightQuerier
 	memCfg := memory.LoadConfigFromRuntime(runtimeCfg)
 	if memCfg.Provider != "" && memCfg.Provider != "disabled" {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -467,7 +465,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		if ready {
 			attached := memory.NewAttachedQuerier(memCfg.SocketPath, memCfg.ClientRequestTimeout)
 			memQuerier = attached
-			memPreflightQuerier = attached
 		}
 	}
 	tools.RegisterMemoryTool(reg, memQuerier, &tuiMemoryFallback{sessionMgr: sessMgr})
@@ -481,6 +478,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop.SetBrowserObservationMaxChars(runtimeCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runtimeCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runtimeCfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(runtimeCfg.Agent.WarmSetMaxSchemas, runtimeCfg.Agent.WarmSetMaxSchemaTokens)
 	// Seed from the configured model and the session's last-seen model so
 	// the first preflight check after a resume/agent-switch uses the right
 	// cap, instead of falling back to the static config until the next
@@ -493,13 +491,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	// Preserve TUI attribution; Cloud currently uses the short TTL for all sources.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(runtimeCfg.Agent.SkillDiscoveryEnabled())
-	if memPreflightQuerier != nil {
-		var helperLLM client.LLMClient
-		if gateway != nil {
-			helperLLM = gateway
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(memPreflightQuerier, helperLLM))
-	}
 	loop.SetTimeBasedCompactConfig(agent.TimeBasedCompactConfig{
 		Enabled:             runtimeCfg.Agent.TimeBasedCompact.Enabled,
 		GapThresholdMinutes: runtimeCfg.Agent.TimeBasedCompact.GapThresholdMinutes,
@@ -521,6 +512,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	if runtimeCfg.Agent.EffortTier != "" {
 		loop.SetEffortTier(runtimeCfg.Agent.EffortTier)
 	}
+	loop.SetResponseDetail(config.EffectiveAgentResponseDetail(runtimeCfg.Agent.ResponseDetail))
 	loop.SetResponseLanguage(runtimeCfg.Agent.Language)
 	// Per-agent model config overrides
 	if agentOverride != nil && agentOverride.Config != nil && agentOverride.Config.Agent != nil {
@@ -534,6 +526,9 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		// Per-agent effort override; nil OR "" = inherit the global tier.
 		if ac.EffortTier != nil && *ac.EffortTier != "" {
 			loop.SetEffortTier(*ac.EffortTier)
+		}
+		if ac.ResponseDetail != nil && *ac.ResponseDetail != "" {
+			loop.SetResponseDetail(*ac.ResponseDetail)
 		}
 		// != nil (not != ""): explicit "" forces mirror over a locked global.
 		if ac.Language != nil {
@@ -625,7 +620,6 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 		agentOverride:  agentOverride,
 		loadedSkills:   loadedSkills,
 		skillsPtr:      skillsPtr,
-		memPreflight:   memPreflightQuerier,
 		markdownCache:  make(map[string]string),
 		slashCommands:  instanceCmds,
 		sessionAllowed: make(map[string]bool),
@@ -690,6 +684,7 @@ func (m *Model) rebuildAgentLoop() {
 	loop.SetBrowserObservationMaxChars(m.cfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(m.cfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(m.cfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(m.cfg.Agent.WarmSetMaxSchemas, m.cfg.Agent.WarmSetMaxSchemaTokens)
 	// Seed the soft context window from the configured model + the
 	// currently-active session's last-seen model. After an agent switch
 	// the session may already carry usage from prior turns served by a
@@ -705,13 +700,6 @@ func (m *Model) rebuildAgentLoop() {
 	// Interactive TUI (switched agent) — same routing as the primary loop.
 	loop.SetCacheSource("tui")
 	loop.SetSkillDiscovery(m.cfg.Agent.SkillDiscoveryEnabled())
-	if m.memPreflight != nil {
-		var helperLLM client.LLMClient
-		if m.gateway != nil {
-			helperLLM = m.gateway
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(m.memPreflight, helperLLM))
-	}
 	if m.cfg.Agent.Model != "" {
 		loop.SetSpecificModel(m.cfg.Agent.Model)
 	} else if m.cfg.Provider == "ollama" && m.cfg.Ollama.Model != "" {
@@ -730,6 +718,7 @@ func (m *Model) rebuildAgentLoop() {
 	if m.cfg.Agent.EffortTier != "" {
 		loop.SetEffortTier(m.cfg.Agent.EffortTier)
 	}
+	loop.SetResponseDetail(config.EffectiveAgentResponseDetail(m.cfg.Agent.ResponseDetail))
 	loop.SetResponseLanguage(m.cfg.Agent.Language)
 	if m.agentOverride != nil && m.agentOverride.Config != nil && m.agentOverride.Config.Agent != nil {
 		ac := m.agentOverride.Config.Agent
@@ -742,6 +731,9 @@ func (m *Model) rebuildAgentLoop() {
 		// Per-agent effort override; nil OR "" = inherit the global tier.
 		if ac.EffortTier != nil && *ac.EffortTier != "" {
 			loop.SetEffortTier(*ac.EffortTier)
+		}
+		if ac.ResponseDetail != nil && *ac.ResponseDetail != "" {
+			loop.SetResponseDetail(*ac.ResponseDetail)
 		}
 		// != nil (not != ""): explicit "" forces mirror over a locked global.
 		if ac.Language != nil {
@@ -1403,7 +1395,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamLive = "" // final answer is rendered to scrollback below
 		m.cancelRun = nil
 		m.injectCh = nil
-		if msg.err != nil && !errors.Is(msg.err, context.Canceled) && !errors.Is(msg.err, agent.ErrMaxIterReached) {
+		if msg.err != nil && !errors.Is(msg.err, context.Canceled) && !errors.Is(msg.err, agent.ErrMaxIterReached) && !errors.Is(msg.err, agent.ErrRequestBudgetExhausted) {
 			code := msg.status.FailureCode
 			if code == runstatus.CodeNone {
 				code = runstatus.CodeFromError(msg.err)
@@ -1412,15 +1404,20 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Display the assistant response (rendered here instead of OnText to
 		// avoid a race where the Println Cmd arrives after state has changed).
-		if msg.result != "" && (msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached)) {
+		if msg.result != "" && (msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) || errors.Is(msg.err, agent.ErrRequestBudgetExhausted)) {
 			m.appendMarkdownOutput(msg.result, m.renderMarkdownCached(msg.result, m.width))
 			m.appendOutput("")
 			// Soft warning for loop-detector force-stop: the reply is valid
 			// and rendered above, but the run ended early. Show a dim hint,
 			// not a red error.
-			if msg.err == nil && msg.status.Partial && msg.status.FailureCode == runstatus.CodeIterationLimit {
+			if msg.status.Partial {
 				dim := lipgloss.NewStyle().Foreground(colorDim).Italic(true)
-				m.appendOutput(dim.Render("  Stopped early after repeated failed attempts."))
+				switch msg.status.FailureCode {
+				case runstatus.CodeIterationLimit:
+					m.appendOutput(dim.Render("  Stopped early after repeated failed attempts."))
+				case runstatus.CodeBudgetExhausted:
+					m.appendOutput(dim.Render("  Provider budget reached; review the partial result."))
+				}
 			}
 		}
 		// Tool count summary (individual tool lines already shown during execution)
@@ -1428,7 +1425,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toolExpandLevel = 0
 		}
 		// Don't show usage/elapsed for cancelled tasks
-		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
+		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) || errors.Is(msg.err, agent.ErrRequestBudgetExhausted) {
 			elapsed := formatElapsed(time.Since(m.processingStartTime))
 			usageDim := lipgloss.NewStyle().Foreground(colorDim)
 			// Prefer session's cumulative usage (captures direct LLM + cloud_delegate
@@ -1461,7 +1458,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// successful turn (same shared core as the daemon path). tea.Batch
 		// drops a nil Cmd, so this is a no-op when gating fails.
 		var titleCmd tea.Cmd
-		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) {
+		if msg.err == nil || errors.Is(msg.err, agent.ErrMaxIterReached) || errors.Is(msg.err, agent.ErrRequestBudgetExhausted) {
 			if sess := m.sessions.Current(); sess != nil {
 				titleCmd = m.generateTitleCmd(sess.ID, sess.Source, sess.Messages, ctxwin.CountCompletedTurns(sess.Messages))
 			}
@@ -2107,7 +2104,7 @@ func (m *Model) runAgentLoop(query string, history []client.Message) tea.Cmd {
 		// don't leave in-memory partial state without disk persistence.
 		sess := m.sessions.Current()
 		isCancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-		shouldPersist := isCancelled || err == nil || errors.Is(err, agent.ErrMaxIterReached)
+		shouldPersist := isCancelled || err == nil || errors.Is(err, agent.ErrMaxIterReached) || errors.Is(err, agent.ErrRequestBudgetExhausted)
 		if shouldPersist {
 			runMsgs := m.agentLoop.RunMessages()
 			runInjected := m.agentLoop.RunMessageInjected()

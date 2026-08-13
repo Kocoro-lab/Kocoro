@@ -2,6 +2,9 @@
   "effective": {
     "agent": {
       "bash_concurrency_enabled": false,
+      "compact_timeout_secs": 0,
+      "compaction_snapshot_max_age_days": 0,
+      "compaction_snapshot_retention": 0,
       "context_window": 0,
       "effort_tier": "",
       "force_think_tool": false,
@@ -22,6 +25,9 @@
         "min_turns": 0
       },
       "reasoning_effort": "",
+      "response_detail": "",
+      "run_event_max_age_days": 0,
+      "run_event_retention": 0,
       "service_tier": "",
       "stream_idle_timeout_secs": 0,
       "temperature": 0,
@@ -33,9 +39,8 @@
         "gap_threshold_minutes": 0,
         "keep_recent": 0
       },
-      "compaction_snapshot_retention": 0,
-      "compaction_snapshot_max_age_days": 0,
-      "compact_timeout_secs": 0
+      "warm_set_max_schema_tokens": 0,
+      "warm_set_max_schemas": 0
     },
     "api_key": "***",
     "auto_update_check": false,

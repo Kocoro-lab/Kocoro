@@ -57,12 +57,11 @@ func (m *Model) maybeSuggestCmd(msg agentDoneMsg, gen int) tea.Cmd {
 	}) {
 		return nil
 	}
-	main, ok := m.agentLoop.LastSentRequest()
+	main, llm, ok := m.agentLoop.LastSentRequestWithClient()
 	if !ok {
 		return nil
 	}
 	result := msg.result
-	llm := m.llmClient
 	return func() tea.Msg {
 		// Append the assistant reply so the fork sees the full turn — the daemon
 		// does this OUTSIDE GenerateSuggestionWithUsage, so we must too. main is

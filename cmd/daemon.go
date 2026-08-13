@@ -56,6 +56,8 @@ var daemonStartCmd = &cobra.Command{
 		detach, _ := cmd.Flags().GetBool("detach")
 		force, _ := cmd.Flags().GetBool("force")
 		isolated, _ := cmd.Flags().GetBool("isolated")
+		isolatedMCP, _ := cmd.Flags().GetString("isolated-mcp")
+		isolatedAPIKeyStdin, _ := cmd.Flags().GetBool("isolated-api-key-stdin")
 		port, _ := cmd.Flags().GetInt("port")
 		stateDir, _ := cmd.Flags().GetString("state-dir")
 		rpcSockPath, _ := cmd.Flags().GetString("rpc-socket")
@@ -66,10 +68,17 @@ var daemonStartCmd = &cobra.Command{
 		); err != nil {
 			return err
 		}
+		if !isolated && strings.TrimSpace(isolatedMCP) != "" {
+			return fmt.Errorf("daemon: --isolated-mcp requires --isolated")
+		}
+		if !isolated && isolatedAPIKeyStdin {
+			return fmt.Errorf("daemon: --isolated-api-key-stdin requires --isolated")
+		}
 		if isolated {
 			if err := config.SetShannonDirOverrideForProcess(stateDir); err != nil {
 				return fmt.Errorf("daemon: configure isolated state: %w", err)
 			}
+			config.DisableCredentialStoreForProcess()
 		}
 		if detach {
 			return daemonStartDetached()
@@ -104,6 +113,22 @@ var daemonStartCmd = &cobra.Command{
 		cfg, configRevision, err := config.LoadWithRevision()
 		if err != nil {
 			return fmt.Errorf("config: %w", err)
+		}
+		if isolatedAPIKeyStdin {
+			apiKey, readErr := readIsolatedAPIKey(cmd.InOrStdin())
+			if readErr != nil {
+				return readErr
+			}
+			cfg.APIKey = apiKey
+		} else if isolated && cfg.APIKey != "" {
+			return fmt.Errorf("daemon: isolated config must not persist api_key; use --isolated-api-key-stdin")
+		}
+
+		var isolatedMCPAllowed []string
+		if isolated {
+			// This must precede registration: the async start closure captures the
+			// enabled map, and Playwright registration may prepare browser state.
+			isolatedMCPAllowed = daemon.RestrictMCPServersToAllowlist(cfg, isolatedMCP)
 		}
 
 		if cfg.Agent.IdleHardTimeoutSecs == 0 {
@@ -348,9 +373,14 @@ var daemonStartCmd = &cobra.Command{
 		}()
 
 		if isolated {
-			log.Print(daemon.IsolationMarkerMCPDisabled)
+			if len(isolatedMCPAllowed) > 0 {
+				log.Printf("%s %s", daemon.IsolationMarkerMCPAllowlisted, strings.Join(isolatedMCPAllowed, ","))
+				startDaemonMCPServices(ctx, deps, cfg, mcpMgr, startMCP, auditor)
+			} else {
+				log.Print(daemon.IsolationMarkerMCPDisabled)
+			}
 		} else {
-			startDaemonMCPServices(ctx, deps, mcpMgr, startMCP, auditor)
+			startDaemonMCPServices(ctx, deps, cfg, mcpMgr, startMCP, auditor)
 		}
 
 		if !cfg.Daemon.AutoApprove {
@@ -554,6 +584,7 @@ var daemonStartCmd = &cobra.Command{
 
 		localServer := daemon.NewServer(port, wsClient, deps, Version)
 		localServer.SetIsolated(isolated)
+		localServer.SetIsolatedMCPAllowlist(isolatedMCP)
 		localServer.SetCancelFunc(cancel)
 		localServer.SetApprovalResolvedNotifier(wsClient.SendApprovalResolved)
 		wsClient.SetEventBus(localServer.EventBus())
@@ -570,8 +601,9 @@ var daemonStartCmd = &cobra.Command{
 		// with that key above and WSController.Start below dials directly.
 		var authMgr *daemon.AuthManager
 		var wsCtl *daemon.WSController
-		kcStore, kcErr := keychain.NewOSStoreAt(shanDir, log.Default())
-		if kcErr == nil {
+		if isolated {
+			log.Print(daemon.IsolationMarkerCredentialStoreDisabled)
+		} else if kcStore, kcErr := keychain.NewOSStoreAt(shanDir, log.Default()); kcErr == nil {
 			// Pre-seed viper's cloud.api_key from Keychain so the memory
 			// subsystem's cold-start gate (memory.ResolveAPIKey at
 			// server.go:518) doesn't fire cloud_misconfigured for users
@@ -747,6 +779,25 @@ func acquireDaemonPIDFile(shannonDir string) (*daemon.PIDFile, error) {
 		return nil, fmt.Errorf("create daemon state directory: %w", err)
 	}
 	return daemon.AcquirePIDFile(filepath.Join(shannonDir, "daemon.pid"))
+}
+
+// readIsolatedAPIKey accepts one bounded credential from the inherited stdin
+// pipe. The caller keeps it in process memory and never copies it into config,
+// arguments, environment variables, or logs.
+func readIsolatedAPIKey(in io.Reader) (string, error) {
+	const maxCredentialBytes = 16 * 1024
+	data, err := io.ReadAll(io.LimitReader(in, maxCredentialBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("daemon: read isolated API key from stdin: %w", err)
+	}
+	if len(data) > maxCredentialBytes {
+		return "", fmt.Errorf("daemon: isolated API key exceeds %d bytes", maxCredentialBytes)
+	}
+	apiKey := strings.TrimSpace(string(data))
+	if apiKey == "" {
+		return "", fmt.Errorf("daemon: --isolated-api-key-stdin received an empty credential")
+	}
+	return apiKey, nil
 }
 
 func validateDaemonStartMode(isolated, detach, force bool, port int, stateDir, rpcSocket, rpcPIDFile string) error {
@@ -1364,6 +1415,7 @@ func truncateReply(s string, n int) string {
 func startDaemonMCPServices(
 	ctx context.Context,
 	deps *daemon.ServerDeps,
+	cfg *config.Config,
 	mcpMgr *mcp.ClientManager,
 	startMCP tools.StartMCPFunc,
 	auditor *audit.AuditLogger,
@@ -1371,6 +1423,10 @@ func startDaemonMCPServices(
 	supervisor := mcp.NewSupervisor(mcpMgr)
 	supervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
 	supervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
+		// The supervisor reconnected this server behind our back (it takes the
+		// same in-flight slot and never calls onResult), so the ladder would
+		// otherwise stay spent on a now-healthy server.
+		deps.ForgetMCPReconnect(serverName)
 		if serverName == "playwright" {
 			tools.CleanupPlaywrightReconnect(ctx, mcpMgr)
 		}
@@ -1406,29 +1462,36 @@ func startDaemonMCPServices(
 	if startMCP == nil {
 		return
 	}
-	go startMCP(ctx, func(name string, connErr error) {
-		_, _, depsSup := deps.Snapshot()
-		if depsSup != supervisor {
-			return
-		}
-		if connErr != nil {
-			log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
-			if auditor != nil {
-				auditor.Log(audit.AuditEntry{
-					Timestamp:     time.Now(),
-					ToolName:      "mcp_connect",
-					InputSummary:  "mcp_servers." + name,
-					OutputSummary: connErr.Error(),
-					Decision:      "error",
-					Approved:      false,
-				})
+	// A failed startup connect is recoverable: the scheduler retries it with
+	// backoff instead of leaving the server enabled-but-dead until the next
+	// daemon restart. Owned by deps so a later /config/reload stops this
+	// generation's ladder when it swaps the manager.
+	onResult, reconnect := daemon.NewMCPReconnectWiring(ctx, mcpMgr, daemon.MCPConnectTimeout(cfg), daemon.MCPConnectHooks{
+		IsCurrent: func() bool {
+			_, _, depsSup := deps.Snapshot()
+			return depsSup == supervisor
+		},
+		AuditFail: func(name string, connErr error) {
+			if auditor == nil {
+				return
 			}
-			return
-		}
-		log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
-		supervisor.ProbeNow(name)
-		tools.PostConnectDisconnectIfDiscoveryOnly(mcpMgr, name)
+			auditor.Log(audit.AuditEntry{
+				Timestamp:     time.Now(),
+				ToolName:      "mcp_connect",
+				InputSummary:  "mcp_servers." + name,
+				OutputSummary: connErr.Error(),
+				Decision:      "error",
+				Approved:      false,
+			})
+		},
+		OnConnected: func(name string) {
+			supervisor.ProbeNow(name)
+			tools.PostConnectDisconnectIfDiscoveryOnly(mcpMgr, name)
+		},
 	})
+	deps.SwapMCPReconnectScheduler(reconnect)
+
+	go startMCP(ctx, onResult)
 }
 
 type daemonAutomation struct {
@@ -1558,7 +1621,9 @@ func init() {
 	daemonStartCmd.Flags().Int("port", defaultDaemonPort, "Local HTTP port (non-default requires --isolated)")
 	daemonStartCmd.Flags().Bool("isolated", false, "Run a state-isolated daemon for live E2E testing")
 	daemonStartCmd.Flags().String("state-dir", "", "Absolute state directory for isolated live E2E testing")
-	for _, name := range []string{"isolated", "port", "state-dir"} {
+	daemonStartCmd.Flags().String("isolated-mcp", "", "Comma-separated MCP servers to keep enabled in an isolated run (default: none)")
+	daemonStartCmd.Flags().Bool("isolated-api-key-stdin", false, "Read an isolated live-E2E API key from stdin without persisting it")
+	for _, name := range []string{"isolated", "port", "state-dir", "isolated-mcp", "isolated-api-key-stdin"} {
 		if err := daemonStartCmd.Flags().MarkHidden(name); err != nil {
 			panic(err)
 		}

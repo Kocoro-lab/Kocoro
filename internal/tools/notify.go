@@ -91,8 +91,8 @@ func (t *NotifyTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 
 // SendBanner delivers a macOS notification banner using the Desktop route when
 // a NotifyHandler is attached to ctx; otherwise falls back to osascript so the
-// banner still fires in headless mode. Shared by the notify tool and the
-// daemon's reply-complete banner so both honor the same delivery contract.
+// banner still fires in headless mode. Automatic reply-complete banners use
+// SendLocalBanner only after agent_reply delivery reports no receiving client.
 //
 // The osascript fallback is macOS-only: on Linux/Windows it returns an
 // `executable file not found` error. Callers that fire SendBanner implicitly
@@ -104,6 +104,15 @@ func SendBanner(ctx context.Context, title, body string, sound bool) error {
 			return nil
 		}
 	}
+	return SendLocalBanner(ctx, title, body, sound)
+}
+
+// SendLocalBanner bypasses the attached Desktop notification route and invokes
+// the local OS fallback directly. The daemon uses this only when no subscriber
+// accepted the authoritative agent_reply event; emitting a second generic
+// EventNotification would otherwise make Desktop mistake an automatic
+// completion banner for an agent-authored notify call.
+func SendLocalBanner(ctx context.Context, title, body string, sound bool) error {
 	// The Desktop route above is cross-platform; the osascript fallback below is
 	// macOS-only. On other platforms without a handler, return a clean error
 	// rather than a cryptic `exec: "osascript": file not found`.

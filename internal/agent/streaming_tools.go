@@ -22,12 +22,13 @@ type speculativeToolRun struct {
 // response remains authoritative: results are consumed only when it contains
 // the exact same call; unmatched work is cancelled and never enters history.
 type streamToolStarter struct {
-	mu      sync.Mutex
-	ctx     context.Context
-	loop    *AgentLoop
-	tools   *ToolRegistry
-	handler EventHandler
-	runs    map[string]*speculativeToolRun
+	mu       sync.Mutex
+	ctx      context.Context
+	loop     *AgentLoop
+	tools    *ToolRegistry
+	handler  EventHandler
+	detector *LoopDetector
+	runs     map[string]*speculativeToolRun
 	// advertised is the exact name set carried in the current completion
 	// request. Registry membership alone is insufficient for Deferred tools.
 	advertised map[string]bool
@@ -46,6 +47,7 @@ func newStreamToolStarter(
 	tools *ToolRegistry,
 	advertisedSchemas []client.Tool,
 	handler EventHandler,
+	detector *LoopDetector,
 ) *streamToolStarter {
 	advertised := make(map[string]bool, len(advertisedSchemas))
 	for _, schema := range advertisedSchemas {
@@ -58,8 +60,10 @@ func newStreamToolStarter(
 		loop:       loop,
 		tools:      tools,
 		handler:    handler,
+		detector:   detector,
 		runs:       make(map[string]*speculativeToolRun),
 		advertised: advertised,
+		barrier:    detector != nil && detector.ShouldDisableSpeculation(),
 	}
 }
 
@@ -88,6 +92,11 @@ func (s *streamToolStarter) eligible(fc client.FunctionCall, activeSkillFilter m
 	readOnly, ok := tool.(ReadOnlyChecker)
 	if !ok || !readOnly.IsReadOnlyCall(argsStr) || tool.RequiresApproval() {
 		return nil, "", false
+	}
+	if s.detector != nil {
+		if action, _ := s.detector.CheckBefore(fc.Name, argsStr, true); action == LoopForceStop {
+			return nil, "", false
+		}
 	}
 	// Hooks are allowed to deny or transform the execution environment. Keep
 	// their ordering exact by leaving those calls on the normal post-stream
@@ -144,8 +153,9 @@ func (s *streamToolStarter) Start(fc client.FunctionCall, activeSkillFilter map[
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				run.result = toolExecResult{
-					result: ToolResult{Content: fmt.Sprintf("tool panicked: %v", recovered), IsError: true},
-					name:   fc.Name,
+					result:   ToolResult{Content: fmt.Sprintf("tool panicked: %v", recovered), IsError: true},
+					name:     fc.Name,
+					executed: true,
 				}
 			}
 		}()
@@ -156,10 +166,11 @@ func (s *streamToolStarter) Start(fc client.FunctionCall, activeSkillFilter map[
 		start := time.Now()
 		result, err := tool.Run(dispatchToolCtx, argsStr)
 		run.result = toolExecResult{
-			result:  result,
-			elapsed: time.Since(start),
-			err:     err,
-			name:    fc.Name,
+			result:   result,
+			elapsed:  time.Since(start),
+			err:      err,
+			name:     fc.Name,
+			executed: true,
 		}
 	}()
 }
@@ -191,9 +202,10 @@ func (s *streamToolStarter) Claim(ctx context.Context, fc client.FunctionCall) (
 	case <-ctx.Done():
 		run.cancel()
 		return toolExecResult{
-			result: ToolResult{Content: "tool startup cancelled with the turn", IsError: true},
-			err:    ctx.Err(),
-			name:   fc.Name,
+			result:   ToolResult{Content: "tool startup cancelled with the turn", IsError: true},
+			err:      ctx.Err(),
+			name:     fc.Name,
+			executed: true,
 		}, true
 	}
 }

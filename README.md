@@ -488,7 +488,7 @@ permissions:
 
 See [docs/config-reference.md](docs/config-reference.md) for the full key list including `agent.*`, `tools.*`, `mcp_servers`, `cloud`, `memory`, `sync`, `daemon`, `hooks`, UI settings, etc. Run `/config` in the TUI to see the merged config with sources.
 
-Per-agent overrides live in `~/.shannon/agents/<name>/_attached.yaml` — including `agent.model_tier` so individual agents can opt into the Large (Opus) tier without changing the global default. `agent.effort_tier` (`low` / `high` / `xhigh` / `max`, empty = inherit) works the same way, overriding the unified reasoning-effort tier per agent. See [docs/agents-reference.md](docs/agents-reference.md) for the precedence chain.
+Per-agent overrides live in `~/.shannon/agents/<name>/_attached.yaml` — including `agent.model_tier` so individual agents can opt into the Large (Opus) tier without changing the global default. `agent.effort_tier` (`low` / `high` / `xhigh` / `max`, empty = inherit) works the same way, overriding the unified reasoning-effort tier per agent. `agent.response_detail` (`concise` / `balanced` / `detailed`, global default `balanced`, empty per-agent value = inherit) controls final-answer style without changing reasoning effort. See [docs/agents-reference.md](docs/agents-reference.md) for the precedence chain.
 
 ## Instructions & Memory
 
@@ -744,13 +744,14 @@ Disabled by default. Skipped when the prompt cache is cold
 
 3. Restart the daemon. First bundle download starts ~60s after boot, then every 24h.
 
-### Implicit episodic preflight
+### Model-driven episodic recall
 
-Before the first main-model call on a memory-relevant turn, a small-tier helper compiles `QueryIntent`s via forced `tool_use`, the sidecar resolves them, and a `<private_memory>` block is injected into the current user message. Many memory questions get answered on turn 0 without an explicit `memory_recall` invocation.
+The main model decides when the answer depends on the user's private past and calls `memory_recall` directly. Ordinary turns do not pay for a hidden classifier or pre-fetch request.
 
-- Fires only when the sidecar is `Ready`; otherwise falls back to explicit `memory_recall` (or its session-search degradation path).
-- The `<private_memory>` block is in-message-only — never persisted to the transcript, never replayed, stripped from compaction summaries.
-- Audit event `memory_preflight` records a content-free trace: `attempted`, `helper_used`, `intents_count`, `results_count`, `context_injected`, `outcome`, `error_class`, `http_status`. Query text, anchors, relation labels, and recalled content are never logged.
+- Natural private-fact questions do not need to say “remember” or “recall”; the tool remains available whenever the model needs past context.
+- `memory_recall` uses the structured sidecar when it is `Ready` and otherwise degrades to session search plus `MEMORY.md`.
+- Unnamed references such as “my doctor” or “that plan” use `session_search` to recover the concrete name or wording instead of inventing a structured-memory anchor.
+- A no-data result ends structured lookup for that target; the model does not retry relation-name or mode variants.
 
 ### Configuration
 

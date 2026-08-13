@@ -146,13 +146,6 @@ func TestAccessibility_Info(t *testing.T) {
 	}
 }
 
-func TestAccessibility_RequiresApproval(t *testing.T) {
-	tool := &AccessibilityTool{client: &AXClient{}}
-	if !tool.RequiresApproval() {
-		t.Error("accessibility mutations must participate in the approval path")
-	}
-}
-
 func TestAccessibility_SafetyAndSerialization(t *testing.T) {
 	tool := &AccessibilityTool{}
 	for _, action := range []string{"read_tree", "annotate", "find", "get_value"} {

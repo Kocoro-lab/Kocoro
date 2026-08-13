@@ -13,13 +13,16 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
@@ -398,6 +401,7 @@ type APIError struct {
 	StatusCode int
 	Code       string
 	Body       string
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -405,6 +409,66 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("API returned %d: %s", e.StatusCode, e.Body)
 	}
 	return fmt.Sprintf("API returned %d", e.StatusCode)
+}
+
+const maxAPIRetryAfter = 60 * time.Second
+
+var retryAfterMessagePattern = regexp.MustCompile(
+	`(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s|seconds?)`,
+)
+
+func boundedAPIRetryAfter(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	if delay > maxAPIRetryAfter {
+		return maxAPIRetryAfter
+	}
+	return delay
+}
+
+func parseAPIRetryAfterHeader(raw string, now time.Time) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseFloat(raw, 64); err == nil && seconds >= 0 {
+		return boundedAPIRetryAfter(time.Duration(seconds * float64(time.Second)))
+	}
+	deadline, err := http.ParseTime(raw)
+	if err != nil {
+		return 0
+	}
+	return boundedAPIRetryAfter(deadline.Sub(now))
+}
+
+func parseAPIRetryAfterMessage(body string) time.Duration {
+	match := retryAfterMessagePattern.FindStringSubmatch(body)
+	if len(match) != 3 {
+		return 0
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil || value < 0 {
+		return 0
+	}
+	delay := time.Duration(value * float64(time.Second))
+	if strings.EqualFold(match[2], "ms") {
+		delay = time.Duration(value * float64(time.Millisecond))
+	}
+	return boundedAPIRetryAfter(delay)
+}
+
+func apiErrorFromHTTPResponse(resp *http.Response) *APIError {
+	body := readResponseBody(resp)
+	retryAfter := parseAPIRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
+	if bodyDelay := parseAPIRetryAfterMessage(body); bodyDelay > retryAfter {
+		retryAfter = bodyDelay
+	}
+	return &APIError{
+		StatusCode: resp.StatusCode,
+		Body:       body,
+		RetryAfter: retryAfter,
+	}
 }
 
 // ErrStreamIdleTimeout is returned by CompleteStream when no SSE chunk has
@@ -1515,7 +1579,7 @@ func (c *GatewayClient) Complete(ctx context.Context, req CompletionRequest) (*C
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+		return nil, apiErrorFromHTTPResponse(resp)
 	}
 
 	raw, err := io.ReadAll(resp.Body)
@@ -1654,7 +1718,7 @@ func (c *GatewayClient) CompleteStream(ctx context.Context, req CompletionReques
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
+		return nil, apiErrorFromHTTPResponse(resp)
 	}
 
 	var result *CompletionResponse
@@ -1859,6 +1923,7 @@ func parseSSEAPIError(line string) *APIError {
 		StatusCode: status,
 		Code:       event.Error.Code,
 		Body:       body,
+		RetryAfter: parseAPIRetryAfterMessage(body),
 	}
 }
 
@@ -1887,6 +1952,7 @@ func parseJSONAPIError(payload []byte) *APIError {
 		StatusCode: status,
 		Code:       event.Error.Code,
 		Body:       body,
+		RetryAfter: parseAPIRetryAfterMessage(body),
 	}
 }
 
@@ -2651,6 +2717,49 @@ type ToolUsage struct {
 	UnitType     string `json:"unit_type,omitempty"`
 }
 
+// ToolDispatchError records whether a tool request may have crossed the
+// network dispatch boundary. Retryable is true only for a transient failure
+// proven to have happened before dispatch.
+type ToolDispatchError struct {
+	MayHaveDispatched bool
+	Retryable         bool
+	Err               error
+}
+
+func (e *ToolDispatchError) Error() string {
+	if e == nil || e.Err == nil {
+		return "tool request failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *ToolDispatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+type toolDispatchTrace struct {
+	wroteHeaders atomic.Bool
+	wroteRequest atomic.Bool
+}
+
+func (t *toolDispatchTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		WroteHeaders: func() {
+			t.wroteHeaders.Store(true)
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			t.wroteRequest.Store(true)
+		},
+	}
+}
+
+func (t *toolDispatchTrace) mayHaveDispatched() bool {
+	return t.wroteHeaders.Load() || t.wroteRequest.Load()
+}
+
 // ListTools fetches available server-side tool schemas from the gateway.
 func (c *GatewayClient) ListTools(ctx context.Context) ([]ServerToolSchema, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/tools", nil)
@@ -2686,36 +2795,42 @@ func (c *GatewayClient) ExecuteTool(ctx context.Context, name string, arguments 
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, &ToolDispatchError{Err: fmt.Errorf("marshal request: %w", err)}
 	}
 
 	endpoint := c.baseURL + "/api/v1/tools/" + url.PathEscape(name) + "/execute"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, &ToolDispatchError{Err: fmt.Errorf("create request: %w", err)}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key := c.getAPIKey(); key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
 
+	dispatch := &toolDispatchTrace{}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), dispatch.clientTrace()))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		mayHaveDispatched := dispatch.mayHaveDispatched()
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: mayHaveDispatched,
+			Retryable:         !mayHaveDispatched,
+			Err:               fmt.Errorf("request failed: %w", err),
+		}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		errBody := readResponseBody(resp)
-		if errBody != "" {
-			return nil, fmt.Errorf("tool %s returned %d: %s", name, resp.StatusCode, errBody)
-		}
-		return nil, fmt.Errorf("tool %s returned %d", name, resp.StatusCode)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 
 	var result ToolExecuteResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: true,
+			Err:               fmt.Errorf("decode response: %w", err),
+		}
 	}
 	return &result, nil
 }
@@ -2756,32 +2871,46 @@ func (c *GatewayClient) ExecuteIntegrationTool(ctx context.Context, name string,
 	reqBody := ToolExecuteRequest{Arguments: arguments}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: false,
+			Retryable:         false,
+			Err:               fmt.Errorf("marshal request: %w", err),
+		}
 	}
 	endpoint := c.baseURL + "/api/v1/integrations/tools/" + url.PathEscape(name) + "/execute"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: false,
+			Retryable:         false,
+			Err:               fmt.Errorf("create request: %w", err),
+		}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key := c.getAPIKey(); key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
+	dispatch := &toolDispatchTrace{}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), dispatch.clientTrace()))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		mayHaveDispatched := dispatch.mayHaveDispatched()
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: mayHaveDispatched,
+			Retryable:         !mayHaveDispatched,
+			Err:               fmt.Errorf("request failed: %w", err),
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		errBody := readResponseBody(resp)
-		if errBody != "" {
-			return nil, fmt.Errorf("integration tool %s returned %d: %s", name, resp.StatusCode, errBody)
-		}
-		return nil, fmt.Errorf("integration tool %s returned %d", name, resp.StatusCode)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: readResponseBody(resp)}
 	}
 	var result ToolExecuteResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, &ToolDispatchError{
+			MayHaveDispatched: true,
+			Err:               fmt.Errorf("decode response: %w", err),
+		}
 	}
 	return &result, nil
 }

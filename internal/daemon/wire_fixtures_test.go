@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,8 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/memory"
+	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
+	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
@@ -542,6 +545,280 @@ func TestWireFixture_Done_PerRequestSSE(t *testing.T) {
 	}
 }
 
+// TestWireFixture_DonePartial_PerRequestSSE pins the explicit soft-stop
+// metadata on the terminal per-request payload. handleMessageSSE marshals the
+// RunAgentResult directly, so this exercises the same producer encoding as the
+// live done frame rather than a parallel test-only map.
+func TestWireFixture_DonePartial_PerRequestSSE(t *testing.T) {
+	fixture := loadWireFixture(t, "sse_event.done.partial.json")
+
+	result := &RunAgentResult{
+		Reply:     fixture["reply"].(string),
+		SessionID: fixture["session_id"].(string),
+		Agent:     fixture["agent"].(string),
+		Usage: RunAgentUsage{
+			InputTokens:    18432,
+			OutputTokens:   956,
+			TotalTokens:    19388,
+			CostUSD:        0.0712,
+			WebSearchCalls: 1,
+		},
+		Partial:     true,
+		FailureCode: runstatus.CodeIterationLimit,
+	}
+	raw := []byte(mustJSON(result))
+	assertSemanticEqual(t, fixture, parseJSONMap(t, raw))
+
+	var consumer struct {
+		Reply       string `json:"reply"`
+		SessionID   string `json:"session_id"`
+		Partial     bool   `json:"partial"`
+		FailureCode string `json:"failure_code"`
+	}
+	if err := json.Unmarshal(raw, &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.Reply == "" || consumer.SessionID == "" || !consumer.Partial || consumer.FailureCode != "iteration_limit" {
+		t.Fatalf("consumer decode lost partial metadata: %+v", consumer)
+	}
+}
+
+type wireFixtureProbeTool struct{}
+
+func (*wireFixtureProbeTool) Info() agent.ToolInfo {
+	return agent.ToolInfo{Name: "wire_fixture_probe", Description: "Return deterministic fixture evidence."}
+}
+func (*wireFixtureProbeTool) RequiresApproval() bool     { return false }
+func (*wireFixtureProbeTool) IsReadOnlyCall(string) bool { return true }
+func (*wireFixtureProbeTool) Run(context.Context, string) (agent.ToolResult, error) {
+	return agent.ToolResult{Content: "fixture probe complete"}, nil
+}
+
+// TestWireFixture_AgentReplyClean_Bus verifies the complementary omitempty
+// contract through the real RunAgent producer: a clean persisted reply must
+// not put partial or failure_code on the broadcast bus.
+func TestWireFixture_AgentReplyClean_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.agent_reply.json")
+	reply := fixture["text"].(string)
+	gw := &fakeGatewayBackend{reply: reply}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.EventBus = NewEventBus()
+	defer deps.SessionCache.CloseAll()
+	sub := deps.EventBus.Subscribe()
+	defer deps.EventBus.Unsubscribe(sub)
+
+	// heartbeat is intentionally autonomous: it suppresses detached smart-title
+	// and suggestion work, so neither can outlive RunAgent and race cleanup of
+	// the BypassRouting temporary session directory.
+	result, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "finish this request",
+		Source:        "heartbeat",
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent clean result error: %v", err)
+	}
+	if result == nil || result.Partial || result.FailureCode != runstatus.CodeNone {
+		t.Fatalf("RunAgent returned unexpected clean status: %+v", result)
+	}
+
+	evt := waitBusEvent(t, sub, EventAgentReply)
+	produced := parseJSONMap(t, evt.Payload)
+	if sessionID, ok := produced["session_id"].(string); !ok || sessionID == "" {
+		t.Fatalf("agent_reply session_id missing or empty: %#v", produced["session_id"])
+	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
+	for _, key := range []string{"partial", "failure_code"} {
+		if _, exists := produced[key]; exists {
+			t.Fatalf("clean agent_reply unexpectedly contains %q: %#v", key, produced)
+		}
+	}
+}
+
+func TestWireFixture_AgentError_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.agent_error.json")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "synthetic upstream rejection", http.StatusTeapot)
+	}))
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.EventBus = NewEventBus()
+	defer deps.SessionCache.CloseAll()
+	sub := deps.EventBus.Subscribe()
+	defer deps.EventBus.Unsubscribe(sub)
+
+	result, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "fail this fixture run",
+		Source:        fixture["source"].(string),
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err == nil || result == nil || result.FailureCode != runstatus.CodeUnexpected {
+		t.Fatalf("RunAgent hard-error result=%+v err=%v", result, err)
+	}
+
+	evt := waitBusEvent(t, sub, EventAgentError)
+	produced := parseJSONMap(t, evt.Payload)
+	if sessionID, ok := produced["session_id"].(string); !ok || sessionID == "" {
+		t.Fatalf("agent_error session_id missing or empty: %#v", produced["session_id"])
+	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		Error         string `json:"error"`
+		FriendlyError string `json:"friendly_error"`
+		FailureCode   string `json:"failure_code"`
+	}
+	if err := json.Unmarshal(evt.Payload, &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.Error == "" || consumer.FriendlyError == "" || consumer.FailureCode == "" {
+		t.Fatalf("consumer decode lost error fields: %+v", consumer)
+	}
+}
+
+// TestWireFixture_AgentReplyPartial_Bus drives a real RunAgent through its
+// max-iteration soft-stop path and captures the EventBus payload emitted only
+// after the transcript is saved. The scripted gateway supplies one tool call
+// followed by the loop's terminal no-tool synthesis response.
+func TestWireFixture_AgentReplyPartial_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.agent_reply.partial.json")
+	var calls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/completions" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		resp := client.CompletionResponse{
+			Provider:     "anthropic",
+			Model:        "test-model",
+			FinishReason: "end_turn",
+			OutputText:   fixture["text"].(string),
+		}
+		if calls.Add(1) == 1 {
+			resp.FinishReason = "tool_use"
+			resp.OutputText = ""
+			resp.ToolCalls = []client.FunctionCall{{
+				ID:        "toolu_wire_partial_1",
+				Name:      "wire_fixture_probe",
+				Arguments: json.RawMessage(`{}`),
+			}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			w.Header().Set("Content-Type", "text/event-stream")
+			raw, err := json.Marshal(struct {
+				Type string `json:"type"`
+				client.CompletionResponse
+			}{Type: "done", CompletionResponse: resp})
+			if err != nil {
+				t.Errorf("marshal streaming gateway response: %v", err)
+				return
+			}
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", raw)
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode gateway response: %v", err)
+		}
+	}))
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.Config.Agent.MaxIterations = 1
+	deps.EventBus = NewEventBus()
+	deps.Registry.Register(&wireFixtureProbeTool{})
+	defer deps.SessionCache.CloseAll()
+	sub := deps.EventBus.Subscribe()
+	defer deps.EventBus.Unsubscribe(sub)
+
+	// heartbeat is intentionally autonomous: it suppresses detached smart-title
+	// and suggestion work, so neither can outlive RunAgent and race cleanup of
+	// the BypassRouting temporary session directory.
+	result, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "continue until the requested work is complete",
+		Source:        fixture["source"].(string),
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent soft-stop error: %v", err)
+	}
+	if result == nil || !result.Partial || result.FailureCode != runstatus.CodeIterationLimit {
+		t.Fatalf("RunAgent result did not carry iteration-limit partial status after %d gateway calls: %+v", calls.Load(), result)
+	}
+
+	evt := waitBusEvent(t, sub, EventAgentReply)
+	produced := parseJSONMap(t, evt.Payload)
+	if sessionID, ok := produced["session_id"].(string); !ok || sessionID == "" {
+		t.Fatalf("agent_reply session_id missing or empty: %#v", produced["session_id"])
+	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		Text        string `json:"text"`
+		Partial     *bool  `json:"partial"`
+		FailureCode string `json:"failure_code"`
+	}
+	if err := json.Unmarshal(evt.Payload, &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.Text == "" || consumer.Partial == nil || !*consumer.Partial || consumer.FailureCode != "iteration_limit" {
+		t.Fatalf("consumer decode lost partial metadata: %+v", consumer)
+	}
+}
+
+func TestWireFixture_ScheduleRunPartial_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.schedule_run.partial.json")
+	bus := NewEventBus()
+	s := &Scheduler{deps: &ServerDeps{EventBus: bus}}
+	sched := schedule.Schedule{
+		ID:    fixture["schedule_id"].(string),
+		Agent: fixture["agent"].(string),
+	}
+	result := &RunAgentResult{
+		SessionID:   fixture["session_id"].(string),
+		Partial:     true,
+		FailureCode: runstatus.CodeIterationLimit,
+	}
+	usageFixture := fixture["usage"].(map[string]any)
+	usage := ScheduleRunUsage{
+		InputTokens:  int(usageFixture["input_tokens"].(float64)),
+		OutputTokens: int(usageFixture["output_tokens"].(float64)),
+		TotalTokens:  int(usageFixture["total_tokens"].(float64)),
+		CostUSD:      usageFixture["cost_usd"].(float64),
+	}
+
+	s.emitScheduleRunWithStatus("partial", sched, result.SessionID, nil, usage, result)
+	events := bus.EventsSince(0)
+	if len(events) != 1 || events[0].Type != EventScheduleRun {
+		t.Fatalf("expected one schedule_run event, got %+v", events)
+	}
+	produced := parseJSONMap(t, events[0].Payload)
+	produced["ts"] = fixture["ts"]
+	assertSemanticEqual(t, fixture, produced)
+
+	var consumer struct {
+		Phase       string `json:"phase"`
+		Partial     *bool  `json:"partial"`
+		FailureCode string `json:"failure_code"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &consumer); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if consumer.Phase != "partial" || consumer.Partial == nil || !*consumer.Partial ||
+		consumer.FailureCode != string(runstatus.CodeIterationLimit) {
+		t.Fatalf("consumer decode lost partial schedule metadata: %+v", consumer)
+	}
+}
+
 // TestWireFixture_DoneWithDeliverable pins the stronger idempotency receipt a
 // client requires before deleting its retained source after persisting a deliverable.
 func TestWireFixture_DoneWithDeliverable(t *testing.T) {
@@ -892,6 +1169,9 @@ func TestWireFixture_HTTPStatus(t *testing.T) {
 	}
 	if !has(CapScheduleSessionFilterV1) {
 		t.Fatalf("capabilities lost %q: %v", CapScheduleSessionFilterV1, *status.Capabilities)
+	}
+	if !has(CapScheduleRunPartialV1) {
+		t.Fatalf("capabilities lost %q: %v", CapScheduleRunPartialV1, *status.Capabilities)
 	}
 	if !has(CapWebSearchUsageV1) {
 		t.Fatalf("capabilities lost %q: %v", CapWebSearchUsageV1, *status.Capabilities)

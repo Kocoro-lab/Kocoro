@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 	"github.com/Kocoro-lab/ShanClaw/internal/schedule"
 )
 
@@ -63,6 +64,45 @@ func TestScheduleRun_HappyPath(t *testing.T) {
 	}
 	if _, ok := events[1]["error"]; ok {
 		t.Errorf("succeeded events must not carry an error field, got %v", events[1]["error"])
+	}
+}
+
+func TestScheduleRun_PartialResultHasDistinctTerminalPhase(t *testing.T) {
+	bus := NewEventBus()
+	deps := &ServerDeps{EventBus: bus}
+	s := &Scheduler{deps: deps}
+	sched := schedule.Schedule{ID: "sch-partial", Agent: "bot"}
+
+	s.runWithLifecycle(sched, func() (*RunAgentResult, error) {
+		return &RunAgentResult{
+			SessionID:   "sess-partial",
+			Partial:     true,
+			FailureCode: runstatus.CodeIterationLimit,
+			Usage: RunAgentUsage{
+				InputTokens: 10, OutputTokens: 2, TotalTokens: 12,
+			},
+		}, nil
+	})
+
+	events := drainScheduleRun(t, bus)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events (started, partial), got %d", len(events))
+	}
+	terminal := events[1]
+	if terminal["phase"] != "partial" {
+		t.Fatalf("terminal phase: got %v, want partial", terminal["phase"])
+	}
+	if terminal["partial"] != true {
+		t.Fatalf("partial marker missing: %+v", terminal)
+	}
+	if terminal["failure_code"] != string(runstatus.CodeIterationLimit) {
+		t.Fatalf("failure_code: got %v, want %q", terminal["failure_code"], runstatus.CodeIterationLimit)
+	}
+	if terminal["session_id"] != "sess-partial" {
+		t.Fatalf("session_id: got %v, want sess-partial", terminal["session_id"])
+	}
+	if _, ok := terminal["usage"].(map[string]any); !ok {
+		t.Fatalf("partial terminal event must retain usage: %+v", terminal)
 	}
 }
 

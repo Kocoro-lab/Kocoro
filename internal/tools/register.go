@@ -98,6 +98,8 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(&PptxToTextTool{})
 	reg.Register(&HTTPTool{})
 	reg.Register(&SystemInfoTool{})
+	reg.Register(&CalculateTool{})
+	reg.Register(&CurrentTimeTool{})
 	reg.Register(&ClipboardTool{})
 	reg.Register(&NotifyTool{})
 	reg.Register(&PresentDeliverableTool{})
@@ -563,38 +565,45 @@ func CloneWithAnthropicComputerForRun(
 	return cloned, nil
 }
 
-// gatewayAllowedTools is the allowlist of server-side tools worth registering
-// locally. Cloud-only tools (python_executor, calculator, etc.) are excluded
-// to prevent the LLM from choosing them over better local equivalents.
-// All cloud tools remain available via cloud_delegate.
-var gatewayAllowedTools = map[string]bool{
+type gatewayToolPolicy struct {
+	noMaterialSideEffect bool
+}
+
+// gatewayToolPolicies is both the local registration allowlist and the place
+// where each tool's journal materiality is reviewed explicitly. A future
+// mutating gateway tool can be registered with the zero-value policy and will
+// remain protected by the durable side-effect journal.
+var gatewayToolPolicies = map[string]gatewayToolPolicy{
 	// Research
-	"web_search":        true,
-	"web_fetch":         true,
-	"web_subpage_fetch": true,
-	"web_crawl":         true,
-	"x_search":          true,
+	"web_search":        {noMaterialSideEffect: true},
+	"web_fetch":         {noMaterialSideEffect: true},
+	"web_subpage_fetch": {noMaterialSideEffect: true},
+	// web_crawl starts a durable provider job and must remain journaled.
+	"web_crawl": {},
+	"x_search":  {noMaterialSideEffect: true},
 	// Financial
-	"getStockBars":      true,
-	"alpaca_news":       true,
-	"sec_filings":       true,
-	"news_aggregator":   true,
-	"twitter_sentiment": true,
+	"getStockBars":      {noMaterialSideEffect: true},
+	"alpaca_news":       {noMaterialSideEffect: true},
+	"sec_filings":       {noMaterialSideEffect: true},
+	"news_aggregator":   {noMaterialSideEffect: true},
+	"twitter_sentiment": {noMaterialSideEffect: true},
 	// Ads/Enterprise
-	"ads_serp_extract":        true,
-	"ads_transparency_search": true,
-	"ads_competitor_discover": true,
-	"lp_visual_analyze":       true,
-	"lp_batch_analyze":        true,
-	"ads_creative_analyze":    true,
-	"yahoo_jp_ads_discover":   true,
-	"meta_ad_library_search":  true,
+	"ads_serp_extract":        {noMaterialSideEffect: true},
+	"ads_transparency_search": {noMaterialSideEffect: true},
+	"ads_competitor_discover": {noMaterialSideEffect: true},
+	// These analyses create durable S3 artifacts or Firecrawl jobs.
+	"lp_visual_analyze":      {},
+	"lp_batch_analyze":       {},
+	"ads_creative_analyze":   {noMaterialSideEffect: true},
+	"yahoo_jp_ads_discover":  {noMaterialSideEffect: true},
+	"meta_ad_library_search": {noMaterialSideEffect: true},
 	// Analytics
-	"ga4_run_report":          true,
-	"ga4_run_realtime_report": true,
-	"ga4_get_metadata":        true,
+	"ga4_run_report":          {noMaterialSideEffect: true},
+	"ga4_run_realtime_report": {noMaterialSideEffect: true},
+	"ga4_get_metadata":        {noMaterialSideEffect: true},
 	// Visual
-	"page_screenshot": true,
+	// page_screenshot uploads a durable object and must remain journaled.
+	"page_screenshot": {},
 }
 
 // RegisterServerTools fetches server-side tools from the gateway and appends
@@ -615,7 +624,7 @@ func RegisterServerTools(ctx context.Context, gw *client.GatewayClient, reg *age
 		if _, exists := reg.Get(schema.Name); exists {
 			continue // local tool takes priority
 		}
-		if !gatewayAllowedTools[schema.Name] {
+		if _, allowed := gatewayToolPolicies[schema.Name]; !allowed {
 			continue // not allowlisted; available via cloud_delegate
 		}
 		reg.Register(NewServerTool(schema, gw))

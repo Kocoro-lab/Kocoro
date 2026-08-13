@@ -50,12 +50,16 @@ import (
 )
 
 type Server struct {
-	port       int
-	client     *Client
-	deps       *ServerDeps
-	server     *http.Server
-	isolated   bool
-	listenerMu sync.Mutex // protects listener
+	port     int
+	client   *Client
+	deps     *ServerDeps
+	server   *http.Server
+	isolated bool
+	// isolatedMCPAllowlist is the immutable process-start policy applied before
+	// every MCP registration, including config reloads. An empty value means no
+	// MCP server may start in isolated mode.
+	isolatedMCPAllowlist string
+	listenerMu           sync.Mutex // protects listener
 	// toolRefreshMu serializes in-place re-registration of the live registry's
 	// gateway/integration tools (RebuildAuthSensitiveTools + RefreshIntegrationTools).
 	// Without it, overlapping refreshes (e.g. sign-in + a connect/delete async
@@ -619,6 +623,13 @@ func (s *Server) SetIsolated(isolated bool) {
 	s.isolated = isolated
 }
 
+// SetIsolatedMCPAllowlist pins the MCP capability boundary for an isolated
+// process. It must be set before Start; reloads reapply the same allowlist to
+// freshly loaded config before any server registration or browser preflight.
+func (s *Server) SetIsolatedMCPAllowlist(allowlist string) {
+	s.isolatedMCPAllowlist = allowlist
+}
+
 // SetOnReload sets a callback invoked after config reload to restart watchers/heartbeat.
 func (s *Server) SetOnReload(fn func()) {
 	s.onReload = fn
@@ -693,7 +704,7 @@ func (s *Server) SetConsequentialRiskHTTPAuthorizer(authorizer func(*http.Reques
 }
 
 func (s *Server) liveAPIKey(cfg *config.Config) string {
-	if s != nil && s.auth != nil && s.deps != nil && s.deps.GW != nil {
+	if s != nil && s.deps != nil && s.deps.GW != nil && (s.isolated || s.auth != nil) {
 		return s.deps.GW.APIKey()
 	}
 	if cfg == nil {
@@ -707,7 +718,7 @@ func (s *Server) configWithLiveAPIKey(cfg *config.Config) *config.Config {
 		return nil
 	}
 	out := config.Clone(cfg)
-	if s != nil && s.auth != nil && s.deps != nil && s.deps.GW != nil {
+	if s != nil && s.deps != nil && s.deps.GW != nil && (s.isolated || s.auth != nil) {
 		out.APIKey = s.deps.GW.APIKey()
 	}
 	return out
@@ -1167,14 +1178,17 @@ func (s *Server) startBackgroundServices(ctx context.Context) func() {
 	// history. Bound their lifetime independently of session deletion so an
 	// old but still-listed session cannot retain full-history copies forever.
 	days := 0
+	runEventDays := 0
 	if s.deps != nil {
 		s.deps.mu.RLock()
 		if s.deps.Config != nil {
 			days = s.deps.Config.Agent.CompactionSnapshotMaxAgeDays
+			runEventDays = s.deps.Config.Agent.RunEventMaxAgeDays
 		}
 		s.deps.mu.RUnlock()
 	}
 	s.startCompactionSnapshotSweep(days)
+	s.startRunEventSweep(runEventDays)
 
 	// One-time agent pull on startup: applies the cloud mirror to local disk
 	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
@@ -7140,6 +7154,10 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.effort_tier %q is not valid; use one of %s", tier, strings.Join(agents.EffortTierAllowedValues(), ", ")))
 			return
 		}
+		if detail, ok := agentPatch["response_detail"].(string); ok && !config.IsValidAgentResponseDetail(detail) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.response_detail %q is not valid; use one of %s", detail, strings.Join(config.AgentResponseDetailAllowedValues(), ", ")))
+			return
+		}
 		if tier, ok := agentPatch["service_tier"].(string); ok && !config.IsValidAgentServiceTier(tier) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("agent.service_tier %q is not valid; use one of %s", tier, strings.Join(config.AgentServiceTierAllowedValues(), ", ")))
 			return
@@ -7326,12 +7344,27 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 	if len(retry) == 0 {
 		return
 	}
-	defaultTimeout := time.Duration(cfg.MCP.DefaultConnectTimeoutSecs) * time.Second
-	if defaultTimeout <= 0 {
-		defaultTimeout = 60 * time.Second
-	}
+	defaultTimeout := MCPConnectTimeout(cfg)
 	capturedSup := sup
 	capturedMgr := mgr
+	// This call IS the user's explicit retry signal, so re-arm every server it
+	// covers: one that already burned through its automatic attempts must get
+	// a fresh streak rather than being permanently written off.
+	for name := range retry {
+		s.deps.ForgetMCPReconnect(name)
+	}
+	onResult := buildMCPConnectResult(s.deps.liveMCPReconnectSink(), MCPConnectHooks{
+		IsCurrent: func() bool {
+			_, _, depsSup := s.deps.Snapshot()
+			return depsSup == capturedSup
+		},
+		AuditFail: s.auditMCPConnectFailure,
+		OnConnected: func(name string) {
+			capturedSup.ProbeNow(name)
+			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
+		},
+		Label: "reload retry",
+	})
 	go func() {
 		// Final stale-check before spawning subprocesses: a fast follow-up
 		// reload may have swapped deps between scheduling this goroutine
@@ -7341,20 +7374,7 @@ func (s *Server) retryDisconnectedEnabledMCPServers(cfg *config.Config) {
 		if depsSup != capturedSup {
 			return
 		}
-		capturedMgr.StartConnectAll(s.ctx, retry, defaultTimeout, func(name string, connErr error) {
-			_, _, depsSup := s.deps.Snapshot()
-			if depsSup != capturedSup {
-				return // deps swapped by a newer reload — drop stale result.
-			}
-			if connErr != nil {
-				log.Printf("[mcp] %s: reload retry failed: %v", name, connErr)
-				s.auditMCPConnectFailure(name, connErr)
-				return
-			}
-			log.Printf("[mcp] %s: reload retry succeeded; probing supervisor", name)
-			capturedSup.ProbeNow(name)
-			tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
-		})
+		capturedMgr.StartConnectAll(s.ctx, retry, defaultTimeout, onResult)
 	}()
 }
 
@@ -7392,6 +7412,9 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("config load failed: %v", err))
 		return
+	}
+	if s.isolated {
+		RestrictMCPServersToAllowlist(newCfg, s.isolatedMCPAllowlist)
 	}
 	turningRecommendationsOff := skillRecommendationsEnabled(oldCfg) && !skillRecommendationsEnabled(newCfg)
 	s.skillRecommendationsOff.Store(!skillRecommendationsEnabled(newCfg))
@@ -7440,6 +7463,10 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		newSupervisor := mcp.NewSupervisor(newMCPMgr)
 		newSupervisor.RegisterCapabilityProbe("playwright", &mcp.PlaywrightProbe{})
 		newSupervisor.SetOnReconnect(func(ctx context.Context, serverName string) {
+			// The supervisor reconnected this server behind our back (it takes
+			// the same in-flight slot and never calls onResult), so the ladder
+			// would otherwise stay spent on a now-healthy server.
+			s.deps.ForgetMCPReconnect(serverName)
 			if serverName == "playwright" {
 				tools.CleanupPlaywrightReconnect(ctx, newMCPMgr)
 			}
@@ -7518,23 +7545,26 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		// trigger a supervisor probe which transitions state to Healthy and
 		// fires OnChange → RebuildRegistryForHealth → MCP tools appear in
 		// the live registry.
-		if startMCP != nil {
-			capturedSupervisor := newSupervisor
-			capturedMgr := newMCPMgr
-			go startMCP(s.ctx, func(name string, connErr error) {
+		capturedSupervisor := newSupervisor
+		capturedMgr := newMCPMgr
+		onResult, scheduler := NewMCPReconnectWiring(s.ctx, capturedMgr, MCPConnectTimeout(newCfg), MCPConnectHooks{
+			IsCurrent: func() bool {
 				_, _, depsSup := s.deps.Snapshot()
-				if depsSup != capturedSupervisor {
-					return // deps swapped by a newer reload — drop result.
-				}
-				if connErr != nil {
-					log.Printf("[mcp] %s: async connect failed: %v", name, connErr)
-					s.auditMCPConnectFailure(name, connErr)
-					return
-				}
-				log.Printf("[mcp] %s: async connect succeeded; probing supervisor", name)
+				return depsSup == capturedSupervisor
+			},
+			AuditFail: s.auditMCPConnectFailure,
+			OnConnected: func(name string) {
 				capturedSupervisor.ProbeNow(name)
 				tools.PostConnectDisconnectIfDiscoveryOnly(capturedMgr, name)
-			})
+			},
+		})
+		// Retries belong to the manager generation that spawned them, so the
+		// swap that stops the superseded ladder is UNCONDITIONAL — gating it on
+		// startMCP would tie an ownership invariant to whether there happened
+		// to be anything to connect.
+		s.deps.SwapMCPReconnectScheduler(scheduler)
+		if startMCP != nil {
+			go startMCP(s.ctx, onResult)
 		}
 	} else {
 		// Config changed but MCP servers didn't — update config and refresh

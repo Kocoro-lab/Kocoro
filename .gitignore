@@ -27,6 +27,7 @@ docs/*
 !docs/live-e2e-testing.md
 !docs/desktop-calendar-rpc-fixtures
 !docs/desktop-wire-fixtures
+!docs/cloud-contract-surface.md
 internal/tools/axserver/.build/
 internal/agent/tmp/
 build/

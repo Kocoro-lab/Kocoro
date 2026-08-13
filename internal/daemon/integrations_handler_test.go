@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -224,6 +226,163 @@ func TestHandleConnectIntegration_RefreshGate(t *testing.T) {
 			t.Error("tool refresh must not fire on a rejected connect")
 		case <-time.After(200 * time.Millisecond):
 		}
+	})
+}
+
+// captureLog redirects the global log output to a buffer for the duration of
+// the test, restoring the previous writer on cleanup (never a hardcoded
+// os.Stderr — an outer redirection must survive).
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return &buf
+}
+
+// TestHandleConnectIntegration_FailureLogging pins the connect-failure log's
+// diagnostic content and its two safety invariants: request-body credentials
+// never reach the log (not even via a response that echoes request input),
+// and an attacker-controlled provider segment cannot forge log lines.
+func TestHandleConnectIntegration_FailureLogging(t *testing.T) {
+	newServer := func(connectStatus int, connectBody string) (*Server, *httptest.Server) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(connectStatus)
+			w.Write([]byte(connectBody))
+		}))
+		cfg := &config.Config{}
+		cfg.Cloud.Enabled = true
+		cfg.APIKey = "test-key"
+		s := &Server{deps: &ServerDeps{
+			Config:   cfg,
+			Registry: agent.NewToolRegistry(),
+			GW:       client.NewGatewayClient(cloud.URL, "test-key"),
+		}}
+		return s, cloud
+	}
+	tokenReq := func(provider string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/integrations/p/connect",
+			strings.NewReader(`{"params":{"shop":"s.myshopify.com","access_token":"shpat_x"}}`))
+		req.SetPathValue("provider", provider)
+		return req
+	}
+	oauthReq := func(provider string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/integrations/p/connect", nil)
+		req.SetPathValue("provider", provider)
+		return req
+	}
+	assertNoCredentials := func(t *testing.T, logged string) {
+		t.Helper()
+		for _, leak := range []string{"shpat_x", "s.myshopify.com", "access_token"} {
+			if strings.Contains(logged, leak) {
+				t.Errorf("failure log leaked request-body content %q (log: %s)", leak, logged)
+			}
+		}
+	}
+
+	t.Run("contract error body logs code and message", func(t *testing.T) {
+		logBuf := captureLog(t)
+		s, cloud := newServer(http.StatusUnauthorized, `{"error":"invalid_token","message":"token was rejected"}`)
+		defer cloud.Close()
+		s.handleConnectIntegration(httptest.NewRecorder(), tokenReq("shopify"))
+		logged := logBuf.String()
+		for _, want := range []string{"integration connect rejected by cloud", `provider="shopify"`, "status=401", `error="invalid_token"`, `message="token was rejected"`} {
+			if !strings.Contains(logged, want) {
+				t.Errorf("failure log missing %q (log: %s)", want, logged)
+			}
+		}
+		assertNoCredentials(t, logged)
+	})
+
+	t.Run("non-contract body on a token-mode connect logs length only", func(t *testing.T) {
+		// A framework validation error can echo request input (pydantic 422
+		// carries the submitted value in detail[].input); the request had a
+		// body, so the raw body must never be quoted.
+		echo := `{"detail":[{"loc":["params","access_token"],"input":"shpat_x"}]}`
+		logBuf := captureLog(t)
+		s, cloud := newServer(http.StatusUnprocessableEntity, echo)
+		defer cloud.Close()
+		s.handleConnectIntegration(httptest.NewRecorder(), tokenReq("shopify"))
+		logged := logBuf.String()
+		for _, want := range []string{`provider="shopify"`, "status=422", "unparsed_body_len="} {
+			if !strings.Contains(logged, want) {
+				t.Errorf("failure log missing %q (log: %s)", want, logged)
+			}
+		}
+		assertNoCredentials(t, logged)
+	})
+
+	t.Run("non-contract body on a body-less connect quotes the body", func(t *testing.T) {
+		logBuf := captureLog(t)
+		s, cloud := newServer(http.StatusBadGateway, "<html>upstream down</html>")
+		defer cloud.Close()
+		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("notion"))
+		logged := logBuf.String()
+		for _, want := range []string{`provider="notion"`, "status=502", `body="<html>upstream down</html>"`} {
+			if !strings.Contains(logged, want) {
+				t.Errorf("failure log missing %q (log: %s)", want, logged)
+			}
+		}
+	})
+
+	t.Run("quoted body is capped", func(t *testing.T) {
+		logBuf := captureLog(t)
+		s, cloud := newServer(http.StatusBadGateway, strings.Repeat("a", 3*maxIntegrationConnectLogBodyBytes))
+		defer cloud.Close()
+		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("notion"))
+		logged := logBuf.String()
+		if !strings.Contains(logged, strings.Repeat("a", maxIntegrationConnectLogBodyBytes)) {
+			t.Errorf("capped body prefix missing from log (log len %d)", len(logged))
+		}
+		if strings.Contains(logged, strings.Repeat("a", maxIntegrationConnectLogBodyBytes+1)) {
+			t.Errorf("logged body exceeds %d-byte cap (log len %d)", maxIntegrationConnectLogBodyBytes, len(logged))
+		}
+	})
+
+	t.Run("provider newline cannot forge log lines", func(t *testing.T) {
+		logBuf := captureLog(t)
+		s, cloud := newServer(http.StatusUnauthorized, `{"error":"invalid_token"}`)
+		defer cloud.Close()
+		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("x\nfake: forged line"))
+		logged := logBuf.String()
+		if strings.Contains(logged, "\nfake: forged line") {
+			t.Errorf("provider newline reached the log stream unescaped (log: %s)", logged)
+		}
+		if !strings.Contains(logged, `provider="x\nfake: forged line"`) {
+			t.Errorf("provider not %%q-escaped (log: %s)", logged)
+		}
+	})
+
+	t.Run("3xx is logged", func(t *testing.T) {
+		// 304 is a non-redirect 3xx the HTTP client returns as-is; it must not
+		// fall through the old >=400 gate silently.
+		logBuf := captureLog(t)
+		s, cloud := newServer(http.StatusNotModified, "")
+		defer cloud.Close()
+		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("notion"))
+		if logged := logBuf.String(); !strings.Contains(logged, "status=304") {
+			t.Errorf("3xx connect failure not logged (log: %s)", logged)
+		}
+	})
+
+	t.Run("transport failure logged distinctly", func(t *testing.T) {
+		logBuf := captureLog(t)
+		cfg := &config.Config{}
+		cfg.Cloud.Enabled = true
+		cfg.APIKey = "test-key"
+		s := &Server{deps: &ServerDeps{
+			Config: cfg,
+			GW:     client.NewGatewayClient("http://127.0.0.1:1", "test-key"),
+		}}
+		s.handleConnectIntegration(httptest.NewRecorder(), tokenReq("shopify"))
+		logged := logBuf.String()
+		for _, want := range []string{"integration connect transport failure", `provider="shopify"`, "err="} {
+			if !strings.Contains(logged, want) {
+				t.Errorf("transport-failure log missing %q (log: %s)", want, logged)
+			}
+		}
+		assertNoCredentials(t, logged)
 	})
 }
 

@@ -461,7 +461,7 @@ func TestKoePersonaUsesRealtimeStructureAndVoiceStyle(t *testing.T) {
 }
 
 func TestKoePersonaDefaultsToOneTaskAndMakesExplicitParallelScopesDisjoint(t *testing.T) {
-	combined := koePersona + koeMultiTaskPersona
+	combined := koePersona + koeMultiTaskPersona + koe.ParallelTaskInstructions
 	for _, want := range []string{
 		"Default to exactly one do_task call.",
 		"only when the user explicitly asks",
@@ -472,8 +472,62 @@ func TestKoePersonaDefaultsToOneTaskAndMakesExplicitParallelScopesDisjoint(t *te
 			t.Errorf("Koe parallel contract missing %q", want)
 		}
 	}
+	if got := strings.Count(combined, koe.ParallelTaskInstructions); got != 1 {
+		t.Fatalf("assembled Koe session has %d complete parallel contracts, want 1", got)
+	}
 	if strings.Contains(combined, "either send one complete compound task, or split it") {
 		t.Fatal("Koe parallel contract still offers the ambiguous compound-plus-split choice")
+	}
+}
+
+func TestKoePersonaConfirmationAndClarificationHaveSinglePassSemantics(t *testing.T) {
+	for _, want := range []string{
+		"only if the exact action is not already",
+		"pass it through do_task without asking again",
+		"several tasks are active",
+		"follow-up or cancellation is ambiguous",
+	} {
+		if !strings.Contains(koePersona, want) {
+			t.Errorf("koePersona missing bounded confirmation/clarification rule %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"Before anything irreversible or outbound, restate it and wait for a clear yes",
+		"This is the only follow-up question allowed before doing the work",
+	} {
+		if strings.Contains(koePersona, forbidden) {
+			t.Errorf("koePersona retains conflicting absolute rule %q", forbidden)
+		}
+	}
+}
+
+func TestKoePersonaHasExactlyOneLanguageAuthority(t *testing.T) {
+	var doTaskDescription string
+	for _, tool := range koe.ToolDefs() {
+		if tool.Name == "do_task" {
+			doTaskDescription = tool.Description
+			break
+		}
+	}
+	if doTaskDescription == "" {
+		t.Fatal("do_task tool definition missing")
+	}
+	for _, lang := range []string{"", "en", "ja", "zh"} {
+		persona := baseKoePersona(koeConfig{language: lang})
+		if got := strings.Count(persona, "# Language"); got != 1 {
+			t.Errorf("language=%q has %d language sections, want 1", lang, got)
+		}
+		if lang != "" && strings.Contains(persona, "current utterance") {
+			t.Errorf("language=%q retains the conflicting follow-utterance rule", lang)
+		}
+		assembled := strings.ToLower(persona + "\n" + doTaskDescription)
+		if lang != "" && (strings.Contains(assembled, "user's current language") ||
+			strings.Contains(assembled, "language of the utterance")) {
+			t.Errorf("language=%q assembled session retains an utterance-language override", lang)
+		}
+		if !strings.Contains(assembled, "active reply language") {
+			t.Errorf("language=%q assembled session lacks the shared active-language handoff", lang)
+		}
 	}
 }
 
@@ -619,7 +673,8 @@ func TestBaseKoePersona(t *testing.T) {
 		t.Errorf("empty language should give the bare base persona")
 	}
 	zh := baseKoePersona(koeConfig{language: "zh"})
-	if !strings.HasPrefix(zh, koePersona) || !strings.Contains(zh, koeLanguageInstruction("zh")) {
+	if !strings.Contains(zh, koeLanguageInstruction("zh")) ||
+		strings.Contains(zh, koeDefaultLanguageSection) || strings.Count(zh, "# Language") != 1 {
 		t.Errorf("zh base persona missing base or language pin: %q", zh)
 	}
 	t.Setenv("KOE_TASK_LEDGER", "1")
@@ -642,10 +697,13 @@ func TestBuildKoePersonaAssembly(t *testing.T) {
 
 	agents := []koe.AgentSummary{{Slug: "finance", DisplayName: "Finance"}}
 	got := buildKoePersona(context.Background(), koe.NewDaemonClient(daemon.URL), koeConfig{language: "en"}, agents)
-	for _, want := range []string{koePersona, "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en"), koeMultiTaskPersona} {
+	for _, want := range []string{"# Role and Objective", "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en"), koeMultiTaskPersona} {
 		if !strings.Contains(got, want) {
 			t.Errorf("buildKoePersona missing %q", want)
 		}
+	}
+	if strings.Contains(got, koeDefaultLanguageSection) || strings.Count(got, "# Language") != 1 {
+		t.Errorf("buildKoePersona has conflicting language authorities: %q", got)
 	}
 }
 

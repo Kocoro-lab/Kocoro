@@ -183,6 +183,11 @@ const (
 	// master-detail session list on the full contract so an older daemon cannot
 	// silently ignore the query and return every session for the agent.
 	CapScheduleSessionFilterV1 = "schedule_session_filter_v1"
+	// CapScheduleRunPartialV1 — schedule_run uses the explicit "partial"
+	// terminal phase and carries partial/failure_code when RunAgent returns a
+	// useful soft-stop result. Older clients ignore the unknown phase instead of
+	// rendering it as a clean success.
+	CapScheduleRunPartialV1 = "schedule_run_partial_v1"
 	// CapAgentDefaultCWDV1 — named-agent cwd writes are validated before any
 	// mutation, invalid persisted cwd is surfaced as a non-fatal warning, and
 	// cross-device agent sync treats cwd as device-local (never pushed or
@@ -269,6 +274,9 @@ const (
 	// checkpointed, and forwarded on ordinary completion requests while sealed
 	// Koe/computer profiles and named-agent model overrides remain isolated.
 	CapAgentServiceTierV1 = "agent_service_tier_v1"
+	// CapAgentResponseDetailV1 means agent.response_detail is validated,
+	// supports per-agent inheritance, and is rendered in BP3 StableContext.
+	CapAgentResponseDetailV1 = "agent_response_detail_v1"
 	// CapWebSearchUsageV1 means usage events and terminal run usage always
 	// include web_search_calls, including an explicit zero when no hosted
 	// search ran. Older clients may ignore the additive field.
@@ -321,6 +329,7 @@ var Capabilities = []string{
 	CapIMTimelineV1,
 	CapAgentProfileV1,
 	CapAgentAvatarV1,
+	CapAgentResponseDetailV1,
 	CapScheduleBroadcastGate,
 	CapProactiveTargeting,
 	CapProactiveThreadMode,
@@ -334,6 +343,7 @@ var Capabilities = []string{
 	CapSessionsScopeAll,
 	CapSessionProjectsV1,
 	CapScheduleSessionFilterV1,
+	CapScheduleRunPartialV1,
 	CapAgentDefaultCWDV1,
 	CapRemoteControlV1,
 	CapRemoteSessionTimelineV1,

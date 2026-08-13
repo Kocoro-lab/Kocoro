@@ -136,12 +136,15 @@ type AgentModelConfig struct {
 	// a value overrides it for this agent. Applied to the loop via
 	// applyAgentModelOverlayToLoop. Empty string "" is treated as inherit too
 	// (Desktop's "Inherit" segment sends the field absent, but tolerate "").
-	EffortTier    *string  `yaml:"effort_tier" json:"effort_tier,omitempty"`
-	Language      *string  `yaml:"language" json:"language,omitempty"` // nil = inherit global agent.language; "" = force mirror even if global is locked; value = lock to that language
-	MaxIterations *int     `yaml:"max_iterations" json:"max_iterations,omitempty"`
-	Temperature   *float64 `yaml:"temperature" json:"temperature,omitempty"`
-	MaxTokens     *int     `yaml:"max_tokens" json:"max_tokens,omitempty"`
-	ContextWindow *int     `yaml:"context_window" json:"context_window,omitempty"`
+	EffortTier *string `yaml:"effort_tier" json:"effort_tier,omitempty"`
+	// ResponseDetail is the per-agent visible-answer detail override. nil or
+	// "" inherits the global agent.response_detail profile.
+	ResponseDetail *string  `yaml:"response_detail" json:"response_detail,omitempty"`
+	Language       *string  `yaml:"language" json:"language,omitempty"` // nil = inherit global agent.language; "" = force mirror even if global is locked; value = lock to that language
+	MaxIterations  *int     `yaml:"max_iterations" json:"max_iterations,omitempty"`
+	Temperature    *float64 `yaml:"temperature" json:"temperature,omitempty"`
+	MaxTokens      *int     `yaml:"max_tokens" json:"max_tokens,omitempty"`
+	ContextWindow  *int     `yaml:"context_window" json:"context_window,omitempty"`
 
 	IdleSoftTimeoutSecs *int `yaml:"idle_soft_timeout_secs" json:"idle_soft_timeout_secs,omitempty"`
 	IdleHardTimeoutSecs *int `yaml:"idle_hard_timeout_secs" json:"idle_hard_timeout_secs,omitempty"`

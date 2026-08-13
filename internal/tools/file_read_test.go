@@ -143,6 +143,10 @@ func TestFileRead_NotFound(t *testing.T) {
 	if !result.IsError {
 		t.Error("expected error result for missing file")
 	}
+	if result.ErrorCategory != agent.ErrCategoryBusiness ||
+		!strings.HasPrefix(result.Content, "[business error]") {
+		t.Fatalf("missing path was not classified as non-retryable business failure: %#v", result)
+	}
 }
 
 // TestFileRead_OffsetWithoutLimit verifies that an offset-only read slices

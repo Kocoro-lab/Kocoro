@@ -144,6 +144,12 @@ func (m *Manager) InterruptedSessions() ([]*Session, error) {
 	return m.store.InterruptedSessions()
 }
 
+func (m *Manager) OpenRunEventLog(sessionID, runID, attemptID string, maxAttempts int) (*RunEventLog, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.OpenRunEventLog(sessionID, runID, attemptID, maxAttempts)
+}
+
 func (m *Manager) Save() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

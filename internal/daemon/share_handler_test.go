@@ -855,16 +855,15 @@ collect:
 }
 
 // TestHandleSessionShare_AsyncUploadFailureSetsFailedPhase covers the error
-// path: cloud upload returns 500 → task transitions to failed with the
+// path: cloud upload is rejected → task transitions to failed with the
 // upstream error message preserved in task.Error.
 func TestHandleSessionShare_AsyncUploadFailureSetsFailedPhase(t *testing.T) {
 	failingCloud := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/api/v1/uploads") {
-			// 500 with code "upload_failed" routes to ErrTransient — the
-			// uploads client retries 3 times then surfaces as a wrapped
-			// transient error. Either way the share task ends in failed.
-			w.WriteHeader(500)
-			_, _ = w.Write([]byte(`{"error":"upload_failed","message":"simulated S3 error"}`))
+			// Retry behavior belongs to the uploads package; this handler test
+			// only needs a deterministic terminal upload failure.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_upload","message":"simulated rejection"}`))
 			return
 		}
 		w.WriteHeader(503)
@@ -884,9 +883,7 @@ func TestHandleSessionShare_AsyncUploadFailureSetsFailedPhase(t *testing.T) {
 	}
 	_ = json.Unmarshal(rr.Body.Bytes(), &body)
 
-	// Wait long enough for 3 retries × backoff (1+2+4=7s); the 180s task
-	// timeout is well above that so the test won't race the ceiling.
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	var final *shareTaskState
 	for time.Now().Before(deadline) {
 		task := s.getShareTask(body.TaskID)

@@ -59,6 +59,21 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 			DecodedHeightPX:    1134,
 		},
 	}))
+	trace.record(openAIComputerTraceEventV1{
+		Phase:                 "private_executor",
+		Status:                "completed",
+		ModelCalls:            3,
+		LLMCalls:              3,
+		InputTokens:           120,
+		OutputTokens:          30,
+		TotalTokens:           150,
+		CostUSD:               0.42,
+		CacheReadTokens:       80,
+		CacheCreationTokens:   60,
+		CacheCreation5mTokens: 20,
+		CacheCreation1hTokens: 40,
+		DurationMS:            23,
+	})
 	if err := logger.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -81,8 +96,8 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 		}
 		entries = append(entries, entry)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("audit entries = %d, want 2: %s", len(entries), raw)
+	if len(entries) != 3 {
+		t.Fatalf("audit entries = %d, want 3: %s", len(entries), raw)
 	}
 	if entries[0].Event != openAIComputerTraceEventNameV1 {
 		t.Fatalf("trace event = %q", entries[0].Event)
@@ -92,25 +107,36 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 		t.Fatal(err)
 	}
 	allowed := map[string]bool{
-		"schema_version":      true,
-		"phase":               true,
-		"status":              true,
-		"attempt":             true,
-		"batch_index":         true,
-		"action_index":        true,
-		"action_count":        true,
-		"action_type":         true,
-		"app_bundle_id":       true,
-		"execution_lane":      true,
-		"foreground_fallback": true,
-		"fallback_reason":     true,
-		"frontmost_class":     true,
-		"commit_state":        true,
-		"failure_code":        true,
-		"model_calls":         true,
-		"model_timeouts":      true,
-		"batch_count":         true,
-		"duration_ms":         true,
+		"schema_version":           true,
+		"phase":                    true,
+		"status":                   true,
+		"attempt":                  true,
+		"batch_index":              true,
+		"action_index":             true,
+		"action_count":             true,
+		"action_type":              true,
+		"app_bundle_id":            true,
+		"execution_lane":           true,
+		"foreground_fallback":      true,
+		"fallback_reason":          true,
+		"frontmost_class":          true,
+		"commit_state":             true,
+		"failure_code":             true,
+		"model_calls":              true,
+		"model_timeouts":           true,
+		"batch_count":              true,
+		"llm_calls":                true,
+		"input_tokens":             true,
+		"output_tokens":            true,
+		"total_tokens":             true,
+		"cost_usd":                 true,
+		"cache_read_tokens":        true,
+		"cache_creation_tokens":    true,
+		"cache_creation_5m_tokens": true,
+		"cache_creation_1h_tokens": true,
+		"context_window_tokens":    true,
+		"context_window_source":    true,
+		"duration_ms":              true,
 	}
 	for key := range payload {
 		if !allowed[key] {
@@ -137,12 +163,37 @@ func TestOpenAIComputerTraceV1WritesOnlyStructuredContentFreeFields(
 	if entries[1].Event != "computer_use_capture_diagnostic_v1" {
 		t.Fatalf("diagnostic event = %q", entries[1].Event)
 	}
+	if entries[2].Event != openAIComputerTraceEventNameV1 {
+		t.Fatalf("private executor trace event = %q", entries[2].Event)
+	}
+	var usagePayload map[string]any
+	if err := json.Unmarshal([]byte(entries[2].InputSummary), &usagePayload); err != nil {
+		t.Fatal(err)
+	}
+	for key := range usagePayload {
+		if !allowed[key] {
+			t.Fatalf("private executor trace emitted non-contract field %q: %s", key, entries[2].InputSummary)
+		}
+	}
+	if usagePayload["llm_calls"] != float64(3) ||
+		usagePayload["input_tokens"] != float64(120) ||
+		usagePayload["output_tokens"] != float64(30) ||
+		usagePayload["total_tokens"] != float64(150) ||
+		usagePayload["cost_usd"] != 0.42 ||
+		usagePayload["cache_read_tokens"] != float64(80) ||
+		usagePayload["cache_creation_tokens"] != float64(60) ||
+		usagePayload["cache_creation_5m_tokens"] != float64(20) ||
+		usagePayload["cache_creation_1h_tokens"] != float64(40) {
+		t.Fatalf("private executor trace lost scoped usage: %s", entries[2].InputSummary)
+	}
 	if len(entries[0].InputSummary) >= 500 ||
-		len(entries[1].InputSummary) >= 500 {
+		len(entries[1].InputSummary) >= 500 ||
+		len(entries[2].InputSummary) >= 500 {
 		t.Fatalf(
-			"structured trace exceeded audit summary limit: trace=%d diagnostic=%d",
+			"structured trace exceeded audit summary limit: trace=%d diagnostic=%d private=%d",
 			len(entries[0].InputSummary),
 			len(entries[1].InputSummary),
+			len(entries[2].InputSummary),
 		)
 	}
 	var diagnosticPayload map[string]any

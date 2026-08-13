@@ -148,12 +148,11 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 	// the model resolved against the wrong base. Point it at the workspace
 	// roots instead of letting it improvise a filesystem-wide search.
 	if _, statErr := os.Stat(args.Path); statErr != nil && os.IsNotExist(statErr) {
+		message := fmt.Sprintf("file_read: path not found: %s", args.Path)
 		if hint := lostMCPArtifactHint(origPath); hint != "" {
-			return agent.ToolResult{
-				Content: fmt.Sprintf("error reading file: %v\n\n%s", statErr, hint),
-				IsError: true,
-			}, nil
+			message += "\n\n" + hint
 		}
+		return definitiveLocalResourceError(message), nil
 	}
 
 	// Image files: return as vision image block instead of text lines.
@@ -211,6 +210,9 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 			if os.IsPermission(err) {
 				return agent.PermissionError(fmt.Sprintf("cannot read %s: permission denied", args.Path)), nil
 			}
+			if os.IsNotExist(err) {
+				return definitiveLocalResourceError(fmt.Sprintf("file_read: path not found: %s", args.Path)), nil
+			}
 			return agent.ToolResult{Content: fmt.Sprintf("error reading file: %v", err), IsError: true}, nil
 		}
 	} else {
@@ -218,6 +220,9 @@ func (t *FileReadTool) Run(ctx context.Context, argsJSON string) (agent.ToolResu
 		if err != nil {
 			if os.IsPermission(err) {
 				return agent.PermissionError(fmt.Sprintf("cannot read %s: permission denied", args.Path)), nil
+			}
+			if os.IsNotExist(err) {
+				return definitiveLocalResourceError(fmt.Sprintf("file_read: path not found: %s", args.Path)), nil
 			}
 			return agent.ToolResult{Content: fmt.Sprintf("error reading file: %v", err), IsError: true}, nil
 		}

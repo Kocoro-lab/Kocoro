@@ -71,13 +71,14 @@ Per-server fields: `command` + `args` (stdio), `type: http` + `url` (HTTP), `env
 
 ```yaml
 agent:
-  max_iterations: 25               # max tool calls per turn (default: 25)
+  max_iterations: 256              # emergency model/tool-round fuse; provider attempts are separately capped at 64 per root run plus one terminal synthesis
   temperature: 0                   # LLM temperature (default: 0)
-  max_tokens: 32000                # max output tokens (default: 32000)
+  max_tokens: 0                    # max output tokens (default: 0 = resolve from the selected model)
   model: ""                        # specific model override (empty = use model_tier)
   model_tier: ""                   # tier override (medium | large); empty = inherit global model_tier. "small" reserved for daemon-internal calls — do not pin via UI.
   reasoning_effort: ""             # "low" / "medium" / "high" (empty = model default)
   effort_tier: ""                  # unified intent: low | high | xhigh | max (empty = provider default)
+  response_detail: balanced         # final-answer style: concise | balanced | detailed; independent of reasoning effort
   service_tier: ""                 # global OpenAI processing: "" | default | fast; pair with an exact OpenAI model
   context_window: 1_000_000        # seed; auto-adjusted from observed model. Per-agent override locks the cap. (Ollama callers clamp to 200K — see ContextWindowFloorForProvider.)
 
@@ -96,6 +97,8 @@ agent:
   interrupted_resume_enabled: true # gate daemon-start auto-continuation entirely. false leaves interrupted checkpoints in place without any automatic execution.
   compaction_snapshot_retention: 1 # prior live-context rollback JSON files kept per session; the full transcript is separate and unchanged. Inline images are omitted. 0 disables snapshots.
   compaction_snapshot_max_age_days: 14 # daemon-start age sweep across default and named-agent snapshots. 0 disables age cleanup.
+  run_event_retention: 32        # observation-only run attempts retained per session; oldest attempts are pruned when a new one opens. 0 disables count pruning.
+  run_event_max_age_days: 14     # daemon-start cleanup for run-event JSONL, incomplete markers, and stale lock files across default and named agents. 0 disables age cleanup.
   compact_timeout_secs: 300 # deadline for one manual TUI /compact pass (persist-learnings + summarize, incl. sequential fold). Raise on slow gateways; 0 uses the default.
 
   # Skill matching
@@ -118,6 +121,8 @@ agent:
   observation_window: 3            # keep the N most recent browser/GUI observations at full fidelity; older ones are stubbed. 0 disables. Negative is rejected.
   max_recent_images: 50            # keep the N most recent image-bearing messages (all images); older screenshots become a placeholder. 0 disables (keep all). Negative is rejected.
   max_recent_browser_images: 1     # keep only the N most recent browser/GUI screenshots; user uploads + non-GUI images stay under max_recent_images. 0 disables. Negative is rejected.
+  warm_set_max_schemas: 16         # session warm set: max deferred tool schemas kept loaded after tool_search. When it binds, the least-recently-loaded schema is evicted (next call re-warms via tool_search). 0 = default. Negative is rejected.
+  warm_set_max_schema_tokens: 8000 # session warm set: estimated token budget across warmed schemas. Raise for very large MCP catalogs. The most recently loaded schema is always kept, even alone over budget. 0 = default. Negative is rejected.
 ```
 
 `effort_tier` is the preferred user-facing reasoning control: **Light** (`low`), **Balanced** (`high`), **Deep** (`xhigh`), and **Max** (`max`), plus **Default** (`""`). Cloud translates those stable product tiers to each provider's native value. GPT-5.6 uses `low` / `medium` / `xhigh` / `max`; Anthropic uses `low` / `high` / `xhigh` / `max`. Claude Haiku does not advertise effort support and stays at the model default.

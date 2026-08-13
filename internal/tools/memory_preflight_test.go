@@ -253,6 +253,57 @@ func TestDetectMemoryIntents_ForceHelperBypassesCheapGate(t *testing.T) {
 	}
 }
 
+func TestDetectMemoryIntents_CheapGateAvoidsOrdinaryWork(t *testing.T) {
+	tests := []string{
+		"hello",
+		"你好",
+		"帮我写一封请假邮件",
+		"把这段话翻译成日文",
+		"今日の予定を整理して",
+		"What is two plus two?",
+		"Please draft an email",
+		"Good morning",
+		"Create a project plan",
+		"Review this file path",
+	}
+	for _, query := range tests {
+		t.Run(query, func(t *testing.T) {
+			llm := &fakeMemoryHelperLLM{}
+			trace := &agent.MemoryPreflightTrace{}
+			intents, usage := DetectMemoryIntents(context.Background(), llm, query, MemoryIntentOptions{Trace: trace})
+			if len(intents) != 0 || memoryUsageNonZero(usage) {
+				t.Fatalf("intents=%v usage=%+v want no recall", intents, usage)
+			}
+			if len(llm.requests) != 0 {
+				t.Fatalf("helper calls=%d want 0", len(llm.requests))
+			}
+			if trace.Outcome != "gate_declined" && trace.Outcome != "task_text" {
+				t.Fatalf("outcome=%q want a local skip", trace.Outcome)
+			}
+		})
+	}
+}
+
+func TestDetectMemoryIntents_CheapGateKeepsExplicitRecall(t *testing.T) {
+	tests := []string{
+		"你还记得小王吗？",
+		"上次我们聊的旅行计划是什么？",
+		"Example Contact 是谁？",
+		"前回決めた旅行プランを覚えてる？",
+	}
+	for _, query := range tests {
+		t.Run(query, func(t *testing.T) {
+			llm := &fakeMemoryHelperLLM{responses: []*client.CompletionResponse{
+				helperToolResponse(t, helperMemoryOutput{ShouldRecall: false}, client.Usage{}),
+			}}
+			_, _ = DetectMemoryIntents(context.Background(), llm, query)
+			if len(llm.requests) != 1 {
+				t.Fatalf("helper calls=%d want 1", len(llm.requests))
+			}
+		})
+	}
+}
+
 func TestDetectMemoryIntents_HelperDropsJapanesePronounAnchor(t *testing.T) {
 	resp := helperToolResponse(t, helperMemoryOutput{
 		ShouldRecall: true,

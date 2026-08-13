@@ -288,40 +288,32 @@ func TestRunAgentRequest_Validate_WithInvalidCWD(t *testing.T) {
 	}
 }
 
-func TestComputeRouteKey_BypassRouting(t *testing.T) {
-	req := RunAgentRequest{Agent: "my-agent", BypassRouting: true}
-	if got := ComputeRouteKey(req); got != "" {
-		t.Errorf("ComputeRouteKey with BypassRouting=true returned %q, want empty", got)
-	}
-}
-
-func TestComputeRouteKey_AgentWithoutBypass(t *testing.T) {
-	req := RunAgentRequest{Agent: "my-agent"}
-	if got := ComputeRouteKey(req); got != "agent:my-agent" {
-		t.Errorf("ComputeRouteKey returned %q, want %q", got, "agent:my-agent")
-	}
-}
-
-func TestComputeRouteKey_WebhookWithNamedAgentBypassesRoute(t *testing.T) {
-	req := RunAgentRequest{Agent: "ops-bot", Source: "webhook", Channel: "github"}
-	if got := ComputeRouteKey(req); got != "" {
-		t.Errorf("ComputeRouteKey returned %q, want empty route", got)
-	}
-}
-
-func TestComputeRouteKey_ScheduleWithNamedAgentKeepsAgentRoute(t *testing.T) {
-	req := RunAgentRequest{Agent: "ops-bot", Source: ChannelSchedule, Channel: "schedule-daily"}
-	if got := ComputeRouteKey(req); got != "agent:ops-bot" {
-		t.Errorf("ComputeRouteKey returned %q, want %q", got, "agent:ops-bot")
-	}
-}
-
-func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
+func TestComputeRouteKey(t *testing.T) {
 	tests := []struct {
 		name string
 		req  RunAgentRequest
 		want string
 	}{
+		{
+			name: "bypass routing",
+			req:  RunAgentRequest{Agent: "my-agent", BypassRouting: true},
+			want: "",
+		},
+		{
+			name: "named agent",
+			req:  RunAgentRequest{Agent: "my-agent"},
+			want: "agent:my-agent",
+		},
+		{
+			name: "named webhook bypasses route",
+			req:  RunAgentRequest{Agent: "ops-bot", Source: "webhook", Channel: "github"},
+			want: "",
+		},
+		{
+			name: "named schedule keeps agent route",
+			req:  RunAgentRequest{Agent: "ops-bot", Source: ChannelSchedule, Channel: "schedule-daily"},
+			want: "agent:ops-bot",
+		},
 		{
 			name: "wecom group default agent",
 			req:  RunAgentRequest{Source: ChannelWeCom, Channel: ChannelWeCom, ThreadID: "g:group-a"},
@@ -343,7 +335,7 @@ func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
 			want: "agent:ops-bot:wecom:g:group-a",
 		},
 		{
-			name: "session id wins over messaging thread",
+			name: "session id wins over agent and messaging thread",
 			req:  RunAgentRequest{Agent: "ops-bot", SessionID: "sess-123", Source: ChannelWeCom, Channel: ChannelWeCom, ThreadID: "g:group-a"},
 			want: "session:sess-123",
 		},
@@ -352,46 +344,70 @@ func TestComputeRouteKey_MessagingPlatformThreadRouting(t *testing.T) {
 			req:  RunAgentRequest{Source: ChannelSlack, Channel: "#general"},
 			want: "default:slack:%23general",
 		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := ComputeRouteKey(tt.req); got != tt.want {
-				t.Errorf("ComputeRouteKey(%+v) = %q, want %q", tt.req, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestComputeRouteKey_NamedAgentMultiSession(t *testing.T) {
-	tests := []struct {
-		name string
-		req  RunAgentRequest
-		want string
-	}{
 		{
-			name: "session_id resumes the exact session",
-			req:  RunAgentRequest{Agent: "ops-bot", SessionID: "sess-abc"},
-			want: "session:sess-abc",
-		},
-		{
-			name: "new_session forks — no plain key (D2 unlock)",
+			name: "named new session bypasses cache",
 			req:  RunAgentRequest{Agent: "ops-bot", NewSession: true},
 			want: "",
 		},
 		{
-			name: "no session_id, no new_session resumes latest interactive (plain key)",
-			req:  RunAgentRequest{Agent: "ops-bot"},
-			want: "agent:ops-bot",
-		},
-		{
-			name: "default agent new_session still forks",
+			name: "default new session bypasses cache",
 			req:  RunAgentRequest{NewSession: true},
 			want: "",
 		},
 		{
-			name: "named agent new_session does not override an explicit session_id",
+			name: "explicit session overrides new session",
 			req:  RunAgentRequest{Agent: "ops-bot", NewSession: true, SessionID: "sess-xyz"},
 			want: "session:sess-xyz",
+		},
+		{
+			name: "line channel",
+			req:  RunAgentRequest{Source: "line", Channel: "group-abc"},
+			want: "default:line:group-abc",
+		},
+		{
+			name: "web source bypasses cache",
+			req:  RunAgentRequest{Source: "web", Channel: "session-1"},
+			want: "",
+		},
+		{
+			name: "webhook bypasses cache",
+			req:  RunAgentRequest{Source: "webhook", Channel: "hook-1"},
+			want: "",
+		},
+		{
+			name: "cron bypasses cache",
+			req:  RunAgentRequest{Source: "cron", Channel: "job-1"},
+			want: "",
+		},
+		{
+			name: "default schedule bypasses cache",
+			req:  RunAgentRequest{Source: ChannelSchedule, Channel: "sched-1"},
+			want: "",
+		},
+		{
+			name: "empty context",
+			req:  RunAgentRequest{},
+			want: "",
+		},
+		{
+			name: "shanclaw explicit session",
+			req:  RunAgentRequest{Source: "shanclaw", SessionID: "sess-xyz"},
+			want: "session:sess-xyz",
+		},
+		{
+			name: "slack channel splits by sender",
+			req:  RunAgentRequest{Source: ChannelSlack, Channel: "C123", Sender: "U-alice"},
+			want: "default:slack:C123:U-alice",
+		},
+		{
+			name: "named slack channel splits by sender",
+			req:  RunAgentRequest{Agent: "ops-bot", Source: ChannelSlack, Channel: "C123", Sender: "U-alice"},
+			want: "agent:ops-bot:slack:C123:U-alice",
+		},
+		{
+			name: "slack thread overrides sender",
+			req:  RunAgentRequest{Source: ChannelSlack, Channel: "C123", ThreadID: "T-9", Sender: "U-alice"},
+			want: "default:slack:T-9",
 		},
 	}
 	for _, tt := range tests {
@@ -659,6 +675,11 @@ func TestIsSoftRunError(t *testing.T) {
 		{"context.Canceled", context.Canceled, true},
 		{"context.DeadlineExceeded", context.DeadlineExceeded, true},
 		{"ErrMaxIterReached", agent.ErrMaxIterReached, true},
+		{"ErrRequestBudgetExhausted", agent.ErrRequestBudgetExhausted, true},
+		{"wrapped ErrRequestBudgetExhausted", fmt.Errorf("turn stopped: %w", agent.ErrRequestBudgetExhausted), true},
+		{"ErrSideEffectOutcomeUnknown", agent.ErrSideEffectOutcomeUnknown, true},
+		{"wrapped ErrSideEffectOutcomeUnknown", fmt.Errorf("turn stopped: %w", agent.ErrSideEffectOutcomeUnknown), true},
+		{"ErrSideEffectJournalUnavailable", agent.ErrSideEffectJournalUnavailable, false},
 		{"ErrHardIdleTimeout", agent.ErrHardIdleTimeout, true},
 		{"wrapped ErrHardIdleTimeout", fmt.Errorf("turn aborted: %w", agent.ErrHardIdleTimeout), true},
 		{"wrapped Canceled", errors.Join(errors.New("loop"), context.Canceled), true},
@@ -1260,6 +1281,16 @@ type fakeGatewayBackend struct {
 	usage    *client.Usage // optional; when set, every completion echoes this usage
 }
 
+type rejectingSuggestionClient struct{}
+
+func (rejectingSuggestionClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	return nil, agent.ErrRequestBudgetExhausted
+}
+
+func (rejectingSuggestionClient) CompleteStream(context.Context, client.CompletionRequest, func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return nil, agent.ErrRequestBudgetExhausted
+}
+
 func (g *fakeGatewayBackend) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1312,7 +1343,7 @@ func TestFireSuggestionAfterRun_AppendsAssistantReplyToMain(t *testing.T) {
 		ModelTier: "medium",
 	}
 
-	fireSuggestionAfterRun(context.Background(), deps,
+	fireSuggestionAfterRun(context.Background(), deps, deps.GW,
 		"test-agent", "sess1",
 		main, // SpeculationEnabled removed
 		"I'll fix the test in foo.go")
@@ -1343,6 +1374,30 @@ func TestFireSuggestionAfterRun_AppendsAssistantReplyToMain(t *testing.T) {
 	}
 }
 
+func TestFireSuggestionAfterRun_UsesOriginatingBudgetClient(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "must not be called"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+	deps := &ServerDeps{
+		GW:          client.NewGatewayClient(ts.URL, "test-key"),
+		Suggestions: agent.NewSuggestionState(),
+	}
+	main := client.CompletionRequest{
+		Messages:  []client.Message{{Role: "user", Content: client.NewTextContent("continue")}},
+		ModelTier: "medium",
+	}
+
+	fireSuggestionAfterRun(context.Background(), deps, rejectingSuggestionClient{},
+		"test-agent", "budgeted-session", main, "finished")
+
+	if got := len(gw.requests()); got != 0 {
+		t.Fatalf("raw gateway bypassed originating budget: calls=%d", got)
+	}
+	if _, ok := deps.Suggestions.Get("budgeted-session"); ok {
+		t.Fatal("budget-rejected suggestion was published")
+	}
+}
+
 // TestFireSuggestionAfterRun_EmptyReplySkipsAll guards against the case
 // where loop.Run returned empty text (tool-only turn, partial result).
 // Firing a suggestion with no assistant reply produces a misleading
@@ -1361,7 +1416,7 @@ func TestFireSuggestionAfterRun_EmptyReplySkipsAll(t *testing.T) {
 		ModelTier: "medium",
 	}
 
-	fireSuggestionAfterRun(context.Background(), deps,
+	fireSuggestionAfterRun(context.Background(), deps, deps.GW,
 		"test-agent", "sess1",
 		main,
 		"") // empty assistantReply
@@ -1429,7 +1484,7 @@ func TestFireSuggestionAfterRun_StaleGoroutineDoesNotResurrect(t *testing.T) {
 	// handler until we send on startResp.
 	done := make(chan struct{})
 	go func() {
-		fireSuggestionAfterRun(context.Background(), deps,
+		fireSuggestionAfterRun(context.Background(), deps, deps.GW,
 			"test-agent", "sess1",
 			main,
 			"I just replied to you")
@@ -1618,9 +1673,11 @@ func TestPlaywrightTurnStartProbeAction(t *testing.T) {
 		{"degraded connected cdp unattended schedule", mcp.StateDegraded, true, cdpCfg, true, "schedule", playwrightProbeSkipRelaunch},
 		{"degraded connected cdp unattended webhook", mcp.StateDegraded, true, cdpCfg, true, "webhook", playwrightProbeSkipRelaunch},
 
-		// No live client: ProbeNow would reconnect+relaunch, so skip.
+		// No live client: ProbeNow would reconnect+relaunch, so skip. A connected
+		// client with stale Disconnected health is the async-connect window and
+		// must probe so the first Run gets the rebuilt MCP registry.
 		{"disconnected (user closed chrome)", mcp.StateDisconnected, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
-		{"disconnected even if connected flag set", mcp.StateDisconnected, true, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
+		{"disconnected health with newly connected client", mcp.StateDisconnected, true, cdpCfg, true, "kocoro", playwrightProbeRun},
 		{"degraded but not connected (post-discovery disconnect)", mcp.StateDegraded, false, cdpCfg, true, "kocoro", playwrightProbeSkipNoClient},
 
 		// Probe runs: keep_alive=true warms Chrome; Healthy/non-CDP are
@@ -1775,6 +1832,26 @@ func TestApplyAgentModelOverlayToLoop_EmptyEffortInherits(t *testing.T) {
 	}
 }
 
+func TestApplyAgentModelOverlayToLoop_ResponseDetail(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetResponseDetail("balanced")
+	detailed := "detailed"
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ResponseDetail: &detailed})
+	if got := loop.ResponseDetail(); got != "detailed" {
+		t.Fatalf("ResponseDetail after overlay = %q, want detailed", got)
+	}
+}
+
+func TestApplyAgentModelOverlayToLoop_EmptyResponseDetailInherits(t *testing.T) {
+	loop := agent.NewAgentLoop(nil, agent.NewToolRegistry(), "medium", "", 1, 1, 1, nil, nil, nil)
+	loop.SetResponseDetail("concise")
+	empty := ""
+	applyAgentModelOverlayToLoop(loop, &agents.AgentModelConfig{ResponseDetail: &empty})
+	if got := loop.ResponseDetail(); got != "concise" {
+		t.Fatalf("ResponseDetail after empty overlay = %q, want concise", got)
+	}
+}
+
 func TestResolveKoeExecutionRunFailsClosedWithoutChangingAgentConfig(t *testing.T) {
 	fls := false
 	tests := []struct {
@@ -1826,11 +1903,22 @@ func TestApplyKoeModeAdmissionUsesSelectedMode(t *testing.T) {
 			wantDecision: executionprofile.AdmissionModeSelectedFull,
 		},
 		{
-			name: "structured reason cannot override selected fast",
+			name: "recognized full reason makes selected fast fail closed",
 			req: RunAgentRequest{
 				Source: "koe", ExecutionMode: executionprofile.ModeFast,
 				RequestedExecutionMode: stringPtr("fast"),
 				FullReason:             executionprofile.FullReasonProductionIncident,
+			},
+			wantMode:     executionprofile.ModeFull,
+			wantReason:   executionprofile.FullReasonProductionIncident,
+			wantDecision: executionprofile.AdmissionFastReasonConflict,
+		},
+		{
+			name: "unknown reason does not upgrade selected fast",
+			req: RunAgentRequest{
+				Source: "koe", ExecutionMode: executionprofile.ModeFast,
+				RequestedExecutionMode: stringPtr("fast"),
+				FullReason:             "lots_of_tools",
 			},
 			wantMode:     executionprofile.ModeFast,
 			wantDecision: executionprofile.AdmissionModeSelectedFast,
@@ -2060,15 +2148,53 @@ func TestRunAgent_Success_PopulatesMessageIndices(t *testing.T) {
 	}
 }
 
+func TestRunAgent_GlobalResponseDetailReachesProviderPrompt(t *testing.T) {
+	gw := &fakeGatewayBackend{reply: "concise reply"}
+	ts := httptest.NewServer(gw.handler())
+	defer ts.Close()
+
+	deps := runAgentContractTestDeps(t, ts.URL)
+	deps.Config.Agent.ResponseDetail = "concise"
+	defer deps.SessionCache.CloseAll()
+
+	_, err := RunAgent(context.Background(), deps, RunAgentRequest{
+		Text:          "hi",
+		Source:        "desktop",
+		BypassRouting: true,
+	}, nullEventHandler{})
+	if err != nil {
+		t.Fatalf("RunAgent error: %v", err)
+	}
+	requests := gw.requests()
+	if len(requests) == 0 {
+		t.Fatal("gateway captured no completion request")
+	}
+	found := false
+	for _, request := range requests {
+		for _, message := range request.Messages {
+			if strings.Contains(message.Content.Text(), `<response_detail level="concise">`) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("global response detail missing from provider prompt: %+v", requests)
+	}
+}
+
 // Hard-error path: RunAgent today returns (nil, err); after this task it
 // must return (&RunAgentResult{SessionID, MessageStartIndex, MessageEndIndex,
 // FailureCode}, err) so the scheduler can stamp LastRun on partial transcripts.
 // The three production callers (cmd/daemon.go x2, heartbeat.go) gate on err
 // first and never deref result on error, so this is wire-safe.
 func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
-	// httptest handler that always 500s — every LLM call hits a hard error.
+	// A non-retryable upstream response exercises the hard-error path directly.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "synthetic upstream failure", http.StatusInternalServerError)
+		http.Error(w, "synthetic request failure", http.StatusBadRequest)
 	}))
 	defer ts.Close()
 
@@ -2084,7 +2210,7 @@ func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
 	}
 	res, err := RunAgent(context.Background(), deps, req, nullEventHandler{})
 	if err == nil {
-		t.Fatal("expected hard error from always-500 gateway")
+		t.Fatal("expected hard error from gateway")
 	}
 	if res == nil {
 		t.Fatal("partial result must be non-nil on hard error (scheduler needs sessionID to stamp LastRun)")
@@ -2103,7 +2229,7 @@ func TestRunAgent_HardError_ReturnsPartialResult(t *testing.T) {
 	if res.MessageEndIndex < res.MessageStartIndex {
 		t.Errorf("indices invariant violated: end %d < start %d", res.MessageEndIndex, res.MessageStartIndex)
 	}
-	// Baseline: always-500 gateway never lets an LLM call succeed AND
+	// Baseline: the rejecting gateway never lets an LLM call succeed AND
 	// nullEventHandler does not implement UsageProvider, so partial Usage
 	// must be the zero value. The companion test PreservesAccumulatedUsage
 	// covers the path where prior calls succeeded before a later hard error.

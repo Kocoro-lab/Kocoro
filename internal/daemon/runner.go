@@ -129,6 +129,11 @@ type RunAgentRequest struct {
 	ParentRunID    string                         `json:"parent_run_id,omitempty"`
 	ExecutionRun   executionprofile.Run           `json:"-"`
 	ModeAdmission  executionprofile.ModeAdmission `json:"-"`
+	// RunID identifies one universal AgentLoop task across interrupted recovery.
+	// AttemptID identifies this concrete loop construction and changes on resume.
+	// Both are daemon-owned and never accepted from HTTP callers.
+	RunID     string `json:"-"`
+	AttemptID string `json:"-"`
 	// ExecutionConfig is the resolved pre-profile Agent baseline carried only
 	// by interrupted recovery. HTTP clients cannot inject it.
 	ExecutionConfig *agent.ExecutionConfig `json:"-"`
@@ -1222,6 +1227,14 @@ func shouldEmitReplyBanner(source string) bool {
 	return !isAutonomousLocalSource(source)
 }
 
+// shouldEmitLocalReplyBanner leaves completion presentation to a client that
+// accepted the authoritative agent_reply event. Only a genuinely detached run
+// falls back to a local OS banner; it must never emit a generic notification
+// event that Desktop could confuse with an agent-authored notify tool call.
+func shouldEmitLocalReplyBanner(source string, replyEventDeliveries int) bool {
+	return replyEventDeliveries == 0 && shouldEmitReplyBanner(source)
+}
+
 // promptSuggestionSources is the allow-list of request sources whose post-turn
 // prompt-suggestion fork has a UI consumer:
 //   - "desktop": Kocoro Desktop's foreground chat. The Desktop client's message
@@ -1686,7 +1699,13 @@ type ServerDeps struct {
 	Registry             *agent.ToolRegistry
 	MCPManager           *mcp.ClientManager  // live MCP connections; swapped on reload
 	Supervisor           *mcp.Supervisor     // MCP health supervisor; swapped on reload
-	Cleanup              func()              // closes MCP connections; swapped on reload
+	// MCPReconnect schedules bounded retries for servers whose async connect
+	// failed. Owned by the MCPManager generation that spawned it, so it is
+	// swapped (and the old one stopped) alongside MCPManager on reload —
+	// letting a superseded ladder keep firing would resurrect connections on
+	// a manager nothing can reach.
+	MCPReconnect *mcp.ReconnectScheduler
+	Cleanup      func() // closes MCP connections; swapped on reload
 	BaselineReg          *agent.ToolRegistry // local-only tools; refreshed on reload
 	GatewayOverlay       []agent.Tool        // cached gateway tools; refreshed on reload
 	PostOverlays         []agent.Tool        // cloud_delegate etc.; refreshed on reload
@@ -1777,7 +1796,14 @@ func (d *ServerDeps) ShutdownCleanup() {
 	d.mu.Lock()
 	cleanup := d.Cleanup
 	d.Cleanup = nil
+	// Cancel pending MCP reconnects before closing connections, so a timer
+	// cannot respawn a subprocess the cleanup is about to reap.
+	reconnect := d.MCPReconnect
+	d.MCPReconnect = nil
 	d.mu.Unlock()
+	if reconnect != nil {
+		reconnect.Stop()
+	}
 	if cleanup != nil {
 		cleanup()
 	}
@@ -1936,8 +1962,8 @@ func shouldSkipPlaywrightProbeChromeRelaunch(before mcp.ServerHealth, cfg mcp.MC
 type playwrightTurnStartAction int
 
 const (
-	// playwrightProbeSkipNoClient: no live client to probe (Disconnected or
-	// never connected). ProbeNow would fire attemptReconnect → relaunch Chrome;
+	// playwrightProbeSkipNoClient: no live client to probe. ProbeNow would fire
+	// attemptReconnect → relaunch Chrome;
 	// on-demand recovery at tool dispatch handles Chrome instead.
 	playwrightProbeSkipNoClient playwrightTurnStartAction = iota
 	// playwrightProbeSkipRelaunch: a client is connected but this is the CDP +
@@ -1955,8 +1981,11 @@ const (
 // keep_alive=false Degraded idle state (ProbeNow → maybeRelaunchDegradedCDPChrome
 // would pop a blank window). Everything else probes: keep_alive=true warms
 // Chrome, Healthy/non-CDP probes are health refreshes whose relaunch is a no-op.
+// A live client whose supervisor state is still Disconnected is the short
+// async-connect window before the connect callback completes its first probe;
+// probing there is required so this Run snapshots the rebuilt MCP registry.
 func playwrightTurnStartProbeAction(before mcp.ServerHealth, playwrightLive bool, cfg mcp.MCPServerConfig, hasCfg bool, req RunAgentRequest) playwrightTurnStartAction {
-	if before.State == mcp.StateDisconnected || !playwrightLive {
+	if !playwrightLive {
 		return playwrightProbeSkipNoClient
 	}
 	if hasCfg && shouldSkipPlaywrightProbeChromeRelaunch(before, cfg, req) {
@@ -2024,6 +2053,11 @@ func applyAgentModelOverlayToLoop(loop *agent.AgentLoop, ac *agents.AgentModelCo
 	// tolerate an explicit "" the same way). A concrete value wins.
 	if ac.EffortTier != nil && *ac.EffortTier != "" {
 		loop.SetEffortTier(*ac.EffortTier)
+	}
+	// Per-agent response-detail override. nil OR "" inherits the global
+	// profile already applied on the loop.
+	if ac.ResponseDetail != nil && *ac.ResponseDetail != "" {
+		loop.SetResponseDetail(*ac.ResponseDetail)
 	}
 	// != nil rather than != "": an explicit "" is a meaningful override that
 	// forces mirror mode even when the global agent.language is locked.
@@ -2191,6 +2225,8 @@ func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string
 		IMStatusContext: append(json.RawMessage(nil), req.IMStatusContext...),
 		Participants:    append([]string(nil), req.Participants...),
 		ResumeAttempts:  req.InterruptedResumeAttempt,
+		RunID:           req.RunID,
+		AttemptID:       req.AttemptID,
 		ExecutionRun:    cloneExecutionRun(req.ExecutionRun),
 		ExecutionConfig: agent.CloneExecutionConfig(req.ExecutionConfig),
 		UpdatedAt:       updatedAt,
@@ -2284,6 +2320,9 @@ func claimInterruptedResume(
 		checkpointAt = sess.UpdatedAt
 		state.UpdatedAt = checkpointAt
 	}
+	if err := guardInterruptedToolExecutions(sessMgr, sess, state); err != nil {
+		return err
+	}
 
 	now := time.Now()
 	if checkpointAt.IsZero() ||
@@ -2374,6 +2413,27 @@ func claimInterruptedResume(
 		req.ParentRunID = state.ExecutionRun.ParentRunID
 	}
 
+	if state.RunID == "" {
+		runID, err := newAgentRunID()
+		if err != nil {
+			return fmt.Errorf("mint recovered agent run id: %w", err)
+		}
+		state.RunID = runID
+	} else if !session.IsValidRunID(state.RunID) {
+		sess.InProgress = false
+		sess.InterruptedTurn = nil
+		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {
+			return fmt.Errorf("abandon invalid checkpointed agent run id %q: %w", state.RunID, err)
+		}
+		return fmt.Errorf("%w: %q", errInterruptedRecoveryInvalidRun, state.RunID)
+	}
+	attemptID, err := newAgentAttemptID()
+	if err != nil {
+		return fmt.Errorf("mint recovered agent attempt id: %w", err)
+	}
+	req.RunID = state.RunID
+	req.AttemptID = attemptID
+	state.AttemptID = attemptID
 	req.InterruptedResumeAttempt = state.ResumeAttempts + 1
 	req.InterruptedResumeCheckpointUpdatedAt = checkpointAt
 	state.Agent = agentName
@@ -2476,7 +2536,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// visible Chrome window on its own. Two guards keep that invariant:
 		//
 		//   (1) Skip entirely when there is no live client to probe
-		//       (mgr.IsConnected == false). ProbeNow on a Disconnected
+		//       (mgr.IsConnected == false). ProbeNow without a client
 		//       server fires attemptReconnect → relaunch Chrome.
 		//
 		//   (2) For CDP + keep_alive=false, skip the relaunch even when a
@@ -2505,7 +2565,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		case playwrightProbeSkipRelaunch:
 			log.Printf("daemon: skipping Playwright turn-start Chrome relaunch (CDP keep_alive=false; Chrome launches on demand at tool dispatch)")
 		case playwrightProbeSkipNoClient:
-			// No live client (Disconnected, or never connected). ProbeNow would
+			// No live client. ProbeNow would
 			// fire attemptReconnect → relaunch Chrome; skip it. On-demand recovery
 			// at tool dispatch (mcp_tool.go ensureChromeDebugPort) launches Chrome
 			// when the agent actually invokes a browser tool.
@@ -2937,6 +2997,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		return result, err
 	}
+	if !req.ResumeInterrupted {
+		if err := mintFreshAgentRun(&req); err != nil {
+			return nil, fmt.Errorf("mint agent run identity: %w", err)
+		}
+	} else if req.RunID == "" || req.AttemptID == "" {
+		return nil, errors.New("interrupted recovery has no authoritative run identity")
+	}
 
 	idempotencySettled := req.IdempotencyKey == ""
 	idempotencyOutcomeKnown := false
@@ -3144,7 +3211,18 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// publishes progress events regardless of transport. See
 	// docs/superpowers/specs/2026-04-23-event-bus-progress-coverage-design.md.
 	bus := &busEventHandler{deps: deps, agent: agentName}
-	handler = &multiHandler{handlers: []agent.EventHandler{handler, bus}}
+	combinedHandler := &multiHandler{handlers: []agent.EventHandler{handler, bus}}
+	var runEvents *runEventCollector
+	if !req.Ephemeral {
+		eventLog, err := sessMgr.OpenRunEventLog(sess.ID, req.RunID, req.AttemptID, cfg.Agent.RunEventRetention)
+		if err != nil {
+			return nil, fmt.Errorf("open agent run event log: %w", err)
+		}
+		runEvents = newRunEventCollector(combinedHandler, eventLog, sess.ID, req.RunID, req.AttemptID)
+		handler = runEvents
+	} else {
+		handler = combinedHandler
+	}
 
 	// Notify handler of resolved session ID so it can include it in EventBus payloads.
 	if setter, ok := handler.(interface{ SetSessionID(string) }); ok {
@@ -3460,24 +3538,25 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			)
 		}
 		reg.Register(&openAIComputerTaskToolV1{
-			gateway:         deps.GW,
-			resolveProfile:  resolveProfile,
-			childTools:      childComputerTools,
-			workflow:        guiWorkflow,
-			runtime:         openAIComputerRuntime,
-			preview:         deps.ComputerUsePreview,
-			appPolicy:       guiWorkflow.appPolicy,
-			handler:         handler,
-			modelTier:       "large",
-			shannonDir:      deps.ShannonDir,
-			maxIter:         runCfg.Agent.MaxIterations,
-			maxTokens:       runCfg.Agent.MaxTokens,
-			resultTrunc:     runCfg.Tools.ResultTruncation,
-			argsTrunc:       runCfg.Tools.ArgsTruncation,
-			postBatchSettle: waitOpenAIComputerPostBatchSettleV1,
-			permissions:     &runCfg.Permissions,
-			auditor:         deps.Auditor,
-			hookRunner:      deps.HookRunner,
+			gateway:               deps.GW,
+			resolveProfile:        resolveProfile,
+			childTools:            childComputerTools,
+			workflow:              guiWorkflow,
+			runtime:               openAIComputerRuntime,
+			preview:               deps.ComputerUsePreview,
+			appPolicy:             guiWorkflow.appPolicy,
+			handler:               handler,
+			modelTier:             "large",
+			shannonDir:            deps.ShannonDir,
+			maxIter:               runCfg.Agent.MaxIterations,
+			maxTokens:             runCfg.Agent.MaxTokens,
+			contextWindowFallback: runCfg.Agent.ContextWindow,
+			resultTrunc:           runCfg.Tools.ResultTruncation,
+			argsTrunc:             runCfg.Tools.ArgsTruncation,
+			postBatchSettle:       waitOpenAIComputerPostBatchSettleV1,
+			permissions:           &runCfg.Permissions,
+			auditor:               deps.Auditor,
+			hookRunner:            deps.HookRunner,
 		})
 	}
 	defer guiWorkflow.EndTurn()
@@ -3485,6 +3564,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
 		&runCfg.Permissions, deps.Auditor, deps.HookRunner)
+	if !req.Ephemeral {
+		loop.SetSideEffectExecutionJournal(newSessionSideEffectJournal(
+			sessMgr,
+			sess,
+			req.RunID,
+			req.AttemptID,
+		))
+		loop.SetSideEffectDispatchPersistedFunc(consumeDrainedMailbox)
+	}
 	loop.SetMaxTokens(runCfg.Agent.MaxTokens)
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
@@ -3492,6 +3580,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(runCfg.Agent.WarmSetMaxSchemas, runCfg.Agent.WarmSetMaxSchemaTokens)
 	// Seed the soft context window from the configured model or the last
 	// model observed on this session, falling back to the static config.
 	// Without this, every routed daemon turn would re-seed at the static
@@ -3517,13 +3606,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// always-allow entry past the handler-side gate.
 	loop.SetUnattendedRun(unattendedRun)
 	loop.SetSkillDiscovery(runCfg.Agent.SkillDiscoveryEnabled())
-	if deps.MemSvc != nil {
-		var helperLLM client.LLMClient
-		if deps.GW != nil {
-			helperLLM = deps.GW
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(deps.MemSvc, helperLLM))
-	}
 	loop.SetTimeBasedCompactConfig(agent.TimeBasedCompactConfig{
 		Enabled:             runCfg.Agent.TimeBasedCompact.Enabled,
 		GapThresholdMinutes: runCfg.Agent.TimeBasedCompact.GapThresholdMinutes,
@@ -3601,6 +3683,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if runCfg.Agent.EffortTier != "" {
 		loop.SetEffortTier(runCfg.Agent.EffortTier)
 	}
+	loop.SetResponseDetail(config.EffectiveAgentResponseDetail(runCfg.Agent.ResponseDetail))
 	loop.SetServiceTier(runCfg.Agent.ServiceTier)
 	// Response language: unconditional global baseline ("" = mirror); the
 	// per-agent overlay below may override (including "" to force mirror).
@@ -3969,7 +4052,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		turnUsage = up
 	}
 	loop.SetCheckpointMinInterval(2 * time.Second) // debounce in the loop, not here
-	loop.SetCheckpointFunc(func(ctx context.Context) error {
+	loop.SetCheckpointFunc(func(checkpointCtx context.Context) error {
+		// EventLog is an observation stream, not recovery authority. Attempt to
+		// align it with the checkpoint, but never let corrupt/failed telemetry
+		// block the session transcript or side-effect ledger from becoming durable.
+		if err := runEvents.Flush(); err != nil {
+			log.Printf("daemon: checkpoint run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, err)
+		}
 		applyTurnState(sess, loop, turnUsage, turnBase)
 		syncExecutionEvidence(&req.ExecutionRun, loop, deliverableReceipts.snapshot())
 		refreshExecutionConfigRuntimeState(loop, &req)
@@ -3978,6 +4067,11 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		sess.InProgress = true
 		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+		if agent.CheckpointReasonFromContext(checkpointCtx) == agent.CheckpointReasonSideEffectPrepared {
+			// The session journal's immediately-following MarkDispatching save
+			// persists this staged transcript and dispatch state atomically.
+			return nil
+		}
 		if err := sessMgr.Save(); err != nil {
 			log.Printf("daemon: mid-turn checkpoint save failed: %v", err)
 			// Return the error so AgentLoop.maybeCheckpoint keeps the
@@ -4019,6 +4113,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		idempotencyFailureCode = status.FailureCode
 		userErr := FriendlyAgentError(runErr)
+		runEventFlushErr := runEvents.Flush()
+		if runEventFlushErr != nil {
+			log.Printf("daemon: hard-error run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, runEventFlushErr)
+		}
 		savedSessionID := ""
 		if !req.Ephemeral && result == "" {
 			// Use the same idempotent rebuild as the mid-turn checkpoint
@@ -4046,7 +4144,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
 				return nil, err
 			}
-			if req.ResumeInterrupted {
+			rollbackToolExecutions, reconcileErr := stageTranscriptToolExecutionsForSave(sess)
+			if reconcileErr != nil {
+				log.Printf("daemon: hard-error tool execution reconcile failed: %v", reconcileErr)
+				rollbackToolExecutions = func() {}
+			}
+			if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
+				sess.InProgress = true
+				sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+			} else if req.ResumeInterrupted {
 				// A recovery attempt that fails before making forward progress
 				// remains eligible for a later daemon restart until the
 				// configured recovery-attempt cap is reached. Clearing this
@@ -4065,9 +4171,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				sess.InterruptedTurn = nil
 			}
 			if err := sessMgr.Save(); err != nil {
+				rollbackToolExecutions()
 				log.Printf("daemon: failed to save error session: %v", err)
 			} else {
 				savedSessionID = sess.ID
+			}
+		}
+		if runEventFlushErr != nil {
+			if err := runEvents.Flush(); err != nil {
+				log.Printf("daemon: hard-error run event flush retry failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, err)
 			}
 		}
 		if deps.EventBus != nil {
@@ -4107,6 +4219,8 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 	if errors.Is(runErr, agent.ErrMaxIterReached) {
 		log.Printf("daemon: agent %s hit iteration limit, saving partial result", agentName)
+	} else if errors.Is(runErr, agent.ErrRequestBudgetExhausted) {
+		log.Printf("daemon: agent %s exhausted its provider budget, saving partial result", agentName)
 	}
 
 	// Koe voice projection: pull the model-authored <spoken_summary> line out of
@@ -4202,8 +4316,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if err := upsertExecutionRun(sess, req.ExecutionRun); err != nil {
 			return nil, err
 		}
-		sess.InProgress = false // turn completed — clear mid-turn crash marker
-		sess.InterruptedTurn = nil
 		if req.IdempotencyKey != "" {
 			receipts := deliverableReceipts.snapshot()
 			setIdempotentRequestState(
@@ -4216,7 +4328,37 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				receipts,
 			)
 		}
+		runEventFlushErr := runEvents.Flush()
+		if runEventFlushErr != nil {
+			log.Printf("daemon: final run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, runEventFlushErr)
+		}
+		previousInProgress := sess.InProgress
+		previousInterruptedTurn := sess.InterruptedTurn
+		rollbackToolExecutions, reconcileErr := stageTranscriptToolExecutionsForSave(sess)
+		if reconcileErr != nil {
+			log.Printf("daemon: final tool execution reconcile failed: %v", reconcileErr)
+			rollbackToolExecutions = func() {}
+		}
+		if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
+			// A post-dispatch outcome that was not durably resolved remains a
+			// startup-review marker. The recovery path will never replay it.
+			sess.InProgress = true
+			sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+		} else {
+			sess.InProgress = false
+			sess.InterruptedTurn = nil
+		}
 		saveErr = sessMgr.Save()
+		if saveErr != nil {
+			rollbackToolExecutions()
+			sess.InProgress = previousInProgress
+			sess.InterruptedTurn = previousInterruptedTurn
+		}
+		if runEventFlushErr != nil {
+			if err := runEvents.Flush(); err != nil {
+				log.Printf("daemon: final run event flush retry failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, err)
+			}
+		}
 		if saveErr != nil {
 			log.Printf("daemon: failed to save session: %v", saveErr)
 			if deps.EventBus != nil {
@@ -4241,6 +4383,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// save failed, the conversation is not on disk and downstream
 		// consumers (e.g. desktop schedule notifications that click through
 		// to the session) would point at a session that cannot be loaded.
+		replyEventDeliveries := 0
 		if saveErr == nil && deps.EventBus != nil {
 			payload := map[string]any{
 				"agent":      agentName,
@@ -4256,17 +4399,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				payload["failure_code"] = status.FailureCode
 			}
 			payloadBytes, _ := json.Marshal(payload)
-			deps.EventBus.Emit(Event{Type: EventAgentReply, Payload: payloadBytes})
+			replyEventDeliveries = deps.EventBus.EmitTo(Event{Type: EventAgentReply, Payload: payloadBytes})
 
-			// Reply-complete banner: routes through tools.SendBanner so it honors
-			// the same Desktop-handler-or-osascript-fallback contract as the
-			// notify tool. Skip when there is nothing to show or the source
-			// already delivers the reply elsewhere (cloud channels) or fires
-			// autonomously and would spam (heartbeat/watcher/mcp). The osascript
-			// fallback is macOS-only — skip the call on other platforms to keep
-			// headless Linux daemons silent instead of log-spamming a missing
-			// binary on every turn.
-			if runtime.GOOS == "darwin" && result != "" && shouldEmitReplyBanner(req.Source) {
+			// Reply-complete banner: an attached client owns presentation after it
+			// accepts the authoritative agent_reply event. Only a detached run uses
+			// the direct OS fallback; routing this automatic banner through the
+			// notification event would make it indistinguishable from an
+			// agent-authored notify tool call. Autonomous and cloud sources remain
+			// silent, and the fallback remains macOS-only.
+			if runtime.GOOS == "darwin" && result != "" &&
+				shouldEmitLocalReplyBanner(req.Source, replyEventDeliveries) {
 				title := "Kocoro"
 				if agentName != "" {
 					// Prefer the user-facing display_name over the opaque
@@ -4278,7 +4420,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					title = "Kocoro · " + label
 				}
 				body := truncate(stripMarkdownLite(audit.RedactSecrets(result)), 140)
-				if err := tools.SendBanner(ctx, title, body, false); err != nil {
+				if err := tools.SendLocalBanner(ctx, title, body, false); err != nil {
 					log.Printf("daemon: reply-complete banner failed (session=%s): %v", sess.ID, err)
 				}
 			}
@@ -4338,7 +4480,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				PlanMode:                 false, // plan-mode tracking lands in a future task
 			}
 			if agent.ShouldGenerateSuggestion(args) {
-				if mainReq, ok := loop.LastSentRequest(); ok {
+				if mainReq, forkLLM, ok := loop.LastSentRequestWithClient(); ok {
 					// context.Background(): the goroutine outlives the
 					// request ctx (HTTP handler / WS dispatch returns
 					// before the forked call completes). Cancellation
@@ -4349,7 +4491,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					// predicts the user's NEXT message after seeing the
 					// assistant's response (not a stale follow-up to
 					// the prior user turn).
-					go fireSuggestionAfterRun(context.Background(), deps, agentName, sess.ID, mainReq, result)
+					go fireSuggestionAfterRun(context.Background(), deps, forkLLM, agentName, sess.ID, mainReq, result)
 				}
 			}
 		}
@@ -4512,7 +4654,7 @@ func suggestionReadyPayload(sessionID, agentName, text string) []byte {
 // can verify the suggestion path is hitting the main turn's prompt cache.
 // Without this telemetry there's no signal that the feature is paying
 // warm-cache pricing as designed.
-func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, sessionID string, main client.CompletionRequest, assistantReply string) {
+func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, llm client.LLMClient, agentName, sessionID string, main client.CompletionRequest, assistantReply string) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("daemon: prompt_suggestion panic: %v", rec)
@@ -4544,7 +4686,7 @@ func fireSuggestionAfterRun(ctx context.Context, deps *ServerDeps, agentName, se
 	// suggestion the user has already moved past.
 	observedGen := deps.Suggestions.CurrentGen(sessionID)
 
-	res, err := agent.GenerateSuggestionWithUsage(ctx, deps.GW, main)
+	res, err := agent.GenerateSuggestionWithUsage(ctx, llm, main)
 	if err != nil {
 		// Transport / gateway failure — silent. Audit a row for diagnosability
 		// only if Auditor is wired; the model is empty here.
@@ -4902,8 +5044,8 @@ func closeRouteDone(done chan struct{}) {
 }
 
 // isSoftRunError reports whether err is a normal termination (cancel, timeout,
-// max iterations) rather than a hard failure. Soft errors should persist the
-// full conversation from RunMessages(), not just a friendly error stub.
+// safety limit) rather than a hard failure. Soft errors should persist the full
+// conversation from RunMessages(), not just a friendly error stub.
 //
 // ErrStreamIdleTimeout is soft: the agent loop already captures partial
 // streaming text and emits OnRunStatus("stream_idle_timeout") with
@@ -4913,6 +5055,8 @@ func closeRouteDone(done chan struct{}) {
 // any text received before the drop).
 func isSoftRunError(err error) bool {
 	return errors.Is(err, agent.ErrMaxIterReached) ||
+		errors.Is(err, agent.ErrRequestBudgetExhausted) ||
+		errors.Is(err, agent.ErrSideEffectOutcomeUnknown) ||
 		errors.Is(err, agent.ErrHardIdleTimeout) ||
 		errors.Is(err, client.ErrStreamIdleTimeout) ||
 		errors.Is(err, context.Canceled) ||

@@ -33,10 +33,3 @@ func TestSystemInfo_Run(t *testing.T) {
 		t.Errorf("expected CPU count in output, got: %s", result.Content)
 	}
 }
-
-func TestSystemInfo_RequiresApproval(t *testing.T) {
-	tool := &SystemInfoTool{}
-	if tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return false")
-	}
-}

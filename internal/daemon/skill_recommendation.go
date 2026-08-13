@@ -730,6 +730,11 @@ func (h *skillRecommendationEffectHandler) OnRunStatus(code, detail string) {
 		v.OnRunStatus(code, detail)
 	}
 }
+func (h *skillRecommendationEffectHandler) OnRunTrace(event agent.RunTraceEvent) {
+	if v, ok := h.EventHandler.(agent.RunTraceHandler); ok {
+		v.OnRunTrace(event)
+	}
+}
 func (h *skillRecommendationEffectHandler) OnInjectedCommitted(id, text string) {
 	if v, ok := h.EventHandler.(agent.InjectCommitHandler); ok {
 		v.OnInjectedCommitted(id, text)

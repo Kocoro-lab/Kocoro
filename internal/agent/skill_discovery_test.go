@@ -124,12 +124,8 @@ func TestDiscoverRelevantSkills_EmptyInputs(t *testing.T) {
 func TestDiscoverRelevantSkills_Timeout(t *testing.T) {
 	mock := &mockFnCompleter{
 		fn: func(ctx context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
-			select {
-			case <-time.After(10 * time.Second):
-				return &client.CompletionResponse{OutputText: "kocoro"}, nil
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
+			<-ctx.Done()
+			return nil, ctx.Err()
 		},
 	}
 
@@ -137,14 +133,14 @@ func TestDiscoverRelevantSkills_Timeout(t *testing.T) {
 	// does NOT short-circuit; this keeps the test focused on timeout.
 	loaded := []*skills.Skill{{Name: "kocoro", Description: "test"}}
 	start := time.Now()
-	result, _ := discoverRelevantSkills(context.Background(), mock, "create agent", loaded)
+	result, _ := discoverRelevantSkillsWithTimeout(context.Background(), mock, "create agent", loaded, 10*time.Millisecond)
 	elapsed := time.Since(start)
 
 	if len(result) != 0 {
 		t.Error("expected no results on timeout")
 	}
-	if elapsed > 7*time.Second {
-		t.Errorf("should timeout in ~5s, took %v", elapsed)
+	if elapsed > time.Second {
+		t.Errorf("test timeout was not applied, took %v", elapsed)
 	}
 }
 
@@ -423,23 +419,19 @@ func TestSkillDiscoveryPreFilter(t *testing.T) {
 	t.Run("pre-filter survives small-model timeout", func(t *testing.T) {
 		slow := &mockFnCompleter{
 			fn: func(ctx context.Context, req client.CompletionRequest) (*client.CompletionResponse, error) {
-				select {
-				case <-time.After(10 * time.Second):
-					return &client.CompletionResponse{OutputText: "none"}, nil
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
+				<-ctx.Done()
+				return nil, ctx.Err()
 			},
 		}
 		loaded := []*skills.Skill{policy, unrelated}
 		start := time.Now()
-		matched, _ := discoverRelevantSkills(context.Background(), slow, "create an agent for daily standup", loaded)
+		matched, _ := discoverRelevantSkillsWithTimeout(context.Background(), slow, "create an agent for daily standup", loaded, 10*time.Millisecond)
 		elapsed := time.Since(start)
 		if len(matched) != 1 || matched[0].Name != "kocoro" {
 			t.Fatalf("expected [kocoro] from pre-filter even on timeout, got %v", skillNames(matched))
 		}
-		if elapsed > 7*time.Second {
-			t.Errorf("pre-filter should not block on slow model beyond the 5s timeout, took %v", elapsed)
+		if elapsed > time.Second {
+			t.Errorf("test timeout was not applied, took %v", elapsed)
 		}
 	})
 

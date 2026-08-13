@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
@@ -94,9 +96,23 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	// show phantom args, and cloud-side reject paths aren't tripped on
 	// older cloud versions without the reserved-daemon-fields whitelist.
 	stripFieldsNotInSchema(args, t.schema.Parameters)
+	materialSideEffect := t.HasMaterialSideEffect(argsJSON)
+	if err := ctx.Err(); err != nil {
+		result := agent.ToolResult{
+			Content: fmt.Sprintf("server tool call cancelled before dispatch: %v", err),
+			IsError: true,
+		}
+		if materialSideEffect {
+			result = withKnownNoEffect(result)
+		}
+		return result, nil
+	}
 
 	resp, err := t.execute(ctx, t.schema.Name, args)
 	if err != nil {
+		if materialSideEffect {
+			return t.materialErrorResult(err), nil
+		}
 		msg := err.Error()
 		prefix := classifyServerError(msg)
 		return agent.ToolResult{
@@ -155,7 +171,7 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 		if !resp.Success {
 			content = appendLadder(content, resp.Metadata)
 		}
-		if looksLikeRemoteValidationError(content) {
+		if !materialSideEffect && looksLikeRemoteValidationError(content) {
 			result := agent.ValidationError(strings.TrimPrefix(content, "[validation error] "))
 			result.Usage = toolUsage
 			return result, nil
@@ -178,8 +194,86 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 	return agent.ToolResult{Content: string(resp.Output), Usage: toolUsage}, nil
 }
 
+func (t *ServerTool) materialErrorResult(err error) agent.ToolResult {
+	var dispatchErr *client.ToolDispatchError
+	if errors.As(err, &dispatchErr) {
+		if dispatchErr.MayHaveDispatched {
+			return externalOutcomeUnknown(fmt.Sprintf(
+				"External tool outcome UNKNOWN: %s may have been dispatched, but no complete response arrived. The external action may have taken effect; verify before retrying.",
+				t.schema.Name,
+			))
+		}
+		msg := fmt.Sprintf("external tool %s failed before dispatch", t.schema.Name)
+		if dispatchErr.Retryable {
+			return withKnownNoEffect(agent.TransientError(msg))
+		}
+		return withKnownNoEffect(agent.BusinessError(msg))
+	}
+
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) {
+		msg := fmt.Sprintf("external tool %s returned %d", t.schema.Name, apiErr.StatusCode)
+		if apiErr.Body != "" {
+			msg += ": " + apiErr.Body
+		}
+		switch apiErr.StatusCode {
+		case http.StatusRequestTimeout:
+			return externalOutcomeUnknown(fmt.Sprintf(
+				"External tool outcome UNKNOWN: Cloud returned %d after receiving %s. The external action may have taken effect; verify before retrying.",
+				apiErr.StatusCode,
+				t.schema.Name,
+			))
+		case http.StatusBadRequest, http.StatusUnprocessableEntity:
+			return withKnownNoEffect(agent.ValidationError(msg))
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return withKnownNoEffect(agent.PermissionError(msg))
+		case http.StatusNotFound:
+			return withKnownNoEffect(agent.BusinessError(msg))
+		case http.StatusConflict:
+			return externalOutcomeUnknown(fmt.Sprintf(
+				"External tool outcome UNKNOWN: Cloud returned %d after receiving %s. The external action may have taken effect; verify before retrying.",
+				apiErr.StatusCode,
+				t.schema.Name,
+			))
+		case http.StatusTooManyRequests:
+			return withKnownNoEffect(agent.TransientError(msg))
+		}
+		if apiErr.StatusCode >= http.StatusInternalServerError {
+			return externalOutcomeUnknown(fmt.Sprintf(
+				"External tool outcome UNKNOWN: Cloud returned %d after receiving %s. The external action may have taken effect; verify before retrying.",
+				apiErr.StatusCode,
+				t.schema.Name,
+			))
+		}
+		prefix := classifyServerError(msg)
+		return agent.ToolResult{Content: prefix + "server tool error: " + msg, IsError: true}
+	}
+
+	return externalOutcomeUnknown(fmt.Sprintf(
+		"External tool outcome UNKNOWN: %s failed without dispatch-phase evidence. The external action may have taken effect; verify before retrying.",
+		t.schema.Name,
+	))
+}
+
+func withKnownNoEffect(result agent.ToolResult) agent.ToolResult {
+	result.SideEffectKnownNoEffect = true
+	return result
+}
+
+func externalOutcomeUnknown(content string) agent.ToolResult {
+	return agent.ToolResult{Content: content, IsError: true, SideEffectOutcomeUnknown: true}
+}
+
 // RequiresApproval returns false — the server enforces its own access control.
 func (t *ServerTool) RequiresApproval() bool { return false }
+
+// HasMaterialSideEffect keeps explicitly reviewed observational gateway tools
+// out of the durable write journal. Gateway jobs that persist provider state,
+// and integrations without reliable read-only annotations, remain material.
+func (t *ServerTool) HasMaterialSideEffect(string) bool {
+	policy, registered := gatewayToolPolicies[t.schema.Name]
+	return t.source != agent.SourceGateway || !registered || !policy.noMaterialSideEffect
+}
 
 // classifyServerError returns the appropriate error prefix based on the error
 // message, so the agent loop's error-handling instructions can guide the model

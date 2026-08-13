@@ -3,9 +3,11 @@ package executionprofile
 import "strings"
 
 // FullReason is bounded diagnostic context for Koe's soft initial mode choice.
-// It never authorizes or denies Full. It is deliberately about the initial task
-// only: tool count, elapsed time, validation failures, and other runtime loop
-// state are not admission inputs.
+// It never authorizes a side effect or bypasses an approval boundary. A
+// recognized Full reason paired with Fast is a contradictory selector result,
+// so admission fails closed to Full instead of silently discarding the reason.
+// It is deliberately about the initial task only: tool count, elapsed time,
+// validation failures, and other runtime loop state are not admission inputs.
 type FullReason string
 
 const (
@@ -23,6 +25,7 @@ const (
 	AdmissionModeSelectedFast     = "mode_selected_fast"
 	AdmissionModeSelectedFull     = "mode_selected_full"
 	AdmissionModeMissingOrInvalid = "mode_missing_or_invalid"
+	AdmissionFastReasonConflict   = "fast_reason_conflict"
 )
 
 // ModeAdmission is the deterministic boundary between Realtime's advisory
@@ -58,12 +61,14 @@ func NormalizeFullReason(value string) FullReason {
 	}
 }
 
-// DecideModeAdmission normalizes Koe's soft initial routing decision. A valid
-// execution_mode is authoritative; FullReason is diagnostic context and never
-// upgrades or downgrades the selected mode. Task prose is intentionally not
-// scanned for keywords because quoted text, filenames, and multilingual wording
-// make lexical routing high-variance. Missing or invalid execution_mode remains
-// a legacy/protocol failure and therefore preserves the pre-Fast Full behavior.
+// DecideModeAdmission normalizes Koe's soft initial routing decision. A valid,
+// internally consistent execution_mode is authoritative. A recognized Full
+// reason paired with Fast is a protocol contradiction and fails closed to Full;
+// unknown reasons normalize to none and cannot change the mode. Task prose is
+// intentionally not scanned for keywords because quoted text, filenames, and
+// multilingual wording make lexical routing high-variance. Missing or invalid
+// execution_mode remains a legacy/protocol failure and therefore preserves the
+// pre-Fast Full behavior.
 func DecideModeAdmission(requestedMode, requestedFullReason string) ModeAdmission {
 	mode, validMode := parseRequestedMode(requestedMode)
 	reason := NormalizeFullReason(requestedFullReason)
@@ -76,6 +81,12 @@ func DecideModeAdmission(requestedMode, requestedFullReason string) ModeAdmissio
 	if !validMode {
 		admission.AdmittedMode = ModeFull
 		admission.DecisionReason = AdmissionModeMissingOrInvalid
+		return admission
+	}
+	if mode == ModeFast && reason != FullReasonNone {
+		admission.AdmittedMode = ModeFull
+		admission.AdmittedFullReason = reason
+		admission.DecisionReason = AdmissionFastReasonConflict
 		return admission
 	}
 	if mode == ModeFull {

@@ -1,0 +1,15 @@
+{
+  "schedule_id": "schedule-1",
+  "session_id": "session-partial",
+  "agent": "research",
+  "phase": "partial",
+  "ts": "2026-08-12T00:00:00Z",
+  "usage": {
+    "input_tokens": 120,
+    "output_tokens": 30,
+    "total_tokens": 150,
+    "cost_usd": 0.004
+  },
+  "partial": true,
+  "failure_code": "iteration_limit"
+}

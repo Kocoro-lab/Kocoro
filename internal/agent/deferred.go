@@ -324,6 +324,48 @@ func deferredToolNames(reg *ToolRegistry) map[string]bool {
 	return names
 }
 
+// koeFastColdTools keeps uncommon, schema-heavy local capabilities out of the
+// initial Koe Fast request. They remain discoverable through tool_search and
+// retain their normal approval and execution policies after loading. Common
+// memory, file, search, calendar, scheduling, and desktop utility openers stay
+// direct so ordinary work does not pay an extra model round.
+var koeFastColdTools = map[string]bool{
+	"archive_extract": true,
+	"archive_inspect": true,
+	"cloud_delegate":  true,
+	"docx_to_text":    true,
+	"http":            true,
+	"pdf_to_text":     true,
+	"pptx_to_text":    true,
+	"system_info":     true,
+	"xlsx_to_text":    true,
+}
+
+// KoeFastColdToolNames returns a copy of the Fast-only cold-tool policy list
+// so registry-level drift tests outside this package can pin it against the
+// real local-tool registration.
+func KoeFastColdToolNames() []string {
+	names := make([]string, 0, len(koeFastColdTools))
+	for name := range koeFastColdTools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func deferredToolNamesForRun(reg *ToolRegistry, koeFast bool) map[string]bool {
+	names := deferredToolNames(reg)
+	if !koeFast || reg == nil {
+		return names
+	}
+	for name := range koeFastColdTools {
+		if _, ok := reg.Get(name); ok {
+			names[name] = true
+		}
+	}
+	return names
+}
+
 // preseedDeferredSchemas filters the session working set down to schemas that
 // are still deferred in the current effective registry.
 func preseedDeferredSchemas(

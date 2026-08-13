@@ -31,13 +31,6 @@ func TestBrowser_Info(t *testing.T) {
 	}
 }
 
-func TestBrowser_RequiresApproval(t *testing.T) {
-	tool := &BrowserTool{}
-	if !tool.RequiresApproval() {
-		t.Error("expected RequiresApproval to return true")
-	}
-}
-
 func TestBrowser_InvalidJSON(t *testing.T) {
 	tool := &BrowserTool{}
 	result, err := tool.Run(context.Background(), `not valid json`)

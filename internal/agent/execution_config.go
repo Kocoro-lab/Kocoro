@@ -15,6 +15,7 @@ type ExecutionConfig struct {
 	Thinking              *client.ThinkingConfig `json:"thinking,omitempty"`
 	ReasoningEffort       string                 `json:"reasoning_effort"`
 	EffortTier            string                 `json:"effort_tier"`
+	ResponseDetail        string                 `json:"response_detail"`
 	ServiceTier           string                 `json:"service_tier"`
 	ResponseLanguage      string                 `json:"response_language"`
 	Temperature           float64                `json:"temperature"`
@@ -82,7 +83,7 @@ func (a *AgentLoop) ContextWindow() (tokens int, explicit bool) {
 	return a.contextWindow, a.contextWindowExplicit
 }
 
-// MaxIterations returns the configured agent-loop iteration limit.
+// MaxIterations returns the configured emergency agent-loop iteration fuse.
 func (a *AgentLoop) MaxIterations() int {
 	if a == nil {
 		return 0
@@ -104,6 +105,7 @@ func (a *AgentLoop) ExecutionConfig() ExecutionConfig {
 		Thinking:              a.Thinking(),
 		ReasoningEffort:       a.ReasoningEffort(),
 		EffortTier:            a.EffortTier(),
+		ResponseDetail:        a.ResponseDetail(),
 		ServiceTier:           a.ServiceTier(),
 		ResponseLanguage:      a.ResponseLanguage(),
 		Temperature:           a.Temperature(),
@@ -130,6 +132,7 @@ func (a *AgentLoop) ApplyExecutionConfig(config ExecutionConfig) {
 	a.SetThinking(thinking)
 	a.SetReasoningEffort(config.ReasoningEffort)
 	a.SetEffortTier(config.EffortTier)
+	a.SetResponseDetail(config.ResponseDetail)
 	a.SetServiceTier(config.ServiceTier)
 	a.SetResponseLanguage(config.ResponseLanguage)
 	a.SetTemperature(config.Temperature)

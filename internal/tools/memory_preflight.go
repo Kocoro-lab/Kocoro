@@ -269,7 +269,11 @@ var memoryHelperToolChoice = map[string]any{"type": "tool", "name": memoryHelper
 // NewMemoryPreflight builds the default fail-silent implicit memory preflight.
 func NewMemoryPreflight(q MemoryPreflightQuerier, llm client.LLMClient) agent.MemoryPreflightFunc {
 	return func(ctx context.Context, query string, opts agent.MemoryPreflightOptions) *agent.MemoryPreflightResult {
+		started := time.Now()
 		trace := opts.Trace
+		if trace != nil {
+			defer func() { trace.TotalDurationMs = time.Since(started).Milliseconds() }()
+		}
 		if trace != nil {
 			trace.Attempted = true
 			trace.ForceHelper = opts.ForceHelper
@@ -298,7 +302,11 @@ func NewMemoryPreflight(q MemoryPreflightQuerier, llm client.LLMClient) agent.Me
 		}
 		queryCtx, cancel := context.WithTimeout(ctx, memoryQueryTimeout)
 		defer cancel()
+		queryStarted := time.Now()
 		results := q.QueryBatch(queryCtx, intents)
+		if trace != nil {
+			trace.QueryDurationMs = time.Since(queryStarted).Milliseconds()
+		}
 		if queryCtx.Err() != nil {
 			setMemoryPreflightOutcome(trace, "query_timeout")
 			return &agent.MemoryPreflightResult{Usage: usage}
@@ -376,7 +384,11 @@ func DetectMemoryIntents(ctx context.Context, llm client.LLMClient, query string
 		trace.HelperUsed = true
 		trace.IntentSource = "helper"
 	}
+	helperStarted := time.Now()
 	out, usage, err := callMemoryHelper(ctx, llm, helperInput)
+	if trace != nil {
+		trace.HelperDurationMs = time.Since(helperStarted).Milliseconds()
+	}
 	if err != nil {
 		setMemoryPreflightHelperError(trace, err)
 		return nil, usage
@@ -649,16 +661,15 @@ func looksMemoryRelevant(query string) bool {
 }
 
 var privateMemoryCues = []string{
-	"remember", "recall", "last time", "previously", "before", "we discussed", "we decided", "did we", "have we", "my ", " me ", " i ",
-	"记得", "記得", "回忆", "回憶", "上次", "之前", "以前", "我们聊", "我們聊", "我们说", "我們說", "我", "我的",
-	"覚えて", "思い出", "前回", "以前", "前に", "話した", "決めた", "私", "わたし", "僕", "俺", "自分",
+	"remember", "recall", "last time", "previously", "before", "we discussed", "we decided", "did we", "have we",
+	"记得", "記得", "回忆", "回憶", "上次", "之前", "以前", "我们聊", "我們聊", "我们说", "我們說",
+	"覚えて", "思い出", "前回", "以前", "前に", "話した", "決めた",
 }
 
 var relationQuestionCues = []string{
-	"relationship", "connection", "know", "met", "meet", "worked", "work with", "colleague", "coworker", "classmate", "advisor", "mentor", "friend",
-	"created", "built", "authored", "founded", "owns", "owned", "depends", "requires", "uses", "implemented", "runs on", "integrates", "supports", "released", "published", "forked", "inspired", "customer", "competitor", "email", "handle", "url", "path", "scheduled", "monitors", "what does", "who created", "who owns", "who built",
-	"关系", "關係", "认识", "認識", "见过", "見過", "合作", "同事", "同学", "同學", "导师", "導師", "朋友", "是谁", "是誰", "工作", "任职", "任職", "创建", "創建", "作者", "拥有", "擁有", "依赖", "依賴", "使用", "实现", "實現", "运行", "運行", "集成", "支持", "发布", "發布", "项目", "項目",
-	"関係", "知", "会った", "仕事", "同僚", "友達", "先生", "メンター", "作った", "作者", "所有", "依存", "使", "実装", "動", "統合", "対応", "発表", "公開", "プロジェクト",
+	"relationship", "connection", "do i know", "did i know", "how do i know", "where do i know", "did i meet", "where did i meet", "worked with", "work with", "colleague", "coworker", "classmate", "advisor", "mentor", "friend", "what does", "who created", "who owns", "who built",
+	"关系", "關係", "认识", "認識", "见过", "見過", "合作过", "合作過", "同事", "同学", "同學", "导师", "導師", "朋友", "是谁", "是誰", "谁创建", "誰創建", "谁拥有", "誰擁有", "在哪工作", "任职于", "任職於", "哪家公司", "怎么认识", "怎麼認識", "最近在做",
+	"関係", "知り合", "会ったこと", "一緒に働", "同僚", "友達", "先生", "メンター", "誰が作", "誰が所有", "どこで働", "どう知り合",
 }
 
 var typedTargetCues = []string{
@@ -696,20 +707,37 @@ func containsAny(s string, markers []string) bool {
 }
 
 func hasEntityishSurface(s string) bool {
-	if latinEntityPattern.FindStringSubmatch(s) != nil {
-		return true
+	for _, match := range latinEntityPattern.FindAllStringSubmatchIndex(s, -1) {
+		if len(match) < 4 || match[2] < 0 || match[3] < 0 {
+			continue
+		}
+		candidate := strings.TrimSpace(s[match[2]:match[3]])
+		// A single title-cased word at byte zero is usually sentence grammar
+		// ("Please", "What", "Draft"), not a named entity. Multi-word names,
+		// mixed-case names, and capitalized words later in the sentence remain
+		// eligible. Quoted CJK/Latin names are handled below.
+		if strings.Contains(candidate, " ") || match[2] > 0 || hasInternalUpper(candidate) {
+			return true
+		}
 	}
 	if strings.ContainsAny(s, "\"'“”‘’`「」『』") {
 		return true
 	}
-	hasCJKOrKana := false
+	return false
+}
+
+func hasInternalUpper(s string) bool {
+	first := true
 	for _, r := range s {
-		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana) {
-			hasCJKOrKana = true
-			break
+		if first {
+			first = false
+			continue
+		}
+		if unicode.IsUpper(r) {
+			return true
 		}
 	}
-	return hasCJKOrKana && len([]rune(s)) <= 80
+	return false
 }
 
 func memoryRelationCatalog() string {

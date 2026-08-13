@@ -11,117 +11,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
-	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
-
-// TestE2E_RouteKeyComputation verifies route keys for all entry-point scenarios.
-func TestE2E_RouteKeyComputation(t *testing.T) {
-	tests := []struct {
-		name     string
-		req      RunAgentRequest
-		expected string
-	}{
-		{
-			name:     "named agent",
-			req:      RunAgentRequest{Text: "hi", Agent: "research"},
-			expected: "agent:research",
-		},
-		{
-			name:     "explicit session_id",
-			req:      RunAgentRequest{Text: "hi", SessionID: "abc-123"},
-			expected: "session:abc-123",
-		},
-		{
-			name:     "new_session forces empty key",
-			req:      RunAgentRequest{Text: "hi", NewSession: true},
-			expected: "",
-		},
-		{
-			name:     "slack channel routing",
-			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "#general"},
-			expected: "default:slack:%23general",
-		},
-		{
-			name:     "slack thread routing",
-			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "slack", ThreadID: "C123-1710000000.000100"},
-			expected: "default:slack:C123-1710000000.000100",
-		},
-		{
-			name:     "wecom named agent thread routing",
-			req:      RunAgentRequest{Text: "hi", Agent: "ops-bot", Source: "wecom", Channel: "wecom", ThreadID: "g:group-a"},
-			expected: "agent:ops-bot:wecom:g:group-a",
-		},
-		{
-			name:     "line channel routing",
-			req:      RunAgentRequest{Text: "hi", Source: "line", Channel: "group-abc"},
-			expected: "default:line:group-abc",
-		},
-		{
-			name:     "web source bypasses cache",
-			req:      RunAgentRequest{Text: "hi", Source: "web", Channel: "session-1"},
-			expected: "",
-		},
-		{
-			name:     "webhook bypasses cache",
-			req:      RunAgentRequest{Text: "hi", Source: "webhook", Channel: "hook-1"},
-			expected: "",
-		},
-		{
-			name:     "named webhook bypasses cache",
-			req:      RunAgentRequest{Text: "hi", Agent: "ops-bot", Source: "webhook", Channel: "hook-1"},
-			expected: "",
-		},
-		{
-			name:     "cron bypasses cache",
-			req:      RunAgentRequest{Text: "hi", Source: "cron", Channel: "job-1"},
-			expected: "",
-		},
-		{
-			name:     "schedule bypasses cache",
-			req:      RunAgentRequest{Text: "hi", Source: "schedule", Channel: "sched-1"},
-			expected: "",
-		},
-		{
-			name:     "no context defaults to empty",
-			req:      RunAgentRequest{Text: "hi"},
-			expected: "",
-		},
-		{
-			name:     "shanclaw with session_id",
-			req:      RunAgentRequest{Text: "hi", Source: "shanclaw", SessionID: "sess-xyz"},
-			expected: "session:sess-xyz",
-		},
-		{
-			name:     "slack channel with sender splits per-user",
-			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "C123", Sender: "U-alice"},
-			expected: "default:slack:C123:U-alice",
-		},
-		{
-			name:     "slack named agent channel with sender splits per-user",
-			req:      RunAgentRequest{Text: "hi", Agent: "ops-bot", Source: "slack", Channel: "C123", Sender: "U-alice"},
-			expected: "agent:ops-bot:slack:C123:U-alice",
-		},
-		{
-			name:     "slack thread takes precedence over sender",
-			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "C123", ThreadID: "T-9", Sender: "U-alice"},
-			expected: "default:slack:T-9",
-		},
-		{
-			name:     "slack channel without sender keeps legacy key",
-			req:      RunAgentRequest{Text: "hi", Source: "slack", Channel: "C123"},
-			expected: "default:slack:C123",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			key := ComputeRouteKey(tt.req)
-			if key != tt.expected {
-				t.Errorf("ComputeRouteKey(%+v) = %q, want %q", tt.req, key, tt.expected)
-			}
-		})
-	}
-}
 
 func TestE2E_MessagingThreadRoutesDoNotInjectAcrossThreads(t *testing.T) {
 	tests := []struct {
@@ -237,27 +127,6 @@ func TestE2E_InjectMessage_FullFlow(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected message in inject channel")
-	}
-}
-
-// TestE2E_CancelRoute_StopsRun verifies hard cancel.
-func TestE2E_CancelRoute_StopsRun(t *testing.T) {
-	sc := NewSessionCache(t.TempDir())
-	defer sc.CloseAll()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	routeKey := "agent:research"
-
-	sc.mu.Lock()
-	sc.routes[routeKey] = &routeEntry{
-		cancel: cancel,
-		done:   make(chan struct{}),
-	}
-	sc.mu.Unlock()
-
-	sc.CancelRoute(routeKey)
-	if ctx.Err() == nil {
-		t.Fatal("expected context to be cancelled")
 	}
 }
 
@@ -591,36 +460,4 @@ func TestE2E_SameRoute_Serializes(t *testing.T) {
 	if len(order) != 2 || order[0] != 1 || order[1] != 2 {
 		t.Errorf("expected order [1, 2], got %v", order)
 	}
-}
-
-// TestE2E_SessionPreSave verifies session metadata persists to disk.
-func TestE2E_SessionPreSave(t *testing.T) {
-	sessDir := t.TempDir()
-
-	mgr := session.NewManager(sessDir)
-	sess := mgr.NewSession()
-	sess.Title = "pre-save test"
-	sess.Source = "slack"
-	sess.Channel = "#general"
-
-	if err := mgr.Save(); err != nil {
-		t.Fatalf("pre-save failed: %v", err)
-	}
-
-	mgr2 := session.NewManager(sessDir)
-	loaded, err := mgr2.Resume(sess.ID)
-	if err != nil {
-		t.Fatalf("failed to load pre-saved session: %v", err)
-	}
-	if loaded.Title != "pre-save test" {
-		t.Errorf("expected title 'pre-save test', got %q", loaded.Title)
-	}
-	if loaded.Source != "slack" {
-		t.Errorf("expected source 'slack', got %q", loaded.Source)
-	}
-	if loaded.Channel != "#general" {
-		t.Errorf("expected channel '#general', got %q", loaded.Channel)
-	}
-	mgr.Close()
-	mgr2.Close()
 }

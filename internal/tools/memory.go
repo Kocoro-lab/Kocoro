@@ -53,7 +53,8 @@ type memoryArgs struct {
 func (t *MemoryTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name: "memory_recall",
-		Description: "Read structured episodic memory results from the user's Kocoro hippocampus — past sessions consolidated through nightly memory replay into long-term records.\n" +
+		Description: "Read structured episodic memory results from the user's Kocoro hippocampus — past sessions consolidated through nightly memory replay into long-term records. Use this first for private facts about a named person or project, including contact details; a user-supplied nickname or name fragment is a valid concrete anchor.\n" +
+			"Call once for each concrete anchor/target needed by the current request. If the result has a matching candidate, answer from it without a confirming session_search. If the target is unnamed or ambiguous, use session_search first. If the result has no_data_reason or no matching candidate, do not retry the same target with alternate relation spellings or modes in this turn.\n" +
 			"Modes:\n" +
 			"- direct_relation: one-hop predicate (e.g. \"what did X create?\"). Read `groups[].via_relations`.\n" +
 			"- path_query: multi-hop / possessive (e.g. \"what did X's collaborator create?\"). relation_constraints is the ordered path; inverse hops use `^-1`. Read `groups[].observed_path`.\n" +
@@ -70,12 +71,12 @@ func (t *MemoryTool) Info() agent.ToolInfo {
 				"anchor_mentions": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Entity names to start from. Use the clearest/fullest name when obvious (for example, use a person's full name rather than a nickname). For path_query, include only the starting entity mention, not relationship words like student/collaborator/project.",
+					"description": "Concrete entity names to start from. Use the clearest/fullest name when obvious (for example, use a person's full name rather than a nickname). Do not invent an anchor for unnamed references such as my doctor or that plan; use session_search first. For path_query, include only the starting entity mention, not relationship words like student/collaborator/project.",
 				},
 				"relation_constraints": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Canonical relation names. For path_query, this is the ordered path; append ^-1 for inverse hops, e.g. collaborated_with^-1 then created for a two-hop possessive question. For typed_neighborhood, provide exactly one relation.",
+					"description": "Canonical relation names. Use the single clearest relation when one is known; otherwise omit this field rather than inventing or retrying synonyms. For path_query, this is the ordered path; append ^-1 for inverse hops, e.g. collaborated_with^-1 then created for a two-hop possessive question. For typed_neighborhood, provide exactly one relation.",
 				},
 				"candidate_type": map[string]any{
 					"type":        "string",

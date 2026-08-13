@@ -1,0 +1,659 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
+	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
+)
+
+type recordingSideEffectJournal struct {
+	mu            sync.Mutex
+	events        []string
+	prepared      []SideEffectExecution
+	commitErr     error
+	dispatchErr   error
+	prepareErr    error
+	abandonErr    error
+	unknownErr    error
+	resultDigests []string
+}
+
+func (j *recordingSideEffectJournal) record(event string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.events = append(j.events, event)
+}
+
+func (j *recordingSideEffectJournal) snapshotEvents() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]string(nil), j.events...)
+}
+
+func (j *recordingSideEffectJournal) Prepare(_ context.Context, execution SideEffectExecution) (PreparedSideEffectExecution, error) {
+	j.mu.Lock()
+	j.events = append(j.events, "prepare")
+	j.prepared = append(j.prepared, execution)
+	j.mu.Unlock()
+	if j.prepareErr != nil {
+		return PreparedSideEffectExecution{}, j.prepareErr
+	}
+	return PreparedSideEffectExecution{ExecutionID: "exec-opaque", IdempotencyKey: "idem-opaque"}, nil
+}
+
+func (j *recordingSideEffectJournal) MarkDispatching(context.Context, string) error {
+	j.record("dispatching")
+	return j.dispatchErr
+}
+
+func (j *recordingSideEffectJournal) MarkCommitted(_ context.Context, _ string, digest string) error {
+	j.mu.Lock()
+	j.events = append(j.events, "committed")
+	j.resultDigests = append(j.resultDigests, digest)
+	j.mu.Unlock()
+	return j.commitErr
+}
+
+func (j *recordingSideEffectJournal) MarkFailedNoEffect(_ context.Context, _ string, digest string) error {
+	j.mu.Lock()
+	j.events = append(j.events, "failed_no_effect")
+	j.resultDigests = append(j.resultDigests, digest)
+	j.mu.Unlock()
+	return j.commitErr
+}
+
+func (j *recordingSideEffectJournal) MarkAbandoned(_ context.Context, _ string, digest string) error {
+	j.mu.Lock()
+	j.events = append(j.events, "abandoned")
+	j.resultDigests = append(j.resultDigests, digest)
+	j.mu.Unlock()
+	return j.abandonErr
+}
+
+func (j *recordingSideEffectJournal) MarkOutcomeUnknown(_ context.Context, _ string, digest string) error {
+	j.mu.Lock()
+	j.events = append(j.events, "outcome_unknown")
+	j.resultDigests = append(j.resultDigests, digest)
+	j.mu.Unlock()
+	return j.unknownErr
+}
+
+type journalWriteTool struct {
+	runs       atomic.Int32
+	journal    *recordingSideEffectJournal
+	result     ToolResult
+	runErr     error
+	ctxCapture SideEffectExecutionContext
+}
+
+type journalRemoteWriteTool struct{ *journalWriteTool }
+
+func (*journalRemoteWriteTool) ToolSource() ToolSource { return SourceMCP }
+
+func (*journalWriteTool) Info() ToolInfo {
+	return ToolInfo{Name: "journal_write", Parameters: map[string]any{"type": "object"}}
+}
+func (*journalWriteTool) RequiresApproval() bool { return false }
+func (t *journalWriteTool) Run(ctx context.Context, _ string) (ToolResult, error) {
+	t.runs.Add(1)
+	if t.journal != nil {
+		t.journal.record("run")
+	}
+	t.ctxCapture, _ = SideEffectExecutionFromContext(ctx)
+	return t.result, t.runErr
+}
+
+type journalReadOnlyTool struct{ runs atomic.Int32 }
+
+func (*journalReadOnlyTool) Info() ToolInfo {
+	return ToolInfo{Name: "journal_read", Parameters: map[string]any{"type": "object"}}
+}
+func (*journalReadOnlyTool) RequiresApproval() bool     { return false }
+func (*journalReadOnlyTool) IsReadOnlyCall(string) bool { return true }
+func (t *journalReadOnlyTool) Run(context.Context, string) (ToolResult, error) {
+	t.runs.Add(1)
+	return ToolResult{Content: "observed"}, nil
+}
+
+type journalNonMaterialTool struct{ runs atomic.Int32 }
+
+func (*journalNonMaterialTool) Info() ToolInfo {
+	return ToolInfo{Name: "journal_local", Parameters: map[string]any{"type": "object"}}
+}
+func (*journalNonMaterialTool) RequiresApproval() bool            { return false }
+func (*journalNonMaterialTool) HasMaterialSideEffect(string) bool { return false }
+func (t *journalNonMaterialTool) Run(context.Context, string) (ToolResult, error) {
+	t.runs.Add(1)
+	return ToolResult{Content: "local"}, nil
+}
+
+func journalApprovedCall(tool Tool, index int) approvedToolCall {
+	return approvedToolCall{
+		index: index,
+		fc: client.FunctionCall{
+			ID:        fmt.Sprintf("call-%d", index),
+			Name:      tool.Info().Name,
+			Arguments: json.RawMessage(`{"value":"private"}`),
+		},
+		tool:    tool,
+		argsStr: `{"value":"private"}`,
+	}
+}
+
+func TestExecuteBatches_SideEffectJournalOrdersDurableBoundary(t *testing.T) {
+	journal := &recordingSideEffectJournal{}
+	tool := &journalWriteTool{journal: journal, result: ToolResult{Content: "created"}}
+	results := make([]toolExecResult, 1)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{{journalApprovedCall(tool, 0)}},
+		results, nil, nil, "request",
+		sideEffectBatchHooks{
+			journal: journal,
+			checkpointPrepared: func(context.Context) error {
+				journal.record("checkpoint")
+				return nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeBatches: %v", err)
+	}
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run committed]"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if tool.ctxCapture.ExecutionID != "exec-opaque" || tool.ctxCapture.IdempotencyKey != "idem-opaque" {
+		t.Fatalf("tool context = %+v", tool.ctxCapture)
+	}
+	if len(journal.prepared) != 1 || len(journal.prepared[0].ArgumentsSHA256) != 64 {
+		t.Fatalf("prepared execution = %+v", journal.prepared)
+	}
+	if journal.prepared[0].ArgumentsSHA256 == `{"value":"private"}` {
+		t.Fatal("journal received raw arguments instead of a digest")
+	}
+	if len(journal.resultDigests) != 1 || len(journal.resultDigests[0]) != 64 {
+		t.Fatalf("result digests = %v", journal.resultDigests)
+	}
+	if results[0].sideEffectResultDigest != journal.resultDigests[0] {
+		t.Fatalf("execution digest %q diverged from journal %q", results[0].sideEffectResultDigest, journal.resultDigests[0])
+	}
+	if results[0].result.Content != "created" {
+		t.Fatalf("result = %+v", results[0].result)
+	}
+}
+
+func TestAgentLoop_SideEffectEvidencePinsJournalDigestBeforeResultShaping(t *testing.T) {
+	llm := &legacyJournalLoopClient{}
+	journal := &recordingSideEffectJournal{}
+	rawResult := "created\n" + strings.Repeat("A", 600)
+	tool := &journalWriteTool{journal: journal, result: ToolResult{Content: rawResult}}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	handler := &runTraceRecorder{}
+	loop := NewAgentLoop(llm, registry, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
+	loop.SetHandler(handler)
+	loop.SetSideEffectExecutionJournal(journal)
+	loop.SetCheckpointFunc(func(context.Context) error { return nil })
+
+	if text, _, err := loop.Run(context.Background(), "create it", nil, nil); err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v)", text, err)
+	}
+	journal.mu.Lock()
+	if len(journal.resultDigests) != 1 {
+		journal.mu.Unlock()
+		t.Fatalf("journal digests = %v", journal.resultDigests)
+	}
+	wantDigest := journal.resultDigests[0]
+	journal.mu.Unlock()
+
+	evidence := loop.ExecutionEvidence()
+	if len(evidence.ToolOutcomes) != 1 {
+		t.Fatalf("tool evidence = %+v", evidence.ToolOutcomes)
+	}
+	outcome := evidence.ToolOutcomes[0]
+	if outcome.ResultDigest != wantDigest || outcome.ResultDigestStage != executionprofile.ToolResultDigestStageToolRun || !outcome.ResultTransformed {
+		t.Fatalf("tool evidence digest provenance = %+v, want digest %q", outcome, wantDigest)
+	}
+	toolEvents := toolRunTraceEvents(handler.events)
+	if len(toolEvents) != 1 || toolEvents[0].Tool == nil ||
+		toolEvents[0].Tool.ResultDigestStage != executionprofile.ToolResultDigestStageToolRun ||
+		!toolEvents[0].Tool.ResultTransformed {
+		t.Fatalf("tool trace digest provenance = %+v", toolEvents)
+	}
+}
+
+func TestExecuteBatches_SideEffectJournalBypassesNonMaterialCalls(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tool Tool
+	}{
+		{name: "read_only", tool: &journalReadOnlyTool{}},
+		{name: "explicit_non_material", tool: &journalNonMaterialTool{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := &recordingSideEffectJournal{}
+			results := make([]toolExecResult, 1)
+			checkpoints := 0
+			err := executeBatches(
+				context.Background(),
+				[][]approvedToolCall{{journalApprovedCall(tc.tool, 0)}},
+				results, nil, nil, "",
+				sideEffectBatchHooks{
+					journal: journal,
+					checkpointPrepared: func(context.Context) error {
+						checkpoints++
+						return nil
+					},
+				},
+			)
+			if err != nil {
+				t.Fatalf("executeBatches: %v", err)
+			}
+			if got := journal.snapshotEvents(); len(got) != 0 {
+				t.Fatalf("journal events = %v, want none", got)
+			}
+			if checkpoints != 0 {
+				t.Fatalf("checkpoints = %d, want 0", checkpoints)
+			}
+		})
+	}
+}
+
+func TestExecuteBatches_SideEffectJournalFailsClosedBeforeDispatch(t *testing.T) {
+	journal := &recordingSideEffectJournal{}
+	tool := &journalWriteTool{journal: journal, result: ToolResult{Content: "must not run"}}
+	results := make([]toolExecResult, 1)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{{journalApprovedCall(tool, 0)}},
+		results, nil, nil, "",
+		sideEffectBatchHooks{journal: journal},
+	)
+	if !errors.Is(err, ErrSideEffectJournalUnavailable) {
+		t.Fatalf("error = %v, want journal unavailable", err)
+	}
+	if tool.runs.Load() != 0 {
+		t.Fatalf("tool runs = %d, want 0", tool.runs.Load())
+	}
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare abandoned]"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if !results[0].result.IsError {
+		t.Fatalf("result = %+v, want error", results[0].result)
+	}
+}
+
+func TestExecuteBatches_SideEffectOutcomeUnknownStopsFollowingBatch(t *testing.T) {
+	journal := &recordingSideEffectJournal{}
+	firstResult := TransientError("connection lost")
+	firstResult.SideEffectOutcomeUnknown = true
+	first := &journalWriteTool{journal: journal, result: firstResult}
+	second := &journalWriteTool{journal: journal, result: ToolResult{Content: "second"}}
+	results := make([]toolExecResult, 2)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{
+			{journalApprovedCall(first, 0)},
+			{journalApprovedCall(second, 1)},
+		},
+		results, nil, nil, "",
+		sideEffectBatchHooks{
+			journal: journal,
+			checkpointPrepared: func(context.Context) error {
+				journal.record("checkpoint")
+				return nil
+			},
+		},
+	)
+	if !errors.Is(err, ErrSideEffectOutcomeUnknown) {
+		t.Fatalf("error = %v, want outcome unknown", err)
+	}
+	if first.runs.Load() != 1 || second.runs.Load() != 0 {
+		t.Fatalf("tool runs = (%d, %d), want (1, 0)", first.runs.Load(), second.runs.Load())
+	}
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run outcome_unknown]"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if !results[0].result.IsError || results[0].result.ErrorCategory != ErrCategoryBusiness {
+		t.Fatalf("result = %+v, want non-retryable outcome-unknown error", results[0].result)
+	}
+	if !results[0].executed {
+		t.Fatal("first call must be recorded as executed")
+	}
+	if results[1].executed || !results[1].result.IsError ||
+		results[1].result.ErrorCategory != ErrCategoryTransient ||
+		!strings.Contains(results[1].result.Content, "was not executed") {
+		t.Fatalf("skipped sibling result = %+v, executed=%t; want explicit non-executed error", results[1].result, results[1].executed)
+	}
+}
+
+func TestExecuteBatches_ConcurrentSideEffectOutcomesAreCollected(t *testing.T) {
+	journal := &recordingSideEffectJournal{}
+	firstResult := TransientError("first lost")
+	firstResult.SideEffectOutcomeUnknown = true
+	secondResult := TransientError("second lost")
+	secondResult.SideEffectOutcomeUnknown = true
+	first := &journalWriteTool{journal: journal, result: firstResult}
+	second := &journalWriteTool{journal: journal, result: secondResult}
+	results := make([]toolExecResult, 2)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{{
+			journalApprovedCall(first, 0),
+			journalApprovedCall(second, 1),
+		}},
+		results, nil, nil, "",
+		sideEffectBatchHooks{
+			journal:            journal,
+			checkpointPrepared: func(context.Context) error { return nil },
+		},
+	)
+	if !errors.Is(err, ErrSideEffectOutcomeUnknown) {
+		t.Fatalf("error = %v, want outcome unknown", err)
+	}
+	if first.runs.Load() != 1 || second.runs.Load() != 1 {
+		t.Fatalf("tool runs = (%d, %d), want (1, 1)", first.runs.Load(), second.runs.Load())
+	}
+}
+
+func TestExecuteBatches_ReturnedToolErrorContinuesFollowingBatch(t *testing.T) {
+	journal := &recordingSideEffectJournal{}
+	first := &journalWriteTool{journal: journal, result: TransientError("remote operation rejected")}
+	second := &journalWriteTool{journal: journal, result: ToolResult{Content: "second completed"}}
+	results := make([]toolExecResult, 2)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{
+			{journalApprovedCall(first, 0)},
+			{journalApprovedCall(second, 1)},
+		},
+		results, nil, nil, "",
+		sideEffectBatchHooks{
+			journal:            journal,
+			checkpointPrepared: func(context.Context) error { return nil },
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeBatches: %v", err)
+	}
+	if first.runs.Load() != 1 || second.runs.Load() != 1 {
+		t.Fatalf("tool runs = (%d, %d), want (1, 1)", first.runs.Load(), second.runs.Load())
+	}
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run committed prepare dispatching run committed]"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if !results[0].result.IsError || results[0].result.SideEffectOutcomeUnknown {
+		t.Fatalf("returned tool error was rewritten: %+v", results[0].result)
+	}
+}
+
+func TestExecuteBatches_CommitPersistenceFailureBecomesOutcomeUnknown(t *testing.T) {
+	journal := &recordingSideEffectJournal{commitErr: errors.New("disk unavailable")}
+	tool := &journalWriteTool{journal: journal, result: ToolResult{Content: "created"}}
+	results := make([]toolExecResult, 1)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{{journalApprovedCall(tool, 0)}},
+		results, nil, nil, "",
+		sideEffectBatchHooks{
+			journal:            journal,
+			checkpointPrepared: func(context.Context) error { return nil },
+		},
+	)
+	if !errors.Is(err, ErrSideEffectOutcomeUnknown) {
+		t.Fatalf("error = %v, want outcome unknown", err)
+	}
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run committed outcome_unknown]"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+	if !results[0].result.IsError || results[0].result.ErrorCategory != ErrCategoryBusiness {
+		t.Fatalf("result = %+v, want non-retryable outcome-unknown error", results[0].result)
+	}
+}
+
+func TestExecuteBatches_ToolErrorPersistenceUsesExplicitNoEffectEvidence(t *testing.T) {
+	explicit := BusinessError("rejected before dispatch")
+	explicit.SideEffectKnownNoEffect = true
+	for _, tc := range []struct {
+		name      string
+		tool      Tool
+		wantEvent string
+	}{
+		{
+			name:      "local structured validation",
+			tool:      &journalWriteTool{result: ValidationError("rejected before local mutation")},
+			wantEvent: "failed_no_effect",
+		},
+		{
+			name: "remote validation remains conservative",
+			tool: &journalRemoteWriteTool{journalWriteTool: &journalWriteTool{
+				result: ValidationError("remote rejected after partial work"),
+			}},
+			wantEvent: "committed",
+		},
+		{
+			name:      "explicit marker",
+			tool:      &journalWriteTool{result: explicit},
+			wantEvent: "failed_no_effect",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := &recordingSideEffectJournal{}
+			switch tool := tc.tool.(type) {
+			case *journalWriteTool:
+				tool.journal = journal
+			case *journalRemoteWriteTool:
+				tool.journal = journal
+			}
+			results := make([]toolExecResult, 1)
+			err := executeBatches(
+				context.Background(),
+				[][]approvedToolCall{{journalApprovedCall(tc.tool, 0)}},
+				results, nil, nil, "",
+				sideEffectBatchHooks{
+					journal: journal,
+					checkpointPrepared: func(context.Context) error {
+						journal.record("checkpoint")
+						return nil
+					},
+				},
+			)
+			if err != nil {
+				t.Fatalf("executeBatches: %v", err)
+			}
+			if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare checkpoint dispatching run "+tc.wantEvent+"]"; got != want {
+				t.Fatalf("events = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestExecuteBatches_ComputerUseNoCommitFailurePersistsDefinitiveResult(t *testing.T) {
+	journal := &recordingSideEffectJournal{}
+	result := BusinessError("policy blocked before input")
+	result.ComputerUseOutcome = &ComputerUseTaskOutcome{
+		Status: ComputerUseTaskNotCompleted,
+		Effect: ComputerUseCommitNone,
+	}
+	tool := &journalWriteTool{journal: journal, result: result}
+	results := make([]toolExecResult, 1)
+	err := executeBatches(
+		context.Background(),
+		[][]approvedToolCall{{journalApprovedCall(tool, 0)}},
+		results, nil, nil, "",
+		sideEffectBatchHooks{
+			journal:            journal,
+			checkpointPrepared: func(context.Context) error { return nil },
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeBatches: %v", err)
+	}
+	if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare dispatching run failed_no_effect]"; got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+}
+
+type journalLoopClient struct{ calls atomic.Int32 }
+
+func (c *journalLoopClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	c.calls.Add(1)
+	return &client.CompletionResponse{
+		FinishReason: "tool_use",
+		ToolCalls: []client.FunctionCall{
+			{
+				ID:        "side-effect-call",
+				Name:      "journal_write",
+				Arguments: json.RawMessage(`{"value":"private"}`),
+			},
+			{
+				ID:        "skipped-side-effect-call",
+				Name:      "journal_write",
+				Arguments: json.RawMessage(`{"value":"must-not-run"}`),
+			},
+		},
+	}, nil
+}
+
+func (c *journalLoopClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+type legacyJournalLoopClient struct{ calls atomic.Int32 }
+
+func (c *legacyJournalLoopClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	if c.calls.Add(1) == 1 {
+		return &client.CompletionResponse{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				Name: "journal_write", Arguments: json.RawMessage(`{"value":"private"}`),
+			}},
+		}, nil
+	}
+	return &client.CompletionResponse{OutputText: "done", FinishReason: "stop"}, nil
+}
+
+func (c *legacyJournalLoopClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+func TestAgentLoop_LegacyToolResultReusesLedgerJoinID(t *testing.T) {
+	llm := &legacyJournalLoopClient{}
+	journal := &recordingSideEffectJournal{}
+	tool := &journalWriteTool{journal: journal, result: ToolResult{Content: "created"}}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(llm, registry, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
+	loop.SetSideEffectExecutionJournal(journal)
+	loop.SetCheckpointFunc(func(context.Context) error { return nil })
+
+	if text, _, err := loop.Run(context.Background(), "create it", nil, nil); err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v), want clean legacy completion", text, err)
+	}
+	journal.mu.Lock()
+	if len(journal.prepared) != 1 {
+		journal.mu.Unlock()
+		t.Fatalf("prepared executions = %d, want 1", len(journal.prepared))
+	}
+	joinID := journal.prepared[0].ToolUseID
+	journal.mu.Unlock()
+	if joinID == "" {
+		t.Fatal("legacy execution did not mint a ledger join ID")
+	}
+	want := `call_id="` + joinID + `"`
+	found := false
+	for _, message := range loop.RunMessages() {
+		if strings.Contains(message.Content.Text(), want) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("legacy transcript did not reuse ledger join ID %q", joinID)
+	}
+}
+
+func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing.T) {
+	llm := &journalLoopClient{}
+	journal := &recordingSideEffectJournal{}
+	result := TransientError("lost after dispatch")
+	result.SideEffectOutcomeUnknown = true
+	tool := &journalWriteTool{journal: journal, result: result}
+	registry := NewToolRegistry()
+	registry.Register(tool)
+	loop := NewAgentLoop(llm, registry, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
+	loop.SetSideEffectExecutionJournal(journal)
+	handler := &collectingHandler{}
+	loop.SetHandler(handler)
+	checkpointCalls := 0
+	loop.SetCheckpointFunc(func(ctx context.Context) error {
+		checkpointCalls++
+		if checkpointCalls != 1 {
+			if reason := CheckpointReasonFromContext(ctx); reason != "" {
+				t.Fatal("terminal checkpoint retained the pre-dispatch checkpoint reason")
+			}
+			return nil
+		}
+		if reason := CheckpointReasonFromContext(ctx); reason != CheckpointReasonSideEffectPrepared {
+			t.Fatalf("pre-dispatch checkpoint reason = %q", reason)
+		}
+		if got, want := fmt.Sprint(journal.snapshotEvents()), "[prepare]"; got != want {
+			t.Fatalf("pre-dispatch journal events = %s, want %s", got, want)
+		}
+		for _, message := range loop.RunMessages() {
+			for _, block := range message.Content.Blocks() {
+				if block.Type == "tool_use" && block.ID == "side-effect-call" {
+					return nil
+				}
+			}
+		}
+		t.Fatal("pre-dispatch checkpoint did not contain the assistant tool call")
+		return nil
+	})
+
+	text, _, err := loop.Run(context.Background(), "mutate external state", nil, nil)
+	if !errors.Is(err, ErrSideEffectOutcomeUnknown) {
+		t.Fatalf("Run error = %v, want outcome unknown", err)
+	}
+	const wantText = "The external action may have completed, but its result could not be durably confirmed. It was not retried. Review the external system before retrying."
+	if text != wantText {
+		t.Fatalf("Run text = %q, want %q", text, wantText)
+	}
+	if llm.calls.Load() != 1 {
+		t.Fatalf("LLM calls = %d, want 1", llm.calls.Load())
+	}
+	if tool.runs.Load() != 1 {
+		t.Fatalf("tool runs = %d, want only the first call dispatched", tool.runs.Load())
+	}
+	if len(handler.results) != 1 {
+		t.Fatalf("handler results = %+v, want only the dispatched call", handler.results)
+	}
+	if checkpointCalls != 2 {
+		t.Fatalf("checkpoint calls = %d, want pre-dispatch + terminal result", checkpointCalls)
+	}
+	status := loop.LastRunStatus()
+	if !status.Partial || status.FailureCode != runstatus.CodeSideEffectOutcomeUnknown {
+		t.Fatalf("run status = %+v", status)
+	}
+	skippedPaired := false
+	for _, message := range loop.RunMessages() {
+		for _, block := range message.Content.Blocks() {
+			if block.Type == "tool_result" && block.ToolUseID == "skipped-side-effect-call" {
+				skippedPaired = block.IsError && strings.Contains(client.ToolResultText(block), "safe to run again")
+			}
+		}
+	}
+	if !skippedPaired {
+		t.Fatal("skipped sibling transcript result was not paired as safely retryable")
+	}
+	assertNativeToolPairs(t, loop.RunMessages())
+}

@@ -15,6 +15,7 @@ func TestExecutionConfigSnapshotAndApplyAreDeepCopies(t *testing.T) {
 	loop.SetThinking(&client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096})
 	loop.SetReasoningEffort("high")
 	loop.SetEffortTier("xhigh")
+	loop.SetResponseDetail("detailed")
 	loop.SetServiceTier("fast")
 	loop.SetResponseLanguage("日本語")
 	loop.SetTemperature(0.27)
@@ -27,6 +28,7 @@ func TestExecutionConfigSnapshotAndApplyAreDeepCopies(t *testing.T) {
 		Thinking:              &client.ThinkingConfig{Type: "enabled", BudgetTokens: 4096},
 		ReasoningEffort:       "high",
 		EffortTier:            "xhigh",
+		ResponseDetail:        "detailed",
 		ServiceTier:           "fast",
 		ResponseLanguage:      "日本語",
 		Temperature:           0.27,
@@ -72,7 +74,8 @@ func TestExecutionConfigApplyPreservesZeroAndNil(t *testing.T) {
 	loop.SetContextWindowExplicit(200_000)
 
 	loop.ApplyExecutionConfig(ExecutionConfig{})
-	if got := loop.ExecutionConfig(); !reflect.DeepEqual(got, ExecutionConfig{}) {
+	want := ExecutionConfig{ResponseDetail: "balanced"}
+	if got := loop.ExecutionConfig(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("zero/nil config drifted: %+v", got)
 	}
 	if CloneExecutionConfig(nil) != nil {

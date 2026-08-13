@@ -225,6 +225,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)
+	agent.SetWorkingSetLimits(runCfg.Agent.WarmSetMaxSchemas, runCfg.Agent.WarmSetMaxSchemaTokens)
 	// One-shot CLI starts with a fresh session (no last-seen model), but
 	// still seed from the configured model so a known 1M/200K cap guides
 	// the first preflight check before any response arrives.
@@ -255,6 +256,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	if runCfg.Agent.EffortTier != "" {
 		loop.SetEffortTier(runCfg.Agent.EffortTier)
 	}
+	loop.SetResponseDetail(config.EffectiveAgentResponseDetail(runCfg.Agent.ResponseDetail))
 	// Response language: unconditional global baseline ("" = mirror); the
 	// per-agent overlay below may override (including "" to force mirror).
 	loop.SetResponseLanguage(runCfg.Agent.Language)
@@ -269,6 +271,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		// Per-agent effort override; nil OR "" = inherit the global tier.
 		if ac.EffortTier != nil && *ac.EffortTier != "" {
 			loop.SetEffortTier(*ac.EffortTier)
+		}
+		if ac.ResponseDetail != nil && *ac.ResponseDetail != "" {
+			loop.SetResponseDetail(*ac.ResponseDetail)
 		}
 		// != nil (not != ""): explicit "" forces mirror over a locked global.
 		if ac.Language != nil {
@@ -361,7 +366,6 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// sidecar is up (or memory is disabled), register with a typed-nil
 	// MemoryQuerier so the tool falls back to session_search + MEMORY.md.
 	var memQuerier tools.MemoryQuerier
-	var memPreflightQuerier tools.MemoryPreflightQuerier
 	memCfg := memory.LoadConfigFromRuntime(runCfg)
 	if memCfg.Provider != "" && memCfg.Provider != "disabled" {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -370,17 +374,9 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		if ready {
 			attached := memory.NewAttachedQuerier(memCfg.SocketPath, memCfg.ClientRequestTimeout)
 			memQuerier = attached
-			memPreflightQuerier = attached
 		}
 	}
 	tools.RegisterMemoryTool(reg, memQuerier, &cliMemoryFallback{sessionMgr: sessMgr})
-	if memPreflightQuerier != nil {
-		var helperLLM client.LLMClient
-		if gw != nil {
-			helperLLM = gw
-		}
-		loop.SetMemoryPreflight(tools.NewMemoryPreflight(memPreflightQuerier, helperLLM))
-	}
 
 	sess := sessMgr.NewSession()
 	sess.Title = sessionTitleFromQuery(query)
@@ -391,7 +387,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	sessMgr.OnSessionClose(sess.ID, loop.SpillCleanupFunc())
 
 	result, _, err := loop.Run(context.Background(), query, nil, nil)
-	if err != nil && !errors.Is(err, agent.ErrMaxIterReached) {
+	if err != nil && !errors.Is(err, agent.ErrMaxIterReached) && !errors.Is(err, agent.ErrRequestBudgetExhausted) {
 		return err
 	}
 	status := loop.LastRunStatus()
@@ -425,8 +421,13 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 	// Soft warning for loop-detector force-stop: the reply is valid and
 	// already printed above, but the run ended early. Matches the TUI
 	// behavior so one-shot CLI and TUI report force-stops consistently.
-	if err == nil && status.Partial && status.FailureCode == runstatus.CodeIterationLimit {
-		fmt.Fprintln(os.Stderr, "\nStopped early after repeated failed attempts.")
+	if status.Partial {
+		switch status.FailureCode {
+		case runstatus.CodeIterationLimit:
+			fmt.Fprintln(os.Stderr, "\nStopped early after repeated failed attempts.")
+		case runstatus.CodeBudgetExhausted:
+			fmt.Fprintln(os.Stderr, "\nStopped after reaching the request's provider budget; the result may be incomplete.")
+		}
 	}
 	usageLine := fmt.Sprintf("\n[tokens: %d in / %d out | llm: $%.4f",
 		llm.InputTokens, llm.OutputTokens, llm.CostUSD)

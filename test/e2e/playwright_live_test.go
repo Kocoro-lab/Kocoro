@@ -1,3 +1,5 @@
+//go:build live
+
 package e2e
 
 import (
@@ -40,7 +42,7 @@ import (
 //     so the skip both matches production loopback behavior and guarantees the
 //     test never tears down a browser it did not launch.
 //
-// Run it with the daemon stopped:  SHANNON_E2E_LIVE=1 go test ./test/e2e/ -run ChromeOnDemand -v
+// Run it with the daemon stopped:  SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -run ChromeOnDemand -v
 func TestLive_Playwright_ChromeOnDemandLifecycle(t *testing.T) {
 	skipUnlessLive(t)
 

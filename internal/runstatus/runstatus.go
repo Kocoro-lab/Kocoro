@@ -12,17 +12,20 @@ import (
 type Code string
 
 const (
-	CodeNone                  Code = ""
-	CodeUserCancelled         Code = "user_cancelled"
-	CodeDeadlineExceeded      Code = "deadline_exceeded"
-	CodeRateLimited           Code = "rate_limited"
-	CodeQuotaExceeded         Code = "quota_exceeded"
-	CodeCreditsExhausted      Code = "credits_exhausted"
-	CodeProviderOverloaded    Code = "provider_overloaded"
-	CodeServiceTemporaryError Code = "service_temporary_error"
-	CodeNetworkInterrupted    Code = "network_interrupted"
-	CodeIterationLimit        Code = "iteration_limit"
-	CodeUnexpected            Code = "unexpected"
+	CodeNone                         Code = ""
+	CodeUserCancelled                Code = "user_cancelled"
+	CodeDeadlineExceeded             Code = "deadline_exceeded"
+	CodeRateLimited                  Code = "rate_limited"
+	CodeQuotaExceeded                Code = "quota_exceeded"
+	CodeCreditsExhausted             Code = "credits_exhausted"
+	CodeProviderOverloaded           Code = "provider_overloaded"
+	CodeServiceTemporaryError        Code = "service_temporary_error"
+	CodeNetworkInterrupted           Code = "network_interrupted"
+	CodeIterationLimit               Code = "iteration_limit"
+	CodeBudgetExhausted              Code = "budget_exhausted"
+	CodeSideEffectOutcomeUnknown     Code = "side_effect_outcome_unknown"
+	CodeSideEffectJournalUnavailable Code = "side_effect_journal_unavailable"
+	CodeUnexpected                   Code = "unexpected"
 
 	CodeContextCompactionFailed Code = "compaction_failed"
 
@@ -49,16 +52,19 @@ const (
 // live in formatFriendly() and must keep these prefixes stable so
 // IsFriendlyMessage's HasPrefix check still recognizes them.
 var friendlyMessages = map[Code]string{
-	CodeUserCancelled:         "The request was cancelled.",
-	CodeDeadlineExceeded:      "The request timed out.",
-	CodeRateLimited:           "Sorry, the AI service is currently rate-limited. Please try again in a moment.",
-	CodeQuotaExceeded:         "You've reached your usage quota. Please upgrade or wait for the quota to reset.",
-	CodeCreditsExhausted:      "Your credits are exhausted. Please top up to continue.",
-	CodeProviderOverloaded:    "Sorry, the AI service is temporarily overloaded. Please try again shortly.",
-	CodeServiceTemporaryError: "Sorry, the AI service encountered a temporary error. Please try again.",
-	CodeNetworkInterrupted:    "Sorry, the connection to the AI service was interrupted. Please try again.",
-	CodeIterationLimit:        "The request reached its iteration limit and returned a partial result.",
-	CodeUnexpected:            "Sorry, an unexpected error occurred. Please try again.",
+	CodeUserCancelled:                "The request was cancelled.",
+	CodeDeadlineExceeded:             "The request timed out.",
+	CodeRateLimited:                  "Sorry, the AI service is currently rate-limited. Please try again in a moment.",
+	CodeQuotaExceeded:                "You've reached your usage quota. Please upgrade or wait for the quota to reset.",
+	CodeCreditsExhausted:             "Your credits are exhausted. Please top up to continue.",
+	CodeProviderOverloaded:           "Sorry, the AI service is temporarily overloaded. Please try again shortly.",
+	CodeServiceTemporaryError:        "Sorry, the AI service encountered a temporary error. Please try again.",
+	CodeNetworkInterrupted:           "Sorry, the connection to the AI service was interrupted. Please try again.",
+	CodeIterationLimit:               "The request reached its iteration limit and returned a partial result.",
+	CodeBudgetExhausted:              "The request reached its provider budget and returned a partial result.",
+	CodeSideEffectOutcomeUnknown:     "An external action may have completed, but its result could not be confirmed. It was not retried. Review the external system before retrying.",
+	CodeSideEffectJournalUnavailable: "The external action was not executed because its durable execution record could not be saved.",
+	CodeUnexpected:                   "Sorry, an unexpected error occurred. Please try again.",
 
 	CodeContextCompactionFailed: "Context compaction encountered an issue but the conversation continued.",
 
@@ -187,6 +193,12 @@ func codeAndDetailFromError(err error) (Code, *Detail) {
 		// stable: it appears in the var declaration in agent/loop.go and
 		// is the only error message containing that exact substring.
 		return CodeEmptyResponse, nil
+	case strings.Contains(msg, "provider request budget exhausted"):
+		return CodeBudgetExhausted, nil
+	case strings.Contains(msg, "side-effect execution outcome unknown"):
+		return CodeSideEffectOutcomeUnknown, nil
+	case strings.Contains(msg, "side-effect execution journal unavailable"):
+		return CodeSideEffectJournalUnavailable, nil
 	default:
 		return CodeUnexpected, nil
 	}

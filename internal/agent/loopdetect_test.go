@@ -1,10 +1,32 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 )
+
+type loopMaterialOnlyTool struct{ name string }
+
+func (t *loopMaterialOnlyTool) Info() ToolInfo { return ToolInfo{Name: t.name} }
+func (*loopMaterialOnlyTool) Run(context.Context, string) (ToolResult, error) {
+	return ToolResult{}, nil
+}
+func (*loopMaterialOnlyTool) RequiresApproval() bool            { return false }
+func (*loopMaterialOnlyTool) HasMaterialSideEffect(string) bool { return false }
+
+type loopReadOnlyTool struct{ loopMaterialOnlyTool }
+
+func (*loopReadOnlyTool) IsReadOnlyCall(string) bool { return true }
+
+type loopMCPMaterialTool struct{ loopMaterialOnlyTool }
+
+func (*loopMCPMaterialTool) ToolSource() ToolSource { return SourceMCP }
+
+type loopGatewayMaterialTool struct{ loopMaterialOnlyTool }
+
+func (*loopGatewayMaterialTool) ToolSource() ToolSource { return SourceGateway }
 
 func TestLoopDetector_ConsecutiveDup_Nudge(t *testing.T) {
 	ld := NewLoopDetector()
@@ -50,6 +72,32 @@ func TestLoopDetector_ConsecutiveDup_ForceStop(t *testing.T) {
 	action, _ := ld.Check("web_search")
 	if action != LoopForceStop {
 		t.Errorf("4 consecutive identical calls should force stop, got %v", action)
+	}
+}
+
+func TestLoopDetector_ForceStopDoesNotClaimCompletion(t *testing.T) {
+	ld := NewLoopDetector()
+	for range 4 {
+		ld.Record("web_search", `{"q":"same"}`, false, "", "same-result", false)
+	}
+	action, message := ld.Check("web_search")
+	if action != LoopForceStop {
+		t.Fatalf("expected force stop, got %v (%q)", action, message)
+	}
+	for _, marker := range []string{
+		"not evidence of success",
+		"partial",
+		"blocked",
+		"outcome unknown",
+	} {
+		if !strings.Contains(message, marker) {
+			t.Errorf("force-stop note missing %q: %s", marker, message)
+		}
+	}
+	for _, forbidden := range []string{"provide your answer now", "Return your collected results now"} {
+		if strings.Contains(message, forbidden) {
+			t.Errorf("force-stop note still directs unsupported completion with %q: %s", forbidden, message)
+		}
 	}
 }
 
@@ -255,6 +303,140 @@ func TestLoopDetector_NoProgress_Nudge(t *testing.T) {
 	}
 }
 
+func TestLoopDetector_NoProgress_StrictArgsAndOutcomeProgressContinues(t *testing.T) {
+	ld := NewLoopDetector()
+
+	for step := 1; step <= 20; step++ {
+		ld.recordOutcome(
+			"stateful_step",
+			fmt.Sprintf(`{"step":%d,"token":"token-%02d"}`, step, step-1),
+			false,
+			"",
+			"",
+			fmt.Sprintf("step-%02d-complete-next-token-%02d", step, step),
+			false,
+			true,
+			false,
+		)
+		if action, msg := ld.Check("stateful_step"); action != LoopContinue {
+			t.Fatalf("strictly changing args and outcomes must show progress at step %d, got %v: %s", step, action, msg)
+		}
+	}
+}
+
+func TestIsLoopReadOnlyCall_SourceAwareMaterialRelief(t *testing.T) {
+	localObservation := &loopMaterialOnlyTool{name: "process"}
+	if !isLoopReadOnlyCall(localObservation, localObservation.Info().Name, `{}`) {
+		t.Fatal("local material=false call must retain read-loop relief")
+	}
+
+	gatewayObservation := &loopGatewayMaterialTool{loopMaterialOnlyTool{name: "web_fetch"}}
+	if isLoopReadOnlyCall(gatewayObservation, gatewayObservation.Info().Name, `{}`) {
+		t.Fatal("gateway material=false must not imply read-loop relief")
+	}
+
+	readOnly := &loopReadOnlyTool{loopMaterialOnlyTool{name: "explicit_read"}}
+	if !isLoopReadOnlyCall(readOnly, readOnly.Info().Name, `{}`) {
+		t.Fatal("ReadOnlyChecker=true must continue to classify a tool as read-only")
+	}
+
+	mcpTool := &loopMCPMaterialTool{loopMaterialOnlyTool{name: "list_records"}}
+	if !isLoopReadOnlyCall(mcpTool, "list_records", `{}`) {
+		t.Fatal("the explicit MCP read-name fallback must remain read-only")
+	}
+	if isLoopReadOnlyCall(gatewayObservation, "browser_snapshot", `{}`) {
+		t.Fatal("a gateway name collision must not receive browser read-loop relief")
+	}
+	if !isLoopReadOnlyCall(&loopMaterialOnlyTool{name: "browser_snapshot"}, "browser_snapshot", `{}`) {
+		t.Fatal("the local browser_snapshot fallback must remain read-only")
+	}
+}
+
+func TestLoopDetector_NoProgress_SourceAwareMaterialRelief(t *testing.T) {
+	tests := []struct {
+		name       string
+		tool       Tool
+		wantAction LoopAction
+	}{
+		{
+			name:       "gateway-material-only",
+			tool:       &loopGatewayMaterialTool{loopMaterialOnlyTool{name: "source_gateway"}},
+			wantAction: LoopNudge,
+		},
+		{
+			name:       "local-observation",
+			tool:       &loopMaterialOnlyTool{name: "process"},
+			wantAction: LoopContinue,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ld := NewLoopDetector()
+			for step := 1; step <= ld.noProgressThreshold; step++ {
+				args := fmt.Sprintf(`{"cursor":%d}`, step)
+				ld.RecordOutcome(
+					tt.tool.Info().Name,
+					args,
+					false,
+					"",
+					"",
+					fmt.Sprintf("page-%d", step),
+					isLoopReadOnlyCall(tt.tool, tt.tool.Info().Name, args),
+					false,
+				)
+			}
+
+			action, msg := ld.Check(tt.tool.Info().Name)
+			if action != tt.wantAction {
+				t.Fatalf("got action %v, want %v: %s", action, tt.wantAction, msg)
+			}
+		})
+	}
+}
+
+func TestLoopDetector_NoProgress_DistinctMutationArgsAndVolatileReceiptsStillStops(t *testing.T) {
+	ld := NewLoopDetector()
+
+	for step := 1; step <= ld.noProgressThreshold; step++ {
+		ld.RecordOutcome(
+			"create_record",
+			fmt.Sprintf(`{"record":"record-%02d"}`, step),
+			false,
+			"",
+			"",
+			fmt.Sprintf("provider-id-%02d", step),
+			false,
+			false,
+		)
+	}
+	action, _ := ld.Check("create_record")
+	if action != LoopNudge {
+		t.Fatalf("untrusted writes must not treat unique provider ids as progress, got %v", action)
+	}
+}
+
+func TestLoopDetector_NoProgress_DistinctMutationArgsWithoutOutcomeEvidenceStillStops(t *testing.T) {
+	ld := NewLoopDetector()
+
+	for step := 1; step <= ld.noProgressThreshold; step++ {
+		ld.RecordOutcome(
+			"create_record",
+			fmt.Sprintf(`{"record":"record-%02d"}`, step),
+			false,
+			"",
+			"",
+			"created",
+			false,
+			false,
+		)
+	}
+	action, _ := ld.Check("create_record")
+	if action != LoopNudge {
+		t.Fatalf("distinct write args with a stable receipt must still nudge, got %v", action)
+	}
+}
+
 func TestLoopDetector_HTTPBatchTolerant_DistinctArgsExempt(t *testing.T) {
 	ld := NewLoopDetector()
 	// 20 http calls with DISTINCT bodies (batch enumeration — e.g. disabling
@@ -443,6 +625,42 @@ func TestLoopDetector_WebFamily_ResultSigDedup(t *testing.T) {
 	action, _ := ld.Check("web_search")
 	if action != LoopNudge {
 		t.Errorf("5 calls with same result signature should nudge, got %v", action)
+	}
+}
+
+func TestLoopDetector_SearchArgumentChurnStableResultBlocksBeforeEighthCall(t *testing.T) {
+	ld := NewLoopDetector()
+	fillers := []string{"today", "latest", "top", "current", "major", "breaking", "headlines"}
+	for call, filler := range fillers {
+		args := fmt.Sprintf(`{"query":"world climate %s March 2 2026"}`, filler)
+		if action, msg := ld.CheckBefore("web_search", args, true); action != LoopContinue {
+			t.Fatalf("search call %d blocked before its recovery window: %v %s", call+1, action, msg)
+		}
+		ld.RecordOutcome("web_search", args, false, "", "reuters.com,bbc.com", "same results", true, false)
+	}
+
+	action, msg := ld.CheckBefore(
+		"web_search",
+		`{"query":"world climate news update March 2 2026"}`,
+		true,
+	)
+	if action != LoopForceStop {
+		t.Fatalf("eighth same-topic stable-result search must be blocked before execution, got %v: %s", action, msg)
+	}
+}
+
+func TestLoopDetector_SearchArgumentChurnChangingResultsContinues(t *testing.T) {
+	ld := NewLoopDetector()
+	fillers := []string{"today", "latest", "top", "current", "major", "breaking", "headlines", "update"}
+	for call, filler := range fillers {
+		args := fmt.Sprintf(`{"query":"world climate %s March 2 2026"}`, filler)
+		if action, msg := ld.CheckBefore("web_search", args, true); action != LoopContinue {
+			t.Fatalf("changing-result search call %d must remain admissible: %v %s", call+1, action, msg)
+		}
+		ld.RecordOutcome("web_search", args, false, "", fmt.Sprintf("source-%d.example", call), fmt.Sprintf("result-%d", call), true, false)
+		if action, msg := ld.Check("web_search"); action == LoopForceStop {
+			t.Fatalf("changing-result search call %d force-stopped: %s", call+1, msg)
+		}
 	}
 }
 
@@ -1030,11 +1248,26 @@ func TestLoopDetector_BrowserSnapshotInterleavedRepeatable(t *testing.T) {
 	// of 8 same-name calls — must stay Continue.
 	for i := range 5 {
 		ld.Record("browser_snapshot", `{}`, false, "", "", false)
+		action, msg := ld.Check("browser_snapshot")
+		if action != LoopContinue {
+			t.Fatalf("interleaved browser_snapshot call %d should Continue, got %v: %s", i+1, action, msg)
+		}
 		ld.Record("browser_click", fmt.Sprintf(`{"ref":"e%d"}`, i), false, "", "", false)
+		action, msg = ld.Check("browser_click")
+		if action != LoopContinue {
+			t.Fatalf("interleaved browser_click call %d should Continue, got %v: %s", i+1, action, msg)
+		}
 	}
-	action, msg := ld.Check("browser_click")
-	if action != LoopContinue {
-		t.Fatalf("interleaved browser_snapshot/browser_click should Continue, got %v: %s", action, msg)
+}
+
+func TestLoopDetector_BrowserSnapshotConsecutiveDuplicatesStillStop(t *testing.T) {
+	ld := NewLoopDetector()
+	for range 4 {
+		ld.Record("browser_snapshot", `{}`, false, "", "", false)
+	}
+	action, msg := ld.Check("browser_snapshot")
+	if action != LoopForceStop {
+		t.Fatalf("four consecutive browser snapshots should force-stop, got %v: %s", action, msg)
 	}
 }
 
@@ -1145,6 +1378,102 @@ func TestLoopDetector_BrowserSnapshotConsecutiveDupStillForceStops(t *testing.T)
 	action, msg := ld.Check("browser_snapshot")
 	if action != LoopForceStop {
 		t.Fatalf("4 identical browser_snapshot calls must still force-stop via duplicate detection, got %v: %s", action, msg)
+	}
+}
+
+func TestLoopDetector_ReadOnlyPollingChangingOutcomeContinues(t *testing.T) {
+	ld := NewLoopDetector()
+	for _, outcome := range []string{"queued", "starting", "running-25", "running-60", "complete"} {
+		if action, msg := ld.CheckBefore("job_status", `{"id":"job-1"}`, true); action != LoopContinue {
+			t.Fatalf("changing read-only outcome must remain admissible, got %v: %s", action, msg)
+		}
+		ld.RecordOutcome("job_status", `{"id":"job-1"}`, false, "", "", outcome, true, false)
+		if action, msg := ld.Check("job_status"); action != LoopContinue {
+			t.Fatalf("changing read-only outcome must count as progress, got %v: %s", action, msg)
+		}
+	}
+}
+
+func TestLoopDetector_ReadOnlyPollingStableOutcomeStops(t *testing.T) {
+	ld := NewLoopDetector()
+	for call := 1; call <= 6; call++ {
+		preAction, _ := ld.CheckBefore("job_status", `{"id":"job-1"}`, true)
+		if call == 6 {
+			if preAction != LoopForceStop {
+				t.Fatalf("sixth stable read-only call must be blocked before execution, got %v", preAction)
+			}
+			break
+		}
+		if preAction != LoopContinue {
+			t.Fatalf("call %d blocked before the recovery window completed: %v", call, preAction)
+		}
+		ld.RecordOutcome("job_status", `{"id":"job-1"}`, false, "", "", "running-0", true, false)
+		action, _ := ld.Check("job_status")
+		if call == 3 && action != LoopNudge {
+			t.Fatalf("stable read-only outcome call 3 must nudge, got %v", action)
+		}
+		if (call == 4 || call == 5) && action != LoopContinue {
+			t.Fatalf("stable read-only outcome call %d must preserve one recovery window, got %v", call, action)
+		}
+	}
+}
+
+func TestLoopDetector_MutatingDuplicateDoesNotTrustChangingReceipts(t *testing.T) {
+	ld := NewLoopDetector()
+	for call, receipt := range []string{"message-1", "message-2", "message-3", "message-4"} {
+		ld.RecordOutcome("send_message", `{"to":"user","text":"hello"}`, false, "", "", receipt, false, false)
+		action, _ := ld.Check("send_message")
+		if call == 2 && action != LoopNudge {
+			t.Fatalf("third duplicate mutation must nudge despite volatile receipt, got %v", action)
+		}
+		if call == 3 && action != LoopForceStop {
+			t.Fatalf("fourth duplicate mutation must stop despite volatile receipt, got %v", action)
+		}
+	}
+}
+
+func TestLoopDetector_PingPongStableOutcomesEscalates(t *testing.T) {
+	ld := NewLoopDetector()
+	for call := 1; call <= 9; call++ {
+		name, args, outcome := "job_status", `{"id":"job-1"}`, "running"
+		if call%2 == 0 {
+			name, args, outcome = "job_log", `{"id":"job-1","tail":20}`, "no new lines"
+		}
+		preAction, _ := ld.CheckBefore(name, args, true)
+		if call == 9 {
+			if preAction != LoopForceStop {
+				t.Fatalf("ninth ping-pong call must be blocked before execution, got %v", preAction)
+			}
+			break
+		}
+		if preAction != LoopContinue {
+			t.Fatalf("ping-pong call %d blocked before the recovery window completed: %v", call, preAction)
+		}
+		ld.RecordOutcome(name, args, false, "", "", outcome, true, false)
+		action, _ := ld.Check(name)
+		if call == 6 && action != LoopNudge {
+			t.Fatalf("six stable ping-pong calls must nudge, got %v", action)
+		}
+		if call == 8 && action != LoopContinue {
+			t.Fatalf("eighth stable ping-pong call must preserve the recovery turn, got %v", action)
+		}
+	}
+}
+
+func TestLoopDetector_PingPongChangingOutcomeContinues(t *testing.T) {
+	ld := NewLoopDetector()
+	for call := 1; call <= 10; call++ {
+		name, args, outcome := "job_status", `{"id":"job-1"}`, fmt.Sprintf("progress-%d", call)
+		if call%2 == 0 {
+			name, args, outcome = "job_log", `{"id":"job-1","tail":20}`, fmt.Sprintf("line-%d", call)
+		}
+		if action, msg := ld.CheckBefore(name, args, true); action != LoopContinue {
+			t.Fatalf("changing ping-pong outcomes must remain admissible, call=%d action=%v msg=%s", call, action, msg)
+		}
+		ld.RecordOutcome(name, args, false, "", "", outcome, true, false)
+		if action, msg := ld.Check(name); action != LoopContinue {
+			t.Fatalf("changing ping-pong outcomes must continue, call=%d action=%v msg=%s", call, action, msg)
+		}
 	}
 }
 
