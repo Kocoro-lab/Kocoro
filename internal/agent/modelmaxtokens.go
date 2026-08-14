@@ -56,6 +56,11 @@ var modelMaxOutputTokens = map[string]int{
 	"gpt-5-mini-2025-08-07": 128_000,
 	"gpt-5-nano-2025-08-07": 128_000,
 	"gpt-4.1-2025-04-14":    32_000,
+
+	// --- xAI output caps (Kocoro product ceiling) ---
+	"grok-4.3": 128_000,
+	"grok-4.5": 128_000,
+	"grok-4.6": 128_000,
 }
 
 // modelMaxOutputTokensPrefix matches forward-compat dated variants of
