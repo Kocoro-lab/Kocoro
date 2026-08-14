@@ -32,6 +32,8 @@ const (
 	generalOutcomeSeedEnv        = "KOCORO_GENERAL_OUTCOME_SEED"
 	generalOutcomeMaxCostEnv     = "KOCORO_GENERAL_OUTCOME_MAX_COST_USD"
 	generalOutcomeOutputEnv      = "KOCORO_GENERAL_OUTCOME_OUTPUT"
+	generalOutcomeModelEnv       = "KOCORO_GENERAL_OUTCOME_MODEL"
+	generalOutcomeEffortEnv      = "KOCORO_GENERAL_OUTCOME_EFFORT"
 
 	generalOutcomeComparisonRepetitions = 1
 	generalOutcomeReleaseRepetitions    = 5
@@ -43,6 +45,7 @@ type generalOutcomeLiveConfig struct {
 	apiKey        string
 	modelTier     string
 	specificModel string
+	effortTier    string
 	sample        string
 	repetitions   int
 	seed          int64
@@ -83,6 +86,8 @@ type generalOutcomeReport struct {
 	GeneratedAt                  string              `json:"generated_at"`
 	Complete                     bool                `json:"complete"`
 	Sample                       string              `json:"sample"`
+	SpecificModel                string              `json:"specific_model,omitempty"`
+	EffortTier                   string              `json:"effort_tier,omitempty"`
 	RepetitionsPerTask           int                 `json:"repetitions_per_task"`
 	MinimumComparisonRepetitions int                 `json:"minimum_comparison_repetitions"`
 	MinimumReleaseRepetitions    int                 `json:"minimum_release_repetitions"`
@@ -421,6 +426,9 @@ func runGeneralOutcomeTask(t *testing.T, provider client.LLMClient, cfg generalO
 	loop.SetBypassPermissions(true)
 	loop.SetMaxTokens(700)
 	loop.SetTemperature(0)
+	if cfg.effortTier != "" {
+		loop.SetEffortTier(cfg.effortTier)
+	}
 	if task.Source != "" {
 		loop.SetSource(task.Source)
 	}
@@ -491,6 +499,13 @@ func loadGeneralOutcomeLiveConfig(t *testing.T) generalOutcomeLiveConfig {
 		}
 		specificModel = loaded.Agent.Model
 	}
+	if modelOverride := strings.TrimSpace(os.Getenv(generalOutcomeModelEnv)); modelOverride != "" {
+		specificModel = modelOverride
+	}
+	effortTier := strings.TrimSpace(os.Getenv(generalOutcomeEffortEnv))
+	if effortTier != "" && effortTier != "low" && effortTier != "high" && effortTier != "xhigh" && effortTier != "max" {
+		t.Fatalf("%s must be low, high, xhigh, or max", generalOutcomeEffortEnv)
+	}
 	if endpoint == "" || apiKey == "" {
 		t.Fatal("general-agent outcome lane needs SHANNON_E2E_ENDPOINT/SHANNON_E2E_API_KEY or configured Cloud credentials; set KOCORO_FORCE_KEYCHAIN_HYDRATE=1 to authorize test-only credential hydration")
 	}
@@ -535,7 +550,7 @@ func loadGeneralOutcomeLiveConfig(t *testing.T) generalOutcomeLiveConfig {
 	if output == "" {
 		output = filepath.Join(os.TempDir(), fmt.Sprintf("kocoro-general-outcomes-%d.json", seed))
 	}
-	return generalOutcomeLiveConfig{endpoint: endpoint, apiKey: apiKey, modelTier: modelTier, specificModel: specificModel, sample: sample, repetitions: repetitions, seed: seed, maxCostUSD: maxCost, outputPath: output}
+	return generalOutcomeLiveConfig{endpoint: endpoint, apiKey: apiKey, modelTier: modelTier, specificModel: specificModel, effortTier: effortTier, sample: sample, repetitions: repetitions, seed: seed, maxCostUSD: maxCost, outputPath: output}
 }
 
 func buildGeneralOutcomeJobs(taskCount, repetitions int, seed int64) []generalOutcomeJob {
@@ -553,7 +568,7 @@ func buildGeneralOutcomeJobs(taskCount, repetitions int, seed int64) []generalOu
 func newGeneralOutcomeReport(cfg generalOutcomeLiveConfig, jobs []generalOutcomeJob, runs []generalOutcomeRun) generalOutcomeReport {
 	report := generalOutcomeReport{
 		SchemaVersion: generalOutcomeSchemaVersion, GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Complete: len(runs) == len(jobs), Sample: cfg.sample, RepetitionsPerTask: cfg.repetitions,
+		Complete: len(runs) == len(jobs), Sample: cfg.sample, SpecificModel: cfg.specificModel, EffortTier: cfg.effortTier, RepetitionsPerTask: cfg.repetitions,
 		MinimumComparisonRepetitions: generalOutcomeComparisonRepetitions, MinimumReleaseRepetitions: generalOutcomeReleaseRepetitions,
 		Seed: cfg.seed, Randomized: true, Scheduled: len(jobs), Completed: len(runs), MaxCostUSD: cfg.maxCostUSD,
 		UsageObserved: len(runs) > 0, CostObserved: len(runs) > 0, Runs: append([]generalOutcomeRun(nil), runs...),

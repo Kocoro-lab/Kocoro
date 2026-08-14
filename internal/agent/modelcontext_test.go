@@ -50,6 +50,9 @@ func TestLookupModelContextWindow(t *testing.T) {
 		{"gpt-4.1 dated 128K", "gpt-4.1-2025-04-14", 128_000, true},
 		{"gemini 2.5 pro 1M+", "gemini-2.5-pro", 1_048_576, true},
 		{"grok 2M", "grok-4-1-fast-reasoning", 2_000_000, true},
+		{"grok 4.3 1M", "grok-4.3", 1_000_000, true},
+		{"grok 4.5 500K", "grok-4.5", 500_000, true},
+		{"grok 4.6 500K", "grok-4.6", 500_000, true},
 		// Guard against accidental prefix collisions.
 		{"sonnet 4.6 numeric suffix is NOT a dated variant", "claude-sonnet-4-60", 0, false},
 	}
