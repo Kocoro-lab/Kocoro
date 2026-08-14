@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
@@ -180,6 +181,9 @@ func abandonInvalidKoeResume(
 	sess *session.Session,
 	validationErr error,
 ) error {
+	// Abandonment ends the run without entering the loop; a still-active work
+	// plan must not survive as "active" (see closeOrphanedWorkPlan).
+	closeOrphanedWorkPlan(sess, session.WorkPlanCloseFailed, time.Now())
 	sess.InProgress = false
 	sess.InterruptedTurn = nil
 	if err := sessMgr.SavePreservingUpdatedAt(); err != nil {

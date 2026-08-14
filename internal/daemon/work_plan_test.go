@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
@@ -295,6 +296,111 @@ func TestRunPlanController_RestoreRules(t *testing.T) {
 	c.Restore(closed)
 	if c.ActiveSnapshot() != nil {
 		t.Fatal("a closed plan is UI history and must not be re-adopted")
+	}
+}
+
+func TestCloseOrphanedWorkPlan(t *testing.T) {
+	now := time.Now()
+	active := &session.WorkPlanSnapshot{
+		PlanID:    "wp1_0123456789abcdef0123456789abcdef",
+		RunID:     testWorkPlanRunID,
+		Revision:  2,
+		Lifecycle: session.WorkPlanActive,
+		Steps: []session.WorkPlanStep{
+			{Content: "a", Status: session.WorkPlanStepCompleted},
+			{Content: "b", Status: session.WorkPlanStepInProgress},
+		},
+	}
+	sess := &session.Session{ID: "s", WorkPlan: active}
+	if !closeOrphanedWorkPlan(sess, session.WorkPlanClosePartial, now) {
+		t.Fatal("active plan must close")
+	}
+	if sess.WorkPlan.Lifecycle != session.WorkPlanStopped ||
+		sess.WorkPlan.CloseReason != session.WorkPlanClosePartial ||
+		sess.WorkPlan.Revision != 3 {
+		t.Fatalf("closure wrong: %+v", sess.WorkPlan)
+	}
+	if len(sess.WorkPlan.Steps) != 2 || sess.WorkPlan.Steps[1].Status != session.WorkPlanStepInProgress {
+		t.Fatal("incomplete steps must be preserved")
+	}
+	// Idempotent: a closed plan is never re-closed.
+	if closeOrphanedWorkPlan(sess, session.WorkPlanCloseFailed, now) {
+		t.Fatal("closed plan must not close again")
+	}
+	if closeOrphanedWorkPlan(&session.Session{ID: "s2"}, session.WorkPlanCloseFailed, now) {
+		t.Fatal("plan-less session must be a no-op")
+	}
+	if closeOrphanedWorkPlan(nil, session.WorkPlanCloseFailed, now) {
+		t.Fatal("nil session must be a no-op")
+	}
+}
+
+// The side-effect review boundary finalizes a crashed run WITHOUT entering the
+// agent loop; a still-active plan for that run must come out stopped/partial
+// in the same durable save (this exact orphan was observed live: kill -9
+// mid-bash left lifecycle=active forever before the fix).
+func TestGuardInterruptedToolExecutions_ClosesActiveWorkPlan(t *testing.T) {
+	manager := session.NewManager(t.TempDir())
+	t.Cleanup(func() { _ = manager.Close() })
+	sess := manager.NewSessionWithID("side-effect-work-plan-001")
+	state := session.InterruptedTurn{
+		RunID:     testWorkPlanRunID,
+		AttemptID: "attempt_wp_001",
+		Source:    "desktop",
+		UpdatedAt: time.Now(),
+	}
+	sess.Messages = []client.Message{{
+		Role: "assistant",
+		Content: client.NewBlockContent([]client.ContentBlock{
+			client.NewToolUseBlock("tool-use-wp", "bash", []byte(`{"command":"sleep 8"}`)),
+		}),
+	}}
+	sess.MessageMeta = []session.MessageMeta{{Source: "desktop", Timestamp: session.TimePtr(time.Now())}}
+	sess.InProgress = true
+	sess.InterruptedTurn = &state
+	sess.WorkPlan = &session.WorkPlanSnapshot{
+		PlanID:    "wp1_0123456789abcdef0123456789abcdef",
+		RunID:     testWorkPlanRunID,
+		Revision:  1,
+		Lifecycle: session.WorkPlanActive,
+		Steps: []session.WorkPlanStep{
+			{Content: "run stage one", Status: session.WorkPlanStepInProgress},
+			{Content: "run stage two", Status: session.WorkPlanStepPending},
+		},
+		UpdatedAt: time.Now(),
+	}
+	journal := newSessionSideEffectJournal(manager, sess, state.RunID, state.AttemptID)
+	prepared, err := journal.Prepare(context.Background(), agent.SideEffectExecution{
+		ToolUseID:       "tool-use-wp",
+		ToolName:        "bash",
+		ArgumentsSHA256: session.ToolExecutionDigest(`{"command":"sleep 8"}`),
+	})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if err := journal.MarkDispatching(context.Background(), prepared.ExecutionID); err != nil {
+		t.Fatalf("MarkDispatching: %v", err)
+	}
+
+	if err := guardInterruptedToolExecutions(manager, sess, state); !errors.Is(err, errInterruptedRecoveryReviewRequired) {
+		t.Fatalf("guard error = %v", err)
+	}
+	persisted, err := manager.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	wp := persisted.WorkPlan
+	if wp == nil {
+		t.Fatal("work plan vanished")
+	}
+	if wp.Lifecycle != session.WorkPlanStopped || wp.CloseReason != session.WorkPlanClosePartial {
+		t.Fatalf("orphaned plan not closed: %+v", wp)
+	}
+	if wp.Revision != 2 {
+		t.Fatalf("closure must bump revision, got %d", wp.Revision)
+	}
+	if len(wp.Steps) != 2 || wp.Steps[1].Status != session.WorkPlanStepPending {
+		t.Fatal("incomplete steps must be preserved")
 	}
 }
 

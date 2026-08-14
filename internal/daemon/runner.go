@@ -2327,6 +2327,9 @@ func claimInterruptedResume(
 	now := time.Now()
 	if checkpointAt.IsZero() ||
 		(req.InterruptedResumeMaxAge > 0 && now.Sub(checkpointAt) > req.InterruptedResumeMaxAge) {
+		// Abandonment ends the run without entering the loop; close a
+		// still-active work plan (failed: the run will never produce a result).
+		closeOrphanedWorkPlan(sess, session.WorkPlanCloseFailed, now)
 		sess.InProgress = false
 		sess.InterruptedTurn = nil
 		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {
@@ -2336,6 +2339,7 @@ func claimInterruptedResume(
 	}
 	if req.InterruptedResumeMaxAttempts > 0 &&
 		state.ResumeAttempts >= req.InterruptedResumeMaxAttempts {
+		closeOrphanedWorkPlan(sess, session.WorkPlanCloseFailed, now)
 		sess.InProgress = false
 		sess.InterruptedTurn = nil
 		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {

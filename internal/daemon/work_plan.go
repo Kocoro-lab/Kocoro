@@ -213,6 +213,27 @@ func normalizedWorkPlanHash(steps []session.WorkPlanStep) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// closeOrphanedWorkPlan closes a still-active plan on recovery paths that
+// finalize a session WITHOUT running the agent loop (side-effect review
+// boundary, stale/exhausted/invalid-checkpoint abandonment). Without this, a
+// crash mid-plan leaves lifecycle=active forever — the runner's CloseForRun
+// only fires inside a run. Mutates sess.WorkPlan in place; the caller's
+// immediately-following save persists it. No event is emitted here: these are
+// daemon-startup paths where any SSE subscriber has just reconnected and must
+// refetch GET /sessions/{id} per the recovery contract anyway.
+func closeOrphanedWorkPlan(sess *session.Session, closeReason string, now time.Time) bool {
+	if sess == nil || sess.WorkPlan == nil || sess.WorkPlan.Lifecycle != session.WorkPlanActive {
+		return false
+	}
+	// Same rule as CloseForRun: closure is a revision, or consumers drop it
+	// as stale under the lower-or-equal gate.
+	sess.WorkPlan.Revision++
+	sess.WorkPlan.Lifecycle = session.WorkPlanStopped
+	sess.WorkPlan.CloseReason = closeReason
+	sess.WorkPlan.UpdatedAt = now
+	return true
+}
+
 // workPlanEventPayload is the work_plan.updated wire payload, pinned by
 // docs/desktop-wire-fixtures/bus_event.work_plan.updated.json. Full snapshot +
 // revision is the recovery contract: the event is coalescible under
