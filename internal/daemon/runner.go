@@ -3494,6 +3494,24 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Use the per-agent manager so searches are scoped to that agent's sessions.
 	tools.RegisterSessionSearch(reg, sessMgr)
 
+	// Durable per-run work plan (internal/daemon/work_plan.go). Registered for
+	// every persistent daemon run — Fast and Full profiles alike, never gated
+	// on query shape or SSE connectivity — so the provider-visible schema is
+	// byte-stable across equivalent runs. Ephemeral runs skip it: they have no
+	// session persistence, so a durable progress record could not honor its
+	// own contract. Koe Realtime never sees it (its ToolDefs are a hardcoded
+	// literal with no registry connection).
+	var planController *runPlanController
+	if !req.Ephemeral {
+		planController = newRunPlanController(sess.ID, req.RunID)
+		if req.ResumeInterrupted {
+			// Same RunID across recovery attempts; a persisted ACTIVE plan is
+			// this run's plan and continues. Closed plans stay UI history.
+			planController.Restore(sess.WorkPlan)
+		}
+		reg.Register(&setWorkPlanTool{controller: planController})
+	}
+
 	// memory_recall — talks to the structured memory sidecar when ready and
 	// falls back to session keyword search + MEMORY.md grep otherwise. Always
 	// register; the tool itself decides whether to use the service or fallback
@@ -3953,6 +3971,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetReadTracker(deps.ReadTrackerCache.GetOrCreate(sess.ID))
 	loop.SetSessionCWD(effectiveCWD)
 	loop.SetWorkingSet(sessMgr.WorkingSet(sess.ID))
+	// A resumed run re-anchors its own active plan through VolatileContext
+	// (after cache_break) — compaction may have dropped the original
+	// set_work_plan call from model-visible context. Fresh runs and closed
+	// plans inject nothing.
+	if planController != nil && req.ResumeInterrupted {
+		if rendered := renderWorkPlanForPrompt(planController.ActiveSnapshot()); rendered != "" {
+			loop.SetActiveWorkPlanContext(rendered)
+		}
+	}
 	// Always set (even nil) to clear paths from a previous run on a reused loop.
 	loop.SetUserFilePaths(extractUserFilePaths(req.Content))
 	sessMgr.OnSessionClose(sess.ID, loop.SpillCleanupFunc())
@@ -4067,6 +4094,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		sess.InProgress = true
 		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+		if planController != nil {
+			planController.StageForSave(sess)
+		}
 		if agent.CheckpointReasonFromContext(checkpointCtx) == agent.CheckpointReasonSideEffectPrepared {
 			// The session journal's immediately-following MarkDispatching save
 			// persists this staged transcript and dispatch state atomically.
@@ -4077,6 +4107,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// Return the error so AgentLoop.maybeCheckpoint keeps the
 			// dirty flag set and the next fire point retries.
 			return err
+		}
+		// Save succeeded: the staged work-plan revision is durable, so its
+		// event may now reach SSE (persist-before-emit invariant).
+		if planController != nil && deps.EventBus != nil {
+			if snap := planController.TakePendingEvent(); snap != nil {
+				emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+			}
 		}
 		// For Source == "" runs there is no pre-loop save; the first checkpoint
 		// that persists the loop's transcript is the first durable home of the
@@ -4170,11 +4207,25 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				sess.InProgress = false // ordinary hard-error path: turn is over
 				sess.InterruptedTurn = nil
 			}
+			if planController != nil {
+				// A hard error that stays recovery-eligible (InProgress still
+				// true) is NOT the end of this RunID — the plan stays active
+				// for the recovery attempt. Only a terminal outcome closes it.
+				if !sess.InProgress {
+					planController.CloseForRun(status, runErr, time.Now())
+				}
+				planController.StageForSave(sess)
+			}
 			if err := sessMgr.Save(); err != nil {
 				rollbackToolExecutions()
 				log.Printf("daemon: failed to save error session: %v", err)
 			} else {
 				savedSessionID = sess.ID
+				if planController != nil && deps.EventBus != nil {
+					if snap := planController.TakePendingEvent(); snap != nil {
+						emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+					}
+				}
 			}
 		}
 		if runEventFlushErr != nil {
@@ -4332,6 +4383,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		if runEventFlushErr != nil {
 			log.Printf("daemon: final run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, runEventFlushErr)
 		}
+		if planController != nil {
+			// The run is over on this path even when a blocking outcome-unknown
+			// execution keeps InProgress as a startup-REVIEW marker (recovery
+			// never replays it) — so the plan always closes here, from
+			// LastRunStatus evidence, before the final save.
+			planController.CloseForRun(status, runErr, time.Now())
+			planController.StageForSave(sess)
+		}
 		previousInProgress := sess.InProgress
 		previousInterruptedTurn := sess.InterruptedTurn
 		rollbackToolExecutions, reconcileErr := stageTranscriptToolExecutionsForSave(sess)
@@ -4385,6 +4444,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// to the session) would point at a session that cannot be loaded.
 		replyEventDeliveries := 0
 		if saveErr == nil && deps.EventBus != nil {
+			// Terminal work-plan closure first, then agent_reply: a client that
+			// reacts to the reply as "turn over" already has the plan's honest
+			// final state. Emitted only after the successful final save above.
+			if planController != nil {
+				if snap := planController.TakePendingEvent(); snap != nil {
+					emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+				}
+			}
 			payload := map[string]any{
 				"agent":      agentName,
 				"source":     req.Source,

@@ -1760,6 +1760,29 @@ func TestLoopDetector_UseSkill_RepeatedNeverFiresAnyDup(t *testing.T) {
 // dupExemptTools map outside the name-scoped path) would suppress
 // legitimate signals on adjacent tools.
 // With consecDupThreshold=3, force-stop fires at consecCount >= 4.
+// TestLoopDetector_SetWorkPlanNotDupExempt pins that set_work_plan stays
+// visible to duplicate detection: ritual identical plan re-submissions must
+// trip the normal budgets, never spin forever. The no-op suppression in the
+// tool keeps honest callers cheap; loop detection is the backstop for
+// dishonest ones.
+func TestLoopDetector_SetWorkPlanNotDupExempt(t *testing.T) {
+	if dupExemptTools["set_work_plan"] {
+		t.Fatal("set_work_plan must NOT be in dupExemptTools")
+	}
+	if windowDupExemptTools["set_work_plan"] {
+		t.Fatal("set_work_plan must NOT be in windowDupExemptTools")
+	}
+	ld := NewLoopDetector()
+	args := `{"steps":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}`
+	for range 4 {
+		ld.Record("set_work_plan", args, false, "", "", false)
+	}
+	action, _ := ld.Check("set_work_plan")
+	if action != LoopForceStop {
+		t.Fatalf("identical set_work_plan ×4 must force-stop, got %v", action)
+	}
+}
+
 func TestLoopDetector_UseSkill_ExemptionScopedToSelf(t *testing.T) {
 	ld := NewLoopDetector()
 	for range 5 {

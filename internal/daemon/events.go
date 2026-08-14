@@ -133,6 +133,16 @@ const (
 	// payload and is deliberately independent from Event.ID, which is the
 	// transport-wide SSE replay cursor.
 	EventComputerUseActivity = "computer_use.activity"
+
+	// EventWorkPlanUpdated carries the full latest WorkPlan snapshot for a
+	// session (dotted domain family; payload in internal/daemon/work_plan.go,
+	// fixture bus_event.work_plan.updated.json). Emitted ONLY after the
+	// snapshot's durable save succeeded — SSE never shows a revision a daemon
+	// crash could erase. Full snapshot + monotonic revision is the recovery
+	// contract: clients drop stale revisions, may coalesce under backpressure,
+	// and refetch GET /sessions/{id} (recovery authority) after a gap. Distinct
+	// from EventCloudPlan, which is the Path B research-plan review stream.
+	EventWorkPlanUpdated = "work_plan.updated"
 )
 
 // Event is a daemon lifecycle event pushed to SSE subscribers.

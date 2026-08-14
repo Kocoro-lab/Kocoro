@@ -1,0 +1,17 @@
+{
+  "session_id": "f3b2a1c0-9d8e-4f5a-b6c7-d8e9f0a1b2c3",
+  "run_id": "run1_0123456789abcdef0123456789abcdef",
+  "plan_id": "wp1_9f2c4b8a01d3e6f79f2c4b8a01d3e6f7",
+  "revision": 2,
+  "lifecycle": "active",
+  "explanation": "Adjusted after discovering a new verification requirement.",
+  "steps": [
+    { "content": "Inspect current behavior", "status": "completed" },
+    { "content": "Implement the change", "status": "in_progress" },
+    { "content": "Exercise the real call path", "status": "pending" }
+  ],
+  "completed": 1,
+  "total": 3,
+  "updated_at": "2026-08-14T00:00:00Z",
+  "ts": "2026-08-14T00:00:01Z"
+}

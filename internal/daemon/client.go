@@ -317,6 +317,10 @@ const (
 	// no-store point-of-risk detail and one-shot allow/deny decision seam. It
 	// does not imply that any model-facing action is classified or wired yet.
 	CapComputerUseRiskConfirmationV1 = "computer_use_risk_confirmation_v1"
+	// CapWorkPlanV1 advertises durable per-run work plans: the set_work_plan
+	// tool, Session.work_plan on GET /sessions/{id}, and the work_plan.updated
+	// bus event (emitted only after the snapshot's durable save).
+	CapWorkPlanV1 = "work_plan_v1"
 )
 
 var Capabilities = []string{
@@ -366,6 +370,7 @@ var Capabilities = []string{
 	CapAgentServiceTierV1,
 	CapWebSearchUsageV1,
 	CapSkillInstallRecommendationV1,
+	CapWorkPlanV1,
 }
 
 // envelopeSenderFn lets tests substitute sendEnvelope without standing up a

@@ -164,6 +164,14 @@ type ToolResult struct {
 	// Set it only for a definitive, non-transient boundary where changing tools
 	// cannot satisfy the same scoped request.
 	StopFurtherTools bool `json:"-"`
+	// CheckpointNow asks the loop to bypass the checkpoint debounce after this
+	// tool batch: the state this result mutated must be durable before the next
+	// provider call, and a checkpoint failure must fail the run rather than
+	// silently leave a dirty bit (checkpointNow semantics, same guarantee as
+	// computer-profile activation). For internal durable-metadata transitions
+	// only — a tool with external side effects belongs in the side-effect
+	// journal, not behind this flag. Never crosses the wire.
+	CheckpointNow bool `json:"-"`
 }
 
 type GUIObservationOutcome struct {

@@ -492,6 +492,14 @@ const planningBulletSection = "### Planning\n- think: Append a structured though
 
 const skillsBulletSection = "## Skills\nWhen a skill is relevant to the task, call use_skill to load its full instructions before proceeding.\nSkills relevant to your task may be suggested each turn — check these before starting work."
 
+// workPlanBulletSection is the exact substring inside coreOperationalRules
+// that documents set_work_plan. The tool is registered only on persistent
+// daemon runs; everywhere else (TUI, one-shot CLI, MCP server, ephemeral)
+// this section is removed at prompt-build time — same byte-exact strip
+// pattern as planningBulletSection, including the trailing blank line so the
+// following ## Error Handling header keeps its spacing.
+const workPlanBulletSection = "## Work Plans\n- set_work_plan: Record a concise execution checklist only when the request needs three or more meaningful execution stages, has dependencies or multiple deliverables, is long-running multi-tool work, or the user explicitly asks to track progress. Never for Q&A, explanation, small talk, translation, rewriting, summarization, one lookup, one calculation, one direct action, one schedule operation, or planning advice you are not executing.\n- Submit the complete current step list each time. Update only when a step completes, scope materially changes, or a new stage becomes active — not after every ordinary tool call.\n- A plan call or checked step is never completion evidence, and the checklist is not the delivered result.\n\n"
+
 // coreOperationalRules contains only cross-capability decisions the model must
 // make. Runtime-owned permissions, validation, idempotency, loop detection,
 // budgets, dispatch, and persistence stay out of this cacheable prompt layer.
@@ -527,6 +535,11 @@ Prefer dedicated tools over bash when one fits: file_read (not cat/head/tail), f
 - Track the requested outcome, constraints, required evidence, completed evidence, remaining gaps, side effects, and failed-approach fingerprints.
 - After each result, continue only when a required item remains and the next action has a specific expected contribution. Stop as soon as the outcome and minimum trustworthy evidence are complete.
 - After three materially different failed approaches to the same blocker, report the evidence and the smallest user action or external change required.
+
+## Work Plans
+- set_work_plan: Record a concise execution checklist only when the request needs three or more meaningful execution stages, has dependencies or multiple deliverables, is long-running multi-tool work, or the user explicitly asks to track progress. Never for Q&A, explanation, small talk, translation, rewriting, summarization, one lookup, one calculation, one direct action, one schedule operation, or planning advice you are not executing.
+- Submit the complete current step list each time. Update only when a step completes, scope materially changes, or a new stage becomes active — not after every ordinary tool call.
+- A plan call or checked step is never completion evidence, and the checklist is not the delivered result.
 
 ## Error Handling
 
@@ -881,6 +894,7 @@ type AgentLoop struct {
 	memoryDir              string             // directory containing MEMORY.md; re-read each Run(), write-before-compact target
 	projectEntityDir       string             // ~/.shannon/projects/<id> when the session belongs to a project; supplies the project-scoped instructions tier. Empty = unfiled session.
 	stickyContext          string             // session-scoped facts injected verbatim into system prompt; never truncated
+	activeWorkPlanContext  string             // pre-rendered active work plan for resumed runs; VolatileContext only
 	outputFormat           string             // "markdown" (default) or "plain" — controls formatting guidance in volatile context
 	responseDetail         string             // "concise" / "balanced" / "detailed" — rendered in BP3 StableContext
 	suppressResponseDetail bool               // internal structured-output lanes omit natural-language answer guidance
@@ -1818,6 +1832,9 @@ func operationalRulesForToolNames(names []string) string {
 	if !has("use_skill") {
 		rules = strings.Replace(rules, skillsBulletSection, "", 1)
 	}
+	if !has("set_work_plan") {
+		rules = strings.Replace(rules, workPlanBulletSection, "", 1)
+	}
 	return rules
 }
 
@@ -2113,6 +2130,15 @@ func (a *AgentLoop) SetMemoryDir(dir string) {
 // Typically populated with session source/channel/task metadata in daemon mode.
 func (a *AgentLoop) SetStickyContext(ctx string) {
 	a.stickyContext = ctx
+}
+
+// SetActiveWorkPlanContext installs the pre-rendered active work plan of a
+// resumed interrupted run. It is injected into the user-message
+// VolatileContext (after cache_break) — never System or StableContext — so a
+// recovered run sees its own plan even when the original set_work_plan call
+// left model-visible context via compaction. Empty for fresh runs.
+func (a *AgentLoop) SetActiveWorkPlanContext(rendered string) {
+	a.activeWorkPlanContext = rendered
 }
 
 // SetWorkingSet injects the session-scoped deferred schema cache for this loop.
@@ -3241,6 +3267,7 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		ResponseDetail:         a.ResponseDetail(),
 		SuppressResponseDetail: a.suppressResponseDetail,
 		QuestionUIAvailable:    QuestionAskerFrom(ctx) != nil,
+		ActiveWorkPlan:         a.activeWorkPlanContext,
 		FastMode:               a.executionProfileID != "",
 	})
 
@@ -3695,6 +3722,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		lastSummaryFailureIter           int
 		toolSearchFired                  bool
 		computerProfileCheckpointPending bool
+		// resultCheckpointPending is latched when a tool result in the current
+		// batch carried ToolResult.CheckpointNow (durable internal metadata
+		// changed, e.g. a work-plan revision). Consumed at the same two sites
+		// as computerProfileCheckpointPending: end-of-iteration and pre-force-stop
+		// synthesis, choosing checkpointNow over the debounced maybeCheckpoint.
+		resultCheckpointPending bool
 		preambleEmitted                  bool
 		silentNarratableBatches          int
 		latestUserText                   = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
@@ -3901,11 +3934,12 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 			a.tracker.MarkDirty()
 		}
 		captureRunMessages()
-		if computerProfileCheckpointPending {
+		if computerProfileCheckpointPending || resultCheckpointPending {
 			if err := a.checkpointNow(ctx); err != nil {
-				return "", fmt.Errorf("persist computer profile activation before %s synthesis: %w", synthesisLabel, err)
+				return "", fmt.Errorf("persist forced durable checkpoint before %s synthesis: %w", synthesisLabel, err)
 			}
 			computerProfileCheckpointPending = false
+			resultCheckpointPending = false
 		} else {
 			a.maybeCheckpoint(ctx)
 		}
@@ -7068,6 +7102,18 @@ iterationLoop:
 			return terminalText, usage, sideEffectExecutionErr
 		}
 
+		// Latch a forced checkpoint when any result in this batch mutated
+		// durable internal metadata (ToolResult.CheckpointNow). Latched here —
+		// with the results already in the transcript — and consumed at the
+		// end-of-iteration checkpoint below, so the snapshot that persists
+		// includes the tool_result the flag rode in on.
+		for _, er := range execResults {
+			if er.result.CheckpointNow {
+				resultCheckpointPending = true
+				break
+			}
+		}
+
 		// A daemon-owned action-card boundary deliberately ends the turn after
 		// its tool result is paired into the transcript. Do not give the model a
 		// further turn: it might otherwise continue the original task while the
@@ -7218,12 +7264,13 @@ iterationLoop:
 		// tracker, snapshot the conversation now so a mid-turn crash does
 		// not lose this batch's work. No-op otherwise.
 		captureRunMessages()
-		if computerProfileCheckpointPending {
+		if computerProfileCheckpointPending || resultCheckpointPending {
 			if err := a.checkpointNow(ctx); err != nil {
 				setRunStatus(runstatus.CodeFromError(err), false)
-				return "", usage, fmt.Errorf("persist computer profile activation: %w", err)
+				return "", usage, fmt.Errorf("persist forced durable checkpoint: %w", err)
 			}
 			computerProfileCheckpointPending = false
+			resultCheckpointPending = false
 		} else {
 			a.maybeCheckpoint(ctx)
 		}
