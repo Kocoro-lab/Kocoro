@@ -171,6 +171,22 @@ and is verified by `internal/daemon/wire_fixtures_test.go`, which emits through
 the real producer path and decodes the produced bytes into consumer-shaped
 structs. **Change a payload, update the fixture and the test in the same PR.**
 
+### Work plans (`work_plan.updated` + `Session.work_plan`)
+
+The daemon-owned durable progress checklist for one run (`internal/daemon/
+work_plan.go`; session shape `session.WorkPlanSnapshot`). Desktop binds to the
+`work_plan.updated` bus event (fixture `bus_event.work_plan.updated.json`) and
+to the optional `work_plan` field on `GET /sessions/{id}`. Contract points:
+
+- Full snapshot + monotonic `revision` is the recovery unit: consumers drop
+  lower-or-equal revisions, may coalesce under backpressure, and refetch the
+  session detail after a gap/reconnect. Closure bumps the revision.
+- The event is emitted only after the covering durable save succeeded — a
+  displayed revision can never vanish in a daemon crash.
+- `lifecycle`/`close_reason` are runtime-owned; plan state never feeds
+  Desktop's outer `TaskPresentationState`.
+- Gated by capability token `work_plan_v1`.
+
 ### Approval-card `description`
 
 The daemon does not block on a missing or empty `description`. Desktop's fallback
