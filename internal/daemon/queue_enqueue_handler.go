@@ -83,6 +83,12 @@ func (s *Server) handleEnqueueQueue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "message text exceeds 1 MB cap")
 		return
 	}
+	// Queued messages drain into a run's prompt, so the reply-envelope limits
+	// apply at this ingress exactly as they do on POST /message.
+	if code, msg := validateConversationReplyEnvelope(req.Text); code != "" {
+		writeErrorCode(w, http.StatusBadRequest, code, msg)
+		return
+	}
 
 	editable := true
 	if req.Editable != nil {

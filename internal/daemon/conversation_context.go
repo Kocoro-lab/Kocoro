@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
@@ -51,6 +52,13 @@ func (s *Server) handleForkSession(w http.ResponseWriter, r *http.Request) {
 	if body.TargetAgent != nil {
 		targetAgent = *body.TargetAgent
 	}
+	// GetOrCreateManager creates the target session directory, so a typo'd
+	// agent would silently file the fork where no UI ever lists it.
+	if !s.conversationAgentExists(targetAgent) {
+		writeErrorCode(w, http.StatusBadRequest, "agent_not_found",
+			fmt.Sprintf("agent not found: %s", targetAgent))
+		return
+	}
 	targetManager := s.deps.SessionCache.GetOrCreateManager(s.deps.SessionCache.SessionsDir(targetAgent))
 	fork, err := sourceManager.ForkSessionInto(id, body.MessageIndex, targetManager)
 	if err != nil {
@@ -82,6 +90,13 @@ func (s *Server) handleSideChat(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	// The ephemeral run executes AS this agent; failing here beats a late
+	// "agent not found" 500 out of RunAgent.
+	if !s.conversationAgentExists(body.Agent) {
+		writeErrorCode(w, http.StatusBadRequest, "agent_not_found",
+			fmt.Sprintf("agent not found: %s", body.Agent))
+		return
 	}
 	if strings.TrimSpace(body.Text) == "" {
 		writeError(w, http.StatusBadRequest, "text is required")
@@ -179,6 +194,20 @@ func (s *Server) decodeConversationContextRequest(w http.ResponseWriter, r *http
 		body.TargetAgent = &target
 	}
 	return id, body, true
+}
+
+// conversationAgentExists reports whether a named agent is defined (user dir
+// or _builtin fallback, mirroring agents.LoadAgent's resolution). The empty
+// name is the default agent, which always exists.
+func (s *Server) conversationAgentExists(name string) bool {
+	if name == "" {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(s.deps.AgentsDir, name, "AGENT.md")); err == nil {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(s.deps.AgentsDir, "_builtin", name, "AGENT.md"))
+	return err == nil
 }
 
 func writeConversationContextError(w http.ResponseWriter, id string, err error) {

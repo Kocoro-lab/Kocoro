@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 )
 
 func TestForkSessionCopiesConversationWithoutRuntimeState(t *testing.T) {
@@ -147,5 +148,140 @@ func TestCopyHistoryThroughDropsInjectedMessagesAndDoesNotAlias(t *testing.T) {
 	}
 	if reloaded.Messages[0].Content.Text() != "hello" {
 		t.Fatal("copied history aliases the persisted source")
+	}
+}
+
+// compactedSourceSession builds a session whose first two turns are covered by
+// a valid compaction checkpoint (marker included) and whose tail continues past
+// it, mirroring what daemon auto-compaction persists.
+func compactedSourceSession(mgr *Manager, id string) *Session {
+	source := mgr.NewSessionWithID(id)
+	source.Messages = []client.Message{
+		mkMsg("user", "first question"),
+		mkMsg("assistant", "first answer"),
+		mkMsg("user", "second question"),
+		mkMsg("assistant", "second answer"),
+		mkMsg("user", "tail question"),
+		mkMsg("assistant", "tail answer"),
+	}
+	source.MessageMeta = make([]MessageMeta, len(source.Messages))
+	source.CompactionCheckpoint = &CompactionCheckpoint{
+		SchemaVersion:       CompactionCheckpointSchemaVersion,
+		ArchiveThroughIndex: 4,
+		Messages: []client.Message{
+			mkMsg("user", "first question"),
+			mkMsg("user", ctxwin.CompactionSummaryPrefix+"compacted summary of the first turns"),
+		},
+	}
+	return source
+}
+
+func TestForkSessionCarriesCoveringCompactionCheckpoint(t *testing.T) {
+	mgr := NewManager(t.TempDir())
+	source := compactedSourceSession(mgr, "compacted-fork-source")
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	fork, err := mgr.ForkSession(source.ID, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fork.CompactionCheckpoint == nil {
+		t.Fatal("fork dropped the covering compaction checkpoint")
+	}
+	history := fork.HistoryForLoop()
+	if len(history) != 4 {
+		t.Fatalf("fork history = %d messages, want checkpoint(2)+tail(2)", len(history))
+	}
+	if history[1].Content.Text() != ctxwin.CompactionSummaryPrefix+"compacted summary of the first turns" ||
+		history[2].Content.Text() != "tail question" {
+		t.Fatalf("fork history is not checkpoint+tail: %#v", history)
+	}
+	// Deep copy: mutating the fork's checkpoint must not reach the source.
+	fork.CompactionCheckpoint.Messages[1] = mkMsg("user", "mutated")
+	reloaded, err := mgr.Load(source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.CompactionCheckpoint.Messages[1].Content.Text() == "mutated" {
+		t.Fatal("fork checkpoint aliases the source checkpoint")
+	}
+
+	// A cut BEFORE the checkpoint's coverage cannot use it — the checkpoint
+	// summarizes messages the fork does not contain.
+	early, err := mgr.ForkSession(source.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if early.CompactionCheckpoint != nil {
+		t.Fatal("fork kept a checkpoint covering messages beyond its cut")
+	}
+}
+
+func TestCopyHistoryThroughUsesCoveringCompactionCheckpoint(t *testing.T) {
+	mgr := NewManager(t.TempDir())
+	source := compactedSourceSession(mgr, "compacted-copy-source")
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := mgr.CopyHistoryThrough(source.ID, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 4 || history[1].Content.Text() != ctxwin.CompactionSummaryPrefix+"compacted summary of the first turns" {
+		t.Fatalf("copy is not checkpoint+tail: %#v", history)
+	}
+
+	// A boundary inside the covered range falls back to the raw prefix.
+	rawPrefix, err := mgr.CopyHistoryThrough(source.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rawPrefix) != 2 || rawPrefix[1].Content.Text() != "first answer" {
+		t.Fatalf("pre-coverage copy = %#v", rawPrefix)
+	}
+}
+
+func TestForkSessionIntoConcurrentForksDoNotInterleave(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(dir)
+	source := mgr.NewSessionWithID("concurrent-fork-source")
+	source.Messages = []client.Message{
+		mkMsg("user", "question"),
+		mkMsg("assistant", "answer"),
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+	target := NewManager(filepath.Join(dir, "other-agent"))
+
+	type outcome struct {
+		fork *Session
+		err  error
+	}
+	results := make(chan outcome, 2)
+	go func() {
+		fork, err := mgr.ForkSessionInto(source.ID, 2, mgr)
+		results <- outcome{fork, err}
+	}()
+	go func() {
+		fork, err := mgr.ForkSessionInto(source.ID, 2, target)
+		results <- outcome{fork, err}
+	}()
+	seen := map[string]bool{}
+	for range 2 {
+		r := <-results
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if seen[r.fork.ID] {
+			t.Fatalf("concurrent forks shared id %q", r.fork.ID)
+		}
+		seen[r.fork.ID] = true
+		if len(r.fork.Messages) != 2 || r.fork.Messages[1].Content.Text() != "answer" {
+			t.Fatalf("concurrent fork corrupted messages: %#v", r.fork.Messages)
+		}
 	}
 }

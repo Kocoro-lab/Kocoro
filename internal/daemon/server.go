@@ -3179,6 +3179,12 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Reply-envelope limits are enforced on the exact bytes the model would
+	// receive, not on the truncated persistence projection.
+	if code, msg := validateConversationReplyEnvelope(req.Text); code != "" {
+		writeErrorCode(w, http.StatusBadRequest, code, msg)
+		return
+	}
 	if req.Source == "" {
 		req.Source = "kocoro"
 	}

@@ -175,12 +175,32 @@ no tools, and publish no global bus events. Their implementation is
 `DaemonClient+ConversationContext.swift`. Neither route belongs in the bundled
 Kocoro skill references because the model never calls them.
 
+`message_index` on both routes is a boundary in the RAW archive index space —
+the `messages` array of the session file, system-injected entries included —
+equal to (index of the last included message) + 1, and it must land on a
+complete assistant turn. Desktop derives it from `SessionDisplayMapper`'s
+`rawIndex` (raw `enumerated()` position, injected entries skipped for display
+but never renumbered), so the two sides share one basis; this was cross-checked
+against the Desktop implementation on 2026-08-17. Both routes honor a
+compaction checkpoint whose coverage ends at or before the boundary: the fork
+carries the checkpoint (deep-copied) and side-chat feeds the model
+checkpoint+tail, never the full raw archive.
+
 Desktop text replies use a transient head-only `<kocoro_replies>` prompt
 envelope. `RunAgent` removes that envelope from the archived user message but
 persists its decoded quotes and comments in the parallel
 `message_meta[].conversation_annotations` display metadata. The metadata never
 enters `HistoryForLoop`; it lets Desktop reconstruct the compact annotation
 attachment immediately and after reload without exposing model-only markup.
+The envelope limits are enforced server-side at both Desktop run ingresses
+(`POST /message`, `POST /queue`) on the exact bytes the
+model would receive: ≤ 100 replies per envelope run, quotes ≤ 8,000 runes,
+comments ≤ 2,000 runes. Violations are 400s with stable codes
+`conversation_replies_too_many` / `conversation_reply_quote_too_long` /
+`conversation_reply_comment_too_long`, and a delimited-but-unparseable
+envelope is `conversation_replies_malformed`. On paths that cannot reject
+(queue drain, non-Desktop sources) a malformed envelope is kept verbatim as
+ordinary text — user bytes are never silently dropped.
 
 ### Event payload shapes
 

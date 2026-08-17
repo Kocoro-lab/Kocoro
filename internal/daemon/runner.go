@@ -2585,6 +2585,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	agentName := req.Agent
 	visibleInput, replyEnvelope := splitConversationReplyPrompt(req.Text)
 	replyAnnotations := conversationReplyAnnotations(replyEnvelope)
+	if replyEnvelope != "" && replyAnnotations == nil {
+		// Delimited but unparseable: treat the whole message as ordinary text
+		// so the user's bytes survive verbatim. Desktop-facing ingresses 400
+		// this shape up front (validateConversationReplyEnvelope); this covers
+		// every path that cannot reject.
+		visibleInput, replyEnvelope = req.Text, ""
+	}
 	prompt := visibleInput
 
 	// Download remote file attachments and convert to file_ref blocks.
@@ -2818,11 +2825,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// consumed and recovery re-delivers them on every restart.
 		if pendingBatch := deps.SessionCache.DrainMailbox(req.RouteKey, 20); len(pendingBatch) > 0 {
 			pendingIDs := make([]string, 0, len(pendingBatch))
-			var b strings.Builder
+			// Each drained message is split individually: its head envelope
+			// (raw Desktop bytes) joins the merged envelope run, its decoded
+			// annotations join the merged turn's metadata, and only its
+			// visible text enters the merged visible prompt. A malformed
+			// envelope stays verbatim in the visible text (lossless).
+			var visibleParts []string
+			var envelopeParts []string
+			var drainedAnnotations []session.ConversationAnnotation
 			for _, m := range pendingBatch {
-				if b.Len() > 0 {
-					b.WriteByte('\n')
-				}
+				var b strings.Builder
 				b.WriteString(m.Text)
 				// Phase 4: surface any attachments as a bracketed hint so the
 				// LLM is aware the user shipped files alongside this text.
@@ -2851,15 +2863,38 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					}
 					b.WriteByte(']')
 				}
+				visible, annotations, stripped := conversationReplyVisibleText(b.String())
+				if stripped {
+					_, envelope := splitConversationReplyPrompt(b.String())
+					envelopeParts = append(envelopeParts, envelope)
+					drainedAnnotations = append(drainedAnnotations, annotations...)
+				}
+				if visible != "" {
+					visibleParts = append(visibleParts, visible)
+				}
 				pendingIDs = append(pendingIDs, m.ID)
 			}
-			if b.Len() > 0 {
-				if prompt == "" {
-					prompt = b.String()
-				} else {
-					prompt = b.String() + "\n" + prompt
+			if len(visibleParts) > 0 || len(envelopeParts) > 0 {
+				mergedVisible := strings.Join(visibleParts, "\n")
+				if visiblePrompt != "" {
+					if mergedVisible != "" {
+						mergedVisible += "\n"
+					}
+					mergedVisible += visiblePrompt
 				}
-				visiblePrompt = visibleConversationReplyText(prompt)
+				// Drained messages precede the trigger in the merged text, so
+				// their envelopes and annotations lead in the same order.
+				if replyEnvelope != "" {
+					envelopeParts = append(envelopeParts, replyEnvelope)
+				}
+				replyEnvelope = strings.Join(envelopeParts, "\n")
+				merged := append(drainedAnnotations, replyAnnotations...)
+				if len(merged) > maxConversationAnnotations {
+					merged = merged[:maxConversationAnnotations]
+				}
+				replyAnnotations = merged
+				visiblePrompt = mergedVisible
+				prompt = restoreConversationReplyPrompt(visiblePrompt, replyEnvelope)
 				req.Text = visiblePrompt
 			}
 			log.Printf("daemon: drained %d mailbox msg(s) into prompt for route %q", len(pendingBatch), req.RouteKey)
@@ -5256,20 +5291,38 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 	if b.preLoopUser && runMsgs[0].Role == "user" {
 		startIdx = 1
 	}
+	// The triggering user message's annotations were decoded at ingress (they
+	// may merge a drained mailbox batch); reuse them instead of re-decoding.
+	// When preLoopUser is set the trigger was persisted before the loop with
+	// its annotations attached, so no run message may claim them here.
+	triggerIdx := -1
+	if !b.preLoopUser {
+		triggerIdx = startIdx
+	}
 	fallbackTime := time.Now()
 	for i := startIdx; i < len(runMsgs); i++ {
 		ts := fallbackTime
 		if i < len(runTimestamps) && !runTimestamps[i].IsZero() {
 			ts = runTimestamps[i]
 		}
-		sess.Messages = append(sess.Messages, visibleConversationReplyMessage(runMsgs[i]))
+		injected := i < len(runInjected) && runInjected[i]
+		persisted := runMsgs[i]
 		meta := session.MessageMeta{Source: b.source, Timestamp: session.TimePtr(ts)}
-		if i == startIdx && runMsgs[i].Role == "user" {
-			meta.ConversationAnnotations = b.conversationAnnotations
-		}
-		if i < len(runInjected) && runInjected[i] {
+		if injected {
 			meta.SystemInjected = true
 		}
+		if persisted.Role == "user" && !injected {
+			// Mid-run injected follow-ups carry their own head envelopes:
+			// decode each one so its annotations survive reload, exactly like
+			// the trigger message's do.
+			var annotations []session.ConversationAnnotation
+			persisted, annotations = conversationReplyPersistedMessage(persisted)
+			if i == triggerIdx {
+				annotations = b.conversationAnnotations
+			}
+			meta.ConversationAnnotations = annotations
+		}
+		sess.Messages = append(sess.Messages, persisted)
 		sess.MessageMeta = append(sess.MessageMeta, meta)
 	}
 }

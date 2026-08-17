@@ -45,6 +45,11 @@ drain:
 	return out
 }
 
+// InjectedUserMessagePrefix marks a text-only injected-turn user message.
+// Exported because the daemon's persistence path keys off it to locate each
+// drained follow-up's head inside the joined text.
+const InjectedUserMessagePrefix = "[New message from user]\n"
+
 // buildInjectedUserMessage converts drained InjectedMessages into a single
 // user-role Message ready to append. Returns (zero, false) when input is
 // empty. When NO Files are present, emits a plain text content (preserving
@@ -70,7 +75,7 @@ func buildInjectedUserMessage(drained []InjectedMessage) (client.Message, bool) 
 		// is byte-identical to the pre-refactor inject behavior.
 		return client.Message{
 			Role:    "user",
-			Content: client.NewTextContent("[New message from user]\n" + combinedText),
+			Content: client.NewTextContent(InjectedUserMessagePrefix + combinedText),
 		}, true
 	}
 	blocks := make([]client.ContentBlock, 0, 1+len(files))

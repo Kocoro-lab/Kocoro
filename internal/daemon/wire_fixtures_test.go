@@ -2397,3 +2397,48 @@ func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
 		t.Fatalf("consumer decode lost execution_run fields: %+v", done.ExecutionRun)
 	}
 }
+
+// TestWireFixture_HTTPSessionFork pins the fork response shape through the
+// real POST /sessions/{id}/fork route. The fork's session id is generated, so
+// it is shape-asserted (non-empty date-hex id) and normalized to the fixture.
+func TestWireFixture_HTTPSessionFork(t *testing.T) {
+	fixture := loadWireFixture(t, "http_post.session_fork.response.json")
+
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: shannonDir, SessionCache: NewSessionCache(shannonDir)}
+	server := NewServer(0, nil, deps, "test")
+	mgr := deps.SessionCache.GetOrCreateManager(deps.SessionCache.SessionsDir(""))
+	source := mgr.NewSessionWithID("wire-fixture-fork-source")
+	source.Title = fixture["title"].(string)
+	source.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("question")},
+		{Role: "assistant", Content: client.NewTextContent("answer")},
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/sessions/wire-fixture-fork-source/fork",
+		strings.NewReader(`{"message_index":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /sessions/{id}/fork = %d: %s", rec.Code, rec.Body.Bytes())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	if v, ok := produced["session_id"].(string); !ok || v == "" || v == "wire-fixture-fork-source" {
+		t.Fatalf("session_id: want fresh generated id, got %#v", produced["session_id"])
+	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
+
+	// Decode the produced bytes through the same consumer shape Desktop uses.
+	var response forkSessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if response.Title != fixture["title"].(string) {
+		t.Fatalf("consumer decode lost title: %+v", response)
+	}
+}

@@ -561,7 +561,10 @@ func (m *Manager) TruncateMessages(id string, index int) error {
 
 // CopyHistoryThrough returns an independent, model-visible copy of a session's
 // history through index. index is exclusive and must end at a complete
-// assistant turn. Loop-internal injected messages are omitted.
+// assistant turn. Loop-internal injected messages are omitted, and a
+// compaction checkpoint covering the requested prefix is honored — the copy is
+// the compacted summary plus the retained tail, exactly what a run at that
+// boundary would see, not the full raw archive.
 func (m *Manager) CopyHistoryThrough(id string, index int) ([]client.Message, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -573,12 +576,7 @@ func (m *Manager) CopyHistoryThrough(id string, index int) ([]client.Message, er
 	if err := validateCompleteTurnBoundary(sess.Messages, index); err != nil {
 		return nil, err
 	}
-	meta := sess.MessageMeta
-	if len(meta) > index {
-		meta = meta[:index]
-	}
-	history := FilterInjected(sess.Messages[:index], meta)
-	return cloneMessages(history)
+	return cloneMessages(sess.HistoryThrough(index))
 }
 
 // ForkSession creates an ordinary persisted session containing the source
@@ -613,19 +611,37 @@ func (m *Manager) ForkSessionInto(id string, index int, target *Manager) (*Sessi
 	}
 	metaCount := min(index, len(source.MessageMeta))
 	meta := append([]MessageMeta(nil), source.MessageMeta[:metaCount]...)
+	// A checkpoint whose coverage ends at or before the cut carries over so the
+	// fork's first run reuses the existing summary instead of re-feeding (and
+	// re-compacting) the full raw archive. Coverage past the cut would describe
+	// messages the fork does not have — drop it and let the fork self-heal.
+	var checkpoint *CompactionCheckpoint
+	if cp := source.CompactionCheckpoint; cp != nil && cp.ArchiveThroughIndex <= index {
+		checkpointMessages, cpErr := cloneMessages(cp.Messages)
+		if cpErr != nil {
+			m.mu.Unlock()
+			return nil, cpErr
+		}
+		checkpoint = &CompactionCheckpoint{
+			SchemaVersion:       cp.SchemaVersion,
+			ArchiveThroughIndex: cp.ArchiveThroughIndex,
+			Messages:            checkpointMessages,
+		}
+	}
 	now := time.Now()
 	fork := &Session{
-		SchemaVersion: 1,
-		ID:            generateID(),
-		CreatedAt:     now,
-		Title:         source.Title,
-		TitleAuto:     source.TitleAuto,
-		TitleTurns:    source.TitleTurns,
-		CWD:           source.CWD,
-		Messages:      messages,
-		MessageMeta:   meta,
-		Source:        source.Source,
-		ProjectID:     source.ProjectID,
+		SchemaVersion:        1,
+		ID:                   generateID(),
+		CreatedAt:            now,
+		Title:                source.Title,
+		TitleAuto:            source.TitleAuto,
+		TitleTurns:           source.TitleTurns,
+		CWD:                  source.CWD,
+		Messages:             messages,
+		MessageMeta:          meta,
+		Source:               source.Source,
+		ProjectID:            source.ProjectID,
+		CompactionCheckpoint: checkpoint,
 	}
 	m.mu.Unlock()
 
