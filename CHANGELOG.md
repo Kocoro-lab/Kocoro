@@ -2,6 +2,19 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.4.6 — 2026-08-17 — Safe X connector execution
+
+**Integration tools now prove which signed-in principal authorized them, and publishing to X stays in the user's hands.** A tool captured its API key by value, so a registry clone or an agent loop holding an old pointer could still dispatch after the account changed underneath it. Separately, a native X connector that can read timelines is one click away from being a connector that publishes — so the browser-driving paths are fenced rather than trusted.
+
+### Added
+
+- **X connector execution flow** — native X reads carry trusted side-effect metadata, durable retry identity, and typed failures. The new `x_prepare_post` tool is Deferred and **URL-only**: it builds a Web Intent review link and does no OAuth, no HTTP, no opener, and no automation. It reports no post, omits the draft and URL from the audit record, and ends the turn. Only the user clicks the review link and X's Post button.
+- **Credential/principal generation binding** — a monotonic generation counter, an RWMutex dispatch lease, and a typed stale-generation error bind every credential-capturing tool to the verified principal that constructed it. A tool retained by an old agent loop or registry clone now fails *known-no-effect* before reaching Cloud after any key or account mutation, instead of dispatching under a principal the user has since replaced. Registry build-to-swap is serialized, and a complete tool run holds its lease across retries. Auth rebuilds drop credential-bound cloud/publish/image overlays while preserving calendar and other non-auth tools.
+
+### Changed
+
+- **Browser automation is fenced on X** — `browser`, `computer_use`, and the canonical Playwright adapter block composer and publish controls while preserving X reads and non-X mutation. On the CDP-backed Playwright adapter, *any* open X target blocks mutation outright, because X home and timeline pages embed an inline composer that element labels cannot reliably distinguish from an ordinary click. `browser_run_code` and `browser_evaluate` are removed from that adapter, since unrestricted page code could navigate to X and publish in one uninspectable call. **Non-CDP Playwright has no target-state guarantee**, and shell plus custom MCP servers are out of scope — the fence is layered friction on the paths the daemon controls, not a guarantee that no path can ever publish.
+
 ## v0.4.5 — 2026-08-17 — Durable work plans
 
 **A long run now carries a progress checklist that survives a crash, and whose completion is decided by the runtime rather than claimed by the model.** Multi-stage work was legible only as a stream of tool calls: nothing recorded which stage the run believed it was on, so a compacted context could lose the plan the model wrote three hundred messages ago, and a daemon restart lost it entirely. This release adds an optional `set_work_plan` tool whose snapshot is persisted before it is ever broadcast, and whose lifecycle closes from `LastRunStatus` evidence — a checked step is progress metadata, never proof the work happened.
