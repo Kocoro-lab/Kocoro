@@ -113,7 +113,7 @@ type workPlanApplyResult struct {
 }
 
 // Apply installs a full-snapshot update. steps must already be validated and
-// normalized (trimmed content). Identical normalized steps are a no-op:
+// normalized (whitespace-collapsed content). Identical normalized steps are a no-op:
 // revision does not advance, no event is staged, no checkpoint is requested.
 func (c *runPlanController) Apply(explanation string, steps []session.WorkPlanStep, now time.Time) (workPlanApplyResult, error) {
 	c.mu.Lock()
@@ -222,13 +222,27 @@ func (c *runPlanController) TakePendingEvent() *session.WorkPlanSnapshot {
 	return snap
 }
 
+// collapseWorkPlanWhitespace flattens every whitespace run — including the
+// newlines and tabs a model can emit inside a JSON string — to a single space.
+// Applied to the STORED content, not just the comparison key: a step is
+// persisted, re-broadcast on every revision, and re-rendered one-line-per-step
+// into a resumed run's prompt, so an embedded newline would forge checklist
+// lines the runtime never recorded. It also subsumes TrimSpace, so the
+// empty-content rejection still fires on whitespace-only input.
+func collapseWorkPlanWhitespace(content string) string {
+	return strings.Join(strings.Fields(content), " ")
+}
+
 // normalizeWorkPlanContent is the single normalization used by BOTH the
 // duplicate-step rejection and the no-op snapshot hash, so "identical
 // normalized snapshots are no-ops" means one thing: case- and
 // whitespace-insensitive content plus status. A pure cosmetic edit therefore
-// neither mints a revision nor forces a persistence write.
+// neither mints a revision nor forces a persistence write. Storing the
+// whitespace-collapsed form is what keeps that rule honest: otherwise "a\nb"
+// and "a b" hash identically while rendering differently, and a model trying to
+// repair its own malformed step would get changed=false forever.
 func normalizeWorkPlanContent(content string) string {
-	return strings.ToLower(strings.Join(strings.Fields(content), " "))
+	return strings.ToLower(collapseWorkPlanWhitespace(content))
 }
 
 func normalizedWorkPlanHash(steps []session.WorkPlanStep) string {
@@ -247,9 +261,13 @@ func normalizedWorkPlanHash(steps []session.WorkPlanStep) string {
 // boundary, stale/exhausted/invalid-checkpoint abandonment). Without this, a
 // crash mid-plan leaves lifecycle=active forever — the runner's CloseForRun
 // only fires inside a run. Mutates sess.WorkPlan in place; the caller's
-// immediately-following save persists it. No event is emitted here: these are
-// daemon-startup paths where any SSE subscriber has just reconnected and must
-// refetch GET /sessions/{id} per the recovery contract anyway.
+// immediately-following save persists it. No event is emitted here. For the
+// recovery call sites that is free: they are daemon-startup paths where any SSE
+// subscriber has just reconnected and must refetch GET /sessions/{id} per the
+// recovery contract anyway. The superseded call site in RunAgent is NOT such a
+// path — a client connected there learns of the closure only on its next
+// refetch. Accepted because only the latest plan per session is retained, so
+// the stale card is replaced as soon as this run mints its own plan.
 func closeOrphanedWorkPlan(sess *session.Session, closeReason string, now time.Time) bool {
 	if sess == nil || sess.WorkPlan == nil || sess.WorkPlan.Lifecycle != session.WorkPlanActive {
 		return false
@@ -332,7 +350,10 @@ func renderWorkPlanForPrompt(snap *session.WorkPlanSnapshot) string {
 		case session.WorkPlanStepInProgress:
 			marker = "[>]"
 		}
-		fmt.Fprintf(&b, "%s %s\n", marker, s.Content)
+		// Collapse again at render time: Restore adopts a persisted snapshot
+		// without re-validating it, so a plan written by an older binary can
+		// still carry embedded newlines.
+		fmt.Fprintf(&b, "%s %s\n", marker, collapseWorkPlanWhitespace(s.Content))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -440,7 +461,7 @@ func (t *setWorkPlanTool) Run(ctx context.Context, args string) (agent.ToolResul
 	seen := make(map[string]bool, len(in.Steps))
 	inProgress := 0
 	for i, s := range in.Steps {
-		content := strings.TrimSpace(s.Content)
+		content := collapseWorkPlanWhitespace(s.Content)
 		if content == "" {
 			return agent.ValidationError(fmt.Sprintf("steps[%d].content is empty", i)), nil
 		}

@@ -287,6 +287,32 @@ func TestSetWorkPlanTool_CaseOnlyEditIsNoOp(t *testing.T) {
 	}
 }
 
+// A model can emit newlines inside a JSON string. Stored content must be
+// whitespace-collapsed, or renderWorkPlanForPrompt forges checklist lines the
+// runtime never recorded — and the model cannot repair it, because the
+// corrected text normalizes to the same hash and comes back changed=false.
+func TestSetWorkPlanTool_StoredContentCollapsesEmbeddedNewlines(t *testing.T) {
+	tool, c := newTestWorkPlanTool()
+	runWorkPlanTool(t, tool, `{"steps":[{"content":"run tests\nand lint","status":"in_progress"},{"content":"ship it","status":"pending"}]}`)
+
+	snap := c.ActiveSnapshot()
+	if snap == nil {
+		t.Fatal("no active snapshot")
+	}
+	if got := snap.Steps[0].Content; got != "run tests and lint" {
+		t.Fatalf("embedded newline survived into stored content: %q", got)
+	}
+
+	rendered := renderWorkPlanForPrompt(snap)
+	// One header line plus exactly one line per step — no forged markers.
+	if got, want := len(strings.Split(rendered, "\n")), 1+len(snap.Steps); got != want {
+		t.Fatalf("rendered %d lines, want %d:\n%s", got, want, rendered)
+	}
+	if strings.Count(rendered, "[x]") != 0 {
+		t.Fatalf("rendered plan claims completed steps it does not have:\n%s", rendered)
+	}
+}
+
 func TestSetWorkPlanTool_LengthCapsAndConfigurableMax(t *testing.T) {
 	tool, _ := newTestWorkPlanTool()
 	long := strings.Repeat("长", 201)
