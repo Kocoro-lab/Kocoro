@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -32,8 +33,22 @@ import (
 // SSE never observes a revision that could vanish in a daemon crash.
 
 const (
-	workPlanMinSteps = 2
-	workPlanMaxSteps = 8
+	// workPlanMinSteps: a one-step "plan" is a single action, which the
+	// guidance forbids anyway; when it binds the tool returns a
+	// [validation error] telling the model to act directly. Not overridable —
+	// lowering it would legalize plan-shaped noise. The MAX is configurable
+	// via agent.work_plan_max_steps (config.AgentConfig.WorkPlanMaxSteps).
+	workPlanMinSteps        = 2
+	defaultWorkPlanMaxSteps = 8
+	// workPlanMaxContentRunes bounds one model-authored step line. Steps are
+	// one-sentence stage labels; when it binds the [validation error] tells
+	// the model to shorten the step. Wire-sanity bound, not configurable —
+	// the text is persisted, re-broadcast per revision, and re-injected into
+	// prompts on resume.
+	workPlanMaxContentRunes = 200
+	// workPlanMaxExplanationRunes bounds the optional change rationale, same
+	// sanity reasoning as workPlanMaxContentRunes.
+	workPlanMaxExplanationRunes = 500
 )
 
 func newWorkPlanID() (string, error) { return mintRunEventID("wp1_") }
@@ -155,16 +170,21 @@ func (c *runPlanController) CloseForRun(status agent.RunStatus, runErr error, no
 	// revisions, so a terminal lifecycle transition riding the same revision
 	// number as the last step update would be discarded as stale.
 	c.snap.Revision++
+	// Order matters: soft limits (iteration cap, budget exhaustion, idle
+	// force-stop) surface as Partial=true WITH a non-nil sentinel error, so
+	// Partial must be classified before the generic error case or expected
+	// partial outcomes would misreport as hard failures. Cancellation stays
+	// first: a user cancel can also carry ctx errors and partial output.
 	switch {
 	case status.FailureCode == runstatus.CodeUserCancelled:
 		c.snap.Lifecycle = session.WorkPlanStopped
 		c.snap.CloseReason = session.WorkPlanCloseCancelled
-	case runErr != nil:
-		c.snap.Lifecycle = session.WorkPlanStopped
-		c.snap.CloseReason = session.WorkPlanCloseFailed
 	case status.Partial:
 		c.snap.Lifecycle = session.WorkPlanStopped
 		c.snap.CloseReason = session.WorkPlanClosePartial
+	case runErr != nil:
+		c.snap.Lifecycle = session.WorkPlanStopped
+		c.snap.CloseReason = session.WorkPlanCloseFailed
 	case c.snap.CompletedStepCount() == len(c.snap.Steps):
 		c.snap.Lifecycle = session.WorkPlanCompleted
 		c.snap.CloseReason = session.WorkPlanCloseRunCompleted
@@ -202,10 +222,19 @@ func (c *runPlanController) TakePendingEvent() *session.WorkPlanSnapshot {
 	return snap
 }
 
+// normalizeWorkPlanContent is the single normalization used by BOTH the
+// duplicate-step rejection and the no-op snapshot hash, so "identical
+// normalized snapshots are no-ops" means one thing: case- and
+// whitespace-insensitive content plus status. A pure cosmetic edit therefore
+// neither mints a revision nor forces a persistence write.
+func normalizeWorkPlanContent(content string) string {
+	return strings.ToLower(strings.Join(strings.Fields(content), " "))
+}
+
 func normalizedWorkPlanHash(steps []session.WorkPlanStep) string {
 	h := sha256.New()
 	for _, s := range steps {
-		h.Write([]byte(s.Content))
+		h.Write([]byte(normalizeWorkPlanContent(s.Content)))
 		h.Write([]byte{0})
 		h.Write([]byte(s.Status))
 		h.Write([]byte{0})
@@ -274,6 +303,11 @@ func emitWorkPlanUpdated(bus *EventBus, sessionID string, snap *session.WorkPlan
 		Ts:          ts,
 	})
 	if err != nil {
+		// The snapshot was already taken from the pending slot; losing it
+		// silently would be undiagnosable. Marshal of these plain structs
+		// cannot realistically fail, but log if it ever does.
+		log.Printf("daemon: work_plan.updated payload marshal failed session=%s plan=%s rev=%d: %v",
+			sessionID, snap.PlanID, snap.Revision, err)
 		return
 	}
 	bus.Emit(Event{Type: EventWorkPlanUpdated, Payload: payload})
@@ -308,6 +342,16 @@ func renderWorkPlanForPrompt(snap *session.WorkPlanSnapshot) string {
 // keeps the schema present before any other work starts.
 type setWorkPlanTool struct {
 	controller *runPlanController
+	// maxSteps comes from agent.work_plan_max_steps (default 8); zero/negative
+	// falls back to the default so hand-built tools in tests stay valid.
+	maxSteps int
+}
+
+func (t *setWorkPlanTool) effectiveMaxSteps() int {
+	if t.maxSteps > 0 {
+		return t.maxSteps
+	}
+	return defaultWorkPlanMaxSteps
 }
 
 type setWorkPlanArgs struct {
@@ -332,7 +376,7 @@ func (t *setWorkPlanTool) Info() agent.ToolInfo {
 				"steps": map[string]any{
 					"type":     "array",
 					"minItems": workPlanMinSteps,
-					"maxItems": workPlanMaxSteps,
+					"maxItems": t.effectiveMaxSteps(),
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
@@ -389,8 +433,8 @@ func (t *setWorkPlanTool) Run(ctx context.Context, args string) (agent.ToolResul
 	if len(in.Steps) < workPlanMinSteps {
 		return agent.ValidationError(fmt.Sprintf("a work plan needs at least %d steps; do not use set_work_plan for single-step work", workPlanMinSteps)), nil
 	}
-	if len(in.Steps) > workPlanMaxSteps {
-		return agent.ValidationError(fmt.Sprintf("at most %d steps; merge related stages", workPlanMaxSteps)), nil
+	if maxSteps := t.effectiveMaxSteps(); len(in.Steps) > maxSteps {
+		return agent.ValidationError(fmt.Sprintf("at most %d steps; merge related stages", maxSteps)), nil
 	}
 	steps := make([]session.WorkPlanStep, 0, len(in.Steps))
 	seen := make(map[string]bool, len(in.Steps))
@@ -400,7 +444,10 @@ func (t *setWorkPlanTool) Run(ctx context.Context, args string) (agent.ToolResul
 		if content == "" {
 			return agent.ValidationError(fmt.Sprintf("steps[%d].content is empty", i)), nil
 		}
-		norm := strings.ToLower(strings.Join(strings.Fields(content), " "))
+		if len([]rune(content)) > workPlanMaxContentRunes {
+			return agent.ValidationError(fmt.Sprintf("steps[%d].content exceeds %d characters; keep steps to one short sentence", i, workPlanMaxContentRunes)), nil
+		}
+		norm := normalizeWorkPlanContent(content)
 		if seen[norm] {
 			return agent.ValidationError(fmt.Sprintf("steps[%d] duplicates another step: %q", i, content)), nil
 		}
@@ -421,10 +468,14 @@ func (t *setWorkPlanTool) Run(ctx context.Context, args string) (agent.ToolResul
 	if inProgress > 1 {
 		return agent.ValidationError("at most one step may be in_progress"), nil
 	}
+	explanation := strings.TrimSpace(in.Explanation)
+	if len([]rune(explanation)) > workPlanMaxExplanationRunes {
+		return agent.ValidationError(fmt.Sprintf("explanation exceeds %d characters; keep it concise", workPlanMaxExplanationRunes)), nil
+	}
 	if t.controller == nil {
 		return agent.ToolResult{}, errors.New("set_work_plan: no run plan controller bound")
 	}
-	res, err := t.controller.Apply(strings.TrimSpace(in.Explanation), steps, time.Now())
+	res, err := t.controller.Apply(explanation, steps, time.Now())
 	if err != nil {
 		return agent.ToolResult{}, err
 	}

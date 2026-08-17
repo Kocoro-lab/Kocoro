@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -242,6 +243,95 @@ func TestRunPlanController_CloseForRun(t *testing.T) {
 				t.Fatal("closing a closed plan must be a no-op")
 			}
 		})
+	}
+}
+
+// Soft limits surface as Partial=true WITH a sentinel error (iteration cap,
+// budget exhaustion); they must classify as partial, not failed.
+func TestRunPlanController_CloseForRun_PartialWithSentinelError(t *testing.T) {
+	c := newRunPlanController("sess-1", testWorkPlanRunID)
+	if _, err := c.Apply("", []session.WorkPlanStep{
+		{Content: "a", Status: session.WorkPlanStepCompleted},
+		{Content: "b", Status: session.WorkPlanStepInProgress},
+	}, time.Now()); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	c.CloseForRun(agent.RunStatus{Partial: true, FailureCode: runstatus.CodeIterationLimit},
+		agent.ErrMaxIterReached, time.Now())
+	var sess session.Session
+	c.StageForSave(&sess)
+	if sess.WorkPlan.CloseReason != session.WorkPlanClosePartial {
+		t.Fatalf("iteration-limit run must close partial, got %q", sess.WorkPlan.CloseReason)
+	}
+}
+
+// A pure cosmetic edit (case/whitespace only) must be a no-op — the dup check
+// and the snapshot hash share one normalization.
+func TestSetWorkPlanTool_CaseOnlyEditIsNoOp(t *testing.T) {
+	tool, c := newTestWorkPlanTool()
+	runWorkPlanTool(t, tool, `{"steps":[{"content":"Draft the report","status":"pending"},{"content":"Verify citations","status":"pending"}]}`)
+	c.TakePendingEvent()
+	res := runWorkPlanTool(t, tool, `{"steps":[{"content":"draft  THE report","status":"pending"},{"content":"verify citations","status":"pending"}]}`)
+	var out struct {
+		Changed  bool   `json:"changed"`
+		Revision uint64 `json:"revision"`
+	}
+	if err := json.Unmarshal([]byte(res.Content), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Changed || out.Revision != 1 {
+		t.Fatalf("case-only edit minted a revision: %+v", out)
+	}
+	if c.TakePendingEvent() != nil {
+		t.Fatal("case-only edit staged an event")
+	}
+}
+
+func TestSetWorkPlanTool_LengthCapsAndConfigurableMax(t *testing.T) {
+	tool, _ := newTestWorkPlanTool()
+	long := strings.Repeat("长", 201)
+	res := runWorkPlanTool(t, tool, `{"steps":[{"content":"`+long+`","status":"pending"},{"content":"b","status":"pending"}]}`)
+	if !res.IsError || !strings.Contains(res.Content, "exceeds 200") {
+		t.Fatalf("over-long content must be rejected: %+v", res)
+	}
+	longExp := strings.Repeat("因", 501)
+	res = runWorkPlanTool(t, tool, `{"explanation":"`+longExp+`","steps":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}`)
+	if !res.IsError || !strings.Contains(res.Content, "exceeds 500") {
+		t.Fatalf("over-long explanation must be rejected: %+v", res)
+	}
+
+	// Configurable max: a raised cap admits more steps and the schema follows.
+	wide := &setWorkPlanTool{controller: newRunPlanController("sess-1", testWorkPlanRunID), maxSteps: 12}
+	steps := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		steps = append(steps, fmt.Sprintf(`{"content":"stage %d","status":"pending"}`, i))
+	}
+	res = runWorkPlanTool(t, wide, `{"steps":[`+strings.Join(steps, ",")+`]}`)
+	if res.IsError {
+		t.Fatalf("10 steps under a max of 12 must pass: %s", res.Content)
+	}
+	if got := wide.Info().Parameters["properties"].(map[string]any)["steps"].(map[string]any)["maxItems"]; got != 12 {
+		t.Fatalf("schema maxItems must follow the configured cap, got %v", got)
+	}
+}
+
+// A NEW run that finds a prior run's still-active plan closes it superseded at
+// controller-creation time — even if this run never makes its own plan.
+func TestCloseOrphanedWorkPlan_SupersededReason(t *testing.T) {
+	sess := &session.Session{ID: "s", WorkPlan: &session.WorkPlanSnapshot{
+		PlanID:    "wp1_0123456789abcdef0123456789abcdef",
+		RunID:     "run1_ffffffffffffffffffffffffffffffff",
+		Revision:  4,
+		Lifecycle: session.WorkPlanActive,
+		Steps:     []session.WorkPlanStep{{Content: "a", Status: session.WorkPlanStepInProgress}},
+	}}
+	if !closeOrphanedWorkPlan(sess, session.WorkPlanCloseSuperseded, time.Now()) {
+		t.Fatal("active prior-run plan must close")
+	}
+	if sess.WorkPlan.Lifecycle != session.WorkPlanStopped ||
+		sess.WorkPlan.CloseReason != session.WorkPlanCloseSuperseded ||
+		sess.WorkPlan.Revision != 5 {
+		t.Fatalf("superseded closure wrong: %+v", sess.WorkPlan)
 	}
 }
 

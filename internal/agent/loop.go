@@ -3728,16 +3728,16 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 		// changed, e.g. a work-plan revision). Consumed at the same two sites
 		// as computerProfileCheckpointPending: end-of-iteration and pre-force-stop
 		// synthesis, choosing checkpointNow over the debounced maybeCheckpoint.
-		resultCheckpointPending bool
-		preambleEmitted                  bool
-		silentNarratableBatches          int
-		latestUserText                   = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
-		cloudNudgeFired                  bool
-		cloudDelegateClaimed             bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
-		criticalLoopRecoveryIteration    = -1   // iteration of the last atomic-veto recovery turn; -1 = none yet. Quota is per trailing window (nudgeWindowIters), not per run — see the batch-veto branch.
-		cloudResultContent               string // non-empty when a cloud deliverable should bypass LLM summarization
-		lastDiscoveryInput               string // dedup: skip discovery when user text hasn't changed between iterations
-		contextBloatStatusSent           bool
+		resultCheckpointPending       bool
+		preambleEmitted               bool
+		silentNarratableBatches       int
+		latestUserText                = buildReanchorText(userMessage, userContent) // most recent real user request — raw prompt plus every current-turn user text block (includes resolved attachment hints); excludes tool results and injected nudges
+		cloudNudgeFired               bool
+		cloudDelegateClaimed          bool   // set on first cloud_delegate attempt; blocks subsequent calls unless it fails
+		criticalLoopRecoveryIteration = -1   // iteration of the last atomic-veto recovery turn; -1 = none yet. Quota is per trailing window (nudgeWindowIters), not per run — see the batch-veto branch.
+		cloudResultContent            string // non-empty when a cloud deliverable should bypass LLM summarization
+		lastDiscoveryInput            string // dedup: skip discovery when user text hasn't changed between iterations
+		contextBloatStatusSent        bool
 
 		lastToolName   string
 		retryCount     int

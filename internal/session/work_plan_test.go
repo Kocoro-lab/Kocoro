@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 // Legacy session JSON without work_plan must decode unchanged and re-encode
@@ -130,6 +132,69 @@ func TestWorkPlan_SurvivesCompactionCheckpointRewrite(t *testing.T) {
 	}
 	if loaded.WorkPlan == nil || loaded.WorkPlan.PlanID != sess.WorkPlan.PlanID {
 		t.Fatal("WorkPlan lost across a compaction-checkpoint rewrite")
+	}
+}
+
+// History-mutation paths drop the plan: the transcript that justified it is
+// gone, and a stale snapshot would keep GET /sessions/{id} reporting a plan
+// (active or terminal) the remaining history no longer supports.
+func TestWorkPlan_DroppedByResetAndTruncate(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(dir)
+	t.Cleanup(func() { _ = mgr.Close() })
+	sess := mgr.NewSessionWithID("wp-reset")
+	sess.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("q1")},
+		{Role: "assistant", Content: client.NewTextContent("a1")},
+		{Role: "user", Content: client.NewTextContent("q2")},
+	}
+	sess.WorkPlan = sampleWorkPlan(WorkPlanActive, "")
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := mgr.Reset(sess.ID); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	loaded, err := mgr.Load(sess.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.WorkPlan != nil {
+		t.Fatal("Reset must drop WorkPlan")
+	}
+
+	sess2 := mgr.NewSessionWithID("wp-truncate")
+	sess2.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("q1")},
+		{Role: "assistant", Content: client.NewTextContent("a1")},
+		{Role: "user", Content: client.NewTextContent("q2")},
+	}
+	sess2.WorkPlan = sampleWorkPlan(WorkPlanActive, "")
+	if _, err := sess2.TruncateAt(2); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if sess2.WorkPlan != nil {
+		t.Fatal("TruncateAt must drop WorkPlan")
+	}
+
+	sess3 := mgr.NewSessionWithID("wp-truncate-messages")
+	sess3.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("q1")},
+		{Role: "assistant", Content: client.NewTextContent("a1")},
+	}
+	sess3.WorkPlan = sampleWorkPlan(WorkPlanCompleted, WorkPlanCloseRunCompleted)
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := mgr.TruncateMessages(sess3.ID, 1); err != nil {
+		t.Fatalf("truncate messages: %v", err)
+	}
+	loaded3, err := mgr.Load(sess3.ID)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded3.WorkPlan != nil {
+		t.Fatal("TruncateMessages must drop WorkPlan")
 	}
 }
 

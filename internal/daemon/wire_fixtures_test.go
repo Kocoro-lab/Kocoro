@@ -1603,6 +1603,22 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 			{Role: "assistant", Content: client.NewTextContent("compacted recent reply")},
 		},
 	}
+	// Session detail is the work-plan recovery authority; pin the field
+	// through the real route, in the STOPPED shape so close_reason — the
+	// branch consumers actually read — is exercised (the bus fixture covers
+	// the active shape).
+	sess.WorkPlan = &session.WorkPlanSnapshot{
+		PlanID:      "wp1_9f2c4b8a01d3e6f79f2c4b8a01d3e6f7",
+		RunID:       "run1_0123456789abcdef0123456789abcdef",
+		Revision:    3,
+		Lifecycle:   session.WorkPlanStopped,
+		CloseReason: session.WorkPlanCloseRunCompletedWithPendingSteps,
+		Steps: []session.WorkPlanStep{
+			{Content: "Inspect current behavior", Status: session.WorkPlanStepCompleted},
+			{Content: "Implement the change", Status: session.WorkPlanStepPending},
+		},
+		UpdatedAt: time.Date(2026, 8, 5, 0, 0, 4, 0, time.UTC),
+	}
 	if err := mgr.Save(); err != nil {
 		t.Fatalf("save fixture session: %v", err)
 	}
@@ -1638,6 +1654,16 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 				Content json.RawMessage `json:"content"`
 			} `json:"messages"`
 		} `json:"compaction_checkpoint"`
+		WorkPlan *struct {
+			PlanID      string `json:"plan_id"`
+			Revision    uint64 `json:"revision"`
+			Lifecycle   string `json:"lifecycle"`
+			CloseReason string `json:"close_reason"`
+			Steps       []struct {
+				Content string `json:"content"`
+				Status  string `json:"status"`
+			} `json:"steps"`
+		} `json:"work_plan"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
 		t.Fatalf("consumer decode failed: %v", err)
@@ -1646,6 +1672,12 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 	if detail.ID != sess.ID || len(detail.Messages) != 3 || len(detail.MessageMeta) != 3 ||
 		cp == nil || cp.SchemaVersion != 1 || cp.ArchiveThroughIndex != 2 || len(cp.Messages) != 3 {
 		t.Fatalf("consumer decode lost default detail fields: %+v", detail)
+	}
+	wp := detail.WorkPlan
+	if wp == nil || wp.Revision != 3 || wp.Lifecycle != "stopped" ||
+		wp.CloseReason != "run_completed_with_pending_steps" || len(wp.Steps) != 2 ||
+		wp.Steps[1].Status != "pending" {
+		t.Fatalf("consumer decode lost work_plan recovery fields: %+v", wp)
 	}
 	if string(detail.Messages[0].Content) != `"ARCHIVE_ONLY_OLD_TASK"` ||
 		string(cp.Messages[1].Content) != `"Previous context summary: stable state"` {

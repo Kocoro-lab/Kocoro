@@ -51,5 +51,23 @@
       "timestamp": "2026-08-05T00:00:03Z"
     }
   ],
-  "source": "desktop"
+  "source": "desktop",
+  "work_plan": {
+    "plan_id": "wp1_9f2c4b8a01d3e6f79f2c4b8a01d3e6f7",
+    "run_id": "run1_0123456789abcdef0123456789abcdef",
+    "revision": 3,
+    "lifecycle": "stopped",
+    "close_reason": "run_completed_with_pending_steps",
+    "steps": [
+      {
+        "content": "Inspect current behavior",
+        "status": "completed"
+      },
+      {
+        "content": "Implement the change",
+        "status": "pending"
+      }
+    ],
+    "updated_at": "2026-08-05T00:00:04Z"
+  }
 }

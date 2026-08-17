@@ -60,8 +60,13 @@ type workPlanEventSummary struct {
 	Total       int    `json:"total"`
 }
 
+// drainWorkPlanEvents collects work_plan.updated events until the TERMINAL
+// lifecycle event arrives (or a 3s deadline — generous so a loaded runner's
+// final-save gap cannot flake the sequence assertion into a confusing count
+// mismatch).
 func drainWorkPlanEvents(t *testing.T, ch <-chan Event) []workPlanEventSummary {
 	t.Helper()
+	deadline := time.After(3 * time.Second)
 	var out []workPlanEventSummary
 	for {
 		select {
@@ -74,7 +79,10 @@ func drainWorkPlanEvents(t *testing.T, ch <-chan Event) []workPlanEventSummary {
 				t.Fatalf("decode work_plan.updated: %v", err)
 			}
 			out = append(out, s)
-		case <-time.After(200 * time.Millisecond):
+			if s.Lifecycle != "active" {
+				return out // terminal closure observed
+			}
+		case <-deadline:
 			return out
 		}
 	}

@@ -40,7 +40,8 @@
         "keep_recent": 0
       },
       "warm_set_max_schema_tokens": 0,
-      "warm_set_max_schemas": 0
+      "warm_set_max_schemas": 0,
+      "work_plan_max_steps": 0
     },
     "api_key": "***",
     "auto_update_check": false,

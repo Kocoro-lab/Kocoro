@@ -3512,8 +3512,20 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// Same RunID across recovery attempts; a persisted ACTIVE plan is
 			// this run's plan and continues. Closed plans stay UI history.
 			planController.Restore(sess.WorkPlan)
+		} else if sess.WorkPlan != nil &&
+			sess.WorkPlan.Lifecycle == session.WorkPlanActive &&
+			sess.WorkPlan.RunID != req.RunID {
+			// A NEW run found a prior run's plan still active (crash leftovers
+			// with recovery disabled/expired, or an overlapping route). Close it
+			// superseded now — even if this run never makes its own plan — so
+			// the session can't report a live-looking plan forever. The next
+			// save on any persistence path carries it.
+			closeOrphanedWorkPlan(sess, session.WorkPlanCloseSuperseded, time.Now())
 		}
-		reg.Register(&setWorkPlanTool{controller: planController})
+		reg.Register(&setWorkPlanTool{
+			controller: planController,
+			maxSteps:   runCfg.Agent.WorkPlanMaxSteps,
+		})
 	}
 
 	// memory_recall — talks to the structured memory sidecar when ready and
@@ -4190,6 +4202,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				log.Printf("daemon: hard-error tool execution reconcile failed: %v", reconcileErr)
 				rollbackToolExecutions = func() {}
 			}
+			// resumeEligible tracks the ONE branch where this RunID genuinely
+			// continues at the next daemon start. InProgress alone is the wrong
+			// gate for plan closure: the blocking-execution branch sets it as a
+			// startup-REVIEW marker (recovery never replays it), and the success
+			// path already treats that state as terminal for the plan.
+			resumeEligible := false
 			if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
 				sess.InProgress = true
 				sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
@@ -4206,16 +4224,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				} else {
 					sess.InProgress = true
 					sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+					resumeEligible = true
 				}
 			} else {
 				sess.InProgress = false // ordinary hard-error path: turn is over
 				sess.InterruptedTurn = nil
 			}
 			if planController != nil {
-				// A hard error that stays recovery-eligible (InProgress still
-				// true) is NOT the end of this RunID — the plan stays active
-				// for the recovery attempt. Only a terminal outcome closes it.
-				if !sess.InProgress {
+				// A recovery-eligible failure is NOT the end of this RunID —
+				// the plan stays active for the resume attempt. Everything
+				// else (including the blocking review marker) is terminal.
+				if !resumeEligible {
 					planController.CloseForRun(status, runErr, time.Now())
 				}
 				planController.StageForSave(sess)
@@ -4228,6 +4247,27 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				if planController != nil && deps.EventBus != nil {
 					if snap := planController.TakePendingEvent(); snap != nil {
 						emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+					}
+				}
+			}
+		} else if !req.Ephemeral && planController != nil && !sess.InProgress {
+			// Hard error WITH terminal result text: the transcript is already
+			// durable via checkpoints and no message rebuild happens here, but
+			// the run is over and the plan must still close (observed case: a
+			// side-effect journal failure after a checkpointed plan revision).
+			// When InProgress is still set, startup recovery owns the outcome —
+			// it either resumes this RunID (plan continues) or finalizes it
+			// (closeOrphanedWorkPlan) — so the plan stays active only then.
+			if planController.CloseForRun(status, runErr, time.Now()) {
+				planController.StageForSave(sess)
+				if err := sessMgr.Save(); err != nil {
+					log.Printf("daemon: hard-error work-plan closure save failed: %v", err)
+				} else {
+					savedSessionID = sess.ID
+					if deps.EventBus != nil {
+						if snap := planController.TakePendingEvent(); snap != nil {
+							emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+						}
 					}
 				}
 			}
