@@ -30,7 +30,12 @@ const (
 )
 
 type EditImageTool struct {
-	client imageEdit
+	client    imageEdit
+	authGuard *authSensitiveToolGuard
+}
+
+func (t *EditImageTool) setAuthSensitiveToolGuard(guard *authSensitiveToolGuard) {
+	t.authGuard = guard
 }
 
 func NewEditImageTool(client imageEdit) *EditImageTool {
@@ -119,6 +124,12 @@ func (t *EditImageTool) Info() agent.ToolInfo {
 }
 
 func (t *EditImageTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	return runAuthSensitiveTool(t.authGuard, func() (agent.ToolResult, error) {
+		return t.run(ctx, argsJSON)
+	})
+}
+
+func (t *EditImageTool) run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args editImageArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil

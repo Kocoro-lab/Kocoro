@@ -821,6 +821,78 @@ func TestAuthManager_AdoptKey_Success(t *testing.T) {
 	}
 }
 
+func TestAuthManager_AdoptKeySerializesDifferentCredentialMutations(t *testing.T) {
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{})
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			active--
+			mu.Unlock()
+		}()
+
+		key := r.Header.Get("X-API-Key")
+		switch key {
+		case "sk_first":
+			close(firstEntered)
+			<-releaseFirst
+			_ = json.NewEncoder(w).Encode(map[string]any{"user_id": "account-first", "tier": "max"})
+		case "sk_second":
+			close(secondEntered)
+			_ = json.NewEncoder(w).Encode(map[string]any{"user_id": "account-second", "tier": "max"})
+		default:
+			t.Fatalf("unexpected key %q", key)
+		}
+	}))
+	defer cloud.Close()
+
+	gw := client.NewGatewayClient(cloud.URL, "")
+	manager := NewAuthManager(AuthManagerConfig{
+		Keychain: keychain.NewStore(keychain.NewMemBackend(), nil),
+		Cloud:    client.NewAuthClient(cloud.URL, cloud.Client()),
+		Gateway:  gw,
+	})
+	errs := make(chan error, 2)
+	go func() { errs <- manager.AdoptKey(context.Background(), "sk_first") }()
+	<-firstEntered
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		errs <- manager.AdoptKey(context.Background(), "sk_second")
+	}()
+	<-secondStarted
+	select {
+	case <-secondEntered:
+		t.Fatal("second AdoptKey entered Cloud while the first auth mutation was in flight")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("AdoptKey: %v", err)
+		}
+	}
+	mu.Lock()
+	observedMax := maxActive
+	mu.Unlock()
+	if observedMax != 1 {
+		t.Fatalf("concurrent auth mutations = %d, want 1", observedMax)
+	}
+	if got := gw.APIKey(); got != "sk_second" {
+		t.Fatalf("final gateway key = %q, want second serialized mutation", got)
+	}
+}
+
 func TestAuthManager_AdoptKey_InvalidKey_NoMutation(t *testing.T) {
 	f := newAuthFixture(t)
 	f.onError(http.MethodGet, "/api/v1/auth/me", http.StatusUnauthorized, "invalid_api_key", "revoked")

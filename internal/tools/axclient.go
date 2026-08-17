@@ -315,7 +315,7 @@ func newAXMutationCommitUnknown(method string, cause error) error {
 func isAXMutationMethod(method string) bool {
 	switch method {
 	case "ping", "display_topology", "capture_coordinate_window", "capture_coordinate_display", "read_tree",
-		"get_value", "find", "resolve_pid", "frontmost", "list_windows",
+		"get_value", "find", "resolve_pid", "frontmost", "current_context", "list_windows",
 		"wait_for", "annotate", "capture_window", "check_permissions":
 		return false
 	default:

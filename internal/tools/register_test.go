@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -33,7 +34,7 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 	}
 
 	// Check local tools are registered
-	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "calculate", "current_time", "clipboard", "notify", "present_deliverable", "process", "applescript", "accessibility", "computer_use", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove", "archive_inspect", "archive_extract", "pdf_to_text", "docx_to_text", "xlsx_to_text", "pptx_to_text"} {
+	for _, name := range []string{"use_skill", "file_read", "file_write", "file_edit", "glob", "grep", "bash", "think", "directory_list", "http", "system_info", "calculate", "current_time", "x_prepare_post", "clipboard", "notify", "present_deliverable", "process", "applescript", "accessibility", "computer_use", "ghostty", "browser", "screenshot", "computer", "wait_for", "schedule_create", "schedule_list", "schedule_update", "schedule_remove", "archive_inspect", "archive_extract", "pdf_to_text", "docx_to_text", "xlsx_to_text", "pptx_to_text"} {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("local tool %q not registered", name)
 		}
@@ -46,12 +47,12 @@ func TestRegisterAll_WithServerTools(t *testing.T) {
 		}
 	}
 
-	// Total: 38 local + 2 server = 40. doc-extract pdf/docx/xlsx/pptx are
+	// Total: 39 local + 2 server = 41. doc-extract pdf/docx/xlsx/pptx are
 	// pre-existing local extractors; schedule_show, present_deliverable, and
 	// ask_user_question are the additions pinned by this assertion.
 	schemas := reg.Schemas()
-	if len(schemas) != 40 {
-		t.Errorf("expected 40 tools, got %d", len(schemas))
+	if len(schemas) != 41 {
+		t.Errorf("expected 41 tools, got %d", len(schemas))
 	}
 }
 
@@ -75,8 +76,8 @@ func TestRegisterAll_ServerUnavailable(t *testing.T) {
 	}
 
 	schemas := reg.Schemas()
-	if len(schemas) != 38 {
-		t.Errorf("expected 38 local tools, got %d", len(schemas))
+	if len(schemas) != 39 {
+		t.Errorf("expected 39 local tools, got %d", len(schemas))
 	}
 }
 
@@ -118,12 +119,12 @@ func TestRegisterAll_LocalPriority(t *testing.T) {
 		t.Error("web_search should be a server tool")
 	}
 
-	// 38 local + 1 server (bash skipped) = 39. doc-extract pdf/docx/xlsx/pptx
+	// 39 local + 1 server (bash skipped) = 40. doc-extract pdf/docx/xlsx/pptx
 	// are pre-existing local extractors; schedule_show, present_deliverable, and
 	// ask_user_question are the additions pinned by this assertion.
 	schemas := reg.Schemas()
-	if len(schemas) != 39 {
-		t.Errorf("expected 39 tools, got %d", len(schemas))
+	if len(schemas) != 40 {
+		t.Errorf("expected 40 tools, got %d", len(schemas))
 	}
 }
 
@@ -168,6 +169,26 @@ func TestRegisterServerTools_AllowlistFiltering(t *testing.T) {
 		if _, ok := reg.Get(name); ok {
 			t.Errorf("non-allowlisted tool %q should NOT be registered", name)
 		}
+	}
+}
+
+func TestRegisterIntegrationTools_TransientListFailurePreservesCurrentIdentityCatalog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/integrations/tools" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		http.Error(w, "temporary outage", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "same-key")
+	reg := agent.NewToolRegistry()
+	reg.Register(NewIntegrationTool(client.ServerToolSchema{Name: "x_mentions"}, gw))
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err == nil {
+		t.Fatal("expected transient integration list failure")
+	}
+	if _, ok := reg.Get("x_mentions"); !ok {
+		t.Fatal("ordinary same-identity refresh failure deleted the current catalog")
 	}
 }
 
@@ -221,6 +242,8 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	mgr := mcp.NewClientManager()
 	mgr.SeedToolCache("playwright", []mcp.RemoteTool{
 		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_navigate"}},
+		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_run_code"}},
+		{ServerName: "playwright", Tool: mcpproto.Tool{Name: "browser_evaluate"}},
 	})
 
 	reg := RebuildRegistryForHealth(baseline, nil, nil, healthStates, mgr, nil)
@@ -229,6 +252,11 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 	}
 	if _, ok := reg.Get("browser_navigate"); !ok {
 		t.Error("browser_navigate should be registered from healthy Playwright")
+	}
+	for _, name := range []string{"browser_run_code", "browser_evaluate"} {
+		if _, ok := reg.Get(name); ok {
+			t.Errorf("%s must be hidden from the canonical Playwright adapter", name)
+		}
 	}
 	// accessibility reads the AX tree of native apps (e.g. WeChat) — playwright
 	// cannot, so it must survive Playwright (regression: it was wrongly removed).
@@ -239,6 +267,26 @@ func TestRebuildRegistryForHealth_PlaywrightHealthy(t *testing.T) {
 		if _, ok := reg.Get(name); !ok {
 			t.Errorf("%s must NOT be removed when Playwright is present", name)
 		}
+	}
+}
+
+func TestRebuildRegistryForHealth_DoesNotReviveStaleIntegrationGeneration(t *testing.T) {
+	baseline := agent.NewToolRegistry()
+	gw := client.NewGatewayClient("http://test", "old-key")
+	stale := NewIntegrationTool(client.ServerToolSchema{Name: "x_mentions"}, gw)
+	gw.SetAPIKey("new-key")
+	gw.BindIntegrationPrincipal("account-b", 2)
+
+	reg := RebuildRegistryForHealth(
+		baseline,
+		[]agent.Tool{stale},
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if _, ok := reg.Get("x_mentions"); ok {
+		t.Fatal("MCP/overlay rebuild revived a stale integration generation")
 	}
 }
 

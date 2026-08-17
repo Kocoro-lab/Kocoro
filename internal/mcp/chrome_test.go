@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,83 @@ type fakeChromeExec struct {
 	pgrepOK         bool
 	pgrepOutput     string
 	osascriptOutput []string
+}
+
+func TestCDPPageURLsOnPortReturnsOnlyPageTargets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/json/list" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`[
+			{"id":"1","type":"page","url":"https://x.com/compose/post"},
+			{"id":"2","type":"service_worker","url":"https://x.com/sw.js"},
+			{"id":"3","type":"page","url":"https://example.com/read"}
+		]`))
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portText, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := CDPPageURLsOnPort(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://x.com/compose/post", "https://example.com/read"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("page URLs = %v, want %v", got, want)
+	}
+}
+
+func TestCDPPageURLsOnPortFallsBackWhenHTTPListHasNoPages(t *testing.T) {
+	originalHTTP := httpListPageURLsForGuard
+	originalWS := wsListPageURLsForGuard
+	t.Cleanup(func() {
+		httpListPageURLsForGuard = originalHTTP
+		wsListPageURLsForGuard = originalWS
+	})
+	var wsCalls int
+	httpListPageURLsForGuard = func(int) ([]string, error) { return nil, nil }
+	wsListPageURLsForGuard = func(port int) ([]string, error) {
+		wsCalls++
+		if port != 9223 {
+			t.Fatalf("port = %d, want 9223", port)
+		}
+		return []string{"https://example.com/from-ws"}, nil
+	}
+
+	got, err := CDPPageURLsOnPort(9223)
+	if err != nil {
+		t.Fatalf("CDPPageURLsOnPort: %v", err)
+	}
+	if wsCalls != 1 || !reflect.DeepEqual(got, []string{"https://example.com/from-ws"}) {
+		t.Fatalf("urls=%v wsCalls=%d", got, wsCalls)
+	}
+}
+
+func TestCDPPageURLsOnPortFinalEmptyIsBrowserNotReady(t *testing.T) {
+	originalHTTP := httpListPageURLsForGuard
+	originalWS := wsListPageURLsForGuard
+	t.Cleanup(func() {
+		httpListPageURLsForGuard = originalHTTP
+		wsListPageURLsForGuard = originalWS
+	})
+	httpListPageURLsForGuard = func(int) ([]string, error) { return []string{}, nil }
+	wsListPageURLsForGuard = func(int) ([]string, error) { return []string{}, nil }
+
+	got, err := CDPPageURLsOnPort(9223)
+	if got != nil || !errors.Is(err, ErrNoCDPPageTargets) {
+		t.Fatalf("urls=%v err=%v, want ErrNoCDPPageTargets", got, err)
+	}
 }
 
 func (f *fakeChromeExec) command(name string, args ...string) *exec.Cmd {

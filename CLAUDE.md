@@ -226,11 +226,77 @@ On failure the tool probes FRESH health (never trusts the cached state at error 
 
 #### Integration tools (local agent)
 
-`tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`, `RequiresApproval()==false` — Cloud enforces access control). Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
+`tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`, `RequiresApproval()==false` — Cloud enforces access control). Each schema and tool is bound to the exact credential and verified-principal generation that listed it. Dispatch atomically rechecks that generation while capturing the credential, so a tool retained by an old agent loop or clone fails known-no-effect before reaching Cloud after any key/account mutation. Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
+
+Cloud may add `material_side_effect` to a schema. Its presence is trusted
+policy: `false` keeps observational tools such as X identity reads out of the
+durable mutation journal and permits concurrent batching; absence stays
+fail-closed for older Cloud versions. Every execute body carries a stable
+`request_id` when the agent dispatcher supplies a tool-use identity. Material
+calls additionally send the durable journal's `Idempotency-Key`; read-only
+calls never claim provider idempotency. Structured Cloud error codes preserve
+known outcomes: reconnectable auth errors point to the provider's Settings
+entry, and explicit pre-dispatch `provider_unavailable` is retryable with
+known no effect. Billing/provider-error/unknown post-dispatch failures on
+material tools remain `outcome_unknown`. Integration usage preserves provider, model,
+unit type/count, and cost through the tool result and usage emitter.
+`call_in_progress` is a separate known state: read-only calls may retry after
+waiting. Material calls poll only with the same durable request identity; if
+that bounded polling is exhausted, the result is journaled `outcome_unknown`,
+never committed, and the loop terminates rather than resending under a new
+identity.
 
 #### Integration tools: refresh triggers
 
-Registered on startup + `/config/reload`, refreshed by `RebuildAuthSensitiveTools` (sign-in) and — the immediate path — **`POST /integrations/refresh`** (`Server.RefreshIntegrationTools`; lightweight, does NOT restart MCP). First-time activation is async (a connection goes active only after the browser OAuth completes, out of band), so `connect`/`delete` fire a best-effort refresh but the reliable trigger is Desktop calling `POST /integrations/refresh`. Capability `integration_tools_v1`.
+Registered on startup + `/config/reload`, refreshed on a verified-principal
+epoch and — the immediate path — **`POST /integrations/refresh`**
+(`Server.RefreshIntegrationTools`; lightweight, does NOT restart MCP). Before
+the potentially blocking catalog clear, an API-key swap synchronously updates
+the Gateway key and invalidates every captured generation, then releases the
+dispatch writer. The daemon removes every `SourceIntegration` tool without that
+writer held; the new verified principal repopulates the catalog, and a failed
+list leaves it empty. All key and principal mutations are serialized. Auth,
+integration, MCP-health, and
+reload registry build-to-swap transactions share one lock, so a queued old
+catalog cannot land after a credential or manager transition. Auth rebuilds
+refresh both cached overlay layers: credential-capturing cloud/publish/image
+tools are removed on key loss while calendar and other non-auth post overlays
+survive. The concrete `cloud_delegate`, publish/list/retract, and generate/edit
+tools each carry the verified credential/principal generation that built their
+client. Their generation lease spans the complete `Run`, including client
+retries, so pointers retained by an old runtime clone, deferred load, or
+approval wait fail known-no-effect before network dispatch after any key or
+principal epoch change. An
+ordinary same-identity refresh failure retains the current catalog. First-time
+activation is async (a connection goes active only after the browser OAuth
+completes, out of band), so `connect`/`delete` fire a best-effort refresh but the
+reliable trigger is Desktop calling `POST /integrations/refresh`. Capability
+`integration_tools_v1`.
+
+`x_prepare_post` is a separate local Deferred tool, not an integration mutation.
+It builds `https://x.com/intent/tweet` without OAuth, network access, or a browser
+opener and reports `published:false`. Success is turn-terminal: remaining calls
+in the same model batch are discarded. The local `browser` tool rejects direct
+X composer navigation and publish-capable mutation on an observed/cached X
+composer; URL-observation failure also rejects explicit composer controls. The
+`computer_use` guard rejects composer controls and coordinate clicks whose exact
+target is unknowable on an observed X page; the OpenAI native computer adapter
+projects every action back through this guarded tool. The built-in Playwright
+MCP adapter does not expose `browser_run_code` or `browser_evaluate`, because
+either can navigate and publish in one opaque call. It rejects composer
+navigation before dispatch and explicit composer controls in every transport.
+In CDP mode, its target check and tools/call execute under the same per-server
+lock; an empty HTTP target list falls back to the WebSocket target source, and
+an ultimately empty/unavailable target set is reported as browser-not-ready
+rather than evidence of an X composer. X home and timeline pages embed a full
+composer, and CDP cannot reveal Playwright MCP's private current-page choice, so
+any observed X target blocks publish-capable mutation without relying on element
+labels. Non-CDP Playwright keeps ordinary mutation available but makes no
+target-state X-protection claim. Observations, ordinary X links/read navigation,
+and mutation when no X target is present remain available. These runtime guards do
+not police arbitrary shell commands or custom MCP servers. Only the user's
+explicit link click and later click on X's Post button may publish. Audit summaries omit both draft text and
+the generated URL.
 
 #### Attachments
 
@@ -494,7 +560,7 @@ Invariants:
 - **Failure telemetry**: `recordCompactionFailure` emits `OnRunStatus("compaction_failed")` + audit row. 10 phase tags cover force-stop, proactive, preflight, reactive, and emergency paths.
 - **Tiered result compression**: newest 8 tool-result messages stay full; distance 8-19 uses Tier 2 (up to two semantic summaries per pass for eligible results >2,000 chars, otherwise 300-char head+tail); distance >=20 normally uses Tier 1 metadata. Already-compressed blocks stay byte-stable, and Tier 2 floor tools (`file_read`, `grep`, `glob`, `directory_list`, `browser_*`) never degrade to Tier 1. Tier-2 semantic summaries carry a head-clipped current-task line (`latestUserText`, ≤240 runes) so the summarizer prioritizes task-relevant details.
 - **Memory staleness**: `annotateStaleness()` appends `[N days ago]` to memory headings.
-- **Deferred tool loading**: each tool resolves independently from an explicit `ToolExposure` override, then its source default. Local tools default Direct; MCP/gateway/integration tools default Deferred. `ask_user_question` is an explicit Direct opener. `web_search` / `web_fetch` are Direct **only when `ToolSource()==SourceGateway`** (`tools/exposure.go` `ServerTool.ToolExposure`) — a same-named MCP or integration tool keeps its Deferred source default, so a third-party catalog cannot widen the base schema surface by shadowing a trusted name. GUI/process automation plus calendar/schedule mutations are explicit Deferred, while calendar/schedule reads remain Direct. `tool_search` ranks automatically derived name/description/schema/namespace metadata with BM25 (maximum 8 ranked seeds before family expansion). The session `WorkingSet` caches warmed schemas and the deterministic search index. The 16K Direct-schema estimate is diagnostic only and never reclassifies tools.
+- **Deferred tool loading**: each tool resolves independently from an explicit `ToolExposure` override, then its source default. Local tools default Direct; MCP/gateway/integration tools default Deferred. `ask_user_question` is an explicit Direct opener. `web_search` / `web_fetch` / `x_search` are Direct **only when `ToolSource()==SourceGateway`** (`tools/exposure.go` `ServerTool.ToolExposure`) — a same-named MCP or integration tool keeps its Deferred source default, so a third-party catalog cannot widen the base schema surface by shadowing a trusted name. GUI/process automation plus calendar/schedule mutations are explicit Deferred, while calendar/schedule reads remain Direct. `tool_search` ranks automatically derived name/description/schema/namespace metadata with BM25 (maximum 8 ranked seeds before family expansion). The session `WorkingSet` caches warmed schemas and the deterministic search index. The 16K Direct-schema estimate is diagnostic only and never reclassifies tools.
 - **System reminders**: short `<system-reminder>` hints appended to `file_read`/`file_write`/`file_edit`/`bash` results; skipped for `cloud_delegate`.
 
 ### Anti-Hallucination

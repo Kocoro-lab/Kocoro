@@ -633,6 +633,9 @@ var daemonStartCmd = &cobra.Command{
 				OnAPIKeyChanged: func(ctx context.Context) {
 					localServer.RebuildAuthSensitiveTools(ctx)
 				},
+				OnAPIKeyChanging: func(ctx context.Context) {
+					localServer.InvalidateIntegrationTools()
+				},
 				LockConfigMutation:   deps.LockConfigMutation,
 				RecordConfigMutation: deps.RecordConfigMutation,
 				Logger:               log.Default(),
@@ -1432,32 +1435,24 @@ func startDaemonMCPServices(
 		}
 	})
 	supervisor.SetOnChange(func(server string, oldState, newState mcp.HealthState) {
-		_, _, depsSup := deps.Snapshot()
-		if depsSup != supervisor {
-			return
+		if newReg, swapped := deps.RebuildRegistryForMCPHealth(supervisor); swapped {
+			log.Printf("MCP registry rebuilt: %d tools", len(newReg.All()))
 		}
-		bl, gwOv, po, mgr := deps.RebuildLayers()
-		newReg := tools.RebuildRegistryForHealth(bl, gwOv, po, supervisor.HealthStates(), mgr, supervisor)
-		deps.WriteLock()
-		deps.Registry = newReg
-		deps.WriteUnlock()
-		log.Printf("MCP registry rebuilt: %d tools", len(newReg.All()))
 	})
 
+	unlockRegistry := deps.LockToolRegistryMutation()
 	deps.WriteLock()
 	deps.Supervisor = supervisor
 	deps.WriteUnlock()
+	unlockRegistry()
 
 	supervisor.Start(ctx)
 
 	// Registration creates tools before the supervisor exists. Rebuild once so
 	// the initial MCP tools get on-demand reconnect support.
-	bl, gwOv, po, mgr := deps.RebuildLayers()
-	initReg := tools.RebuildRegistryForHealth(bl, gwOv, po, supervisor.HealthStates(), mgr, supervisor)
-	deps.WriteLock()
-	deps.Registry = initReg
-	deps.WriteUnlock()
-	log.Printf("MCP registry initialized with supervisor: %d tools", len(initReg.All()))
+	if initReg, swapped := deps.RebuildRegistryForMCPHealth(supervisor); swapped {
+		log.Printf("MCP registry initialized with supervisor: %d tools", len(initReg.All()))
+	}
 
 	if startMCP == nil {
 		return

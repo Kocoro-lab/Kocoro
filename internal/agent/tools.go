@@ -190,6 +190,7 @@ type GUIObservationOutcome struct {
 type ToolUsage struct {
 	Provider     string
 	Model        string
+	CostModel    string
 	InputTokens  int
 	OutputTokens int
 	TotalTokens  int
@@ -728,6 +729,31 @@ func (r *ToolRegistry) Remove(name string) {
 		}
 	}
 	r.notifyChangedLocked()
+}
+
+// RemoveSource atomically removes every tool declared by one dynamic source.
+// Auth transitions use this to prevent a registry reader from observing a
+// partially-cleared previous-account integration catalog.
+func (r *ToolRegistry) RemoveSource(source ToolSource) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed := 0
+	kept := r.order[:0]
+	for _, name := range r.order {
+		tool := r.tools[name]
+		sourcer, ok := tool.(ToolSourcer)
+		if ok && sourcer.ToolSource() == source {
+			delete(r.tools, name)
+			removed++
+			continue
+		}
+		kept = append(kept, name)
+	}
+	r.order = kept
+	if removed > 0 {
+		r.notifyChangedLocked()
+	}
+	return removed
 }
 
 // SubscribeChanges reports tool-name additions and removals. Replacing an

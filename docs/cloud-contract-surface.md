@@ -105,6 +105,33 @@ resolver is `resolve_prompt_cache_ttl_block` in
 label as attribution only and never as a TTL selector. Do not re-implement the
 mapping on either side.
 
+### Integration tool discovery and execution
+
+This repo: `internal/client/gateway.go` (`ServerToolSchema`,
+`ToolExecuteRequest`, `ToolExecuteResponse`,
+`GatewayClient.ExecuteIntegrationToolWithIdentity`) and
+`internal/tools/server.go` (`NewIntegrationTool`).
+Cloud: `go/orchestrator/cmd/gateway/internal/handlers/integrations_tools.go`.
+
+`GET /api/v1/integrations/tools` may add the optional trusted fields
+`provider` and `material_side_effect`. Missing materiality means material
+side effect for backward compatibility; only explicit `false` bypasses the
+durable mutation journal. `POST .../{name}/execute` accepts optional
+`request_id`, and material calls also send `Idempotency-Key`. Both identities
+must remain stable for a retry of one tool call and distinct across separate
+tool calls.
+
+Non-2xx execute responses are decoded as structured integration errors. Codes
+that prove no provider action may terminate the durable journal as no-effect;
+`provider_unavailable` is an explicit pre-dispatch no-effect code.
+`billing_error`, `provider_error`, `outcome_unknown`, and unknown
+post-dispatch errors must remain outcome-unknown for material tools. Response
+`usage` preserves `provider`, `model`, `unit_type`, `units`,
+`cost_usd`, and `cost_model`; all remain optional for old Cloud versions.
+`call_in_progress` is neither no-effect nor outcome-unknown: read-only callers
+may retry after waiting, while material callers treat the original dispatch as
+accepted and must wait or query state instead of resending it.
+
 ### Upload `kind` enum
 
 This repo: `internal/uploads/client.go` (`validUploadKinds`, `IsValidKind`, and

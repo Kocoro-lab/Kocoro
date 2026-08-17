@@ -654,6 +654,9 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 	if args.Clicks < 0 || args.Clicks > 3 {
 		return agent.ValidationError("clicks must be between 0 and 3 (0 or omitted means a single click)"), nil
 	}
+	if blocked, result := t.blockXComposerAutomation(ctx, args); blocked {
+		return result, nil
+	}
 	if t.coordinateFocus != nil && args.Action != "type" &&
 		args.Action != "get_app_state" && args.Action != "screenshot" {
 		t.coordinateFocus = nil
@@ -697,6 +700,91 @@ func (t *ComputerUseTool) runWithGUIOperationLockHeld(
 	default:
 		return agent.ValidationError(fmt.Sprintf("unknown action: %q", args.Action)), nil
 	}
+}
+
+func (t *ComputerUseTool) blockXComposerAutomation(
+	ctx context.Context,
+	args computerUseArgs,
+) (bool, agent.ToolResult) {
+	if computerUseObservationAction(args.Action) || t == nil || t.client == nil {
+		return false, agent.ToolResult{}
+	}
+	snapshot := t.snapshot
+	if snapshot == nil || !isBrowserBundleID(snapshot.bundleID) || snapshot.pid <= 0 {
+		return false, agent.ToolResult{}
+	}
+	raw, err := t.client.Call(ctx, "current_context", map[string]any{"pid": snapshot.pid})
+	var current appContext
+	if err == nil {
+		err = json.Unmarshal(raw, &current)
+	}
+	if isXComposerURL(current.URL) {
+		return true, xAutomationBlockedResult()
+	}
+	if args.Ref != "" {
+		if entry, ok := t.refs[args.Ref]; ok {
+			if element, resolveErr := resolveComputerUseFingerprint(snapshot.elements, entry.fingerprint); resolveErr == nil &&
+				looksLikeExplicitXComposerElement(element) {
+				return true, xAutomationBlockedResult()
+			}
+		}
+	}
+	if snapshot.focusedRef != "" &&
+		(args.Action == "type" || args.Action == "hotkey" || args.Action == "keypress") {
+		if entry, ok := t.refs[snapshot.focusedRef]; ok {
+			if element, resolveErr := resolveComputerUseFingerprint(snapshot.elements, entry.fingerprint); resolveErr == nil &&
+				looksLikeExplicitXComposerElement(element) {
+				return true, xAutomationBlockedResult()
+			}
+		}
+	}
+	_, onX := xURL(current.URL)
+	windowLooksX := looksLikeXWindow(snapshot.window) || looksLikeXWindow(current.Window)
+	if !onX && !windowLooksX {
+		return false, agent.ToolResult{}
+	}
+	if args.Ref != "" {
+		if entry, ok := t.refs[args.Ref]; ok {
+			if element, resolveErr := resolveComputerUseFingerprint(snapshot.elements, entry.fingerprint); resolveErr == nil &&
+				looksLikeXComposerElement(element) {
+				return true, xAutomationBlockedResult()
+			}
+		}
+	}
+	if snapshot.focusedRef != "" {
+		if entry, ok := t.refs[snapshot.focusedRef]; ok {
+			if element, resolveErr := resolveComputerUseFingerprint(snapshot.elements, entry.fingerprint); resolveErr == nil &&
+				looksLikeXComposerElement(element) &&
+				(args.Action == "type" || args.Action == "hotkey" || args.Action == "keypress") {
+				return true, xAutomationBlockedResult()
+			}
+		}
+	}
+	// A coordinate click has no semantic target identity at this seam. On a
+	// verified X page it could hit the Post control, so fail closed while
+	// preserving observations and ref-based navigation/read interactions.
+	if args.Action == "click" && args.Ref == "" {
+		return true, xAutomationBlockedResult()
+	}
+	return false, agent.ToolResult{}
+}
+
+func looksLikeXComposerElement(element computerUseElement) bool {
+	return looksLikeXComposerControl(xComposerElementValues(element)...)
+}
+
+func looksLikeExplicitXComposerElement(element computerUseElement) bool {
+	return looksLikeExplicitXComposerControl(xComposerElementValues(element)...)
+}
+
+func xComposerElementValues(element computerUseElement) []string {
+	values := make([]string, 0, 4)
+	for _, value := range []*string{element.Title, element.Description, element.Desc, element.Identifier} {
+		if value != nil {
+			values = append(values, *value)
+		}
+	}
+	return values
 }
 
 func (t *ComputerUseTool) resolvePID(ctx context.Context, app string) (int, agent.ToolResult, bool) {
