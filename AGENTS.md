@@ -86,46 +86,29 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
-- Integration schemas may carry optional trusted `material_side_effect`.
-  `false` means an observational call can batch and bypass the durable mutation
-  journal; missing stays fail-closed for old Cloud. Execute calls carry stable
-  `request_id`; material calls also carry the journal `Idempotency-Key`.
-  Never treat billing/provider-error/unknown post-dispatch errors on a material
-  integration as known-no-effect; explicit pre-dispatch `provider_unavailable`
-  is known-no-effect. Preserve integration provider/model/unit/cost
-  usage fields through `ToolResult` and `EmitUsage`.
-  Exhausted material `call_in_progress` polling is `outcome_unknown`, never
-  committed; wait/query and never resend it under a new durable identity.
-- SourceIntegration catalogs are identity-scoped. An API-key swap must first
-  synchronously invalidate captured generations, then clear the whole source
-  without holding the dispatch writer; leave it empty when the new identity's
-  list fails. An ordinary same-identity refresh failure keeps the current
-  catalog. Each ServerTool is bound to the exact credential and
-  verified-principal generation used to list it; stale captured/cloned tools
-  fail before dispatch, and cached overlays must not re-advertise them. Auth,
-  integration, MCP-health, and reload registry build-to-swap transactions share
-  one lock. Auth rebuilds must refresh both GatewayOverlay and PostOverlays,
-  dropping credential-capturing cloud/publish/image tools while preserving
-  calendar and other non-auth post overlays. The six credential-capturing post
-  overlays (`cloud_delegate`, publish/list/retract, generate/edit) must retain
-  their concrete tool types but carry the same generation guard: its lease
-  spans the complete `Run`, including internal retries, and stale clones fail
-  known-no-effect before dispatch. Auth mutations are serialized across
-  accounts and keys.
-- `x_prepare_post` is a local Deferred URL builder, never an X API write. Keep it
-  free of OAuth, HTTP, browser openers, and browser/computer automation. It must
-  report that nothing was posted and keep draft text and the generated URL out
-  of audit summaries; it is turn-terminal, so same-batch calls are discarded.
-  Local `browser`/`computer_use` and the canonical Playwright MCP adapter block X
-  composer navigation and publish-capable controls while preserving X reads and
-  ordinary links. Canonical Playwright does not expose `browser_run_code` or
-  `browser_evaluate`; in CDP mode its target check and tools/call share one
-  per-server lock, and any observed X target makes publish-capable mutation
-  read-only because home/timeline pages embed a composer. X navigation/reads and
-  non-X mutation remain available. Non-CDP Playwright retains ordinary mutation
-  but cannot claim target-state X protection. Native computer actions delegate through guarded
-  `computer_use`. This boundary does not police arbitrary shell commands or
-  custom MCP servers; the user alone clicks the review link and X's Post button.
+- Trusted `material_side_effect=false` permits observational batching without
+  the journal; absent is fail-closed. Calls use stable `request_id`; material
+  calls also use `Idempotency-Key`. Only pre-dispatch `provider_unavailable` is
+  known-no-effect; billing/provider/post-dispatch failures are not. Preserve
+  provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted material
+  `call_in_progress` is `outcome_unknown`: never commit/resend under a new ID.
+- SourceIntegration is identity-scoped. Key mutation invalidates generations
+  before source clear, without the dispatch writer. Failed new-identity listing
+  leaves it empty; same-identity refresh failure keeps it. ServerTool binds list
+  credential/principal generation; stale clones fail pre-dispatch and caches
+  cannot revive them. Auth/integration/MCP-health/reload swaps share one lock.
+  Auth rebuilds both overlays, dropping credential-bound cloud/publish/image but
+  preserving calendar/non-auth tools. The six concrete tools (`cloud_delegate`,
+  publish/list/retract, generate/edit) lease generation through all `Run` retries;
+  stale clones are known-no-effect. Serialize auth across accounts/keys.
+- `x_prepare_post` is Deferred URL-only: no OAuth/HTTP/opener/automation; it
+  reports no post, omits draft/URL from audit, and ends the turn. `browser`,
+  `computer_use`, and canonical Playwright block X composer/publish controls but
+  preserve X reads/non-X mutation. Playwright omits `browser_run_code` and
+  `browser_evaluate`; CDP target check + call share a lock, and any X target
+  blocks mutation because X embeds a composer. Non-CDP has no target-state
+  guarantee. Native actions use guarded `computer_use`; shell/custom MCP are out
+  of scope. Only the user clicks the review link and X's Post button.
 
 ## MCP
 
