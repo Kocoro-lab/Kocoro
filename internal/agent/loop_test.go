@@ -6884,9 +6884,36 @@ func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
 	loop := &AgentLoop{tools: NewToolRegistry()}
 	loop.tools.Register(&fakeThinkTool{})
 	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
+	loop.tools.Register(&fakeNamedTool{name: "set_work_plan"})
 	got := loop.operationalRules()
 	if got != coreOperationalRules {
-		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when think registered; len got=%d want=%d", len(got), len(coreOperationalRules))
+		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when every conditional tool is registered; len got=%d want=%d", len(got), len(coreOperationalRules))
+	}
+}
+
+// TestOperationalRules_StripsWorkPlanSectionWhenAbsent verifies the
+// ## Work Plans guidance disappears byte-exactly when set_work_plan is not
+// registered (TUI, one-shot CLI, MCP server, ephemeral daemon runs), so those
+// prompts stay identical to pre-feature builds.
+func TestOperationalRules_StripsWorkPlanSectionWhenAbsent(t *testing.T) {
+	if !strings.Contains(coreOperationalRules, workPlanBulletSection) {
+		t.Fatal("workPlanBulletSection is not a byte-exact substring of coreOperationalRules; the strip is broken")
+	}
+	loop := &AgentLoop{tools: NewToolRegistry()}
+	loop.tools.Register(&fakeThinkTool{})
+	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
+	got := loop.operationalRules()
+	if strings.Contains(got, "## Work Plans") {
+		t.Error("'## Work Plans' section must not appear when set_work_plan is unregistered")
+	}
+	if strings.Contains(got, "set_work_plan") {
+		t.Error("set_work_plan must not be mentioned when unregistered")
+	}
+	if !strings.Contains(got, "## Progress and Stopping") || !strings.Contains(got, "## Error Handling") {
+		t.Error("surrounding sections must remain after the strip")
+	}
+	if strings.Contains(got, "\n\n\n") {
+		t.Error("strip left a double blank line")
 	}
 }
 

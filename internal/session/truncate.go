@@ -75,6 +75,10 @@ func (s *Session) TruncateAt(idx int) (*RestoredMessage, error) {
 	s.ToolResultReplacements = nil
 	s.ToolResultSeen = nil
 
+	// The plan was authored against the removed tail; drop it rather than
+	// keep a snapshot the remaining transcript no longer supports.
+	s.WorkPlan = nil
+
 	// The truncate operation is intentional; if InProgress was set from a
 	// crashed run, clear it so the session list no longer flags the row.
 	s.InProgress = false

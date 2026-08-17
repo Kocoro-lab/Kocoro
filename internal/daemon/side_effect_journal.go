@@ -186,6 +186,11 @@ func guardInterruptedToolExecutions(
 			SystemInjected: true,
 		})
 	}
+	// This boundary ends the interrupted run without ever entering the agent
+	// loop, so the runner's CloseForRun never fires — close a still-active
+	// work plan here or it stays "active" forever. Partial: the transcript
+	// holds usable partial work up to the uncertain dispatch.
+	closeOrphanedWorkPlan(sess, session.WorkPlanClosePartial, time.Now())
 	sess.InProgress = false
 	sess.InterruptedTurn = nil
 	if err := manager.SavePreservingUpdatedAt(); err != nil {

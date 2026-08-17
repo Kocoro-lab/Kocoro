@@ -507,6 +507,9 @@ func (m *Manager) Reset(id string) error {
 	sess.RouteKey = ""
 	sess.InProgress = false
 	sess.InterruptedTurn = nil
+	// A reset session has no transcript left to justify a plan; a stale
+	// snapshot here would keep GET /sessions/{id} reporting one.
+	sess.WorkPlan = nil
 	if err := m.store.Save(sess); err != nil {
 		return err
 	}
@@ -538,6 +541,9 @@ func (m *Manager) TruncateMessages(id string, index int) error {
 	}
 	// Editing history invalidates any checkpoint derived from the old archive.
 	sess.CompactionCheckpoint = nil
+	// The plan was authored against the removed tail; drop it rather than
+	// keep a snapshot the remaining transcript no longer supports.
+	sess.WorkPlan = nil
 	// 若当前内存中缓存的 session 与截断目标一致，同步更新内存状态
 	if m.current != nil && m.current.ID == id {
 		m.current = sess

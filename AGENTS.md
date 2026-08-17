@@ -77,6 +77,12 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   eligible; everything else stays in a size-1 serial batch.
 - `tool_status` running/completed carry `tool_use_id` (capability
   `tool_use_id_events`).
+- `set_work_plan` (`daemon/work_plan.go`): full-snapshot 2–8-step progress
+  checklist, daemon non-ephemeral runs only. Runtime owns
+  plan_id/revision/lifecycle/close_reason; closure comes from `LastRunStatus`,
+  never a model claim, and bumps the revision. Persist-before-emit:
+  `work_plan.updated` fires only after the covering save. Not dup-exempt;
+  `SkillExempt`; never in the side-effect journal. Capability `work_plan_v1`.
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.

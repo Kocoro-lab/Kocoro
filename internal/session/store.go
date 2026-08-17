@@ -154,6 +154,12 @@ type Session struct {
 	// was generated. A later upgrade triggered at a LOWER turn count is a
 	// reordered straggler and is skipped.
 	TitleTurns int `json:"title_turns,omitempty"`
+	// WorkPlan is the session's latest work-plan snapshot (see
+	// WorkPlanSnapshot). Optional and additive: legacy sessions without the
+	// field decode unchanged. Compaction never touches it — it lives outside
+	// Messages/CompactionCheckpoint — so an active plan survives context
+	// compression and daemon restarts.
+	WorkPlan *WorkPlanSnapshot `json:"work_plan,omitempty"`
 	// PublishedShares is the daemon-side source-of-truth for upload_ids
 	// returned by POST /sessions/{id}/share. The UI is the primary keeper of
 	// these IDs (it sends them back on DELETE /sessions/{id}/share), but UI
