@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	ctxwin "github.com/Kocoro-lab/ShanClaw/internal/context"
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
@@ -174,13 +178,28 @@ func TestConversationContextCapabilityAdvertised(t *testing.T) {
 	t.Fatalf("Capabilities missing %q", CapConversationContextActionsV1)
 }
 
-func TestSideChatEndpointUsesReadOnlyEphemeralContext(t *testing.T) {
+// sideChatProbeTool is a minimal approval-requiring tool for pinning that
+// side chats run with the normal registry + approval flow.
+type sideChatProbeTool struct{ calls int }
+
+func (t *sideChatProbeTool) Info() agent.ToolInfo {
+	return agent.ToolInfo{Name: "sidechat_probe", Description: "side chat probe tool"}
+}
+func (t *sideChatProbeTool) RequiresApproval() bool { return true }
+func (t *sideChatProbeTool) Run(context.Context, string) (agent.ToolResult, error) {
+	t.calls++
+	return agent.ToolResult{Content: "probe ok"}, nil
+}
+
+func TestSideChatEndpointRunsToolEnabledEphemeralContext(t *testing.T) {
 	gateway := &fakeGatewayBackend{reply: "focused answer"}
 	gatewayServer := httptest.NewServer(gateway.handler())
 	defer gatewayServer.Close()
 
 	deps := runAgentContractTestDeps(t, gatewayServer.URL)
 	defer deps.SessionCache.CloseAll()
+	deps.Registry.Register(&sideChatProbeTool{})
+	deps.BaselineReg.Register(&sideChatProbeTool{})
 	mgr := deps.SessionCache.GetOrCreateManager(deps.SessionCache.SessionsDir(""))
 	source := mgr.NewSessionWithID("side-chat-source")
 	source.CWD = t.TempDir()
@@ -214,8 +233,19 @@ func TestSideChatEndpointUsesReadOnlyEphemeralContext(t *testing.T) {
 	}
 	var transcript strings.Builder
 	for _, request := range requests {
-		if len(request.Tools) != 0 {
-			t.Fatalf("side chat exposed %d tools", len(request.Tools))
+		// Side chats expose the normal registry — same capability as the
+		// primary conversation, only the lifecycle is ephemeral.
+		if len(request.Messages) == 0 {
+			continue // tool-less internal probe call, not a model turn
+		}
+		found := false
+		for _, tool := range request.Tools {
+			if tool.Function.Name == "sidechat_probe" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("side chat request lost the registered tool: %d tools", len(request.Tools))
 		}
 		for _, message := range request.Messages {
 			transcript.WriteString(message.Content.Text())
@@ -341,5 +371,146 @@ func TestSideChatUsesCompactionCheckpointHistory(t *testing.T) {
 	}
 	if strings.Contains(transcript.String(), "archived bulky answer") {
 		t.Fatalf("side chat re-fed the raw archive past the checkpoint: %s", transcript.String())
+	}
+}
+
+func TestShouldInjectQuestionAskerSkipsEphemeralRuns(t *testing.T) {
+	if !shouldInjectQuestionAsker(RunAgentRequest{Source: "desktop"}) {
+		t.Fatal("attended desktop run must get an asker")
+	}
+	// Side chats are ephemeral panels with no question UI: an asker would
+	// block for the auto-resolution window then report a phantom decline.
+	if shouldInjectQuestionAsker(RunAgentRequest{Source: "desktop", Ephemeral: true}) {
+		t.Fatal("ephemeral run must not get an asker")
+	}
+	if shouldInjectQuestionAsker(RunAgentRequest{Source: "slack"}) {
+		t.Fatal("messaging source must not get an asker")
+	}
+}
+
+// TestSideChatSSEEmitsApprovalRequestAndRunsTool drives the full loop over a
+// live HTTP server: the model calls an approval-requiring tool in a side chat,
+// the per-request SSE stream must carry the approval frame, POST /approval
+// resolves it, and the tool actually runs.
+func TestSideChatSSEEmitsApprovalRequestAndRunsTool(t *testing.T) {
+	// Streamed SSE done-frames so the loop's streaming path succeeds; the
+	// response is chosen by transcript state (tool_result present or not) so
+	// retries and probe calls cannot desynchronize a call counter.
+	gatewayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req client.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := client.CompletionResponse{Provider: "anthropic", Model: "test-model"}
+		hasToolResult := false
+		for _, message := range req.Messages {
+			for _, block := range message.Content.Blocks() {
+				if block.Type == "tool_result" {
+					hasToolResult = true
+				}
+			}
+		}
+		if hasToolResult {
+			resp.FinishReason = "end_turn"
+			resp.OutputText = "probe finished"
+		} else {
+			resp.FinishReason = "tool_use"
+			resp.ToolCalls = []client.FunctionCall{{
+				ID: "call-probe-1", Name: "sidechat_probe",
+				Arguments: json.RawMessage(`{"description":"run the probe"}`),
+			}}
+		}
+		payload, _ := json.Marshal(struct {
+			Type string `json:"type"`
+			client.CompletionResponse
+		}{Type: "done", CompletionResponse: resp})
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer gatewayServer.Close()
+
+	deps := runAgentContractTestDeps(t, gatewayServer.URL)
+	defer deps.SessionCache.CloseAll()
+	probe := &sideChatProbeTool{}
+	deps.Registry.Register(probe)
+	deps.BaselineReg.Register(probe)
+	mgr := deps.SessionCache.GetOrCreateManager(deps.SessionCache.SessionsDir(""))
+	source := mgr.NewSessionWithID("side-chat-approval-source")
+	source.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("original question")},
+		{Role: "assistant", Content: client.NewTextContent("original answer")},
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer(0, nil, deps, "test")
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := `{"message_index":2,"text":"run the probe"}`
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/sessions/side-chat-approval-source/side-chat", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+
+	sawApproval := false
+	sawDone := false
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	event := ""
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			data := strings.TrimPrefix(line, "data: ")
+			switch event {
+			case "approval":
+				sawApproval = true
+				var frame struct {
+					RequestID string `json:"request_id"`
+					Tool      string `json:"tool"`
+				}
+				if err := json.Unmarshal([]byte(data), &frame); err != nil || frame.Tool != "sidechat_probe" {
+					t.Fatalf("approval frame = %s err=%v", data, err)
+				}
+				resolve := fmt.Sprintf(`{"request_id":%q,"decision":"allow"}`, frame.RequestID)
+				resolveResp, err := http.Post(httpServer.URL+"/approval", "application/json", strings.NewReader(resolve))
+				if err != nil {
+					t.Fatal(err)
+				}
+				resolveResp.Body.Close()
+				if resolveResp.StatusCode != http.StatusOK {
+					t.Fatalf("resolve status = %d", resolveResp.StatusCode)
+				}
+			case "done":
+				sawDone = true
+				if !strings.Contains(data, "probe finished") {
+					t.Fatalf("done frame = %s", data)
+				}
+			}
+		}
+	}
+	if !sawApproval || !sawDone {
+		t.Fatalf("stream missing frames: approval=%t done=%t", sawApproval, sawDone)
+	}
+	if probe.calls == 0 {
+		t.Fatal("approved probe tool never ran")
 	}
 }

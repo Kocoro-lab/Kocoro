@@ -1425,6 +1425,16 @@ func CanPresentQuestionUI(source string) bool {
 	return ok
 }
 
+// shouldInjectQuestionAsker gates the SSE handler's QuestionAsker injection.
+// Ephemeral runs (side chat) come from panels with no question UI: an asker
+// there blocks the run for the whole auto-resolution window and then reports
+// a decline the user never made — the same failure mode that once hit the
+// IM channels. Without an asker, ask_user_question degrades to its clean
+// "can't ask here" result.
+func shouldInjectQuestionAsker(req RunAgentRequest) bool {
+	return !req.Ephemeral && CanPresentQuestionUI(req.Source)
+}
+
 // cacheSourceFromDaemonSource normalizes daemon-level origins for Cloud-side
 // attribution. It does not select a TTL: Cloud currently applies the short
 // prompt-cache TTL to every source. See docs/cache-strategy.md.

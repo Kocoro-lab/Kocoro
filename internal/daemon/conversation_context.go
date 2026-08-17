@@ -130,6 +130,10 @@ func (s *Server) handleSideChat(w http.ResponseWriter, r *http.Request) {
 		}
 		history = append(history, client.Message{Role: role, Content: client.NewTextContent(content)})
 	}
+	// Side chats run with the normal tool registry and permission engine —
+	// identical capability to the primary conversation, only the lifecycle is
+	// ephemeral. Approvals flow over the per-request SSE stream like any
+	// /message run.
 	req := RunAgentRequest{
 		Text:              body.Text,
 		Agent:             body.Agent,
@@ -140,9 +144,8 @@ func (s *Server) handleSideChat(w http.ResponseWriter, r *http.Request) {
 		Ephemeral:         true,
 		BypassRouting:     true,
 		SessionHistory:    history,
-		DisableTools:      true,
 		SuppressBusEvents: true,
-		StickyContext:     "This is a temporary side conversation. Answer from the provided conversation context. Do not modify or claim to modify the primary conversation.",
+		StickyContext:     "This is a temporary side conversation branched from the primary conversation; its transcript is not saved. You have your normal tools — use them when they help answer. Do not modify or claim to modify the primary conversation itself.",
 	}
 	if err := req.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

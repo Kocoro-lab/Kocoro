@@ -3517,7 +3517,7 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	// through Cloud, questions do not, so an asker there blocks the run for the
 	// whole auto-resolution window and then reports a decline the user never made.
 	askCtx := r.Context()
-	if CanPresentQuestionUI(req.Source) {
+	if shouldInjectQuestionAsker(req) {
 		askCtx = agent.WithQuestionAsker(askCtx, &brokerQuestionAsker{
 			broker: qBroker,
 			metaFn: func() ApprovalRequestMeta {

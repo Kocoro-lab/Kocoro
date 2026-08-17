@@ -169,11 +169,16 @@ Its optional `agent` identifies the source session directory; optional
 `target_agent` selects the destination agent directory (use `"default"` for
 Default, and omit it to branch within the source agent).
 `POST /sessions/{id}/side-chat` runs against that same bounded history plus the
-panel's temporary user/assistant history. Side-chat runs are ephemeral, expose
-no tools, and publish no global bus events. Their implementation is
-`internal/daemon/conversation_context.go`; the Desktop consumer is
-`DaemonClient+ConversationContext.swift`. Neither route belongs in the bundled
-Kocoro skill references because the model never calls them.
+panel's temporary user/assistant history. Side-chat runs carry the normal tool
+registry and permission engine — identical capability to the primary
+conversation. Tool approvals flow over the per-request SSE stream
+(`approval` frames, resolved via `POST /approval`) exactly like `/message`;
+`ask_user_question` gets no asker on ephemeral runs (the panel has no question
+UI) and degrades to its clean "can't ask here" result. The runs stay ephemeral:
+no session is persisted and no global bus events are published. The
+implementation is `internal/daemon/conversation_context.go`; the Desktop
+consumer is `DaemonClient+ConversationContext.swift`. Neither route belongs in
+the bundled Kocoro skill references because the model never calls them.
 
 `message_index` on both routes is a boundary in the RAW archive index space —
 the `messages` array of the session file, system-injected entries included —
