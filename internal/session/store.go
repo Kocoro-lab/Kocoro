@@ -25,10 +25,19 @@ func TimePtr(t time.Time) *time.Time { return &t }
 // MessageMeta holds per-message metadata not sent to the LLM gateway.
 // Indexed parallel to Session.Messages.
 type MessageMeta struct {
-	Source         string     `json:"source,omitempty"`          // "local", "slack", "line", "kocoro", "webhook", "scheduler" (legacy "shanclaw" still appears in older sessions)
-	MessageID      string     `json:"message_id,omitempty"`      // stable ID for dedup (e.g. "msg-<uuid>")
-	Timestamp      *time.Time `json:"timestamp,omitempty"`       // when this message was sent/received; nil = legacy (pre-timestamp)
-	SystemInjected bool       `json:"system_injected,omitempty"` // true for guardrail/nudge messages injected by the agent loop
+	Source                  string                   `json:"source,omitempty"`                   // "local", "slack", "line", "kocoro", "webhook", "scheduler" (legacy "shanclaw" still appears in older sessions)
+	MessageID               string                   `json:"message_id,omitempty"`               // stable ID for dedup (e.g. "msg-<uuid>")
+	Timestamp               *time.Time               `json:"timestamp,omitempty"`                // when this message was sent/received; nil = legacy (pre-timestamp)
+	SystemInjected          bool                     `json:"system_injected,omitempty"`          // true for guardrail/nudge messages injected by the agent loop
+	ConversationAnnotations []ConversationAnnotation `json:"conversation_annotations,omitempty"` // user-visible reply anchors, excluded from model history
+}
+
+// ConversationAnnotation is the durable display metadata for one text reply.
+// The model receives the equivalent data through the transient reply envelope;
+// this copy exists only so clients can reconstruct the sent-message attachment.
+type ConversationAnnotation struct {
+	SelectedText string `json:"selected_text"`
+	Comment      string `json:"comment,omitempty"`
 }
 
 // DeliverableReceipt is the durable, daemon-validated metadata emitted only

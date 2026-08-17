@@ -945,6 +945,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 	mux.HandleFunc("PATCH /sessions/{id}", s.handlePatchSession)
 	mux.HandleFunc("POST /sessions/{id}/edit", s.handleEditMessage)
+	mux.HandleFunc("POST /sessions/{id}/fork", s.handleForkSession)
+	mux.HandleFunc("POST /sessions/{id}/side-chat", s.handleSideChat)
 	mux.HandleFunc("POST /sessions/{id}/reset", s.handleResetSession)
 	mux.HandleFunc("POST /sessions/{id}/rewind", s.handleRewind)
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)

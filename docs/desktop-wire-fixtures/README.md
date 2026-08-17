@@ -150,6 +150,12 @@ codecs.
 | `http_get.session.response.json` | `server.go handleGetSession` (`GET /sessions/{id}`) | lossless default session detail. Top-level `messages` remain the archive; `compaction_checkpoint` additively exposes the durable model-live state and its exclusive raw archive index. No new capability token is required: clients that ignore the additive field retain the existing archive semantics; consumers that opt into live-context metrics read the checkpoint explicitly. |
 | `http_get.session.remote_timeline.response.json` | `server.go handleGetSession` (`GET /sessions/{id}?view=remote_timeline`) | capability-gated mobile projection of the archive. Returns a byte-bounded newest page with aligned `messages` / `message_meta`, absolute `start_index`, opaque `next_cursor`, `has_more`, and explicit `omitted_content_count`; it projects from top-level archived `messages`, not the model-live checkpoint. |
 
+`conversation_context_actions_v1` covers two Desktop-only POST routes without
+golden response files: `/sessions/{id}/fork` and `/sessions/{id}/side-chat`.
+Their request/response, complete-turn boundary, tool-free side-chat, and
+non-persistence contracts are exercised directly in
+`internal/daemon/conversation_context_test.go`.
+
 ### Quick-panel surfaces (POST request bodies + error responses)
 
 `POST /message` optionally accepts `idempotency_key` together with a
