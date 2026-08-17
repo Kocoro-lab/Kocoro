@@ -133,6 +133,11 @@ var vaguePurposes = map[string]bool{
 type PublishToWebTool struct {
 	client       uploader
 	extAllowlist map[string]bool
+	authGuard    *authSensitiveToolGuard
+}
+
+func (t *PublishToWebTool) setAuthSensitiveToolGuard(guard *authSensitiveToolGuard) {
+	t.authGuard = guard
 }
 
 // NewPublishToWebTool constructs the tool with the given uploads client and
@@ -217,6 +222,12 @@ func (t *PublishToWebTool) Info() agent.ToolInfo {
 }
 
 func (t *PublishToWebTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	return runAuthSensitiveTool(t.authGuard, func() (agent.ToolResult, error) {
+		return t.run(ctx, argsJSON)
+	})
+}
+
+func (t *PublishToWebTool) run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args publishArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil

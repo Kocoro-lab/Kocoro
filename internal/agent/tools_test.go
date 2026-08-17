@@ -628,6 +628,21 @@ func (m *mockSourcedTool) Run(ctx context.Context, args string) (ToolResult, err
 func (m *mockSourcedTool) RequiresApproval() bool { return false }
 func (m *mockSourcedTool) ToolSource() ToolSource { return m.source }
 
+func TestToolRegistryRemoveSourceRemovesOnlyMatchingSource(t *testing.T) {
+	r := NewToolRegistry()
+	r.Register(&mockTool{name: "local"})
+	r.Register(&mockSourcedTool{name: "integration_a", source: SourceIntegration})
+	r.Register(&mockSourcedTool{name: "gateway", source: SourceGateway})
+	r.Register(&mockSourcedTool{name: "integration_b", source: SourceIntegration})
+
+	if removed := r.RemoveSource(SourceIntegration); removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if got := r.Names(); !reflect.DeepEqual(got, []string{"local", "gateway"}) {
+		t.Fatalf("remaining names = %v", got)
+	}
+}
+
 func TestToolRegistry_SortedSchemas(t *testing.T) {
 	r := NewToolRegistry()
 	// Register in non-alphabetical, mixed-source order

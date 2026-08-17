@@ -57,7 +57,7 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - **Exposure** (`agent/exposure.go EffectiveToolExposure`): explicit
   `ToolExposure` first, then source default — local Direct; MCP/gateway/
   integration Deferred. `ask_user_question` is explicitly Direct. `web_search` /
-  `web_fetch` are Direct **only when `ToolSource()==SourceGateway`**
+  `web_fetch` / `x_search` are Direct **only when `ToolSource()==SourceGateway`**
   (`tools/exposure.go ServerTool.ToolExposure`); a same-named MCP or integration
   tool keeps its Deferred default so a third-party catalog cannot widen the base
   schema surface. GUI/process automation and calendar/schedule mutations are
@@ -86,6 +86,29 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
+- Trusted `material_side_effect=false` permits observational batching without
+  the journal; absent is fail-closed. Calls use stable `request_id`; material
+  calls also use `Idempotency-Key`. Only pre-dispatch `provider_unavailable` is
+  known-no-effect; billing/provider/post-dispatch failures are not. Preserve
+  provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted material
+  `call_in_progress` is `outcome_unknown`: never commit/resend under a new ID.
+- SourceIntegration is identity-scoped. Key mutation invalidates generations
+  before source clear, without the dispatch writer. Failed new-identity listing
+  leaves it empty; same-identity refresh failure keeps it. ServerTool binds list
+  credential/principal generation; stale clones fail pre-dispatch and caches
+  cannot revive them. Auth/integration/MCP-health/reload swaps share one lock.
+  Auth rebuilds both overlays, dropping credential-bound cloud/publish/image but
+  preserving calendar/non-auth tools. The six concrete tools (`cloud_delegate`,
+  publish/list/retract, generate/edit) lease generation through all `Run` retries;
+  stale clones are known-no-effect. Serialize auth across accounts/keys.
+- `x_prepare_post` is Deferred URL-only: no OAuth/HTTP/opener/automation; it
+  reports no post, omits draft/URL from audit, and ends the turn. `browser`,
+  `computer_use`, and canonical Playwright block X composer/publish controls but
+  preserve X reads/non-X mutation. Playwright omits `browser_run_code` and
+  `browser_evaluate`; CDP target check + call share a lock, and any X target
+  blocks mutation because X embeds a composer. Non-CDP has no target-state
+  guarantee. Native actions use guarded `computer_use`; shell/custom MCP are out
+  of scope. Only the user clicks the review link and X's Post button.
 
 ## MCP
 

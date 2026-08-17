@@ -59,6 +59,7 @@ var (
 	playwrightCDPPort            = mcp.PlaywrightCDPPort
 	ensureChromeDebugPort        = mcp.EnsureChromeDebugPort
 	shouldPreflightChromeForTool = mcp.ShouldPreflightDedicatedChrome
+	playwrightCDPPageURLs        = mcp.CDPPageURLsOnPort
 )
 
 // MCPTool wraps an MCP server tool as a local agent.Tool.
@@ -141,6 +142,13 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	if args == nil {
 		args = make(map[string]any)
 	}
+	if t.blocksUnrestrictedPlaywrightCode() {
+		return xUnrestrictedPlaywrightCodeBlockedResult(), nil
+	}
+	if blocked, result := t.blockPlaywrightXComposerNavigation(args); blocked {
+		return result, nil
+	}
+	var preDispatchGuard func() error
 
 	// CDP mode: ensure Chrome is running when playwright is not yet connected.
 	// Also preflight the daemon-owned dedicated Chrome on first tool use for the
@@ -148,12 +156,14 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	// This preserves the copied-profile/session behavior instead of letting the MCP
 	// server improvise its own temporary browser.
 	if t.serverName == "playwright" {
-		if cfg, ok := t.manager.ConfigFor(t.serverName); ok && isPlaywrightCDPMode(cfg) {
-			mcp.MarkChromeUsed(ctx)
-			port := playwrightCDPPort(cfg)
-			if !t.manager.IsConnected(t.serverName) || shouldPreflightChromeForTool(port) {
-				if err := ensureChromeDebugPort(port); err != nil {
-					return agent.ToolResult{Content: fmt.Sprintf("Chrome CDP unavailable: %v", err), IsError: true}, nil
+		if t.manager != nil {
+			if cfg, ok := t.manager.ConfigFor(t.serverName); ok && isPlaywrightCDPMode(cfg) {
+				mcp.MarkChromeUsed(ctx)
+				port := playwrightCDPPort(cfg)
+				if !t.manager.IsConnected(t.serverName) || shouldPreflightChromeForTool(port) {
+					if err := ensureChromeDebugPort(port); err != nil {
+						return agent.ToolResult{Content: fmt.Sprintf("Chrome CDP unavailable: %v", err), IsError: true}, nil
+					}
 				}
 			}
 		}
@@ -166,6 +176,11 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 			if rewritten, ok := maybeRewriteFileURL(ctx, args); ok {
 				args["url"] = rewritten
 			}
+		}
+		var blocked agent.ToolResult
+		preDispatchGuard, blocked = t.playwrightXMutationGuard(args)
+		if blocked.IsError {
+			return blocked, nil
 		}
 	}
 
@@ -191,7 +206,10 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	// file_read agree on the same location. Unrelated tools are not touched.
 	rewrittenOutPath := maybeRewriteFileProducingArg(ctx, t.serverName, t.tool.Name, args)
 
-	content, isError, err := t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
+	callTool := func() (string, bool, error) {
+		return t.manager.CallToolGuarded(ctx, t.serverName, t.tool.Name, args, preDispatchGuard)
+	}
+	content, isError, err := callTool()
 	if err != nil && t.supervisor != nil && ctx.Err() == nil && mcp.IsTransportError(err) {
 		// Post-dispatch TRANSPORT failure. The request was already written to
 		// a server that was alive at dispatch time, and "connection died"
@@ -226,10 +244,14 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		if !mcp.ToolReplaySafe(t.tool) {
 			err = &mcp.OutcomeUnknownError{Server: t.serverName, Tool: t.tool.Name, Err: err}
 		} else if reconHealth.State == mcp.StateHealthy {
-			content, isError, err = t.manager.CallTool(ctx, t.serverName, t.tool.Name, args)
+			content, isError, err = callTool()
 		}
 	}
 	if err != nil {
+		var guardErr *playwrightPreDispatchGuardError
+		if errors.As(err, &guardErr) {
+			return guardErr.result, nil
+		}
 		var unknown *mcp.OutcomeUnknownError
 		if errors.As(err, &unknown) {
 			return agent.ToolResult{
@@ -255,6 +277,91 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		content = maybeAnnotateResultPaths(t.serverName, content, t.manager)
 	}
 	return agent.ToolResult{Content: content, IsError: isError}, nil
+}
+
+func (t *MCPTool) blockPlaywrightXComposerNavigation(args map[string]any) (bool, agent.ToolResult) {
+	if t == nil || t.serverName != "playwright" {
+		return false, agent.ToolResult{}
+	}
+	if t.tool.Name == "browser_navigate" {
+		if raw, _ := args["url"].(string); isXComposerURL(raw) {
+			return true, xAutomationBlockedResult()
+		}
+		return false, agent.ToolResult{}
+	}
+	return false, agent.ToolResult{}
+}
+
+func (t *MCPTool) blocksUnrestrictedPlaywrightCode() bool {
+	return t != nil && canonicalPlaywrightToolDisabled(t.serverName, t.tool.Name)
+}
+
+func canonicalPlaywrightToolDisabled(serverName, toolName string) bool {
+	return serverName == "playwright" &&
+		(toolName == "browser_evaluate" || toolName == "browser_run_code")
+}
+
+type playwrightPreDispatchGuardError struct {
+	result agent.ToolResult
+}
+
+func (e *playwrightPreDispatchGuardError) Error() string {
+	if e == nil {
+		return "Playwright pre-dispatch guard rejected the call"
+	}
+	return e.result.Content
+}
+
+func (t *MCPTool) playwrightXMutationGuard(args map[string]any) (func() error, agent.ToolResult) {
+	if t == nil || t.serverName != "playwright" ||
+		!playwrightMutationCanPublish(t.tool.Name) {
+		return nil, agent.ToolResult{}
+	}
+	evidence, _ := json.Marshal(args)
+	composerHint := looksLikeExplicitXComposerControl(string(evidence))
+	if composerHint {
+		return nil, xAutomationBlockedResult()
+	}
+	if t.manager == nil {
+		return nil, agent.ToolResult{}
+	}
+	cfg, ok := t.manager.ConfigFor(t.serverName)
+	if !ok || !isPlaywrightCDPMode(cfg) {
+		// Non-CDP Playwright has no reliable shared-target introspection. Preserve
+		// ordinary mutation instead of globally blocking the browser; only direct
+		// composer URLs, explicit composer controls, and unrestricted code tools
+		// are covered there.
+		return nil, agent.ToolResult{}
+	}
+	port := playwrightCDPPort(cfg)
+	return func() error {
+		urls, err := playwrightCDPPageURLs(port)
+		if err != nil || len(urls) == 0 {
+			return &playwrightPreDispatchGuardError{result: agent.TransientError(
+				fmt.Sprintf("Playwright browser is not ready for guarded mutation: %v", err),
+			)}
+		}
+		for _, currentURL := range urls {
+			if isXURL(currentURL) {
+				// X home/timeline pages embed a full composer, so URL-path checks
+				// and element labels cannot distinguish an ordinary click/type from
+				// a one-call publish sequence. Keep CDP-backed X access read-only.
+				return &playwrightPreDispatchGuardError{result: xPageMutationBlockedResult()}
+			}
+		}
+		return nil
+	}, agent.ToolResult{}
+}
+
+func playwrightMutationCanPublish(name string) bool {
+	switch name {
+	case "browser_click", "browser_type", "browser_press_key",
+		"browser_drag", "browser_select_option", "browser_file_upload",
+		"browser_fill_form":
+		return true
+	default:
+		return false
+	}
 }
 
 // outcomeUnknownResultMessage renders a post-dispatch transport failure for

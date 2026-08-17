@@ -57,6 +57,10 @@ func (*WaitTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDeferred
 }
 
+func (*XPreparePostTool) ToolExposure() agent.ToolExposure {
+	return agent.ToolExposureDeferred
+}
+
 func (t *ScheduleTool) ToolExposure() agent.ToolExposure {
 	switch t.action {
 	case "create", "update", "remove":
@@ -102,11 +106,13 @@ func (*CalendarDeleteEventTool) ToolExposure() agent.ToolExposure {
 
 func (t *ServerTool) ToolExposure() agent.ToolExposure {
 	// Only Cloud's canonical research openers are trusted as always-present
-	// Direct tools. Same-named MCP or integration tools retain their source
-	// default so a third-party catalog cannot expand the base schema surface.
+	// Direct tools. x_search is the X-native research opener and deliberately
+	// matches web_search's always-visible discovery experience. Same-named MCP
+	// or integration tools retain their source default so a third-party catalog
+	// cannot expand the base schema surface.
 	if t.source == agent.SourceGateway {
 		switch t.schema.Name {
-		case "web_search", "web_fetch":
+		case "web_search", "web_fetch", "x_search":
 			return agent.ToolExposureDirect
 		}
 	}

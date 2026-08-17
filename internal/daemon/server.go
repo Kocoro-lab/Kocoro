@@ -60,18 +60,12 @@ type Server struct {
 	// MCP server may start in isolated mode.
 	isolatedMCPAllowlist string
 	listenerMu           sync.Mutex // protects listener
-	// toolRefreshMu serializes in-place re-registration of the live registry's
-	// gateway/integration tools (RebuildAuthSensitiveTools + RefreshIntegrationTools).
-	// Without it, overlapping refreshes (e.g. sign-in + a connect/delete async
-	// refresh + POST /integrations/refresh) can apply stale snapshots out of order
-	// and resurrect a disconnected provider's tools.
-	toolRefreshMu  sync.Mutex
-	listener       net.Listener
-	version        string
-	ctx            context.Context // daemon lifecycle context, set on Start
-	cancel         context.CancelFunc
-	approvalBroker *ApprovalBroker
-	eventBus       *EventBus
+	listener             net.Listener
+	version              string
+	ctx                  context.Context // daemon lifecycle context, set on Start
+	cancel               context.CancelFunc
+	approvalBroker       *ApprovalBroker
+	eventBus             *EventBus
 	// computerUseCoordinator is the process-wide authority shared by every
 	// model-facing GUI mutation and the local Desktop control plane. Tests may
 	// replace it before serving requests.
@@ -643,24 +637,31 @@ func (s *Server) SetAuth(a *AuthManager) {
 		s.deps.AuthManager = a
 	}
 	if a != nil {
-		a.SetPrincipalChangedHandler(func(previous, _ string) {
-			if previous == "" {
-				return
-			}
-			if err := s.skillRecommendations.invalidateAccount(previous); err != nil {
-				log.Printf("daemon: invalidate old recommendation principal: %v", err)
-				s.skillRecommendations.failClosedAccount(previous, err)
-			}
-			s.skillRecommendationSinksMu.Lock()
-			for key, sink := range s.skillRecommendationSinks {
-				if strings.HasPrefix(key, previous+"\x00") {
-					if sink.close != nil {
-						sink.close()
-					}
-					delete(s.skillRecommendationSinks, key)
+		a.SetPrincipalChangedHandler(func(previous, current string) {
+			if previous != "" {
+				if err := s.skillRecommendations.invalidateAccount(previous); err != nil {
+					log.Printf("daemon: invalidate old recommendation principal: %v", err)
+					s.skillRecommendations.failClosedAccount(previous, err)
 				}
+				s.skillRecommendationSinksMu.Lock()
+				for key, sink := range s.skillRecommendationSinks {
+					if strings.HasPrefix(key, previous+"\x00") {
+						if sink.close != nil {
+							sink.close()
+						}
+						delete(s.skillRecommendationSinks, key)
+					}
+				}
+				s.skillRecommendationSinksMu.Unlock()
 			}
-			s.skillRecommendationSinksMu.Unlock()
+			// SetAPIKey invalidates auth-bound tool generations before Cloud has
+			// verified the new principal, so the key-change callback only removes
+			// old clients. Re-register their generation guards now that
+			// setStateWithPrincipalEpoch has bound the verified principal.
+			s.RebuildAuthSensitiveTools(context.Background())
+			if err := s.resetIntegrationToolsForPrincipal(context.Background(), current != ""); err != nil {
+				log.Printf("daemon: integration tools principal refresh failed (catalog remains empty): %v", err)
+			}
 		})
 	}
 }
@@ -738,61 +739,86 @@ func (s *Server) RegisterAuthRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /local/auth/adopt-key", s.handleAuthAdoptKey)
 }
 
-// RebuildAuthSensitiveTools re-registers the gateway tools whose
-// construction captures cfg.APIKey by value (cloud_delegate,
-// publish_to_web, list_my_published_files, retract_published_file,
-// generate_image, edit_image). The AuthManager calls this after a key
-// change so sign-out invalidates these tools (cfg.APIKey == "" causes
-// the Register* helpers to skip) and login re-arms them with the new
-// key.
-//
-// This is intentionally a narrow rebuild — it does NOT reload yaml or
-// touch MCP / local tools, which keeps the path safe to call repeatedly
-// without disturbing in-flight agent runs that hold concurrent reads on
-// the local-tool subset.
-// syncGatewayOverlay re-extracts the cached GatewayOverlay from the live
-// registry. The in-place refresh paths (RebuildAuthSensitiveTools,
-// RefreshIntegrationTools) register gateway/integration tools directly on
-// s.deps.Registry; the cached overlay is otherwise only rewritten by
-// /config/reload. An MCP health transition rebuilds the live registry from the
-// cached overlay (SetOnChange → RebuildRegistryForHealth), so without syncing it
-// here any integration tool connected after startup would be dropped on the next
-// health flap. Integration tools are *ServerTool, so ExtractGatewayTools
-// captures them alongside the gateway tools. Extract before taking the write
-// lock to keep the deps critical section short.
-func (s *Server) syncGatewayOverlay(reg *agent.ToolRegistry) {
+// syncToolOverlays re-extracts both cached overlay layers from the live
+// registry. Callers hold ServerDeps' tool-registry mutation lock, so an MCP
+// health build cannot snapshot one old layer and one new layer. Rebuilding the
+// post layer is auth-critical: its publish/image/cloud tools capture an API key
+// by value, while calendar and other non-auth overlays must survive unchanged.
+func (s *Server) syncToolOverlays(reg *agent.ToolRegistry) {
 	if reg == nil {
 		return
 	}
-	overlay := tools.ExtractGatewayTools(reg)
+	s.deps.mu.RLock()
+	baseline := s.deps.BaselineReg
+	s.deps.mu.RUnlock()
+	gatewayOverlay := tools.ExtractGatewayTools(reg)
+	var postOverlays []agent.Tool
+	if baseline != nil {
+		postOverlays = tools.ExtractPostOverlays(reg, baseline)
+	}
 	s.deps.WriteLock()
-	s.deps.GatewayOverlay = overlay
+	s.deps.GatewayOverlay = gatewayOverlay
+	// A missing baseline cannot safely classify post overlays; clear rather
+	// than retaining credential-capturing tools from an older snapshot.
+	s.deps.PostOverlays = postOverlays
 	s.deps.WriteUnlock()
 }
 
+var authSensitivePostOverlayToolNames = []string{
+	"cloud_delegate",
+	"publish_to_web",
+	"list_my_published_files",
+	"retract_published_file",
+	"generate_image",
+	"edit_image",
+}
+
+func isAuthSensitivePostOverlay(name string) bool {
+	for _, candidate := range authSensitivePostOverlayToolNames {
+		if name == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// preserveNonAuthPostOverlays carries process-local overlays such as calendar
+// tools across a config-registry rebuild. Credential-capturing overlays are
+// always reconstructed from the current live key instead.
+func preserveNonAuthPostOverlays(reg *agent.ToolRegistry, previous []agent.Tool) {
+	if reg == nil {
+		return
+	}
+	for _, tool := range previous {
+		if tool == nil || isAuthSensitivePostOverlay(tool.Info().Name) {
+			continue
+		}
+		if _, exists := reg.Get(tool.Info().Name); !exists {
+			reg.Register(tool)
+		}
+	}
+}
+
+// RebuildAuthSensitiveTools re-registers the non-integration gateway tools whose
+// construction captures cfg.APIKey by value (cloud_delegate,
+// publish_to_web, list_my_published_files, retract_published_file,
+// generate_image, edit_image). The AuthManager calls this after a key change so
+// sign-out invalidates these tools and login re-arms them with the new key. It
+// does not reload yaml or touch MCP/local tools.
 func (s *Server) RebuildAuthSensitiveTools(ctx context.Context) {
 	if s == nil || s.deps == nil || s.deps.GW == nil {
 		return
 	}
-	cfg := s.configWithLiveAPIKey(s.deps.Config)
-	if cfg == nil {
+	// Serialize the whole live-registry mutation and overlay publication with
+	// integration refresh, MCP health rebuild, and config reload.
+	unlock := s.deps.LockToolRegistryMutation()
+	defer unlock()
+	cfgSnapshot, reg, _ := s.deps.Snapshot()
+	cfg := s.configWithLiveAPIKey(cfgSnapshot)
+	if cfg == nil || reg == nil {
 		return
 	}
-	// Serialize with RefreshIntegrationTools (shares the integration-tool refresh).
-	s.toolRefreshMu.Lock()
-	defer s.toolRefreshMu.Unlock()
-	_, reg, _ := s.deps.Snapshot() // read the registry pointer under deps.mu
-	if reg == nil {
-		return
-	}
-	for _, name := range []string{
-		"cloud_delegate",
-		"publish_to_web",
-		"list_my_published_files",
-		"retract_published_file",
-		"generate_image",
-		"edit_image",
-	} {
+	for _, name := range authSensitivePostOverlayToolNames {
 		reg.Remove(name)
 	}
 	tools.RegisterCloudDelegate(reg, s.deps.GW, cfg, nil, "", "")
@@ -802,16 +828,10 @@ func (s *Server) RebuildAuthSensitiveTools(ctx context.Context) {
 	tools.RegisterGenerateImageTool(reg, s.deps.GW, cfg)
 	tools.RegisterEditImageTool(reg, s.deps.GW, cfg)
 
-	// Refresh third-party integration tools: a bounded call so a slow/unavailable
-	// gateway can't stall the caller (e.g. an integration connect/disconnect).
-	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := tools.RegisterIntegrationTools(itCtx, s.deps.GW, reg); err != nil {
-		log.Printf("daemon: integration tools refresh failed (continuing): %v", err)
-	}
 	// Keep the cached overlay in sync so a later MCP health rebuild preserves
-	// the tools registered in place above.
-	s.syncGatewayOverlay(reg)
+	// the tools registered in place above. Existing integration entries are
+	// retained until their own identity-aware refresh boundary.
+	s.syncToolOverlays(reg)
 }
 
 // registerRoutes wires every HTTP handler onto mux. Extracted from Start so
@@ -7440,6 +7460,7 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 
 	var regErr error
 	if mcpChanged {
+		unlockRegistry := s.deps.LockToolRegistryMutation()
 		var newReg *agent.ToolRegistry
 		var newMCPMgr *mcp.ClientManager
 		var newCleanup func()
@@ -7457,6 +7478,10 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		tools.RegisterGenerateImageTool(newReg, s.deps.GW, toolCfg)
 		tools.RegisterEditImageTool(newReg, s.deps.GW, toolCfg)
 
+		s.deps.mu.RLock()
+		previousPostOverlays := append([]agent.Tool(nil), s.deps.PostOverlays...)
+		s.deps.mu.RUnlock()
+		preserveNonAuthPostOverlays(newReg, previousPostOverlays)
 		newGatewayOverlay := tools.ExtractGatewayTools(newReg)
 		newPostOverlays := tools.ExtractPostOverlays(newReg, newBaseline)
 
@@ -7472,16 +7497,9 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 			}
 		})
 		newSupervisor.SetOnChange(func(server string, oldState, newState mcp.HealthState) {
-			_, _, depsSup := s.deps.Snapshot()
-			if depsSup != newSupervisor {
-				return
+			if rebuilt, swapped := s.deps.RebuildRegistryForMCPHealth(newSupervisor); swapped {
+				log.Printf("MCP registry rebuilt (reload): %d tools", len(rebuilt.All()))
 			}
-			bl, gwOv, po, mgr := s.deps.RebuildLayers()
-			rebuilt := tools.RebuildRegistryForHealth(bl, gwOv, po, newSupervisor.HealthStates(), mgr, newSupervisor)
-			s.deps.WriteLock()
-			s.deps.Registry = rebuilt
-			s.deps.WriteUnlock()
-			log.Printf("MCP registry rebuilt (reload): %d tools", len(rebuilt.All()))
 		})
 
 		var oldBrowser *tools.BrowserTool
@@ -7504,6 +7522,7 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		s.deps.GatewayOverlay = newGatewayOverlay
 		s.deps.PostOverlays = newPostOverlays
 		s.deps.mu.Unlock()
+		unlockRegistry()
 
 		if oldSupervisor != nil {
 			oldSupervisor.Stop()
@@ -7530,12 +7549,13 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		// reason as initial startup — CompleteRegistration creates tools
 		// before the supervisor exists).
 		{
-			bl, gwOv, po, mgr := s.deps.RebuildLayers()
-			initReg := tools.RebuildRegistryForHealth(bl, gwOv, po, newSupervisor.HealthStates(), mgr, newSupervisor)
-			s.deps.WriteLock()
-			s.deps.Registry = initReg
-			s.deps.WriteUnlock()
-			log.Printf("MCP registry initialized with supervisor (reload): %d tools", len(initReg.All()))
+			initReg, swapped := s.deps.RebuildRegistryForMCPHealth(newSupervisor)
+			if !swapped {
+				initReg = nil
+			}
+			if initReg != nil {
+				log.Printf("MCP registry initialized with supervisor (reload): %d tools", len(initReg.All()))
+			}
 		}
 
 		// Kick off per-server connect goroutines in the background. HTTP
@@ -7567,6 +7587,7 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 			go startMCP(s.ctx, onResult)
 		}
 	} else {
+		unlockRegistry := s.deps.LockToolRegistryMutation()
 		// Config changed but MCP servers didn't — update config and refresh
 		// cached rebuild layers so health-driven rebuilds use current settings.
 		newBaseline, _, newBaseCleanup := tools.RegisterLocalTools(newCfg, s.secretsStore)
@@ -7595,6 +7616,10 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		tools.RegisterRetractPublishedFileTool(freshReg, s.deps.GW, toolCfg)
 		tools.RegisterGenerateImageTool(freshReg, s.deps.GW, toolCfg)
 		tools.RegisterEditImageTool(freshReg, s.deps.GW, toolCfg)
+		s.deps.mu.RLock()
+		previousPostOverlays := append([]agent.Tool(nil), s.deps.PostOverlays...)
+		s.deps.mu.RUnlock()
+		preserveNonAuthPostOverlays(freshReg, previousPostOverlays)
 		var newGatewayOverlay []agent.Tool
 		if gwErr != nil {
 			log.Printf("daemon: reload: gateway refresh failed, keeping existing overlay: %v", gwErr)
@@ -7605,6 +7630,18 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 			newGatewayOverlay = tools.ExtractGatewayTools(freshReg)
 		}
 		newPostOverlays := tools.ExtractPostOverlays(freshReg, newBaseline)
+		s.deps.mu.RLock()
+		currentMgr := s.deps.MCPManager
+		currentSupervisor := s.deps.Supervisor
+		s.deps.mu.RUnlock()
+		var healthStates map[string]mcp.ServerHealth
+		if currentSupervisor != nil {
+			healthStates = currentSupervisor.HealthStates()
+		}
+		newLiveReg := tools.RebuildRegistryForHealth(
+			newBaseline, newGatewayOverlay, newPostOverlays,
+			healthStates, currentMgr, currentSupervisor,
+		)
 
 		var oldBrowser *tools.BrowserTool
 		s.deps.mu.Lock()
@@ -7617,11 +7654,13 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		}
 		oldCleanup := s.deps.Cleanup
 		s.deps.Config = newCfg
+		s.deps.Registry = newLiveReg
 		s.deps.BaselineReg = newBaseline
 		s.deps.GatewayOverlay = newGatewayOverlay
 		s.deps.PostOverlays = newPostOverlays
 		s.deps.Cleanup = func() { newBaseCleanup(); oldCleanup() }
 		s.deps.mu.Unlock()
+		unlockRegistry()
 
 		if oldBrowser != nil {
 			backstop := time.Duration(newCfg.Daemon.BrowserReloadBackstopSecs) * time.Second

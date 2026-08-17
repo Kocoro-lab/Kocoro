@@ -40,6 +40,7 @@ type BrowserTool struct {
 	cancel          context.CancelFunc
 	chromedpDataDir string
 	active          bool
+	currentURL      string
 
 	deprecated atomic.Bool // set by reload handoff; consulted by register.go cleanup gate
 
@@ -54,6 +55,7 @@ type BrowserTool struct {
 // Chrome. Production uses (*BrowserTool).ensureBackend. Mirrors the pattern
 // in internal/tools/mcp_tool.go ensureChromeDebugPort.
 var ensureBackendFn = (*BrowserTool).ensureBackend
+var browserCurrentURLFn = (*BrowserTool).currentPageURL
 
 type browserArgs struct {
 	Action       string `json:"action"`
@@ -139,6 +141,9 @@ func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	if err := t.validateArgs(args); err != nil {
 		return agent.ValidationError(err.Error()), nil
 	}
+	if args.Action == "navigate" && isXComposerURL(args.URL) {
+		return xAutomationBlockedResult(), nil
+	}
 
 	// Mark the per-Run browser lease BEFORE ensureBackend so a concurrent
 	// teardown observes our contribution to the counter before deciding
@@ -162,6 +167,27 @@ func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 	// Ensure a backend is available (pinchtab preferred, chromedp fallback)
 	if err := ensureBackendFn(t, ctx); err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("failed to start browser: %v", err), IsError: true}, nil
+	}
+	if browserMutationCanPublish(args) {
+		currentURL, err := browserCurrentURLFn(t, ctx, timeout)
+		composerHint := looksLikeXComposerControl(
+			args.Selector, args.Ref, args.Key, args.Value, args.Script,
+		)
+		explicitXHint := looksLikeExplicitXComposerControl(
+			args.Selector, args.Ref, args.Key, args.Value, args.Script,
+		)
+		if isXComposerURL(currentURL) {
+			return xAutomationBlockedResult(), nil
+		}
+		if _, onX := xURL(currentURL); onX && (args.Action == "execute_js" || composerHint) {
+			return xAutomationBlockedResult(), nil
+		}
+		// URL observation is best-effort, but an observation failure cannot
+		// turn an explicit X composer control into an automation escape hatch.
+		// Unknown-page mutations without a composer signal remain available.
+		if err != nil && explicitXHint {
+			return xAutomationBlockedResult(), nil
+		}
 	}
 
 	switch args.Action {
@@ -193,6 +219,52 @@ func (t *BrowserTool) Run(ctx context.Context, argsJSON string) (agent.ToolResul
 		// unreachable — validateArgs catches unknown actions
 		return agent.ToolResult{Content: fmt.Sprintf("unknown action: %q", args.Action), IsError: true}, nil
 	}
+}
+
+func browserMutationCanPublish(args browserArgs) bool {
+	switch args.Action {
+	case "click", "type", "execute_js":
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *BrowserTool) setCurrentURL(raw string) {
+	t.mu.Lock()
+	t.currentURL = strings.TrimSpace(raw)
+	t.mu.Unlock()
+}
+
+func (t *BrowserTool) cachedCurrentURL() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.currentURL
+}
+
+func (t *BrowserTool) currentPageURL(_ context.Context, timeout time.Duration) (string, error) {
+	if t.isPinchtab() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		resp, err := t.pt.text(ctx, t.tabID, "", 1, false)
+		if err == nil && strings.TrimSpace(resp.URL) != "" {
+			t.setCurrentURL(resp.URL)
+			return resp.URL, nil
+		}
+		return t.cachedCurrentURL(), err
+	}
+	chromedpCtx, ok := t.snapshotChromedpCtx()
+	if !ok {
+		return t.cachedCurrentURL(), fmt.Errorf("browser context unavailable")
+	}
+	tCtx, cancel := context.WithTimeout(chromedpCtx, timeout)
+	defer cancel()
+	var current string
+	if err := chromedp.Run(tCtx, chromedp.Location(&current)); err != nil {
+		return t.cachedCurrentURL(), err
+	}
+	t.setCurrentURL(current)
+	return current, nil
 }
 
 // validateArgs checks required params before starting a browser.
@@ -402,6 +474,7 @@ func (t *BrowserTool) navigate(_ context.Context, args browserArgs, timeout time
 		if resp.TabID != "" {
 			t.tabID = resp.TabID
 		}
+		t.setCurrentURL(resp.URL)
 
 		// Best-effort content preview — don't fail navigate if text fetch fails.
 		// Only fetch if we have a valid tab ID from this navigation response.
@@ -432,6 +505,7 @@ func (t *BrowserTool) navigate(_ context.Context, args browserArgs, timeout time
 	if err != nil {
 		return agent.ToolResult{Content: fmt.Sprintf("navigate error: %v", err), IsError: true}, nil
 	}
+	t.setCurrentURL(args.URL)
 
 	// Best-effort content preview
 	_ = chromedp.Run(tCtx, chromedp.Evaluate(

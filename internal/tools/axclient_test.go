@@ -214,7 +214,7 @@ func TestAXMutationMethodClassificationCoversHelperSideEffects(t *testing.T) {
 	}
 	for _, method := range []string{
 		"ping", "display_topology", "capture_coordinate_window", "capture_coordinate_display", "read_tree", "get_value",
-		"find", "resolve_pid", "frontmost", "list_windows", "wait_for", "annotate",
+		"find", "resolve_pid", "frontmost", "current_context", "list_windows", "wait_for", "annotate",
 		"capture_window", "check_permissions",
 	} {
 		if isAXMutationMethod(method) {
