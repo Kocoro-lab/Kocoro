@@ -321,7 +321,7 @@ type setWorkPlanArgs struct {
 func (t *setWorkPlanTool) Info() agent.ToolInfo {
 	return agent.ToolInfo{
 		Name:        "set_work_plan",
-		Description: "Maintain a concise execution progress plan for work Kocoro is actively carrying out. Use it when the current request requires multiple meaningful execution stages, dependencies, several deliverables, a long-running tool sequence, or the user explicitly asks to track progress — and always when the user themselves enumerates the execution steps as a numbered or bulleted list of actions to perform: record the checklist before starting, mirroring their structure. Do not use it for questions, explanations, small talk, translation, rewriting, one lookup, one calculation, one direct action, one schedule operation, or advice that only asks you to propose a plan; never pad simple work with filler steps to justify a plan. Submit the complete current step list each time. Update it only when a step or the task scope materially changes. This tool records progress; it does not perform work or prove completion.",
+		Description: "Records or updates the execution plan for the current task. Provide the complete list of steps, each with content and status; at most one step may be in_progress. This tool records progress — it does not perform work or prove completion. See the Work Plans guidance for when to use it.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
