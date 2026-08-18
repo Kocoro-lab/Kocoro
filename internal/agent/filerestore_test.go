@@ -22,20 +22,33 @@ func recordRead(rt *ReadTracker, path string, offset, limit int) {
 }
 
 func TestReadTracker_RecentReads(t *testing.T) {
-	// The tracker stores symlink-resolved paths, so expectations must resolve
-	// too: on macOS /tmp is a symlink to /private/tmp.
-	dir, err := filepath.EvalSymlinks("/tmp")
-	if err != nil {
-		t.Fatalf("resolve /tmp: %v", err)
+	// The tracker resolves symlinks only for paths that exist, so a bare
+	// /tmp/a.txt is stored verbatim on a clean machine but as /private/tmp/...
+	// on a Mac that happens to have that file. Use real files under a temp dir
+	// and resolve the expectations the same way, so the result does not depend
+	// on the host or on leftovers in /tmp.
+	dir := t.TempDir()
+	aPath, bPath := filepath.Join(dir, "a.txt"), filepath.Join(dir, "b.txt")
+	for _, p := range []string{aPath, bPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
 	}
-	wantA, wantB := filepath.Join(dir, "a.txt"), filepath.Join(dir, "b.txt")
+	wantA, err := filepath.EvalSymlinks(aPath)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", aPath, err)
+	}
+	wantB, err := filepath.EvalSymlinks(bPath)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", bPath, err)
+	}
 
 	rt := NewReadTracker()
-	recordRead(rt, "/tmp/a.txt", 0, 0)
+	recordRead(rt, aPath, 0, 0)
 	time.Sleep(2 * time.Millisecond)
-	recordRead(rt, "/tmp/b.txt", 0, 100)
+	recordRead(rt, bPath, 0, 100)
 	time.Sleep(2 * time.Millisecond)
-	recordRead(rt, "/tmp/a.txt", 100, 100) // newer range of the same path wins
+	recordRead(rt, aPath, 100, 100) // newer range of the same path wins
 
 	reads := rt.RecentReads(10)
 	if len(reads) != 2 {
