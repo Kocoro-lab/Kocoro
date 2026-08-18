@@ -165,6 +165,57 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 	t.Error("do_task complete result never reached mailbox")
 }
 
+func TestQwenDoTaskSendsOnlyCompletedFunctionOutput(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply": "Tokyo is nine hours ahead of UTC.", "spoken_summary": "Tokyo is nine hours ahead of UTC.", "agent": "default",
+		})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-provider-result", "")
+	disp := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	var h *eventHandler
+	h = newEventHandler(disp, state, nil, func(v any) error {
+		if err := cap.send(v); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"result-response"}}`))
+		}
+		return nil
+	})
+	h.provider = string(ProviderQwen)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.handleFunctionCallForResponse(ctx, "tool-response", "call-final", "do_task", []byte(`{"task":"check the Tokyo time offset"}`), false)
+
+	waitUntil(t, func() bool {
+		return cap.countType("conversation.item.create") == 1 && cap.countType("response.create") == 1
+	}, "completed function result was not continued")
+	if got := cap.countType("conversation.item.create"); got != 1 {
+		t.Fatalf("function output count=%d, want 1", got)
+	}
+	if cap.sentContains(`"status":"running"`) {
+		t.Fatal("provider call id was consumed by a running acknowledgement")
+	}
+	if !cap.sentContains("Tokyo is nine hours ahead of UTC.") {
+		t.Fatalf("completed daemon result missing from function output: %v", cap.types())
+	}
+	if h.resultMailbox.pending() != 0 {
+		t.Fatal("provider-native result must not enter the unsupported message mailbox path")
+	}
+}
+
 // TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel verifies S2: a hangup that
 // cancels the session ctx while a do_task is in flight must NOT abort the
 // delegation. The daemon reply is held until after the caller cancels the ctx; a
@@ -472,6 +523,56 @@ func TestInterruptOutputWhenIdleOnlyClearsInput(t *testing.T) {
 	want := []string{"input_audio_buffer.clear"}
 	if got := cap.types(); !equalStringSlices(got, want) {
 		t.Fatalf("sent event types = %v, want %v", got, want)
+	}
+}
+
+func TestQwenInterruptSkipsUnsupportedOutputClear(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-provider-interrupt", ""), nil, cap.send)
+	h.provider = string(ProviderQwen)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.interruptOutput()
+
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("response.cancel count=%d, want 1", got)
+	}
+	if got := cap.countType("output_audio_buffer.clear"); got != 0 {
+		t.Fatalf("unsupported output clear count=%d, want 0", got)
+	}
+}
+
+func TestQwenSilentRTPDoesNotExtendSpeakingGate(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-provider-silence", ""), nil, func(any) error { return nil })
+	if h.observeProviderRemoteAudio(make([]int16, audioFrameSize)) {
+		t.Fatal("idle keepalive RTP was accepted for playback")
+	}
+	if h.outputBufferActive.Load() || h.speakingEpoch.Load() != 0 {
+		t.Fatal("silent keepalive RTP opened the speaking gate")
+	}
+
+	h.respBusy.Store(true)
+	loud := make([]int16, audioFrameSize)
+	for i := range loud {
+		loud[i] = 2000
+	}
+	if !h.observeProviderRemoteAudio(loud) {
+		t.Fatal("active response RTP was rejected from playback")
+	}
+	if !h.outputBufferActive.Load() {
+		t.Fatal("audible RTP did not open the speaking gate")
+	}
+	epoch := h.speakingEpoch.Load()
+	if !h.observeProviderRemoteAudio(make([]int16, audioFrameSize)) {
+		t.Fatal("silence inside an active response was rejected from playback")
+	}
+	if got := h.speakingEpoch.Load(); got != epoch {
+		t.Fatalf("silent keepalive RTP extended speaking epoch from %d to %d", epoch, got)
+	}
+	h.respBusy.Store(false)
+	if h.observeProviderRemoteAudio(loud) {
+		t.Fatal("post-response RTP was accepted for playback")
 	}
 }
 
@@ -887,6 +988,30 @@ func TestQwenSessionConfigUsesProviderSchema(t *testing.T) {
 		if strings.Contains(s, forbidden) {
 			t.Fatalf("qwenSessionConfig contains unsupported tool schema %s in %s", forbidden, s)
 		}
+	}
+}
+
+func TestQwenResponseCreateUsesProviderSchema(t *testing.T) {
+	payload := responseCreatePayloadForProvider(responseCreateRequest{
+		instructions: "speak this result",
+		purpose:      responsePurposeTaskResult,
+		toolMode:     responseToolsDisabled,
+		requestID:    "request-1",
+	}, string(ProviderQwen))
+	raw, _ := json.Marshal(payload)
+	if got, want := string(raw), `{"type":"response.create"}`; got != want {
+		t.Fatalf("response.create payload=%s, want %s", got, want)
+	}
+}
+
+func TestQwenCreatedResponseBindsWithoutMetadata(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.setPendingResponse(responseCreateRequest{
+		purpose: responsePurposeTaskResult, requestID: "request-1",
+	})
+	if !h.bindCreatedResponse("response-1", nil) {
+		t.Fatal("provider response without metadata did not acknowledge the pending response.create")
 	}
 }
 

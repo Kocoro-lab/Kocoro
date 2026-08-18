@@ -70,7 +70,7 @@ type RealtimeConn struct {
 	interruptOutput      func()
 	onLocalSpeechStarted func()
 	onLocalSpeechEnded   func()
-	onRemoteAudio        func()
+	onRemoteAudio        func([]int16) bool
 	// callActive (nil-safe) gates mic capture: when set and it returns false, the
 	// send pump drops mic audio so Koe is NOT listening (Desktop press-to-talk —
 	// a call must be started via the control channel). nil = always send (the
@@ -120,10 +120,9 @@ func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*R
 			}
 			pcm, derr := audio.DecodeFrame(pkt.Payload)
 			if derr == nil {
-				if rc.onRemoteAudio != nil {
-					rc.onRemoteAudio()
+				if rc.onRemoteAudio == nil || rc.onRemoteAudio(pcm) {
+					audio.Play(pcm)
 				}
-				audio.Play(pcm)
 			}
 		}
 	})
@@ -523,12 +522,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	rc.callActive = opts.CallActive
 	rc.fullDuplexAEC = opts.FullDuplexAEC
 	if provider == ProviderQwen {
-		rc.onRemoteAudio = func() {
-			if !h.outputBufferActive.Swap(true) {
-				h.outputStartedAt = time.Now()
-			}
-			h.markSpeaking()
-		}
+		rc.onRemoteAudio = h.observeProviderRemoteAudio
 	}
 	var closedOnce sync.Once
 	var live atomic.Bool

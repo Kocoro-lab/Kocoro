@@ -124,8 +124,9 @@ type eventHandler struct {
 	// sends serially, waits for respCreated/respRejected, and retries a rejection.
 	respReq      chan responseCreateRequest // queued response.create requests
 	loopRespReq  chan responseCreateRequest // durable latest turn-loop continuation/closure
-	respCreated  chan struct{}              // signalled only when response.created matches the pending request token
-	respRejected chan struct{}              // signalled (buffered 1) on the active-response error
+	deferredReq  chan deferredFunctionResult
+	respCreated  chan struct{} // signalled only when response.created binds the pending local request
+	respRejected chan struct{} // signalled (buffered 1) on the active-response error
 	// resultMailbox is the connection-independent delivery plane for completed
 	// do_task speech. resultOwner leases one batch to this handler until its bound
 	// response ID reaches a completed response.done; teardown releases the lease
@@ -157,9 +158,10 @@ type eventHandler struct {
 	floorServerCleared atomic.Bool
 	activeRespMu       sync.Mutex
 	activeRespID       string
-	// pendingResponse binds a response.created only when its echoed metadata token
-	// matches the serialized response.create that caused it. Native user responses
-	// carry no local token and are registered against the newest committed turn.
+	// pendingResponse binds response.created to the serialized response.create that
+	// caused it. Providers that echo metadata use the request token; the fallback
+	// protocol serializes and binds the next created response because it has no
+	// response-level metadata field.
 	pendingResponseMu sync.Mutex
 	pendingResponse   *responseCreateRequest
 }
@@ -180,6 +182,11 @@ type responseCreateRequest struct {
 	toolMode        responseToolMode
 	dropIfPreempted bool
 	requestID       string
+}
+
+type deferredFunctionResult struct {
+	callID string
+	output json.RawMessage
 }
 
 type resultBatchState struct {
@@ -255,6 +262,24 @@ const (
 // 2026-07-02 — semantic_vad rejects the commit with an error and the audio is
 // gone), so answering from stale context would be a non-sequitur. Ask to repeat.
 const missedSpeechInstructions = "The user's last spoken words were lost before they reached you (audio capture problem on this call). In the language of this conversation, briefly tell the user you could not hear what they just said and ask them to say it again. One short sentence. Do not repeat earlier answers and do not guess what they said."
+
+func (h *eventHandler) observeProviderRemoteAudio(pcm []int16) bool {
+	// The fallback transport sends continuous silent RTP between responses. Only
+	// frames inside an active response belong in the playback queue, and only
+	// audible frames may extend the speaking epoch. Treating idle keepalives as
+	// response audio prevents the drain watchdog from releasing the result sender.
+	if !h.respBusy.Load() {
+		return false
+	}
+	if rmsLevel(pcm) < playbackIdleLevelEps {
+		return true
+	}
+	if !h.outputBufferActive.Swap(true) {
+		h.outputStartedAt = time.Now()
+	}
+	h.markSpeaking()
+	return true
+}
 
 func (h *eventHandler) markSpeaking() {
 	if h.barged.Load() {
@@ -388,7 +413,7 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 	if hadResponse {
 		_ = h.sendFn(map[string]any{"type": "response.cancel"})
 	}
-	if hadOutput {
+	if hadOutput && h.provider != string(ProviderQwen) {
 		_ = h.sendFn(map[string]any{"type": "output_audio_buffer.clear"})
 	}
 	h.maybeRestoreUserMic()
@@ -605,6 +630,7 @@ func newEventHandlerWithMailbox(disp *Dispatcher, state *CallState, audio *Audio
 		disp: disp, state: state, audio: audio, sendFn: sendFn,
 		respReq:       make(chan responseCreateRequest, 8),
 		loopRespReq:   make(chan responseCreateRequest, 1),
+		deferredReq:   make(chan deferredFunctionResult, 8),
 		respCreated:   make(chan struct{}, 1),
 		respRejected:  make(chan struct{}, 1),
 		resultMailbox: mailbox,
@@ -672,6 +698,12 @@ func (h *eventHandler) runResponseSender(ctx context.Context) {
 		h.floor.abort()
 		h.releaseResultBatch(false)
 	}()
+	// A retiring handler can consume the mailbox's shared edge-triggered wake just
+	// as its replacement starts. Inspect durable state directly on attachment so a
+	// completed result cannot remain asleep until an unrelated later notification.
+	if h.resultMailbox.pending() > 0 {
+		h.sendResultBatch(ctx)
+	}
 	for {
 		// Turn-local control responses outrank asynchronous result delivery. This
 		// keeps a paused playback decision and a tool continuation adjacent to the
@@ -685,6 +717,8 @@ func (h *eventHandler) runResponseSender(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case req := <-h.deferredReq:
+			h.sendDeferredFunctionResult(ctx, req)
 		case <-h.resultMailbox.notifications():
 			h.sendResultBatch(ctx)
 		case req := <-h.loopRespReq:
@@ -787,7 +821,7 @@ func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreat
 			return false
 		}
 		h.setPendingResponse(attemptReq)
-		err := h.sendFn(responseCreatePayload(attemptReq))
+		err := h.sendFn(responseCreatePayloadForProvider(attemptReq, h.provider))
 		h.terminalMu.Unlock()
 		if err != nil {
 			h.clearPendingResponse()
@@ -838,6 +872,13 @@ func responseCreatedMatches(req responseCreateRequest, metadata map[string]strin
 	return metadata["koe_request_id"] == req.requestID
 }
 
+func responseCreatedMatchesProvider(req responseCreateRequest, metadata map[string]string, provider string) bool {
+	if provider == string(ProviderQwen) {
+		return true
+	}
+	return responseCreatedMatches(req, metadata)
+}
+
 func responsePurposeFromMetadata(metadata map[string]string) (responsePurpose, int64, bool) {
 	purpose := responsePurpose(metadata["koe_purpose"])
 	switch purpose {
@@ -860,7 +901,7 @@ func (h *eventHandler) bindCreatedResponse(responseID string, metadata map[strin
 	}
 	h.pendingResponseMu.Lock()
 	pending := h.pendingResponse
-	matched := pending != nil && responseCreatedMatches(*pending, metadata)
+	matched := pending != nil && responseCreatedMatchesProvider(*pending, metadata, h.provider)
 	if matched {
 		h.pendingResponse = nil
 	}
@@ -1009,6 +1050,71 @@ func (h *eventHandler) waitResultVoiceGap(ctx context.Context) bool {
 		case <-time.After(resultVoicePollInterval):
 		}
 	}
+}
+
+func (h *eventHandler) queueDeferredFunctionResult(ctx context.Context, callID string, output json.RawMessage) {
+	req := deferredFunctionResult{callID: callID, output: append(json.RawMessage(nil), output...)}
+	if ctx.Err() != nil {
+		h.finishUndeliveredFunctionResult(callID, ctx.Err())
+		return
+	}
+	select {
+	case h.deferredReq <- req:
+	case <-ctx.Done():
+		h.finishUndeliveredFunctionResult(callID, ctx.Err())
+	}
+}
+
+func (h *eventHandler) sendDeferredFunctionResult(ctx context.Context, req deferredFunctionResult) {
+	if !h.waitResultVoiceGap(ctx) {
+		if ctx.Err() == nil && !h.ending.Load() && len(h.loopRespReq) > 0 {
+			select {
+			case h.deferredReq <- req:
+			default:
+				h.finishUndeliveredFunctionResult(req.callID, fmt.Errorf("deferred result queue is full"))
+			}
+			return
+		}
+		h.finishUndeliveredFunctionResult(req.callID, ctx.Err())
+		return
+	}
+	h.terminalMu.Lock()
+	if h.ending.Load() {
+		h.terminalMu.Unlock()
+		h.finishUndeliveredFunctionResult(req.callID, fmt.Errorf("call ended"))
+		return
+	}
+	err := h.sendFunctionOutputErr(req.callID, req.output)
+	h.terminalMu.Unlock()
+	if err != nil {
+		h.finishUndeliveredFunctionResult(req.callID, err)
+		return
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[result]: function output submitted call_id=%q output=%s", req.callID, logMaybeBytes(req.output, 500))
+	}
+	if h.sendResponseCreate(ctx, responseCreateRequest{
+		purpose:  responsePurposeTaskResult,
+		toolMode: responseToolsDisabled,
+	}) {
+		if eventLogEnabled() {
+			log.Printf("koe[result]: continuation accepted call_id=%q", req.callID)
+		}
+		return
+	}
+	h.finishUndeliveredFunctionResult(req.callID, fmt.Errorf("result response was not accepted"))
+}
+
+func (h *eventHandler) finishUndeliveredFunctionResult(callID string, err error) {
+	if eventLogEnabled() {
+		log.Printf("koe[result]: deferred function result not voiced call_id=%q err=%v", callID, err)
+	}
+	if h.taskInFlight() {
+		return
+	}
+	h.asyncTaskPending.Store(false)
+	h.maybeRestoreUserMic()
+	h.emitVoiceState("listening")
 }
 
 func (h *eventHandler) beginResultBatch() {
@@ -1416,6 +1522,13 @@ func (h *eventHandler) handleNativeFloorTool(responseID, callID, name string) bo
 	return true
 }
 
+func responseCreatePayloadForProvider(req responseCreateRequest, provider string) map[string]any {
+	if provider == string(ProviderQwen) {
+		return map[string]any{"type": "response.create"}
+	}
+	return responseCreatePayload(req)
+}
+
 func responseCreatePayload(req responseCreateRequest) map[string]any {
 	payload := map[string]any{"type": "response.create"}
 	response := map[string]any{}
@@ -1731,6 +1844,7 @@ func qwenSchemaAllowsNull(value any) bool {
 // controller while provider-native VAD owns interruption.
 func qwenSessionConfig(persona, voice string) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
+	instructions := strings.TrimSpace(persona + "\n\n" + deferredFunctionResultInstructions)
 	return map[string]any{
 		"event_id": fmt.Sprintf("event_%d", time.Now().UnixNano()),
 		"type":     "session.update",
@@ -1742,7 +1856,7 @@ func qwenSessionConfig(persona, voice string) map[string]any {
 			"input_audio_transcription": map[string]any{
 				"model": "qwen3-asr-flash-realtime",
 			},
-			"instructions": strings.TrimSpace(persona),
+			"instructions": instructions,
 			"turn_detection": map[string]any{
 				"type":                "server_vad",
 				"threshold":           koeEnvFloat("KOE_VAD_THRESHOLD", 0.5),
@@ -1752,6 +1866,8 @@ func qwenSessionConfig(persona, voice string) map[string]any {
 		},
 	}
 }
+
+const deferredFunctionResultInstructions = "When you call do_task, say at most one short acknowledgement, then stop and wait without inventing progress. When its function output arrives, immediately tell the user the actual outcome in at most three short conversational sentences. Preserve important facts, explicit failures, and uncertainty; do not read JSON, Markdown, URLs, or file paths aloud, and do not call another tool unless the user made a new request."
 
 // handleEvent routes one decoded oai-events message.
 func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
@@ -2226,15 +2342,15 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		h.state.SetInFlightForRoute(req.Text, req.Agent, req.ThreadID)
 		h.asyncTaskPending.Store(true)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
-		if task != nil {
+		if task != nil && h.provider != string(ProviderQwen) {
 			// Resolve the Realtime function call immediately. Keeping do_task open
 			// until a minutes-long daemon run returns prevents the native model from
 			// issuing a follow-up, a second independent task, or a cancel in the same
 			// interaction window.
 			ack, _ := json.Marshal(SayResult{Status: "running", TaskID: task.ID})
 			h.sendFunctionOutput(callID, ack)
-			h.toolLoop.noteDeferredDoTask(responseID)
 		}
+		h.toolLoop.noteDeferredDoTask(responseID)
 		originBurstID := h.state.BurstID()
 		go func() {
 			// do_task must survive session teardown: a hangup cancels the session ctx
@@ -2308,6 +2424,10 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 					len([]rune(r.Reply)), len(r.Deliverables), r.Revision, r.Supersedes, time.Since(started).Milliseconds(), derr)
 			}
 			b, _ := json.Marshal(r)
+			if h.provider == string(ProviderQwen) {
+				h.queueDeferredFunctionResult(ctx, callID, b)
+				return
+			}
 			if task == nil {
 				h.sendFunctionOutput(callID, b)
 			}
@@ -2408,7 +2528,11 @@ func (h *eventHandler) sendOutputForResponse(responseID, callID string, r SayRes
 // caller decides whether to voice (the async do_task result voices; an
 // already-replied/injected outcome does not).
 func (h *eventHandler) sendFunctionOutput(callID string, output json.RawMessage) {
-	_ = h.sendFn(map[string]any{
+	_ = h.sendFunctionOutputErr(callID, output)
+}
+
+func (h *eventHandler) sendFunctionOutputErr(callID string, output json.RawMessage) error {
+	return h.sendFn(map[string]any{
 		"type": "conversation.item.create",
 		"item": map[string]any{
 			"type":    "function_call_output",
