@@ -1592,7 +1592,9 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 	sess.MessageMeta = []session.MessageMeta{
 		{Source: "desktop", Timestamp: &firstTime},
 		{Source: "desktop", Timestamp: &secondTime},
-		{Source: "desktop", Timestamp: &tailTime},
+		{Source: "desktop", Timestamp: &tailTime, ConversationAnnotations: []session.ConversationAnnotation{
+			{SelectedText: "ARCHIVE_ONLY_OLD_REPLY", Comment: "explain this line"},
+		}},
 	}
 	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
 		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
@@ -1643,8 +1645,12 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 		MessageMeta []struct {
-			Source    string `json:"source"`
-			Timestamp string `json:"timestamp"`
+			Source                  string `json:"source"`
+			Timestamp               string `json:"timestamp"`
+			ConversationAnnotations []struct {
+				SelectedText string `json:"selected_text"`
+				Comment      string `json:"comment"`
+			} `json:"conversation_annotations"`
 		} `json:"message_meta"`
 		CompactionCheckpoint *struct {
 			SchemaVersion       int `json:"schema_version"`
@@ -1683,6 +1689,12 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 		string(cp.Messages[1].Content) != `"Previous context summary: stable state"` {
 		t.Fatalf("archive/live checkpoint semantics drifted: archive=%s checkpoint=%s",
 			detail.Messages[0].Content, cp.Messages[1].Content)
+	}
+	tailAnnotations := detail.MessageMeta[2].ConversationAnnotations
+	if len(tailAnnotations) != 1 || tailAnnotations[0].SelectedText != "ARCHIVE_ONLY_OLD_REPLY" ||
+		tailAnnotations[0].Comment != "explain this line" ||
+		len(detail.MessageMeta[0].ConversationAnnotations) != 0 {
+		t.Fatalf("consumer decode lost conversation annotations: %+v", detail.MessageMeta)
 	}
 }
 

@@ -13,6 +13,13 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/session"
 )
 
+// maxSideChatHistoryMessages bounds the panel-supplied temporary transcript on
+// POST /sessions/{id}/side-chat. Workload: a side chat is a short focused
+// aside — tens of turns, not hundreds; 100 is several times the longest panel
+// session observed in testing. When it binds the route 400s ("side chat
+// history is too long") and Desktop trims its oldest panel turns client-side.
+// Const, not viper: the bound is a request-size guard on a Desktop-only wire
+// surface, so lifting it is a coordinated Desktop + daemon change.
 const maxSideChatHistoryMessages = 100
 
 type forkSessionRequest struct {

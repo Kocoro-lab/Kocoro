@@ -13,8 +13,20 @@ import (
 )
 
 const (
-	conversationRepliesOpen               = "<kocoro_replies>"
-	conversationRepliesClose              = "</kocoro_replies>"
+	conversationRepliesOpen  = "<kocoro_replies>"
+	conversationRepliesClose = "</kocoro_replies>"
+
+	// Wire-contract caps for one message's reply envelope, mirrored by
+	// Desktop's composer (its textarea maxlength and annotation editor use the
+	// same numbers). Workload: one reply per selected passage — 100 covers a
+	// user annotating every paragraph of a very long assistant turn, 8K runes
+	// a full-screen text selection, 2K runes a paragraph-length comment. When
+	// they bind, the Desktop ingresses 400 with a stable
+	// conversation_replies_* / conversation_reply_* code; paths that cannot
+	// reject truncate only the persisted display metadata (the model still
+	// sees the full envelope). Deliberately consts, not viper: both ends of
+	// the contract hardcode the values, so lifting them is a coordinated
+	// Desktop + daemon release, never a per-machine config edit.
 	maxConversationAnnotations            = 100
 	maxConversationAnnotationQuoteRunes   = 8_000
 	maxConversationAnnotationCommentRunes = 2_000
@@ -206,15 +218,16 @@ func conversationReplyPersistedMessage(message client.Message) (client.Message, 
 // conversationReplyVisibleText splits + decodes a head envelope. stripped is
 // false (and visible == text) when there is no envelope or it fails to parse.
 // An injected-turn message (the agent loop's "[New message from user]" join of
-// drained follow-ups) is handled segment-aware, because each follow-up's
-// envelope sits at that follow-up's head inside the joined text, not at the
-// message head.
+// drained follow-ups) is handled by stripping the envelope run immediately
+// after that prefix — the only position that is a follow-up head BY
+// CONSTRUCTION. Positions further into the joined text are ambiguous (a
+// "\n\n" boundary can equally be a paragraph of the user's own prose), so a
+// later follow-up's envelope stays verbatim rather than risk eating user
+// bytes; its annotations were still delivered to the model, only the reload
+// chip for that rare merged batch is missing.
 func conversationReplyVisibleText(text string) (visible string, annotations []session.ConversationAnnotation, stripped bool) {
-	if rest, ok := strings.CutPrefix(text, agent.InjectedUserMessagePrefix); ok {
-		visible, annotations, stripped = stripJoinedConversationReplies(rest)
-		return agent.InjectedUserMessagePrefix + visible, annotations, stripped
-	}
-	split, envelope := splitConversationReplyPrompt(text)
+	rest, injected := strings.CutPrefix(text, agent.InjectedUserMessagePrefix)
+	split, envelope := splitConversationReplyPrompt(rest)
 	if envelope == "" {
 		return text, nil, false
 	}
@@ -222,47 +235,8 @@ func conversationReplyVisibleText(text string) (visible string, annotations []se
 	if annotations == nil {
 		return text, nil, false
 	}
+	if injected {
+		split = agent.InjectedUserMessagePrefix + split
+	}
 	return split, annotations, true
-}
-
-// stripJoinedConversationReplies removes every well-formed envelope run that
-// starts at the head of a "\n\n"-joined segment — the positions where a
-// drained follow-up's own head can land inside an injected-turn message.
-// Anything that fails to parse, or sits anywhere else, stays verbatim.
-func stripJoinedConversationReplies(text string) (string, []session.ConversationAnnotation, bool) {
-	var out strings.Builder
-	var annotations []session.ConversationAnnotation
-	stripped := false
-	i := 0
-	for {
-		idx := strings.Index(text[i:], conversationRepliesOpen)
-		if idx < 0 {
-			out.WriteString(text[i:])
-			break
-		}
-		abs := i + idx
-		atSegmentHead := abs == 0 || strings.HasSuffix(text[:abs], "\n\n")
-		if atSegmentHead {
-			segVisible, envelope := splitConversationReplyPrompt(text[abs:])
-			if decoded := conversationReplyAnnotations(envelope); envelope != "" && decoded != nil {
-				out.WriteString(text[:abs][i:])
-				annotations = append(annotations, decoded...)
-				if len(annotations) > maxConversationAnnotations {
-					annotations = annotations[:maxConversationAnnotations]
-				}
-				stripped = true
-				// splitConversationReplyPrompt already trimmed the separator
-				// between the envelope run and the segment's visible text.
-				text = segVisible
-				i = 0
-				continue
-			}
-		}
-		out.WriteString(text[i : abs+len(conversationRepliesOpen)])
-		i = abs + len(conversationRepliesOpen)
-	}
-	if !stripped {
-		return text, nil, false
-	}
-	return out.String(), annotations, true
 }

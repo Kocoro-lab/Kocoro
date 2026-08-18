@@ -159,6 +159,10 @@ One `####` per subsystem. Each names its code home first, then the invariant.
 
 `daemon/runner.go` + `daemon/skill_recommendation.go`. The two tools above are Direct only for capable signed-in Desktop/Kocoro requests with the feature enabled; absent from TUI, one-shot, MCP, schedule, IM, heartbeat, and watcher runs. A disconnected card-event sink does NOT change schemas — `offer_skill_installation` fails closed when invoked.
 
+#### Conversation context actions (Branch / Side Chat / reply annotations)
+
+`internal/daemon/conversation_context.go` + `conversation_reply.go`, capability `conversation_context_actions_v1`, Desktop-only transport (the agent never calls these → NOT in kocoro skill references; wire contract in `docs/desktop-wire-fixtures/` + `docs/cloud-contract-surface.md`). `POST /sessions/{id}/fork` copies history through a complete assistant turn into a normal persisted session (optional `target_agent`, validated to exist); `POST /sessions/{id}/side-chat` runs an ephemeral turn over that bounded history. `message_index` on both is a RAW-archive boundary (system-injected entries counted) — the same index space Desktop's `rawIndex` uses. Both honor a covering `CompactionCheckpoint` (fork deep-copies it; side-chat feeds checkpoint+tail via `Session.HistoryThrough`). Side chats run the NORMAL tool registry + permission engine with SSE approvals, but stay ephemeral: no session persisted, no bus events, and no question asker (`shouldInjectQuestionAsker` — the panel has no question UI, so an asker would block then report a phantom decline). Desktop text replies ride a transient head-only `<kocoro_replies>` envelope: stripped from the archive ONLY when it parses (malformed stays verbatim — lossless), decoded into `message_meta[].conversation_annotations`, limits (100 replies / 8K quote / 2K comment runes) enforced with stable 400 codes at `/message` + `/queue`.
+
 #### WS handshake
 
 `client.go`. Sends `User-Agent: kocoro/<ver>` + `X-Kocoro-Daemon-Version` + `X-Kocoro-Capabilities`.

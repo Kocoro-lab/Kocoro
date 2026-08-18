@@ -15,6 +15,8 @@ Kocoro runs AI agents locally with full computer access — files, apps, browser
 
 > **Coming from Claude Code?** Kocoro Desktop can import your existing agents, skills, and instructions from `~/.claude/` in one click — preview-then-apply via the daemon's `/migrate/claude-code/*` endpoints.
 
+In Kocoro Desktop you can also work *inside* a conversation: select any passage of a reply to annotate it with inline comments (they reach the agent alongside your next message and survive reload), open a **Side Chat** — a temporary aside with the same tools and approvals as the main conversation that vanishes when the app closes — or **branch** a finished turn into a new session, optionally under a different agent. All three are served by this daemon (`conversation_context_actions_v1`).
+
 Built on **[Shannon](https://github.com/Kocoro-lab/Shannon)** — the open-source multi-agent framework that powers both the Shannon Cloud SaaS and the self-hosted Shannon Gateway.
 
 ## Contents

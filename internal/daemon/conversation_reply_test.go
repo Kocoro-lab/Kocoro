@@ -64,6 +64,43 @@ func TestConversationReplyPersistedMessageStripsHeadEnvelopeOnly(t *testing.T) {
 	}
 }
 
+func TestInjectedTurnStripsOnlyThePrefixAdjacentEnvelope(t *testing.T) {
+	prefix := agent.InjectedUserMessagePrefix
+	env := "<kocoro_replies><reply><quote>q1</quote><comment>c1</comment></reply></kocoro_replies>"
+
+	// The envelope immediately after the inject prefix is a follow-up head by
+	// construction and is stripped.
+	head, annotations := conversationReplyPersistedMessage(client.Message{
+		Role: "user", Content: client.NewTextContent(prefix + env + "\n\nfollow-up text"),
+	})
+	if head.Content.Text() != prefix+"follow-up text" || len(annotations) != 1 {
+		t.Fatalf("prefix-adjacent envelope not stripped: %q %#v", head.Content.Text(), annotations)
+	}
+
+	// A well-formed pair at a "\n\n" boundary deeper into the joined text is
+	// indistinguishable from the user's own prose paragraph — it must stay
+	// verbatim (the old blank-line heuristic ate it).
+	prose := prefix + "please explain this snippet:\n\n" + env + "\n\nthanks"
+	kept, keptAnnotations := conversationReplyPersistedMessage(client.Message{
+		Role: "user", Content: client.NewTextContent(prose),
+	})
+	if kept.Content.Text() != prose || keptAnnotations != nil {
+		t.Fatalf("mid-join envelope was eaten: %q %#v", kept.Content.Text(), keptAnnotations)
+	}
+
+	// Block-path injected batches (files present) carry no prefix; the head
+	// envelope of the first follow-up gets the identical treatment.
+	blockMsg, blockAnnotations := conversationReplyPersistedMessage(client.Message{
+		Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+			{Type: "text", Text: env + "\n\nsee attachment"},
+			{Type: "image", Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: "abc"}},
+		}),
+	})
+	if blockMsg.Content.Blocks()[0].Text != "see attachment" || len(blockAnnotations) != 1 {
+		t.Fatalf("block-path head envelope not stripped: %#v", blockMsg.Content.Blocks())
+	}
+}
+
 func TestConversationReplyPersistedMessageKeepsMalformedEnvelopeVerbatim(t *testing.T) {
 	malformed := "<kocoro_replies><reply><quote>broken</kocoro_replies>\n\nquery"
 	kept, annotations := conversationReplyPersistedMessage(client.Message{
