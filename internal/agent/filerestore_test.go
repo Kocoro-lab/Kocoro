@@ -22,6 +22,14 @@ func recordRead(rt *ReadTracker, path string, offset, limit int) {
 }
 
 func TestReadTracker_RecentReads(t *testing.T) {
+	// The tracker stores symlink-resolved paths, so expectations must resolve
+	// too: on macOS /tmp is a symlink to /private/tmp.
+	dir, err := filepath.EvalSymlinks("/tmp")
+	if err != nil {
+		t.Fatalf("resolve /tmp: %v", err)
+	}
+	wantA, wantB := filepath.Join(dir, "a.txt"), filepath.Join(dir, "b.txt")
+
 	rt := NewReadTracker()
 	recordRead(rt, "/tmp/a.txt", 0, 0)
 	time.Sleep(2 * time.Millisecond)
@@ -33,10 +41,10 @@ func TestReadTracker_RecentReads(t *testing.T) {
 	if len(reads) != 2 {
 		t.Fatalf("per-path dedup expected 2 entries, got %d: %+v", len(reads), reads)
 	}
-	if reads[0].Path != "/tmp/a.txt" || reads[0].Offset != 100 {
+	if reads[0].Path != wantA || reads[0].Offset != 100 {
 		t.Errorf("most recent read (a.txt offset=100) must come first, got %+v", reads[0])
 	}
-	if reads[1].Path != "/tmp/b.txt" {
+	if reads[1].Path != wantB {
 		t.Errorf("second entry should be b.txt, got %+v", reads[1])
 	}
 
