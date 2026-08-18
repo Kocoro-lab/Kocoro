@@ -79,6 +79,7 @@ func NewXUploadMediaTool(uploader xMediaUploader, execute xMediaExecuteFn) *XUpl
 type xUploadMediaArgs struct {
 	FilePath    string `json:"file_path"`
 	AltText     string `json:"alt_text,omitempty"`
+	Purpose     string `json:"purpose,omitempty"`
 	Description string `json:"description,omitempty"`
 }
 
@@ -93,6 +94,9 @@ func (t *XUploadMediaTool) Info() agent.ToolInfo {
 			"transfer and the staging copy is removed afterwards.\n\n" +
 			"Formats: jpg, jpeg, png, gif, webp. Size limits (X's own): images\n" +
 			"5 MB, GIFs 15 MB. Video is not supported yet.\n\n" +
+			"Media for a DIRECT MESSAGE must be uploaded with purpose: \"dm\" —\n" +
+			"X uses a separate DM media category and attaching a default-purpose\n" +
+			"upload to a DM fails. Media for a post needs no purpose (default).\n\n" +
 			"media_id values expire on X (typically within ~24 hours) — upload\n" +
 			"shortly before posting, and do not stockpile ids." +
 			agent.DescriptionGuidance,
@@ -106,6 +110,11 @@ func (t *XUploadMediaTool) Info() agent.ToolInfo {
 				"alt_text": map[string]any{
 					"type":        "string",
 					"description": "Optional accessibility description of the image, attached to the media on X.",
+				},
+				"purpose": map[string]any{
+					"type":        "string",
+					"enum":        []string{"post", "dm"},
+					"description": "What the media will be attached to. \"dm\" is REQUIRED for direct-message attachments (X uses a separate DM media category). Default: \"post\".",
 				},
 				"description": agent.DescriptionFieldSpec,
 			},
@@ -130,6 +139,13 @@ func (t *XUploadMediaTool) run(ctx context.Context, argsJSON string) (agent.Tool
 	}
 	if strings.TrimSpace(args.Description) == "" {
 		return agent.ValidationError("x_upload_media: missing required `description` parameter"), nil
+	}
+	purpose := strings.TrimSpace(args.Purpose)
+	switch purpose {
+	case "", "post", "dm":
+	default:
+		return agent.ValidationError(fmt.Sprintf(
+			`invalid purpose %q — must be "post" (default) or "dm"`, args.Purpose)), nil
 	}
 
 	resolved, resolveErr := cwdctx.ResolveFilesystemPath(ctx, args.FilePath)
@@ -219,6 +235,11 @@ func (t *XUploadMediaTool) run(ctx context.Context, argsJSON string) (agent.Tool
 	execArgs := map[string]any{"media_url": staged.URL}
 	if strings.TrimSpace(args.AltText) != "" {
 		execArgs["alt_text"] = args.AltText
+	}
+	// Only the non-default value goes on the wire — Cloud defaults absent
+	// purpose to "post", and X needs the dm media category for DM attachments.
+	if purpose == "dm" {
+		execArgs["purpose"] = "dm"
 	}
 	resp, execErr := t.execute(ctx, "x_upload_media", execArgs, requestID)
 	if execErr != nil {

@@ -146,6 +146,50 @@ func TestXUploadMedia_AltTextOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestXUploadMedia_PurposePassthrough(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     map[string]any
+		wantSent any // nil = key must be absent
+	}{
+		{"dm sent on the wire", map[string]any{"purpose": "dm"}, "dm"},
+		{"post omitted (Cloud default)", map[string]any{"purpose": "post"}, nil},
+		{"absent omitted", map[string]any{}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool, _, calls, path := newXMediaFixture(t, "photo.png", 128)
+			tc.args["file_path"] = path
+			res := runXMediaTool(t, tool, tc.args)
+			if res.IsError {
+				t.Fatalf("unexpected error result: %s", res.Content)
+			}
+			got, present := (*calls)[0].args["purpose"]
+			if tc.wantSent == nil {
+				if present {
+					t.Errorf("purpose key sent when it should be omitted: %#v", (*calls)[0].args)
+				}
+				return
+			}
+			if got != tc.wantSent {
+				t.Errorf("purpose = %v, want %v", got, tc.wantSent)
+			}
+		})
+	}
+}
+
+func TestXUploadMedia_InvalidPurposeRejected(t *testing.T) {
+	tool, uploader, calls, path := newXMediaFixture(t, "photo.png", 128)
+
+	res := runXMediaTool(t, tool, map[string]any{"file_path": path, "purpose": "story"})
+	if !res.IsError || !strings.Contains(res.Content, `invalid purpose "story"`) {
+		t.Errorf("got (%v, %s), want invalid-purpose rejection", res.IsError, res.Content)
+	}
+	if len(uploader.uploadOpts) != 0 || len(*calls) != 0 {
+		t.Error("invalid purpose must fail before upload or execute")
+	}
+}
+
 func TestXUploadMedia_RequestIDFromToolInvocation(t *testing.T) {
 	tool, _, calls, path := newXMediaFixture(t, "photo.png", 256)
 
