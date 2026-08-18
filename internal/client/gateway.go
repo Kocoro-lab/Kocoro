@@ -1737,6 +1737,41 @@ func (c *GatewayClient) MintRealtime(ctx context.Context, model, voice string) (
 	return json.RawMessage(raw), nil
 }
 
+// ExchangeRealtimeSDP asks Cloud to perform Qwen's authenticated one-shot SDP
+// exchange. The long-lived provider key stays in Cloud; only Offer/Answer SDP
+// crosses this daemon boundary and the media plane remains direct.
+func (c *GatewayClient) ExchangeRealtimeSDP(ctx context.Context, provider, model, offerSDP string) (json.RawMessage, error) {
+	body, err := json.Marshal(map[string]string{
+		"provider":  provider,
+		"model":     model,
+		"offer_sdp": offerSDP,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/realtime/sdp", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if key := c.getAPIKey(); key != "" {
+		httpReq.Header.Set("X-API-Key", key)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+	return json.RawMessage(raw), nil
+}
+
 // SendRealtimeUsage forwards a realtime usage report (from a `response.done`
 // event: model, response_id, token details) to the Cloud usage-ingest endpoint,
 // which computes the cost server-side and debits quota. The daemon relays Koe's

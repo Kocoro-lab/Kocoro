@@ -54,8 +54,9 @@ type eventHandler struct {
 	// model + onUsage (nil-safe) report per-turn token usage for billing (G3): on
 	// each response.done, build {model, response_id, usage} and fire onUsage, which
 	// relays via the daemon to Cloud (server-side cost). Koe never sees pricing.
-	model   string
-	onUsage func(json.RawMessage)
+	provider string
+	model    string
+	onUsage  func(json.RawMessage)
 	// language is the user-pinned koe reply language ("en"/"ja"/"zh"; "" = follow the
 	// utterance). It picks the language of the MECHANICAL spoken fallbacks (transport
 	// failure / busy / misheard / agent clarify) that bypass the Realtime model; when
@@ -572,6 +573,7 @@ func (h *eventHandler) reportUsage(raw []byte) {
 		return // no usage on this response.done (e.g. an early/failed turn)
 	}
 	body, err := json.Marshal(map[string]any{
+		"provider":    h.provider,
 		"model":       h.model,
 		"response_id": rd.Response.ID,
 		"usage":       rd.Response.Usage,
@@ -1185,7 +1187,7 @@ func (h *eventHandler) finishToolLoopResponse(responseID string) {
 }
 
 func (h *eventHandler) nativeFloorEnabled() bool {
-	return h != nil && nativeFloorControlEnabled(h.fullDuplexAEC)
+	return h != nil && h.provider != string(ProviderQwen) && nativeFloorControlEnabled(h.fullDuplexAEC)
 }
 
 // pauseForNativeFloor locally freezes the exact queued PCM without cancelling or
@@ -1355,6 +1357,9 @@ func (h *eventHandler) speechItemFor(responseID string) string {
 // unknown; an overshoot estimate only makes the server reject the truncate,
 // which degrades to today's keep-full-text behavior.
 func (h *eventHandler) truncateHeldSpeech() {
+	if h.provider == string(ProviderQwen) {
+		return
+	}
 	itemID := h.speechItemFor(h.floor.heldSourceID())
 	if itemID == "" || h.outputStartedAt.IsZero() || h.floorPausedAt.Before(h.outputStartedAt) {
 		return
@@ -1597,6 +1602,39 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 			"reasoning": map[string]any{
 				"effort": koeEnvString("KOE_REASONING_EFFORT", "low"),
 			},
+		},
+	}
+}
+
+// qwenSessionConfig uses Qwen's Realtime session schema. Qwen currently lacks
+// conversation.item.truncate, so its handler disables the native cognitive-floor
+// controller while keeping server-side VAD interruption responsive.
+func qwenSessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
+	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
+	return map[string]any{
+		"type": "session.update",
+		"session": map[string]any{
+			"modalities":          []string{"text", "audio"},
+			"voice":               voice,
+			"input_audio_format":  "pcm",
+			"output_audio_format": "pcm",
+			"input_audio_transcription": map[string]any{
+				"model": "qwen3-asr-flash-realtime",
+			},
+			"instructions": strings.TrimSpace(persona),
+			"turn_detection": map[string]any{
+				"type":                "server_vad",
+				"threshold":           koeEnvFloat("KOE_VAD_THRESHOLD", 0.5),
+				"prefix_padding_ms":   300,
+				"silence_duration_ms": vadSilenceMS,
+				"create_response":     true,
+				// Qwen has no conversation.item.truncate support, so the OpenAI
+				// cognitive-floor path is disabled and provider-native interruption
+				// owns barge-in whenever the full-duplex audio path is available.
+				"interrupt_response": fullDuplexAEC,
+			},
+			"tools":       ToolDefs(),
+			"tool_choice": "auto",
 		},
 	}
 }
@@ -1915,7 +1953,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.clearActiveResponseID(ev.Response.ID)
 		}
 		h.reportUsage(raw)
-	case "response.output_audio_transcript.done":
+	case "response.output_audio_transcript.done", "response.audio_transcript.done":
 		if transcriptLogEnabled() && ev.Transcript != "" {
 			log.Printf("koe[assistant]: %q", shortLogString(ev.Transcript, 500))
 		}

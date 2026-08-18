@@ -860,6 +860,55 @@ func TestSessionConfigCanDisableNoiseReduction(t *testing.T) {
 	}
 }
 
+func TestQwenSessionConfigUsesProviderSchemaAndNativeInterruption(t *testing.T) {
+	// OpenAI's native-floor rollback sets this to 0. Qwen must ignore it because
+	// it lacks conversation.item.truncate and relies on provider-native barge-in.
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "0")
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina", true))
+	s := string(raw)
+
+	for _, want := range []string{
+		`"modalities":["text","audio"]`,
+		`"voice":"Tina"`,
+		`"input_audio_format":"pcm"`,
+		`"output_audio_format":"pcm"`,
+		`"input_audio_transcription":{"model":"qwen3-asr-flash-realtime"}`,
+		`"type":"server_vad"`,
+		`"create_response":true`,
+		`"interrupt_response":true`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("qwenSessionConfig missing %s in %s", want, s)
+		}
+	}
+	for _, forbidden := range []string{`"reasoning"`, `"output_modalities"`, `"noise_reduction"`, `"semantic_vad"`} {
+		if strings.Contains(s, forbidden) {
+			t.Fatalf("qwenSessionConfig contains OpenAI-only field %s in %s", forbidden, s)
+		}
+	}
+}
+
+func TestQwenDisablesNativeFloorAndConversationTruncate(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, nil, nil, cap.send)
+	h.provider = string(ProviderQwen)
+	h.fullDuplexAEC = true
+	if h.nativeFloorEnabled() {
+		t.Fatal("Qwen must not enable the native cognitive floor")
+	}
+	if !h.floor.begin("resp_qwen") {
+		t.Fatal("failed to arrange held response")
+	}
+	h.speechItemResp = "resp_qwen"
+	h.speechItemID = "item_qwen"
+	h.outputStartedAt = time.Now().Add(-time.Second)
+	h.floorPausedAt = time.Now()
+	h.truncateHeldSpeech()
+	if cap.sentContains("conversation.item.truncate") {
+		t.Fatal("Qwen must not receive unsupported conversation.item.truncate")
+	}
+}
+
 func TestTranscriptCompletedDoesNotCreateResponse(t *testing.T) {
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)

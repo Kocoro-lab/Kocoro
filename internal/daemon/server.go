@@ -996,6 +996,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /remote/revoke", s.handleRemoteRevoke)
 	mux.HandleFunc("POST /message", s.handleMessage)
 	mux.HandleFunc("POST /koe/realtime/mint", s.handleKoeRealtimeMint)
+	mux.HandleFunc("POST /koe/realtime/sdp", s.handleKoeRealtimeSDP)
 	mux.HandleFunc("POST /koe/realtime/usage", s.handleKoeRealtimeUsage)
 	mux.HandleFunc("GET /koe/persona", s.handleKoePersona)
 	mux.HandleFunc("POST /local/screenshot/window", s.handleScreenshotWindow)
@@ -7193,6 +7194,20 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if koePatch, ok := patch["koe"].(map[string]interface{}); ok {
+		if provider, ok := koePatch["provider"].(string); ok && !config.IsValidKoeRealtimeProvider(provider) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("koe.provider %q is not valid; use auto, openai, or qwen", provider))
+			return
+		}
+		if model, ok := koePatch["model"].(string); ok && !config.IsValidKoeRealtimeModel("openai", model) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("koe.model %q is not an allowed OpenAI Realtime model", model))
+			return
+		}
+		if model, ok := koePatch["qwen_model"].(string); ok && !config.IsValidKoeRealtimeModel("qwen", model) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("koe.qwen_model %q is not an allowed Qwen Realtime model", model))
+			return
+		}
+	}
 
 	if err := s.patchGlobalConfig(patch); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -7285,15 +7300,19 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 	if cfg != nil {
 		resp["koe"] = map[string]interface{}{
 			"enabled":          cfg.Koe.Enabled,
+			"provider":         cfg.Koe.Provider,
 			"model":            cfg.Koe.Model,
 			"voice":            cfg.Koe.Voice,
+			"qwen_model":       cfg.Koe.QwenModel,
+			"qwen_voice":       cfg.Koe.QwenVoice,
 			"agent":            cfg.Koe.Agent,
 			"language":         cfg.Koe.Language,
 			"audio_processing": cfg.Koe.AudioProcessing,
 			// Automatic fast-task toggle. nil means the runtime default (ON), so
 			// Desktop renders it enabled. Only explicit false disables semantic
 			// fast requests; full always preserves normal Agent configuration.
-			"fast_effort": cfg.Koe.FastEffort,
+			"fast_effort":      cfg.Koe.FastEffort,
+			"realtime_catalog": config.KoeRealtimeCatalog(),
 		}
 	}
 

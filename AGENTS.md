@@ -371,6 +371,13 @@ line and seeds no digest, so a cut run's progress tail is never voiced as the
 result. ASR transcripts stay asynchronous evidence — not turn control, not
 barge-in admission, not default dismissal.
 
+Realtime provider routing is WebRTC-only. Auto may change OpenAI→Qwen only for
+an eligible bootstrap failure before the session is ready and before any media,
+user input, tool action, or conversation history exists. Forced modes never
+fall back. Qwen does not support `conversation.item.truncate`, so native
+cognitive-floor control stays disabled there; do not emulate it by replaying or
+rewriting an active call.
+
 ## Tests
 
 ```bash

@@ -45,6 +45,37 @@ func (s *Server) handleKoeRealtimeMint(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(raw)
 }
 
+func (s *Server) handleKoeRealtimeSDP(w http.ResponseWriter, r *http.Request) {
+	gw := s.cloudGateway()
+	if gw == nil {
+		writeError(w, http.StatusServiceUnavailable, "cloud not configured (sign in, or set cloud.enabled + api_key)")
+		return
+	}
+	var req struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+		OfferSDP string `json:"offer_sdp"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid SDP request")
+		return
+	}
+	raw, err := gw.ExchangeRealtimeSDP(r.Context(), req.Provider, req.Model, req.OfferSDP)
+	if err != nil {
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(apiErr.StatusCode)
+			_, _ = w.Write([]byte(apiErr.Body))
+			return
+		}
+		writeError(w, http.StatusBadGateway, "SDP relay failed: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(raw)
+}
+
 // handleKoeRealtimeUsage relays Koe's realtime usage report (from a response.done
 // event: model, response_id, token details) to the Cloud usage-ingest endpoint
 // via the daemon's API key. Koe never holds a credential and never sees pricing —

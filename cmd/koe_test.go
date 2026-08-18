@@ -738,9 +738,13 @@ func TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
+		mint := func(context.Context) (string, error) { return "", fmt.Errorf("no mint in test") }
 		done <- runDesktopCall(ctx, koeConfig{controlPort: port, daemonURL: daemon.URL, model: "gpt-realtime-mini"},
 			koe.NewDaemonClient(daemon.URL),
-			func(context.Context) (string, error) { return "", fmt.Errorf("no mint in test") },
+			&realtimeConnector{
+				mode: koe.ProviderOpenAI, openAIModel: "gpt-realtime-mini", mint: mint,
+				circuit: koe.NewOpenAICircuit(time.Minute),
+			},
 			func(json.RawMessage) {})
 	}()
 
