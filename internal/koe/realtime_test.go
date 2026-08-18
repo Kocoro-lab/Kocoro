@@ -860,30 +860,32 @@ func TestSessionConfigCanDisableNoiseReduction(t *testing.T) {
 	}
 }
 
-func TestQwenSessionConfigUsesProviderSchemaAndNativeInterruption(t *testing.T) {
-	// OpenAI's native-floor rollback sets this to 0. Qwen must ignore it because
-	// it lacks conversation.item.truncate and relies on provider-native barge-in.
-	t.Setenv("KOE_INTERRUPT_RESPONSE", "0")
-	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina", true))
+func TestQwenSessionConfigUsesProviderSchema(t *testing.T) {
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
 	s := string(raw)
 
 	for _, want := range []string{
+		`"event_id":"event_`,
 		`"modalities":["text","audio"]`,
 		`"voice":"Tina"`,
 		`"input_audio_format":"pcm"`,
 		`"output_audio_format":"pcm"`,
 		`"input_audio_transcription":{"model":"qwen3-asr-flash-realtime"}`,
 		`"type":"server_vad"`,
-		`"create_response":true`,
-		`"interrupt_response":true`,
+		`"function":{"name":"do_task"`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("qwenSessionConfig missing %s in %s", want, s)
 		}
 	}
-	for _, forbidden := range []string{`"reasoning"`, `"output_modalities"`, `"noise_reduction"`, `"semantic_vad"`} {
+	for _, forbidden := range []string{`"reasoning"`, `"output_modalities"`, `"noise_reduction"`, `"semantic_vad"`, `"prefix_padding_ms"`, `"create_response"`, `"interrupt_response"`, `"tool_choice"`} {
 		if strings.Contains(s, forbidden) {
 			t.Fatalf("qwenSessionConfig contains OpenAI-only field %s in %s", forbidden, s)
+		}
+	}
+	for _, forbidden := range []string{`"type":["string","null"]`, `"additionalProperties"`, `"enum":["new","follow_up",null]`} {
+		if strings.Contains(s, forbidden) {
+			t.Fatalf("qwenSessionConfig contains unsupported tool schema %s in %s", forbidden, s)
 		}
 	}
 }

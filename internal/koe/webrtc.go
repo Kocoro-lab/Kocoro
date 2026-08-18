@@ -581,7 +581,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 			rc.setDataChannel(dc)
 			var payload map[string]any
 			if provider == ProviderQwen {
-				payload = qwenSessionConfig(persona, qwenVoice, opts.FullDuplexAEC)
+				payload = qwenSessionConfig(persona, qwenVoice)
 			} else {
 				payload = sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
 			}

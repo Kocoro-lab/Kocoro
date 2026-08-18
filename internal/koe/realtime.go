@@ -1606,13 +1606,134 @@ func sessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
 	}
 }
 
+type qwenToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type qwenToolDef struct {
+	Type     string           `json:"type"`
+	Function qwenToolFunction `json:"function"`
+}
+
+func qwenToolDefs() []qwenToolDef {
+	defs := ToolDefs()
+	result := make([]qwenToolDef, 0, len(defs))
+	for _, def := range defs {
+		result = append(result, qwenToolDef{
+			Type: def.Type,
+			Function: qwenToolFunction{
+				Name:        def.Name,
+				Description: def.Description,
+				Parameters:  qwenToolParameters(def.Parameters),
+			},
+		})
+	}
+	return result
+}
+
+func qwenToolParameters(raw json.RawMessage) json.RawMessage {
+	var schema any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return raw
+	}
+	normalized, err := json.Marshal(normalizeQwenToolSchema(schema))
+	if err != nil {
+		return raw
+	}
+	return normalized
+}
+
+func normalizeQwenToolSchema(value any) any {
+	switch schema := value.(type) {
+	case map[string]any:
+		optional := make(map[string]bool)
+		if properties, ok := schema["properties"].(map[string]any); ok {
+			for name, property := range properties {
+				if qwenSchemaAllowsNull(property) {
+					optional[name] = true
+				}
+			}
+		}
+		result := make(map[string]any, len(schema))
+		for key, item := range schema {
+			switch key {
+			case "additionalProperties":
+				continue
+			case "type":
+				if types, ok := item.([]any); ok {
+					for _, candidate := range types {
+						if name, ok := candidate.(string); ok && name != "null" {
+							result[key] = name
+							break
+						}
+					}
+					continue
+				}
+			case "enum":
+				if values, ok := item.([]any); ok {
+					filtered := make([]any, 0, len(values))
+					for _, candidate := range values {
+						if candidate != nil {
+							filtered = append(filtered, normalizeQwenToolSchema(candidate))
+						}
+					}
+					result[key] = filtered
+					continue
+				}
+			case "required":
+				if required, ok := item.([]any); ok {
+					filtered := make([]any, 0, len(required))
+					for _, candidate := range required {
+						name, _ := candidate.(string)
+						if !optional[name] {
+							filtered = append(filtered, candidate)
+						}
+					}
+					result[key] = filtered
+					continue
+				}
+			}
+			result[key] = normalizeQwenToolSchema(item)
+		}
+		return result
+	case []any:
+		result := make([]any, 0, len(schema))
+		for _, item := range schema {
+			result = append(result, normalizeQwenToolSchema(item))
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+func qwenSchemaAllowsNull(value any) bool {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	types, ok := schema["type"].([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range types {
+		if item == "null" {
+			return true
+		}
+	}
+	return false
+}
+
 // qwenSessionConfig uses Qwen's Realtime session schema. Qwen currently lacks
 // conversation.item.truncate, so its handler disables the native cognitive-floor
-// controller while keeping server-side VAD interruption responsive.
-func qwenSessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any {
+// controller while provider-native VAD owns interruption.
+func qwenSessionConfig(persona, voice string) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	return map[string]any{
-		"type": "session.update",
+		"event_id": fmt.Sprintf("event_%d", time.Now().UnixNano()),
+		"type":     "session.update",
 		"session": map[string]any{
 			"modalities":          []string{"text", "audio"},
 			"voice":               voice,
@@ -1625,16 +1746,9 @@ func qwenSessionConfig(persona, voice string, fullDuplexAEC bool) map[string]any
 			"turn_detection": map[string]any{
 				"type":                "server_vad",
 				"threshold":           koeEnvFloat("KOE_VAD_THRESHOLD", 0.5),
-				"prefix_padding_ms":   300,
 				"silence_duration_ms": vadSilenceMS,
-				"create_response":     true,
-				// Qwen has no conversation.item.truncate support, so the OpenAI
-				// cognitive-floor path is disabled and provider-native interruption
-				// owns barge-in whenever the full-duplex audio path is available.
-				"interrupt_response": fullDuplexAEC,
 			},
-			"tools":       ToolDefs(),
-			"tool_choice": "auto",
+			"tools": qwenToolDefs(),
 		},
 	}
 }
