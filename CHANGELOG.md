@@ -2,6 +2,12 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Changed
+
+- **`integration_connect_body_v1` now carries connect params, not credentials** — Cloud migrated its integration vendor (Klavis → Composio) in 2026-08 and retired the token / `set_auth` connect mode, so the v0.4.3 note below no longer describes any provider: none returns an immediately-active connection, and none takes a pasted credential. Every provider authorizes in the browser — `connect` returns `{connection_id, oauth_url, status:"pending"}` and the renderer opens the URL. The daemon's wire behaviour is unchanged (body forwarded verbatim, 64 KiB cap, `Content-Type` only when a body is present, whitespace-only treated as absent), but what rides the body is now a provider's declared connect-time parameters, and Shopify / Jira / Confluence / Salesforce **require** `{params:{subdomain}}`. Desktop must gate its connect-param form on this token: an older daemon drops the body and Cloud rejects the connect for the missing parameter. The token keeps its name because the behaviour it advertises did not change.
+
 ## v0.4.6 — 2026-08-17 — Safe X connector execution
 
 **Integration tools now prove which signed-in principal authorized them, and publishing to X stays in the user's hands.** A tool captured its API key by value, so a registry clone or an agent loop holding an old pointer could still dispatch after the account changed underneath it. Separately, a native X connector that can read timelines is one click away from being a connector that publishes — so the browser-driving paths are fenced rather than trusted.

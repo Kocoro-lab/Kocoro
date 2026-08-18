@@ -82,16 +82,14 @@ func (s *Server) InvalidateIntegrationTools() {
 // refreshIntegrationToolsAsync fires RefreshIntegrationTools in the background
 // so it never delays the HTTP response.
 //
-// For an OAuth provider, `connect` returns an oauth_url and the connection
-// only goes active AFTER the user completes OAuth in the browser — out of band
-// from this daemon — so this call populates tools immediately only for a
-// re-connect of an already-authorized provider; first-time activation reliably
-// lands via the explicit POST /integrations/refresh (Desktop calls it once the
-// connection is confirmed active), the sign-in refresh (OnAPIKeyChanged), or
-// daemon restart. For a token-mode provider (Shopify) the connection is active
-// on the connect response itself, so this refresh registers its tools right
-// away. `delete` is immediate: the provider's tools are dropped on the next
-// refresh.
+// Every provider is OAuth-based (Composio vendor migration, 2026-08): `connect`
+// returns an oauth_url and the connection only goes active AFTER the user
+// completes OAuth in the browser — out of band from this daemon. So the
+// post-connect refresh is a best-effort backstop that normally finds nothing;
+// activation reliably lands via the explicit POST /integrations/refresh
+// (Desktop calls it once the connection is confirmed active), the sign-in
+// refresh (OnAPIKeyChanged), or daemon restart. `delete` is immediate: the
+// provider's tools are dropped on the next refresh.
 func (s *Server) refreshIntegrationToolsAsync() {
 	go func() {
 		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
@@ -123,8 +121,10 @@ func (s *Server) integrationsCloudReady(w http.ResponseWriter) bool {
 }
 
 // maxIntegrationConnectBodyBytes bounds the connect request body forwarded to
-// Cloud. Token-mode providers (Shopify) send a small {params:{shop,
-// access_token}} object well under 1 KiB; 64 KiB leaves generous headroom for
+// Cloud. The real payload is a tiny declared-params object (e.g. Shopify /
+// Jira / Confluence / Salesforce send {params:{subdomain}} well under 1 KiB)
+// and Cloud caps its own decode at 4 KiB, so this only exists to stop a
+// runaway local client before the round-trip; 64 KiB leaves headroom for
 // future provider params. When it binds, the handler returns 413 — bump this
 // constant if a provider ever needs more.
 const maxIntegrationConnectBodyBytes = 64 << 10
@@ -148,13 +148,14 @@ func truncateForConnectLog(s string) string {
 // logIntegrationConnectFailure records a structured warn log for a failed
 // connect passthrough so provider/status/error-code/message are diagnosable
 // offline (Desktop only shows the message in a dialog). Response-side content
-// only: the request body may carry credentials and is never logged. The
+// only: the request body is caller-supplied and is never logged. The
 // parsed branch is safe by contract (Cloud keeps {"error": "<code>",
 // "message": "<detail>"} failure bodies credential-free); a NON-contract body
 // carries no such guarantee — an intermediary or framework validation error
 // can echo request input (e.g. a pydantic 422 quotes the submitted value) —
-// so the raw body is quoted only when the request had no body to echo
-// (OAuth connects); token-mode failures degrade to the body length. provider
+// so the raw body is quoted only when the request carried no body to echo (a
+// provider declaring no connect params); a connect that did send params
+// degrades to the body length. provider
 // is an untrusted percent-decoded path segment, so it is %q-quoted everywhere
 // to keep newline injection out of the log stream.
 func logIntegrationConnectFailure(provider string, status int, body []byte, requestHadBody bool, elapsed time.Duration) {
@@ -177,14 +178,16 @@ func logIntegrationConnectFailure(provider string, status int, body []byte, requ
 }
 
 // handleConnectIntegration proxies POST /integrations/{provider}/connect to
-// Cloud, forwarding the client's JSON body verbatim. OAuth providers send no
-// body and get back {connection_id, oauth_url} the renderer opens to complete
-// authorization; token-mode providers (e.g. Shopify) send credentials in the
-// body and get back an active connection directly. The body may carry
-// long-lived credentials — never log or persist it. The response side is a
-// verbatim Cloud passthrough, so the end-to-end invariant also relies on the
-// Cloud contract keeping connect error bodies credential-free (never quoting
-// a rejected token back).
+// Cloud, forwarding the client's JSON body verbatim. Every provider completes
+// authorization through the browser: the response is {connection_id,
+// oauth_url, status} and the renderer opens the URL. Providers that declare
+// connect-time parameters (Shopify / Jira / Confluence / Salesforce:
+// {params:{subdomain}}) carry them in the body; Cloud forwards only declared
+// params. The body is treated as sensitive and never logged or persisted —
+// it is caller-supplied and a future provider may again deliver a credential
+// this way. The response side is a verbatim Cloud passthrough, so the
+// end-to-end invariant also relies on the Cloud contract keeping connect
+// error bodies credential-free.
 func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request) {
 	if !s.integrationsCloudReady(w) {
 		return
@@ -207,8 +210,8 @@ func (s *Server) handleConnectIntegration(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// A whitespace-only payload counts as absent so a renderer quirk (empty
-	// string, stray newline) cannot flip an OAuth connect onto the token-mode
-	// wire shape.
+	// string, stray newline) cannot turn a param-less connect into a
+	// body-carrying request Cloud must then decode.
 	if len(bytes.TrimSpace(reqBody)) == 0 {
 		reqBody = nil
 	}
