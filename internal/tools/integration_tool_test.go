@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -475,11 +474,13 @@ func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsN
 // self-correct — never the outcome-unknown wording. Material side effect is
 // journaled known-no-effect because Cloud confirms nothing ran.
 func TestIntegrationTool_ProviderRejectedIsOrdinaryErrorWithDetail(t *testing.T) {
+	// Cloud's pinned wire shape: HTTP 422 (deliberately not 409, which the
+	// material path treats as outcome-unknown) with the two-field envelope.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
+		w.WriteHeader(http.StatusUnprocessableEntity)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error":        "provider_rejected",
-			"error_detail": "You are not allowed to create a Tweet with duplicate content.",
+			"error_detail": "x api rejected x_create_post with status 403: You are not allowed to create a Tweet with duplicate content.",
 		})
 	}))
 	defer server.Close()
@@ -585,9 +586,12 @@ func TestIntegrationTool_MaterialCallInProgressExhaustionPersistsOutcomeUnknown(
 	)
 	loop.SetCheckpointFunc(func(context.Context) error { return nil })
 	loop.SetSideEffectExecutionJournal(journal)
-	_, _, err := loop.Run(context.Background(), "post hello", nil, nil)
-	if !errors.Is(err, agent.ErrSideEffectOutcomeUnknown) {
-		t.Fatalf("Run error = %v, want outcome unknown", err)
+	// Exhausted bounded polling journals outcome_unknown, and the run now
+	// CONTINUES so the model can narrate the uncertainty (the same-turn retry
+	// latch blocks a byte-identical re-dispatch).
+	text, _, err := loop.Run(context.Background(), "post hello", nil, nil)
+	if err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v), want narrated completion", text, err)
 	}
 	if journal.committed != 0 || journal.unknown != 1 {
 		t.Fatalf("journal committed=%d unknown=%d, want 0/1", journal.committed, journal.unknown)

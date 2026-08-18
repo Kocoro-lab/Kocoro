@@ -256,9 +256,16 @@ material tools remain `outcome_unknown`. Integration usage preserves provider, m
 unit type/count, and cost through the tool result and usage emitter.
 `call_in_progress` is a separate known state: read-only calls may retry after
 waiting. Material calls poll only with the same durable request identity; if
-that bounded polling is exhausted, the result is journaled `outcome_unknown`,
-never committed, and the loop terminates rather than resending under a new
-identity.
+that bounded polling is exhausted, the result is journaled `outcome_unknown`
+and never committed. An outcome-unknown material result returns to the model
+as an ORDINARY narratable tool error (the run continues — no synthetic
+terminal assistant message), while the same-turn retry latch
+(`agent/unknown_outcome_gate.go`) locally rejects any byte-identical
+tool+arguments repeat for the rest of the user turn — before the approval
+flow, with zero network. The next user message (fresh run or committed
+mid-run injected follow-up) clears the latch; different arguments pass
+through. The journal-unavailable sibling (call definitively never executed)
+also continues as an ordinary error.
 
 #### Integration tools: refresh triggers
 

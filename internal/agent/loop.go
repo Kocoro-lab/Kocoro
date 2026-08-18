@@ -1081,6 +1081,9 @@ type AgentLoop struct {
 	// machine. nil preserves the legacy execution path for callers that have
 	// not installed a persistent journal.
 	sideEffectJournal SideEffectExecutionJournal
+	// unknownOutcomeRetryGate latches exact tool+args calls whose outcome
+	// became unknown this user turn; see unknown_outcome_gate.go.
+	unknownOutcomeRetryGate map[string]struct{}
 	// sideEffectDispatchPersisted runs after the journal has durably saved the
 	// pre-dispatch checkpoint. Daemon uses it to consume drained mailbox rows
 	// only after their text and dispatch boundary share a durable session save.
@@ -2815,6 +2818,7 @@ type toolExecResult struct {
 	executed                    bool   // Tool.Run was entered; synthetic admissions and skipped siblings stay false
 	sideEffectResultDigest      string // exact digest stored by the durable side-effect journal
 	sideEffectResultTransformed bool
+	sideEffectOutcomeUnknown    bool // this call's journal record is outcome_unknown; arms the retry latch
 }
 
 // approvedToolCall tracks a tool call that passed permission checks and pre-hooks.
@@ -2985,6 +2989,10 @@ func (a *AgentLoop) run(ctx context.Context, userMessage string, userContent []c
 	a.runMsgTimestamps = nil // reset for this run
 	a.compactionCheckpointMessages = nil
 	a.lastRunStatus = RunStatus{}
+	// A new run starts with a new user message (or a human-visible resume):
+	// the human is back in the loop, so latched uncertain mutations may be
+	// deliberately retried again.
+	a.clearUnknownOutcomeGate()
 	if !initialUserInjected {
 		a.clearRunComputerProfile()
 	}
@@ -4484,6 +4492,9 @@ iterationLoop:
 			// flight). A Go channel can't remove specific elements, so filter here,
 			// post-drain; commitInjectedTurn does the append/emit/mailbox path.
 			if drained := a.filterRetractedInjects(drainInjected(a.injectCh)); len(drained) > 0 {
+				// A committed mid-run follow-up is a new user message: clear
+				// the uncertain-mutation latch exactly like a fresh run does.
+				a.clearUnknownOutcomeGate()
 				commitInjectedTurn(drained)
 			}
 		}
@@ -6473,6 +6484,26 @@ iterationLoop:
 
 			callMeta[idx].stateTraits = resolveCallStateTraits(fc.Name, argsStr)
 
+			// Mechanical retry latch: a byte-identical repeat of a call whose
+			// outcome became unknown earlier this turn is rejected locally —
+			// before the approval flow and before any network dispatch. See
+			// unknown_outcome_gate.go for the lifecycle.
+			if a.unknownOutcomeGateBlocks(fc.Name, argsStr) {
+				blocked := unknownOutcomeGateBlockedResult(fc.Name)
+				a.logAudit(fc.Name, argsStr, blocked.Content, "deny", false, 0, nil)
+				callMeta[idx].decision = "deny"
+				callMeta[idx].resolution = "denied"
+				callMeta[idx].resolved = true
+				execResults[idx] = toolExecResult{
+					result: blocked,
+					name:   fc.Name,
+				}
+				if a.handler != nil {
+					a.handler.OnToolResult(fc.Name, argsStr, fc.ID, blocked, 0)
+				}
+				continue
+			}
+
 			// Permission check
 			decision, wasApproved := a.checkPermissionAndApproval(ctx, fc.Name, argsStr, tool, approvalCache)
 			callMeta[idx].decision = decision
@@ -7068,43 +7099,34 @@ iterationLoop:
 		}
 
 		if sideEffectExecutionErr != nil {
-			// Pair and persist the synthetic result, but never ask the model to
-			// interpret or retry an uncertain mutation. A cancellation that raced
-			// with Tool.Run must not suppress this final local durability attempt.
-			terminalText := "The external action was not executed because its durable execution record could not be saved."
-			if errors.Is(sideEffectExecutionErr, ErrSideEffectOutcomeUnknown) {
-				terminalText = "The external action may have completed, but its result could not be durably confirmed. It was not retried. Review the external system before retrying."
-			}
-			messages = append(messages, client.Message{
-				Role:    "assistant",
-				Content: client.NewTextContent(terminalText),
-			})
-			stampMessage()
-			captureRunMessages()
-			a.tracker.MarkDirty()
-			if checkpointErr := a.checkpointNow(context.WithoutCancel(ctx)); checkpointErr != nil {
-				sideEffectExecutionErr = fmt.Errorf(
-					"%w: persist terminal side-effect result: %v",
-					sideEffectExecutionErr,
-					checkpointErr,
-				)
-			}
+			// The uncertain (or failed-to-journal) results are already paired
+			// into the transcript as ordinary tool errors above. Hand them
+			// back to the model to narrate — in the user's language, with a
+			// suggestion to verify the external system — instead of ending
+			// the run on a fixed assistant message the user could not act on.
+			// Continuing is safe: the retry latch below rejects a
+			// byte-identical automatic retry for the rest of this user turn,
+			// and the journal-unavailable sibling was definitively never
+			// executed. The tool_result pairing keeps the persisted history
+			// resume-legal (no synthetic consecutive assistant messages).
 			code := runstatus.CodeSideEffectJournalUnavailable
-			partial := false
-			detail := "material tool execution stopped before dispatch because its durable journal was unavailable"
+			detail := "material tool execution stopped before dispatch because its durable journal was unavailable; the call was not executed"
 			if errors.Is(sideEffectExecutionErr, ErrSideEffectOutcomeUnknown) {
 				code = runstatus.CodeSideEffectOutcomeUnknown
-				partial = true
-				detail = "external state may have changed; automatic continuation and retry were stopped"
+				detail = "external state may have changed; the identical call is blocked locally for the rest of this turn"
+				for i := range execResults {
+					if execResults[i].sideEffectOutcomeUnknown {
+						a.armUnknownOutcomeGate(execResults[i].name, callMeta[i].argsStr)
+					}
+				}
 			}
-			setRunStatus(code, partial)
 			if rs, ok := a.handler.(RunStatusHandler); ok {
 				rs.OnRunStatus(string(code), detail)
 			}
-			if a.handler != nil {
-				a.handler.OnText(terminalText)
-			}
-			return terminalText, usage, sideEffectExecutionErr
+			// Persist the journal-state-bearing pair promptly through the
+			// standard end-of-iteration forced checkpoint.
+			resultCheckpointPending = true
+			sideEffectExecutionErr = nil
 		}
 
 		// Latch a forced checkpoint when any result in this batch mutated

@@ -142,7 +142,10 @@ func sideEffectJournalUnavailableResult(toolName string) ToolResult {
 
 func sideEffectOutcomeUnknownResult(toolName, detail string) ToolResult {
 	content := fmt.Sprintf(
-		"%s may have changed external state, but its outcome could not be confirmed; review the external system before retrying", toolName,
+		"%s may have changed external state, but its outcome could not be confirmed. "+
+			"It was NOT retried automatically, and a byte-identical retry is blocked locally for the rest of this turn. "+
+			"Explain the situation to the user in their language and suggest verifying directly in the external system before any retry.",
+		toolName,
 	)
 	if detail = strings.TrimSpace(detail); detail != "" {
 		content += "\n\nTool detail before the outcome became uncertain:\n" + detail

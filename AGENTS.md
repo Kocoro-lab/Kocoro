@@ -91,6 +91,11 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   known-no-effect; billing/provider/post-dispatch failures are not. Preserve
   provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted material
   `call_in_progress` is `outcome_unknown`: never commit/resend under a new ID.
+- An outcome-unknown material result is an ordinary narratable tool error (the
+  run continues); the same-turn retry latch (`agent/unknown_outcome_gate.go`)
+  locally rejects a byte-identical tool+args repeat until the next user
+  message. Journal-unavailable (never executed) also continues as an ordinary
+  error.
 - SourceIntegration is identity-scoped. Key mutation invalidates generations
   before source clear, without the dispatch writer. Failed new-identity listing
   leaves it empty; same-identity refresh failure keeps it. ServerTool binds list
