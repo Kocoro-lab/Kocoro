@@ -136,6 +136,10 @@ ordinary turn.
   and `superseded_by_recency` is an older value kept for audit — prefer
   current unless the user asked about the past. Do not quote these field
   names in user-facing replies.
+- For how-many / how-much questions, `direct_relation` may set
+  `aggregator` to `count` or `sum` and an explicit `YYYY-MM-DD/YYYY-MM-DD`
+  `time_window`. A withheld count arrives as `reason: incomplete` with
+  `aggregation.known_lower_bound` — do not treat that as a finished total.
 - For an unnamed reference such as “my doctor” or “that plan”, use
   `session_search` to recover the concrete name or raw wording instead of
   inventing a graph anchor.

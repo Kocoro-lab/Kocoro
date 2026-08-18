@@ -520,6 +520,7 @@ func TestMemoryEvidenceGuidanceTracksEvidenceStrength(t *testing.T) {
 		"corroborated",
 		"singleton, derived, text, or missing/unknown",
 		"do not quote evidence_tier field names, bracketed markers, or counts",
+		"prefer current unless the user asked about the past",
 		"keep relevant weaker items but qualify them",
 		"Do not add people, organizations, roles, or attributes",
 	} {

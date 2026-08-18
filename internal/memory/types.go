@@ -4,7 +4,10 @@
 // memory sidecar HTTP contract.
 package memory
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type QueryMode string
 
@@ -22,6 +25,7 @@ type QueryIntent struct {
 	ScopeFilter         []string  `json:"scope_filter,omitempty"`
 	TargetSlot          string    `json:"target_slot,omitempty"`
 	TimeWindow          *string   `json:"time_window,omitempty"`
+	Aggregator          string    `json:"aggregator,omitempty"`
 	EvidenceBudget      int       `json:"evidence_budget,omitempty"`
 	ResultLimit         int       `json:"result_limit,omitempty"`
 }
@@ -33,17 +37,41 @@ type QueryRequest struct {
 }
 
 type QueryCandidate struct {
-	Value                string      `json:"value"`
-	Score                float64     `json:"score"`
-	Evidence             string      `json:"evidence"`
-	SupportingEventIDs   []string    `json:"supporting_event_ids"`
-	SupportCount         *int        `json:"support_count,omitempty"`
-	DistinctSessionCount *int        `json:"distinct_session_count,omitempty"`
-	EntityID             *string     `json:"entity_id,omitempty"`
-	Scope                *string     `json:"scope,omitempty"`
-	ObservedPath         []HopRecord `json:"observed_path,omitempty"`
-	PathCollisionCount   int         `json:"path_collision_count,omitempty"`
-	TemporalStatus       string      `json:"temporal_status,omitempty"`
+	Value                string                     `json:"value"`
+	Score                float64                    `json:"score"`
+	Evidence             string                     `json:"evidence"`
+	SupportingEventIDs   []string                   `json:"supporting_event_ids"`
+	SupportCount         *int                       `json:"support_count,omitempty"`
+	DistinctSessionCount *int                       `json:"distinct_session_count,omitempty"`
+	EntityID             *string                    `json:"entity_id,omitempty"`
+	Scope                *string                    `json:"scope,omitempty"`
+	ObservedPath         []HopRecord                `json:"observed_path,omitempty"`
+	PathCollisionCount   int                        `json:"path_collision_count,omitempty"`
+	TemporalStatus       string                     `json:"temporal_status,omitempty"`
+	Extra                map[string]json.RawMessage `json:"-"`
+}
+
+var queryCandidateKnownKeys = []string{
+	"value", "score", "evidence", "supporting_event_ids", "support_count",
+	"distinct_session_count", "entity_id", "scope", "observed_path",
+	"path_collision_count", "temporal_status",
+}
+
+func (c *QueryCandidate) UnmarshalJSON(data []byte) error {
+	type alias QueryCandidate
+	var known alias
+	extra, err := unmarshalKeepingExtra(data, &known, queryCandidateKnownKeys)
+	if err != nil {
+		return err
+	}
+	*c = QueryCandidate(known)
+	c.Extra = extra
+	return nil
+}
+
+func (c QueryCandidate) MarshalJSON() ([]byte, error) {
+	type alias QueryCandidate
+	return marshalWithExtra(alias(c), c.Extra)
 }
 
 // HopRecord is one edge of a path-narration walk emitted by path_query.
@@ -63,19 +91,44 @@ type HopRecord struct {
 // via_relations tagging (direct_relation), and observed_path narration
 // (path_query).
 type MemoryCandidateGroup struct {
-	Value              string      `json:"value"`
-	Score              float64     `json:"score"`
-	Evidence           string      `json:"evidence"`
-	EvidenceTier       string      `json:"evidence_tier,omitempty"`
-	SupportCount       int         `json:"support_count"`
-	SupportingEventIDs []string    `json:"supporting_event_ids"`
-	EntityIDs          []string    `json:"entity_ids"`
-	Scopes             []string    `json:"scopes"`
-	ViaRelations       []string    `json:"via_relations"`
-	ViaAnchorEntityIDs []string    `json:"via_anchor_entity_ids"`
-	ObservedPath       []HopRecord `json:"observed_path"`
-	PathCollisionCount int         `json:"path_collision_count"`
-	TemporalStatus     string      `json:"temporal_status,omitempty"`
+	Value              string                     `json:"value"`
+	Score              float64                    `json:"score"`
+	Evidence           string                     `json:"evidence"`
+	EvidenceTier       string                     `json:"evidence_tier,omitempty"`
+	SupportCount       int                        `json:"support_count"`
+	SupportingEventIDs []string                   `json:"supporting_event_ids"`
+	EntityIDs          []string                   `json:"entity_ids"`
+	Scopes             []string                   `json:"scopes"`
+	ViaRelations       []string                   `json:"via_relations"`
+	ViaAnchorEntityIDs []string                   `json:"via_anchor_entity_ids"`
+	ObservedPath       []HopRecord                `json:"observed_path"`
+	PathCollisionCount int                        `json:"path_collision_count"`
+	TemporalStatus     string                     `json:"temporal_status,omitempty"`
+	Extra              map[string]json.RawMessage `json:"-"`
+}
+
+var memoryCandidateGroupKnownKeys = []string{
+	"value", "score", "evidence", "evidence_tier", "support_count",
+	"supporting_event_ids", "entity_ids", "scopes", "via_relations",
+	"via_anchor_entity_ids", "observed_path", "path_collision_count",
+	"temporal_status",
+}
+
+func (g *MemoryCandidateGroup) UnmarshalJSON(data []byte) error {
+	type alias MemoryCandidateGroup
+	var known alias
+	extra, err := unmarshalKeepingExtra(data, &known, memoryCandidateGroupKnownKeys)
+	if err != nil {
+		return err
+	}
+	*g = MemoryCandidateGroup(known)
+	g.Extra = extra
+	return nil
+}
+
+func (g MemoryCandidateGroup) MarshalJSON() ([]byte, error) {
+	type alias MemoryCandidateGroup
+	return marshalWithExtra(alias(g), g.Extra)
 }
 
 // MemoryBlock is the structured LLM-facing view emitted by the sidecar's

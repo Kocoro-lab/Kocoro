@@ -302,7 +302,8 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   preflight. Route unnamed references to session search; stop after a structured
   no-data instead of retrying relation variants. Keep sidecar `temporal_status`
   (`current` / `superseded_by_recency`) on recall groups; prefer current
-  unless the user asked about the past.
+  unless the user asked about the past. Preserve unknown sidecar group
+  fields on the recall round-trip. `aggregator` is `direct_relation` only.
 - Session sync is opt-in: single Run entry point, flock, atomic markers,
   per-session ACKs. Permanent failures remain until the source session changes.
 - Browser file previews stay fail-closed: only effective session CWD and attached

@@ -884,6 +884,9 @@ func renderPrivateMemoryContext(intents []memory.QueryIntent, results []memory.Q
 		body.WriteString("\n")
 		for _, g := range env.MemoryBlock.Groups {
 			fmt.Fprintf(&body, "- %s [strength=%s]", g.Value, privateMemoryStrength(g.EvidenceTier))
+			if g.TemporalStatus != "" {
+				fmt.Fprintf(&body, " [status=%s]", g.TemporalStatus)
+			}
 			if len(g.ViaRelations) > 0 {
 				fmt.Fprintf(&body, " via %s", strings.Join(g.ViaRelations, ", "))
 			}

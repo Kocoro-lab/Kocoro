@@ -30,6 +30,7 @@ const UserInstructionsTag = "<user_instructions>"
 const MemoryEvidenceGuidance = "Current user statements and verified current observations take precedence over past records. " +
 	"For facts covered by past records, preserve the recorded value. Never substitute training knowledge for a recorded value. " +
 	"Use evidence_tier when present: corroborated may be stated plainly as a past record; singleton, derived, text, or missing/unknown are weaker and must be qualified. " +
+	"When temporal_status is present, current is the latest value of an updating fact and superseded_by_recency is an older value kept for audit; prefer current unless the user asked about the past. " +
 	"Translate evidence strength into natural confidence wording; do not quote evidence_tier field names, bracketed markers, or counts unless the user asks for provenance. " +
 	"In exhaustive answers, keep relevant weaker items but qualify them; when space is limited, prioritize corroborated items. " +
 	"Do not add people, organizations, roles, or attributes absent from the current conversation, verified observations, or the records."
