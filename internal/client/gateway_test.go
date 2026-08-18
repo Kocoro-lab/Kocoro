@@ -1223,7 +1223,7 @@ func TestExecuteIntegrationToolWithIdentity_SendsStableIdentity(t *testing.T) {
 func TestExecuteIntegrationTool_ParsesStructuredErrorCode(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"error":"auth_expired","message":"reauthorize"}`))
+		_, _ = w.Write([]byte(`{"error":"auth_expired","message":"reauthorize","error_detail":"token revoked by provider"}`))
 	}))
 	defer server.Close()
 
@@ -1234,7 +1234,8 @@ func TestExecuteIntegrationTool_ParsesStructuredErrorCode(t *testing.T) {
 		t.Fatalf("error = %T %v, want *IntegrationToolAPIError", err, err)
 	}
 	if integrationErr.StatusCode != http.StatusConflict ||
-		integrationErr.Code != "auth_expired" || integrationErr.Message != "reauthorize" {
+		integrationErr.Code != "auth_expired" || integrationErr.Message != "reauthorize" ||
+		integrationErr.ErrorDetail != "token revoked by provider" {
 		t.Fatalf("IntegrationToolAPIError = %#v", integrationErr)
 	}
 	var legacy *APIError

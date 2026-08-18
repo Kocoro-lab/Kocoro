@@ -432,6 +432,7 @@ func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsN
 		wantNoEffect bool
 	}{
 		{code: "auth_expired", status: http.StatusConflict, wantNoEffect: true},
+		{code: "provider_rejected", status: http.StatusForbidden, wantNoEffect: true},
 		{code: "unexpected_conflict", status: http.StatusConflict, wantUnknown: true},
 		{code: "outcome_unknown", status: http.StatusConflict, wantUnknown: true},
 		{code: "billing_error", status: http.StatusServiceUnavailable, wantUnknown: true},
@@ -464,6 +465,98 @@ func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsN
 				t.Fatalf("call_in_progress result = %#v", result)
 			}
 		})
+	}
+}
+
+// TestIntegrationTool_ProviderRejectedIsOrdinaryErrorWithDetail pins the
+// provider_rejected + error_detail contract: a vendor-deterministic refusal
+// (e.g. X 403 on duplicate content, not executed, not billed) surfaces as an
+// ORDINARY tool error carrying the provider's reason so the model can
+// self-correct — never the outcome-unknown wording. Material side effect is
+// journaled known-no-effect because Cloud confirms nothing ran.
+func TestIntegrationTool_ProviderRejectedIsOrdinaryErrorWithDetail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":        "provider_rejected",
+			"error_detail": "You are not allowed to create a Tweet with duplicate content.",
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_create_post"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown || !result.SideEffectKnownNoEffect {
+		t.Fatalf("result = %#v, want ordinary known-no-effect error", result)
+	}
+	if !strings.Contains(result.Content, "duplicate content") ||
+		!strings.Contains(result.Content, "NOT executed") {
+		t.Fatalf("content missing provider detail / no-execution statement: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "outcome UNKNOWN") {
+		t.Fatalf("provider_rejected must not use outcome-unknown wording: %s", result.Content)
+	}
+}
+
+// TestIntegrationTool_OutcomeUnknownKeepsWordingAndAttachesDetail pins that
+// error_detail is purely additive on the conservative paths: outcome_unknown
+// keeps its exact semantics and wording, with the provider detail appended to
+// help locate the cause.
+func TestIntegrationTool_OutcomeUnknownKeepsWordingAndAttachesDetail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":        "outcome_unknown",
+			"error_detail": "provider socket closed mid-flight",
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_create_post"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.SideEffectOutcomeUnknown {
+		t.Fatalf("outcome_unknown semantics must be unchanged: %#v", result)
+	}
+	if !strings.Contains(result.Content, "outcome UNKNOWN") ||
+		!strings.Contains(result.Content, "provider socket closed mid-flight") {
+		t.Fatalf("content = %s", result.Content)
+	}
+}
+
+// TestIntegrationTool_SuccessFalseErrorDetailAppended pins the 200-with-error
+// body path: error_detail rides into the tool result content.
+func TestIntegrationTool_SuccessFalseErrorDetailAppended(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(client.ToolExecuteResponse{
+			Success:     false,
+			Error:       strPtr("provider_rejected"),
+			ErrorDetail: "media type not supported for this endpoint",
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_read_home"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "media type not supported") {
+		t.Fatalf("result = %#v", result)
 	}
 }
 

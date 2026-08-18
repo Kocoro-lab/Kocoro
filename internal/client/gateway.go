@@ -2792,11 +2792,15 @@ type ToolExecuteRequest struct {
 }
 
 type ToolExecuteResponse struct {
-	Success         bool            `json:"success"`
-	Output          json.RawMessage `json:"output"`
-	Text            *string         `json:"text"`
-	Error           *string         `json:"error"`
-	ExecutionTimeMs int             `json:"execution_time_ms,omitempty"`
+	Success bool            `json:"success"`
+	Output  json.RawMessage `json:"output"`
+	Text    *string         `json:"text"`
+	Error   *string         `json:"error"`
+	// ErrorDetail optionally carries the provider's human-readable failure
+	// reason (e.g. X's "duplicate content" text on a provider_rejected
+	// failure). Absent on older Cloud deployments.
+	ErrorDetail     string `json:"error_detail,omitempty"`
+	ExecutionTimeMs int    `json:"execution_time_ms,omitempty"`
 	// Usage reports resource consumption from the underlying provider (e.g.
 	// xAI Grok tokens for x_search, SerpAPI query count for web_search).
 	// Server-populated when available; nil when the tool does not bill per call.
@@ -2867,8 +2871,12 @@ type IntegrationToolAPIError struct {
 	StatusCode int
 	Code       string
 	Message    string
-	Body       string
-	apiError   *APIError
+	// ErrorDetail is the optional provider-level failure reason forwarded by
+	// Cloud (execute response field `error_detail`). Empty on older Cloud
+	// deployments and on errors with no provider detail.
+	ErrorDetail string
+	Body        string
+	apiError    *APIError
 }
 
 func (e *IntegrationToolAPIError) Error() string {
@@ -3147,10 +3155,11 @@ func (c *GatewayClient) executeIntegrationToolWithIdentityForGeneration(
 		body := readResponseBody(resp)
 		legacy := &APIError{StatusCode: resp.StatusCode, Body: body}
 		var envelope struct {
-			Error     string `json:"error"`
-			Code      string `json:"code"`
-			ErrorCode string `json:"error_code"`
-			Message   string `json:"message"`
+			Error       string `json:"error"`
+			Code        string `json:"code"`
+			ErrorCode   string `json:"error_code"`
+			Message     string `json:"message"`
+			ErrorDetail string `json:"error_detail"`
 		}
 		_ = json.Unmarshal([]byte(body), &envelope)
 		code := strings.TrimSpace(envelope.ErrorCode)
@@ -3161,11 +3170,12 @@ func (c *GatewayClient) executeIntegrationToolWithIdentityForGeneration(
 			code = strings.TrimSpace(envelope.Error)
 		}
 		return nil, &IntegrationToolAPIError{
-			StatusCode: resp.StatusCode,
-			Code:       code,
-			Message:    strings.TrimSpace(envelope.Message),
-			Body:       body,
-			apiError:   legacy,
+			StatusCode:  resp.StatusCode,
+			Code:        code,
+			Message:     strings.TrimSpace(envelope.Message),
+			ErrorDetail: strings.TrimSpace(envelope.ErrorDetail),
+			Body:        body,
+			apiError:    legacy,
 		}
 	}
 	var result ToolExecuteResponse

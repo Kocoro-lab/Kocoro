@@ -227,6 +227,32 @@ func TestXUploadMedia_ExecuteFailureStillDeletesStagedUpload(t *testing.T) {
 	}
 }
 
+// X deterministically rejecting the media (provider_rejected + error_detail)
+// is an ordinary fixable error carrying the vendor's reason — and the staging
+// upload is still cleaned up.
+func TestXUploadMedia_ProviderRejectedSurfacesDetailAndCleansUp(t *testing.T) {
+	tool, uploader, _, path := newXMediaFixture(t, "photo.png", 256)
+	tool.execute = func(context.Context, string, map[string]any, string) (*client.ToolExecuteResponse, error) {
+		return nil, &client.IntegrationToolAPIError{
+			StatusCode:  403,
+			Code:        "provider_rejected",
+			ErrorDetail: "animated GIF exceeds frame limit",
+		}
+	}
+
+	res := runXMediaTool(t, tool, map[string]any{"file_path": path})
+	if !res.IsError || res.SideEffectOutcomeUnknown {
+		t.Fatalf("want ordinary error, got %#v", res)
+	}
+	if !strings.Contains(res.Content, "animated GIF exceeds frame limit") ||
+		!strings.Contains(res.Content, "NOT uploaded") {
+		t.Fatalf("content missing detail / no-upload statement: %s", res.Content)
+	}
+	if len(uploader.deleted) != 1 {
+		t.Errorf("staged upload must still be cleaned up: %v", uploader.deleted)
+	}
+}
+
 func TestXUploadMedia_DeleteFailureDoesNotAffectResult(t *testing.T) {
 	tool, uploader, _, path := newXMediaFixture(t, "photo.png", 256)
 	uploader.deleteErr = errors.New("gateway down")

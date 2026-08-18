@@ -249,7 +249,11 @@ func (t *XUploadMediaTool) run(ctx context.Context, argsJSON string) (agent.Tool
 	toolUsage := convertAndEmitXMediaUsage(ctx, resp.Usage)
 
 	if resp.Error != nil && *resp.Error != "" {
-		return agent.ToolResult{Content: *resp.Error, IsError: true, Usage: toolUsage}, nil
+		content := *resp.Error
+		if resp.ErrorDetail != "" {
+			content += ": " + resp.ErrorDetail
+		}
+		return agent.ToolResult{Content: content, IsError: true, Usage: toolUsage}, nil
 	}
 
 	var out struct {
@@ -373,7 +377,7 @@ func classifyXMediaStagingErr(err error) agent.ToolResult {
 func classifyXMediaExecuteErr(err error) agent.ToolResult {
 	var integrationErr *client.IntegrationToolAPIError
 	if errors.As(err, &integrationErr) {
-		msg := fmt.Sprintf("x_upload_media: %v", err)
+		msg := appendErrorDetail(fmt.Sprintf("x_upload_media: %v", err), integrationErr.ErrorDetail)
 		switch integrationErr.Code {
 		case "auth_expired", "connection_not_found", "connection_inactive":
 			return agent.PermissionError(msg + " — reconnect the X integration from Settings → Integrations")
@@ -381,6 +385,10 @@ func classifyXMediaExecuteErr(err error) agent.ToolResult {
 			return agent.BusinessError(msg + " — the X integration is not connected or media upload is not enabled")
 		case "integration_limit_exceeded":
 			return agent.BusinessError(msg + ": the integration usage limit was reached")
+		case "provider_rejected":
+			// X deterministically refused the media (bad format, policy, …)
+			// and it was NOT uploaded — fix the file or arguments and retry.
+			return agent.BusinessError(msg + ": X rejected the media and it was NOT uploaded. Adjust the file or arguments before retrying.")
 		case "provider_unavailable":
 			return agent.TransientError(msg + ": X is temporarily unavailable")
 		}
