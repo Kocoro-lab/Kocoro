@@ -189,6 +189,51 @@ Routes the kocoro agent itself calls additionally need a matching reference unde
 `internal/skills/bundled/skills/kocoro/references/`; see the Doc Co-Maintenance
 section of `CLAUDE.md`.
 
+Conversation context actions are Desktop-only and gated by
+`conversation_context_actions_v1`: `POST /sessions/{id}/fork` copies model
+history through a complete assistant turn into a normal persisted session.
+Its optional `agent` identifies the source session directory; optional
+`target_agent` selects the destination agent directory (use `"default"` for
+Default, and omit it to branch within the source agent).
+`POST /sessions/{id}/side-chat` runs against that same bounded history plus the
+panel's temporary user/assistant history. Side-chat runs carry the normal tool
+registry and permission engine — identical capability to the primary
+conversation. Tool approvals flow over the per-request SSE stream
+(`approval` frames, resolved via `POST /approval`) exactly like `/message`;
+`ask_user_question` gets no asker on ephemeral runs (the panel has no question
+UI) and degrades to its clean "can't ask here" result. The runs stay ephemeral:
+no session is persisted and no global bus events are published. The
+implementation is `internal/daemon/conversation_context.go`; the Desktop
+consumer is `DaemonClient+ConversationContext.swift`. Neither route belongs in
+the bundled Kocoro skill references because the model never calls them.
+
+`message_index` on both routes is a boundary in the RAW archive index space —
+the `messages` array of the session file, system-injected entries included —
+equal to (index of the last included message) + 1, and it must land on a
+complete assistant turn. Desktop derives it from `SessionDisplayMapper`'s
+`rawIndex` (raw `enumerated()` position, injected entries skipped for display
+but never renumbered), so the two sides share one basis; this was cross-checked
+against the Desktop implementation on 2026-08-17. Both routes honor a
+compaction checkpoint whose coverage ends at or before the boundary: the fork
+carries the checkpoint (deep-copied) and side-chat feeds the model
+checkpoint+tail, never the full raw archive.
+
+Desktop text replies use a transient head-only `<kocoro_replies>` prompt
+envelope. `RunAgent` removes that envelope from the archived user message but
+persists its decoded quotes and comments in the parallel
+`message_meta[].conversation_annotations` display metadata. The metadata never
+enters `HistoryForLoop`; it lets Desktop reconstruct the compact annotation
+attachment immediately and after reload without exposing model-only markup.
+The envelope limits are enforced server-side at both Desktop run ingresses
+(`POST /message`, `POST /queue`) on the exact bytes the
+model would receive: ≤ 100 replies per envelope run, quotes ≤ 8,000 runes,
+comments ≤ 2,000 runes. Violations are 400s with stable codes
+`conversation_replies_too_many` / `conversation_reply_quote_too_long` /
+`conversation_reply_comment_too_long`, and a delimited-but-unparseable
+envelope is `conversation_replies_malformed`. On paths that cannot reject
+(queue drain, non-Desktop sources) a malformed envelope is kept verbatim as
+ordinary text — user bytes are never silently dropped.
+
 ### Event payload shapes
 
 `tool_status`, `approval_request`, `approval_request.flags`, and

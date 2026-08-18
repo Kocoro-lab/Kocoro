@@ -965,6 +965,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 	mux.HandleFunc("PATCH /sessions/{id}", s.handlePatchSession)
 	mux.HandleFunc("POST /sessions/{id}/edit", s.handleEditMessage)
+	mux.HandleFunc("POST /sessions/{id}/fork", s.handleForkSession)
+	mux.HandleFunc("POST /sessions/{id}/side-chat", s.handleSideChat)
 	mux.HandleFunc("POST /sessions/{id}/reset", s.handleResetSession)
 	mux.HandleFunc("POST /sessions/{id}/rewind", s.handleRewind)
 	mux.HandleFunc("GET /sessions/{id}/summary", s.handleSessionSummary)
@@ -3197,6 +3199,12 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Reply-envelope limits are enforced on the exact bytes the model would
+	// receive, not on the truncated persistence projection.
+	if code, msg := validateConversationReplyEnvelope(req.Text); code != "" {
+		writeErrorCode(w, http.StatusBadRequest, code, msg)
+		return
+	}
 	if req.Source == "" {
 		req.Source = "kocoro"
 	}
@@ -3529,7 +3537,7 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	// through Cloud, questions do not, so an asker there blocks the run for the
 	// whole auto-resolution window and then reports a decline the user never made.
 	askCtx := r.Context()
-	if CanPresentQuestionUI(req.Source) {
+	if shouldInjectQuestionAsker(req) {
 		askCtx = agent.WithQuestionAsker(askCtx, &brokerQuestionAsker{
 			broker: qBroker,
 			metaFn: func() ApprovalRequestMeta {

@@ -3,6 +3,7 @@ package session
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 // ErrMessageIndexOutOfRange is returned by TruncateMessages when the requested
@@ -17,6 +19,12 @@ import (
 // (HTTP 400) and must be distinguishable from a load/save IO failure (500) so
 // handleEditMessage can map each to the correct status.
 var ErrMessageIndexOutOfRange = errors.New("message_index out of range")
+
+// ErrIncompleteTurnBoundary is returned when a caller tries to copy history
+// from the middle of an assistant/tool trajectory. A branch or side chat must
+// start after a complete assistant turn so the copied context never contains a
+// tool_use without its result or an unfinished model response.
+var ErrIncompleteTurnBoundary = errors.New("message_index is not a complete turn boundary")
 
 // validSessionIDPattern restricts client-supplied session IDs to a safe shape.
 // Allowed: 8–80 chars of [A-Za-z0-9._-]. The cap matches generateID's
@@ -549,6 +557,139 @@ func (m *Manager) TruncateMessages(id string, index int) error {
 		m.current = sess
 	}
 	return m.store.Save(sess)
+}
+
+// CopyHistoryThrough returns an independent, model-visible copy of a session's
+// history through index. index is exclusive and must end at a complete
+// assistant turn. Loop-internal injected messages are omitted, and a
+// compaction checkpoint covering the requested prefix is honored — the copy is
+// the compacted summary plus the retained tail, exactly what a run at that
+// boundary would see, not the full raw archive.
+func (m *Manager) CopyHistoryThrough(id string, index int) ([]client.Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	sess, err := m.store.Load(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCompleteTurnBoundary(sess.Messages, index); err != nil {
+		return nil, err
+	}
+	return cloneMessages(sess.HistoryThrough(index))
+}
+
+// ForkSession creates an ordinary persisted session containing the source
+// transcript through index. Runtime/task state is intentionally not inherited:
+// the new session keeps conversation context, CWD, project, and message
+// timestamps, but starts with no active work plan, usage ledger, route binding,
+// share records, or in-progress execution.
+func (m *Manager) ForkSession(id string, index int) (*Session, error) {
+	return m.ForkSessionInto(id, index, m)
+}
+
+// ForkSessionInto persists the fork in target. Source and target managers may
+// point at different agent session directories.
+func (m *Manager) ForkSessionInto(id string, index int, target *Manager) (*Session, error) {
+	if target == nil {
+		target = m
+	}
+	m.mu.Lock()
+	source, err := m.store.Load(id)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	if err := validateCompleteTurnBoundary(source.Messages, index); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	messages, err := cloneMessages(source.Messages[:index])
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	metaCount := min(index, len(source.MessageMeta))
+	meta := append([]MessageMeta(nil), source.MessageMeta[:metaCount]...)
+	// A checkpoint whose coverage ends at or before the cut carries over so the
+	// fork's first run reuses the existing summary instead of re-feeding (and
+	// re-compacting) the full raw archive. Coverage past the cut would describe
+	// messages the fork does not have — drop it and let the fork self-heal.
+	var checkpoint *CompactionCheckpoint
+	if cp := source.CompactionCheckpoint; cp != nil && cp.ArchiveThroughIndex <= index {
+		checkpointMessages, cpErr := cloneMessages(cp.Messages)
+		if cpErr != nil {
+			m.mu.Unlock()
+			return nil, cpErr
+		}
+		checkpoint = &CompactionCheckpoint{
+			SchemaVersion:       cp.SchemaVersion,
+			ArchiveThroughIndex: cp.ArchiveThroughIndex,
+			Messages:            checkpointMessages,
+		}
+	}
+	now := time.Now()
+	fork := &Session{
+		SchemaVersion:        1,
+		ID:                   generateID(),
+		CreatedAt:            now,
+		Title:                source.Title,
+		TitleAuto:            source.TitleAuto,
+		TitleTurns:           source.TitleTurns,
+		CWD:                  source.CWD,
+		Messages:             messages,
+		MessageMeta:          meta,
+		Source:               source.Source,
+		ProjectID:            source.ProjectID,
+		CompactionCheckpoint: checkpoint,
+	}
+	m.mu.Unlock()
+
+	target.mu.Lock()
+	defer target.mu.Unlock()
+	if err := target.store.Save(fork); err != nil {
+		return nil, err
+	}
+	return fork, nil
+}
+
+func validateCompleteTurnBoundary(messages []client.Message, index int) error {
+	if index < 1 || index > len(messages) {
+		return fmt.Errorf("%w: %d not in [1, %d]", ErrMessageIndexOutOfRange, index, len(messages))
+	}
+	last := messages[index-1]
+	if last.Role != "assistant" || containsToolBlock(last, "tool_use") || containsToolBlock(last, client.OpenAIComputerCallType) {
+		return ErrIncompleteTurnBoundary
+	}
+	if index == len(messages) {
+		return nil
+	}
+	next := messages[index]
+	if next.Role != "user" || containsToolBlock(next, "tool_result") {
+		return ErrIncompleteTurnBoundary
+	}
+	return nil
+}
+
+func containsToolBlock(message client.Message, blockType string) bool {
+	for _, block := range message.Content.Blocks() {
+		if block.Type == blockType {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneMessages(messages []client.Message) ([]client.Message, error) {
+	data, err := json.Marshal(messages)
+	if err != nil {
+		return nil, fmt.Errorf("copy session messages: %w", err)
+	}
+	var cloned []client.Message
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return nil, fmt.Errorf("copy session messages: %w", err)
+	}
+	return cloned, nil
 }
 
 // ResumeLatest loads the most recently updated session from disk.

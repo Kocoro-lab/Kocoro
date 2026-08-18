@@ -50,7 +50,8 @@
     "agent_service_tier_v1",
     "web_search_usage_v1",
     "skill_install_recommendation_v1",
-    "work_plan_v1"
+    "work_plan_v1",
+    "conversation_context_actions_v1"
   ],
   "memory": {
     "provider": "disabled",

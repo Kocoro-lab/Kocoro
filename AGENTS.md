@@ -1,21 +1,18 @@
 # Kocoro Project Guide (AGENTS.md)
 
-**Condensed mirror of `CLAUDE.md` for external coding agents. `CLAUDE.md` in this
-directory is the full guide** — open it for reasoning, wire details, incident
-history, or any subsystem not listed here. This file carries only rules you can
-act on, plus the symbols and constants to grep. If the two disagree, `CLAUDE.md`
-and the code win.
+**Condensed mirror of `CLAUDE.md` for external coding agents; `CLAUDE.md` is the
+full guide** for reasoning, wire details, and unlisted subsystems. This file is
+actionable rules plus the symbols to grep. If the two disagree, `CLAUDE.md` and
+the code win.
 
-**Keep this file under 24 KB.** Harnesses that read `AGENTS.md` do so under a byte
-budget shared across every such file from the repo root down (32 KiB by default),
-and an over-budget file is truncated **from the tail, with no marker in the injected
-text** — the reader cannot tell it got a partial file, and the sections at the bottom
-are simply gone. CI asserts the ceiling; if you need more room, cut prose, not rules.
+**Keep this file under 24 KB (CI asserts).** Harnesses inject `AGENTS.md` under a
+shared 32 KiB budget and truncate over-budget files **silently from the tail** —
+bottom sections vanish. Need room? Cut prose, not rules.
 
 Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production path:
-daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WebSocket,
-receives channel messages, runs the agent loop locally with full tool access, and
-streams back. Also TUI, one-shot CLI, MCP server, local scheduled tasks.
+daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WS, receives
+channel messages, runs the agent loop locally, streams back. Also TUI, one-shot
+CLI, MCP server, schedules.
 
 Layout: `cmd/` (Cobra) + `internal/<pkg>/`; use Glob/Grep. Production path is
 `internal/daemon/` driving `internal/agent/`.
@@ -180,10 +177,15 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 - `ApprovalBroker` and `QuestionBroker` are thin faces over ONE shared
   `pendingCore[D]` (`pending.go`). A third interaction kind MUST build on it — do
   NOT copy a broker.
-- `ask_user_question` gates on `CanPresentQuestionUI` / `questionUISources`, an
-  ALLOW-list, NOT the approval predicate: every source without a question UI
-  DECLINES, because a question has no safe auto-answer. Slack/Feishu/Lark/Teams/
-  LINE render approval cards but have NO question channel. Capability `question_v1`.
+- `ask_user_question` gates on `CanPresentQuestionUI` / `questionUISources` — an
+  ALLOW-list, NOT the approval predicate: sources without a question UI DECLINE
+  (no safe auto-answer; IM channels have approval cards but no question channel).
+  Capability `question_v1`. Ephemeral runs get no asker (`shouldInjectQuestionAsker`).
+- Conversation context actions (`conversation_context_actions_v1`, Desktop-only):
+  `POST /sessions/{id}/{fork,side-chat}`; `message_index` = RAW-archive turn
+  boundary (injected entries counted). Side chats run the NORMAL tool registry +
+  SSE approvals but stay ephemeral (no session, no bus events). Reply envelopes
+  strip head-only, only when they parse; limits 400 at `/message` + `/queue`.
 - `delivery_ack`: ack an inbound message only AFTER reply delivery succeeds.
   Reply-failure paths skip the ack so replay stays correct.
 

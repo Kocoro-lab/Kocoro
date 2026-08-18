@@ -8895,9 +8895,13 @@ func looksLikeUnverifiedActionClaim(text string) bool {
 
 // fabricatedToolCallPattern matches text that mimics tool call output format.
 // Real tool calls go through the tool_calls API array — they never appear as text.
-// Matches both old "I called" format (backward compat) and new <tool_exec> XML tags.
-// XML branch requires exact attribute shape to avoid false-positives on code examples.
-var fabricatedToolCallPattern = regexp.MustCompile(`(?s)(?:I called \w+\(.*?\)\.\s*\n\n(?:Result|Error):\s|<tool_exec tool="[^"]*" call_id="[^"]+">\n<input>.*?</input>\n<output status="(?:ok|error)">.*?</output>\n</tool_exec>)`)
+// Matches the old "I called" format (backward compat), the <tool_exec> XML tags,
+// and a bare paired <tool_call>name(args)</tool_call> block — a shape observed
+// when the model invents a call syntax instead of using the API (e.g. a run
+// whose history shows tool traffic it cannot reproduce). Each branch stays
+// strict — exact attribute shape / paired tags around a function-call body —
+// to avoid false-positives on code examples discussing these formats.
+var fabricatedToolCallPattern = regexp.MustCompile(`(?s)(?:I called \w+\(.*?\)\.\s*\n\n(?:Result|Error):\s|<tool_exec tool="[^"]*" call_id="[^"]+">\n<input>.*?</input>\n<output status="(?:ok|error)">.*?</output>\n</tool_exec>|<tool_call>\s*\w+\(.*?\)\s*</tool_call>)`)
 
 // looksLikeFabricatedToolCalls returns true if the model's text output contains
 // what looks like fabricated tool call results. This is always a hallucination —

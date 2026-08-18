@@ -1592,7 +1592,9 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 	sess.MessageMeta = []session.MessageMeta{
 		{Source: "desktop", Timestamp: &firstTime},
 		{Source: "desktop", Timestamp: &secondTime},
-		{Source: "desktop", Timestamp: &tailTime},
+		{Source: "desktop", Timestamp: &tailTime, ConversationAnnotations: []session.ConversationAnnotation{
+			{SelectedText: "ARCHIVE_ONLY_OLD_REPLY", Comment: "explain this line"},
+		}},
 	}
 	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
 		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
@@ -1643,8 +1645,12 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 		MessageMeta []struct {
-			Source    string `json:"source"`
-			Timestamp string `json:"timestamp"`
+			Source                  string `json:"source"`
+			Timestamp               string `json:"timestamp"`
+			ConversationAnnotations []struct {
+				SelectedText string `json:"selected_text"`
+				Comment      string `json:"comment"`
+			} `json:"conversation_annotations"`
 		} `json:"message_meta"`
 		CompactionCheckpoint *struct {
 			SchemaVersion       int `json:"schema_version"`
@@ -1683,6 +1689,12 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 		string(cp.Messages[1].Content) != `"Previous context summary: stable state"` {
 		t.Fatalf("archive/live checkpoint semantics drifted: archive=%s checkpoint=%s",
 			detail.Messages[0].Content, cp.Messages[1].Content)
+	}
+	tailAnnotations := detail.MessageMeta[2].ConversationAnnotations
+	if len(tailAnnotations) != 1 || tailAnnotations[0].SelectedText != "ARCHIVE_ONLY_OLD_REPLY" ||
+		tailAnnotations[0].Comment != "explain this line" ||
+		len(detail.MessageMeta[0].ConversationAnnotations) != 0 {
+		t.Fatalf("consumer decode lost conversation annotations: %+v", detail.MessageMeta)
 	}
 }
 
@@ -2395,5 +2407,50 @@ func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
 		!done.ExecutionRun.Profile.IsFast() ||
 		done.ExecutionRun.Profile.ResolutionReason != "cloud_profile_resolved" {
 		t.Fatalf("consumer decode lost execution_run fields: %+v", done.ExecutionRun)
+	}
+}
+
+// TestWireFixture_HTTPSessionFork pins the fork response shape through the
+// real POST /sessions/{id}/fork route. The fork's session id is generated, so
+// it is shape-asserted (non-empty date-hex id) and normalized to the fixture.
+func TestWireFixture_HTTPSessionFork(t *testing.T) {
+	fixture := loadWireFixture(t, "http_post.session_fork.response.json")
+
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: shannonDir, SessionCache: NewSessionCache(shannonDir)}
+	server := NewServer(0, nil, deps, "test")
+	mgr := deps.SessionCache.GetOrCreateManager(deps.SessionCache.SessionsDir(""))
+	source := mgr.NewSessionWithID("wire-fixture-fork-source")
+	source.Title = fixture["title"].(string)
+	source.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("question")},
+		{Role: "assistant", Content: client.NewTextContent("answer")},
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/sessions/wire-fixture-fork-source/fork",
+		strings.NewReader(`{"message_index":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /sessions/{id}/fork = %d: %s", rec.Code, rec.Body.Bytes())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	if v, ok := produced["session_id"].(string); !ok || v == "" || v == "wire-fixture-fork-source" {
+		t.Fatalf("session_id: want fresh generated id, got %#v", produced["session_id"])
+	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
+
+	// Decode the produced bytes through the same consumer shape Desktop uses.
+	var response forkSessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if response.Title != fixture["title"].(string) {
+		t.Fatalf("consumer decode lost title: %+v", response)
 	}
 }

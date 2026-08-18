@@ -25,10 +25,19 @@ func TimePtr(t time.Time) *time.Time { return &t }
 // MessageMeta holds per-message metadata not sent to the LLM gateway.
 // Indexed parallel to Session.Messages.
 type MessageMeta struct {
-	Source         string     `json:"source,omitempty"`          // "local", "slack", "line", "kocoro", "webhook", "scheduler" (legacy "shanclaw" still appears in older sessions)
-	MessageID      string     `json:"message_id,omitempty"`      // stable ID for dedup (e.g. "msg-<uuid>")
-	Timestamp      *time.Time `json:"timestamp,omitempty"`       // when this message was sent/received; nil = legacy (pre-timestamp)
-	SystemInjected bool       `json:"system_injected,omitempty"` // true for guardrail/nudge messages injected by the agent loop
+	Source                  string                   `json:"source,omitempty"`                   // "local", "slack", "line", "kocoro", "webhook", "scheduler" (legacy "shanclaw" still appears in older sessions)
+	MessageID               string                   `json:"message_id,omitempty"`               // stable ID for dedup (e.g. "msg-<uuid>")
+	Timestamp               *time.Time               `json:"timestamp,omitempty"`                // when this message was sent/received; nil = legacy (pre-timestamp)
+	SystemInjected          bool                     `json:"system_injected,omitempty"`          // true for guardrail/nudge messages injected by the agent loop
+	ConversationAnnotations []ConversationAnnotation `json:"conversation_annotations,omitempty"` // user-visible reply anchors, excluded from model history
+}
+
+// ConversationAnnotation is the durable display metadata for one text reply.
+// The model receives the equivalent data through the transient reply envelope;
+// this copy exists only so clients can reconstruct the sent-message attachment.
+type ConversationAnnotation struct {
+	SelectedText string `json:"selected_text"`
+	Comment      string `json:"comment,omitempty"`
 }
 
 // DeliverableReceipt is the durable, daemon-validated metadata emitted only
@@ -330,15 +339,40 @@ func (s *Session) HistoryForLoop() []client.Message {
 	if s == nil {
 		return nil
 	}
+	return s.HistoryThrough(len(s.Messages))
+}
+
+// HistoryThrough is HistoryForLoop bounded to the raw archive prefix
+// [0, index) — the model-visible view a run would see if the archive ended at
+// index. A checkpoint whose coverage extends past index cannot describe that
+// prefix, so it falls back to the filtered raw slice (same self-healing as an
+// invalid checkpoint). Callers pass an index already validated against the
+// archive; it is clamped defensively.
+func (s *Session) HistoryThrough(index int) []client.Message {
+	if s == nil {
+		return nil
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index > len(s.Messages) {
+		index = len(s.Messages)
+	}
+	meta := s.MessageMeta
+	if len(meta) > index {
+		meta = meta[:index]
+	}
 	cp := s.CompactionCheckpoint
 	if cp == nil {
-		return FilterInjected(s.Messages, s.MessageMeta)
+		return FilterInjected(s.Messages[:index], meta)
 	}
 	if cp.SchemaVersion != CompactionCheckpointSchemaVersion || len(cp.Messages) == 0 ||
-		cp.ArchiveThroughIndex < 0 || cp.ArchiveThroughIndex > len(s.Messages) {
-		log.Printf("session: ignoring invalid compaction checkpoint (session=%q schema=%d messages=%d archive_through_index=%d archive_messages=%d); falling back to archive",
-			s.ID, cp.SchemaVersion, len(cp.Messages), cp.ArchiveThroughIndex, len(s.Messages))
-		return FilterInjected(s.Messages, s.MessageMeta)
+		cp.ArchiveThroughIndex < 0 || cp.ArchiveThroughIndex > index {
+		if index == len(s.Messages) {
+			log.Printf("session: ignoring invalid compaction checkpoint (session=%q schema=%d messages=%d archive_through_index=%d archive_messages=%d); falling back to archive",
+				s.ID, cp.SchemaVersion, len(cp.Messages), cp.ArchiveThroughIndex, len(s.Messages))
+		}
+		return FilterInjected(s.Messages[:index], meta)
 	}
 	// ShapeHistory always writes the compacted-history marker — even a failed
 	// summary keeps the prefixed "(summary unavailable)" line — so a
@@ -349,17 +383,17 @@ func (s *Session) HistoryForLoop() []client.Message {
 	if !ctxwin.IsCompactedHistory(cp.Messages) {
 		log.Printf("session: ignoring compaction checkpoint missing the compacted-history marker (session=%q messages=%d archive_through_index=%d); falling back to archive",
 			s.ID, len(cp.Messages), cp.ArchiveThroughIndex)
-		return FilterInjected(s.Messages, s.MessageMeta)
+		return FilterInjected(s.Messages[:index], meta)
 	}
 
 	through := cp.ArchiveThroughIndex
-	tailMeta := s.MessageMeta
+	tailMeta := meta
 	if len(tailMeta) > through {
 		tailMeta = tailMeta[through:]
 	} else {
 		tailMeta = nil
 	}
-	tail := FilterInjected(s.Messages[through:], tailMeta)
+	tail := FilterInjected(s.Messages[through:index], tailMeta)
 	out := make([]client.Message, 0, len(cp.Messages)+len(tail))
 	out = append(out, cp.Messages...)
 	out = append(out, tail...)

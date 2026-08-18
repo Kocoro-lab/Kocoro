@@ -2698,9 +2698,25 @@ func TestFabricatedToolCallDetection(t *testing.T) {
 	if !looksLikeFabricatedToolCalls(xml) {
 		t.Error("should detect XML format in text output")
 	}
+	// Bare paired <tool_call> block (observed side-chat fabrication shape)
+	bare := `Let me search for that.
+
+<tool_call>web_search(query="kocoro daemon port")</tool_call>
+
+The results show...`
+	if !looksLikeFabricatedToolCalls(bare) {
+		t.Error("should detect paired <tool_call> block")
+	}
 	// Normal text
 	if looksLikeFabricatedToolCalls("Here is the answer.") {
 		t.Error("should not flag normal text")
+	}
+	// Unpaired tag and prose mentioning the tag stay unflagged
+	if looksLikeFabricatedToolCalls("The <tool_call> tag is used by some models.") {
+		t.Error("should not flag unpaired tag mention")
+	}
+	if looksLikeFabricatedToolCalls("Wrap output in <tool_call>plain words</tool_call> markers.") {
+		t.Error("should not flag paired tags without a call-shaped body")
 	}
 }
 

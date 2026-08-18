@@ -99,6 +99,8 @@ type RunAgentRequest struct {
 	ModelOverride           string                           `json:"-"`                           // internal tier override; an exact model pin remains authoritative
 	BypassRouting           bool                             `json:"-"`                           // skip route lock (heartbeat runs)
 	SessionHistory          []client.Message                 `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
+	DisableTools            bool                             `json:"-"`                           // internal read-only run: expose no model-callable tools
+	SuppressBusEvents       bool                             `json:"-"`                           // internal request-scoped run: do not publish progress to global subscribers
 	OmitHistory             bool                             `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
 	StickyContext           string                           `json:"-"`                           // 额外的 sticky context，注入系统提示（对用户不可见）
 	ForegroundHint          *ForegroundHint                  `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
@@ -1424,6 +1426,16 @@ func CanPresentQuestionUI(source string) bool {
 	return ok
 }
 
+// shouldInjectQuestionAsker gates the SSE handler's QuestionAsker injection.
+// Ephemeral runs (side chat) come from panels with no question UI: an asker
+// there blocks the run for the whole auto-resolution window and then reports
+// a decline the user never made — the same failure mode that once hit the
+// IM channels. Without an asker, ask_user_question degrades to its clean
+// "can't ask here" result.
+func shouldInjectQuestionAsker(req RunAgentRequest) bool {
+	return !req.Ephemeral && CanPresentQuestionUI(req.Source)
+}
+
 // cacheSourceFromDaemonSource normalizes daemon-level origins for Cloud-side
 // attribution. It does not select a TTL: Cloud currently applies the short
 // prompt-cache TTL to every source. See docs/cache-strategy.md.
@@ -2634,7 +2646,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		return nil, fmt.Errorf("daemon not fully configured")
 	}
 	agentName := req.Agent
-	prompt := req.Text
+	visibleInput, replyEnvelope := splitConversationReplyPrompt(req.Text)
+	replyAnnotations := conversationReplyAnnotations(replyEnvelope)
+	if replyEnvelope != "" && replyAnnotations == nil {
+		// Delimited but unparseable: treat the whole message as ordinary text
+		// so the user's bytes survive verbatim. Desktop-facing ingresses 400
+		// this shape up front (validateConversationReplyEnvelope); this covers
+		// every path that cannot reject.
+		visibleInput, replyEnvelope = req.Text, ""
+	}
+	prompt := visibleInput
 
 	// Download remote file attachments and convert to file_ref blocks.
 	// Attachment files must survive across turns (non-image files become
@@ -2689,10 +2710,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// re-routed here to that other agent, so two apps collapse onto one agent and
 	// answer identically. Mirrors the same guard in cmd/daemon.go onMsg.
 	if agentName == "" && !IsMessagingPlatform(req.Source) {
-		agentName, prompt = agents.ParseAgentMention(req.Text)
+		agentName, prompt = agents.ParseAgentMention(visibleInput)
 	}
 	if prompt == "" {
-		prompt = req.Text
+		prompt = visibleInput
 	}
 
 	var agentOverride *agents.Agent
@@ -2705,7 +2726,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// @mention fallback: use default agent
 			log.Printf("daemon: agent %q not found: %v, using default", agentName, loadErr)
 			agentName = ""
-			prompt = req.Text
+			prompt = visibleInput
 		} else {
 			agentOverride = a
 		}
@@ -2722,7 +2743,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			prompt = strings.ReplaceAll(content, "$ARGUMENTS", args)
 		}
 	}
-	req.Text = prompt
+	visiblePrompt := prompt
+	prompt = restoreConversationReplyPrompt(visiblePrompt, replyEnvelope)
+	req.Text = visiblePrompt
 	// Recompute route key after final agent resolution.
 	// Callers may precompute a default/source-channel key before @mention parsing.
 	// Recomputing here avoids cross-route contamination.
@@ -2865,11 +2888,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// consumed and recovery re-delivers them on every restart.
 		if pendingBatch := deps.SessionCache.DrainMailbox(req.RouteKey, 20); len(pendingBatch) > 0 {
 			pendingIDs := make([]string, 0, len(pendingBatch))
-			var b strings.Builder
+			// Each drained message is split individually: its head envelope
+			// (raw Desktop bytes) joins the merged envelope run, its decoded
+			// annotations join the merged turn's metadata, and only its
+			// visible text enters the merged visible prompt. A malformed
+			// envelope stays verbatim in the visible text (lossless).
+			var visibleParts []string
+			var envelopeParts []string
+			var drainedAnnotations []session.ConversationAnnotation
 			for _, m := range pendingBatch {
-				if b.Len() > 0 {
-					b.WriteByte('\n')
-				}
+				var b strings.Builder
 				b.WriteString(m.Text)
 				// Phase 4: surface any attachments as a bracketed hint so the
 				// LLM is aware the user shipped files alongside this text.
@@ -2898,15 +2926,39 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					}
 					b.WriteByte(']')
 				}
+				visible, annotations, stripped := conversationReplyVisibleText(b.String())
+				if stripped {
+					_, envelope := splitConversationReplyPrompt(b.String())
+					envelopeParts = append(envelopeParts, envelope)
+					drainedAnnotations = append(drainedAnnotations, annotations...)
+				}
+				if visible != "" {
+					visibleParts = append(visibleParts, visible)
+				}
 				pendingIDs = append(pendingIDs, m.ID)
 			}
-			if b.Len() > 0 {
-				if prompt == "" {
-					prompt = b.String()
-				} else {
-					prompt = b.String() + "\n" + prompt
+			if len(visibleParts) > 0 || len(envelopeParts) > 0 {
+				mergedVisible := strings.Join(visibleParts, "\n")
+				if visiblePrompt != "" {
+					if mergedVisible != "" {
+						mergedVisible += "\n"
+					}
+					mergedVisible += visiblePrompt
 				}
-				req.Text = prompt
+				// Drained messages precede the trigger in the merged text, so
+				// their envelopes and annotations lead in the same order.
+				if replyEnvelope != "" {
+					envelopeParts = append(envelopeParts, replyEnvelope)
+				}
+				replyEnvelope = strings.Join(envelopeParts, "\n")
+				merged := append(drainedAnnotations, replyAnnotations...)
+				if len(merged) > maxConversationAnnotations {
+					merged = merged[:maxConversationAnnotations]
+				}
+				replyAnnotations = merged
+				visiblePrompt = mergedVisible
+				prompt = restoreConversationReplyPrompt(visiblePrompt, replyEnvelope)
+				req.Text = visiblePrompt
 			}
 			log.Printf("daemon: drained %d mailbox msg(s) into prompt for route %q", len(pendingBatch), req.RouteKey)
 			// Defer the durable consumed_at flag + EventQueueFlushed to
@@ -3267,8 +3319,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Wrap the transport handler with a bus-emitting handler so every run
 	// publishes progress events regardless of transport. See
 	// docs/superpowers/specs/2026-04-23-event-bus-progress-coverage-design.md.
-	bus := &busEventHandler{deps: deps, agent: agentName}
-	combinedHandler := &multiHandler{handlers: []agent.EventHandler{handler, bus}}
+	combinedHandler := &multiHandler{handlers: []agent.EventHandler{handler}}
+	if !req.SuppressBusEvents {
+		bus := &busEventHandler{deps: deps, agent: agentName}
+		combinedHandler.handlers = append(combinedHandler.handlers, bus)
+	}
+	handler = combinedHandler
 	var runEvents *runEventCollector
 	if !req.Ephemeral {
 		eventLog, err := sessMgr.OpenRunEventLog(sess.ID, req.RunID, req.AttemptID, cfg.Agent.RunEventRetention)
@@ -3277,8 +3333,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		runEvents = newRunEventCollector(combinedHandler, eventLog, sess.ID, req.RunID, req.AttemptID)
 		handler = runEvents
-	} else {
-		handler = combinedHandler
 	}
 
 	// Notify handler of resolved session ID so it can include it in EventBus payloads.
@@ -3373,16 +3427,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			source = "unknown"
 		}
 		msgID := generateMessageID()
-		userMsgContent := buildUserMsgContent(prompt, resolvedContent)
+		userMsgContent := buildUserMsgContent(visiblePrompt, resolvedContent)
 		sess.Messages = append(sess.Messages,
 			client.Message{Role: "user", Content: userMsgContent},
 		)
 		sess.MessageMeta = append(sess.MessageMeta,
 			session.MessageMeta{
-				Source:         source,
-				MessageID:      msgID,
-				Timestamp:      session.TimePtr(userMsgTime),
-				SystemInjected: req.ResumeInterrupted || req.SystemInjected,
+				Source:                  source,
+				MessageID:               msgID,
+				Timestamp:               session.TimePtr(userMsgTime),
+				SystemInjected:          req.ResumeInterrupted || req.SystemInjected,
+				ConversationAnnotations: replyAnnotations,
 			},
 		)
 		preLoopUserAppended = true
@@ -3399,7 +3454,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					"sender":     req.Sender,
 					"session_id": sess.ID,
 					"message_id": msgID,
-					"text":       prompt,
+					"text":       visiblePrompt,
 				})
 				deps.EventBus.Emit(Event{Type: EventMessageReceived, Payload: payload})
 			}
@@ -3647,6 +3702,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		})
 	}
 	defer guiWorkflow.EndTurn()
+	if req.DisableTools {
+		reg = agent.NewToolRegistry()
+	}
 
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
@@ -4141,6 +4199,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		checkpointSource = "unknown"
 	}
 	turnBase := captureTurnBaseline(sess, checkpointSource, preLoopUserAppended)
+	turnBase.conversationAnnotations = replyAnnotations
 	// The daemon handler implements agent.UsageProvider; extract once so
 	// callsites pass a strongly-typed provider (or nil) to applyTurnState.
 	var turnUsage usageProvider
@@ -4406,7 +4465,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// identically to the default agent — the smart-title upgrade replaces
 		// this placeholder asynchronously.
 		if sess.Title == "New session" {
-			sess.Title = session.Title(prompt)
+			sess.Title = session.Title(visiblePrompt)
 			sess.TitleAuto = true
 		}
 
@@ -4426,12 +4485,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				sess.MessageMeta = sess.MessageMeta[:turnBase.metaCount]
 			}
 			if !preLoopUserAppended {
-				fallbackContent := buildUserMsgContent(prompt, resolvedContent)
+				fallbackContent := buildUserMsgContent(visiblePrompt, resolvedContent)
 				sess.Messages = append(sess.Messages,
 					client.Message{Role: "user", Content: fallbackContent},
 				)
 				sess.MessageMeta = append(sess.MessageMeta,
-					session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(userMsgTime)},
+					session.MessageMeta{
+						Source:                  checkpointSource,
+						Timestamp:               session.TimePtr(userMsgTime),
+						ConversationAnnotations: replyAnnotations,
+					},
 				)
 			}
 			replyTime := time.Now()
@@ -5235,12 +5298,13 @@ func isSoftRunError(err error) bool {
 // for the accumulated turn, no matter how many times the function is
 // called.
 type turnBaseline struct {
-	msgCount    int
-	metaCount   int
-	usage       session.UsageSummary // pre-turn cumulative usage; zero if sess.Usage was nil
-	hadUsage    bool                 // true if sess.Usage was non-nil at baseline
-	source      string
-	preLoopUser bool
+	msgCount                int
+	metaCount               int
+	usage                   session.UsageSummary // pre-turn cumulative usage; zero if sess.Usage was nil
+	hadUsage                bool                 // true if sess.Usage was non-nil at baseline
+	source                  string
+	preLoopUser             bool
+	conversationAnnotations []session.ConversationAnnotation
 }
 
 // captureTurnBaseline snapshots sess state at turn start so subsequent
@@ -5290,17 +5354,38 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 	if b.preLoopUser && runMsgs[0].Role == "user" {
 		startIdx = 1
 	}
+	// The triggering user message's annotations were decoded at ingress (they
+	// may merge a drained mailbox batch); reuse them instead of re-decoding.
+	// When preLoopUser is set the trigger was persisted before the loop with
+	// its annotations attached, so no run message may claim them here.
+	triggerIdx := -1
+	if !b.preLoopUser {
+		triggerIdx = startIdx
+	}
 	fallbackTime := time.Now()
 	for i := startIdx; i < len(runMsgs); i++ {
 		ts := fallbackTime
 		if i < len(runTimestamps) && !runTimestamps[i].IsZero() {
 			ts = runTimestamps[i]
 		}
-		sess.Messages = append(sess.Messages, runMsgs[i])
+		injected := i < len(runInjected) && runInjected[i]
+		persisted := runMsgs[i]
 		meta := session.MessageMeta{Source: b.source, Timestamp: session.TimePtr(ts)}
-		if i < len(runInjected) && runInjected[i] {
+		if injected {
 			meta.SystemInjected = true
 		}
+		if persisted.Role == "user" && !injected {
+			// Mid-run injected follow-ups carry their own head envelopes:
+			// decode each one so its annotations survive reload, exactly like
+			// the trigger message's do.
+			var annotations []session.ConversationAnnotation
+			persisted, annotations = conversationReplyPersistedMessage(persisted)
+			if i == triggerIdx {
+				annotations = b.conversationAnnotations
+			}
+			meta.ConversationAnnotations = annotations
+		}
+		sess.Messages = append(sess.Messages, persisted)
 		sess.MessageMeta = append(sess.MessageMeta, meta)
 	}
 }
