@@ -226,13 +226,16 @@ const (
 	// sees the tools), so Desktop can prompt the user to update the engine.
 	CapIntegrationToolsV1 = "integration_tools_v1"
 	// CapIntegrationConnectBodyV1 — POST /integrations/{provider}/connect
-	// forwards the client's JSON body verbatim to Cloud, which is how
-	// token-mode providers (Shopify: {params:{shop, access_token}}) deliver
-	// credentials and get back an active connection without a browser
-	// round-trip. An old daemon silently DROPS the body and forwards a
-	// body-less connect, so Desktop must gate its credential-entry form on
-	// this token rather than letting Cloud reject a request that never
-	// carried the credentials.
+	// forwards the client's JSON body verbatim to Cloud, which is how a
+	// provider's declared connect-time parameters reach the authorization
+	// flow (Shopify / Jira / Confluence / Salesforce: {params:{subdomain}}).
+	// An old daemon silently DROPS the body and forwards a body-less connect,
+	// which Cloud rejects with a missing-parameter error for the providers
+	// that declare one (every other provider connects fine either way), so
+	// Desktop must gate its connect-param form on this token. The name
+	// predates the Composio vendor migration, where the same body carried a
+	// pasted credential for token-mode providers; the wire behaviour it
+	// advertises (body forwarded verbatim) is unchanged, so it keeps the name.
 	CapIntegrationConnectBodyV1 = "integration_connect_body_v1"
 	// CapMessageIdempotencyV1 — POST /message accepts idempotency_key together
 	// with a client-minted session_id. A completed retry returns the persisted

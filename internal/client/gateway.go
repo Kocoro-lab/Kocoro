@@ -2461,11 +2461,11 @@ func (c *GatewayClient) CloudBaseURL() string { return c.baseURL }
 // ---------------------------------------------------------------------------
 
 // IntegrationConnect starts a connect for the given provider via Cloud.
-// Returns Cloud's status + raw body verbatim. For OAuth providers the response
-// carries the oauth_url the renderer must open plus a connection_id; token-mode
-// providers (e.g. Shopify) take credentials in the forwarded JSON body and
-// return an active connection directly. The body may contain long-lived
-// credentials — never log it.
+// Returns Cloud's status + raw body verbatim: {connection_id, oauth_url,
+// status}, where oauth_url is the authorization page the renderer must open.
+// Providers declaring connect-time parameters (Shopify / Jira / Confluence /
+// Salesforce: {params:{subdomain}}) carry them in the forwarded JSON body.
+// The body is caller-supplied and treated as sensitive — never log it.
 func (c *GatewayClient) IntegrationConnect(ctx context.Context, provider string, body []byte) (int, []byte, error) {
 	endpoint := c.baseURL + "/api/v1/integrations/" + url.PathEscape(provider) + "/connect"
 	var reqBody io.Reader
