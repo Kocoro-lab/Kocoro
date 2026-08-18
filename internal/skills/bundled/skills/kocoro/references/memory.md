@@ -131,7 +131,15 @@ ordinary turn.
 - Use `memory_recall` once for each concrete named anchor or target. The tool
   consumes the sidecar's per-group `evidence_tier`: `corroborated` may be
   stated plainly as a past record; `singleton`, `derived`, `text`, and
-  missing/unknown tiers must be qualified.
+  missing/unknown tiers must be qualified. When a group has
+  `temporal_status`, `current` is the latest value of that updating fact
+  and `superseded_by_recency` is an older value kept for audit — prefer
+  current unless the user asked about the past. Do not quote these field
+  names in user-facing replies.
+- For how-many / how-much questions, `direct_relation` may set
+  `aggregator` to `count` or `sum` and an explicit `YYYY-MM-DD/YYYY-MM-DD`
+  `time_window`. A withheld count arrives as `reason: incomplete` with
+  `aggregation.known_lower_bound` — do not treat that as a finished total.
 - For an unnamed reference such as “my doctor” or “that plan”, use
   `session_search` to recover the concrete name or raw wording instead of
   inventing a graph anchor.

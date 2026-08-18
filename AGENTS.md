@@ -1,23 +1,16 @@
 # Kocoro Project Guide (AGENTS.md)
 
-**Condensed mirror of `CLAUDE.md` for external coding agents. `CLAUDE.md` in this
-directory is the full guide** — open it for reasoning, wire details, incident
-history, or any subsystem not listed here. This file carries only rules you can
-act on, plus the symbols and constants to grep. If the two disagree, `CLAUDE.md`
-and the code win.
+**Condensed mirror of `CLAUDE.md`** — actionable rules plus the symbols to grep.
+If the two disagree, `CLAUDE.md` and the code win.
 
-**Keep this file under 24 KB.** Harnesses that read `AGENTS.md` do so under a byte
-budget shared across every such file from the repo root down (32 KiB by default),
-and an over-budget file is truncated **from the tail, with no marker in the injected
-text** — the reader cannot tell it got a partial file, and the sections at the bottom
-are simply gone. CI asserts the ceiling; if you need more room, cut prose, not rules.
+**Keep this file under 24 KB (CI asserts).** Harnesses truncate over-budget
+files silently from the tail. Cut prose, not rules.
 
 Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production path:
-daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WebSocket,
-receives channel messages, runs the agent loop locally with full tool access, and
-streams back. Also TUI, one-shot CLI, MCP server, local scheduled tasks.
+daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WS, runs the
+agent loop locally, streams back. Also TUI, one-shot CLI, MCP server, schedules.
 
-Layout: `cmd/` (Cobra) + `internal/<pkg>/`; use Glob/Grep. Production path is
+Layout: `cmd/` (Cobra) + `internal/<pkg>/`. Production path is
 `internal/daemon/` driving `internal/agent/`.
 
 ## Working Rules
@@ -57,7 +50,7 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - **Exposure** (`agent/exposure.go EffectiveToolExposure`): explicit
   `ToolExposure` first, then source default — local Direct; MCP/gateway/
   integration Deferred. `ask_user_question` is explicitly Direct. `web_search` /
-  `web_fetch` are Direct **only when `ToolSource()==SourceGateway`**
+  `web_fetch` / `x_search` are Direct **only when `ToolSource()==SourceGateway`**
   (`tools/exposure.go ServerTool.ToolExposure`); a same-named MCP or integration
   tool keeps its Deferred default so a third-party catalog cannot widen the base
   schema surface. GUI/process automation and calendar/schedule mutations are
@@ -77,9 +70,38 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   eligible; everything else stays in a size-1 serial batch.
 - `tool_status` running/completed carry `tool_use_id` (capability
   `tool_use_id_events`).
+- `set_work_plan` (`daemon/work_plan.go`): full-snapshot 2–8-step progress
+  checklist, daemon non-ephemeral runs only. Runtime owns
+  plan_id/revision/lifecycle/close_reason; closure comes from `LastRunStatus`,
+  never a model claim, and bumps the revision. Persist-before-emit:
+  `work_plan.updated` fires only after the covering save. Not dup-exempt;
+  `SkillExempt`; never in the side-effect journal. Capability `work_plan_v1`.
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
+- Trusted `material_side_effect=false` permits observational batching without
+  the journal; absent is fail-closed. Calls use stable `request_id`; material
+  calls also use `Idempotency-Key`. Only pre-dispatch `provider_unavailable` is
+  known-no-effect; billing/provider/post-dispatch failures are not. Preserve
+  provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted material
+  `call_in_progress` is `outcome_unknown`: never commit/resend under a new ID.
+- SourceIntegration is identity-scoped. Key mutation invalidates generations
+  before source clear, without the dispatch writer. Failed new-identity listing
+  leaves it empty; same-identity refresh failure keeps it. ServerTool binds list
+  credential/principal generation; stale clones fail pre-dispatch and caches
+  cannot revive them. Auth/integration/MCP-health/reload swaps share one lock.
+  Auth rebuilds both overlays, dropping credential-bound cloud/publish/image but
+  preserving calendar/non-auth tools. The six concrete tools (`cloud_delegate`,
+  publish/list/retract, generate/edit) lease generation through all `Run` retries;
+  stale clones are known-no-effect. Serialize auth across accounts/keys.
+- `x_prepare_post` is Deferred URL-only: no OAuth/HTTP/opener/automation; it
+  reports no post, omits draft/URL from audit, and ends the turn. `browser`,
+  `computer_use`, and canonical Playwright block X composer/publish controls but
+  preserve X reads/non-X mutation. Playwright omits `browser_run_code` and
+  `browser_evaluate`; CDP target check + call share a lock, and any X target
+  blocks mutation because X embeds a composer. Non-CDP has no target-state
+  guarantee. Native actions use guarded `computer_use`; shell/custom MCP are out
+  of scope. Only the user clicks the review link and X's Post button.
 
 ## MCP
 
@@ -151,10 +173,15 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 - `ApprovalBroker` and `QuestionBroker` are thin faces over ONE shared
   `pendingCore[D]` (`pending.go`). A third interaction kind MUST build on it — do
   NOT copy a broker.
-- `ask_user_question` gates on `CanPresentQuestionUI` / `questionUISources`, an
-  ALLOW-list, NOT the approval predicate: every source without a question UI
-  DECLINES, because a question has no safe auto-answer. Slack/Feishu/Lark/Teams/
-  LINE render approval cards but have NO question channel. Capability `question_v1`.
+- `ask_user_question` gates on `CanPresentQuestionUI` / `questionUISources` — an
+  ALLOW-list, NOT the approval predicate: sources without a question UI DECLINE
+  (no safe auto-answer; IM channels have approval cards but no question channel).
+  Capability `question_v1`. Ephemeral runs get no asker (`shouldInjectQuestionAsker`).
+- Conversation context actions (`conversation_context_actions_v1`, Desktop-only):
+  `POST /sessions/{id}/{fork,side-chat}`; `message_index` = RAW-archive turn
+  boundary (injected entries counted). Side chats run the NORMAL tool registry +
+  SSE approvals but stay ephemeral (no session, no bus events). Reply envelopes
+  strip head-only, only when they parse; limits 400 at `/message` + `/queue`.
 - `delivery_ack`: ack an inbound message only AFTER reply delivery succeeds.
   Reply-failure paths skip the ack so replay stays correct.
 
@@ -273,7 +300,10 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 - Episodic recall is model-driven: production paths expose `memory_recall` and
   `session_search` directly and MUST NOT install the implicit small-model
   preflight. Route unnamed references to session search; stop after a structured
-  no-data instead of retrying relation variants.
+  no-data instead of retrying relation variants. Keep sidecar `temporal_status`
+  (`current` / `superseded_by_recency`) on recall groups; prefer current
+  unless the user asked about the past. Preserve unknown sidecar group
+  fields on the recall round-trip. `aggregator` is `direct_relation` only.
 - Session sync is opt-in: single Run entry point, flock, atomic markers,
   per-session ACKs. Permanent failures remain until the source session changes.
 - Browser file previews stay fail-closed: only effective session CWD and attached
@@ -342,9 +372,9 @@ barge-in admission, not default dismissal.
 ## Tests
 
 ```bash
-go test ./...                                          # or ./internal/{agent,daemon,agents,schedule}/ -v
+go test ./...                                        # or per-package with -v
 go test ./test/ -v && go test ./test/e2e/ -v
-SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v   # live suite; the build tag is required
+SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v # live suite (tag required)
 go build ./...
 ```
 

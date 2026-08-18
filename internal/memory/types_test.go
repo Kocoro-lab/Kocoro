@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -133,6 +135,79 @@ func TestMemoryCandidateGroup_LegacyPayloadDefaultsEvidenceTier(t *testing.T) {
 	}
 	if bytes.Contains(out, []byte(`"evidence_tier"`)) {
 		t.Fatalf("legacy empty evidence_tier should stay omitted on re-marshal: %s", out)
+	}
+}
+
+func TestKnownKeysMatchStructTags(t *testing.T) {
+	assertJSONKeysMatch(t, "QueryCandidate", QueryCandidate{}, queryCandidateKnownKeys)
+	assertJSONKeysMatch(t, "MemoryCandidateGroup", MemoryCandidateGroup{}, memoryCandidateGroupKnownKeys)
+}
+
+func assertJSONKeysMatch(t *testing.T, name string, sample any, known []string) {
+	t.Helper()
+	typ := reflect.TypeOf(sample)
+	var tags []string
+	for i := 0; i < typ.NumField(); i++ {
+		tag := typ.Field(i).Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		key := strings.Split(tag, ",")[0]
+		if key == "" || key == "-" {
+			continue
+		}
+		tags = append(tags, key)
+	}
+	sort.Strings(tags)
+	got := append([]string(nil), known...)
+	sort.Strings(got)
+	if !reflect.DeepEqual(tags, got) {
+		t.Fatalf("%s json tags %v != knownKeys %v", name, tags, got)
+	}
+}
+
+func TestMemoryCandidateGroup_PreservesUnknownContractFields(t *testing.T) {
+	raw := []byte(`{"value":"1","score":1,"evidence":"observed","support_count":1,"aggregation":{"status":"ok","value":1,"superseded_excluded_count":2},"measure":{"value":5,"unit":"wins"}}`)
+	var group MemoryCandidateGroup
+	if err := json.Unmarshal(raw, &group); err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var round map[string]any
+	if err := json.Unmarshal(out, &round); err != nil {
+		t.Fatal(err)
+	}
+	agg, ok := round["aggregation"].(map[string]any)
+	if !ok {
+		t.Fatalf("aggregation dropped: %s", out)
+	}
+	if agg["status"] != "ok" || agg["superseded_excluded_count"] != float64(2) {
+		t.Fatalf("aggregation=%v", agg)
+	}
+	measure, ok := round["measure"].(map[string]any)
+	if !ok || measure["unit"] != "wins" {
+		t.Fatalf("measure dropped: %s", out)
+	}
+}
+
+func TestMemoryCandidateGroup_TemporalStatusRoundTrip(t *testing.T) {
+	raw := `{"value":"5-2","score":1,"evidence":"observed","support_count":1,"temporal_status":"current"}`
+	var group MemoryCandidateGroup
+	if err := json.Unmarshal([]byte(raw), &group); err != nil {
+		t.Fatal(err)
+	}
+	if group.TemporalStatus != "current" {
+		t.Fatalf("temporal_status=%q want current", group.TemporalStatus)
+	}
+	out, err := json.Marshal(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte(`"temporal_status":"current"`)) {
+		t.Fatalf("temporal_status dropped on marshal: %s", out)
 	}
 }
 

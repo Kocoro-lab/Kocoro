@@ -9,12 +9,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
+	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
 // newIntegrationsTestServer builds a minimal Server for exercising the
@@ -428,6 +431,317 @@ func TestRefreshIntegrationTools_SyncsGatewayOverlay(t *testing.T) {
 	}
 	if !found {
 		t.Error("integration tool must be in GatewayOverlay after refresh (survives MCP health rebuild)")
+	}
+}
+
+func TestIntegrationTools_WS401SignOutClearsPreviousPrincipalCatalog(t *testing.T) {
+	cfg := &config.Config{}
+	reg := agent.NewToolRegistry()
+	gw := client.NewGatewayClient("http://127.0.0.1:1", "old-key")
+	reg.Register(tools.NewIntegrationTool(client.ServerToolSchema{Name: "x_mentions"}, gw))
+	deps := &ServerDeps{Config: cfg, Registry: reg, GW: gw, ShannonDir: t.TempDir()}
+	s := NewServer(0, nil, deps, "test")
+	kc := keychain.NewStore(keychain.NewMemBackend(), nil)
+	_ = kc.SetAPIKey("account-a", "old-key")
+	auth := NewAuthManager(AuthManagerConfig{Keychain: kc, Gateway: gw})
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "account-a"}, "")
+	s.SetAuth(auth)
+
+	auth.HandleWSAuthFailure()
+	if _, ok := reg.Get("x_mentions"); ok {
+		t.Fatal("WS 401 sign-out retained the previous principal's integration tool")
+	}
+	for _, tool := range deps.GatewayOverlay {
+		if sourcer, ok := tool.(agent.ToolSourcer); ok && sourcer.ToolSource() == agent.SourceIntegration {
+			t.Fatalf("WS 401 sign-out retained integration in gateway overlay: %s", tool.Info().Name)
+		}
+	}
+}
+
+func TestIntegrationTools_AccountSwitchTransientListFailureStaysEmpty(t *testing.T) {
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/me":
+			_ = json.NewEncoder(w).Encode(client.AuthUser{ID: "account-b", Email: "b@example.com"})
+		case "/api/v1/integrations/tools":
+			http.Error(w, "temporary outage", http.StatusBadGateway)
+		default:
+			t.Fatalf("unexpected cloud path %s", r.URL.Path)
+		}
+	}))
+	defer cloud.Close()
+
+	cfg := &config.Config{}
+	reg := agent.NewToolRegistry()
+	gw := client.NewGatewayClient(cloud.URL, "old-key")
+	reg.Register(tools.NewIntegrationTool(client.ServerToolSchema{Name: "x_mentions"}, gw))
+	deps := &ServerDeps{Config: cfg, Registry: reg, GW: gw, ShannonDir: t.TempDir()}
+	s := NewServer(0, nil, deps, "test")
+	kc := keychain.NewStore(keychain.NewMemBackend(), nil)
+	_ = kc.SetAPIKey("account-a", "old-key")
+	auth := NewAuthManager(AuthManagerConfig{
+		Keychain: kc,
+		Cloud:    client.NewAuthClient(cloud.URL, cloud.Client()),
+		Gateway:  gw,
+		OnAPIKeyChanging: func(context.Context) {
+			s.InvalidateIntegrationTools()
+		},
+		OnAPIKeyChanged: func(ctx context.Context) {
+			s.RebuildAuthSensitiveTools(ctx)
+		},
+	})
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "account-a"}, "")
+	s.SetAuth(auth)
+
+	if err := auth.AdoptKey(context.Background(), "new-key"); err != nil {
+		t.Fatalf("AdoptKey: %v", err)
+	}
+	if id, _, ok := auth.VerifiedPrincipal(); !ok || id != "account-b" {
+		t.Fatalf("verified principal = %q, %t", id, ok)
+	}
+	if _, ok := reg.Get("x_mentions"); ok {
+		t.Fatal("account switch transient failure retained account A's tool")
+	}
+}
+
+func TestIntegrationTools_SamePrincipalKeyRotationRepopulatesNewCatalog(t *testing.T) {
+	var catalogKeys []string
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/me":
+			_ = json.NewEncoder(w).Encode(client.AuthUser{ID: "account-a", Email: "a@example.com"})
+		case "/api/v1/integrations/tools":
+			key := r.Header.Get("X-API-Key")
+			catalogKeys = append(catalogKeys, key)
+			if key != "new-key" {
+				t.Fatalf("catalog fetched with key %q, want new-key", key)
+			}
+			_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{{Name: "x_new_catalog"}})
+		default:
+			t.Fatalf("unexpected cloud path %s", r.URL.Path)
+		}
+	}))
+	defer cloud.Close()
+
+	cfg := &config.Config{}
+	reg := agent.NewToolRegistry()
+	gw := client.NewGatewayClient(cloud.URL, "old-key")
+	reg.Register(tools.NewIntegrationTool(client.ServerToolSchema{Name: "x_old_catalog"}, gw))
+	deps := &ServerDeps{Config: cfg, Registry: reg, GW: gw, ShannonDir: t.TempDir()}
+	s := NewServer(0, nil, deps, "test")
+	kc := keychain.NewStore(keychain.NewMemBackend(), nil)
+	_ = kc.SetAPIKey("account-a", "old-key")
+	auth := NewAuthManager(AuthManagerConfig{
+		Keychain: kc,
+		Cloud:    client.NewAuthClient(cloud.URL, cloud.Client()),
+		Gateway:  gw,
+		OnAPIKeyChanging: func(context.Context) {
+			s.InvalidateIntegrationTools()
+		},
+		OnAPIKeyChanged: func(ctx context.Context) {
+			s.RebuildAuthSensitiveTools(ctx)
+		},
+	})
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "account-a"}, "")
+	_, oldEpoch, _ := auth.VerifiedPrincipal()
+	s.SetAuth(auth)
+	auth.applyAPIKey(context.Background(), "old-key")
+	if _, ok := reg.Get("x_old_catalog"); ok || len(catalogKeys) != 0 {
+		t.Fatalf("same-byte credential mutation retained old catalog or refetched before verified binding: present=%t keys=%v", ok, catalogKeys)
+	}
+
+	if err := auth.AdoptKey(context.Background(), "new-key"); err != nil {
+		t.Fatalf("AdoptKey: %v", err)
+	}
+	_, newEpoch, ok := auth.VerifiedPrincipal()
+	if !ok || newEpoch <= oldEpoch {
+		t.Fatalf("principal epoch old=%d new=%d verified=%t", oldEpoch, newEpoch, ok)
+	}
+	if _, ok := reg.Get("x_old_catalog"); ok {
+		t.Fatal("same-principal key rotation retained old catalog")
+	}
+	if _, ok := reg.Get("x_new_catalog"); !ok {
+		t.Fatal("same-principal key rotation did not repopulate new catalog")
+	}
+	if len(catalogKeys) != 1 || catalogKeys[0] != "new-key" {
+		t.Fatalf("catalog keys = %v", catalogKeys)
+	}
+}
+
+func TestAuthManager_KeySwapInvalidatesCapturedToolsBeforeBlockingRegistryCallback(t *testing.T) {
+	var uploadCalls atomic.Int32
+	var executeCalls atomic.Int32
+	var oldCatalogCalls atomic.Int32
+	var newCatalogCalls atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/auth/me":
+			if got := r.Header.Get("X-API-Key"); got != "new-key" {
+				t.Errorf("auth probe key = %q, want new-key", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"user_id": "account-b",
+				"email":   "b@example.com",
+			})
+		case r.URL.Path == "/api/v1/integrations/tools":
+			switch r.Header.Get("X-API-Key") {
+			case "old-key":
+				oldCatalogCalls.Add(1)
+				_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{{Name: "x_old_catalog"}})
+			case "new-key":
+				newCatalogCalls.Add(1)
+				_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{{Name: "x_new_catalog"}})
+			default:
+				t.Errorf("catalog key = %q", r.Header.Get("X-API-Key"))
+				http.Error(w, "unexpected key", http.StatusUnauthorized)
+			}
+		case r.URL.Path == "/api/v1/uploads":
+			uploadCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"uploads": []any{}, "total_count": 0})
+		case strings.HasSuffix(r.URL.Path, "/execute"):
+			executeCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"output":  map[string]any{"ok": true},
+			})
+		default:
+			t.Errorf("unexpected cloud path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer cloud.Close()
+
+	baseline := agent.NewToolRegistry()
+	reg := baseline.Clone()
+	cfg := &config.Config{
+		Endpoint: cloud.URL,
+		APIKey:   "old-key",
+		Cloud:    config.CloudConfig{Enabled: true},
+	}
+	gw := client.NewGatewayClient(cloud.URL, "old-key")
+	deps := &ServerDeps{
+		Config:      cfg,
+		GW:          gw,
+		Registry:    reg,
+		BaselineReg: baseline,
+		ShannonDir:  t.TempDir(),
+	}
+	server := NewServer(0, nil, deps, "test")
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(releaseCallback)
+		}
+	}
+	t.Cleanup(release)
+	auth := NewAuthManager(AuthManagerConfig{
+		Keychain: keychain.NewStore(keychain.NewMemBackend(), nil),
+		Cloud:    client.NewAuthClient(cloud.URL, cloud.Client()),
+		Gateway:  gw,
+		OnAPIKeyChanging: func(context.Context) {
+			close(callbackEntered)
+			<-releaseCallback
+			server.InvalidateIntegrationTools()
+		},
+		OnAPIKeyChanged: func(ctx context.Context) {
+			server.RebuildAuthSensitiveTools(ctx)
+		},
+	})
+	server.SetAuth(auth)
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "account-a"}, "")
+	if got := oldCatalogCalls.Load(); got != 1 {
+		t.Fatalf("initial old catalog fetches = %d, want 1", got)
+	}
+
+	captured := tools.CloneWithRuntimeConfig(reg, cfg)
+	oldPost, ok := captured.Get("list_my_published_files")
+	if !ok {
+		t.Fatal("initial principal did not register list_my_published_files")
+	}
+	oldIntegration, ok := captured.Get("x_old_catalog")
+	if !ok {
+		t.Fatal("initial principal did not register x_old_catalog")
+	}
+
+	adoptDone := make(chan error, 1)
+	go func() {
+		adoptDone <- auth.AdoptKey(context.Background(), "new-key")
+	}()
+	<-callbackEntered
+
+	// The registry callback is deliberately blocked before clearing the live
+	// registry. Generation invalidation, rather than pointer removal, must make
+	// both previously captured tools fail before dispatch in this window.
+	if got := gw.APIKey(); got != "new-key" {
+		t.Fatalf("gateway key during callback = %q, want new-key", got)
+	}
+	if generation, active := gw.IntegrationGeneration(); active {
+		t.Fatalf("integration generation %d remained active during callback", generation)
+	}
+	if _, ok := reg.Get("list_my_published_files"); !ok {
+		t.Fatal("test did not reach the intended pre-clear callback window")
+	}
+	if _, ok := reg.Get("x_old_catalog"); !ok {
+		t.Fatal("old integration catalog cleared before the blocked callback resumed")
+	}
+	for _, capturedTool := range []agent.Tool{oldPost, oldIntegration} {
+		result, err := capturedTool.Run(context.Background(), `{}`)
+		if err != nil {
+			t.Fatalf("%s Run: %v", capturedTool.Info().Name, err)
+		}
+		if !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness ||
+			!result.SideEffectKnownNoEffect || result.SideEffectOutcomeUnknown {
+			t.Fatalf("%s stale result = %#v", capturedTool.Info().Name, result)
+		}
+	}
+	if got := uploadCalls.Load(); got != 0 {
+		t.Fatalf("stale post overlay dispatched %d HTTP request(s)", got)
+	}
+	if got := executeCalls.Load(); got != 0 {
+		t.Fatalf("stale integration tool dispatched %d HTTP request(s)", got)
+	}
+	select {
+	case err := <-adoptDone:
+		t.Fatalf("AdoptKey completed inside blocked registry callback: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case err := <-adoptDone:
+		if err != nil {
+			t.Fatalf("AdoptKey: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AdoptKey did not complete after registry callback resumed")
+	}
+	if id, _, ok := auth.VerifiedPrincipal(); !ok || id != "account-b" {
+		t.Fatalf("verified principal = %q, %t; want account-b", id, ok)
+	}
+	if _, active := gw.IntegrationGeneration(); !active {
+		t.Fatal("new verified principal did not activate a fresh generation")
+	}
+	newPost, ok := reg.Get("list_my_published_files")
+	if !ok || newPost == oldPost {
+		t.Fatalf("new principal post overlay = %T present=%t; want a fresh tool", newPost, ok)
+	}
+	if _, ok := reg.Get("x_new_catalog"); !ok {
+		t.Fatal("new principal did not rebuild its integration catalog")
+	}
+	if _, ok := reg.Get("x_old_catalog"); ok {
+		t.Fatal("new principal retained the old integration catalog")
+	}
+	result, err := newPost.Run(context.Background(), `{}`)
+	if err != nil || result.IsError {
+		t.Fatalf("new principal post overlay result = %#v, err=%v", result, err)
+	}
+	if got := uploadCalls.Load(); got != 1 {
+		t.Fatalf("new principal post overlay dispatched %d requests, want 1", got)
+	}
+	if got := newCatalogCalls.Load(); got != 1 {
+		t.Fatalf("new principal catalog fetches = %d, want 1", got)
 	}
 }
 

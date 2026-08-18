@@ -60,6 +60,7 @@ type AuthManagerConfig struct {
 	Cfg                  *config.Config
 	ShannonDir           string
 	OnAPIKeyChanged      func(context.Context)
+	OnAPIKeyChanging     func(context.Context)
 	LockConfigMutation   func() func()
 	RecordConfigMutation func(config.MutationRevisions)
 	Logger               *log.Logger
@@ -69,6 +70,7 @@ type AuthManagerConfig struct {
 // changes go through setState(); concurrent operations on the same email
 // are coalesced via singleflight.
 type AuthManager struct {
+	mutationMu   sync.Mutex
 	mu           sync.RWMutex
 	state        AuthState
 	user         *client.AuthUser
@@ -93,6 +95,7 @@ type AuthManager struct {
 	bus                  *EventBus
 	onPrincipalChanged   func(previous, current string)
 	onAPIKeyChanged      func(context.Context)
+	onAPIKeyChanging     func(context.Context)
 	lockConfigMutation   func() func()
 	recordConfigMutation func(config.MutationRevisions)
 	logger               *log.Logger
@@ -109,7 +112,7 @@ func NewAuthManager(cfg AuthManagerConfig) *AuthManager {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &AuthManager{
+	manager := &AuthManager{
 		state:                AuthStateSignedOut,
 		updatedAt:            time.Now(),
 		kc:                   cfg.Keychain,
@@ -117,11 +120,19 @@ func NewAuthManager(cfg AuthManagerConfig) *AuthManager {
 		gw:                   cfg.Gateway,
 		wsClient:             cfg.WSClient,
 		onAPIKeyChanged:      cfg.OnAPIKeyChanged,
+		onAPIKeyChanging:     cfg.OnAPIKeyChanging,
 		lockConfigMutation:   cfg.LockConfigMutation,
 		recordConfigMutation: cfg.RecordConfigMutation,
 		logger:               logger,
 		shanDir:              cfg.ShannonDir,
 	}
+	// GatewayClient defaults to an active generation for legacy non-AuthManager
+	// callers. Once AuthManager owns the process, integration execution remains
+	// inactive until Cloud verifies and binds a concrete principal.
+	if manager.gw != nil {
+		manager.gw.BindIntegrationPrincipal("", 0)
+	}
+	return manager
 }
 
 // SetEventBus installs the bus AuthManager emits auth_state_changed on.
@@ -225,6 +236,15 @@ func (a *AuthManager) VerifiedPrincipal() (string, uint64, bool) {
 // Event emission happens AFTER releasing the AuthManager lock so handlers
 // reading from the bus cannot deadlock against the mutator.
 func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode string) {
+	a.setStateWithPrincipalEpoch(s, user, errCode, false)
+}
+
+func (a *AuthManager) setStateWithPrincipalEpoch(
+	s AuthState,
+	user *client.AuthUser,
+	errCode string,
+	forcePrincipalEpoch bool,
+) {
 	a.mu.Lock()
 	previousVerifiedID := a.verifiedID
 	prev := a.state
@@ -254,10 +274,14 @@ func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode strin
 	if a.state == AuthStateSignedIn && a.user != nil {
 		newVerifiedID = a.user.ID
 	}
-	principalTransition := newVerifiedID != a.verifiedID
+	principalTransition := newVerifiedID != a.verifiedID ||
+		forcePrincipalEpoch && newVerifiedID != ""
 	if principalTransition {
 		a.verifiedID = newVerifiedID
 		a.principalEpoch++
+		if a.gw != nil {
+			a.gw.BindIntegrationPrincipal(newVerifiedID, a.principalEpoch)
+		}
 	}
 	snap := a.snapshotLocked()
 	bus := a.bus
@@ -300,6 +324,8 @@ func (a *AuthManager) setState(s AuthState, user *client.AuthUser, errCode strin
 // Bootstrap is non-blocking by design — cmd/daemon.go launches it in a
 // goroutine so the HTTP server is up immediately.
 func (a *AuthManager) Bootstrap(ctx context.Context) {
+	a.mutationMu.Lock()
+	defer a.mutationMu.Unlock()
 	if a.kc == nil {
 		a.logger.Printf("auth: bootstrap skipped (keychain unsupported)")
 		return
@@ -400,6 +426,8 @@ func (a *AuthManager) selfHealFromYAML(ctx context.Context) {
 // 3-50 char + globally-unique Cloud constraint holds without forcing
 // Desktop to collect a username field.
 func (a *AuthManager) Register(ctx context.Context, req client.AuthRegisterRequest) error {
+	a.mutationMu.Lock()
+	defer a.mutationMu.Unlock()
 	if a.kc == nil {
 		return errPlatformUnsupported
 	}
@@ -480,6 +508,8 @@ func (a *AuthManager) Login(ctx context.Context, email, password string) error {
 		return errPlatformUnsupported
 	}
 	_, err, _ := a.sf.Do("login:"+email, func() (any, error) {
+		a.mutationMu.Lock()
+		defer a.mutationMu.Unlock()
 		return nil, a.doLogin(ctx, email, password)
 	})
 	return err
@@ -569,6 +599,8 @@ func (a *AuthManager) AdoptKey(ctx context.Context, apiKey string) error {
 		return fmt.Errorf("adopt key: empty api_key")
 	}
 	_, err, _ := a.sf.Do("adopt:"+apiKey, func() (any, error) {
+		a.mutationMu.Lock()
+		defer a.mutationMu.Unlock()
 		return nil, a.doAdoptKey(ctx, apiKey)
 	})
 	return err
@@ -601,7 +633,11 @@ func (a *AuthManager) doAdoptKey(ctx context.Context, apiKey string) error {
 	a.refreshToken = ""
 	a.mu.Unlock()
 	a.applyAPIKey(ctx, apiKey)
-	a.setState(AuthStateSignedIn, user, "")
+	// Adopted credentials start a new identity epoch even when Cloud resolves
+	// them to the same account. This repopulates auth-bound integration schemas
+	// after the pre-key-swap invalidation and prevents old-key work from flowing
+	// into a same-account credential rotation.
+	a.setStateWithPrincipalEpoch(AuthStateSignedIn, user, "", true)
 	// Restart (not stop+start): on an account switch a WS for the previous
 	// account may still be live, and stop+start would no-op the start.
 	a.restartWS(ctx)
@@ -645,6 +681,8 @@ func (a *AuthManager) ForgotPassword(ctx context.Context, email, language string
 // user_id. When clearKeychain is true (/sign-out-full), the active api_key
 // entry is removed before current_user_id is cleared.
 func (a *AuthManager) SignOut(ctx context.Context, clearKeychain bool) {
+	a.mutationMu.Lock()
+	defer a.mutationMu.Unlock()
 	if a.kc == nil {
 		return
 	}
@@ -666,6 +704,8 @@ func (a *AuthManager) SignOut(ctx context.Context, clearKeychain bool) {
 // api_key has been revoked (vs network noise) so we wipe Keychain and
 // drop to signed_out — the user must re-login to get a fresh key.
 func (a *AuthManager) HandleWSAuthFailure() {
+	a.mutationMu.Lock()
+	defer a.mutationMu.Unlock()
 	if a.kc == nil {
 		return
 	}
@@ -694,14 +734,27 @@ func IsErrPlatformUnsupported(err error) bool {
 
 // applyAPIKey is the single chokepoint that fan-outs an api_key change to
 // the dependencies that consume it:
-//   - GatewayClient.SetAPIKey   (X-API-Key on all Cloud HTTP requests)
+//   - GatewayClient.SetAPIKey   (X-API-Key plus synchronous generation invalidation)
+//   - OnAPIKeyChanging callback (clears old integration registry entries)
 //   - WS client.SetAPIKey       (Authorization: Bearer on WS upgrade)
 //   - OnAPIKeyChanged callback  (rebuilds auth-sensitive tools from the
 //     GatewayClient's synchronized live key)
 //
+// Gateway invalidation must happen before the registry callback: the callback
+// can block on a concurrent build-to-swap transaction, and old runtime clones
+// must already fail closed throughout that wait. SetAPIKey releases its short
+// dispatch writer before the callback so registry locks never invert with tool
+// execution leases.
+//
 // Pass "" to clear all live consumers uniformly.
 func (a *AuthManager) applyAPIKey(ctx context.Context, key string) {
 	a.gw.SetAPIKey(key)
+	a.mu.RLock()
+	before := a.onAPIKeyChanging
+	a.mu.RUnlock()
+	if before != nil {
+		before(ctx)
+	}
 	if a.wsClient != nil {
 		a.wsClient.SetAPIKey(key)
 	}

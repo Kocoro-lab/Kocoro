@@ -888,6 +888,75 @@ func TestWireFixture_SuggestionReady_Bus(t *testing.T) {
 	assertSemanticEqual(t, fixture, parseJSONMap(t, payload))
 }
 
+func TestWireFixture_WorkPlanUpdated_Bus(t *testing.T) {
+	fixture := loadWireFixture(t, "bus_event.work_plan.updated.json")
+
+	bus := NewEventBus()
+	sub := bus.Subscribe()
+	defer bus.Unsubscribe(sub)
+
+	// Real producer chain: controller Apply (twice, to reach the fixture's
+	// revision 2) → TakePendingEvent → emitWorkPlanUpdated. The same chain the
+	// runner drives after a successful durable save.
+	c := newRunPlanController(fixture["session_id"].(string), fixture["run_id"].(string))
+	if _, err := c.Apply("", []session.WorkPlanStep{
+		{Content: "Inspect current behavior", Status: session.WorkPlanStepInProgress},
+		{Content: "Implement the change", Status: session.WorkPlanStepPending},
+		{Content: "Exercise the real call path", Status: session.WorkPlanStepPending},
+	}, time.Now()); err != nil {
+		t.Fatalf("initial apply: %v", err)
+	}
+	c.TakePendingEvent()
+	if _, err := c.Apply(fixture["explanation"].(string), []session.WorkPlanStep{
+		{Content: "Inspect current behavior", Status: session.WorkPlanStepCompleted},
+		{Content: "Implement the change", Status: session.WorkPlanStepInProgress},
+		{Content: "Exercise the real call path", Status: session.WorkPlanStepPending},
+	}, time.Now()); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	snap := c.TakePendingEvent()
+	if snap == nil {
+		t.Fatal("no pending event after a changed apply")
+	}
+	emitWorkPlanUpdated(bus, fixture["session_id"].(string), snap, time.Now())
+
+	evt := waitBusEvent(t, sub, EventWorkPlanUpdated)
+	produced := parseJSONMap(t, evt.Payload)
+	normalizePrefixedID(t, produced, fixture, "plan_id", "wp1_")
+	normalizeRFC3339(t, produced, fixture, "updated_at")
+	normalizeRFC3339(t, produced, fixture, "ts")
+	assertSemanticEqual(t, fixture, produced)
+
+	// Consumer-shaped decode: the fields Desktop binds to must survive.
+	var card struct {
+		SessionID   string `json:"session_id"`
+		RunID       string `json:"run_id"`
+		PlanID      string `json:"plan_id"`
+		Revision    uint64 `json:"revision"`
+		Lifecycle   string `json:"lifecycle"`
+		CloseReason string `json:"close_reason"`
+		Explanation string `json:"explanation"`
+		Steps       []struct {
+			Content string `json:"content"`
+			Status  string `json:"status"`
+		} `json:"steps"`
+		Completed int    `json:"completed"`
+		Total     int    `json:"total"`
+		UpdatedAt string `json:"updated_at"`
+		TS        string `json:"ts"`
+	}
+	if err := json.Unmarshal(evt.Payload, &card); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if card.Revision != 2 || card.Lifecycle != "active" || card.Completed != 1 ||
+		card.Total != 3 || len(card.Steps) != 3 || !strings.HasPrefix(card.PlanID, "wp1_") {
+		t.Fatalf("consumer decode lost fields: %+v", card)
+	}
+	if card.CloseReason != "" {
+		t.Fatalf("active plan must omit close_reason, got %q", card.CloseReason)
+	}
+}
+
 // --- HTTP responses (full-router seam) ------------------------------------
 
 func TestWireFixture_HTTPComputerUseTopology(t *testing.T) {
@@ -1523,7 +1592,9 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 	sess.MessageMeta = []session.MessageMeta{
 		{Source: "desktop", Timestamp: &firstTime},
 		{Source: "desktop", Timestamp: &secondTime},
-		{Source: "desktop", Timestamp: &tailTime},
+		{Source: "desktop", Timestamp: &tailTime, ConversationAnnotations: []session.ConversationAnnotation{
+			{SelectedText: "ARCHIVE_ONLY_OLD_REPLY", Comment: "explain this line"},
+		}},
 	}
 	sess.CompactionCheckpoint = &session.CompactionCheckpoint{
 		SchemaVersion:       session.CompactionCheckpointSchemaVersion,
@@ -1533,6 +1604,22 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 			{Role: "user", Content: client.NewTextContent("Previous context summary: stable state")},
 			{Role: "assistant", Content: client.NewTextContent("compacted recent reply")},
 		},
+	}
+	// Session detail is the work-plan recovery authority; pin the field
+	// through the real route, in the STOPPED shape so close_reason — the
+	// branch consumers actually read — is exercised (the bus fixture covers
+	// the active shape).
+	sess.WorkPlan = &session.WorkPlanSnapshot{
+		PlanID:      "wp1_9f2c4b8a01d3e6f79f2c4b8a01d3e6f7",
+		RunID:       "run1_0123456789abcdef0123456789abcdef",
+		Revision:    3,
+		Lifecycle:   session.WorkPlanStopped,
+		CloseReason: session.WorkPlanCloseRunCompletedWithPendingSteps,
+		Steps: []session.WorkPlanStep{
+			{Content: "Inspect current behavior", Status: session.WorkPlanStepCompleted},
+			{Content: "Implement the change", Status: session.WorkPlanStepPending},
+		},
+		UpdatedAt: time.Date(2026, 8, 5, 0, 0, 4, 0, time.UTC),
 	}
 	if err := mgr.Save(); err != nil {
 		t.Fatalf("save fixture session: %v", err)
@@ -1558,8 +1645,12 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 		MessageMeta []struct {
-			Source    string `json:"source"`
-			Timestamp string `json:"timestamp"`
+			Source                  string `json:"source"`
+			Timestamp               string `json:"timestamp"`
+			ConversationAnnotations []struct {
+				SelectedText string `json:"selected_text"`
+				Comment      string `json:"comment"`
+			} `json:"conversation_annotations"`
 		} `json:"message_meta"`
 		CompactionCheckpoint *struct {
 			SchemaVersion       int `json:"schema_version"`
@@ -1569,6 +1660,16 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 				Content json.RawMessage `json:"content"`
 			} `json:"messages"`
 		} `json:"compaction_checkpoint"`
+		WorkPlan *struct {
+			PlanID      string `json:"plan_id"`
+			Revision    uint64 `json:"revision"`
+			Lifecycle   string `json:"lifecycle"`
+			CloseReason string `json:"close_reason"`
+			Steps       []struct {
+				Content string `json:"content"`
+				Status  string `json:"status"`
+			} `json:"steps"`
+		} `json:"work_plan"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
 		t.Fatalf("consumer decode failed: %v", err)
@@ -1578,10 +1679,22 @@ func TestWireFixture_HTTPDefaultSessionDetail(t *testing.T) {
 		cp == nil || cp.SchemaVersion != 1 || cp.ArchiveThroughIndex != 2 || len(cp.Messages) != 3 {
 		t.Fatalf("consumer decode lost default detail fields: %+v", detail)
 	}
+	wp := detail.WorkPlan
+	if wp == nil || wp.Revision != 3 || wp.Lifecycle != "stopped" ||
+		wp.CloseReason != "run_completed_with_pending_steps" || len(wp.Steps) != 2 ||
+		wp.Steps[1].Status != "pending" {
+		t.Fatalf("consumer decode lost work_plan recovery fields: %+v", wp)
+	}
 	if string(detail.Messages[0].Content) != `"ARCHIVE_ONLY_OLD_TASK"` ||
 		string(cp.Messages[1].Content) != `"Previous context summary: stable state"` {
 		t.Fatalf("archive/live checkpoint semantics drifted: archive=%s checkpoint=%s",
 			detail.Messages[0].Content, cp.Messages[1].Content)
+	}
+	tailAnnotations := detail.MessageMeta[2].ConversationAnnotations
+	if len(tailAnnotations) != 1 || tailAnnotations[0].SelectedText != "ARCHIVE_ONLY_OLD_REPLY" ||
+		tailAnnotations[0].Comment != "explain this line" ||
+		len(detail.MessageMeta[0].ConversationAnnotations) != 0 {
+		t.Fatalf("consumer decode lost conversation annotations: %+v", detail.MessageMeta)
 	}
 }
 
@@ -2294,5 +2407,50 @@ func TestWireFixture_DoneWithExecutionRun(t *testing.T) {
 		!done.ExecutionRun.Profile.IsFast() ||
 		done.ExecutionRun.Profile.ResolutionReason != "cloud_profile_resolved" {
 		t.Fatalf("consumer decode lost execution_run fields: %+v", done.ExecutionRun)
+	}
+}
+
+// TestWireFixture_HTTPSessionFork pins the fork response shape through the
+// real POST /sessions/{id}/fork route. The fork's session id is generated, so
+// it is shape-asserted (non-empty date-hex id) and normalized to the fixture.
+func TestWireFixture_HTTPSessionFork(t *testing.T) {
+	fixture := loadWireFixture(t, "http_post.session_fork.response.json")
+
+	shannonDir := t.TempDir()
+	deps := &ServerDeps{ShannonDir: shannonDir, SessionCache: NewSessionCache(shannonDir)}
+	server := NewServer(0, nil, deps, "test")
+	mgr := deps.SessionCache.GetOrCreateManager(deps.SessionCache.SessionsDir(""))
+	source := mgr.NewSessionWithID("wire-fixture-fork-source")
+	source.Title = fixture["title"].(string)
+	source.Messages = []client.Message{
+		{Role: "user", Content: client.NewTextContent("question")},
+		{Role: "assistant", Content: client.NewTextContent("answer")},
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/sessions/wire-fixture-fork-source/fork",
+		strings.NewReader(`{"message_index":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /sessions/{id}/fork = %d: %s", rec.Code, rec.Body.Bytes())
+	}
+	produced := parseJSONMap(t, rec.Body.Bytes())
+	if v, ok := produced["session_id"].(string); !ok || v == "" || v == "wire-fixture-fork-source" {
+		t.Fatalf("session_id: want fresh generated id, got %#v", produced["session_id"])
+	}
+	produced["session_id"] = fixture["session_id"]
+	assertSemanticEqual(t, fixture, produced)
+
+	// Decode the produced bytes through the same consumer shape Desktop uses.
+	var response forkSessionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("consumer decode failed: %v", err)
+	}
+	if response.Title != fixture["title"].(string) {
+		t.Fatalf("consumer decode lost title: %+v", response)
 	}
 }

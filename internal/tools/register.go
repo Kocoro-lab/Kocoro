@@ -100,6 +100,7 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(&SystemInfoTool{})
 	reg.Register(&CalculateTool{})
 	reg.Register(&CurrentTimeTool{})
+	reg.Register(&XPreparePostTool{})
 	reg.Register(&ClipboardTool{})
 	reg.Register(&NotifyTool{})
 	reg.Register(&PresentDeliverableTool{})
@@ -644,8 +645,9 @@ func RegisterServerTools(ctx context.Context, gw *client.GatewayClient, reg *age
 // are removed, so a failed Cloud round-trip leaves the registry untouched
 // (previously registered tools survive the outage) rather than wiping the tools
 // and returning empty. Callers must still serialize concurrent refreshes so two
-// overlapping runs can't apply stale snapshots out of order (see
-// Server.toolRefreshMu).
+// overlapping runs can't apply stale snapshots out of order. Daemon rebuilds
+// hold ServerDeps.toolRegistryMutationMu across the full build-to-swap path;
+// the generation CAS below rejects a snapshot fetched before an auth change.
 func RegisterIntegrationTools(ctx context.Context, gw *client.GatewayClient, reg *agent.ToolRegistry) error {
 	if reg == nil {
 		return fmt.Errorf("tool registry is nil")
@@ -654,7 +656,7 @@ func RegisterIntegrationTools(ctx context.Context, gw *client.GatewayClient, reg
 		return nil
 	}
 
-	schemas, err := gw.ListIntegrationTools(ctx)
+	schemas, generation, err := gw.ListIntegrationToolsWithGeneration(ctx)
 	if err != nil {
 		// Registry left as-is: keep the previously registered integration tools
 		// through a transient integration-endpoint outage.
@@ -667,19 +669,18 @@ func RegisterIntegrationTools(ctx context.Context, gw *client.GatewayClient, reg
 		}
 		return fmt.Errorf("integration tools unavailable: %w", err)
 	}
-
 	// Fetch succeeded — now replace the integration subset. Drop stale tools
 	// (a disconnected provider's tools disappear) then register the current set.
-	for _, t := range reg.All() {
-		if sourcer, ok := t.(agent.ToolSourcer); ok && sourcer.ToolSource() == agent.SourceIntegration {
-			reg.Remove(t.Info().Name)
+	if err := gw.WithIntegrationGeneration(generation, func() {
+		reg.RemoveSource(agent.SourceIntegration)
+		for _, schema := range schemas {
+			if _, exists := reg.Get(schema.Name); exists {
+				continue // local/gateway tool takes priority
+			}
+			reg.Register(NewIntegrationToolForGeneration(schema, gw, generation))
 		}
-	}
-	for _, schema := range schemas {
-		if _, exists := reg.Get(schema.Name); exists {
-			continue // local/gateway tool takes priority
-		}
-		reg.Register(NewIntegrationTool(schema, gw))
+	}); err != nil {
+		return fmt.Errorf("integration tools unavailable: principal generation changed during refresh: %w", err)
 	}
 	return nil
 }
@@ -799,6 +800,9 @@ func CompleteRegistration(ctx context.Context, gw *client.GatewayClient, cfg *co
 		}
 		hasPlaywright := false
 		for _, t := range mcpTools {
+			if canonicalPlaywrightToolDisabled(t.ServerName, t.Tool.Name) {
+				continue
+			}
 			if _, exists := reg.Get(t.Tool.Name); exists {
 				continue
 			}
@@ -1204,7 +1208,7 @@ func RegisterCalendarTools(reg *agent.ToolRegistry, broker *desktop_rpc.DesktopR
 
 // RegisterCloudDelegate registers the cloud_delegate tool if cloud is enabled.
 func RegisterCloudDelegate(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg *config.Config, handler agent.EventHandler, agentName, agentPrompt string) {
-	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" {
+	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || gw == nil {
 		return
 	}
 	timeout := time.Duration(cfg.Cloud.Timeout) * time.Second
@@ -1212,7 +1216,10 @@ func RegisterCloudDelegate(reg *agent.ToolRegistry, gw *client.GatewayClient, cf
 		timeout = 3600 * time.Second
 	}
 	idleTimeout := time.Duration(cfg.Cloud.StreamIdleTimeoutSecs) * time.Second
-	reg.Register(NewCloudDelegateTool(gw, cfg.APIKey, timeout, idleTimeout, handler, agentName, agentPrompt))
+	registerAuthSensitiveTool(
+		reg, gw,
+		NewCloudDelegateTool(gw, cfg.APIKey, timeout, idleTimeout, handler, agentName, agentPrompt),
+	)
 }
 
 // RegisterPublishTool registers the publish_to_web tool. It needs the gateway
@@ -1225,7 +1232,7 @@ func RegisterPublishTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg 
 	}
 	allow := buildPublishAllowlist(cfg.Cloud.PublishAllowedExtensions)
 	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
-	reg.Register(NewPublishToWebTool(uploadsClient, allow))
+	registerAuthSensitiveTool(reg, gw, NewPublishToWebTool(uploadsClient, allow))
 }
 
 // RegisterGenerateImageTool registers the generate_image tool. Same gating as
@@ -1236,7 +1243,7 @@ func RegisterGenerateImageTool(reg *agent.ToolRegistry, gw *client.GatewayClient
 		return
 	}
 	imagesClient := images.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
-	reg.Register(NewGenerateImageTool(imagesClient))
+	registerAuthSensitiveTool(reg, gw, NewGenerateImageTool(imagesClient))
 }
 
 // RegisterEditImageTool registers the edit_image tool. Same gating as
@@ -1250,7 +1257,7 @@ func RegisterEditImageTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cf
 		return
 	}
 	imagesClient := images.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
-	reg.Register(NewEditImageTool(imagesClient))
+	registerAuthSensitiveTool(reg, gw, NewEditImageTool(imagesClient))
 }
 
 // RegisterListPublishedFilesTool registers the read-only list_my_published_files
@@ -1262,7 +1269,7 @@ func RegisterListPublishedFilesTool(reg *agent.ToolRegistry, gw *client.GatewayC
 		return
 	}
 	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
-	reg.Register(NewListPublishedFilesTool(uploadsClient))
+	registerAuthSensitiveTool(reg, gw, NewListPublishedFilesTool(uploadsClient))
 }
 
 // RegisterRetractPublishedFileTool registers the destructive
@@ -1275,7 +1282,7 @@ func RegisterRetractPublishedFileTool(reg *agent.ToolRegistry, gw *client.Gatewa
 		return
 	}
 	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
-	reg.Register(NewRetractPublishedFileTool(uploadsClient))
+	registerAuthSensitiveTool(reg, gw, NewRetractPublishedFileTool(uploadsClient))
 }
 
 // buildPublishAllowlist merges user-supplied extensions onto the default
@@ -1303,7 +1310,7 @@ func buildPublishAllowlist(extra []string) map[string]bool {
 func ExtractGatewayTools(reg *agent.ToolRegistry) []agent.Tool {
 	var result []agent.Tool
 	for _, t := range reg.All() {
-		if _, ok := t.(*ServerTool); ok {
+		if serverTool, ok := t.(*ServerTool); ok && serverTool.IntegrationGenerationCurrent() {
 			result = append(result, t)
 		}
 	}
@@ -1395,6 +1402,9 @@ func RebuildRegistryForHealth(
 			}
 			tools := mcpMgr.CachedTools(serverName)
 			for _, t := range tools {
+				if canonicalPlaywrightToolDisabled(t.ServerName, t.Tool.Name) {
+					continue
+				}
 				if _, exists := reg.Get(t.Tool.Name); exists {
 					// Deterministic shadowing is permanent shadowing: without
 					// this line a hidden tool is undiagnosable from the outside.
@@ -1431,6 +1441,9 @@ func RebuildRegistryForHealth(
 	}
 
 	for _, t := range gatewayOverlay {
+		if serverTool, ok := t.(*ServerTool); ok && !serverTool.IntegrationGenerationCurrent() {
+			continue
+		}
 		if _, exists := reg.Get(t.Info().Name); !exists {
 			reg.Register(t)
 		}

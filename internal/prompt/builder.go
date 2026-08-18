@@ -30,6 +30,7 @@ const UserInstructionsTag = "<user_instructions>"
 const MemoryEvidenceGuidance = "Current user statements and verified current observations take precedence over past records. " +
 	"For facts covered by past records, preserve the recorded value. Never substitute training knowledge for a recorded value. " +
 	"Use evidence_tier when present: corroborated may be stated plainly as a past record; singleton, derived, text, or missing/unknown are weaker and must be qualified. " +
+	"When temporal_status is present, current is the latest value of an updating fact and superseded_by_recency is an older value kept for audit; prefer current unless the user asked about the past. " +
 	"Translate evidence strength into natural confidence wording; do not quote evidence_tier field names, bracketed markers, or counts unless the user asks for provenance. " +
 	"In exhaustive answers, keep relevant weaker items but qualify them; when space is limited, prioritize corroborated items. " +
 	"Do not add people, organizations, roles, or attributes absent from the current conversation, verified observations, or the records."
@@ -94,6 +95,11 @@ type PromptOptions struct {
 	// It is rendered only in VolatileContext so attended/unattended source
 	// differences never perturb the cacheable system prompt.
 	QuestionUIAvailable bool
+	// ActiveWorkPlan is the pre-rendered active work plan of a resumed
+	// interrupted run (daemon-rendered text, not a storage type — keeps this
+	// package free of session imports). Rendered only in VolatileContext,
+	// after cache_break; empty for fresh runs and closed plans.
+	ActiveWorkPlan string
 	// FastMode adds outcome-first stopping guidance for the reserved fast
 	// execution profile. It stays volatile so toggling the profile does not
 	// invalidate the shared system or per-session stable prompt prefixes.
@@ -480,6 +486,16 @@ func buildVolatileContext(opts PromptOptions) string {
 	if opts.FastMode {
 		sb.WriteString("\n\n## Fast Task\n")
 		sb.WriteString("Do not add a call unless it closes a required outcome or evidence gap; batch independent safe work when possible. Search only for requested or required current/external facts. For open-ended search, start with one broad query aimed at a primary or established source. Search again only when the first result failed, was unusable, omitted a required fact or source, conflicted, or the user requested independent sources. For a user-named page, fetch that page directly and do not substitute another source when it is empty or blocked.")
+	}
+
+	// Active work plan — resumed interrupted runs only. Pre-rendered by the
+	// daemon (prompt must not import session storage types); dynamic, so it
+	// lives here after cache_break, never in System or StableContext. Within a
+	// live run the latest revision already rides the set_work_plan tool
+	// results, so this is not re-sent per provider call.
+	if wp := strings.TrimSpace(opts.ActiveWorkPlan); wp != "" {
+		sb.WriteString("\n\n## Active Work Plan\n")
+		sb.WriteString(wp)
 	}
 
 	// Memory — stays volatile: memory_append can mutate MEMORY.md during a

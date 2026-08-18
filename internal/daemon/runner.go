@@ -49,6 +49,7 @@ var (
 		mgr.Disconnect("playwright")
 	}
 	stopPlaywrightChromeAndWaitFn = mcp.StopCDPChromeAndWait
+	rebuildRegistryForHealthFn    = tools.RebuildRegistryForHealth
 )
 
 var validIdempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{8,128}$`)
@@ -98,6 +99,8 @@ type RunAgentRequest struct {
 	ModelOverride           string                           `json:"-"`                           // internal tier override; an exact model pin remains authoritative
 	BypassRouting           bool                             `json:"-"`                           // skip route lock (heartbeat runs)
 	SessionHistory          []client.Message                 `json:"-"`                           // pre-loaded history for LLM context (BypassRouting runs)
+	DisableTools            bool                             `json:"-"`                           // internal read-only run: expose no model-callable tools
+	SuppressBusEvents       bool                             `json:"-"`                           // internal request-scoped run: do not publish progress to global subscribers
 	OmitHistory             bool                             `json:"-"`                           // skip sess.HistoryForLoop() snapshot; LLM sees empty history. Set by scheduler for stateless schedules.
 	StickyContext           string                           `json:"-"`                           // 额外的 sticky context，注入系统提示（对用户不可见）
 	ForegroundHint          *ForegroundHint                  `json:"foreground_hint,omitempty"`   // app the user was looking at when they summoned the quick panel; folded into StickyContext so screen-reading tools default to it
@@ -1423,6 +1426,16 @@ func CanPresentQuestionUI(source string) bool {
 	return ok
 }
 
+// shouldInjectQuestionAsker gates the SSE handler's QuestionAsker injection.
+// Ephemeral runs (side chat) come from panels with no question UI: an asker
+// there blocks the run for the whole auto-resolution window and then reports
+// a decline the user never made — the same failure mode that once hit the
+// IM channels. Without an asker, ask_user_question degrades to its clean
+// "can't ask here" result.
+func shouldInjectQuestionAsker(req RunAgentRequest) bool {
+	return !req.Ephemeral && CanPresentQuestionUI(req.Source)
+}
+
 // cacheSourceFromDaemonSource normalizes daemon-level origins for Cloud-side
 // attribution. It does not select a TTL: Cloud currently applies the short
 // prompt-cache TTL to every source. See docs/cache-strategy.md.
@@ -1697,15 +1710,21 @@ type ServerDeps struct {
 	RecordConfigMutation func(config.MutationRevisions)
 	GW                   *client.GatewayClient
 	Registry             *agent.ToolRegistry
-	MCPManager           *mcp.ClientManager  // live MCP connections; swapped on reload
-	Supervisor           *mcp.Supervisor     // MCP health supervisor; swapped on reload
+	// toolRegistryMutationMu is the build-to-swap authority for every live
+	// registry and cached-overlay mutation. Auth refresh, integration refresh,
+	// MCP health callbacks, and config reloads must hold it from their layer
+	// snapshot through Registry replacement so an old build cannot land after a
+	// credential or manager transition.
+	toolRegistryMutationMu sync.Mutex
+	MCPManager             *mcp.ClientManager // live MCP connections; swapped on reload
+	Supervisor             *mcp.Supervisor    // MCP health supervisor; swapped on reload
 	// MCPReconnect schedules bounded retries for servers whose async connect
 	// failed. Owned by the MCPManager generation that spawned it, so it is
 	// swapped (and the old one stopped) alongside MCPManager on reload —
 	// letting a superseded ladder keep firing would resurrect connections on
 	// a manager nothing can reach.
-	MCPReconnect *mcp.ReconnectScheduler
-	Cleanup      func() // closes MCP connections; swapped on reload
+	MCPReconnect         *mcp.ReconnectScheduler
+	Cleanup              func()              // closes MCP connections; swapped on reload
 	BaselineReg          *agent.ToolRegistry // local-only tools; refreshed on reload
 	GatewayOverlay       []agent.Tool        // cached gateway tools; refreshed on reload
 	PostOverlays         []agent.Tool        // cloud_delegate etc.; refreshed on reload
@@ -1814,12 +1833,58 @@ func (d *ServerDeps) ShutdownCleanup() {
 func (d *ServerDeps) WriteLock()   { d.mu.Lock() }
 func (d *ServerDeps) WriteUnlock() { d.mu.Unlock() }
 
+// LockToolRegistryMutation serializes the complete layer-build-to-live-swap
+// transaction across auth, integration, MCP health, and reload paths.
+func (d *ServerDeps) LockToolRegistryMutation() func() {
+	if d == nil {
+		return func() {}
+	}
+	d.toolRegistryMutationMu.Lock()
+	return d.toolRegistryMutationMu.Unlock
+}
+
 // RebuildLayers returns the cached rebuild layers under read lock.
 func (d *ServerDeps) RebuildLayers() (*agent.ToolRegistry, []agent.Tool, []agent.Tool, *mcp.ClientManager) {
 	d.mu.RLock()
 	bl, gw, po, mgr := d.BaselineReg, d.GatewayOverlay, d.PostOverlays, d.MCPManager
 	d.mu.RUnlock()
 	return bl, gw, po, mgr
+}
+
+// RebuildRegistryForMCPHealth rebuilds and swaps the live registry under the
+// process-wide tool-registry transaction lock. The supervisor identity is
+// checked after acquiring the lock, so a callback queued by a superseded MCP
+// generation cannot publish its cached catalog after reload.
+func (d *ServerDeps) RebuildRegistryForMCPHealth(expected *mcp.Supervisor) (*agent.ToolRegistry, bool) {
+	if d == nil || expected == nil {
+		return nil, false
+	}
+	unlock := d.LockToolRegistryMutation()
+	defer unlock()
+
+	d.mu.RLock()
+	if d.Supervisor != expected || d.BaselineReg == nil {
+		d.mu.RUnlock()
+		return nil, false
+	}
+	baseline := d.BaselineReg
+	gatewayOverlay := append([]agent.Tool(nil), d.GatewayOverlay...)
+	postOverlays := append([]agent.Tool(nil), d.PostOverlays...)
+	mgr := d.MCPManager
+	d.mu.RUnlock()
+
+	rebuilt := rebuildRegistryForHealthFn(
+		baseline, gatewayOverlay, postOverlays,
+		expected.HealthStates(), mgr, expected,
+	)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.Supervisor != expected {
+		return nil, false
+	}
+	d.Registry = rebuilt
+	return rebuilt, true
 }
 
 // cleanupPlaywrightAfterTurn runs at the end of every RunAgent invocation
@@ -2327,6 +2392,9 @@ func claimInterruptedResume(
 	now := time.Now()
 	if checkpointAt.IsZero() ||
 		(req.InterruptedResumeMaxAge > 0 && now.Sub(checkpointAt) > req.InterruptedResumeMaxAge) {
+		// Abandonment ends the run without entering the loop; close a
+		// still-active work plan (failed: the run will never produce a result).
+		closeOrphanedWorkPlan(sess, session.WorkPlanCloseFailed, now)
 		sess.InProgress = false
 		sess.InterruptedTurn = nil
 		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {
@@ -2336,6 +2404,7 @@ func claimInterruptedResume(
 	}
 	if req.InterruptedResumeMaxAttempts > 0 &&
 		state.ResumeAttempts >= req.InterruptedResumeMaxAttempts {
+		closeOrphanedWorkPlan(sess, session.WorkPlanCloseFailed, now)
 		sess.InProgress = false
 		sess.InterruptedTurn = nil
 		if err := sessMgr.SavePreservingUpdatedAt(); err != nil {
@@ -2577,7 +2646,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		return nil, fmt.Errorf("daemon not fully configured")
 	}
 	agentName := req.Agent
-	prompt := req.Text
+	visibleInput, replyEnvelope := splitConversationReplyPrompt(req.Text)
+	replyAnnotations := conversationReplyAnnotations(replyEnvelope)
+	if replyEnvelope != "" && replyAnnotations == nil {
+		// Delimited but unparseable: treat the whole message as ordinary text
+		// so the user's bytes survive verbatim. Desktop-facing ingresses 400
+		// this shape up front (validateConversationReplyEnvelope); this covers
+		// every path that cannot reject.
+		visibleInput, replyEnvelope = req.Text, ""
+	}
+	prompt := visibleInput
 
 	// Download remote file attachments and convert to file_ref blocks.
 	// Attachment files must survive across turns (non-image files become
@@ -2632,10 +2710,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// re-routed here to that other agent, so two apps collapse onto one agent and
 	// answer identically. Mirrors the same guard in cmd/daemon.go onMsg.
 	if agentName == "" && !IsMessagingPlatform(req.Source) {
-		agentName, prompt = agents.ParseAgentMention(req.Text)
+		agentName, prompt = agents.ParseAgentMention(visibleInput)
 	}
 	if prompt == "" {
-		prompt = req.Text
+		prompt = visibleInput
 	}
 
 	var agentOverride *agents.Agent
@@ -2648,7 +2726,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// @mention fallback: use default agent
 			log.Printf("daemon: agent %q not found: %v, using default", agentName, loadErr)
 			agentName = ""
-			prompt = req.Text
+			prompt = visibleInput
 		} else {
 			agentOverride = a
 		}
@@ -2665,7 +2743,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			prompt = strings.ReplaceAll(content, "$ARGUMENTS", args)
 		}
 	}
-	req.Text = prompt
+	visiblePrompt := prompt
+	prompt = restoreConversationReplyPrompt(visiblePrompt, replyEnvelope)
+	req.Text = visiblePrompt
 	// Recompute route key after final agent resolution.
 	// Callers may precompute a default/source-channel key before @mention parsing.
 	// Recomputing here avoids cross-route contamination.
@@ -2808,11 +2888,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// consumed and recovery re-delivers them on every restart.
 		if pendingBatch := deps.SessionCache.DrainMailbox(req.RouteKey, 20); len(pendingBatch) > 0 {
 			pendingIDs := make([]string, 0, len(pendingBatch))
-			var b strings.Builder
+			// Each drained message is split individually: its head envelope
+			// (raw Desktop bytes) joins the merged envelope run, its decoded
+			// annotations join the merged turn's metadata, and only its
+			// visible text enters the merged visible prompt. A malformed
+			// envelope stays verbatim in the visible text (lossless).
+			var visibleParts []string
+			var envelopeParts []string
+			var drainedAnnotations []session.ConversationAnnotation
 			for _, m := range pendingBatch {
-				if b.Len() > 0 {
-					b.WriteByte('\n')
-				}
+				var b strings.Builder
 				b.WriteString(m.Text)
 				// Phase 4: surface any attachments as a bracketed hint so the
 				// LLM is aware the user shipped files alongside this text.
@@ -2841,15 +2926,39 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					}
 					b.WriteByte(']')
 				}
+				visible, annotations, stripped := conversationReplyVisibleText(b.String())
+				if stripped {
+					_, envelope := splitConversationReplyPrompt(b.String())
+					envelopeParts = append(envelopeParts, envelope)
+					drainedAnnotations = append(drainedAnnotations, annotations...)
+				}
+				if visible != "" {
+					visibleParts = append(visibleParts, visible)
+				}
 				pendingIDs = append(pendingIDs, m.ID)
 			}
-			if b.Len() > 0 {
-				if prompt == "" {
-					prompt = b.String()
-				} else {
-					prompt = b.String() + "\n" + prompt
+			if len(visibleParts) > 0 || len(envelopeParts) > 0 {
+				mergedVisible := strings.Join(visibleParts, "\n")
+				if visiblePrompt != "" {
+					if mergedVisible != "" {
+						mergedVisible += "\n"
+					}
+					mergedVisible += visiblePrompt
 				}
-				req.Text = prompt
+				// Drained messages precede the trigger in the merged text, so
+				// their envelopes and annotations lead in the same order.
+				if replyEnvelope != "" {
+					envelopeParts = append(envelopeParts, replyEnvelope)
+				}
+				replyEnvelope = strings.Join(envelopeParts, "\n")
+				merged := append(drainedAnnotations, replyAnnotations...)
+				if len(merged) > maxConversationAnnotations {
+					merged = merged[:maxConversationAnnotations]
+				}
+				replyAnnotations = merged
+				visiblePrompt = mergedVisible
+				prompt = restoreConversationReplyPrompt(visiblePrompt, replyEnvelope)
+				req.Text = visiblePrompt
 			}
 			log.Printf("daemon: drained %d mailbox msg(s) into prompt for route %q", len(pendingBatch), req.RouteKey)
 			// Defer the durable consumed_at flag + EventQueueFlushed to
@@ -3210,8 +3319,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Wrap the transport handler with a bus-emitting handler so every run
 	// publishes progress events regardless of transport. See
 	// docs/superpowers/specs/2026-04-23-event-bus-progress-coverage-design.md.
-	bus := &busEventHandler{deps: deps, agent: agentName}
-	combinedHandler := &multiHandler{handlers: []agent.EventHandler{handler, bus}}
+	combinedHandler := &multiHandler{handlers: []agent.EventHandler{handler}}
+	if !req.SuppressBusEvents {
+		bus := &busEventHandler{deps: deps, agent: agentName}
+		combinedHandler.handlers = append(combinedHandler.handlers, bus)
+	}
+	handler = combinedHandler
 	var runEvents *runEventCollector
 	if !req.Ephemeral {
 		eventLog, err := sessMgr.OpenRunEventLog(sess.ID, req.RunID, req.AttemptID, cfg.Agent.RunEventRetention)
@@ -3220,8 +3333,6 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		runEvents = newRunEventCollector(combinedHandler, eventLog, sess.ID, req.RunID, req.AttemptID)
 		handler = runEvents
-	} else {
-		handler = combinedHandler
 	}
 
 	// Notify handler of resolved session ID so it can include it in EventBus payloads.
@@ -3316,16 +3427,17 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			source = "unknown"
 		}
 		msgID := generateMessageID()
-		userMsgContent := buildUserMsgContent(prompt, resolvedContent)
+		userMsgContent := buildUserMsgContent(visiblePrompt, resolvedContent)
 		sess.Messages = append(sess.Messages,
 			client.Message{Role: "user", Content: userMsgContent},
 		)
 		sess.MessageMeta = append(sess.MessageMeta,
 			session.MessageMeta{
-				Source:         source,
-				MessageID:      msgID,
-				Timestamp:      session.TimePtr(userMsgTime),
-				SystemInjected: req.ResumeInterrupted || req.SystemInjected,
+				Source:                  source,
+				MessageID:               msgID,
+				Timestamp:               session.TimePtr(userMsgTime),
+				SystemInjected:          req.ResumeInterrupted || req.SystemInjected,
+				ConversationAnnotations: replyAnnotations,
 			},
 		)
 		preLoopUserAppended = true
@@ -3342,7 +3454,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 					"sender":     req.Sender,
 					"session_id": sess.ID,
 					"message_id": msgID,
-					"text":       prompt,
+					"text":       visiblePrompt,
 				})
 				deps.EventBus.Emit(Event{Type: EventMessageReceived, Payload: payload})
 			}
@@ -3494,6 +3606,36 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Use the per-agent manager so searches are scoped to that agent's sessions.
 	tools.RegisterSessionSearch(reg, sessMgr)
 
+	// Durable per-run work plan (internal/daemon/work_plan.go). Registered for
+	// every persistent daemon run — Fast and Full profiles alike, never gated
+	// on query shape or SSE connectivity — so the provider-visible schema is
+	// byte-stable across equivalent runs. Ephemeral runs skip it: they have no
+	// session persistence, so a durable progress record could not honor its
+	// own contract. Koe Realtime never sees it (its ToolDefs are a hardcoded
+	// literal with no registry connection).
+	var planController *runPlanController
+	if !req.Ephemeral {
+		planController = newRunPlanController(sess.ID, req.RunID)
+		if req.ResumeInterrupted {
+			// Same RunID across recovery attempts; a persisted ACTIVE plan is
+			// this run's plan and continues. Closed plans stay UI history.
+			planController.Restore(sess.WorkPlan)
+		} else if sess.WorkPlan != nil &&
+			sess.WorkPlan.Lifecycle == session.WorkPlanActive &&
+			sess.WorkPlan.RunID != req.RunID {
+			// A NEW run found a prior run's plan still active (crash leftovers
+			// with recovery disabled/expired, or an overlapping route). Close it
+			// superseded now — even if this run never makes its own plan — so
+			// the session can't report a live-looking plan forever. The next
+			// save on any persistence path carries it.
+			closeOrphanedWorkPlan(sess, session.WorkPlanCloseSuperseded, time.Now())
+		}
+		reg.Register(&setWorkPlanTool{
+			controller: planController,
+			maxSteps:   runCfg.Agent.WorkPlanMaxSteps,
+		})
+	}
+
 	// memory_recall — talks to the structured memory sidecar when ready and
 	// falls back to session keyword search + MEMORY.md grep otherwise. Always
 	// register; the tool itself decides whether to use the service or fallback
@@ -3560,6 +3702,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		})
 	}
 	defer guiWorkflow.EndTurn()
+	if req.DisableTools {
+		reg = agent.NewToolRegistry()
+	}
 
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
@@ -3953,6 +4098,15 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetReadTracker(deps.ReadTrackerCache.GetOrCreate(sess.ID))
 	loop.SetSessionCWD(effectiveCWD)
 	loop.SetWorkingSet(sessMgr.WorkingSet(sess.ID))
+	// A resumed run re-anchors its own active plan through VolatileContext
+	// (after cache_break) — compaction may have dropped the original
+	// set_work_plan call from model-visible context. Fresh runs and closed
+	// plans inject nothing.
+	if planController != nil && req.ResumeInterrupted {
+		if rendered := renderWorkPlanForPrompt(planController.ActiveSnapshot()); rendered != "" {
+			loop.SetActiveWorkPlanContext(rendered)
+		}
+	}
 	// Always set (even nil) to clear paths from a previous run on a reused loop.
 	loop.SetUserFilePaths(extractUserFilePaths(req.Content))
 	sessMgr.OnSessionClose(sess.ID, loop.SpillCleanupFunc())
@@ -4045,6 +4199,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		checkpointSource = "unknown"
 	}
 	turnBase := captureTurnBaseline(sess, checkpointSource, preLoopUserAppended)
+	turnBase.conversationAnnotations = replyAnnotations
 	// The daemon handler implements agent.UsageProvider; extract once so
 	// callsites pass a strongly-typed provider (or nil) to applyTurnState.
 	var turnUsage usageProvider
@@ -4067,6 +4222,9 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		}
 		sess.InProgress = true
 		sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+		if planController != nil {
+			planController.StageForSave(sess)
+		}
 		if agent.CheckpointReasonFromContext(checkpointCtx) == agent.CheckpointReasonSideEffectPrepared {
 			// The session journal's immediately-following MarkDispatching save
 			// persists this staged transcript and dispatch state atomically.
@@ -4077,6 +4235,13 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 			// Return the error so AgentLoop.maybeCheckpoint keeps the
 			// dirty flag set and the next fire point retries.
 			return err
+		}
+		// Save succeeded: the staged work-plan revision is durable, so its
+		// event may now reach SSE (persist-before-emit invariant).
+		if planController != nil && deps.EventBus != nil {
+			if snap := planController.TakePendingEvent(); snap != nil {
+				emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+			}
 		}
 		// For Source == "" runs there is no pre-loop save; the first checkpoint
 		// that persists the loop's transcript is the first durable home of the
@@ -4149,6 +4314,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				log.Printf("daemon: hard-error tool execution reconcile failed: %v", reconcileErr)
 				rollbackToolExecutions = func() {}
 			}
+			// resumeEligible tracks the ONE branch where this RunID genuinely
+			// continues at the next daemon start. InProgress alone is the wrong
+			// gate for plan closure: the blocking-execution branch sets it as a
+			// startup-REVIEW marker (recovery never replays it), and the success
+			// path already treats that state as terminal for the plan.
+			resumeEligible := false
 			if len(sess.BlockingToolExecutions(req.RunID)) > 0 {
 				sess.InProgress = true
 				sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
@@ -4165,16 +4336,52 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				} else {
 					sess.InProgress = true
 					sess.InterruptedTurn = interruptedTurnSnapshot(req, agentName, effectiveCWD)
+					resumeEligible = true
 				}
 			} else {
 				sess.InProgress = false // ordinary hard-error path: turn is over
 				sess.InterruptedTurn = nil
+			}
+			if planController != nil {
+				// A recovery-eligible failure is NOT the end of this RunID —
+				// the plan stays active for the resume attempt. Everything
+				// else (including the blocking review marker) is terminal.
+				if !resumeEligible {
+					planController.CloseForRun(status, runErr, time.Now())
+				}
+				planController.StageForSave(sess)
 			}
 			if err := sessMgr.Save(); err != nil {
 				rollbackToolExecutions()
 				log.Printf("daemon: failed to save error session: %v", err)
 			} else {
 				savedSessionID = sess.ID
+				if planController != nil && deps.EventBus != nil {
+					if snap := planController.TakePendingEvent(); snap != nil {
+						emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+					}
+				}
+			}
+		} else if !req.Ephemeral && planController != nil && !sess.InProgress {
+			// Hard error WITH terminal result text: the transcript is already
+			// durable via checkpoints and no message rebuild happens here, but
+			// the run is over and the plan must still close (observed case: a
+			// side-effect journal failure after a checkpointed plan revision).
+			// When InProgress is still set, startup recovery owns the outcome —
+			// it either resumes this RunID (plan continues) or finalizes it
+			// (closeOrphanedWorkPlan) — so the plan stays active only then.
+			if planController.CloseForRun(status, runErr, time.Now()) {
+				planController.StageForSave(sess)
+				if err := sessMgr.Save(); err != nil {
+					log.Printf("daemon: hard-error work-plan closure save failed: %v", err)
+				} else {
+					savedSessionID = sess.ID
+					if deps.EventBus != nil {
+						if snap := planController.TakePendingEvent(); snap != nil {
+							emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+						}
+					}
+				}
 			}
 		}
 		if runEventFlushErr != nil {
@@ -4258,7 +4465,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// identically to the default agent — the smart-title upgrade replaces
 		// this placeholder asynchronously.
 		if sess.Title == "New session" {
-			sess.Title = session.Title(prompt)
+			sess.Title = session.Title(visiblePrompt)
 			sess.TitleAuto = true
 		}
 
@@ -4278,12 +4485,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 				sess.MessageMeta = sess.MessageMeta[:turnBase.metaCount]
 			}
 			if !preLoopUserAppended {
-				fallbackContent := buildUserMsgContent(prompt, resolvedContent)
+				fallbackContent := buildUserMsgContent(visiblePrompt, resolvedContent)
 				sess.Messages = append(sess.Messages,
 					client.Message{Role: "user", Content: fallbackContent},
 				)
 				sess.MessageMeta = append(sess.MessageMeta,
-					session.MessageMeta{Source: checkpointSource, Timestamp: session.TimePtr(userMsgTime)},
+					session.MessageMeta{
+						Source:                  checkpointSource,
+						Timestamp:               session.TimePtr(userMsgTime),
+						ConversationAnnotations: replyAnnotations,
+					},
 				)
 			}
 			replyTime := time.Now()
@@ -4331,6 +4542,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		runEventFlushErr := runEvents.Flush()
 		if runEventFlushErr != nil {
 			log.Printf("daemon: final run event flush failed run=%s attempt=%s: %v", req.RunID, req.AttemptID, runEventFlushErr)
+		}
+		if planController != nil {
+			// The run is over on this path even when a blocking outcome-unknown
+			// execution keeps InProgress as a startup-REVIEW marker (recovery
+			// never replays it) — so the plan always closes here, from
+			// LastRunStatus evidence, before the final save.
+			planController.CloseForRun(status, runErr, time.Now())
+			planController.StageForSave(sess)
 		}
 		previousInProgress := sess.InProgress
 		previousInterruptedTurn := sess.InterruptedTurn
@@ -4385,6 +4604,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		// to the session) would point at a session that cannot be loaded.
 		replyEventDeliveries := 0
 		if saveErr == nil && deps.EventBus != nil {
+			// Terminal work-plan closure first, then agent_reply: a client that
+			// reacts to the reply as "turn over" already has the plan's honest
+			// final state. Emitted only after the successful final save above.
+			if planController != nil {
+				if snap := planController.TakePendingEvent(); snap != nil {
+					emitWorkPlanUpdated(deps.EventBus, sess.ID, snap, time.Now())
+				}
+			}
 			payload := map[string]any{
 				"agent":      agentName,
 				"source":     req.Source,
@@ -5071,12 +5298,13 @@ func isSoftRunError(err error) bool {
 // for the accumulated turn, no matter how many times the function is
 // called.
 type turnBaseline struct {
-	msgCount    int
-	metaCount   int
-	usage       session.UsageSummary // pre-turn cumulative usage; zero if sess.Usage was nil
-	hadUsage    bool                 // true if sess.Usage was non-nil at baseline
-	source      string
-	preLoopUser bool
+	msgCount                int
+	metaCount               int
+	usage                   session.UsageSummary // pre-turn cumulative usage; zero if sess.Usage was nil
+	hadUsage                bool                 // true if sess.Usage was non-nil at baseline
+	source                  string
+	preLoopUser             bool
+	conversationAnnotations []session.ConversationAnnotation
 }
 
 // captureTurnBaseline snapshots sess state at turn start so subsequent
@@ -5126,17 +5354,38 @@ func applyTurnMessages(sess *session.Session, loop *agent.AgentLoop, b turnBasel
 	if b.preLoopUser && runMsgs[0].Role == "user" {
 		startIdx = 1
 	}
+	// The triggering user message's annotations were decoded at ingress (they
+	// may merge a drained mailbox batch); reuse them instead of re-decoding.
+	// When preLoopUser is set the trigger was persisted before the loop with
+	// its annotations attached, so no run message may claim them here.
+	triggerIdx := -1
+	if !b.preLoopUser {
+		triggerIdx = startIdx
+	}
 	fallbackTime := time.Now()
 	for i := startIdx; i < len(runMsgs); i++ {
 		ts := fallbackTime
 		if i < len(runTimestamps) && !runTimestamps[i].IsZero() {
 			ts = runTimestamps[i]
 		}
-		sess.Messages = append(sess.Messages, runMsgs[i])
+		injected := i < len(runInjected) && runInjected[i]
+		persisted := runMsgs[i]
 		meta := session.MessageMeta{Source: b.source, Timestamp: session.TimePtr(ts)}
-		if i < len(runInjected) && runInjected[i] {
+		if injected {
 			meta.SystemInjected = true
 		}
+		if persisted.Role == "user" && !injected {
+			// Mid-run injected follow-ups carry their own head envelopes:
+			// decode each one so its annotations survive reload, exactly like
+			// the trigger message's do.
+			var annotations []session.ConversationAnnotation
+			persisted, annotations = conversationReplyPersistedMessage(persisted)
+			if i == triggerIdx {
+				annotations = b.conversationAnnotations
+			}
+			meta.ConversationAnnotations = annotations
+		}
+		sess.Messages = append(sess.Messages, persisted)
 		sess.MessageMeta = append(sess.MessageMeta, meta)
 	}
 }

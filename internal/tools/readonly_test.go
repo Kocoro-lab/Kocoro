@@ -153,6 +153,16 @@ func TestMaterialSideEffect_ServerTool_SourceAware(t *testing.T) {
 	if !integration.HasMaterialSideEffect(`{}`) {
 		t.Error("unannotated integration tool must remain a material side effect")
 	}
+	readOnly := false
+	annotatedRead := NewIntegrationTool(client.ServerToolSchema{
+		Name: "x_read_home", MaterialSideEffect: &readOnly,
+	}, nil)
+	if annotatedRead.HasMaterialSideEffect(`{}`) {
+		t.Error("trusted observational integration schema must bypass the durable write journal")
+	}
+	if !annotatedRead.IsConcurrencySafeCall(`{}`) {
+		t.Error("trusted observational integration schema should be concurrency-safe")
+	}
 	unknownGateway := NewServerTool(client.ServerToolSchema{Name: "future_mutating_tool"}, nil)
 	if !unknownGateway.HasMaterialSideEffect(`{}`) {
 		t.Error("unallowlisted gateway tool must fail closed as material")

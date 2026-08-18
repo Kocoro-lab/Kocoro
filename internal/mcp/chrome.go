@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1090,6 +1091,90 @@ func getAllCDPPageTargets(port int) ([]string, error) {
 	}
 	// Fallback: use CDP WebSocket.
 	return wsListPageTargets(port)
+}
+
+var (
+	httpListPageURLsForGuard = httpListPageURLs
+	wsListPageURLsForGuard   = wsListPageURLs
+)
+
+// CDPPageURLsOnPort returns the URLs of every page target owned by the
+// dedicated Chrome instance. Callers use all targets deliberately: CDP does
+// not expose Playwright MCP's internal "current page" selection, so a
+// consequential guard must treat any open composer target as ambiguous rather
+// than guess which tab the next MCP mutation will reach.
+func CDPPageURLsOnPort(port int) ([]string, error) {
+	httpURLs, httpErr := httpListPageURLsForGuard(port)
+	if httpErr == nil && len(httpURLs) > 0 {
+		return httpURLs, nil
+	}
+	wsURLs, wsErr := wsListPageURLsForGuard(port)
+	if wsErr == nil && len(wsURLs) > 0 {
+		return wsURLs, nil
+	}
+	if wsErr != nil {
+		if httpErr != nil {
+			return nil, fmt.Errorf("CDP page targets unavailable (HTTP: %v; WebSocket: %w)", httpErr, wsErr)
+		}
+		return nil, fmt.Errorf("CDP HTTP target list contained no pages and WebSocket fallback failed: %w", wsErr)
+	}
+	return nil, ErrNoCDPPageTargets
+}
+
+// ErrNoCDPPageTargets means Chrome answered both discovery paths but neither
+// exposed a usable page. It is browser-readiness evidence, never evidence that
+// an X composer is open.
+var ErrNoCDPPageTargets = errors.New("CDP browser has no page targets")
+
+func httpListPageURLs(port int) ([]string, error) {
+	transport := &http.Transport{DisableKeepAlives: true}
+	client := &http.Client{Timeout: 3 * time.Second, Transport: transport}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/list", port))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := readAllLimited(resp.Body, 256*1024)
+	if err != nil || len(body) == 0 {
+		return nil, fmt.Errorf("empty /json/list response")
+	}
+	var targets []struct {
+		Type string `json:"type"`
+		URL  string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &targets); err != nil {
+		return nil, err
+	}
+	urls := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.Type == "page" && strings.TrimSpace(target.URL) != "" {
+			urls = append(urls, target.URL)
+		}
+	}
+	return urls, nil
+}
+
+func wsListPageURLs(port int) ([]string, error) {
+	result, err := cdpBrowserCall(port, "Target.getTargets", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		TargetInfos []struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		} `json:"targetInfos"`
+	}
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, err
+	}
+	urls := make([]string, 0, len(resp.TargetInfos))
+	for _, target := range resp.TargetInfos {
+		if target.Type == "page" && strings.TrimSpace(target.URL) != "" {
+			urls = append(urls, target.URL)
+		}
+	}
+	return urls, nil
 }
 
 func httpListPageTargets(port int) ([]string, error) {

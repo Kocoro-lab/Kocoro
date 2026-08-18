@@ -100,10 +100,14 @@ go test -tags=live ./test/e2e \
 # research-honesty, clarification, recovery, and everyday/voice-style tasks.
 # Tools and side effects are sandboxed; the provider and AgentLoop are real.
 # Set SAMPLE=release and REPETITIONS=5 for release qualification.
+# Set KOCORO_GENERAL_OUTCOME_MODEL and KOCORO_GENERAL_OUTCOME_EFFORT to pin an
+# exact route without changing the user's persistent global configuration.
 SHANNON_E2E_LIVE=1 \
 KOCORO_GENERAL_OUTCOME_LIVE=1 \
 KOCORO_GENERAL_OUTCOME_SAMPLE=comparison \
 KOCORO_GENERAL_OUTCOME_REPETITIONS=1 \
+KOCORO_GENERAL_OUTCOME_MODEL=grok-4.6 \
+KOCORO_GENERAL_OUTCOME_EFFORT=low \
 go test -tags=live ./test/e2e \
   -run '^TestLive_GeneralAgentOutcomeDataset$' \
   -count=1 -v -timeout=60m

@@ -2698,9 +2698,25 @@ func TestFabricatedToolCallDetection(t *testing.T) {
 	if !looksLikeFabricatedToolCalls(xml) {
 		t.Error("should detect XML format in text output")
 	}
+	// Bare paired <tool_call> block (observed side-chat fabrication shape)
+	bare := `Let me search for that.
+
+<tool_call>web_search(query="kocoro daemon port")</tool_call>
+
+The results show...`
+	if !looksLikeFabricatedToolCalls(bare) {
+		t.Error("should detect paired <tool_call> block")
+	}
 	// Normal text
 	if looksLikeFabricatedToolCalls("Here is the answer.") {
 		t.Error("should not flag normal text")
+	}
+	// Unpaired tag and prose mentioning the tag stay unflagged
+	if looksLikeFabricatedToolCalls("The <tool_call> tag is used by some models.") {
+		t.Error("should not flag unpaired tag mention")
+	}
+	if looksLikeFabricatedToolCalls("Wrap output in <tool_call>plain words</tool_call> markers.") {
+		t.Error("should not flag paired tags without a call-shaped body")
 	}
 }
 
@@ -6884,9 +6900,36 @@ func TestOperationalRules_FullByteEqualWhenThinkRegistered(t *testing.T) {
 	loop := &AgentLoop{tools: NewToolRegistry()}
 	loop.tools.Register(&fakeThinkTool{})
 	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
+	loop.tools.Register(&fakeNamedTool{name: "set_work_plan"})
 	got := loop.operationalRules()
 	if got != coreOperationalRules {
-		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when think registered; len got=%d want=%d", len(got), len(coreOperationalRules))
+		t.Errorf("operationalRules() must equal coreOperationalRules byte-for-byte when every conditional tool is registered; len got=%d want=%d", len(got), len(coreOperationalRules))
+	}
+}
+
+// TestOperationalRules_StripsWorkPlanSectionWhenAbsent verifies the
+// ## Work Plans guidance disappears byte-exactly when set_work_plan is not
+// registered (TUI, one-shot CLI, MCP server, ephemeral daemon runs), so those
+// prompts stay identical to pre-feature builds.
+func TestOperationalRules_StripsWorkPlanSectionWhenAbsent(t *testing.T) {
+	if !strings.Contains(coreOperationalRules, workPlanBulletSection) {
+		t.Fatal("workPlanBulletSection is not a byte-exact substring of coreOperationalRules; the strip is broken")
+	}
+	loop := &AgentLoop{tools: NewToolRegistry()}
+	loop.tools.Register(&fakeThinkTool{})
+	loop.tools.Register(&fakeNamedTool{name: "use_skill"})
+	got := loop.operationalRules()
+	if strings.Contains(got, "## Work Plans") {
+		t.Error("'## Work Plans' section must not appear when set_work_plan is unregistered")
+	}
+	if strings.Contains(got, "set_work_plan") {
+		t.Error("set_work_plan must not be mentioned when unregistered")
+	}
+	if !strings.Contains(got, "## Progress and Stopping") || !strings.Contains(got, "## Error Handling") {
+		t.Error("surrounding sections must remain after the strip")
+	}
+	if strings.Contains(got, "\n\n\n") {
+		t.Error("strip left a double blank line")
 	}
 }
 

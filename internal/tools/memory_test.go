@@ -108,21 +108,31 @@ func TestMemoryTool_RejectsInvalidTypedNeighborhood(t *testing.T) {
 }
 
 type stubQuerier struct {
-	status memory.ServiceStatus
-	env    *memory.ResponseEnvelope
-	class  memory.ErrorClass
-	err    error
-	callN  int
-	seq    []memory.ErrorClass // optional: deliver i-th class on i-th call
+	status     memory.ServiceStatus
+	env        *memory.ResponseEnvelope
+	class      memory.ErrorClass
+	err        error
+	callN      int
+	lastIntent memory.QueryIntent
+	intents    []memory.QueryIntent
+	seq        []memory.ErrorClass // optional: deliver i-th class on i-th call
+	seqEnv     []*memory.ResponseEnvelope
 }
 
 func (s *stubQuerier) Status() memory.ServiceStatus { return s.status }
-func (s *stubQuerier) Query(_ context.Context, _ memory.QueryIntent) (*memory.ResponseEnvelope, memory.ErrorClass, error) {
+func (s *stubQuerier) Query(_ context.Context, intent memory.QueryIntent) (*memory.ResponseEnvelope, memory.ErrorClass, error) {
+	s.lastIntent = intent
+	s.intents = append(s.intents, intent)
 	s.callN++
 	if len(s.seq) > 0 {
 		c := s.seq[0]
 		s.seq = s.seq[1:]
-		return s.env, c, nil
+		env := s.env
+		if len(s.seqEnv) > 0 {
+			env = s.seqEnv[0]
+			s.seqEnv = s.seqEnv[1:]
+		}
+		return env, c, nil
 	}
 	return s.env, s.class, s.err
 }
@@ -296,6 +306,9 @@ func TestMemoryTool_Info(t *testing.T) {
 	}
 	for _, rule := range []string{
 		"evidence_tier",
+		"temporal_status",
+		"superseded_by_recency",
+		"aggregator",
 		"corroborated",
 		"singleton",
 		"derived",
@@ -309,6 +322,9 @@ func TestMemoryTool_Info(t *testing.T) {
 		if !strings.Contains(info.Description, rule) {
 			t.Errorf("description missing evidence-fidelity rule %q", rule)
 		}
+	}
+	if n := strings.Count(info.Description, "prefer current unless the user asked about the past"); n != 1 {
+		t.Fatalf("prefer-current sentence appears %d times, want 1", n)
 	}
 	if !strings.Contains(info.Description, "do not surface internal labels") && !strings.Contains(info.Description, "do not surface raw event IDs") {
 		t.Fatal("description should forbid surfacing internal labels in user-facing output")
@@ -334,7 +350,17 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 	env := &memory.ResponseEnvelope{
 		Reason:        "ok",
 		BundleVersion: "0.6.0",
-		Candidates:    []memory.QueryCandidate{{Value: "Nexus", Score: 1.37, Evidence: "observed", SupportingEventIDs: []string{"ev_a"}}},
+		Candidates: []memory.QueryCandidate{{
+			Value:              "Nexus",
+			Score:              1.37,
+			Evidence:           "observed",
+			SupportingEventIDs: []string{"ev_a"},
+			TemporalStatus:     "current",
+			EntityID:           strPtr("ent_secret"),
+			Extra: map[string]json.RawMessage{
+				"aggregation": json.RawMessage(`{"status":"ok"}`),
+			},
+		}},
 		MemoryBlock: &memory.MemoryBlock{
 			Groups: []memory.MemoryCandidateGroup{{
 				Value:              "Nexus",
@@ -347,6 +373,7 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 				Scopes:             []string{"project:Kocoro"},
 				ViaRelations:       []string{"created"},
 				ViaAnchorEntityIDs: []string{"ent_anchor"},
+				TemporalStatus:     "current",
 			}},
 			Notes: []string{},
 		},
@@ -375,6 +402,9 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 	if got := g0["evidence_tier"]; got != "corroborated" {
 		t.Fatalf("group[0].evidence_tier=%v want corroborated", got)
 	}
+	if got := g0["temporal_status"]; got != "current" {
+		t.Fatalf("group[0].temporal_status=%v want current", got)
+	}
 	via, _ := g0["via_relations"].([]any)
 	if len(via) != 1 || via[0] != "created" {
 		t.Fatalf("group[0].via_relations=%+v", via)
@@ -382,6 +412,225 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 	cands, _ := body["candidates"].([]any)
 	if len(cands) != 1 {
 		t.Fatalf("legacy candidates dropped: %+v", cands)
+	}
+	c0, _ := cands[0].(map[string]any)
+	if got := c0["temporal_status"]; got != "current" {
+		t.Fatalf("candidates[0].temporal_status=%v want current", got)
+	}
+	if _, ok := c0["entity_id"]; ok {
+		t.Fatalf("shaped candidates must not leak entity_id: %#v", c0)
+	}
+	if _, ok := c0["observed_path"]; ok {
+		t.Fatalf("shaped candidates must not leak observed_path: %#v", c0)
+	}
+	if agg, ok := c0["aggregation"].(map[string]any); !ok || agg["status"] != "ok" {
+		t.Fatalf("extra aggregation not merged: %#v", c0)
+	}
+}
+
+func TestMemoryTool_ForwardsAggregator(t *testing.T) {
+	stub := &stubQuerier{
+		status: memory.StatusReady,
+		env:    &memory.ResponseEnvelope{Reason: "ok"},
+		class:  memory.ClassOK,
+	}
+	tool := &MemoryTool{Service: stub, Fallback: &fakeFallback{}}
+	res, err := tool.Run(context.Background(), `{"mode":"direct_relation","anchor_mentions":["me"],"relation_constraints":["volleyball_record"],"aggregator":"count"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if stub.lastIntent.Aggregator != "count" {
+		t.Fatalf("aggregator=%q want count", stub.lastIntent.Aggregator)
+	}
+}
+
+func TestMemoryTool_StripsAggregatorAfterSchemaRejection(t *testing.T) {
+	reject := &memory.ResponseEnvelope{
+		Error: &memory.ErrorObject{
+			Code:    "validation_error",
+			Message: "request validation failed",
+			Details: map[string]any{
+				"sub_code": "schema_validation",
+				"errors": []any{
+					map[string]any{
+						"type": "extra_forbidden",
+						"loc":  []any{"body", "intent", "aggregator"},
+						"msg":  "Extra inputs are not permitted",
+					},
+				},
+			},
+		},
+	}
+	ok := &memory.ResponseEnvelope{
+		Reason:        "ok",
+		BundleVersion: "0.6.0",
+		Candidates:    []memory.QueryCandidate{{Value: "5-2", Evidence: "observed"}},
+	}
+	stub := &stubQuerier{
+		status: memory.StatusReady,
+		seq:    []memory.ErrorClass{memory.ClassPermanent, memory.ClassOK},
+		seqEnv: []*memory.ResponseEnvelope{reject, ok},
+	}
+	tool := &MemoryTool{Service: stub, Fallback: &fakeFallback{}}
+	res, err := tool.Run(context.Background(), `{"mode":"direct_relation","anchor_mentions":["me"],"aggregator":"count"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if stub.callN != 2 {
+		t.Fatalf("callN=%d want 2", stub.callN)
+	}
+	if stub.intents[0].Aggregator != "count" || stub.intents[1].Aggregator != "" {
+		t.Fatalf("intents=%+v", stub.intents)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(res.Content), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["reason"] != "ok" {
+		t.Fatalf("reason=%v", body["reason"])
+	}
+	if body["evidence_quality"] != "structured_unaggregated" {
+		t.Fatalf("evidence_quality=%v want structured_unaggregated", body["evidence_quality"])
+	}
+	warnings, _ := body["warnings"].([]any)
+	found := false
+	for _, raw := range warnings {
+		w, _ := raw.(map[string]any)
+		if w["code"] == "aggregator_unsupported" {
+			found = true
+			msg, _ := w["message"].(string)
+			if !strings.Contains(msg, "truncated") || !strings.Contains(msg, "total") {
+				t.Fatalf("warning must say the list is truncated and not a total: %q", msg)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("missing aggregator_unsupported warning: %#v", warnings)
+	}
+}
+
+func TestMemoryTool_DoesNotStripOnUnrelatedValidationError(t *testing.T) {
+	reject := &memory.ResponseEnvelope{
+		Error: &memory.ErrorObject{
+			Code:    "validation_error",
+			Message: "request validation failed",
+			Details: map[string]any{
+				"sub_code": "schema_validation",
+				"errors": []any{
+					map[string]any{
+						"loc": []any{"body", "intent", "time_window"},
+						"msg": "String should match pattern",
+					},
+				},
+			},
+		},
+	}
+	stub := &stubQuerier{
+		status: memory.StatusReady,
+		env:    reject,
+		class:  memory.ClassPermanent,
+	}
+	tool := &MemoryTool{Service: stub, Fallback: &fakeFallback{}}
+	res, err := tool.Run(context.Background(), `{"mode":"direct_relation","anchor_mentions":["me"],"aggregator":"count","time_window":"last year"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected permanent validation error, got %s", res.Content)
+	}
+	if stub.callN != 1 {
+		t.Fatalf("callN=%d want 1 (must not strip-and-retry)", stub.callN)
+	}
+}
+
+func TestMemoryTool_StripRetryUnavailableFallsBack(t *testing.T) {
+	reject := &memory.ResponseEnvelope{
+		Error: &memory.ErrorObject{
+			Code:    "validation_error",
+			Message: "request validation failed",
+			Details: map[string]any{
+				"sub_code": "schema_validation",
+				"errors": []any{
+					map[string]any{"loc": []any{"body", "intent", "aggregator"}},
+				},
+			},
+		},
+	}
+	stub := &stubQuerier{
+		status: memory.StatusReady,
+		seq:    []memory.ErrorClass{memory.ClassPermanent, memory.ClassUnavailable},
+		seqEnv: []*memory.ResponseEnvelope{reject, nil},
+	}
+	fb := &fakeFallback{snippet: "memory.md note"}
+	tool := &MemoryTool{Service: stub, Fallback: fb}
+	res, err := tool.Run(context.Background(), `{"mode":"direct_relation","anchor_mentions":["me"],"aggregator":"count"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("expected fallback, got error %s", res.Content)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(res.Content), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["source"] != "fallback" {
+		t.Fatalf("source=%v want fallback", body["source"])
+	}
+	if stub.callN != 2 {
+		t.Fatalf("callN=%d want 2", stub.callN)
+	}
+}
+
+func TestMemoryTool_RejectsAggregatorOnPathQuery(t *testing.T) {
+	tool := &MemoryTool{
+		Service:  &stubQuerier{status: memory.StatusReady, env: &memory.ResponseEnvelope{}, class: memory.ClassOK},
+		Fallback: &fakeFallback{},
+	}
+	res, _ := tool.Run(context.Background(), `{"mode":"path_query","anchor_mentions":["me"],"relation_constraints":["works_on","uses"],"aggregator":"count"}`)
+	if !res.IsError || !strings.Contains(res.Content, "direct_relation") {
+		t.Fatalf("res=%+v", res)
+	}
+}
+
+func TestMemoryTool_IncompleteReasonReachesModel(t *testing.T) {
+	env := &memory.ResponseEnvelope{
+		Reason:        "incomplete",
+		BundleVersion: "0.7.0",
+		MemoryBlock: &memory.MemoryBlock{
+			Groups: []memory.MemoryCandidateGroup{{
+				Value:        "insufficient_date_coverage",
+				Evidence:     "observed",
+				EvidenceTier: "incomplete",
+				Extra: map[string]json.RawMessage{
+					"aggregation": json.RawMessage(`{"status":"insufficient_date_coverage","known_lower_bound":2}`),
+				},
+			}},
+		},
+	}
+	tool := &MemoryTool{
+		Service:  &stubQuerier{status: memory.StatusReady, env: env, class: memory.ClassOK},
+		Fallback: &fakeFallback{},
+	}
+	res, err := tool.Run(context.Background(), `{"anchor_mentions":["me"],"aggregator":"count"}`)
+	if err != nil || res.IsError {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(res.Content), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["reason"] != "incomplete" {
+		t.Fatalf("reason=%v want incomplete", body["reason"])
+	}
+	if body["evidence_quality"] != "structured_incomplete" {
+		t.Fatalf("evidence_quality=%v", body["evidence_quality"])
+	}
+	mb := body["memory_block"].(map[string]any)
+	g0 := mb["groups"].([]any)[0].(map[string]any)
+	agg := g0["aggregation"].(map[string]any)
+	if agg["known_lower_bound"] != float64(2) {
+		t.Fatalf("aggregation dropped: %#v", g0)
 	}
 }
 

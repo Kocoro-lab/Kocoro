@@ -16,11 +16,16 @@ import (
 type CloudDelegateTool struct {
 	gw          *client.GatewayClient
 	apiKey      string
+	authGuard   *authSensitiveToolGuard
 	timeout     time.Duration
 	idleTimeout time.Duration
 	handler     agent.EventHandler
 	agentName   string
 	agentPrompt string
+}
+
+func (t *CloudDelegateTool) setAuthSensitiveToolGuard(guard *authSensitiveToolGuard) {
+	t.authGuard = guard
 }
 
 type cloudDelegateArgs struct {
@@ -110,6 +115,12 @@ func (t *CloudDelegateTool) Info() agent.ToolInfo {
 }
 
 func (t *CloudDelegateTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	return runAuthSensitiveTool(t.authGuard, func() (agent.ToolResult, error) {
+		return t.run(ctx, argsJSON)
+	})
+}
+
+func (t *CloudDelegateTool) run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args cloudDelegateArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil

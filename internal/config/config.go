@@ -136,12 +136,19 @@ type MCPConfig struct {
 }
 
 type AgentConfig struct {
-	MaxIterations  int     `mapstructure:"max_iterations"   yaml:"max_iterations"   json:"max_iterations"`
-	Temperature    float64 `mapstructure:"temperature"      yaml:"temperature"      json:"temperature"`
-	MaxTokens      int     `mapstructure:"max_tokens"       yaml:"max_tokens"       json:"max_tokens"`
-	Thinking       bool    `mapstructure:"thinking"         yaml:"thinking"         json:"thinking"`
-	ThinkingMode   string  `mapstructure:"thinking_mode"    yaml:"thinking_mode"    json:"thinking_mode"` // "adaptive" (default) or "enabled" (fixed budget)
-	ThinkingBudget int     `mapstructure:"thinking_budget"  yaml:"thinking_budget"  json:"thinking_budget"`
+	MaxIterations int `mapstructure:"max_iterations"   yaml:"max_iterations"   json:"max_iterations"`
+	// WorkPlanMaxSteps caps the set_work_plan checklist length. Default 8:
+	// long multi-stage runs summarize into coarse stages, and the Desktop card
+	// stays glanceable. When it binds the tool returns a [validation error]
+	// telling the model to merge stages (three identical retries would
+	// force-stop the run via the validation-error loop rule). Override with
+	// agent.work_plan_max_steps for workflows that genuinely need more stages.
+	WorkPlanMaxSteps int     `mapstructure:"work_plan_max_steps" yaml:"work_plan_max_steps" json:"work_plan_max_steps"`
+	Temperature      float64 `mapstructure:"temperature"      yaml:"temperature"      json:"temperature"`
+	MaxTokens        int     `mapstructure:"max_tokens"       yaml:"max_tokens"       json:"max_tokens"`
+	Thinking         bool    `mapstructure:"thinking"         yaml:"thinking"         json:"thinking"`
+	ThinkingMode     string  `mapstructure:"thinking_mode"    yaml:"thinking_mode"    json:"thinking_mode"` // "adaptive" (default) or "enabled" (fixed budget)
+	ThinkingBudget   int     `mapstructure:"thinking_budget"  yaml:"thinking_budget"  json:"thinking_budget"`
 	// ForceThinkTool re-enables the local `think` tool even on paths where
 	// native extended thinking is active (the default-skip case). The two
 	// signals are redundant on Sonnet 4.6 / Opus 4.7 with adaptive thinking
@@ -495,6 +502,7 @@ func Load() (*Config, error) {
 	// of model/tool rounds; loop detection, watchdogs, cancellation, and context
 	// budgeting are the primary controls. User-configurable per agent.
 	viper.SetDefault("agent.max_iterations", DefaultAgentMaxIterations)
+	viper.SetDefault("agent.work_plan_max_steps", 8)
 	viper.SetDefault("agent.system_event_cap", 20)
 	viper.SetDefault("agent.reply_route_index_cap", 256)
 	viper.SetDefault("agent.temperature", 0)

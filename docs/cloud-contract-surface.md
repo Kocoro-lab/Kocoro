@@ -105,6 +105,33 @@ resolver is `resolve_prompt_cache_ttl_block` in
 label as attribution only and never as a TTL selector. Do not re-implement the
 mapping on either side.
 
+### Integration tool discovery and execution
+
+This repo: `internal/client/gateway.go` (`ServerToolSchema`,
+`ToolExecuteRequest`, `ToolExecuteResponse`,
+`GatewayClient.ExecuteIntegrationToolWithIdentity`) and
+`internal/tools/server.go` (`NewIntegrationTool`).
+Cloud: `go/orchestrator/cmd/gateway/internal/handlers/integrations_tools.go`.
+
+`GET /api/v1/integrations/tools` may add the optional trusted fields
+`provider` and `material_side_effect`. Missing materiality means material
+side effect for backward compatibility; only explicit `false` bypasses the
+durable mutation journal. `POST .../{name}/execute` accepts optional
+`request_id`, and material calls also send `Idempotency-Key`. Both identities
+must remain stable for a retry of one tool call and distinct across separate
+tool calls.
+
+Non-2xx execute responses are decoded as structured integration errors. Codes
+that prove no provider action may terminate the durable journal as no-effect;
+`provider_unavailable` is an explicit pre-dispatch no-effect code.
+`billing_error`, `provider_error`, `outcome_unknown`, and unknown
+post-dispatch errors must remain outcome-unknown for material tools. Response
+`usage` preserves `provider`, `model`, `unit_type`, `units`,
+`cost_usd`, and `cost_model`; all remain optional for old Cloud versions.
+`call_in_progress` is neither no-effect nor outcome-unknown: read-only callers
+may retry after waiting, while material callers treat the original dispatch as
+accepted and must wait or query state instead of resending it.
+
 ### Upload `kind` enum
 
 This repo: `internal/uploads/client.go` (`validUploadKinds`, `IsValidKind`, and
@@ -162,6 +189,51 @@ Routes the kocoro agent itself calls additionally need a matching reference unde
 `internal/skills/bundled/skills/kocoro/references/`; see the Doc Co-Maintenance
 section of `CLAUDE.md`.
 
+Conversation context actions are Desktop-only and gated by
+`conversation_context_actions_v1`: `POST /sessions/{id}/fork` copies model
+history through a complete assistant turn into a normal persisted session.
+Its optional `agent` identifies the source session directory; optional
+`target_agent` selects the destination agent directory (use `"default"` for
+Default, and omit it to branch within the source agent).
+`POST /sessions/{id}/side-chat` runs against that same bounded history plus the
+panel's temporary user/assistant history. Side-chat runs carry the normal tool
+registry and permission engine — identical capability to the primary
+conversation. Tool approvals flow over the per-request SSE stream
+(`approval` frames, resolved via `POST /approval`) exactly like `/message`;
+`ask_user_question` gets no asker on ephemeral runs (the panel has no question
+UI) and degrades to its clean "can't ask here" result. The runs stay ephemeral:
+no session is persisted and no global bus events are published. The
+implementation is `internal/daemon/conversation_context.go`; the Desktop
+consumer is `DaemonClient+ConversationContext.swift`. Neither route belongs in
+the bundled Kocoro skill references because the model never calls them.
+
+`message_index` on both routes is a boundary in the RAW archive index space —
+the `messages` array of the session file, system-injected entries included —
+equal to (index of the last included message) + 1, and it must land on a
+complete assistant turn. Desktop derives it from `SessionDisplayMapper`'s
+`rawIndex` (raw `enumerated()` position, injected entries skipped for display
+but never renumbered), so the two sides share one basis; this was cross-checked
+against the Desktop implementation on 2026-08-17. Both routes honor a
+compaction checkpoint whose coverage ends at or before the boundary: the fork
+carries the checkpoint (deep-copied) and side-chat feeds the model
+checkpoint+tail, never the full raw archive.
+
+Desktop text replies use a transient head-only `<kocoro_replies>` prompt
+envelope. `RunAgent` removes that envelope from the archived user message but
+persists its decoded quotes and comments in the parallel
+`message_meta[].conversation_annotations` display metadata. The metadata never
+enters `HistoryForLoop`; it lets Desktop reconstruct the compact annotation
+attachment immediately and after reload without exposing model-only markup.
+The envelope limits are enforced server-side at both Desktop run ingresses
+(`POST /message`, `POST /queue`) on the exact bytes the
+model would receive: ≤ 100 replies per envelope run, quotes ≤ 8,000 runes,
+comments ≤ 2,000 runes. Violations are 400s with stable codes
+`conversation_replies_too_many` / `conversation_reply_quote_too_long` /
+`conversation_reply_comment_too_long`, and a delimited-but-unparseable
+envelope is `conversation_replies_malformed`. On paths that cannot reject
+(queue drain, non-Desktop sources) a malformed envelope is kept verbatim as
+ordinary text — user bytes are never silently dropped.
+
 ### Event payload shapes
 
 `tool_status`, `approval_request`, `approval_request.flags`, and
@@ -170,6 +242,22 @@ JSON for every payload a UI client decodes lives in `docs/desktop-wire-fixtures/
 and is verified by `internal/daemon/wire_fixtures_test.go`, which emits through
 the real producer path and decodes the produced bytes into consumer-shaped
 structs. **Change a payload, update the fixture and the test in the same PR.**
+
+### Work plans (`work_plan.updated` + `Session.work_plan`)
+
+The daemon-owned durable progress checklist for one run (`internal/daemon/
+work_plan.go`; session shape `session.WorkPlanSnapshot`). Desktop binds to the
+`work_plan.updated` bus event (fixture `bus_event.work_plan.updated.json`) and
+to the optional `work_plan` field on `GET /sessions/{id}`. Contract points:
+
+- Full snapshot + monotonic `revision` is the recovery unit: consumers drop
+  lower-or-equal revisions, may coalesce under backpressure, and refetch the
+  session detail after a gap/reconnect. Closure bumps the revision.
+- The event is emitted only after the covering durable save succeeded — a
+  displayed revision can never vanish in a daemon crash.
+- `lifecycle`/`close_reason` are runtime-owned; plan state never feeds
+  Desktop's outer `TaskPresentationState`.
+- Gated by capability token `work_plan_v1`.
 
 ### Approval-card `description`
 

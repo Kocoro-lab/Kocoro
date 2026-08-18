@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
@@ -24,10 +25,10 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 	if s == nil || s.deps == nil || s.deps.GW == nil {
 		return nil
 	}
-	// Serialize with other live-registry refreshes so overlapping calls can't
-	// apply stale snapshots out of order.
-	s.toolRefreshMu.Lock()
-	defer s.toolRefreshMu.Unlock()
+	// Serialize the list/build/live-swap transaction with auth, MCP health, and
+	// reload so no cached catalog can land across an identity transition.
+	unlock := s.deps.LockToolRegistryMutation()
+	defer unlock()
 	_, reg, _ := s.deps.Snapshot() // read the registry pointer under deps.mu
 	if reg == nil {
 		return nil
@@ -38,8 +39,44 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 	// Keep the cached overlay in sync so a later MCP health rebuild preserves
 	// the integration tools registered above (RebuildRegistryForHealth rebuilds
 	// the live registry from the cached GatewayOverlay).
-	s.syncGatewayOverlay(reg)
+	s.syncToolOverlays(reg)
 	return err
+}
+
+// resetIntegrationToolsForPrincipal applies the strict identity boundary for
+// Cloud-owned integration schemas. Unlike an ordinary refresh, an auth epoch
+// transition must never retain tools fetched under the previous API key when
+// the new identity's list call is unavailable. Clear the entire integration
+// source atomically first; only then may the new verified principal populate
+// its own catalog.
+func (s *Server) resetIntegrationToolsForPrincipal(ctx context.Context, hasPrincipal bool) error {
+	if s == nil || s.deps == nil {
+		return nil
+	}
+	unlock := s.deps.LockToolRegistryMutation()
+	defer unlock()
+	_, reg, _ := s.deps.Snapshot()
+	if reg == nil {
+		return nil
+	}
+	reg.RemoveSource(agent.SourceIntegration)
+	s.syncToolOverlays(reg)
+	if !hasPrincipal || s.deps.GW == nil {
+		return nil
+	}
+	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	err := tools.RegisterIntegrationTools(itCtx, s.deps.GW, reg)
+	s.syncToolOverlays(reg)
+	return err
+}
+
+// InvalidateIntegrationTools removes the old catalog after AuthManager has
+// synchronously swapped the live key and invalidated every captured generation.
+// Keeping the generation boundary first closes the registry-lock wait window;
+// the verified-principal transition repopulates the catalog.
+func (s *Server) InvalidateIntegrationTools() {
+	_ = s.resetIntegrationToolsForPrincipal(context.Background(), false)
 }
 
 // refreshIntegrationToolsAsync fires RefreshIntegrationTools in the background

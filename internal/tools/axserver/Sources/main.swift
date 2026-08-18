@@ -556,6 +556,13 @@ func dispatch(
         if let err = err { return Response(id: id, error: err) }
         return Response(id: id, result: AnyCodable(result!))
 
+    case "current_context":
+        let pid = params.pid ?? frontmostPID()
+        guard pid > 0 else {
+            return Response(id: id, error: ErrorInfo(code: -1, message: "Cannot determine target app"))
+        }
+        return Response(id: id, result: AnyCodable(currentContext(pid: pid)))
+
     case "list_windows":
         let pid = params.pid ?? frontmostPID()
         guard pid > 0 else {

@@ -513,6 +513,8 @@ func TestRenderPrivateMemoryContext_RendersEvidenceStrengthMarkers(t *testing.T)
 				{Value: "Amber Field", EvidenceTier: "text"},
 				{Value: "Legacy Record"},
 				{Value: "Future Record", EvidenceTier: "future-tier"},
+				{Value: "5-2", EvidenceTier: "corroborated", TemporalStatus: "current"},
+				{Value: "3-1", EvidenceTier: "corroborated", TemporalStatus: "superseded_by_recency"},
 			},
 		}},
 	}}
@@ -526,6 +528,8 @@ func TestRenderPrivateMemoryContext_RendersEvidenceStrengthMarkers(t *testing.T)
 		"Amber Field [strength=text]",
 		"Legacy Record [strength=unrated]",
 		"Future Record [strength=unrated]",
+		"5-2 [strength=corroborated] [status=current]",
+		"3-1 [strength=corroborated] [status=superseded_by_recency]",
 	} {
 		if !strings.Contains(out, marker) {
 			t.Errorf("rendered context missing %q:\n%s", marker, out)
@@ -535,6 +539,7 @@ func TestRenderPrivateMemoryContext_RendersEvidenceStrengthMarkers(t *testing.T)
 		"Current user statements and verified current observations take precedence",
 		"preserve the recorded value",
 		"do not quote evidence_tier field names, bracketed markers, or counts",
+		"prefer current unless the user asked about the past",
 		"keep relevant weaker items but qualify them",
 		"Do not add people, organizations, roles, or attributes",
 	} {

@@ -61,6 +61,9 @@ var modelContextWindow = map[string]int{
 	// --- xAI Grok ---
 	"grok-4-1-fast-non-reasoning": 2_000_000,
 	"grok-4-1-fast-reasoning":     2_000_000,
+	"grok-4.3":                    1_000_000,
+	"grok-4.5":                    500_000,
+	"grok-4.6":                    500_000,
 	"grok-4.20-0309-reasoning":    2_000_000,
 
 	// --- Others routed by Shannon Cloud (medium/large tiers) ---

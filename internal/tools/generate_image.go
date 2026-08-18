@@ -34,7 +34,12 @@ var (
 )
 
 type GenerateImageTool struct {
-	client imageGen
+	client    imageGen
+	authGuard *authSensitiveToolGuard
+}
+
+func (t *GenerateImageTool) setAuthSensitiveToolGuard(guard *authSensitiveToolGuard) {
+	t.authGuard = guard
 }
 
 func NewGenerateImageTool(client imageGen) *GenerateImageTool {
@@ -105,6 +110,12 @@ func (t *GenerateImageTool) Info() agent.ToolInfo {
 }
 
 func (t *GenerateImageTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
+	return runAuthSensitiveTool(t.authGuard, func() (agent.ToolResult, error) {
+		return t.run(ctx, argsJSON)
+	})
+}
+
+func (t *GenerateImageTool) run(ctx context.Context, argsJSON string) (agent.ToolResult, error) {
 	var args generateImageArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return agent.ValidationError(fmt.Sprintf("invalid arguments: %v", err)), nil

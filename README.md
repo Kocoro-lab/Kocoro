@@ -15,6 +15,8 @@ Kocoro runs AI agents locally with full computer access — files, apps, browser
 
 > **Coming from Claude Code?** Kocoro Desktop can import your existing agents, skills, and instructions from `~/.claude/` in one click — preview-then-apply via the daemon's `/migrate/claude-code/*` endpoints.
 
+In Kocoro Desktop you can also work *inside* a conversation: select any passage of a reply to annotate it with inline comments (they reach the agent alongside your next message and survive reload), open a **Side Chat** — a temporary aside with the same tools and approvals as the main conversation that vanishes when the app closes — or **branch** a finished turn into a new session, optionally under a different agent. All three are served by this daemon (`conversation_context_actions_v1`).
+
 Built on **[Shannon](https://github.com/Kocoro-lab/Shannon)** — the open-source multi-agent framework that powers both the Shannon Cloud SaaS and the self-hosted Shannon Gateway.
 
 ## Contents
@@ -290,6 +292,7 @@ Tools executed on your macOS machine. Detailed schemas live in each tool's `Info
 | `schedule_list` / `_show` | No | List with sync status; show a schedule's last run. |
 | `session_search` | No | FTS5 keyword search across past session messages. |
 | `memory_append` | No | Append entries to agent MEMORY.md (flock-protected). |
+| `set_work_plan` | No | Record a short progress checklist (2–8 steps) for genuinely multi-stage work the agent is executing. Daemon-served runs only; each update replaces the full list, the daemon persists it before broadcasting, and Kocoro Desktop shows it as a live progress card. It records progress only — it never executes work, and a checked step is not completion evidence. |
 | `ask_user_question` | No | Ask the user to pick among a few explicit options (1-4 questions, 2-4 options each) when genuinely blocked or when they must choose between equivalent alternatives. You get the full chosen labels back. Rendered as a selection card in Kocoro Desktop; on channels/surfaces that can't prompt, it returns cleanly so the agent proceeds on its own judgment. |
 | `use_skill` | No | Activate a skill by name — returns full SKILL.md body. Skill names and descriptions are always listed to the model, so it can call this unprompted. Additionally, an opt-in `model_tier: small` prefetch can semantically suggest a relevant skill on the first turn — set `agent.skill_discovery: true` to enable it (off by default, so ordinary turns carry no extra model call). |
 | `present_deliverable` | No | Surface a finished file as a deliverable. The daemon validates the path locally and emits a vouched file reference to attached clients. **Kocoro Desktop renders it in the session's Deliverables sidebar; TUI, one-shot CLI, and MCP have no such surface**, so there the call succeeds without producing any UI. The path may sit outside the session working directory — the event is a user-visible file card, not proof the file was created inside a sandbox. |
@@ -454,7 +457,9 @@ mcp_servers:
 
 Per-server: `command`/`args` (stdio), `type: http` + `url` (HTTP), `env`, `context` (LLM guidance — critical), `disabled: true` (skip without removing), `tool_timeout_secs` (bound a single tool-call attempt — after a transport failure the daemon reconnects and retries once, so a call is at most two attempts plus reconnect; default from `mcp.tool_timeout_secs`, 300s — raise for long-running tools; cannot be disabled, `0` means the default), `workspace_base` (for file-producing servers: the directory their results render relative paths against, so the daemon can report absolute artifact paths).
 
-- **On-demand discovery** — large MCP and integration catalogs are searched and loaded as needed; common openers and core local tools remain immediately available.
+- **On-demand discovery** — large MCP and integration catalogs are searched and loaded as needed; trusted Cloud `web_search`, `web_fetch`, and `x_search` openers plus core local tools remain immediately available.
+- **Cloud integrations** — connected services such as X are exposed to the local agent after Desktop refreshes the catalog. Read-only calls can run concurrently when Cloud explicitly marks them observational; older schemas remain conservative. Integration tools and credential-capturing cloud/publish/image tools are credential/principal-generation scoped; old runtime clones fail locally before dispatch after auth changes. Auth/integration/MCP-health/reload registry transactions share one build-to-swap lock so cached overlays also fail closed. Reconnect prompts name the exact entry under Kocoro Settings → MCP Servers.
+- **X post handoff** — the deferred local `x_prepare_post` tool only builds an official X composer link and ends the agent turn. It never publishes or opens a browser; built-in browser and computer automation are blocked from X composer and Post controls while ordinary X reading remains available. Canonical Playwright omits arbitrary-code tools; CDP-backed mutations serialize target verification with dispatch and remain read-only whenever an X target is open, covering the inline home composer without element-label guesses. Non-CDP ordinary mutations remain available without claiming target-state X protection. The user must click the link, review the draft on X, and click Post.
 - **Artifact scratch sweep** — files a file-producing MCP server saves without an explicit path (e.g. playwright screenshots in daemon-served sessions) land in a per-session scratch dir under `~/.shannon/tmp/sessions/<id>/`. The daemon removes whole session dirs older than `daemon.scratch_max_age_days` (default 14) once at startup; `0` disables the sweep.
 - **`context` is critical** — tells the LLM what auth, capabilities, and queries to use. Without it, the LLM guesses wrong.
 - **All MCP tools require approval.** Use `-y` for auto-approve in one-shot.
@@ -750,6 +755,8 @@ The main model decides when the answer depends on the user's private past and ca
 
 - Natural private-fact questions do not need to say “remember” or “recall”; the tool remains available whenever the model needs past context.
 - `memory_recall` uses the structured sidecar when it is `Ready` and otherwise degrades to session search plus `MEMORY.md`.
+- Groups may carry `temporal_status`: `current` is the latest value of an updating fact; `superseded_by_recency` is an older value kept for audit. Prefer current unless the user asked about the past.
+- `memory_recall` can send `aggregator` (`count` / `sum`) on `direct_relation`. A withheld count is `reason: incomplete`, not a finished total.
 - Unnamed references such as “my doctor” or “that plan” use `session_search` to recover the concrete name or wording instead of inventing a structured-memory anchor.
 - A no-data result ends structured lookup for that target; the model does not retry relation-name or mode variants.
 

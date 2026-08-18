@@ -46,6 +46,7 @@ type memoryArgs struct {
 	ScopeFilter         []string `json:"scope_filter,omitempty"`
 	TargetSlot          string   `json:"target_slot,omitempty"`
 	TimeWindow          *string  `json:"time_window,omitempty"`
+	Aggregator          string   `json:"aggregator,omitempty"`
 	EvidenceBudget      int      `json:"evidence_budget,omitempty"`
 	ResultLimit         int      `json:"result_limit,omitempty"`
 }
@@ -58,7 +59,8 @@ func (t *MemoryTool) Info() agent.ToolInfo {
 			"Modes:\n" +
 			"- direct_relation: one-hop predicate (e.g. \"what did X create?\"). Read `groups[].via_relations`.\n" +
 			"- path_query: multi-hop / possessive (e.g. \"what did X's collaborator create?\"). relation_constraints is the ordered path; inverse hops use `^-1`. Read `groups[].observed_path`.\n" +
-			"- typed_neighborhood: typed target with exactly one relation. Requires candidate_type. Rank by score.\n\n" +
+			"- typed_neighborhood: typed target with exactly one relation. Requires candidate_type. Rank by score.\n" +
+			"For how-many / how-much on a named fact, use direct_relation with aggregator count or sum and an explicit YYYY-MM-DD/YYYY-MM-DD time_window when the period is bounded. A withheld count is reason=incomplete with a known lower bound, not a finished total.\n\n" +
 			"Evidence rules: read `memory_block.groups` and its `evidence_tier` before answering. " + prompt.MemoryEvidenceGuidance + " In user-facing wording say \"past records\" / \"I found\" / \"过去的记录\" / \"以前提到过\"; do not surface raw event IDs, support counts, tier labels, `memory_block`, `no_data_reason`, or scope labels unless the user asks for debug/provenance. If `no_data_reason` is set, say past records have no direct answer. The JSON schema field names and ontology terms used here are internal API vocabulary — never put them in replies; describe findings by their human name (person, project, company, file) or generically as past records / 过去的记录.",
 		Parameters: map[string]any{
 			"type": "object",
@@ -94,7 +96,12 @@ func (t *MemoryTool) Info() agent.ToolInfo {
 				},
 				"time_window": map[string]any{
 					"type":        "string",
-					"description": "Optional time window when the user asks about a date/time-bounded memory.",
+					"description": "Optional time window when the user asks about a date/time-bounded memory. For count/sum, use an explicit YYYY-MM-DD/YYYY-MM-DD interval; do not send relative phrases such as last year.",
+				},
+				"aggregator": map[string]any{
+					"type":        "string",
+					"enum":        []string{"count", "sum"},
+					"description": "direct_relation only. Use count for how many, sum for how much with numeric measures. Do not use path_query or typed_neighborhood with aggregator. A state fact that updated several times counts as one current value, not several events.",
 				},
 				"evidence_budget": map[string]any{
 					"type":        "integer",
@@ -140,6 +147,7 @@ func (t *MemoryTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 		ScopeFilter:         a.ScopeFilter,
 		TargetSlot:          a.TargetSlot,
 		TimeWindow:          a.TimeWindow,
+		Aggregator:          a.Aggregator,
 		EvidenceBudget:      a.EvidenceBudget,
 		ResultLimit:         a.ResultLimit,
 	}
@@ -150,6 +158,16 @@ func validateMemoryArgs(a memoryArgs) string {
 	for _, rel := range a.RelationConstraints {
 		if isBroadMemoryRelation(rel) {
 			return "memory_recall requires concrete relation_constraints. Broad relations like related_to are not valid for structured lookup; use a concrete relation/path, or use session_search for raw private-context lookup."
+		}
+	}
+	if a.Aggregator != "" {
+		switch a.Aggregator {
+		case "count", "sum":
+		default:
+			return "memory_recall aggregator must be count or sum."
+		}
+		if memory.QueryMode(a.Mode) != memory.ModeDirectRelation {
+			return "memory_recall aggregator is only valid with mode=direct_relation."
 		}
 	}
 	switch memory.QueryMode(a.Mode) {
@@ -232,10 +250,23 @@ func (t *MemoryTool) run(ctx context.Context, intent memory.QueryIntent) (agent.
 		Mode:                string(intent.Mode),
 		RelationConstraints: intent.RelationConstraints,
 		CandidateType:       intent.CandidateType,
+		Aggregator:          intent.Aggregator,
 	}); err != "" {
 		return agent.ToolResult{Content: err, IsError: true}, nil
 	}
-	env, class, err := t.Service.Query(ctx, intent)
+	queryIntent := intent
+	env, class, err := t.Service.Query(ctx, queryIntent)
+	if intent.Aggregator != "" && err == nil && class == memory.ClassPermanent && aggregatorSchemaRejected(env) {
+		queryIntent.Aggregator = ""
+		env, class, err = t.Service.Query(ctx, queryIntent)
+		if err == nil && class == memory.ClassOK && env != nil {
+			env.Warnings = append(append([]memory.Warning(nil), env.Warnings...), memory.Warning{
+				Code: "aggregator_unsupported",
+				Message: "sidecar rejected aggregator; returned an unaggregated lookup " +
+					"truncated at result_limit; do not treat this list length as a total count",
+			})
+		}
+	}
 	if err != nil || class == memory.ClassUnavailable {
 		return t.fallback(ctx, intent, "service_unavailable", "fallback")
 	}
@@ -246,7 +277,7 @@ func (t *MemoryTool) run(ctx context.Context, intent memory.QueryIntent) (agent.
 			return t.fallback(ctx, intent, "service_unavailable", "fallback")
 		case <-time.After(500 * time.Millisecond):
 		}
-		env, class, err = t.Service.Query(ctx, intent)
+		env, class, err = t.Service.Query(ctx, queryIntent)
 		if err != nil || class == memory.ClassUnavailable || class == memory.ClassRetryable {
 			return t.fallback(ctx, intent, "retryable_failed", "fallback_after_retry")
 		}
@@ -280,24 +311,15 @@ func (t *MemoryTool) shapeResult(env *memory.ResponseEnvelope) agent.ToolResult 
 			"message": "memory bundle degraded — results may be incomplete",
 		}}, warnings...)
 	}
+	if env.Reason == "incomplete" {
+		quality = "structured_incomplete"
+	}
+	if hasWarningCode(env, "aggregator_unsupported") {
+		quality = "structured_unaggregated"
+	}
 	cands := make([]map[string]any, 0, len(env.Candidates))
 	for _, c := range env.Candidates {
-		m := map[string]any{
-			"value":                c.Value,
-			"score":                c.Score,
-			"evidence":             c.Evidence,
-			"supporting_event_ids": c.SupportingEventIDs,
-		}
-		if c.Scope != nil {
-			m["scope"] = *c.Scope
-		}
-		if c.SupportCount != nil {
-			m["support_count"] = *c.SupportCount
-		}
-		if c.DistinctSessionCount != nil {
-			m["distinct_session_count"] = *c.DistinctSessionCount
-		}
-		cands = append(cands, m)
+		cands = append(cands, shapeCandidate(c))
 	}
 	out := map[string]any{
 		"source":           "memory_sidecar",
@@ -305,11 +327,96 @@ func (t *MemoryTool) shapeResult(env *memory.ResponseEnvelope) agent.ToolResult 
 		"bundle_version":   env.BundleVersion,
 		"memory_block":     env.MemoryBlock,
 		"candidates":       cands,
+		"reason":           env.Reason,
 		"warnings":         warnings,
 		"fallback_reason":  nil,
 	}
 	body, _ := json.Marshal(out)
 	return agent.ToolResult{Content: string(body)}
+}
+
+func aggregatorSchemaRejected(env *memory.ResponseEnvelope) bool {
+	if env == nil || env.Error == nil {
+		return false
+	}
+	if env.Error.SubCode() != "schema_validation" && env.Error.Code != "validation_error" {
+		return false
+	}
+	return errorMentionsField(env.Error, "aggregator")
+}
+
+func errorMentionsField(err *memory.ErrorObject, field string) bool {
+	if err == nil || field == "" {
+		return false
+	}
+	needle := strings.ToLower(field)
+	if strings.Contains(strings.ToLower(err.Message), needle) {
+		return true
+	}
+	if err.Details == nil {
+		return false
+	}
+	return jsonMentionsField(err.Details, needle)
+}
+
+func jsonMentionsField(v any, field string) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.EqualFold(t, field) || strings.Contains(strings.ToLower(t), field)
+	case []any:
+		for _, item := range t {
+			if jsonMentionsField(item, field) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range t {
+			if strings.EqualFold(key, field) || jsonMentionsField(item, field) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasWarningCode(env *memory.ResponseEnvelope, code string) bool {
+	if env == nil {
+		return false
+	}
+	for _, w := range env.Warnings {
+		if w.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func shapeCandidate(c memory.QueryCandidate) map[string]any {
+	m := map[string]any{
+		"value":                c.Value,
+		"score":                c.Score,
+		"evidence":             c.Evidence,
+		"supporting_event_ids": c.SupportingEventIDs,
+	}
+	if c.Scope != nil {
+		m["scope"] = *c.Scope
+	}
+	if c.SupportCount != nil {
+		m["support_count"] = *c.SupportCount
+	}
+	if c.DistinctSessionCount != nil {
+		m["distinct_session_count"] = *c.DistinctSessionCount
+	}
+	if c.TemporalStatus != "" {
+		m["temporal_status"] = c.TemporalStatus
+	}
+	for key, raw := range c.Extra {
+		var value any
+		if err := json.Unmarshal(raw, &value); err == nil {
+			m[key] = value
+		}
+	}
+	return m
 }
 
 func envelopeWarnings(env *memory.ResponseEnvelope) []map[string]any {

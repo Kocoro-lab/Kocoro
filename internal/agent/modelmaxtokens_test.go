@@ -38,6 +38,11 @@ func TestMaxTokensForModel(t *testing.T) {
 		{"gpt-5 mini", "gpt-5-mini-2025-08-07", 128_000},
 		{"gpt-4.1", "gpt-4.1-2025-04-14", 32_000},
 
+		// xAI Grok
+		{"grok 4.3", "grok-4.3", 128_000},
+		{"grok 4.5", "grok-4.5", 128_000},
+		{"grok 4.6", "grok-4.6", 128_000},
+
 		// Forward-compat: future dated variant of a known dateless family
 		// (e.g. a hypothetical "claude-sonnet-4-6-20260601") should match
 		// via prefix lookup and inherit the family's cap.

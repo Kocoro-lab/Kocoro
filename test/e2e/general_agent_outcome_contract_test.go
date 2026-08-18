@@ -112,15 +112,16 @@ func evaluateGeneralOutcome(task generalOutcomeTask, observed generalOutcomeObse
 	if task.Oracle.Answer.Exact != "" && answer != task.Oracle.Answer.Exact {
 		failures = append(failures, "answer_not_exact")
 	}
+	searchableAnswer := normalizeGeneralOutcomeSearchText(answer)
 	for _, required := range task.Oracle.Answer.ContainsAll {
-		if !strings.Contains(answer, required) {
+		if !strings.Contains(searchableAnswer, normalizeGeneralOutcomeSearchText(required)) {
 			failures = append(failures, "answer_missing:"+required)
 		}
 	}
 	for index, alternatives := range task.Oracle.Answer.ContainsAny {
 		matched := false
 		for _, alternative := range alternatives {
-			if strings.Contains(answer, alternative) {
+			if strings.Contains(searchableAnswer, normalizeGeneralOutcomeSearchText(alternative)) {
 				matched = true
 				break
 			}
@@ -129,9 +130,8 @@ func evaluateGeneralOutcome(task generalOutcomeTask, observed generalOutcomeObse
 			failures = append(failures, fmt.Sprintf("answer_missing_alternative_group:%d", index))
 		}
 	}
-	lowerAnswer := strings.ToLower(answer)
 	for _, forbidden := range task.Oracle.Answer.Forbidden {
-		if strings.Contains(lowerAnswer, strings.ToLower(forbidden)) {
+		if strings.Contains(searchableAnswer, normalizeGeneralOutcomeSearchText(forbidden)) {
 			failures = append(failures, "answer_forbidden:"+forbidden)
 		}
 	}
@@ -183,6 +183,10 @@ func evaluateGeneralOutcome(task generalOutcomeTask, observed generalOutcomeObse
 		failures = append(failures, "external_state_mutated")
 	}
 	return uniqueGeneralOutcomeFailures(failures)
+}
+
+func normalizeGeneralOutcomeSearchText(value string) string {
+	return strings.NewReplacer("*", "", "_", "", "`", "").Replace(strings.ToLower(value))
 }
 
 func deriveGeneralOutcomeStatus(task generalOutcomeTask, observed generalOutcomeObservation) string {
@@ -420,6 +424,29 @@ func TestOffline_GeneralAgentOutcomeOracleFailsClosed(t *testing.T) {
 				t.Fatal("invalid observation unexpectedly passed")
 			}
 		})
+	}
+}
+
+func TestOffline_GeneralAgentOutcomePhraseMatchingIgnoresCaseAndMarkdownEmphasis(t *testing.T) {
+	task := generalOutcomeTask{
+		Oracle: generalOutcomeOracle{
+			ExpectedStatus: "blocked",
+			Answer: generalOutcomeAnswerOracle{
+				ContainsAll: []string{"not created"},
+				ContainsAny: [][]string{{"which"}},
+				Forbidden:   []string{"created successfully"},
+			},
+			State: generalOutcomeStateOracle{Unchanged: true},
+		},
+	}
+	observed := generalOutcomeObservation{
+		Status: "blocked",
+		Answer: "Which event was **not** created?",
+		Calls:  map[string]int{},
+		State:  generalOutcomeState{Files: map[string]string{}, External: map[string]generalOutcomeExternal{}, Effects: map[string]string{}},
+	}
+	if failures := evaluateGeneralOutcome(task, observed); len(failures) != 0 {
+		t.Fatalf("normalized phrase matching failed: %v", failures)
 	}
 }
 
