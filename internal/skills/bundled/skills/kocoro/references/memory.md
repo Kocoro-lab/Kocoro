@@ -131,7 +131,11 @@ ordinary turn.
 - Use `memory_recall` once for each concrete named anchor or target. The tool
   consumes the sidecar's per-group `evidence_tier`: `corroborated` may be
   stated plainly as a past record; `singleton`, `derived`, `text`, and
-  missing/unknown tiers must be qualified.
+  missing/unknown tiers must be qualified. When a group has
+  `temporal_status`, `current` is the latest value of that updating fact
+  and `superseded_by_recency` is an older value kept for audit — prefer
+  current unless the user asked about the past. Do not quote these field
+  names in user-facing replies.
 - For an unnamed reference such as “my doctor” or “that plan”, use
   `session_search` to recover the concrete name or raw wording instead of
   inventing a graph anchor.

@@ -755,6 +755,7 @@ The main model decides when the answer depends on the user's private past and ca
 
 - Natural private-fact questions do not need to say “remember” or “recall”; the tool remains available whenever the model needs past context.
 - `memory_recall` uses the structured sidecar when it is `Ready` and otherwise degrades to session search plus `MEMORY.md`.
+- Groups may carry `temporal_status`: `current` is the latest value of an updating fact; `superseded_by_recency` is an older value kept for audit. Prefer current unless the user asked about the past.
 - Unnamed references such as “my doctor” or “that plan” use `session_search` to recover the concrete name or wording instead of inventing a structured-memory anchor.
 - A no-data result ends structured lookup for that target; the model does not retry relation-name or mode variants.
 

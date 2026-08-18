@@ -431,7 +431,7 @@ Recovered runs are ALWAYS unattended (`IsUnattendedRun()==true` regardless of th
 
 #### Episodic recall routing
 
-`prompt/builder.go` + `tools/memory.go`. Production CLI, TUI, and daemon loops expose `memory_recall` directly to the main model; no implicit small-model preflight is installed. Unnamed references route to `session_search`; no-data stops relation/mode retries. Evidence guidance (`MemoryEvidenceGuidance`) lives with the tool that produces `evidence_tier` — the `memory_recall` description — NOT in the system prompt. `agent/preflight.go` + `tools/memory_preflight.go` remain evaluation-only hooks.
+`prompt/builder.go` + `tools/memory.go`. Production CLI, TUI, and daemon loops expose `memory_recall` directly to the main model; no implicit small-model preflight is installed. Unnamed references route to `session_search`; no-data stops relation/mode retries. Evidence guidance (`MemoryEvidenceGuidance`) lives with the tool that produces `evidence_tier` — the `memory_recall` description — NOT in the system prompt. `memory_recall` also keeps per-group `temporal_status` (`current` vs `superseded_by_recency`) from the sidecar; prefer current unless the user asked about the past. `agent/preflight.go` + `tools/memory_preflight.go` remain evaluation-only hooks and do not yet render `temporal_status`.
 
 #### Loop detector
 
