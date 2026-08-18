@@ -1,20 +1,16 @@
 # Kocoro Project Guide (AGENTS.md)
 
-**Condensed mirror of `CLAUDE.md` for external coding agents; `CLAUDE.md` is the
-full guide** for reasoning, wire details, and unlisted subsystems. This file is
-actionable rules plus the symbols to grep. If the two disagree, `CLAUDE.md` and
-the code win.
+**Condensed mirror of `CLAUDE.md`** — actionable rules plus the symbols to grep.
+If the two disagree, `CLAUDE.md` and the code win.
 
-**Keep this file under 24 KB (CI asserts).** Harnesses inject `AGENTS.md` under a
-shared 32 KiB budget and truncate over-budget files **silently from the tail** —
-bottom sections vanish. Need room? Cut prose, not rules.
+**Keep this file under 24 KB (CI asserts).** Harnesses truncate over-budget
+files silently from the tail. Cut prose, not rules.
 
 Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production path:
-daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WS, receives
-channel messages, runs the agent loop locally, streams back. Also TUI, one-shot
-CLI, MCP server, schedules.
+daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WS, runs the
+agent loop locally, streams back. Also TUI, one-shot CLI, MCP server, schedules.
 
-Layout: `cmd/` (Cobra) + `internal/<pkg>/`; use Glob/Grep. Production path is
+Layout: `cmd/` (Cobra) + `internal/<pkg>/`. Production path is
 `internal/daemon/` driving `internal/agent/`.
 
 ## Working Rules
@@ -375,9 +371,9 @@ barge-in admission, not default dismissal.
 ## Tests
 
 ```bash
-go test ./...                                          # or ./internal/{agent,daemon,agents,schedule}/ -v
+go test ./...                                        # or per-package with -v
 go test ./test/ -v && go test ./test/e2e/ -v
-SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v   # live suite; the build tag is required
+SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v # live suite (tag required)
 go build ./...
 ```
 
