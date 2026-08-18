@@ -767,6 +767,7 @@ func (s *Server) syncToolOverlays(reg *agent.ToolRegistry) {
 var authSensitivePostOverlayToolNames = []string{
 	"cloud_delegate",
 	"publish_to_web",
+	"x_upload_media",
 	"list_my_published_files",
 	"retract_published_file",
 	"generate_image",
@@ -823,6 +824,7 @@ func (s *Server) RebuildAuthSensitiveTools(ctx context.Context) {
 	}
 	tools.RegisterCloudDelegate(reg, s.deps.GW, cfg, nil, "", "")
 	tools.RegisterPublishTool(reg, s.deps.GW, cfg)
+	tools.RegisterXUploadMediaTool(reg, s.deps.GW, cfg)
 	tools.RegisterListPublishedFilesTool(reg, s.deps.GW, cfg)
 	tools.RegisterRetractPublishedFileTool(reg, s.deps.GW, cfg)
 	tools.RegisterGenerateImageTool(reg, s.deps.GW, cfg)
@@ -7481,6 +7483,7 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		toolCfg := s.configWithLiveAPIKey(newCfg)
 		tools.RegisterCloudDelegate(newReg, s.deps.GW, toolCfg, nil, "", "")
 		tools.RegisterPublishTool(newReg, s.deps.GW, toolCfg)
+		tools.RegisterXUploadMediaTool(newReg, s.deps.GW, toolCfg)
 		tools.RegisterListPublishedFilesTool(newReg, s.deps.GW, toolCfg)
 		tools.RegisterRetractPublishedFileTool(newReg, s.deps.GW, toolCfg)
 		tools.RegisterGenerateImageTool(newReg, s.deps.GW, toolCfg)
@@ -7620,6 +7623,7 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 		toolCfg := s.configWithLiveAPIKey(newCfg)
 		tools.RegisterCloudDelegate(freshReg, s.deps.GW, toolCfg, nil, "", "")
 		tools.RegisterPublishTool(freshReg, s.deps.GW, toolCfg)
+		tools.RegisterXUploadMediaTool(freshReg, s.deps.GW, toolCfg)
 		tools.RegisterListPublishedFilesTool(freshReg, s.deps.GW, toolCfg)
 		tools.RegisterRetractPublishedFileTool(freshReg, s.deps.GW, toolCfg)
 		tools.RegisterGenerateImageTool(freshReg, s.deps.GW, toolCfg)

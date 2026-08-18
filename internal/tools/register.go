@@ -1235,6 +1235,23 @@ func RegisterPublishTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg 
 	registerAuthSensitiveTool(reg, gw, NewPublishToWebTool(uploadsClient, allow))
 }
 
+// RegisterXUploadMediaTool registers the x_upload_media tool. Same gating as
+// publish_to_web: both the CDN staging upload and the Cloud x_upload_media
+// execute call 401 without an API key. Cloud also defines a same-named
+// integration schema (for execute-route authorization); the local tool wins
+// under the standard local-priority collision rules, so this must run in the
+// same registration slots as the other auth-sensitive cloud tools.
+func RegisterXUploadMediaTool(reg *agent.ToolRegistry, gw *client.GatewayClient, cfg *config.Config) {
+	if cfg == nil || !cfg.Cloud.Enabled || cfg.APIKey == "" || gw == nil {
+		return
+	}
+	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
+	execute := func(ctx context.Context, name string, args map[string]any, requestID string) (*client.ToolExecuteResponse, error) {
+		return gw.ExecuteIntegrationToolWithIdentity(ctx, name, args, requestID, "")
+	}
+	registerAuthSensitiveTool(reg, gw, NewXUploadMediaTool(uploadsClient, execute))
+}
+
 // RegisterGenerateImageTool registers the generate_image tool. Same gating as
 // publish_to_web: needs the gateway client (for the shared *http.Client) and
 // a configured API key — without a key, /api/v1/images/generations will 401.

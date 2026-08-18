@@ -838,6 +838,38 @@ func TestRegisterIntegrationTools_CarriesRequiresApprovalThrough(t *testing.T) {
 	}
 }
 
+// TestRegisterIntegrationTools_LocalXUploadMediaWinsOverCloudSchema pins the
+// x_upload_media collision contract: Cloud defines a same-named integration
+// schema (it exists for execute-route authorization), but the daemon's local
+// tool — which owns the file staging and cleanup flow — must keep the name.
+// Same generic local-priority rule as every other collision; no X special case.
+func TestRegisterIntegrationTools_LocalXUploadMediaWinsOverCloudSchema(t *testing.T) {
+	schemas := []client.ServerToolSchema{
+		{Name: "x_upload_media", Description: "Cloud-side media transfer", RequiresApproval: true},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(schemas)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := agent.NewToolRegistry()
+	local := NewXUploadMediaTool(&fakeXMediaUploads{}, nil)
+	reg.Register(local)
+
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, ok := reg.Get("x_upload_media")
+	if !ok {
+		t.Fatal("x_upload_media missing after integration registration")
+	}
+	if _, isLocal := got.(*XUploadMediaTool); !isLocal {
+		t.Fatalf("integration schema replaced the local tool: %T", got)
+	}
+}
+
 // TestRegisterIntegrationTools_ListFailurePreservesExisting verifies that a
 // failed Cloud round-trip leaves the previously registered integration tools in
 // place (fetch-then-replace), rather than wiping them.

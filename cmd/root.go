@@ -190,6 +190,7 @@ func runOneShot(cfg *config.Config, query string, agentOverride *agents.Agent) e
 		}
 		tools.RegisterCloudDelegate(reg, gw, runCfg, nil, agentName, cloudAgentPrompt)
 		tools.RegisterPublishTool(reg, gw, runCfg)
+		tools.RegisterXUploadMediaTool(reg, gw, runCfg)
 		tools.RegisterListPublishedFilesTool(reg, gw, runCfg)
 		tools.RegisterRetractPublishedFileTool(reg, gw, runCfg)
 		tools.RegisterGenerateImageTool(reg, gw, runCfg)

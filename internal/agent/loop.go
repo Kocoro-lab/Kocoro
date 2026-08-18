@@ -7947,6 +7947,15 @@ func extractToolPath(toolName, argsJSON string) string {
 		if v, ok := m["path"].(string); ok {
 			return v
 		}
+	default:
+		// Generic convention for tools outside the explicit map: `file_path`
+		// is the standard path-carrying argument name (e.g. x_upload_media).
+		// Recognizing it here extends the user-attachment auto-approve to any
+		// tool adopting the convention without per-tool wiring. Deliberately
+		// NOT extended to the looser "path" key, whose meaning varies by tool.
+		if v, ok := m["file_path"].(string); ok {
+			return v
+		}
 	}
 	return ""
 }
