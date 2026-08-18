@@ -448,8 +448,17 @@ func TestMemoryTool_StripsAggregatorAfterSchemaRejection(t *testing.T) {
 	reject := &memory.ResponseEnvelope{
 		Error: &memory.ErrorObject{
 			Code:    "validation_error",
-			Message: "extra fields not permitted",
-			Details: map[string]any{"sub_code": "schema_validation"},
+			Message: "request validation failed",
+			Details: map[string]any{
+				"sub_code": "schema_validation",
+				"errors": []any{
+					map[string]any{
+						"type": "extra_forbidden",
+						"loc":  []any{"body", "intent", "aggregator"},
+						"msg":  "Extra inputs are not permitted",
+					},
+				},
+			},
 		},
 	}
 	ok := &memory.ResponseEnvelope{
@@ -480,16 +489,96 @@ func TestMemoryTool_StripsAggregatorAfterSchemaRejection(t *testing.T) {
 	if body["reason"] != "ok" {
 		t.Fatalf("reason=%v", body["reason"])
 	}
+	if body["evidence_quality"] != "structured_unaggregated" {
+		t.Fatalf("evidence_quality=%v want structured_unaggregated", body["evidence_quality"])
+	}
 	warnings, _ := body["warnings"].([]any)
 	found := false
 	for _, raw := range warnings {
 		w, _ := raw.(map[string]any)
 		if w["code"] == "aggregator_unsupported" {
 			found = true
+			msg, _ := w["message"].(string)
+			if !strings.Contains(msg, "truncated") || !strings.Contains(msg, "total") {
+				t.Fatalf("warning must say the list is truncated and not a total: %q", msg)
+			}
 		}
 	}
 	if !found {
 		t.Fatalf("missing aggregator_unsupported warning: %#v", warnings)
+	}
+}
+
+func TestMemoryTool_DoesNotStripOnUnrelatedValidationError(t *testing.T) {
+	reject := &memory.ResponseEnvelope{
+		Error: &memory.ErrorObject{
+			Code:    "validation_error",
+			Message: "request validation failed",
+			Details: map[string]any{
+				"sub_code": "schema_validation",
+				"errors": []any{
+					map[string]any{
+						"loc": []any{"body", "intent", "time_window"},
+						"msg": "String should match pattern",
+					},
+				},
+			},
+		},
+	}
+	stub := &stubQuerier{
+		status: memory.StatusReady,
+		env:    reject,
+		class:  memory.ClassPermanent,
+	}
+	tool := &MemoryTool{Service: stub, Fallback: &fakeFallback{}}
+	res, err := tool.Run(context.Background(), `{"mode":"direct_relation","anchor_mentions":["me"],"aggregator":"count","time_window":"last year"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected permanent validation error, got %s", res.Content)
+	}
+	if stub.callN != 1 {
+		t.Fatalf("callN=%d want 1 (must not strip-and-retry)", stub.callN)
+	}
+}
+
+func TestMemoryTool_StripRetryUnavailableFallsBack(t *testing.T) {
+	reject := &memory.ResponseEnvelope{
+		Error: &memory.ErrorObject{
+			Code:    "validation_error",
+			Message: "request validation failed",
+			Details: map[string]any{
+				"sub_code": "schema_validation",
+				"errors": []any{
+					map[string]any{"loc": []any{"body", "intent", "aggregator"}},
+				},
+			},
+		},
+	}
+	stub := &stubQuerier{
+		status: memory.StatusReady,
+		seq:    []memory.ErrorClass{memory.ClassPermanent, memory.ClassUnavailable},
+		seqEnv: []*memory.ResponseEnvelope{reject, nil},
+	}
+	fb := &fakeFallback{snippet: "memory.md note"}
+	tool := &MemoryTool{Service: stub, Fallback: fb}
+	res, err := tool.Run(context.Background(), `{"mode":"direct_relation","anchor_mentions":["me"],"aggregator":"count"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("expected fallback, got error %s", res.Content)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(res.Content), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["source"] != "fallback" {
+		t.Fatalf("source=%v want fallback", body["source"])
+	}
+	if stub.callN != 2 {
+		t.Fatalf("callN=%d want 2", stub.callN)
 	}
 }
 

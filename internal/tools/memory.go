@@ -100,7 +100,7 @@ func (t *MemoryTool) Info() agent.ToolInfo {
 				},
 				"aggregator": map[string]any{
 					"type":        "string",
-					"enum":        []string{"count", "sum", "duration"},
+					"enum":        []string{"count", "sum"},
 					"description": "direct_relation only. Use count for how many, sum for how much with numeric measures. Do not use path_query or typed_neighborhood with aggregator. A state fact that updated several times counts as one current value, not several events.",
 				},
 				"evidence_budget": map[string]any{
@@ -162,9 +162,9 @@ func validateMemoryArgs(a memoryArgs) string {
 	}
 	if a.Aggregator != "" {
 		switch a.Aggregator {
-		case "count", "sum", "duration":
+		case "count", "sum":
 		default:
-			return "memory_recall aggregator must be count, sum, or duration."
+			return "memory_recall aggregator must be count or sum."
 		}
 		if memory.QueryMode(a.Mode) != memory.ModeDirectRelation {
 			return "memory_recall aggregator is only valid with mode=direct_relation."
@@ -254,17 +254,17 @@ func (t *MemoryTool) run(ctx context.Context, intent memory.QueryIntent) (agent.
 	}); err != "" {
 		return agent.ToolResult{Content: err, IsError: true}, nil
 	}
-	env, class, err := t.Service.Query(ctx, intent)
+	queryIntent := intent
+	env, class, err := t.Service.Query(ctx, queryIntent)
 	if intent.Aggregator != "" && err == nil && class == memory.ClassPermanent && aggregatorSchemaRejected(env) {
-		retry := intent
-		retry.Aggregator = ""
-		env2, class2, err2 := t.Service.Query(ctx, retry)
-		if err2 == nil && class2 == memory.ClassOK && env2 != nil {
-			env2.Warnings = append(append([]memory.Warning(nil), env2.Warnings...), memory.Warning{
-				Code:    "aggregator_unsupported",
-				Message: "sidecar rejected aggregator; returned an unaggregated lookup instead of a count or sum",
+		queryIntent.Aggregator = ""
+		env, class, err = t.Service.Query(ctx, queryIntent)
+		if err == nil && class == memory.ClassOK && env != nil {
+			env.Warnings = append(append([]memory.Warning(nil), env.Warnings...), memory.Warning{
+				Code: "aggregator_unsupported",
+				Message: "sidecar rejected aggregator; returned an unaggregated lookup " +
+					"truncated at result_limit; do not treat this list length as a total count",
 			})
-			env, class, err = env2, class2, err2
 		}
 	}
 	if err != nil || class == memory.ClassUnavailable {
@@ -277,7 +277,7 @@ func (t *MemoryTool) run(ctx context.Context, intent memory.QueryIntent) (agent.
 			return t.fallback(ctx, intent, "service_unavailable", "fallback")
 		case <-time.After(500 * time.Millisecond):
 		}
-		env, class, err = t.Service.Query(ctx, intent)
+		env, class, err = t.Service.Query(ctx, queryIntent)
 		if err != nil || class == memory.ClassUnavailable || class == memory.ClassRetryable {
 			return t.fallback(ctx, intent, "retryable_failed", "fallback_after_retry")
 		}
@@ -314,6 +314,9 @@ func (t *MemoryTool) shapeResult(env *memory.ResponseEnvelope) agent.ToolResult 
 	if env.Reason == "incomplete" {
 		quality = "structured_incomplete"
 	}
+	if hasWarningCode(env, "aggregator_unsupported") {
+		quality = "structured_unaggregated"
+	}
 	cands := make([]map[string]any, 0, len(env.Candidates))
 	for _, c := range env.Candidates {
 		cands = append(cands, shapeCandidate(c))
@@ -336,10 +339,56 @@ func aggregatorSchemaRejected(env *memory.ResponseEnvelope) bool {
 	if env == nil || env.Error == nil {
 		return false
 	}
-	if env.Error.SubCode() == "schema_validation" {
+	if env.Error.SubCode() != "schema_validation" && env.Error.Code != "validation_error" {
+		return false
+	}
+	return errorMentionsField(env.Error, "aggregator")
+}
+
+func errorMentionsField(err *memory.ErrorObject, field string) bool {
+	if err == nil || field == "" {
+		return false
+	}
+	needle := strings.ToLower(field)
+	if strings.Contains(strings.ToLower(err.Message), needle) {
 		return true
 	}
-	return env.Error.Code == "validation_error"
+	if err.Details == nil {
+		return false
+	}
+	return jsonMentionsField(err.Details, needle)
+}
+
+func jsonMentionsField(v any, field string) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.EqualFold(t, field) || strings.Contains(strings.ToLower(t), field)
+	case []any:
+		for _, item := range t {
+			if jsonMentionsField(item, field) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range t {
+			if strings.EqualFold(key, field) || jsonMentionsField(item, field) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasWarningCode(env *memory.ResponseEnvelope, code string) bool {
+	if env == nil {
+		return false
+	}
+	for _, w := range env.Warnings {
+		if w.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 func shapeCandidate(c memory.QueryCandidate) map[string]any {
