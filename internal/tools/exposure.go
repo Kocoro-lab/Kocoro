@@ -57,10 +57,6 @@ func (*WaitTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDeferred
 }
 
-func (*XPreparePostTool) ToolExposure() agent.ToolExposure {
-	return agent.ToolExposureDeferred
-}
-
 func (*XUploadMediaTool) ToolExposure() agent.ToolExposure {
 	return agent.ToolExposureDeferred
 }

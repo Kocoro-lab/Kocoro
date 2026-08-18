@@ -105,14 +105,15 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   preserving calendar/non-auth tools. The six concrete tools (`cloud_delegate`,
   publish/list/retract, generate/edit) lease generation through all `Run` retries;
   stale clones are known-no-effect. Serialize auth across accounts/keys.
-- `x_prepare_post` is Deferred URL-only: no OAuth/HTTP/opener/automation; it
-  reports no post, omits draft/URL from audit, and ends the turn. `browser`,
+- X automation guardrails: `browser`,
   `computer_use`, and canonical Playwright block X composer/publish controls but
   preserve X reads/non-X mutation. Playwright omits `browser_run_code` and
   `browser_evaluate`; CDP target check + call share a lock, and any X target
   blocks mutation because X embeds a composer. Non-CDP has no target-state
   guarantee. Native actions use guarded `computer_use`; shell/custom MCP are out
-  of scope. Only the user clicks the review link and X's Post button.
+  of scope. Browser-side, only the user clicks X's Post button; agent posting
+  goes exclusively through the Cloud X integration tools (`x_prepare_post` was
+  removed, superseded by `x_create_post`).
 
 ## MCP
 

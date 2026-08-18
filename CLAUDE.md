@@ -294,10 +294,9 @@ completes, out of band), so `connect`/`delete` fire a best-effort refresh but th
 reliable trigger is Desktop calling `POST /integrations/refresh`. Capability
 `integration_tools_v1`.
 
-`x_prepare_post` is a separate local Deferred tool, not an integration mutation.
-It builds `https://x.com/intent/tweet` without OAuth, network access, or a browser
-opener and reports `published:false`. Success is turn-terminal: remaining calls
-in the same model batch are discarded. The local `browser` tool rejects direct
+X automation guardrails (independent of the X integration tools — publishing
+happens ONLY through Cloud's authorized X API tools, never through browser or
+GUI automation): the local `browser` tool rejects direct
 X composer navigation and publish-capable mutation on an observed/cached X
 composer; URL-observation failure also rejects explicit composer controls. The
 `computer_use` guard rejects composer controls and coordinate clicks whose exact
@@ -315,9 +314,10 @@ any observed X target blocks publish-capable mutation without relying on element
 labels. Non-CDP Playwright keeps ordinary mutation available but makes no
 target-state X-protection claim. Observations, ordinary X links/read navigation,
 and mutation when no X target is present remain available. These runtime guards do
-not police arbitrary shell commands or custom MCP servers. Only the user's
-explicit link click and later click on X's Post button may publish. Audit summaries omit both draft text and
-the generated URL.
+not police arbitrary shell commands or custom MCP servers. Browser-side, only
+the user's own click on X's Post button may publish. (The former
+`x_prepare_post` Web Intent tool was removed — superseded by the Cloud
+`x_create_post` integration tool.)
 
 #### Attachments
 

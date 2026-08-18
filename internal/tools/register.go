@@ -100,7 +100,6 @@ func RegisterLocalTools(cfg *config.Config, secretsStore *skills.SecretsStore) (
 	reg.Register(&SystemInfoTool{})
 	reg.Register(&CalculateTool{})
 	reg.Register(&CurrentTimeTool{})
-	reg.Register(&XPreparePostTool{})
 	reg.Register(&ClipboardTool{})
 	reg.Register(&NotifyTool{})
 	reg.Register(&PresentDeliverableTool{})
