@@ -136,6 +136,24 @@ func TestMemoryCandidateGroup_LegacyPayloadDefaultsEvidenceTier(t *testing.T) {
 	}
 }
 
+func TestMemoryCandidateGroup_TemporalStatusRoundTrip(t *testing.T) {
+	raw := `{"value":"5-2","score":1,"evidence":"observed","support_count":1,"temporal_status":"current"}`
+	var group MemoryCandidateGroup
+	if err := json.Unmarshal([]byte(raw), &group); err != nil {
+		t.Fatal(err)
+	}
+	if group.TemporalStatus != "current" {
+		t.Fatalf("temporal_status=%q want current", group.TemporalStatus)
+	}
+	out, err := json.Marshal(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte(`"temporal_status":"current"`)) {
+		t.Fatalf("temporal_status dropped on marshal: %s", out)
+	}
+}
+
 // canonicalJSONEqual decodes a and b into untyped values and compares with
 // reflect.DeepEqual. Robust against ordering and against Go-side struct
 // nil-slice vs empty-slice differences that don't affect the wire shape.

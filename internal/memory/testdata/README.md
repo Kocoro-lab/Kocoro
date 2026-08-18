@@ -3,6 +3,9 @@
 Fixtures for `TestResponseEnvelope_MemoryBlockFixtureRoundTrip` in `types_test.go`.
 Each fixture is a synthetic JSON file that exercises the full `ResponseEnvelope` wire shape
 (strict decode + round-trip). Values are fictional; the only requirement is structural completeness.
+Group and candidate objects include `temporal_status` (null when the query
+did not mark state recency) so a new sidecar field is visible to
+`DisallowUnknownFields`.
 
 ## Fixture inventory
 

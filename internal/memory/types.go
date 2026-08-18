@@ -43,6 +43,7 @@ type QueryCandidate struct {
 	Scope                *string     `json:"scope,omitempty"`
 	ObservedPath         []HopRecord `json:"observed_path,omitempty"`
 	PathCollisionCount   int         `json:"path_collision_count,omitempty"`
+	TemporalStatus       string      `json:"temporal_status,omitempty"`
 }
 
 // HopRecord is one edge of a path-narration walk emitted by path_query.
@@ -74,6 +75,7 @@ type MemoryCandidateGroup struct {
 	ViaAnchorEntityIDs []string    `json:"via_anchor_entity_ids"`
 	ObservedPath       []HopRecord `json:"observed_path"`
 	PathCollisionCount int         `json:"path_collision_count"`
+	TemporalStatus     string      `json:"temporal_status,omitempty"`
 }
 
 // MemoryBlock is the structured LLM-facing view emitted by the sidecar's

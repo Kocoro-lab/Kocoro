@@ -59,7 +59,7 @@ func (t *MemoryTool) Info() agent.ToolInfo {
 			"- direct_relation: one-hop predicate (e.g. \"what did X create?\"). Read `groups[].via_relations`.\n" +
 			"- path_query: multi-hop / possessive (e.g. \"what did X's collaborator create?\"). relation_constraints is the ordered path; inverse hops use `^-1`. Read `groups[].observed_path`.\n" +
 			"- typed_neighborhood: typed target with exactly one relation. Requires candidate_type. Rank by score.\n\n" +
-			"Evidence rules: read `memory_block.groups` and its `evidence_tier` before answering. " + prompt.MemoryEvidenceGuidance + " In user-facing wording say \"past records\" / \"I found\" / \"过去的记录\" / \"以前提到过\"; do not surface raw event IDs, support counts, tier labels, `memory_block`, `no_data_reason`, or scope labels unless the user asks for debug/provenance. If `no_data_reason` is set, say past records have no direct answer. The JSON schema field names and ontology terms used here are internal API vocabulary — never put them in replies; describe findings by their human name (person, project, company, file) or generically as past records / 过去的记录.",
+			"Evidence rules: read `memory_block.groups` and its `evidence_tier` before answering. When a group has `temporal_status`, `current` is the latest value of that state and `superseded_by_recency` is an older value kept for audit — prefer current unless the user asked about the past. " + prompt.MemoryEvidenceGuidance + " In user-facing wording say \"past records\" / \"I found\" / \"过去的记录\" / \"以前提到过\"; do not surface raw event IDs, support counts, tier labels, `memory_block`, `no_data_reason`, or scope labels unless the user asks for debug/provenance. If `no_data_reason` is set, say past records have no direct answer. The JSON schema field names and ontology terms used here are internal API vocabulary — never put them in replies; describe findings by their human name (person, project, company, file) or generically as past records / 过去的记录.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -296,6 +296,9 @@ func (t *MemoryTool) shapeResult(env *memory.ResponseEnvelope) agent.ToolResult 
 		}
 		if c.DistinctSessionCount != nil {
 			m["distinct_session_count"] = *c.DistinctSessionCount
+		}
+		if c.TemporalStatus != "" {
+			m["temporal_status"] = c.TemporalStatus
 		}
 		cands = append(cands, m)
 	}

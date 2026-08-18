@@ -296,6 +296,8 @@ func TestMemoryTool_Info(t *testing.T) {
 	}
 	for _, rule := range []string{
 		"evidence_tier",
+		"temporal_status",
+		"superseded_by_recency",
 		"corroborated",
 		"singleton",
 		"derived",
@@ -334,7 +336,7 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 	env := &memory.ResponseEnvelope{
 		Reason:        "ok",
 		BundleVersion: "0.6.0",
-		Candidates:    []memory.QueryCandidate{{Value: "Nexus", Score: 1.37, Evidence: "observed", SupportingEventIDs: []string{"ev_a"}}},
+		Candidates:    []memory.QueryCandidate{{Value: "Nexus", Score: 1.37, Evidence: "observed", SupportingEventIDs: []string{"ev_a"}, TemporalStatus: "current"}},
 		MemoryBlock: &memory.MemoryBlock{
 			Groups: []memory.MemoryCandidateGroup{{
 				Value:              "Nexus",
@@ -347,6 +349,7 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 				Scopes:             []string{"project:Kocoro"},
 				ViaRelations:       []string{"created"},
 				ViaAnchorEntityIDs: []string{"ent_anchor"},
+				TemporalStatus:     "current",
 			}},
 			Notes: []string{},
 		},
@@ -375,6 +378,9 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 	if got := g0["evidence_tier"]; got != "corroborated" {
 		t.Fatalf("group[0].evidence_tier=%v want corroborated", got)
 	}
+	if got := g0["temporal_status"]; got != "current" {
+		t.Fatalf("group[0].temporal_status=%v want current", got)
+	}
 	via, _ := g0["via_relations"].([]any)
 	if len(via) != 1 || via[0] != "created" {
 		t.Fatalf("group[0].via_relations=%+v", via)
@@ -382,6 +388,10 @@ func TestMemoryTool_MemoryBlock_Direct(t *testing.T) {
 	cands, _ := body["candidates"].([]any)
 	if len(cands) != 1 {
 		t.Fatalf("legacy candidates dropped: %+v", cands)
+	}
+	c0, _ := cands[0].(map[string]any)
+	if got := c0["temporal_status"]; got != "current" {
+		t.Fatalf("candidates[0].temporal_status=%v want current", got)
 	}
 }
 

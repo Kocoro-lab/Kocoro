@@ -45,7 +45,8 @@
                     ]
                 }
             ],
-            "path_collision_count": 1
+            "path_collision_count": 1,
+            "temporal_status": null
         },
         {
             "value": "Pulsar",
@@ -87,7 +88,8 @@
                     ]
                 }
             ],
-            "path_collision_count": 1
+            "path_collision_count": 1,
+            "temporal_status": null
         },
         {
             "value": "Vega",
@@ -128,7 +130,8 @@
                     ]
                 }
             ],
-            "path_collision_count": 1
+            "path_collision_count": 1,
+            "temporal_status": null
         }
     ],
     "memory_block": {
@@ -178,7 +181,8 @@
                         ]
                     }
                 ],
-                "path_collision_count": 1
+                "path_collision_count": 1,
+                "temporal_status": null
             },
             {
                 "value": "Pulsar",
@@ -225,7 +229,8 @@
                         ]
                     }
                 ],
-                "path_collision_count": 1
+                "path_collision_count": 1,
+                "temporal_status": null
             },
             {
                 "value": "Vega",
@@ -271,7 +276,8 @@
                         ]
                     }
                 ],
-                "path_collision_count": 1
+                "path_collision_count": 1,
+                "temporal_status": null
             }
         ],
         "no_data_reason": null,
