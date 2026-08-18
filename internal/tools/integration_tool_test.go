@@ -800,6 +800,44 @@ func TestRegisterIntegrationTools_RegistersAndRespectsLocalPriority(t *testing.T
 	}
 }
 
+// TestRegisterIntegrationTools_CarriesRequiresApprovalThrough pins the schema
+// flag's path into the registry: a requires_approval:true schema registers a
+// tool whose RequiresApproval() is true (routed through the approval flow by
+// loop.checkPermissionAndApproval like any local approval-requiring tool),
+// while an unmarked schema keeps the historical approval-free behavior.
+func TestRegisterIntegrationTools_CarriesRequiresApprovalThrough(t *testing.T) {
+	schemas := []client.ServerToolSchema{
+		{Name: "x_create_post", Description: "Publish a post on X", RequiresApproval: true},
+		{Name: "x_read_home", Description: "Read the home timeline"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(schemas)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := agent.NewToolRegistry()
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	post, ok := reg.Get("x_create_post")
+	if !ok {
+		t.Fatal("x_create_post not registered")
+	}
+	if !post.RequiresApproval() {
+		t.Error("requires_approval:true schema registered an approval-free tool")
+	}
+	read, ok := reg.Get("x_read_home")
+	if !ok {
+		t.Fatal("x_read_home not registered")
+	}
+	if read.RequiresApproval() {
+		t.Error("schema without requires_approval must stay approval-free")
+	}
+}
+
 // TestRegisterIntegrationTools_ListFailurePreservesExisting verifies that a
 // failed Cloud round-trip leaves the previously registered integration tools in
 // place (fetch-then-replace), rather than wiping them.

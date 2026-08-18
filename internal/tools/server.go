@@ -54,8 +54,9 @@ func NewServerTool(schema client.ServerToolSchema, gateway *client.GatewayClient
 
 // NewIntegrationTool builds a third-party integration tool (Notion/Slack/…),
 // executed via /api/v1/integrations/tools/{name}/execute. Cloud resolves the
-// caller's connection from the API key and enforces its own access control, so
-// like a gateway tool it does not require local approval.
+// caller's connection from the API key and enforces its own access control;
+// local approval applies only when the schema carries requires_approval
+// (see RequiresApproval).
 func NewIntegrationTool(schema client.ServerToolSchema, gateway *client.GatewayClient) *ServerTool {
 	generation := uint64(0)
 	if gateway != nil {
@@ -484,8 +485,14 @@ func externalOutcomeUnknown(content string) agent.ToolResult {
 	return agent.ToolResult{Content: content, IsError: true, SideEffectOutcomeUnknown: true}
 }
 
-// RequiresApproval returns false — the server enforces its own access control.
-func (t *ServerTool) RequiresApproval() bool { return false }
+// RequiresApproval reflects the schema's requires_approval flag. Cloud marks
+// consequential integration tools (e.g. X write endpoints) and only sends
+// them to daemons advertising the integration_requires_approval capability;
+// unmarked tools keep relying on Cloud's own access control with no local
+// approval, exactly as before. The flag is only the permission engine's
+// default input: persisted always-allow (global or per-agent) and
+// daemon.auto_approve bypass it like any other approval-requiring tool.
+func (t *ServerTool) RequiresApproval() bool { return t.schema.RequiresApproval }
 
 // HasMaterialSideEffect keeps explicitly reviewed observational gateway tools
 // out of the durable write journal. Gateway jobs that persist provider state,

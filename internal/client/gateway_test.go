@@ -1151,6 +1151,45 @@ func TestListIntegrationTools_MaterialSideEffectOptionalAndUsageFields(t *testin
 	}
 }
 
+// TestListIntegrationTools_AdvertisesRequiresApprovalCapability pins both
+// halves of the version-skew contract: the list request declares
+// integration_requires_approval on X-Kocoro-Capabilities (Cloud fails closed
+// and withholds requires_approval:true schemas from callers without it), and
+// the response's requires_approval flag decodes with absent meaning false.
+func TestListIntegrationTools_AdvertisesRequiresApprovalCapability(t *testing.T) {
+	var gotCapabilities string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/integrations/tools" {
+			http.NotFound(w, r)
+			return
+		}
+		gotCapabilities = r.Header.Get("X-Kocoro-Capabilities")
+		_, _ = w.Write([]byte(`[
+			{"name":"x_create_post","requires_approval":true},
+			{"name":"x_read_home"}
+		]`))
+	}))
+	defer server.Close()
+
+	gw := NewGatewayClient(server.URL, "")
+	schemas, err := gw.ListIntegrationTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListIntegrationTools: %v", err)
+	}
+	found := false
+	for _, token := range strings.Split(gotCapabilities, ",") {
+		if token == CapIntegrationRequiresApproval {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("X-Kocoro-Capabilities = %q, want it to contain %q", gotCapabilities, CapIntegrationRequiresApproval)
+	}
+	if len(schemas) != 2 || !schemas[0].RequiresApproval || schemas[1].RequiresApproval {
+		t.Fatalf("schemas = %#v, want requires_approval true then false", schemas)
+	}
+}
+
 func TestExecuteIntegrationToolWithIdentity_SendsStableIdentity(t *testing.T) {
 	var bodies []ToolExecuteRequest
 	var keys []string

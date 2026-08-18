@@ -246,9 +246,12 @@ func TestShouldForwardQueuedFollowUpStatusForMessageSuppressesLifecycleContext(t
 // broker; the product call moved them off the gate. The plumbing remains
 // so a future tool can re-occupy the slot.
 func TestDaemonEventHandler_AutoApproveAllowsAllTools(t *testing.T) {
+	// x_create_post stands in for a requires_approval:true integration tool:
+	// the flag is only the permission engine's default input, so auto_approve
+	// (bypass) covers it exactly like every other tool off the deny-list.
 	for _, tool := range []string{
 		"publish_to_web", "generate_image", "edit_image",
-		"bash", "file_write",
+		"bash", "file_write", "x_create_post",
 	} {
 		t.Run(tool, func(t *testing.T) {
 			brokerCalled := false

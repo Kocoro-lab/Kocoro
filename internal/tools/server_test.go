@@ -29,9 +29,20 @@ func TestServerTool_Info(t *testing.T) {
 }
 
 func TestServerTool_RequiresApproval(t *testing.T) {
-	tool := NewServerTool(client.ServerToolSchema{Name: "test"}, nil)
-	if tool.RequiresApproval() {
-		t.Error("server tools should not require approval")
+	// Absent flag keeps the historical no-local-approval behavior for both
+	// gateway and integration constructors; requires_approval:true routes the
+	// tool through the local approval flow.
+	if NewServerTool(client.ServerToolSchema{Name: "test"}, nil).RequiresApproval() {
+		t.Error("gateway tool without requires_approval should not require approval")
+	}
+	if NewIntegrationToolForGeneration(client.ServerToolSchema{Name: "x_read_home"}, nil, 1).RequiresApproval() {
+		t.Error("integration tool without requires_approval should not require approval")
+	}
+	if !NewIntegrationToolForGeneration(client.ServerToolSchema{Name: "x_create_post", RequiresApproval: true}, nil, 1).RequiresApproval() {
+		t.Error("integration tool with requires_approval:true must require approval")
+	}
+	if !NewServerTool(client.ServerToolSchema{Name: "marked_gateway_tool", RequiresApproval: true}, nil).RequiresApproval() {
+		t.Error("gateway tool with requires_approval:true must require approval")
 	}
 }
 

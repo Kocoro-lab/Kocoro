@@ -35,6 +35,7 @@
     "search_v1",
     "integration_tools_v1",
     "integration_connect_body_v1",
+    "integration_requires_approval",
     "message_idempotency_v1",
     "message_idempotency_receipt_v2",
     "question_v1",

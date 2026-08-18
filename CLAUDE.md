@@ -230,12 +230,22 @@ On failure the tool probes FRESH health (never trusts the cached state at error 
 
 #### Integration tools (local agent)
 
-`tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`, `RequiresApproval()==false` — Cloud enforces access control). Each schema and tool is bound to the exact credential and verified-principal generation that listed it. Dispatch atomically rechecks that generation while capturing the credential, so a tool retained by an old agent loop or clone fails known-no-effect before reaching Cloud after any key/account mutation. Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
+`tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`; `RequiresApproval()` reads the schema's optional `requires_approval` flag — absent means false, Cloud's own access control only). Each schema and tool is bound to the exact credential and verified-principal generation that listed it. Dispatch atomically rechecks that generation while capturing the credential, so a tool retained by an old agent loop or clone fails known-no-effect before reaching Cloud after any key/account mutation. Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
 
 Cloud may add `material_side_effect` to a schema. Its presence is trusted
 policy: `false` keeps observational tools such as X identity reads out of the
 durable mutation journal and permits concurrent batching; absence stays
-fail-closed for older Cloud versions. Every execute body carries a stable
+fail-closed for older Cloud versions. Cloud may also add `requires_approval`
+(trusted policy too): `true` routes the tool through the normal local approval
+flow — first-use approval card, "Always Allow" persistence, per-agent
+`always_allow_tools`, and `daemon.auto_approve` all behave exactly as for
+local approval-requiring tools, with no integration special-casing. The list
+request advertises `integration_requires_approval` on `X-Kocoro-Capabilities`;
+Cloud fails closed and withholds `requires_approval:true` schemas from daemons
+without the token, because an older daemon would register them approval-free.
+The token is also on the WS handshake; its string constant lives in
+`internal/client` (`CapIntegrationRequiresApproval`), aliased into the daemon
+`Capabilities` slice. Every execute body carries a stable
 `request_id` when the agent dispatcher supplies a tool-use identity. Material
 calls additionally send the durable journal's `Idempotency-Key`; read-only
 calls never claim provider idempotency. Structured Cloud error codes preserve

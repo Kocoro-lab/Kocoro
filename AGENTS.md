@@ -79,6 +79,12 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
+- Trusted `requires_approval=true` on an integration schema routes the tool
+  through the normal local approval flow (always-allow / per-agent lists /
+  `daemon.auto_approve` bypass it as usual); absent is false. The schema fetch
+  and WS handshake advertise `integration_requires_approval`
+  (`client.CapIntegrationRequiresApproval`); Cloud withholds marked schemas
+  from daemons without it.
 - Trusted `material_side_effect=false` permits observational batching without
   the journal; absent is fail-closed. Calls use stable `request_id`; material
   calls also use `Idempotency-Key`. Only pre-dispatch `provider_unavailable` is

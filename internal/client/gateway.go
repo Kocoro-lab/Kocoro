@@ -2757,12 +2757,32 @@ func (c *GatewayClient) Health(ctx context.Context) error {
 
 // --- Server tool types (used by tools.RegisterAll) ---
 
+// CapIntegrationRequiresApproval is the capability token that unlocks
+// approval-gated integration tools. Cloud fails closed: it only includes
+// `requires_approval: true` schemas in GET /api/v1/integrations/tools for a
+// caller advertising this token, because an older daemon would register them
+// with RequiresApproval()==false and execute consequential writes (e.g. X
+// posting) with zero approval. Advertised on the integration tool list
+// request here and on the WS handshake (internal/daemon aliases this
+// constant into its Capabilities slice).
+const CapIntegrationRequiresApproval = "integration_requires_approval"
+
+// integrationListCapabilities is the X-Kocoro-Capabilities value sent with
+// integration tool schema fetches. Comma-separated, same header grammar as
+// the WS handshake.
+var integrationListCapabilities = []string{CapIntegrationRequiresApproval}
+
 type ServerToolSchema struct {
 	Name               string         `json:"name"`
 	Description        string         `json:"description"`
 	Parameters         map[string]any `json:"parameters,omitempty"`
 	Provider           string         `json:"provider,omitempty"`
 	MaterialSideEffect *bool          `json:"material_side_effect,omitempty"`
+	// RequiresApproval marks a tool whose execution must pass the local
+	// approval flow (first-use approval card). Cloud sets it on consequential
+	// integration tools and omits it otherwise; absence means false so old
+	// Cloud responses keep today's no-approval behavior.
+	RequiresApproval bool `json:"requires_approval,omitempty"`
 }
 
 type ToolExecuteRequest struct {
@@ -3006,6 +3026,9 @@ func (c *GatewayClient) ListIntegrationToolsWithGeneration(ctx context.Context) 
 	if key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
+	// Cloud gates approval-requiring tool schemas on this advertisement
+	// (fail-closed against older daemons); see CapIntegrationRequiresApproval.
+	req.Header.Set("X-Kocoro-Capabilities", strings.Join(integrationListCapabilities, ","))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, generation, fmt.Errorf("request failed: %w", err)
