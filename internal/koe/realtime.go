@@ -1904,13 +1904,17 @@ func qwenSchemaAllowsNull(value any) bool {
 
 // qwenSessionConfig uses Qwen's Realtime session schema. Qwen currently lacks
 // conversation.item.truncate, so its handler disables the native cognitive-floor
-// controller. Semantic VAD is the provider-recommended default; the user-visible
-// barge-in setting still controls playback-time capture and interruption.
+// controller. Interruptible calls use server VAD so short first turns and talk-over
+// are detected promptly; half-duplex calls keep semantic VAD's complete-thought
+// endpointing. KOE_QWEN_VAD_MODE remains the A/B and rollback override.
 func qwenSessionConfig(persona, voice string) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	vadMode := strings.ToLower(strings.TrimSpace(os.Getenv("KOE_QWEN_VAD_MODE")))
-	if vadMode != "server_vad" {
+	if vadMode != "server_vad" && vadMode != "semantic_vad" {
 		vadMode = "semantic_vad"
+		if providerBargeInEnabled(string(ProviderQwen)) {
+			vadMode = "server_vad"
+		}
 	}
 	if eventLogEnabled() {
 		log.Printf("koe[qwen]: turn_detection=%s interrupt_response=%v silence_ms=%d",

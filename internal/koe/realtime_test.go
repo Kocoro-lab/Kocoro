@@ -1055,13 +1055,24 @@ func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 }
 
 func TestQwenSessionConfigUsesEnabledBargeIn(t *testing.T) {
-	t.Setenv("KOE_QWEN_VAD_MODE", "server_vad")
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
 	s := string(raw)
 	for _, want := range []string{`"type":"server_vad"`, `"interrupt_response":true`} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("Qwen enabled barge-in missing %s in %s", want, s)
+		}
+	}
+}
+
+func TestQwenSessionConfigCanKeepSemanticVADWithBargeIn(t *testing.T) {
+	t.Setenv("KOE_QWEN_VAD_MODE", "semantic_vad")
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
+	s := string(raw)
+	for _, want := range []string{`"type":"semantic_vad"`, `"interrupt_response":true`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("Qwen semantic VAD override missing %s in %s", want, s)
 		}
 	}
 }

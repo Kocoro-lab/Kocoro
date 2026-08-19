@@ -12,13 +12,17 @@ const (
 	// WORKLOAD: far-field laptop mic, quiet/long user utterances. A higher fixed
 	// floor or short hangover made the local gate stop RTP before server_vad could
 	// endpoint, so the user had to say a second phrase. OVERRIDE: KOE_MIC_GATE_*.
-	defaultMicGateThreshold       = 0.010
-	defaultVPIOMicGateThreshold   = 0.0038
-	defaultMicGateNoiseMultiplier = 2.0
-	defaultMicGateStartMS         = 160
-	defaultMicGateHangoverMS      = 2000
-	micGateHotEvidenceWeight      = 2
-	micGateNoiseAlpha             = 0.04
+	defaultMicGateThreshold        = 0.010
+	defaultVPIOMicGateThreshold    = 0.0038
+	defaultVPIOBargeStartThreshold = defaultMicGateThreshold
+	defaultVPIOBargeOutputRatio    = 0.30
+	defaultVPIOBargeStartCeiling   = 0.045
+	defaultVPIOBargeOutputDecay    = 0.92
+	defaultMicGateNoiseMultiplier  = 2.0
+	defaultMicGateStartMS          = 160
+	defaultMicGateHangoverMS       = 2000
+	micGateHotEvidenceWeight       = 2
+	micGateNoiseAlpha              = 0.04
 )
 
 type micGateStats struct {
@@ -54,6 +58,48 @@ type micNoiseGate struct {
 	stats micGateStats
 }
 
+type vpioBargeStartGate struct {
+	baseThreshold  float64
+	outputRatio    float64
+	ceiling        float64
+	outputDecay    float64
+	outputEnvelope float64
+	audible        bool
+}
+
+func newVPIOBargeStartGate() *vpioBargeStartGate {
+	baseThreshold := koeEnvFloat("KOE_VPIO_BARGE_START_THRESHOLD", defaultVPIOBargeStartThreshold)
+	ceiling := koeEnvFloat("KOE_VPIO_BARGE_START_CEILING", defaultVPIOBargeStartCeiling)
+	if ceiling < baseThreshold {
+		ceiling = baseThreshold
+	}
+	return &vpioBargeStartGate{
+		baseThreshold: baseThreshold,
+		outputRatio:   math.Max(0, koeEnvFloat("KOE_VPIO_BARGE_OUTPUT_RATIO", defaultVPIOBargeOutputRatio)),
+		ceiling:       ceiling,
+		outputDecay:   defaultVPIOBargeOutputDecay,
+	}
+}
+
+func (g *vpioBargeStartGate) threshold(assistantSpeaking bool, outputLevel float64) float64 {
+	if !assistantSpeaking {
+		g.outputEnvelope = 0
+		g.audible = false
+		return 0
+	}
+	g.outputEnvelope *= g.outputDecay
+	if outputLevel > g.outputEnvelope {
+		g.outputEnvelope = outputLevel
+	}
+	if outputLevel >= playbackIdleLevelEps {
+		g.audible = true
+	}
+	if !g.audible {
+		return math.Inf(1)
+	}
+	return math.Min(g.ceiling, math.Max(g.baseThreshold, g.outputEnvelope*g.outputRatio))
+}
+
 func newMicNoiseGate() *micNoiseGate {
 	return &micNoiseGate{
 		enabled:         !koeEnvBool("KOE_MIC_GATE_OFF", false),
@@ -86,6 +132,10 @@ func msToAudioFrames(ms int) int {
 }
 
 func (g *micNoiseGate) process(frame []int16) [][]int16 {
+	return g.processWithStartThreshold(frame, 0)
+}
+
+func (g *micNoiseGate) processWithStartThreshold(frame []int16, startThreshold float64) [][]int16 {
 	if !g.enabled {
 		g.stats.PassedFrames++
 		return [][]int16{frame}
@@ -95,6 +145,9 @@ func (g *micNoiseGate) process(frame []int16) [][]int16 {
 		g.maxLevel = level
 	}
 	threshold := math.Max(g.threshold, g.noiseFloor*g.noiseMultiplier)
+	if !g.open {
+		threshold = math.Max(threshold, startThreshold)
+	}
 	hot := level >= threshold
 
 	if g.open {

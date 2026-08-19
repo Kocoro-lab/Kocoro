@@ -278,6 +278,18 @@ func (s *sendTrackStats) totalsLine() string {
 	return fmt.Sprintf("written=%d write_err=%d encode_err=%d", s.written, s.writeErrs, s.encodeErrs)
 }
 
+func resetMicGateAtAssistantBoundary(gate *micNoiseGate, wasSpeaking, speaking bool) bool {
+	if gate == nil || !speaking || wasSpeaking {
+		return false
+	}
+	gate.resetState()
+	return true
+}
+
+func qwenBargeProtectionEnabled(fullDuplexAEC bool, provider string) bool {
+	return fullDuplexAEC && provider == string(ProviderQwen)
+}
+
 // pumpSendTrack Opus-encodes captured frames and writes them to the send track.
 func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	rc.audio.markSendReady() // unblock the file backend's feedFrames — the session is configured
@@ -292,6 +304,9 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			log.Printf("koe[audio]: send track stats: %s", stats.totalsLine())
 		}
 	}()
+	assistantWasSpeaking := false
+	bargeStartGate := newVPIOBargeStartGate()
+	protectQwenBarge := qwenBargeProtectionEnabled(rc.fullDuplexAEC, rc.audio.currentRealtimeProvider())
 	pacer := time.NewTicker(audioFrameMs * time.Millisecond)
 	defer pacer.Stop()
 	for {
@@ -304,10 +319,31 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			// to keep the capture pipeline from backing up.
 			if rc.callActive != nil && !rc.callActive() {
 				gate.resetState()
+				assistantWasSpeaking = false
 				continue
 			}
 			wasOpen := gate.open
-			for _, out := range gate.process(frame) {
+			assistantSpeaking := rc.audio.dropCapture()
+			// A user turn can leave the local noise gate open for its two-second
+			// hangover. Qwen often starts replying before that closes; carrying the
+			// open gate into playback forwards low residual speaker echo directly to
+			// server VAD and creates a false second user turn. Close the prior segment
+			// exactly once when assistant output takes the floor. A genuine barge-in
+			// reopens through the normal speech-start evidence window.
+			if protectQwenBarge {
+				resetMicGateAtAssistantBoundary(gate, assistantWasSpeaking, assistantSpeaking)
+			}
+			assistantWasSpeaking = assistantSpeaking
+			startThreshold := 0.0
+			if protectQwenBarge {
+				// The lower VPIO threshold is needed for quiet speech while listening,
+				// but speaker residue at that level can reopen the gate during playback.
+				// Do not admit a talk-over before output is audible, then scale its start
+				// floor with the decaying playback envelope. Once open, the lower VPIO
+				// threshold and hangover preserve quiet syllables.
+				startThreshold = bargeStartGate.threshold(assistantSpeaking, rc.audio.OutputLevel())
+			}
+			for _, out := range gate.processWithStartThreshold(frame, startThreshold) {
 				enc, err := rc.audio.EncodeFrame(out)
 				if err != nil {
 					stats.noteEncodeErr()
@@ -323,6 +359,10 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				}))
 			}
 			if !wasOpen && gate.open {
+				if assistantSpeaking && (eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1") {
+					log.Printf("koe[barge]: local talk-over admitted input_rms=%.4f output_rms=%.4f start_threshold=%.4f",
+						rmsLevel(frame), rc.audio.OutputLevel(), startThreshold)
+				}
 				stats.beginSegment(gate.stats.PassedFrames)
 				if rc.onLocalSpeechStarted != nil {
 					rc.onLocalSpeechStarted()
