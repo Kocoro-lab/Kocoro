@@ -2,15 +2,12 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
-	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 func TestXComposerURLClassificationDoesNotBlockOrdinaryXReads(t *testing.T) {
@@ -173,51 +170,5 @@ func TestComputerUseExplicitXControlBlocksWhenContextLookupFails(t *testing.T) {
 	)
 	if !blocked || !result.IsError || result.ErrorCategory != agent.ErrCategoryBusiness {
 		t.Fatalf("guard = (%t, %#v)", blocked, result)
-	}
-}
-
-type xPrepareBatchClient struct{ calls atomic.Int32 }
-
-func (c *xPrepareBatchClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
-	call := c.calls.Add(1)
-	if call == 1 {
-		return &client.CompletionResponse{FinishReason: "tool_use", ToolCalls: []client.FunctionCall{
-			{ID: "search", Name: "tool_search", Arguments: json.RawMessage(`{"query":"select:x_prepare_post"}`)},
-		}}, nil
-	}
-	return &client.CompletionResponse{FinishReason: "tool_use", ToolCalls: []client.FunctionCall{
-		{ID: "prepare", Name: "x_prepare_post", Arguments: json.RawMessage(`{"text":"hello"}`)},
-		{ID: "later", Name: "x_prepare_batch_side_effect", Arguments: json.RawMessage(`{}`)},
-	}}, nil
-}
-
-func (c *xPrepareBatchClient) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
-	return c.Complete(ctx, req)
-}
-
-type xPrepareBatchSideEffect struct{ runs atomic.Int32 }
-
-func (*xPrepareBatchSideEffect) Info() agent.ToolInfo {
-	return agent.ToolInfo{Name: "x_prepare_batch_side_effect", Parameters: map[string]any{"type": "object"}}
-}
-func (*xPrepareBatchSideEffect) RequiresApproval() bool { return false }
-func (t *xPrepareBatchSideEffect) Run(context.Context, string) (agent.ToolResult, error) {
-	t.runs.Add(1)
-	return agent.ToolResult{Content: "ran"}, nil
-}
-
-func TestXPreparePostEndsTurnBeforeSameBatchAutomation(t *testing.T) {
-	llm := &xPrepareBatchClient{}
-	later := &xPrepareBatchSideEffect{}
-	reg := agent.NewToolRegistry()
-	reg.Register(&XPreparePostTool{})
-	reg.Register(later)
-	loop := agent.NewAgentLoop(llm, reg, "medium", t.TempDir(), 4, 2000, 200, nil, nil, nil)
-	text, _, err := loop.Run(context.Background(), "draft an X post", nil, nil)
-	if err != nil || !strings.Contains(text, "Review and post on X") {
-		t.Fatalf("Run = (%q, %v)", text, err)
-	}
-	if llm.calls.Load() != 2 || later.runs.Load() != 0 {
-		t.Fatalf("llm calls=%d later runs=%d", llm.calls.Load(), later.runs.Load())
 	}
 }

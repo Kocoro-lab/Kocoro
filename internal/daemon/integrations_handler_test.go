@@ -69,10 +69,11 @@ func TestHandleConnectIntegration_GateAndValidation(t *testing.T) {
 	})
 }
 
-// TestHandleConnectIntegration_ForwardsBody pins the token-mode connect
-// contract (Shopify): the client's JSON body must reach Cloud verbatim with
-// Content-Type set, and a body-less OAuth connect must keep sending no body
-// and no Content-Type.
+// TestHandleConnectIntegration_ForwardsBody pins the connect-param contract
+// (Shopify / Jira / Confluence / Salesforce declare a subdomain): the client's
+// JSON body must reach Cloud verbatim with Content-Type set, and a connect for
+// a provider with no declared params must keep sending no body and no
+// Content-Type.
 func TestHandleConnectIntegration_ForwardsBody(t *testing.T) {
 	type captured struct {
 		body        string
@@ -83,7 +84,7 @@ func TestHandleConnectIntegration_ForwardsBody(t *testing.T) {
 		b, _ := io.ReadAll(r.Body)
 		got = captured{body: string(b), contentType: r.Header.Get("Content-Type")}
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"connection_id":"c1","status":"active"}`))
+		w.Write([]byte(`{"connection_id":"c1","oauth_url":"https://auth.example/x","status":"pending"}`))
 	}))
 	defer cloud.Close()
 
@@ -92,8 +93,8 @@ func TestHandleConnectIntegration_ForwardsBody(t *testing.T) {
 	cfg.APIKey = "test-key"
 	s := &Server{deps: &ServerDeps{Config: cfg, GW: client.NewGatewayClient(cloud.URL, "test-key")}}
 
-	t.Run("token-mode body forwarded verbatim", func(t *testing.T) {
-		payload := `{"params":{"shop":"mystore.myshopify.com","access_token":"shpat_x"}}`
+	t.Run("connect params forwarded verbatim", func(t *testing.T) {
+		payload := `{"params":{"subdomain":"mystore"}}`
 		req := httptest.NewRequest(http.MethodPost, "/integrations/shopify/connect", strings.NewReader(payload))
 		req.SetPathValue("provider", "shopify")
 		rr := httptest.NewRecorder()
@@ -107,12 +108,12 @@ func TestHandleConnectIntegration_ForwardsBody(t *testing.T) {
 		if got.contentType != "application/json" {
 			t.Errorf("cloud received Content-Type %q, want application/json", got.contentType)
 		}
-		if rr.Body.String() != `{"connection_id":"c1","status":"active"}` {
+		if rr.Body.String() != `{"connection_id":"c1","oauth_url":"https://auth.example/x","status":"pending"}` {
 			t.Errorf("response not passed through verbatim: %s", rr.Body.String())
 		}
 	})
 
-	t.Run("oauth connect stays body-less", func(t *testing.T) {
+	t.Run("param-less connect stays body-less", func(t *testing.T) {
 		got = captured{}
 		req := httptest.NewRequest(http.MethodPost, "/integrations/figma/connect", nil)
 		req.SetPathValue("provider", "figma")
@@ -163,10 +164,10 @@ func TestHandleConnectIntegration_ForwardsBody(t *testing.T) {
 }
 
 // TestHandleConnectIntegration_RefreshGate pins the 2xx guard on the
-// post-connect tool refresh: a token-mode success (connection active on the
-// connect response itself) must fire the async integration-tool refresh, and
-// a rejected credential must pass Cloud's error through untouched without
-// kicking a pointless registry refresh.
+// post-connect tool refresh: an accepted connect must fire the async
+// integration-tool refresh (a best-effort backstop — the connection only goes
+// active after browser OAuth), and a rejected connect must pass Cloud's error
+// through untouched without kicking a pointless registry refresh.
 func TestHandleConnectIntegration_RefreshGate(t *testing.T) {
 	newServer := func(connectStatus int, connectBody string, toolsFetched chan struct{}) (*Server, *httptest.Server) {
 		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -191,14 +192,14 @@ func TestHandleConnectIntegration_RefreshGate(t *testing.T) {
 	}
 	connectReq := func() *http.Request {
 		req := httptest.NewRequest(http.MethodPost, "/integrations/shopify/connect",
-			strings.NewReader(`{"params":{"shop":"s.myshopify.com","access_token":"shpat_x"}}`))
+			strings.NewReader(`{"params":{"subdomain":"mystore"}}`))
 		req.SetPathValue("provider", "shopify")
 		return req
 	}
 
 	t.Run("2xx fires async tool refresh", func(t *testing.T) {
 		toolsFetched := make(chan struct{}, 1)
-		s, cloud := newServer(http.StatusCreated, `{"connection_id":"c1","status":"active"}`, toolsFetched)
+		s, cloud := newServer(http.StatusCreated, `{"connection_id":"c1","oauth_url":"https://auth.example/x","status":"pending"}`, toolsFetched)
 		defer cloud.Close()
 		rr := httptest.NewRecorder()
 		s.handleConnectIntegration(rr, connectReq())
@@ -264,63 +265,65 @@ func TestHandleConnectIntegration_FailureLogging(t *testing.T) {
 		}}
 		return s, cloud
 	}
-	tokenReq := func(provider string) *http.Request {
+	paramReq := func(provider string) *http.Request {
 		req := httptest.NewRequest(http.MethodPost, "/integrations/p/connect",
-			strings.NewReader(`{"params":{"shop":"s.myshopify.com","access_token":"shpat_x"}}`))
+			strings.NewReader(`{"params":{"subdomain":"mystore"}}`))
 		req.SetPathValue("provider", provider)
 		return req
 	}
-	oauthReq := func(provider string) *http.Request {
+	paramlessReq := func(provider string) *http.Request {
 		req := httptest.NewRequest(http.MethodPost, "/integrations/p/connect", nil)
 		req.SetPathValue("provider", provider)
 		return req
 	}
-	assertNoCredentials := func(t *testing.T, logged string) {
+	// The invariant is that the SUBMITTED VALUE never reaches the log. Param
+	// names are deliberately not asserted on: Cloud's own contract messages
+	// legitimately name the offending parameter ("invalid format for
+	// parameter: subdomain"), and that message is quoted by design.
+	assertNoRequestBodyEcho := func(t *testing.T, logged string) {
 		t.Helper()
-		for _, leak := range []string{"shpat_x", "s.myshopify.com", "access_token"} {
-			if strings.Contains(logged, leak) {
-				t.Errorf("failure log leaked request-body content %q (log: %s)", leak, logged)
-			}
+		if strings.Contains(logged, "mystore") {
+			t.Errorf("failure log leaked the submitted param value (log: %s)", logged)
 		}
 	}
 
 	t.Run("contract error body logs code and message", func(t *testing.T) {
 		logBuf := captureLog(t)
-		s, cloud := newServer(http.StatusUnauthorized, `{"error":"invalid_token","message":"token was rejected"}`)
+		s, cloud := newServer(http.StatusBadRequest, `{"error":"invalid_shop_domain","message":"invalid format for parameter: subdomain"}`)
 		defer cloud.Close()
-		s.handleConnectIntegration(httptest.NewRecorder(), tokenReq("shopify"))
+		s.handleConnectIntegration(httptest.NewRecorder(), paramReq("shopify"))
 		logged := logBuf.String()
-		for _, want := range []string{"integration connect rejected by cloud", `provider="shopify"`, "status=401", `error="invalid_token"`, `message="token was rejected"`} {
+		for _, want := range []string{"integration connect rejected by cloud", `provider="shopify"`, "status=400", `error="invalid_shop_domain"`, `message="invalid format for parameter: subdomain"`} {
 			if !strings.Contains(logged, want) {
 				t.Errorf("failure log missing %q (log: %s)", want, logged)
 			}
 		}
-		assertNoCredentials(t, logged)
+		assertNoRequestBodyEcho(t, logged)
 	})
 
-	t.Run("non-contract body on a token-mode connect logs length only", func(t *testing.T) {
+	t.Run("non-contract body on a connect with params logs length only", func(t *testing.T) {
 		// A framework validation error can echo request input (pydantic 422
 		// carries the submitted value in detail[].input); the request had a
 		// body, so the raw body must never be quoted.
-		echo := `{"detail":[{"loc":["params","access_token"],"input":"shpat_x"}]}`
+		echo := `{"detail":[{"loc":["params","subdomain"],"input":"mystore"}]}`
 		logBuf := captureLog(t)
 		s, cloud := newServer(http.StatusUnprocessableEntity, echo)
 		defer cloud.Close()
-		s.handleConnectIntegration(httptest.NewRecorder(), tokenReq("shopify"))
+		s.handleConnectIntegration(httptest.NewRecorder(), paramReq("shopify"))
 		logged := logBuf.String()
 		for _, want := range []string{`provider="shopify"`, "status=422", "unparsed_body_len="} {
 			if !strings.Contains(logged, want) {
 				t.Errorf("failure log missing %q (log: %s)", want, logged)
 			}
 		}
-		assertNoCredentials(t, logged)
+		assertNoRequestBodyEcho(t, logged)
 	})
 
 	t.Run("non-contract body on a body-less connect quotes the body", func(t *testing.T) {
 		logBuf := captureLog(t)
 		s, cloud := newServer(http.StatusBadGateway, "<html>upstream down</html>")
 		defer cloud.Close()
-		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("notion"))
+		s.handleConnectIntegration(httptest.NewRecorder(), paramlessReq("notion"))
 		logged := logBuf.String()
 		for _, want := range []string{`provider="notion"`, "status=502", `body="<html>upstream down</html>"`} {
 			if !strings.Contains(logged, want) {
@@ -333,7 +336,7 @@ func TestHandleConnectIntegration_FailureLogging(t *testing.T) {
 		logBuf := captureLog(t)
 		s, cloud := newServer(http.StatusBadGateway, strings.Repeat("a", 3*maxIntegrationConnectLogBodyBytes))
 		defer cloud.Close()
-		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("notion"))
+		s.handleConnectIntegration(httptest.NewRecorder(), paramlessReq("notion"))
 		logged := logBuf.String()
 		if !strings.Contains(logged, strings.Repeat("a", maxIntegrationConnectLogBodyBytes)) {
 			t.Errorf("capped body prefix missing from log (log len %d)", len(logged))
@@ -345,9 +348,9 @@ func TestHandleConnectIntegration_FailureLogging(t *testing.T) {
 
 	t.Run("provider newline cannot forge log lines", func(t *testing.T) {
 		logBuf := captureLog(t)
-		s, cloud := newServer(http.StatusUnauthorized, `{"error":"invalid_token"}`)
+		s, cloud := newServer(http.StatusBadRequest, `{"error":"invalid_request"}`)
 		defer cloud.Close()
-		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("x\nfake: forged line"))
+		s.handleConnectIntegration(httptest.NewRecorder(), paramlessReq("x\nfake: forged line"))
 		logged := logBuf.String()
 		if strings.Contains(logged, "\nfake: forged line") {
 			t.Errorf("provider newline reached the log stream unescaped (log: %s)", logged)
@@ -363,7 +366,7 @@ func TestHandleConnectIntegration_FailureLogging(t *testing.T) {
 		logBuf := captureLog(t)
 		s, cloud := newServer(http.StatusNotModified, "")
 		defer cloud.Close()
-		s.handleConnectIntegration(httptest.NewRecorder(), oauthReq("notion"))
+		s.handleConnectIntegration(httptest.NewRecorder(), paramlessReq("notion"))
 		if logged := logBuf.String(); !strings.Contains(logged, "status=304") {
 			t.Errorf("3xx connect failure not logged (log: %s)", logged)
 		}
@@ -378,14 +381,14 @@ func TestHandleConnectIntegration_FailureLogging(t *testing.T) {
 			Config: cfg,
 			GW:     client.NewGatewayClient("http://127.0.0.1:1", "test-key"),
 		}}
-		s.handleConnectIntegration(httptest.NewRecorder(), tokenReq("shopify"))
+		s.handleConnectIntegration(httptest.NewRecorder(), paramReq("shopify"))
 		logged := logBuf.String()
 		for _, want := range []string{"integration connect transport failure", `provider="shopify"`, "err="} {
 			if !strings.Contains(logged, want) {
 				t.Errorf("transport-failure log missing %q (log: %s)", want, logged)
 			}
 		}
-		assertNoCredentials(t, logged)
+		assertNoRequestBodyEcho(t, logged)
 	})
 }
 

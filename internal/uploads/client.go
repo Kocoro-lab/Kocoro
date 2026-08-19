@@ -86,6 +86,11 @@ type ListOptions struct {
 // UploadResponse mirrors the JSON returned by POST /api/v1/uploads on success.
 // Use URL directly — its path segments are already percent-encoded server-side.
 type UploadResponse struct {
+	// ID is the user_uploads row id — pass it to Delete to retract the file.
+	// Empty on the ephemeral endpoint (no library row) and on older Cloud
+	// deployments that predate the field; callers treating it as a cleanup
+	// handle must skip deletion when it is empty.
+	ID          string          `json:"id,omitempty"`
 	URL         string          `json:"url"`
 	Key         string          `json:"key"`
 	Size        int64           `json:"size"`

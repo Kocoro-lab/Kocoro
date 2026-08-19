@@ -54,8 +54,9 @@ func NewServerTool(schema client.ServerToolSchema, gateway *client.GatewayClient
 
 // NewIntegrationTool builds a third-party integration tool (Notion/Slack/…),
 // executed via /api/v1/integrations/tools/{name}/execute. Cloud resolves the
-// caller's connection from the API key and enforces its own access control, so
-// like a gateway tool it does not require local approval.
+// caller's connection from the API key and enforces its own access control;
+// local approval applies only when the schema carries requires_approval
+// (see RequiresApproval).
 func NewIntegrationTool(schema client.ServerToolSchema, gateway *client.GatewayClient) *ServerTool {
 	generation := uint64(0)
 	if gateway != nil {
@@ -227,6 +228,9 @@ func (t *ServerTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult
 
 	if resp.Error != nil && *resp.Error != "" {
 		content := *resp.Error
+		if resp.ErrorDetail != "" {
+			content += ": " + resp.ErrorDetail
+		}
 		if !resp.Success {
 			content = appendLadder(content, resp.Metadata)
 		}
@@ -322,10 +326,10 @@ func (t *ServerTool) materialErrorResult(err error) agent.ToolResult {
 			))
 		}
 		if integrationCodeMayHaveEffect(integrationErr.Code) {
-			return externalOutcomeUnknown(fmt.Sprintf(
+			return externalOutcomeUnknown(appendErrorDetail(fmt.Sprintf(
 				"External tool outcome UNKNOWN: Cloud returned %d (%s) after receiving %s. The external action may have taken effect; verify before retrying.",
 				integrationErr.StatusCode, integrationErr.Code, t.schema.Name,
-			))
+			), integrationErr.ErrorDetail))
 		}
 		if integrationCodeProvesNoEffect(integrationErr.Code) ||
 			integrationStatusProvesNoEffect(integrationErr.StatusCode) {
@@ -334,10 +338,10 @@ func (t *ServerTool) materialErrorResult(err error) agent.ToolResult {
 		// Billing may fail after the provider committed, and provider transport
 		// failures do not prove the action was rejected. Any structured error
 		// without explicit no-effect evidence therefore remains conservative.
-		return externalOutcomeUnknown(fmt.Sprintf(
+		return externalOutcomeUnknown(appendErrorDetail(fmt.Sprintf(
 			"External tool outcome UNKNOWN: Cloud returned %d (%s) after receiving %s. The external action may have taken effect; verify before retrying.",
 			integrationErr.StatusCode, integrationErr.Code, t.schema.Name,
-		))
+		), integrationErr.ErrorDetail))
 	}
 	var dispatchErr *client.ToolDispatchError
 	if errors.As(err, &dispatchErr) {
@@ -399,6 +403,17 @@ func (t *ServerTool) materialErrorResult(err error) agent.ToolResult {
 	))
 }
 
+// appendErrorDetail attaches Cloud's optional provider-level failure reason
+// (execute response `error_detail`) to an error message. The outcome semantics
+// of the surrounding result are unchanged — the detail only helps the model
+// and the user locate the real cause.
+func appendErrorDetail(msg, detail string) string {
+	if detail == "" {
+		return msg
+	}
+	return msg + " Provider detail: " + detail
+}
+
 func integrationCodeMayHaveEffect(code string) bool {
 	switch code {
 	case "billing_error", "provider_error", "outcome_unknown":
@@ -423,7 +438,7 @@ func integrationCodeProvesNoEffect(code string) bool {
 	switch code {
 	case "not_connected", "auth_expired", "integration_limit_exceeded",
 		"provider_unavailable", "feature_disabled", "tool_not_allowed",
-		"idempotency_conflict":
+		"idempotency_conflict", "provider_rejected":
 		return true
 	default:
 		return false
@@ -445,11 +460,28 @@ func (t *ServerTool) integrationAPIErrorResult(apiErr *client.IntegrationToolAPI
 		return agent.BusinessError(msg + ": usage recording is still pending; do not issue a new tool call")
 	case "provider_unavailable":
 		return agent.TransientError(msg + ": the provider is temporarily unavailable")
+	case "provider_rejected":
+		// The vendor deterministically refused the request (e.g. X 403 on
+		// duplicate content) and Cloud confirms it was NOT executed — an
+		// ordinary tool error the model can fix by changing arguments or
+		// content, never outcome-unknown.
+		detail := apiErr.ErrorDetail
+		if detail == "" {
+			detail = apiErr.Message
+		}
+		reason := msg + ": the provider rejected the request and it was NOT executed"
+		if detail != "" {
+			reason += ": " + detail
+		}
+		return agent.BusinessError(reason + ". Adjust the arguments or content before retrying; do not resend it unchanged.")
 	case "outcome_unknown":
 		if material {
-			return externalOutcomeUnknown("External tool outcome UNKNOWN: " + msg)
+			return externalOutcomeUnknown(appendErrorDetail(
+				"External tool outcome UNKNOWN: "+msg, apiErr.ErrorDetail))
 		}
-		return agent.BusinessError(msg + ": the provider result or charge could not be confirmed; do not repeat automatically")
+		return agent.BusinessError(appendErrorDetail(
+			msg+": the provider result or charge could not be confirmed; do not repeat automatically",
+			apiErr.ErrorDetail))
 	case "call_in_progress":
 		if material {
 			return agent.BusinessError(msg + ": the original request is still in progress; wait or query its state, and do not resend the action")
@@ -484,8 +516,14 @@ func externalOutcomeUnknown(content string) agent.ToolResult {
 	return agent.ToolResult{Content: content, IsError: true, SideEffectOutcomeUnknown: true}
 }
 
-// RequiresApproval returns false — the server enforces its own access control.
-func (t *ServerTool) RequiresApproval() bool { return false }
+// RequiresApproval reflects the schema's requires_approval flag. Cloud marks
+// consequential integration tools (e.g. X write endpoints) and only sends
+// them to daemons advertising the integration_requires_approval capability;
+// unmarked tools keep relying on Cloud's own access control with no local
+// approval, exactly as before. The flag is only the permission engine's
+// default input: persisted always-allow (global or per-agent) and
+// daemon.auto_approve bypass it like any other approval-requiring tool.
+func (t *ServerTool) RequiresApproval() bool { return t.schema.RequiresApproval }
 
 // HasMaterialSideEffect keeps explicitly reviewed observational gateway tools
 // out of the durable write journal. Gateway jobs that persist provider state,

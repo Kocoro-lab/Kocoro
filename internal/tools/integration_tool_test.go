@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -432,6 +431,7 @@ func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsN
 		wantNoEffect bool
 	}{
 		{code: "auth_expired", status: http.StatusConflict, wantNoEffect: true},
+		{code: "provider_rejected", status: http.StatusForbidden, wantNoEffect: true},
 		{code: "unexpected_conflict", status: http.StatusConflict, wantUnknown: true},
 		{code: "outcome_unknown", status: http.StatusConflict, wantUnknown: true},
 		{code: "billing_error", status: http.StatusServiceUnavailable, wantUnknown: true},
@@ -467,6 +467,100 @@ func TestIntegrationTool_MaterialAuthExpiredIsKnownNoEffectButUnknownConflictIsN
 	}
 }
 
+// TestIntegrationTool_ProviderRejectedIsOrdinaryErrorWithDetail pins the
+// provider_rejected + error_detail contract: a vendor-deterministic refusal
+// (e.g. X 403 on duplicate content, not executed, not billed) surfaces as an
+// ORDINARY tool error carrying the provider's reason so the model can
+// self-correct — never the outcome-unknown wording. Material side effect is
+// journaled known-no-effect because Cloud confirms nothing ran.
+func TestIntegrationTool_ProviderRejectedIsOrdinaryErrorWithDetail(t *testing.T) {
+	// Cloud's pinned wire shape: HTTP 422 (deliberately not 409, which the
+	// material path treats as outcome-unknown) with the two-field envelope.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":        "provider_rejected",
+			"error_detail": "x api rejected x_create_post with status 403: You are not allowed to create a Tweet with duplicate content.",
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_create_post"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || result.SideEffectOutcomeUnknown || !result.SideEffectKnownNoEffect {
+		t.Fatalf("result = %#v, want ordinary known-no-effect error", result)
+	}
+	if !strings.Contains(result.Content, "duplicate content") ||
+		!strings.Contains(result.Content, "NOT executed") {
+		t.Fatalf("content missing provider detail / no-execution statement: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "outcome UNKNOWN") {
+		t.Fatalf("provider_rejected must not use outcome-unknown wording: %s", result.Content)
+	}
+}
+
+// TestIntegrationTool_OutcomeUnknownKeepsWordingAndAttachesDetail pins that
+// error_detail is purely additive on the conservative paths: outcome_unknown
+// keeps its exact semantics and wording, with the provider detail appended to
+// help locate the cause.
+func TestIntegrationTool_OutcomeUnknownKeepsWordingAndAttachesDetail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":        "outcome_unknown",
+			"error_detail": "provider socket closed mid-flight",
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_create_post"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{"text":"hello"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.SideEffectOutcomeUnknown {
+		t.Fatalf("outcome_unknown semantics must be unchanged: %#v", result)
+	}
+	if !strings.Contains(result.Content, "outcome UNKNOWN") ||
+		!strings.Contains(result.Content, "provider socket closed mid-flight") {
+		t.Fatalf("content = %s", result.Content)
+	}
+}
+
+// TestIntegrationTool_SuccessFalseErrorDetailAppended pins the 200-with-error
+// body path: error_detail rides into the tool result content.
+func TestIntegrationTool_SuccessFalseErrorDetailAppended(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(client.ToolExecuteResponse{
+			Success:     false,
+			Error:       strPtr("provider_rejected"),
+			ErrorDetail: "media type not supported for this endpoint",
+		})
+	}))
+	defer server.Close()
+
+	tool := NewIntegrationTool(
+		client.ServerToolSchema{Name: "x_read_home"},
+		client.NewGatewayClient(server.URL, ""),
+	)
+	result, err := tool.Run(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content, "media type not supported") {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestIntegrationTool_MaterialCallInProgressExhaustionPersistsOutcomeUnknown(t *testing.T) {
 	var requestIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -492,9 +586,12 @@ func TestIntegrationTool_MaterialCallInProgressExhaustionPersistsOutcomeUnknown(
 	)
 	loop.SetCheckpointFunc(func(context.Context) error { return nil })
 	loop.SetSideEffectExecutionJournal(journal)
-	_, _, err := loop.Run(context.Background(), "post hello", nil, nil)
-	if !errors.Is(err, agent.ErrSideEffectOutcomeUnknown) {
-		t.Fatalf("Run error = %v, want outcome unknown", err)
+	// Exhausted bounded polling journals outcome_unknown, and the run now
+	// CONTINUES so the model can narrate the uncertainty (the same-turn retry
+	// latch blocks a byte-identical re-dispatch).
+	text, _, err := loop.Run(context.Background(), "post hello", nil, nil)
+	if err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v), want narrated completion", text, err)
 	}
 	if journal.committed != 0 || journal.unknown != 1 {
 		t.Fatalf("journal committed=%d unknown=%d, want 0/1", journal.committed, journal.unknown)
@@ -797,6 +894,76 @@ func TestRegisterIntegrationTools_RegistersAndRespectsLocalPriority(t *testing.T
 	got, _ := reg.Get("file_read")
 	if sourcer, ok := got.(agent.ToolSourcer); ok && sourcer.ToolSource() == agent.SourceIntegration {
 		t.Error("integration tool overrode a local tool of the same name")
+	}
+}
+
+// TestRegisterIntegrationTools_CarriesRequiresApprovalThrough pins the schema
+// flag's path into the registry: a requires_approval:true schema registers a
+// tool whose RequiresApproval() is true (routed through the approval flow by
+// loop.checkPermissionAndApproval like any local approval-requiring tool),
+// while an unmarked schema keeps the historical approval-free behavior.
+func TestRegisterIntegrationTools_CarriesRequiresApprovalThrough(t *testing.T) {
+	schemas := []client.ServerToolSchema{
+		{Name: "x_create_post", Description: "Publish a post on X", RequiresApproval: true},
+		{Name: "x_read_home", Description: "Read the home timeline"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(schemas)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := agent.NewToolRegistry()
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	post, ok := reg.Get("x_create_post")
+	if !ok {
+		t.Fatal("x_create_post not registered")
+	}
+	if !post.RequiresApproval() {
+		t.Error("requires_approval:true schema registered an approval-free tool")
+	}
+	read, ok := reg.Get("x_read_home")
+	if !ok {
+		t.Fatal("x_read_home not registered")
+	}
+	if read.RequiresApproval() {
+		t.Error("schema without requires_approval must stay approval-free")
+	}
+}
+
+// TestRegisterIntegrationTools_LocalXUploadMediaWinsOverCloudSchema pins the
+// x_upload_media collision contract: Cloud defines a same-named integration
+// schema (it exists for execute-route authorization), but the daemon's local
+// tool — which owns the file staging and cleanup flow — must keep the name.
+// Same generic local-priority rule as every other collision; no X special case.
+func TestRegisterIntegrationTools_LocalXUploadMediaWinsOverCloudSchema(t *testing.T) {
+	schemas := []client.ServerToolSchema{
+		{Name: "x_upload_media", Description: "Cloud-side media transfer", RequiresApproval: true},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(schemas)
+	}))
+	defer server.Close()
+
+	gw := client.NewGatewayClient(server.URL, "")
+	reg := agent.NewToolRegistry()
+	local := NewXUploadMediaTool(&fakeXMediaUploads{}, nil)
+	reg.Register(local)
+
+	if err := RegisterIntegrationTools(context.Background(), gw, reg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, ok := reg.Get("x_upload_media")
+	if !ok {
+		t.Fatal("x_upload_media missing after integration registration")
+	}
+	if _, isLocal := got.(*XUploadMediaTool); !isLocal {
+		t.Fatalf("integration schema replaced the local tool: %T", got)
 	}
 }
 

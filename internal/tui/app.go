@@ -865,6 +865,7 @@ func (m *Model) loadServerTools() tea.Cmd {
 			}
 			tools.RegisterCloudDelegate(reg, m.gateway, m.cfg, nil, cloudAgentName, cloudAgentPrompt)
 			tools.RegisterPublishTool(reg, m.gateway, m.cfg)
+			tools.RegisterXUploadMediaTool(reg, m.gateway, m.cfg)
 			tools.RegisterListPublishedFilesTool(reg, m.gateway, m.cfg)
 			tools.RegisterRetractPublishedFileTool(reg, m.gateway, m.cfg)
 			tools.RegisterGenerateImageTool(reg, m.gateway, m.cfg)
