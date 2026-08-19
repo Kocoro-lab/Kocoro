@@ -1329,11 +1329,8 @@ func (h *eventHandler) nativeFloorEnabled() bool {
 	return h != nil && h.provider != string(ProviderQwen) && nativeFloorControlEnabled(h.fullDuplexAEC)
 }
 
-func providerBargeInEnabled(provider string) bool {
-	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
-		return false
-	}
-	return provider != string(ProviderQwen) || koeEnvBool("KOE_QWEN_BARGE_IN", false)
+func providerBargeInEnabled(_ string) bool {
+	return koeEnvBool("KOE_VPIO_BARGE_IN", false)
 }
 
 // pauseForNativeFloor locally freezes the exact queued PCM without cancelling or
@@ -1881,9 +1878,8 @@ func qwenSchemaAllowsNull(value any) bool {
 
 // qwenSessionConfig uses Qwen's Realtime session schema. Qwen currently lacks
 // conversation.item.truncate, so its handler disables the native cognitive-floor
-// controller. Semantic VAD is the provider-recommended default; playback-time
-// capture and interruption remain off unless Qwen's separate experiment gate is
-// enabled, so endpointing and echo protection stay independent.
+// controller. Semantic VAD is the provider-recommended default; the user-visible
+// barge-in setting still controls playback-time capture and interruption.
 func qwenSessionConfig(persona, voice string) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	vadMode := strings.ToLower(strings.TrimSpace(os.Getenv("KOE_QWEN_VAD_MODE")))

@@ -281,18 +281,18 @@ func TestVPIOBargeInForwardsContinuouslyWhileSpeaking(t *testing.T) {
 	}
 }
 
-func TestVPIOQwenBargeInRequiresProviderOptIn(t *testing.T) {
+func TestVPIOQwenBargeInFollowsUserSetting(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	a, _ := NewAudioIO()
 	a.SetRealtimeProvider(ProviderQwen)
 	a.SetSpeaking(true)
 
-	if a.shouldForwardVPIOCapture(0.5) {
-		t.Fatal("Qwen playback capture must stay gated without explicit provider qualification")
-	}
-	t.Setenv("KOE_QWEN_BARGE_IN", "1")
 	if !a.shouldForwardVPIOCapture(0.5) {
-		t.Fatal("Qwen playback capture should flow when its experimental override is enabled")
+		t.Fatal("Qwen playback capture should flow when barge-in is enabled")
+	}
+	t.Setenv("KOE_VPIO_BARGE_IN", "0")
+	if a.shouldForwardVPIOCapture(0.5) {
+		t.Fatal("Qwen playback capture must stay gated when barge-in is disabled")
 	}
 }
 

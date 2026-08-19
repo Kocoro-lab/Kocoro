@@ -545,7 +545,7 @@ func TestQwenInterruptSkipsUnsupportedOutputClear(t *testing.T) {
 	}
 }
 
-func TestQwenSpeechStartedDoesNotInterruptPlaybackWithoutProviderOptIn(t *testing.T) {
+func TestQwenSpeechStartedInterruptsPlaybackWhenBargeInEnabled(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	audio, err := NewAudioIO()
 	if err != nil {
@@ -561,14 +561,14 @@ func TestQwenSpeechStartedDoesNotInterruptPlaybackWithoutProviderOptIn(t *testin
 
 	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
 
-	if !h.respBusy.Load() || !h.outputBufferActive.Load() {
-		t.Fatal("Qwen speech_started must not cancel active output without provider barge-in qualification")
+	if h.respBusy.Load() || h.outputBufferActive.Load() {
+		t.Fatal("Qwen speech_started did not cancel active output while barge-in was enabled")
 	}
-	if got := len(audio.playBuf); got != 1 {
-		t.Fatalf("Qwen speech_started drained playback without provider opt-in: got %d frame(s)", got)
+	if got := len(audio.playBuf); got != 0 {
+		t.Fatalf("Qwen speech_started left %d playback frame(s), want none", got)
 	}
-	if got := cap.countType("response.cancel"); got != 0 {
-		t.Fatalf("Qwen speech_started sent %d response.cancel event(s) without provider opt-in", got)
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("Qwen speech_started sent %d response.cancel event(s), want 1", got)
 	}
 }
 
@@ -1024,15 +1024,14 @@ func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	}
 }
 
-func TestQwenSessionConfigAllowsServerVADAndExperimentalBargeIn(t *testing.T) {
+func TestQwenSessionConfigUsesEnabledBargeIn(t *testing.T) {
 	t.Setenv("KOE_QWEN_VAD_MODE", "server_vad")
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
-	t.Setenv("KOE_QWEN_BARGE_IN", "1")
 	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
 	s := string(raw)
 	for _, want := range []string{`"type":"server_vad"`, `"interrupt_response":true`} {
 		if !strings.Contains(s, want) {
-			t.Fatalf("Qwen A/B override missing %s in %s", want, s)
+			t.Fatalf("Qwen enabled barge-in missing %s in %s", want, s)
 		}
 	}
 }

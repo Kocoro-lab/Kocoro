@@ -42,7 +42,7 @@ type koeConfig struct {
 	audioProcessing string // auto | mac_voice | clean_device; controls whether VPIO applies or bypasses Apple's voice processing
 	micDevice       string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice   string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
-	bargeIn         bool   // --barge-in: reversible native-S2S floor control while Kocoro speaks (vpio backend only)
+	bargeIn         bool   // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
