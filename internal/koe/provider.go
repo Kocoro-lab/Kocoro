@@ -86,6 +86,12 @@ func OpenAIMintError(err error) error {
 // AutoFallbackEligible reports whether an OpenAI failure is safe to route to
 // Qwen before a session becomes ready. An SDP POST timeout has unknown OpenAI
 // outcome, so the caller must not retry OpenAI; it may start one Qwen session.
+//
+// The >=500 gate is coarser than it looks: Cloud's mint endpoint folds every
+// upstream OpenAI failure — auth and config rejections included — into 502, so
+// Cloud-side OpenAI failures fall back by design (voice degrades to Qwen
+// instead of dying with the Cloud-held credential). Only gateway-authored 4xx
+// (client auth, quota denial) stay terminal here.
 func AutoFallbackEligible(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false

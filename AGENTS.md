@@ -379,13 +379,17 @@ still owns all other turn control.
 
 Realtime provider routing is WebRTC-only. Auto may change OpenAI→Qwen only for
 an eligible bootstrap failure before the session is ready and before any media,
-user input, tool action, or conversation history exists. Forced modes never
+user input, tool action, or conversation history exists. Eligible means network
+error/timeout or a 5xx bootstrap response; Cloud's mint endpoint folds upstream
+OpenAI auth/config failures into 502, so those fall back by design, while
+gateway-authored 4xx stay terminal. Forced modes never
 fall back. Qwen does not support `conversation.item.truncate`, so native
-cognitive-floor control stays disabled there. Qwen defaults to semantic VAD and
-uses ordinary VPIO barge-in while a response is active. Because Qwen can emit
+cognitive-floor control stays disabled there. Interruptible (barge-in on) Qwen
+calls use server VAD; barge-in-off calls keep semantic VAD. Ordinary VPIO
+barge-in stays available while a response is active. Because Qwen can emit
 final RTP after `response.done`, only that short local playback tail is protected
-from capture to prevent self-interruption. Use `KOE_QWEN_VAD_MODE=server_vad`
-only for controlled A/B tests. Do not emulate truncation by replaying or
+from capture to prevent self-interruption. `KOE_QWEN_VAD_MODE` remains the
+controlled A/B and rollback override. Do not emulate truncation by replaying or
 rewriting an active call.
 
 An active transport reconnect preserves the task ledger and result mailbox, not

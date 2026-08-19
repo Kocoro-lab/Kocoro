@@ -193,6 +193,13 @@ localhost routes. OpenAI uses the existing ephemeral-mint path. Qwen sends one
 offer through `POST /v1/realtime/sdp`; only answer SDP returns, while provider
 credentials stay in Cloud and media remains direct Koe↔Qwen.
 
+Fallback eligibility rides these status codes: the mint endpoint folds every
+upstream OpenAI failure (auth and config included) into 502, and
+`AutoFallbackEligible` treats bootstrap 5xx/network/timeout as availability —
+so Cloud-side OpenAI failures fall back to Qwen by design, while
+gateway-authored 4xx stay terminal. The Cloud-side statement of the same rule
+lives in `shannon-cloud/contracts/shanclaw-surface.md` §7a; keep them aligned.
+
 Usage includes `provider`, `model`, `response_id`, and the provider-native
 `usage` object. Cloud validates provider/model agreement and normalizes OpenAI's
 singular token-detail keys versus Qwen's plural keys before pricing. A Qwen SDP
