@@ -88,6 +88,31 @@ func drainWorkPlanEvents(t *testing.T, ch <-chan Event) []workPlanEventSummary {
 	}
 }
 
+// waitForTitleFence blocks until the async smart-title goroutine has finished
+// its session write, using EventSessionTitleUpdated as the fence — UpgradeTitle
+// saves the session BEFORE the emit, so the event proves the write landed.
+// Without it the detached goroutine (fireTitleAfterRun outlives RunAgent)
+// races t.TempDir cleanup: CI 2026-08-19 run 32205789576 failed with "TempDir
+// RemoveAll cleanup: unlinkat .../sessions: directory not empty", the title
+// landing right after the FAIL line. Timing out is a hard failure because an
+// unfenced goroutine is exactly that race; every scripted-gateway branch
+// returns non-empty OutputText, so on the current trigger turns the upgrade
+// deterministically fires and succeeds.
+func waitForTitleFence(t *testing.T, ch <-chan Event) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case evt := <-ch:
+			if evt.Type == EventSessionTitleUpdated {
+				return
+			}
+		case <-deadline:
+			t.Fatal("smart-title fence: EventSessionTitleUpdated never arrived; the detached title goroutine would race TempDir cleanup")
+		}
+	}
+}
+
 func runWorkPlanE2E(t *testing.T, finalSteps string) ([]workPlanEventSummary, *session.Session) {
 	t.Helper()
 	const primary = "compile the quarterly research report"
@@ -110,6 +135,7 @@ func runWorkPlanE2E(t *testing.T, finalSteps string) ([]workPlanEventSummary, *s
 		t.Fatal("no session id")
 	}
 	events := drainWorkPlanEvents(t, sub)
+	waitForTitleFence(t, sub)
 
 	mgr := deps.SessionCache.GetOrCreateManager(deps.SessionCache.SessionsDir(""))
 	sess, err := mgr.Load(res.SessionID)
