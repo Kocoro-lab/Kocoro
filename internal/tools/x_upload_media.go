@@ -52,8 +52,10 @@ type xMediaUploader interface {
 // GatewayClient.ExecuteIntegrationToolWithIdentity against the Cloud-side
 // x_upload_media integration tool (POST
 // /api/v1/integrations/tools/x_upload_media/execute), which fetches the staged
-// media_url and runs X's INIT/APPEND/FINALIZE flow.
-type xMediaExecuteFn func(ctx context.Context, name string, args map[string]any, requestID string) (*client.ToolExecuteResponse, error)
+// media_url and runs X's INIT/APPEND/FINALIZE flow. idempotencyKey carries the
+// durable journal's provider-level dedup key on journal-backed calls (empty
+// outside the dispatcher), mirroring the ServerTool material contract.
+type xMediaExecuteFn func(ctx context.Context, name string, args map[string]any, requestID, idempotencyKey string) (*client.ToolExecuteResponse, error)
 
 // XUploadMediaTool uploads one local image to X and returns the media_id for
 // the X posting tools. Internally: local guards → stage on the Cloud CDN →
@@ -211,8 +213,10 @@ func (t *XUploadMediaTool) run(ctx context.Context, argsJSON string) (agent.Tool
 	}
 
 	requestID := ""
+	idempotencyKey := ""
 	if execution, ok := agent.SideEffectExecutionFromContext(ctx); ok {
 		requestID = execution.ExecutionID
+		idempotencyKey = execution.IdempotencyKey
 	} else if invocation, ok := agent.ToolInvocationFromContext(ctx); ok {
 		requestID = invocation.ToolUseID
 	}
@@ -241,7 +245,7 @@ func (t *XUploadMediaTool) run(ctx context.Context, argsJSON string) (agent.Tool
 	if purpose == "dm" {
 		execArgs["purpose"] = "dm"
 	}
-	resp, execErr := t.execute(ctx, "x_upload_media", execArgs, requestID)
+	resp, execErr := t.execute(ctx, "x_upload_media", execArgs, requestID, idempotencyKey)
 	if execErr != nil {
 		return classifyXMediaExecuteErr(execErr), nil
 	}

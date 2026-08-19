@@ -49,9 +49,10 @@ func (f *fakeXMediaUploads) Delete(ctx context.Context, id string) (*uploads.Del
 }
 
 type xMediaExecuteCall struct {
-	name      string
-	args      map[string]any
-	requestID string
+	name           string
+	args           map[string]any
+	requestID      string
+	idempotencyKey string
 }
 
 // newXMediaFixture builds the tool with recording fakes and a temp media file
@@ -70,8 +71,8 @@ func newXMediaFixture(t *testing.T, filename string, size int) (*XUploadMediaToo
 		},
 	}
 	calls := &[]xMediaExecuteCall{}
-	execute := func(ctx context.Context, name string, args map[string]any, requestID string) (*client.ToolExecuteResponse, error) {
-		*calls = append(*calls, xMediaExecuteCall{name: name, args: args, requestID: requestID})
+	execute := func(ctx context.Context, name string, args map[string]any, requestID, idempotencyKey string) (*client.ToolExecuteResponse, error) {
+		*calls = append(*calls, xMediaExecuteCall{name: name, args: args, requestID: requestID, idempotencyKey: idempotencyKey})
 		return &client.ToolExecuteResponse{
 			Success: true,
 			Output:  []byte(`{"media_id":"1234567890","expires_after_secs":86400}`),
@@ -211,7 +212,7 @@ func TestXUploadMedia_RequestIDFromToolInvocation(t *testing.T) {
 
 func TestXUploadMedia_ExecuteFailureStillDeletesStagedUpload(t *testing.T) {
 	tool, uploader, _, path := newXMediaFixture(t, "photo.png", 256)
-	tool.execute = func(context.Context, string, map[string]any, string) (*client.ToolExecuteResponse, error) {
+	tool.execute = func(context.Context, string, map[string]any, string, string) (*client.ToolExecuteResponse, error) {
 		return nil, &client.IntegrationToolAPIError{StatusCode: 403, Code: "tool_not_allowed"}
 	}
 
@@ -232,7 +233,7 @@ func TestXUploadMedia_ExecuteFailureStillDeletesStagedUpload(t *testing.T) {
 // upload is still cleaned up.
 func TestXUploadMedia_ProviderRejectedSurfacesDetailAndCleansUp(t *testing.T) {
 	tool, uploader, _, path := newXMediaFixture(t, "photo.png", 256)
-	tool.execute = func(context.Context, string, map[string]any, string) (*client.ToolExecuteResponse, error) {
+	tool.execute = func(context.Context, string, map[string]any, string, string) (*client.ToolExecuteResponse, error) {
 		return nil, &client.IntegrationToolAPIError{
 			StatusCode:  403,
 			Code:        "provider_rejected",
@@ -297,7 +298,7 @@ func TestXUploadMedia_EmptyUploadIDSkipsDelete(t *testing.T) {
 
 func TestXUploadMedia_MissingMediaIDIsError(t *testing.T) {
 	tool, uploader, _, path := newXMediaFixture(t, "photo.png", 256)
-	tool.execute = func(context.Context, string, map[string]any, string) (*client.ToolExecuteResponse, error) {
+	tool.execute = func(context.Context, string, map[string]any, string, string) (*client.ToolExecuteResponse, error) {
 		return &client.ToolExecuteResponse{Success: true, Output: []byte(`{"ok":true}`)}, nil
 	}
 
@@ -438,7 +439,7 @@ func TestXUploadMedia_ApprovalAndExposureContract(t *testing.T) {
 
 func TestXUploadMedia_UsagePropagatesFromExecuteResponse(t *testing.T) {
 	tool, _, _, path := newXMediaFixture(t, "photo.png", 256)
-	tool.execute = func(context.Context, string, map[string]any, string) (*client.ToolExecuteResponse, error) {
+	tool.execute = func(context.Context, string, map[string]any, string, string) (*client.ToolExecuteResponse, error) {
 		return &client.ToolExecuteResponse{
 			Success: true,
 			Output:  []byte(`{"media_id":"42"}`),

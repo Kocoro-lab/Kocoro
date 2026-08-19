@@ -1245,8 +1245,8 @@ func RegisterXUploadMediaTool(reg *agent.ToolRegistry, gw *client.GatewayClient,
 		return
 	}
 	uploadsClient := uploads.NewClient(cfg.Endpoint, cfg.APIKey, gw.HTTPClient())
-	execute := func(ctx context.Context, name string, args map[string]any, requestID string) (*client.ToolExecuteResponse, error) {
-		return gw.ExecuteIntegrationToolWithIdentity(ctx, name, args, requestID, "")
+	execute := func(ctx context.Context, name string, args map[string]any, requestID, idempotencyKey string) (*client.ToolExecuteResponse, error) {
+		return gw.ExecuteIntegrationToolWithIdentity(ctx, name, args, requestID, idempotencyKey)
 	}
 	registerAuthSensitiveTool(reg, gw, NewXUploadMediaTool(uploadsClient, execute))
 }
