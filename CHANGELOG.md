@@ -2,6 +2,28 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.4.8 — 2026-08-19 — Approved writes, attached media
+
+**Cloud can now ship X mutation tools, but only to a daemon that will put a first-use card in front of them.** v0.4.6 fenced browser posting and handed the model a URL-only composer link; this release is the daemon half of Cloud's X full-capability expansion. The daemon advertises `integration_requires_approval`, honors the per-schema flag through the existing permission engine, stages a local image through `x_upload_media`, and treats an outcome-unknown material result as a narratable tool error instead of a hard-stop English template. A same-turn latch blocks that identical write from firing again until the next user message.
+
+### Added
+
+- **Integration `requires_approval`** (`integration_requires_approval`) — Cloud marks consequential integration schemas (X writes and similar) with `requires_approval: true` and **withholds them** from daemons that do not advertise the token, because an older daemon would register them approval-free. `ServerTool.RequiresApproval()` reads the flag; first-use approval, "Always Allow", per-agent `always_allow_tools`, and `daemon.auto_approve` all behave exactly as for local approval-requiring tools. Advertised on the WS handshake, `GET /status`, and the integration tool-list request (the fetch is what unlocks delivery).
+- **`x_upload_media`** — local Deferred tool (always approval; same `cloud.enabled` + API-key gate as `publish_to_web`) that takes one local image (`jpg`/`jpeg`/`png`/`gif`/`webp`; 5 MB, GIF 15 MB — X's own caps), applies `publish_to_web`'s path blocklist, stages it on the Cloud CDN (`kind=image`, purpose `x_media`), calls Cloud's `x_upload_media` execute, best-effort deletes the staging upload, and returns `media_id` plus an expiry hint. The three-step X INIT/APPEND/FINALIZE flow stays invisible to the model, so it cannot skip finalize or leak a half-uploaded id. Execute carries the journal's `request_id` and `Idempotency-Key`. Local tools win the same-name collision with Cloud's execute-route schema (pinned by test). User-attached files ride the existing attachment auto-approve via the conventional `file_path` argument.
+
+### Changed
+
+- **Outcome-unknown material results narrate instead of hard-stopping** — an uncertain external write used to end the run on a fixed English assistant message the user could not act on. The uncertain result is now paired into the transcript as an ordinary tool error (tell the user, in their language, and suggest verifying the external system); the run continues. Safety moved into code: a same-turn latch rejects a byte-identical tool+args repeat locally — no network, no approval card — until the next user message, including a committed mid-run follow-up. Different arguments pass through. The durable journal still records `outcome_unknown`; the latch is in-memory and run-scoped on top of that. `provider_rejected` plus `error_detail` surface a definitive vendor refusal (duplicate content, and similar) as a known-no-effect business error, not as outcome-unknown.
+
+### Removed
+
+- **`x_prepare_post`** — the URL-only Web Intent handoff from v0.4.6 is gone, superseded by Cloud `x_create_post`. Posting on X happens only through the authorized X integration tools plus `x_upload_media` for attachments. Browser / `computer_use` / Playwright composer and Post guards are unchanged.
+
+### Fixed
+
+- **`TestReadTracker_RecentReads` no longer depends on leftover `/tmp` files** — the assertion compared tracker output against unresolved `/tmp` paths and against whatever else happened to live there, which failed on macOS (where `/tmp` is a symlink to `/private/tmp`) and on a dirty temp dir.
+- **Work-plan E2E teardown raced the session-title write** — the test now fences teardown on that write so a slow title upgrade cannot flake the suite.
+
 ## v0.4.7 — 2026-08-18 — Branch, aside, and count
 
 **A conversation can now branch without being disturbed, and a memory count is either real or plainly withheld.** Working sideways off a long thread used to mean editing it: to explore an alternative you truncated history, and to ask a quick aside you polluted the transcript. This release adds a fork that copies context through a complete assistant turn and an ephemeral side chat that keeps full tool capability but leaves no trace. Alongside it, `memory_recall` learns to aggregate — and, more importantly, learns to refuse: a rejected aggregator returns a labelled unaggregated list instead of a list length dressed up as a total.
