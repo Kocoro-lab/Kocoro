@@ -66,6 +66,23 @@ func TestRenderIntoReportsOutputLevelAndIdle(t *testing.T) {
 	}
 }
 
+func TestPlaybackQueueReportsDroppedFrames(t *testing.T) {
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	frame := make([]int16, audioFrameSize)
+	for i := 0; i < playbackBufferFrames+1; i++ {
+		a.Play(frame)
+	}
+	if got := a.playbackQueueDrops.Load(); got != 1 {
+		t.Fatalf("playback queue drops=%d, want 1", got)
+	}
+	if got := a.playbackQueueMax.Load(); got != playbackBufferFrames {
+		t.Fatalf("playback queue max=%d, want %d", got, playbackBufferFrames)
+	}
+}
+
 // TestResolveCaptureFrameKeepaliveSilence pins the RTP-continuity contract: when
 // the speak-gate suppresses capture, the pipeline must forward a SILENT frame by
 // default instead of halting the send track. Halting glues the pre/post-speech RTP

@@ -140,9 +140,10 @@ type eventHandler struct {
 	// userSpeaking prevents an async task result from taking the floor in the
 	// middle of the user's utterance. Both native server VAD and the local audio
 	// floor update it; no ASR text participates in this decision.
-	userSpeaking atomic.Bool
-	toolLoop     *toolLoopLedger
-	floor        *nativeFloorController
+	userSpeaking          atomic.Bool
+	inputTranscriptFailed atomic.Bool
+	toolLoop              *toolLoopLedger
+	floor                 *nativeFloorController
 	// Held-speech identity for a true interruption: the assistant message item
 	// most recently speaking and the moment the floor pause froze its playback.
 	// An accepted interruption truncates that server-side item to the audio the
@@ -1952,6 +1953,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	switch ev.Type {
 	case "input_audio_buffer.speech_started":
 		h.userSpeaking.Store(true)
+		h.inputTranscriptFailed.Store(false)
 		h.speechStartedAt = time.Now()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: speech_started")
@@ -2016,8 +2018,10 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.toolLoop.noteUserCommit(turnID)
 		}
 	case "conversation.item.input_audio_transcription.completed":
+		h.inputTranscriptFailed.Store(false)
 		h.handleInputTranscript(ev.Transcript)
 	case "conversation.item.input_audio_transcription.failed":
+		h.inputTranscriptFailed.Store(true)
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
 	case "response.created":
@@ -2242,21 +2246,29 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if transcriptLogEnabled() && ev.Transcript != "" {
 			log.Printf("koe[assistant]: %q", shortLogString(ev.Transcript, 500))
 		}
+		// When input transcription failed, a provider can still understand a raw
+		// dismissal but answer it verbally instead of selecting the lifecycle tool.
+		// A closed set of exact goodbye acknowledgements is enough evidence to finish
+		// that call; ordinary replies and successful transcripts never use this path.
+		if h.provider == string(ProviderQwen) && h.inputTranscriptFailed.Swap(false) && isDismissAcknowledgement(ev.Transcript) {
+			h.requestEndCall("assistant-dismiss-backstop")
+		}
 	}
 }
 
-// handleInputTranscript logs the user's transcript for diagnostics only. Under
-// create_response:true the server already auto-creates the response, so this must
-// NOT send response.create. Off by default (privacy: user voice content); opt in
-// with KOE_TRANSCRIPT_LOG=1.
+// handleInputTranscript logs the user's transcript for diagnostics and provides
+// the fixed-vocabulary dismiss backstop when the raw-audio floor controller is
+// unavailable. Under create_response:true the server already auto-creates the
+// response, so this must NOT send response.create. Transcript logging remains off
+// by default (privacy: user voice content); opt in with KOE_TRANSCRIPT_LOG=1.
 func (h *eventHandler) handleInputTranscript(transcript string) {
 	if os.Getenv("KOE_TRANSCRIPT_LOG") == "1" {
 		log.Printf("koe[transcript]: %q", transcript)
 	}
-	// ASR is evidence only and is excluded from the default control path. This
-	// legacy deterministic dismiss backstop remains an explicit rollback/debug
-	// switch; native floor and normal response admission never wait for it.
-	if !koeEnvBool("KOE_ASR_DISMISS_BACKSTOP", false) {
+	// The raw-audio floor controller is authoritative when available. Provider
+	// paths without that controller use completed ASR for exact dismiss phrases.
+	// The explicit environment value remains a kill switch in either direction.
+	if !koeEnvBool("KOE_ASR_DISMISS_BACKSTOP", !h.nativeFloorEnabled()) {
 		return
 	}
 	// Deterministic dismiss backstop: a whole-utterance control phrase (闭嘴/停/够了/

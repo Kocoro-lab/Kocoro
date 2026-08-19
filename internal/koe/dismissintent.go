@@ -108,6 +108,14 @@ var taskAmbiguousDismissPhrases = map[string]struct{}{
 	"止まって": {}, "止まれ": {}, "止めて": {}, "やめて": {}, "やめろ": {}, "もうやめて": {},
 }
 
+var dismissAcknowledgements = map[string]struct{}{
+	"再见": {}, "好的再见": {}, "好再见": {}, "好那再见": {},
+	"拜拜": {}, "好的拜拜": {}, "好拜拜": {},
+	"さようなら": {}, "はいさようなら": {}, "バイバイ": {},
+	"bye": {}, "goodbye": {}, "okbye": {}, "okaybye": {},
+	"okgoodbye": {}, "okaygoodbye": {},
+}
+
 // normalizeDismissPhrase strips surrounding whitespace and punctuation (ASCII and CJK,
 // e.g. "." "!" "。" "！" "，") and lowercases. Trimming is end-only, so internal
 // spaces ("shut up") are preserved. ToLower is a no-op for CJK.
@@ -149,5 +157,16 @@ func isDismissPhrase(transcript string) bool {
 func isTaskAmbiguousDismissPhrase(transcript string) bool {
 	norm := normalizeDismissPhrase(transcript)
 	_, ok := taskAmbiguousDismissPhrases[norm]
+	return ok
+}
+
+func isDismissAcknowledgement(transcript string) bool {
+	norm := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) || unicode.IsPunct(r) {
+			return -1
+		}
+		return unicode.ToLower(r)
+	}, transcript)
+	_, ok := dismissAcknowledgements[norm]
 	return ok
 }

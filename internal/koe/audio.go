@@ -71,6 +71,8 @@ type AudioIO struct {
 	preferredMicUID     string
 	preferredSpeakerUID string
 	playback            atomic.Bool
+	playbackQueueDrops  atomic.Uint64
+	playbackQueueMax    atomic.Int64
 	// playbackPaused is a reversible local floor hold. Unlike playback=false it
 	// keeps accepting and retaining inbound assistant PCM so a backchannel can
 	// resume the exact response instead of restarting or discarding it.
@@ -376,7 +378,15 @@ func (a *AudioIO) Play(pcm []int16) {
 	}
 	select {
 	case a.playBuf <- pcm:
+		queued := int64(len(a.playBuf))
+		for {
+			current := a.playbackQueueMax.Load()
+			if queued <= current || a.playbackQueueMax.CompareAndSwap(current, queued) {
+				break
+			}
+		}
 	default: // drop on overflow rather than block the decode path
+		a.playbackQueueDrops.Add(1)
 	}
 }
 
@@ -641,8 +651,10 @@ func (a *AudioIO) resetVPIOCallStats() {
 	a.vpioStatsBase = a.vpioDebugStats()
 	a.vpioMaxInput.Store(0)
 	a.vpioMaxOutput.Store(0)
+	a.playbackQueueMax.Store(0)
 	a.vpioStatsBase.MaxInputLevel = 0
 	a.vpioStatsBase.MaxOutputLevel = 0
+	a.vpioStatsBase.PlayQueueMax = 0
 }
 
 func (a *AudioIO) vpioDebugStatsSinceBase() vpioDebugStats {
@@ -657,6 +669,8 @@ func (a *AudioIO) vpioDebugStatsSinceBase() vpioDebugStats {
 		OutputFrames:    subUint64(cur.OutputFrames, base.OutputFrames),
 		PlayUnderruns:   subUint64(cur.PlayUnderruns, base.PlayUnderruns),
 		PlayOverwrites:  subUint64(cur.PlayOverwrites, base.PlayOverwrites),
+		PlayQueueDrops:  subUint64(cur.PlayQueueDrops, base.PlayQueueDrops),
+		PlayQueueMax:    cur.PlayQueueMax,
 		PlayBuffered:    cur.PlayBuffered,
 		PlayCapacity:    cur.PlayCapacity,
 		ForwardedFrames: subUint64(cur.ForwardedFrames, base.ForwardedFrames),

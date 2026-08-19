@@ -158,6 +158,56 @@ func TestTranscriptIsEvidenceOnlyByDefault(t *testing.T) {
 	}
 }
 
+func TestQwenDismissTranscriptUsesBackstopByDefault(t *testing.T) {
+	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "")
+	h := newEventHandler(nil, NewCallState("burst-qwen-dismiss", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleInputTranscript("退出吧。")
+
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Qwen dismiss transcript did not use the deterministic backstop by default")
+	}
+}
+
+func TestQwenDismissAcknowledgementEndsAfterFailedTranscript(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-qwen-dismiss-ack", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.failed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.audio_transcript.done","transcript":"好的，再见。"}`))
+
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Qwen dismissal acknowledgement did not end the call after failed input transcription")
+	}
+}
+
+func TestFailedTranscriptNormalReplyDoesNotEndCall(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-qwen-normal-ack", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.failed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.audio_transcript.done","transcript":"好的，我来帮你。"}`))
+
+	select {
+	case <-ended:
+		t.Fatal("normal acknowledgement after failed input transcription ended the call")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // TestEndCallToolNilHookIsSafe: the standalone/CLI path leaves onEndCall nil, so a
 // stray end_call must be an inert no-op, never a panic.
 func TestEndCallToolNilHookIsSafe(t *testing.T) {
