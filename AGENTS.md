@@ -79,10 +79,9 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
-- Trusted `requires_approval=true` on an integration schema routes the tool
-  through the normal local approval flow (always-allow / per-agent lists /
-  `daemon.auto_approve` bypass it as usual); absent is false. The schema fetch
-  and WS handshake advertise `integration_requires_approval`
+- Trusted `requires_approval=true` on an integration schema routes through the
+  normal approval flow (always-allow / auto_approve bypass as usual); absent is
+  false. Fetch + WS handshake advertise `integration_requires_approval`
   (`client.CapIntegrationRequiresApproval`); Cloud withholds marked schemas
   from daemons without it.
 - Trusted `material_side_effect=false` permits observational batching without
@@ -91,11 +90,10 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   known-no-effect; billing/provider/post-dispatch failures are not. Preserve
   provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted material
   `call_in_progress` is `outcome_unknown`: never commit/resend under a new ID.
-- An outcome-unknown material result is an ordinary narratable tool error (the
-  run continues); the same-turn retry latch (`agent/unknown_outcome_gate.go`)
-  locally rejects a byte-identical tool+args repeat until the next user
-  message. Journal-unavailable (never executed) also continues as an ordinary
-  error.
+- Outcome-unknown material results are ordinary narratable tool errors (run
+  continues); the same-turn latch (`agent/unknown_outcome_gate.go`) rejects a
+  byte-identical tool+args repeat until the next user message.
+  Journal-unavailable (never executed) also continues as an ordinary error.
 - SourceIntegration is identity-scoped. Key mutation invalidates generations
   before source clear, without the dispatch writer. Failed new-identity listing
   leaves it empty; same-identity refresh failure keeps it. ServerTool binds list
@@ -111,9 +109,9 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   `browser_evaluate`; CDP target check + call share a lock, and any X target
   blocks mutation because X embeds a composer. Non-CDP has no target-state
   guarantee. Native actions use guarded `computer_use`; shell/custom MCP are out
-  of scope. Browser-side, only the user clicks X's Post button; agent posting
-  goes exclusively through the Cloud X integration tools (`x_prepare_post` was
-  removed, superseded by `x_create_post`).
+  of scope. Browser-side only the user clicks X's Post button; agent posting
+  goes exclusively through the Cloud X tools (`x_prepare_post` removed,
+  superseded by `x_create_post`).
 
 ## MCP
 
