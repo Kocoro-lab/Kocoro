@@ -54,6 +54,99 @@ func TestResultMailboxDeliversStaggeredTasksIndependently(t *testing.T) {
 	}
 }
 
+func TestResultMailboxWaitsForWholeResponseTaskGroup(t *testing.T) {
+	m := NewResultMailbox()
+	m.BeginBurst("call")
+	weather := m.BeginTaskResult("call", "response-1", "call-weather")
+	news := m.BeginTaskResult("call", "response-1", "call-news")
+
+	if id := m.EnqueueTaskResult(weather, SayResult{TaskID: "weather", Status: "ok", Reply: "Sunny."}, false); id == 0 {
+		t.Fatal("first grouped result was rejected")
+	}
+	m.SealTaskResponse("call", "response-1")
+	if got := m.claimForBurst("connection", "call"); len(got) != 0 {
+		t.Fatalf("partial task group became speakable: %+v", got)
+	}
+
+	if id := m.EnqueueTaskResult(news, SayResult{TaskID: "news", Status: "ok", Reply: "Atlas shipped."}, false); id == 0 {
+		t.Fatal("second grouped result was rejected")
+	}
+	got := m.claimForBurst("connection", "call")
+	if len(got) != 2 {
+		t.Fatalf("complete task group claim=%d, want 2: %+v", len(got), got)
+	}
+	if got[0].callID != "call-weather" || got[1].callID != "call-news" {
+		t.Fatalf("group lost provider call ids: %+v", got)
+	}
+}
+
+func TestResultMailboxAbandonedTaskDoesNotBlockSiblingResult(t *testing.T) {
+	m := NewResultMailbox()
+	m.BeginBurst("call")
+	abandoned := m.BeginTaskResult("call", "response-1", "call-abandoned")
+	completed := m.BeginTaskResult("call", "response-1", "call-completed")
+	m.SealTaskResponse("call", "response-1")
+	m.AbandonTaskResult(abandoned)
+	m.EnqueueTaskResult(completed, SayResult{TaskID: "done", Status: "ok", Reply: "Done."}, false)
+
+	got := m.claimForBurst("connection", "call")
+	if len(got) != 1 || got[0].callID != "call-completed" {
+		t.Fatalf("abandoned sibling blocked or polluted the result batch: %+v", got)
+	}
+}
+
+func TestResultMailboxCompletionWakesNextReadyTaskGroup(t *testing.T) {
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst("burst")
+	first := mailbox.BeginTaskResult("burst", "response-1", "call-1")
+	second := mailbox.BeginTaskResult("burst", "response-2", "call-2")
+	mailbox.SealTaskResponse("burst", "response-1")
+	mailbox.SealTaskResponse("burst", "response-2")
+	mailbox.EnqueueTaskResult(first, SayResult{TaskID: "task-1", Say: "first"}, false)
+	mailbox.EnqueueTaskResult(second, SayResult{TaskID: "task-2", Say: "second"}, false)
+
+	select {
+	case <-mailbox.notifications():
+	default:
+		t.Fatal("ready groups did not notify the sender")
+	}
+	claimed := mailbox.claimForBurst("owner-1", "burst")
+	if len(claimed) != 1 || claimed[0].result.TaskID != "task-1" {
+		t.Fatalf("first claim=%+v, want only task-1", claimed)
+	}
+	mailbox.complete("owner-1")
+
+	select {
+	case <-mailbox.notifications():
+	default:
+		t.Fatal("completing the first group did not wake the already-ready second group")
+	}
+	claimed = mailbox.claimForBurst("owner-2", "burst")
+	if len(claimed) != 1 || claimed[0].result.TaskID != "task-2" {
+		t.Fatalf("second claim=%+v, want only task-2", claimed)
+	}
+}
+
+func TestResultMailboxTaskGroupSealWaitsForLatestCall(t *testing.T) {
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst("burst")
+	first := mailbox.BeginTaskResult("burst", "response", "call-1")
+	mailbox.ScheduleTaskGroupSeal(first, 40*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	second := mailbox.BeginTaskResult("burst", "response", "call-2")
+	mailbox.ScheduleTaskGroupSeal(second, 40*time.Millisecond)
+	mailbox.EnqueueTaskResult(first, SayResult{TaskID: "task-1", Say: "first"}, false)
+	mailbox.EnqueueTaskResult(second, SayResult{TaskID: "task-2", Say: "second"}, false)
+
+	time.Sleep(25 * time.Millisecond)
+	if got := mailbox.claimForBurst("early", "burst"); len(got) != 0 {
+		t.Fatalf("older seal timer split a still-growing task group: %+v", got)
+	}
+	waitUntil(t, func() bool {
+		return len(mailbox.claimForBurst("ready", "burst")) == 2
+	}, "latest task-call quiet window did not seal the complete group")
+}
+
 func TestResultMailboxReleasesAcrossConnectionTeardown(t *testing.T) {
 	m := NewResultMailbox()
 	m.Enqueue(SayResult{TaskID: "task-a", Status: "ok", Reply: "Done."}, false)

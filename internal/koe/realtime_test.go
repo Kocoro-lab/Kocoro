@@ -189,6 +189,7 @@ func TestQwenDoTaskSendsOnlyCompletedFunctionOutput(t *testing.T) {
 		_ = json.Unmarshal(payload, &frame)
 		if frame.Type == "response.create" {
 			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"result-response"}}`))
+			h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"result-response","status":"completed"}}`))
 		}
 		return nil
 	})
@@ -198,6 +199,7 @@ func TestQwenDoTaskSendsOnlyCompletedFunctionOutput(t *testing.T) {
 	go h.runResponseSender(ctx)
 
 	h.handleFunctionCallForResponse(ctx, "tool-response", "call-final", "do_task", []byte(`{"task":"check the Tokyo time offset"}`), false)
+	h.handleEvent(ctx, []byte(`{"type":"response.done","response":{"id":"tool-response","status":"completed"}}`))
 
 	waitUntil(t, func() bool {
 		return cap.countType("conversation.item.create") == 1 && cap.countType("response.create") == 1
@@ -540,6 +542,33 @@ func TestQwenInterruptSkipsUnsupportedOutputClear(t *testing.T) {
 	}
 	if got := cap.countType("output_audio_buffer.clear"); got != 0 {
 		t.Fatalf("unsupported output clear count=%d, want 0", got)
+	}
+}
+
+func TestQwenSpeechStartedDoesNotInterruptPlaybackWithoutProviderOptIn(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-qwen-echo", ""), audio, cap.send)
+	h.provider = string(ProviderQwen)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	audio.SetSpeaking(true)
+	audio.Play(make([]int16, audioFrameSize))
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+
+	if !h.respBusy.Load() || !h.outputBufferActive.Load() {
+		t.Fatal("Qwen speech_started must not cancel active output without provider barge-in qualification")
+	}
+	if got := len(audio.playBuf); got != 1 {
+		t.Fatalf("Qwen speech_started drained playback without provider opt-in: got %d frame(s)", got)
+	}
+	if got := cap.countType("response.cancel"); got != 0 {
+		t.Fatalf("Qwen speech_started sent %d response.cancel event(s) without provider opt-in", got)
 	}
 }
 
@@ -961,7 +990,7 @@ func TestSessionConfigCanDisableNoiseReduction(t *testing.T) {
 	}
 }
 
-func TestQwenSessionConfigUsesProviderSchema(t *testing.T) {
+func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
 	s := string(raw)
 
@@ -972,14 +1001,16 @@ func TestQwenSessionConfigUsesProviderSchema(t *testing.T) {
 		`"input_audio_format":"pcm"`,
 		`"output_audio_format":"pcm"`,
 		`"input_audio_transcription":{"model":"qwen3-asr-flash-realtime"}`,
-		`"type":"server_vad"`,
+		`"type":"semantic_vad"`,
+		`"create_response":true`,
+		`"interrupt_response":false`,
 		`"function":{"name":"do_task"`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("qwenSessionConfig missing %s in %s", want, s)
 		}
 	}
-	for _, forbidden := range []string{`"reasoning"`, `"output_modalities"`, `"noise_reduction"`, `"semantic_vad"`, `"prefix_padding_ms"`, `"create_response"`, `"interrupt_response"`, `"tool_choice"`} {
+	for _, forbidden := range []string{`"reasoning"`, `"output_modalities"`, `"noise_reduction"`, `"tool_choice"`} {
 		if strings.Contains(s, forbidden) {
 			t.Fatalf("qwenSessionConfig contains OpenAI-only field %s in %s", forbidden, s)
 		}
@@ -987,6 +1018,19 @@ func TestQwenSessionConfigUsesProviderSchema(t *testing.T) {
 	for _, forbidden := range []string{`"type":["string","null"]`, `"additionalProperties"`, `"enum":["new","follow_up",null]`} {
 		if strings.Contains(s, forbidden) {
 			t.Fatalf("qwenSessionConfig contains unsupported tool schema %s in %s", forbidden, s)
+		}
+	}
+}
+
+func TestQwenSessionConfigAllowsServerVADAndExperimentalBargeIn(t *testing.T) {
+	t.Setenv("KOE_QWEN_VAD_MODE", "server_vad")
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_QWEN_BARGE_IN", "1")
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
+	s := string(raw)
+	for _, want := range []string{`"type":"server_vad"`, `"interrupt_response":true`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("Qwen A/B override missing %s in %s", want, s)
 		}
 	}
 }

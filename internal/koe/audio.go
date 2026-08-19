@@ -84,6 +84,7 @@ type AudioIO struct {
 	// Explicit barge-in experiments can opt into a stricter local energy gate.
 	vpioActive                atomic.Bool
 	vpioBypassVoiceProcessing atomic.Bool
+	realtimeProvider          atomic.Value
 	vpioDone                  chan struct{}
 	vpioWG                    sync.WaitGroup
 	vpioForwarded             atomic.Uint64
@@ -231,6 +232,22 @@ func (a *AudioIO) SetVPIOVoiceProcessingBypassed(bypass bool) {
 	a.vpioBypassVoiceProcessing.Store(bypass)
 }
 
+// SetRealtimeProvider binds playback-time capture policy to the active WebRTC
+// provider. Qwen requires a separate experimental opt-in because it lacks Koe's
+// native cognitive-floor controller and otherwise turns echoed playback into a
+// new user turn.
+func (a *AudioIO) SetRealtimeProvider(provider RealtimeProvider) {
+	a.realtimeProvider.Store(string(provider))
+}
+
+func (a *AudioIO) currentRealtimeProvider() string {
+	if value := a.realtimeProvider.Load(); value != nil {
+		provider, _ := value.(string)
+		return provider
+	}
+	return ""
+}
+
 // VPIOVoiceProcessingBypassed exposes the pending StartVPIO setting for tests and
 // diagnostics. It is meaningful before and during a VPIO run.
 func (a *AudioIO) VPIOVoiceProcessingBypassed() bool {
@@ -285,7 +302,8 @@ func (a *AudioIO) shouldForwardVPIOCapture(level float64) bool {
 	}
 	// Kocoro is speaking. Default policy is half-duplex: drop the mic so its own
 	// voice cannot loop back (barge-in off).
-	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
+	provider := a.currentRealtimeProvider()
+	if !providerBargeInEnabled(provider) {
 		a.vpioGateDropped.Add(1)
 		return false
 	}
@@ -608,7 +626,9 @@ func (a *AudioIO) LogDebugStats() {
 		// Barge-in diagnostics: with barge-in on, ForwardedFrames should climb while
 		// speaking (mic stays live for the server VAD). enabled=false means the
 		// flag→env wiring failed.
-		log.Printf("koe[barge]: enabled=%v", koeEnvBool("KOE_VPIO_BARGE_IN", false))
+		provider := a.currentRealtimeProvider()
+		log.Printf("koe[barge]: requested=%v effective=%v provider=%q",
+			koeEnvBool("KOE_VPIO_BARGE_IN", false), providerBargeInEnabled(provider), provider)
 	}
 }
 

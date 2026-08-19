@@ -81,3 +81,17 @@ func TestFeedFramesContinuesSilenceUntilStopped(t *testing.T) {
 		}
 	}
 }
+
+func TestSynthSpeechChineseProducesNonTrivialAudio(t *testing.T) {
+	t.Setenv("KOE_SAY_VOICE", "")
+	pcm, err := synthSpeech("请查询东京今天的天气，并告诉我结果。")
+	if err != nil {
+		t.Fatalf("synthSpeech: %v", err)
+	}
+	if len(pcm) < audioSampleRate {
+		t.Fatalf("Chinese synthesis produced only %.3fs of audio", float64(len(pcm))/audioSampleRate)
+	}
+	if got := wavMetrics(pcm).RMS; got < 0.005 {
+		t.Fatalf("Chinese synthesis is effectively silent: rms=%.4f", got)
+	}
+}

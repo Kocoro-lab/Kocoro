@@ -977,6 +977,12 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 	if h.ending.Load() {
 		return
 	}
+	if h.resultBatchActive() {
+		// A provider may accept the output items and then fail to acknowledge the
+		// continuation before our timeout. Keep that outcome-unknown batch leased;
+		// claiming another group would overwrite its delivery acknowledgement state.
+		return
+	}
 	if !h.waitResultVoiceGap(ctx) {
 		return
 	}
@@ -999,7 +1005,22 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 	if eventLogEnabled() {
 		log.Printf("koe[result]: announcing count=%d task_ids=%q", len(results), resultTaskIDs(results))
 	}
-	err := h.injectTaskResultBatch(results)
+	var err error
+	if h.provider == string(ProviderQwen) {
+		for _, result := range results {
+			output, marshalErr := json.Marshal(providerFunctionOutputResult(h.provider, result.result))
+			if marshalErr != nil {
+				err = marshalErr
+				break
+			}
+			if sendErr := h.sendFunctionOutputErr(result.callID, output); sendErr != nil {
+				err = sendErr
+				break
+			}
+		}
+	} else {
+		err = h.injectTaskResultBatch(results)
+	}
 	h.terminalMu.Unlock()
 	if err != nil {
 		if eventLogEnabled() {
@@ -1017,6 +1038,17 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 		h.resultRetries = 0
 		return // response.done owns the delivery acknowledgement
 	}
+	if h.provider == string(ProviderQwen) {
+		// function_call_output is not idempotent. Once the provider has accepted the
+		// items, an unacknowledged response.create is outcome_unknown: replaying the
+		// whole batch can make the model repeat the same result. Keep the lease until
+		// response.done or connection teardown; sendResponseCreate already retries
+		// explicit active-response rejections without resubmitting these outputs.
+		if eventLogEnabled() {
+			log.Printf("koe[result]: continuation outcome unknown; retaining submitted batch task_ids=%q", resultTaskIDs(results))
+		}
+		return
+	}
 	h.releaseResultBatch(false)
 	if ctx.Err() == nil && h.resultRetries == 0 {
 		// One bounded same-connection retry. The result stays pending after that;
@@ -1024,6 +1056,28 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 		h.resultRetries++
 		time.AfterFunc(responseRejectRetryDelay, h.resultMailbox.Wake)
 	}
+}
+
+func providerFunctionOutputResult(provider string, result SayResult) SayResult {
+	if provider == string(ProviderQwen) && result.Status == "ok" {
+		if summary := strings.TrimSpace(result.LegacySpeech); summary != "" {
+			// Qwen can ignore response-level brevity instructions when a long tool
+			// output is present. Pair the daemon's bounded voice projection with a
+			// short factual excerpt; the complete reply remains in its Desktop session.
+			result.SpokenSummary = summary
+			result.Reply = boundedRunes(result.Reply, 360)
+		}
+	}
+	return result
+}
+
+func boundedRunes(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if limit <= 0 || len(runes) <= limit {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:limit])) + "…"
 }
 
 func (h *eventHandler) waitResultVoiceGap(ctx context.Context) bool {
@@ -1294,6 +1348,13 @@ func (h *eventHandler) finishToolLoopResponse(responseID string) {
 
 func (h *eventHandler) nativeFloorEnabled() bool {
 	return h != nil && h.provider != string(ProviderQwen) && nativeFloorControlEnabled(h.fullDuplexAEC)
+}
+
+func providerBargeInEnabled(provider string) bool {
+	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
+		return false
+	}
+	return provider != string(ProviderQwen) || koeEnvBool("KOE_QWEN_BARGE_IN", false)
 }
 
 // pauseForNativeFloor locally freezes the exact queued PCM without cancelling or
@@ -1841,9 +1902,19 @@ func qwenSchemaAllowsNull(value any) bool {
 
 // qwenSessionConfig uses Qwen's Realtime session schema. Qwen currently lacks
 // conversation.item.truncate, so its handler disables the native cognitive-floor
-// controller while provider-native VAD owns interruption.
+// controller. Semantic VAD is the provider-recommended default; playback-time
+// capture and interruption remain off unless Qwen's separate experiment gate is
+// enabled, so endpointing and echo protection stay independent.
 func qwenSessionConfig(persona, voice string) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
+	vadMode := strings.ToLower(strings.TrimSpace(os.Getenv("KOE_QWEN_VAD_MODE")))
+	if vadMode != "server_vad" {
+		vadMode = "semantic_vad"
+	}
+	if eventLogEnabled() {
+		log.Printf("koe[qwen]: turn_detection=%s interrupt_response=%v silence_ms=%d",
+			vadMode, providerBargeInEnabled(string(ProviderQwen)), vadSilenceMS)
+	}
 	instructions := strings.TrimSpace(persona + "\n\n" + deferredFunctionResultInstructions)
 	return map[string]any{
 		"event_id": fmt.Sprintf("event_%d", time.Now().UnixNano()),
@@ -1858,9 +1929,12 @@ func qwenSessionConfig(persona, voice string) map[string]any {
 			},
 			"instructions": instructions,
 			"turn_detection": map[string]any{
-				"type":                "server_vad",
+				"type":                vadMode,
 				"threshold":           koeEnvFloat("KOE_VAD_THRESHOLD", 0.5),
+				"prefix_padding_ms":   500,
 				"silence_duration_ms": vadSilenceMS,
+				"create_response":     true,
+				"interrupt_response":  providerBargeInEnabled(string(ProviderQwen)),
 			},
 			"tools": qwenToolDefs(),
 		},
@@ -1910,7 +1984,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// this is the talk-over signal — stop Kocoro's buffered speech immediately so
 		// the interruption is instant (interrupt_response=true cancels the response
 		// server-side in parallel).
-		if koeEnvBool("KOE_VPIO_BARGE_IN", false) && h.isSpeakingOrResponding() {
+		if providerBargeInEnabled(h.provider) && h.isSpeakingOrResponding() {
 			if h.pauseForNativeFloor() {
 				log.Printf("koe[barge]: talk-over detected — playback paused for native floor decision")
 			} else {
@@ -2149,6 +2223,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// can still have speaker energy after the server says its output buffer ended.
 		h.releaseSpeakingTail()
 	case "response.done":
+		if h.state != nil {
+			h.resultMailbox.SealTaskResponse(h.state.BurstID(), ev.Response.ID)
+		}
 		// A task-result entry remains leased through response.created and is removed
 		// only after a completed response.done. Cancelled/failed responses put it
 		// back in the mailbox so the next quiet boundary or connection can retry.
@@ -2339,6 +2416,16 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		// refined the task" (shouldVoiceDoTaskResult). handleEvent is single-goroutine,
 		// so this Store races with no other writer.
 		h.lastDoTaskCommitSeq.Store(h.inputCommitSeq.Load())
+		originBurstID := h.state.BurstID()
+		resultTicket := h.resultMailbox.BeginTaskResult(originBurstID, responseID, callID)
+		if h.provider == string(ProviderQwen) && resultTicket.groupID != "" {
+			sealMS := koeEnvInt("KOE_QWEN_TASK_GROUP_SEAL_MS", 1500)
+			if sealMS <= 0 {
+				sealMS = 1500
+			}
+			sealDelay := time.Duration(sealMS) * time.Millisecond
+			h.resultMailbox.ScheduleTaskGroupSeal(resultTicket, sealDelay)
+		}
 		h.state.SetInFlightForRoute(req.Text, req.Agent, req.ThreadID)
 		h.asyncTaskPending.Store(true)
 		h.emitVoiceState("thinking") // delegating; the model's call-turn ack already played
@@ -2351,7 +2438,6 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 			h.sendFunctionOutput(callID, ack)
 		}
 		h.toolLoop.noteDeferredDoTask(responseID)
-		originBurstID := h.state.BurstID()
 		go func() {
 			// do_task must survive session teardown: a hangup cancels the session ctx
 			// that Connect rides, which would abort this in-flight POST /message and
@@ -2396,6 +2482,15 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 					// task is still in flight, leave the state alone — that
 					// task's own completion owns the transition to listening.
 					h.state.MarkFailed(task.ID, "conflicting execution run")
+					if h.provider == string(ProviderQwen) && resultTicket.groupID != "" {
+						say := fallbackSay(lang, "incomplete")
+						h.resultMailbox.EnqueueTaskResult(resultTicket, SayResult{
+							Status: "failed", TaskID: task.ID, Task: task.Label,
+							FailReason: "conflicting execution run", SpokenSummary: say, Say: say,
+						}, false)
+					} else {
+						h.resultMailbox.AbandonTaskResult(resultTicket)
+					}
 					if !h.taskInFlight() {
 						h.asyncTaskPending.Store(false)
 						h.maybeRestoreUserMic()
@@ -2408,6 +2503,13 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 					if eventLogEnabled() {
 						log.Printf("koe[task]: suppress stale execution result task_id=%q run_id=%q current_run_id=%q",
 							task.ID, landingRunID, landed.CurrentExecutionRun().RunID)
+					}
+					if h.provider == string(ProviderQwen) && resultTicket.groupID != "" {
+						h.resultMailbox.EnqueueTaskResult(resultTicket, SayResult{
+							Status: "injected", TaskID: task.ID, Task: task.Label,
+						}, false)
+					} else {
+						h.resultMailbox.AbandonTaskResult(resultTicket)
 					}
 					return
 				}
@@ -2424,7 +2526,7 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 					len([]rune(r.Reply)), len(r.Deliverables), r.Revision, r.Supersedes, time.Since(started).Milliseconds(), derr)
 			}
 			b, _ := json.Marshal(r)
-			if h.provider == string(ProviderQwen) {
+			if h.provider == string(ProviderQwen) && resultTicket.groupID == "" {
 				h.queueDeferredFunctionResult(ctx, callID, b)
 				return
 			}
@@ -2436,7 +2538,7 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 			// part to the Realtime connection that happened to start the task.
 			userSpokeSinceLastDoTask := h.inputCommitSeq.Load() > h.lastDoTaskCommitSeq.Load()
 			if koeEnvBool("KOE_RESULT_DELIVERY", true) {
-				enqueued := h.resultMailbox.EnqueueForBurst(originBurstID, r, userSpokeSinceLastDoTask)
+				enqueued := h.resultMailbox.EnqueueTaskResult(resultTicket, r, userSpokeSinceLastDoTask)
 				if eventLogEnabled() {
 					log.Printf("koe[tool]: output call_id=%q status=%s mailbox_id=%d resumptive=%t output=%s",
 						callID, r.Status, enqueued, userSpokeSinceLastDoTask, logMaybeBytes(b, 500))

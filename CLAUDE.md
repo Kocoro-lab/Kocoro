@@ -73,6 +73,12 @@ Both `stop_speaking` and `end_call` say nothing and send no
 - `do_task` defaults to exactly ONE call per response. Multiple calls in one
   response require an explicit user request for parallel execution, and each
   call must carry one disjoint work scope.
+- Results from `do_task` calls created by the same Realtime response form one
+  delivery group. Do not make a partial group speakable: wait until every
+  registered call is terminal, submit all provider acknowledgements together,
+  and request exactly one spoken continuation. OpenAI seals on `response.done`;
+  Qwen also seals after a provider-specific tool-call quiet window because it
+  can withhold `response.done` until function outputs arrive.
 - `do_task` does not expose execution routing to Realtime — see Provider
   Architecture for the daemon-side Fast/Full decision.
 - `MapDoTaskOutcome` maps a partial run (soft idle/deadline timeout,
@@ -96,7 +102,7 @@ Both `stop_speaking` and `end_call` say nothing and send no
 
 **Koe Fast/Full execution** (`internal/executionprofile` + daemon `resolveKoeExecutionRun` / `authorizeKoeExecutionLineage`): Realtime's `do_task` schema contains no routing fields; each new `source=koe` request asks for Fast. The daemon remains authoritative: `koe.fast_effort=false`, a failed/missing Cloud profile, or a validated inherited Full lineage keeps the normal global/per-agent configuration byte-for-byte. Fast resolves the opaque Luna kfp1 profile from Cloud (`ResolveKoeExecutionProfile`, 5s bound). The validated `Run` (lineage ids + profile + digest-only evidence) is persisted in `Session.ExecutionRuns` and returned on `done` as `execution_run` for Koe's call ledger; interrupted recovery restores the pinned profile from the checkpoint and validates it against the ledger, abandoning on `ErrInvalidPersistedRun` (legacy zero-run checkpoints instead mint a fresh Full run under the route lock). The wire still carries admitted mode fields for compatibility and recovery. Capability token `koe_fast_profile_v1`; wire fixtures `message_koe_execution_{fast,full}_request.json` + `sse_event.done.with_execution_run.json`.
 
-**Koe Realtime provider routing** (`internal/koe/provider.go`, `webrtc.go`, `cmd/koe.go`): every provider uses WebRTC. `auto` tries the pinned OpenAI route and changes to Qwen only for a classified pre-media bootstrap failure (network/5xx/ICE/DataChannel/session-ready timeout); credential, quota/rate, invalid model/voice, and rejected `session.update` errors remain terminal. The OpenAI negative-health cache only affects later calls during its cooldown; a ready call never switches provider. Forced OpenAI/Qwen never fall back. Qwen SDP goes through `DaemonClient.ExchangeSDPViaDaemon`; media remains direct and no provider credential enters Koe. Qwen lacks `conversation.item.truncate`, so `eventHandler.nativeFloorEnabled` and `truncateHeldSpeech` disable that capability for Qwen while server VAD keeps interruption responsive. Capability token `koe_realtime_provider_v1`; the provider/model/voice catalog is additive under `GET /config/status`.
+**Koe Realtime provider routing** (`internal/koe/provider.go`, `webrtc.go`, `cmd/koe.go`): every provider uses WebRTC. `auto` tries the pinned OpenAI route and changes to Qwen only for a classified pre-media bootstrap failure (network/5xx/ICE/DataChannel/session-ready timeout); credential, quota/rate, invalid model/voice, and rejected `session.update` errors remain terminal. The OpenAI negative-health cache only affects later calls during its cooldown; a ready call never switches provider. Forced OpenAI/Qwen never fall back. Qwen SDP goes through `DaemonClient.ExchangeSDPViaDaemon`; media remains direct and no provider credential enters Koe. Qwen lacks `conversation.item.truncate`, so `eventHandler.nativeFloorEnabled` and `truncateHeldSpeech` disable that capability for Qwen. Qwen defaults to semantic VAD and does not forward playback-period microphone frames unless both the ordinary VPIO barge-in gate and the provider-specific `KOE_QWEN_BARGE_IN=1` experiment are enabled. `KOE_QWEN_VAD_MODE=server_vad` is an A/B-only override. Capability token `koe_realtime_provider_v1`; the provider/model/voice catalog is additive under `GET /config/status`.
 
 ### Tool Priority
 

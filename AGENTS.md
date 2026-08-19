@@ -366,7 +366,11 @@ text. Unattended runs remain silent.
 output), `cancel` (delegated work, by `task_id` or `all_running=true`), and
 terminal `end_call` (whole session) as SEPARATE authorities. `do_task` defaults to
 exactly one call per response; parallel calls need an explicit user request and
-disjoint scopes. `MapDoTaskOutcome` maps a partial run to a canned `incomplete`
+disjoint scopes. Calls created by one Realtime response are one result-delivery
+group: wait for every call to become terminal, acknowledge them together, and
+request one spoken continuation. Qwen may wait for function outputs before
+`response.done`, so its group boundary also uses a tool-call quiet window.
+`MapDoTaskOutcome` maps a partial run to a canned `incomplete`
 line and seeds no digest, so a cut run's progress tail is never voiced as the
 result. ASR transcripts stay asynchronous evidence — not turn control, not
 barge-in admission, not default dismissal.
@@ -375,8 +379,11 @@ Realtime provider routing is WebRTC-only. Auto may change OpenAI→Qwen only for
 an eligible bootstrap failure before the session is ready and before any media,
 user input, tool action, or conversation history exists. Forced modes never
 fall back. Qwen does not support `conversation.item.truncate`, so native
-cognitive-floor control stays disabled there; do not emulate it by replaying or
-rewriting an active call.
+cognitive-floor control stays disabled there. Qwen defaults to semantic VAD and
+playback-period microphone forwarding stays off unless both ordinary barge-in
+and `KOE_QWEN_BARGE_IN=1` are enabled; use `KOE_QWEN_VAD_MODE=server_vad` only
+for controlled A/B tests. Do not emulate truncation by replaying or rewriting
+an active call.
 
 ## Tests
 

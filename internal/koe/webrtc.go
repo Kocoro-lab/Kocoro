@@ -501,6 +501,9 @@ func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Cont
 }
 
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
+	if audio != nil {
+		audio.SetRealtimeProvider(provider)
+	}
 	rc, err := newPeerConnectionForProvider(audio, provider)
 	if err != nil {
 		return nil, connectError(provider, "local_setup", err)
