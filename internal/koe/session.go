@@ -1,0 +1,111 @@
+package koe
+
+import (
+	"context"
+	"encoding/json"
+	"sync/atomic"
+)
+
+// SessionConfig describes one voice call for an out-of-process driver.
+//
+// Every field is supplied by the host application because none of it exists on
+// the platform the host runs on: on iOS the audio layer is Swift, the transport
+// is a WebRTC data channel, and there is no local daemon to reach.
+type SessionConfig struct {
+	// BurstID scopes the call's task ledger and result mailbox.
+	BurstID string
+	// BoundAgent is the agent this call is pinned to; empty means default.
+	BoundAgent string
+	// BackendURL is where do_task/cancel/agent-listing go. On macOS that is the
+	// local daemon; on iOS it is Shannon Cloud.
+	BackendURL string
+	// Audio owns the microphone and speaker. See ExternalAudio.
+	Audio ExternalAudio
+	// Send delivers one Realtime client event, already JSON-encoded, to the
+	// transport. The brain never owns a socket.
+	Send func(payloadJSON string) error
+	// ControlApp asks the host UI to act (show/hide/new_conversation/open_settings).
+	// Optional.
+	ControlApp func(action string)
+}
+
+// Session is the exported handle on the front brain.
+//
+// The brain's own types are unexported on purpose — they are internal to the
+// event loop. This façade exists so a host outside package koe (the iOS gomobile
+// binding) can drive the SAME logic macOS runs, rather than reimplementing
+// turn-taking, the hang-up vocabulary, the task ledger and the result mailbox in
+// another language, where they would drift silently.
+type Session struct {
+	handler   *eventHandler
+	state     *CallState
+	send      func(any) error
+	sendCount int64
+}
+
+// NewSession wires the front brain against host-supplied audio and transport.
+func NewSession(cfg SessionConfig) *Session {
+	s := &Session{}
+	s.state = NewCallState(cfg.BurstID, cfg.BoundAgent)
+
+	client := NewDaemonClient(cfg.BackendURL)
+	resolver := NewAgentResolver(nil, nil)
+
+	var controlApp ControlAppFunc
+	if cfg.ControlApp != nil {
+		controlApp = func(_ context.Context, action string) error {
+			cfg.ControlApp(action)
+			return nil
+		}
+	}
+	disp := NewDispatcher(client, resolver, s.state, controlApp)
+
+	sendFn := func(v any) error {
+		atomic.AddInt64(&s.sendCount, 1)
+		if cfg.Send == nil {
+			return nil
+		}
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		return cfg.Send(string(raw))
+	}
+
+	s.send = sendFn
+	s.handler = newEventHandler(disp, s.state, NewExternalAudioController(cfg.Audio), sendFn)
+	return s
+}
+
+// HandleEvent feeds one Realtime server event to the brain. `raw` is the JSON
+// exactly as it arrived on the transport — the brain parses it itself, so no
+// host-side interpretation can diverge between platforms.
+func (s *Session) HandleEvent(raw []byte) {
+	s.handler.handleEvent(context.Background(), raw)
+}
+
+// BurstID identifies this call's task lineage.
+func (s *Session) BurstID() string { return s.state.BurstID() }
+
+// SentEventCount is how many client events the brain has emitted. Useful for
+// asserting the brain actually reacted, which a silent audio path cannot show.
+func (s *Session) SentEventCount() int64 { return atomic.LoadInt64(&s.sendCount) }
+
+// SendSessionUpdate configures the realtime session: spoken instructions, the
+// seven voice tools, turn detection, and the output voice.
+//
+// It MUST be sent as soon as the event channel opens. Without it the model has
+// no tools and no instructions, so the call connects, the audio path runs, and
+// nothing whatsoever happens — which is precisely how the first iOS call failed.
+// The macOS path does the same thing from its data channel's OnOpen.
+//
+// `persona` is a parameter rather than a package constant because the macOS
+// spoken persona currently lives in cmd/koe.go (package main), out of reach of
+// any other host. Moving it here is follow-up work; until then a host that
+// passes "" gets a functioning call with tools and turn-taking but no persona.
+func (s *Session) SendSessionUpdate(persona, voice string, fullDuplexAEC bool) error {
+	if s.send == nil {
+		return nil
+	}
+	return s.send(sessionConfig(persona, voice, fullDuplexAEC))
+}
