@@ -22,6 +22,17 @@ func TestParseRealtimeProvider(t *testing.T) {
 	}
 }
 
+func TestQwenRealtimeModelAllowlistOnlyIncludesCompatibleModels(t *testing.T) {
+	for _, model := range []string{"qwen3.5-omni-flash-realtime", "qwen3.5-omni-plus-realtime"} {
+		if err := ValidateRealtimeModel(ProviderQwen, model); err != nil {
+			t.Fatalf("compatible Qwen model %q rejected: %v", model, err)
+		}
+	}
+	if err := ValidateRealtimeModel(ProviderQwen, "qwen3-omni-flash-realtime"); err == nil {
+		t.Fatal("Qwen3 realtime model without function calling remained selectable")
+	}
+}
+
 func TestAutoFallbackEligibility(t *testing.T) {
 	netFailure := &net.DNSError{Err: "timeout", IsTimeout: true}
 	tests := []struct {

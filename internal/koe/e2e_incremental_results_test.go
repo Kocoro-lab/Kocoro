@@ -388,8 +388,17 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	weatherOnce.Do(func() { close(weatherRelease) })
 	waitUntil(t, func() bool { return h.resultMailbox.pending() == 1 }, "weather result did not land")
 	time.Sleep(250 * time.Millisecond)
-	if got := resultInjections.Load() + functionOutputs.Load(); got != 0 {
-		t.Fatalf("partial parallel group submitted %d result item(s), want 0", got)
+	if got := resultInjections.Load(); got != 0 {
+		t.Fatalf("partial parallel group injected %d result item(s), want 0", got)
+	}
+	if provider == ProviderQwen {
+		if got := functionOutputs.Load(); got != 0 {
+			t.Fatalf("partial Qwen group submitted %d function outputs, want 0", got)
+		}
+	} else if got := functionOutputs.Load(); got != 2 {
+		// OpenAI receives one immediate status=running output per background task;
+		// these release the model's tool loop and are not final result delivery.
+		t.Fatalf("OpenAI running acknowledgements=%d, want 2", got)
 	}
 	newsOnce.Do(func() { close(newsRelease) })
 

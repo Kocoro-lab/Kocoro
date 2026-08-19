@@ -60,6 +60,10 @@ type AudioIO struct {
 	// this hold: forwarding a known local cue makes server VAD answer its own sound.
 	// The capture clock still advances through silent keepalive frames.
 	knownOutputCaptureHold atomic.Bool
+	// playbackTailProtected closes the narrow post-response echo window for Qwen.
+	// Its response.done event can precede local RTP/CoreAudio drain; during that
+	// tail, forwarding the still-audible reply makes server VAD interrupt itself.
+	playbackTailProtected atomic.Bool
 	// userMicSticky marks a MANUAL mute (user muted outside a task window).
 	// Sticky mutes survive maybeRestoreUserMic — only the user restores them.
 	userMicSticky atomic.Bool
@@ -189,9 +193,18 @@ func NewAudioIO() (*AudioIO, error) {
 func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
 
 // SetSpeaking marks playback as active. Production treats it as a hard mute while
-// Kocoro speaks unless experimental VPIO barge-in is explicitly enabled.
-func (a *AudioIO) SetSpeaking(s bool) { a.speaking.Store(s) }
-func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
+// Kocoro speaks unless VPIO barge-in is explicitly enabled.
+func (a *AudioIO) SetSpeaking(s bool) {
+	a.speaking.Store(s)
+	if !s {
+		a.playbackTailProtected.Store(false)
+	}
+}
+func (a *AudioIO) dropCapture() bool { return a.speaking.Load() }
+
+func (a *AudioIO) SetPlaybackTailProtected(protected bool) {
+	a.playbackTailProtected.Store(protected)
+}
 
 // SetUserMicOff toggles the user mic-off gate (koe-mic-off design). Task-window
 // enforcement lives in the /call/mic handler; auto-restore in maybeRestoreUserMic.
@@ -295,6 +308,10 @@ func (a *AudioIO) shouldForwardVPIOCapture(level float64) bool {
 	if a.userMicOff.Load() {
 		// User mic-off outranks everything, including barge-in: never forward while
 		// the user has explicitly asked for silence.
+		a.vpioGateDropped.Add(1)
+		return false
+	}
+	if a.playbackTailProtected.Load() {
 		a.vpioGateDropped.Add(1)
 		return false
 	}

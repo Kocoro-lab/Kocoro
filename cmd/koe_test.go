@@ -854,25 +854,43 @@ func TestCloseDesktopSessionStatePreservesActiveCallResults(t *testing.T) {
 	}
 }
 
+func TestDesktopSessionPersonaDisclosesActiveReconnectContextBoundary(t *testing.T) {
+	const base = "base voice persona"
+	if got := desktopSessionPersona(base, "startup"); got != base {
+		t.Fatalf("startup persona changed: %q", got)
+	}
+	recovered := desktopSessionPersona(base, "active_session_reconnect")
+	for _, want := range []string{base, "does not contain the earlier voice conversation", "ask the user to restate", "task-result data"} {
+		if !strings.Contains(recovered, want) {
+			t.Fatalf("active reconnect persona missing %q: %s", want, recovered)
+		}
+	}
+}
+
 // TestApplyBargeInEnv locks the flag→env bridge: native floor is on while remote
 // irreversible interruption is off.
 func TestApplyBargeInEnv(t *testing.T) {
-	t.Setenv("KOE_VPIO_BARGE_IN", "")
-	t.Setenv("KOE_NATIVE_FLOOR", "")
-	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_NATIVE_FLOOR", "1")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
 
-	applyBargeInEnv(false)
-	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "" {
-		t.Fatalf("barge-in off set KOE_VPIO_BARGE_IN=%q, want unchanged", v)
-	}
-	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "" {
-		t.Fatalf("barge-in off set KOE_INTERRUPT_RESPONSE=%q, want unchanged", v)
-	}
-	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "" {
-		t.Fatalf("barge-in off set KOE_NATIVE_FLOOR=%q, want unchanged", v)
+	applyBargeInEnv(false, false)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
+		t.Fatalf("implicit barge-in setting changed KOE_VPIO_BARGE_IN=%q", v)
 	}
 
-	applyBargeInEnv(true)
+	applyBargeInEnv(false, true)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "0" {
+		t.Fatalf("explicit barge-in off left KOE_VPIO_BARGE_IN=%q, want 0", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "0" {
+		t.Fatalf("explicit barge-in off left KOE_INTERRUPT_RESPONSE=%q, want 0", v)
+	}
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "0" {
+		t.Fatalf("explicit barge-in off left KOE_NATIVE_FLOOR=%q, want 0", v)
+	}
+
+	applyBargeInEnv(true, true)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
 		t.Fatalf("KOE_VPIO_BARGE_IN=%q, want 1", v)
 	}

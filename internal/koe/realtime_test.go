@@ -574,6 +574,7 @@ func TestQwenSpeechStartedInterruptsPlaybackWhenBargeInEnabled(t *testing.T) {
 
 func TestQwenSilentRTPDoesNotExtendSpeakingGate(t *testing.T) {
 	h := newEventHandler(nil, NewCallState("burst-provider-silence", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
 	if h.observeProviderRemoteAudio(make([]int16, audioFrameSize)) {
 		t.Fatal("idle keepalive RTP was accepted for playback")
 	}
@@ -600,8 +601,37 @@ func TestQwenSilentRTPDoesNotExtendSpeakingGate(t *testing.T) {
 		t.Fatalf("silent keepalive RTP extended speaking epoch from %d to %d", epoch, got)
 	}
 	h.respBusy.Store(false)
+	h.beginProviderRemoteAudioTail()
+	if !h.observeProviderRemoteAudio(loud) {
+		t.Fatal("Qwen RTP racing response.done was rejected from playback")
+	}
+	h.remoteAudioTailUntil.Store(time.Now().Add(-time.Millisecond).UnixNano())
 	if h.observeProviderRemoteAudio(loud) {
-		t.Fatal("post-response RTP was accepted for playback")
+		t.Fatal("expired post-response RTP tail was accepted for playback")
+	}
+}
+
+func TestQwenResponseDoneProtectsPlaybackTailFromEchoBargeIn(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	audio.SetRealtimeProvider(ProviderQwen)
+	audio.SetSpeaking(true)
+	h := newEventHandler(nil, NewCallState("burst-qwen-tail-guard", ""), audio, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"resp-1","status":"completed"}}`))
+
+	if audio.shouldForwardVPIOCapture(0.2) {
+		t.Fatal("Qwen post-response playback tail was forwarded to server VAD")
+	}
+	audio.SetSpeaking(false)
+	if !audio.shouldForwardVPIOCapture(0.2) {
+		t.Fatal("Qwen capture did not reopen after playback tail drained")
 	}
 }
 
@@ -1044,8 +1074,35 @@ func TestQwenResponseCreateUsesProviderSchema(t *testing.T) {
 		requestID:    "request-1",
 	}, string(ProviderQwen))
 	raw, _ := json.Marshal(payload)
-	if got, want := string(raw), `{"type":"response.create"}`; got != want {
+	if got, want := string(raw), `{"response":{"instructions":"speak this result","modalities":["text","audio"]},"type":"response.create"}`; got != want {
 		t.Fatalf("response.create payload=%s, want %s", got, want)
+	}
+}
+
+func TestQwenActiveResponseErrorSignalsRetry(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.handleEvent(context.Background(), []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"","message":"Conversation already has an active response"}}`))
+	select {
+	case <-h.respRejected:
+	default:
+		t.Fatal("Qwen active-response rejection did not wake the response sender")
+	}
+}
+
+func TestQwenResponseStreamTimeoutTerminatesSession(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	fatal := make(chan error, 1)
+	h.onProviderFatal = func(err error) { fatal <- err }
+	h.handleEvent(context.Background(), []byte(`{"type":"error","error":{"message":"Response stream timeout (timeout_seconds=298, elapsed_ms=298012)"}}`))
+	select {
+	case err := <-fatal:
+		if err == nil || !strings.Contains(err.Error(), "Response stream timeout") {
+			t.Fatalf("fatal error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Qwen response-stream timeout did not terminate the session")
 	}
 }
 
@@ -1440,12 +1497,9 @@ func TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay(t *testing.T) {
 	}
 }
 
-// TestDismissContainmentHangsUpWhileTaskInFlight pins the task-in-flight split of
-// the deterministic dismiss gate: ambiguous stop words (停/stop) are left to the
-// model mid-task (they usually mean "cancel the task", the cancel tool's job), but
-// a strong dismiss like "闭嘴" — including its decorated containment form — is about
-// talking, not the task, and must still hang up.
-func TestDismissContainmentHangsUpWhileTaskInFlight(t *testing.T) {
+// TestStopSpeakingNeverHangsUpWhileTaskInFlight keeps speech control separate
+// from call lifecycle even while background work is still running.
+func TestStopSpeakingNeverHangsUpWhileTaskInFlight(t *testing.T) {
 	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
@@ -1456,18 +1510,13 @@ func TestDismissContainmentHangsUpWhileTaskInFlight(t *testing.T) {
 
 	state.SetInFlightForAgent("查一下特斯拉股价", "")
 
-	h.handleInputTranscript("停") // ambiguous while a task runs — left to the model
-	select {
-	case <-ended:
-		t.Fatal("ambiguous stop word must not hang up while a task is in flight")
-	case <-time.After(80 * time.Millisecond):
-	}
-
-	h.handleInputTranscript("不需要了,闭嘴吧。") // strong containment — still a hang-up
-	select {
-	case <-ended:
-	case <-time.After(2 * time.Second):
-		t.Fatal("strong dismiss containment must hang up even while a task is in flight")
+	for _, transcript := range []string{"停", "不需要了,闭嘴吧。"} {
+		h.handleInputTranscript(transcript)
+		select {
+		case <-ended:
+			t.Fatalf("stop-speaking transcript %q hung up while a task was in flight", transcript)
+		case <-time.After(80 * time.Millisecond):
+		}
 	}
 }
 

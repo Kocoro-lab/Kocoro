@@ -43,6 +43,7 @@ type koeConfig struct {
 	micDevice       string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice   string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
 	bargeIn         bool   // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
+	bargeInSet      bool   // whether --barge-in was explicit; false must override an inherited debug env
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
@@ -83,8 +84,14 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 // Realtime then chooses resume_playback or accept_turn without ASR admission.
 // KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1 remains the rollback to the old
 // irreversible server-cancel experiment.
-func applyBargeInEnv(bargeIn bool) {
+func applyBargeInEnv(bargeIn, explicit bool) {
+	if !bargeIn && !explicit {
+		return
+	}
 	if !bargeIn {
+		os.Setenv("KOE_VPIO_BARGE_IN", "0")
+		os.Setenv("KOE_NATIVE_FLOOR", "0")
+		os.Setenv("KOE_INTERRUPT_RESPONSE", "0")
 		return
 	}
 	os.Setenv("KOE_VPIO_BARGE_IN", "1")
@@ -277,6 +284,7 @@ var koeCmd = &cobra.Command{
 		cfg.micDevice, _ = cmd.Flags().GetString("mic-device")
 		cfg.speakerDevice, _ = cmd.Flags().GetString("speaker-device")
 		cfg.bargeIn, _ = cmd.Flags().GetBool("barge-in")
+		cfg.bargeInSet = cmd.Flags().Changed("barge-in")
 		cfg.sayText, _ = cmd.Flags().GetString("say")
 		cfg.audioIn, _ = cmd.Flags().GetString("audio-in")
 		cfg.audioOut, _ = cmd.Flags().GetString("audio-out")
@@ -745,13 +753,22 @@ func baseKoePersona(cfg koeConfig) string {
 	return persona
 }
 
+const activeReconnectContextBoundary = "CONNECTION RECOVERY: This Realtime session does not contain the earlier voice conversation. Do not pretend to remember wording from before the reconnect. If the user's next request depends on that missing wording, briefly ask the user to restate it instead of guessing. Newly injected task-result data is authoritative and must still be delivered normally."
+
+func desktopSessionPersona(persona, reason string) string {
+	if reason != "active_session_reconnect" {
+		return persona
+	}
+	return persona + "\n\n" + activeReconnectContextBoundary
+}
+
 func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	// --barge-in selects native floor control before any audio/session code reads
 	// the env gates (covers both Desktop and standalone branches below).
-	applyBargeInEnv(cfg.bargeIn)
+	applyBargeInEnv(cfg.bargeIn, cfg.bargeInSet)
 	if w := bargeInBackendWarning(cfg.bargeIn, cfg.aec); w != "" {
 		log.Printf("koe[barge]: WARNING — %s", w)
 	}
@@ -1110,8 +1127,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 
 		// A provider session can expire while the logical Desktop call is still
-		// active. Preserve the CallState and ResultMailbox burst, replace only the
-		// transport, and let queued task results continue on the new connection.
+		// active. Preserve the CallState and ResultMailbox burst so queued task results
+		// survive, but give the replacement session an explicit context boundary: the
+		// provider conversation itself cannot be transferred across WebRTC sessions.
 		ctrl.EmitCallState("connecting")
 		callStarted = time.Now()
 		conn, cancel, audio := closeSessionLocked(false)
@@ -1246,7 +1264,8 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				FullDuplexAEC: fullDuplexAEC,
 				OnClosed:      func(err error) { handleSessionClosed(seq, err) },
 			}
-			conn, provider, cerr := connector.connect(sessionCtx, audio, *personaHolder.Load(), state, disp, connectOpts)
+			persona := desktopSessionPersona(*personaHolder.Load(), reason)
+			conn, provider, cerr := connector.connect(sessionCtx, audio, persona, state, disp, connectOpts)
 			if cerr == nil {
 				log.Printf("koe[provider]: warm session connected provider=%s in %dms reason=%s", provider, time.Since(started).Milliseconds(), reason)
 			}

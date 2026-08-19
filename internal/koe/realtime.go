@@ -57,6 +57,11 @@ type eventHandler struct {
 	provider string
 	model    string
 	onUsage  func(json.RawMessage)
+	// onProviderFatal retires a session immediately when the provider reports a
+	// terminal error but leaves the WebRTC transport open. Qwen's response-stream
+	// timeout otherwise leaves an active Desktop call dead for roughly a minute.
+	onProviderFatal func(error)
+	providerFatal   sync.Once
 	// language is the user-pinned koe reply language ("en"/"ja"/"zh"; "" = follow the
 	// utterance). It picks the language of the MECHANICAL spoken fallbacks (transport
 	// failure / busy / misheard / agent clarify) that bypass the Realtime model; when
@@ -79,7 +84,11 @@ type eventHandler struct {
 	// before the local output buffer is fully drained, so it must not immediately
 	// release the echo gate while speaker tail is still audible.
 	outputBufferActive atomic.Bool
-	speakingEpoch      atomic.Int64
+	// remoteAudioTailUntil keeps Qwen RTP admissible for one short jitter window
+	// after response.done. Its event DataChannel and media RTP track are unordered;
+	// rejecting on the event boundary clips final phonemes that arrive afterward.
+	remoteAudioTailUntil atomic.Int64
+	speakingEpoch        atomic.Int64
 	// barged is set when a barge-in / explicit interrupt supersedes the active
 	// response, and cleared on the next response.created. While set, markSpeaking
 	// ignores the cancelled response's trailing audio deltas so they cannot re-open
@@ -140,10 +149,9 @@ type eventHandler struct {
 	// userSpeaking prevents an async task result from taking the floor in the
 	// middle of the user's utterance. Both native server VAD and the local audio
 	// floor update it; no ASR text participates in this decision.
-	userSpeaking          atomic.Bool
-	inputTranscriptFailed atomic.Bool
-	toolLoop              *toolLoopLedger
-	floor                 *nativeFloorController
+	userSpeaking atomic.Bool
+	toolLoop     *toolLoopLedger
+	floor        *nativeFloorController
 	// Held-speech identity for a true interruption: the assistant message item
 	// most recently speaking and the moment the floor pause froze its playback.
 	// An accepted interruption truncates that server-side item to the audio the
@@ -269,17 +277,29 @@ func (h *eventHandler) observeProviderRemoteAudio(pcm []int16) bool {
 	// frames inside an active response belong in the playback queue, and only
 	// audible frames may extend the speaking epoch. Treating idle keepalives as
 	// response audio prevents the drain watchdog from releasing the result sender.
-	if !h.respBusy.Load() {
-		return false
+	busy := h.respBusy.Load()
+	if !busy {
+		if h.provider != string(ProviderQwen) || time.Now().UnixNano() > h.remoteAudioTailUntil.Load() {
+			return false
+		}
 	}
-	if rmsLevel(pcm) < playbackIdleLevelEps {
+	level := rmsLevel(pcm)
+	if level < playbackIdleLevelEps {
 		return true
+	}
+	if !busy {
+		h.beginProviderRemoteAudioTail()
 	}
 	if !h.outputBufferActive.Swap(true) {
 		h.outputStartedAt = time.Now()
 	}
 	h.markSpeaking()
 	return true
+}
+
+func (h *eventHandler) beginProviderRemoteAudioTail() {
+	tail := time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond
+	h.remoteAudioTailUntil.Store(time.Now().Add(tail).UnixNano())
 }
 
 func (h *eventHandler) markSpeaking() {
@@ -1561,7 +1581,13 @@ func (h *eventHandler) handleNativeFloorTool(responseID, callID, name string) bo
 
 func responseCreatePayloadForProvider(req responseCreateRequest, provider string) map[string]any {
 	if provider == string(ProviderQwen) {
-		return map[string]any{"type": "response.create"}
+		return map[string]any{
+			"type": "response.create",
+			"response": map[string]any{
+				"instructions": req.instructions,
+				"modalities":   []string{"text", "audio"},
+			},
+		}
 	}
 	return responseCreatePayload(req)
 }
@@ -1949,7 +1975,6 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 	switch ev.Type {
 	case "input_audio_buffer.speech_started":
 		h.userSpeaking.Store(true)
-		h.inputTranscriptFailed.Store(false)
 		h.speechStartedAt = time.Now()
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: speech_started")
@@ -2014,10 +2039,8 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.toolLoop.noteUserCommit(turnID)
 		}
 	case "conversation.item.input_audio_transcription.completed":
-		h.inputTranscriptFailed.Store(false)
 		h.handleInputTranscript(ev.Transcript)
 	case "conversation.item.input_audio_transcription.failed":
-		h.inputTranscriptFailed.Store(true)
 		// Treat failed ASR like unclear audio. Do not guess.
 		h.emitVoiceState("listening")
 	case "response.created":
@@ -2045,6 +2068,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// deltas re-open playback normally (markSpeaking is otherwise a no-op while
 		// barged is set).
 		h.barged.Store(false)
+		h.remoteAudioTailUntil.Store(0)
 		// A response is now generating — the serialized sender waits for its
 		// response.done before sending the next response.create. Gate capture
 		// immediately, not only once output_audio_buffer.started arrives: otherwise
@@ -2060,6 +2084,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		h.speakingEpoch.Add(1)
 		h.respBusy.Store(true)
 		if h.audio != nil {
+			h.audio.SetPlaybackTailProtected(false)
 			h.audio.SetPlaybackEnabled(true)
 			h.audio.SetSpeaking(true)
 		}
@@ -2075,7 +2100,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// GA rejects a response.create sent while a response is active. Signal the
 		// sender to retry instead of silently losing the turn (the exact code
 		// kocoro-reachy matches: conversation_already_has_active_response).
-		if ev.Error.Code == "conversation_already_has_active_response" {
+		if isActiveResponseRejection(h.provider, ev.Error.Type, ev.Error.Code, ev.Error.Message) {
 			signalNonBlocking(h.respRejected)
 		}
 		// An empty-buffer commit rejection means the manual fallback commit found
@@ -2087,6 +2112,10 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// would need its own snapshot of this counter.
 		if ev.Error.Code == "input_audio_buffer_commit_empty" {
 			h.commitEmptySeq.Add(1)
+		}
+		if isTerminalProviderError(h.provider, ev.Error.Type, ev.Error.Code, ev.Error.Message) && h.onProviderFatal != nil {
+			err := fmt.Errorf("provider error: type=%q code=%q message=%q", ev.Error.Type, ev.Error.Code, ev.Error.Message)
+			h.providerFatal.Do(func() { go h.onProviderFatal(err) })
 		}
 	case "response.function_call_arguments.done":
 		args := unwrapArgs(ev.Arguments)
@@ -2219,6 +2248,12 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.finishToolLoopResponse(ev.Response.ID)
 		}
 		h.responseDoneAt = time.Now()
+		if h.provider == string(ProviderQwen) && h.outputBufferActive.Load() {
+			h.beginProviderRemoteAudioTail()
+			if h.audio != nil {
+				h.audio.SetPlaybackTailProtected(true)
+			}
+		}
 		if eventLogEnabled() {
 			log.Printf("koe[timing]: response_done response_ms=%d output_elapsed_ms=%d", elapsedMS(h.responseCreatedAt, h.responseDoneAt), elapsedMS(h.outputStartedAt, h.responseDoneAt))
 		}
@@ -2242,14 +2277,28 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if transcriptLogEnabled() && ev.Transcript != "" {
 			log.Printf("koe[assistant]: %q", shortLogString(ev.Transcript, 500))
 		}
-		// When input transcription failed, a provider can still understand a raw
-		// dismissal but answer it verbally instead of selecting the lifecycle tool.
-		// A closed set of exact goodbye acknowledgements is enough evidence to finish
-		// that call; ordinary replies and successful transcripts never use this path.
-		if h.provider == string(ProviderQwen) && h.inputTranscriptFailed.Swap(false) && isDismissAcknowledgement(ev.Transcript) {
-			h.requestEndCall("assistant-dismiss-backstop")
-		}
 	}
+}
+
+func isActiveResponseRejection(provider, errorType, code, message string) bool {
+	if code == "conversation_already_has_active_response" {
+		return true
+	}
+	if provider != string(ProviderQwen) || errorType != "invalid_request_error" {
+		return false
+	}
+	msg := strings.ToLower(message)
+	return strings.Contains(msg, "active response") || strings.Contains(msg, "response is in progress")
+}
+
+func isTerminalProviderError(provider, errorType, code, message string) bool {
+	if provider != string(ProviderQwen) {
+		return false
+	}
+	if errorType == "server_error" || code == "server_error" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(message), "response stream timeout")
 }
 
 // handleInputTranscript logs the user's transcript for diagnostics and provides
@@ -2267,8 +2316,8 @@ func (h *eventHandler) handleInputTranscript(transcript string) {
 	if !koeEnvBool("KOE_ASR_DISMISS_BACKSTOP", !h.nativeFloorEnabled()) {
 		return
 	}
-	// Deterministic dismiss backstop: a whole-utterance control phrase (闭嘴/停/够了/
-	// 退出/再见/bye/…) hangs up regardless of whether the model also calls end_call —
+	// Deterministic dismiss backstop: a whole-utterance terminal phrase (退出/再见/
+	// bye/…) hangs up regardless of whether the model also calls end_call —
 	// gpt-realtime-mini is unreliable at that tool (1/7 live), so the fixed vocabulary
 	// cannot depend on it. requestEndCall owns the same handler-local terminal as the
 	// tool path, so a racing tool call is harmless. Runs regardless of KOE_TRANSCRIPT_LOG.

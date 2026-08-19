@@ -14,7 +14,6 @@ var koeRealtimeModels = map[string][]string{
 	"qwen": {
 		"qwen3.5-omni-flash-realtime",
 		"qwen3.5-omni-plus-realtime",
-		"qwen3-omni-flash-realtime",
 	},
 }
 

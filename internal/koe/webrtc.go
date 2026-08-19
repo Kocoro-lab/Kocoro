@@ -540,6 +540,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 		}
 		closedOnce.Do(func() { opts.OnClosed(err) })
 	}
+	h.onProviderFatal = notifyClosed
 	rc.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		switch s {
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
