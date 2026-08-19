@@ -4918,6 +4918,43 @@ func TestOpenAIComputerTaskToolSchemaSeparatesControlledAppsAndForegroundPolicy(
 	}
 }
 
+func TestOpenAIComputerTaskToolRejectsImplicitDeviceLocationInference(t *testing.T) {
+	ctx := agent.ContextWithToolInvocation(context.Background(), agent.ToolInvocation{
+		ToolName:    "computer_use",
+		ToolUseID:   "call-location",
+		UserRequest: "搜索我现在的位置，并查询该地今天的天气。",
+	})
+	result, err := (&openAIComputerTaskToolV1{}).Run(ctx,
+		`{"task":"读取 Weather 当前定位和天气","controlled_apps":["Weather"],`+
+			`"foreground_policy":"foreground_allowed","description":"读取当前位置天气"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError ||
+		!strings.Contains(result.Content, "physical_location_unavailable") ||
+		!strings.Contains(result.Content, "ask the user for a city or region") {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestOpenAIComputerTaskToolAllowsExplicitLocationAppRequest(t *testing.T) {
+	ctx := agent.ContextWithToolInvocation(context.Background(), agent.ToolInvocation{
+		ToolName:    "computer_use",
+		ToolUseID:   "call-weather-app",
+		UserRequest: "打开天气应用，读取应用里当前显示的位置和天气。",
+	})
+	result, err := (&openAIComputerTaskToolV1{}).Run(ctx,
+		`{"task":"读取 Weather 当前显示的位置和天气","controlled_apps":["Weather"],`+
+			`"foreground_policy":"foreground_allowed","description":"读取天气应用"}`)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.IsError || strings.Contains(result.Content, "physical_location_unavailable") ||
+		!strings.Contains(result.Content, "native_executor_unavailable") {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestOpenAIComputerTaskArgsRequireOneControlledAppWhenPreservingFrontmost(
 	t *testing.T,
 ) {

@@ -3465,9 +3465,10 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// and when the parent delegates a desktop goal, so ordinary Sonnet turns
 	// never pay provider-native preparation latency.
 	modelIntent := effectiveRunModelIntent(runCfg, agentOverride, req)
+	implicitPhysicalLocation := implicitPhysicalLocationRequestV1(visiblePrompt)
 	var computerReg *agent.ToolRegistry
 	var openAIComputerPrivate *daemonOpenAIComputerPrivateRuntimeV1
-	if baseReg.Has("computer_use") {
+	if !implicitPhysicalLocation && baseReg.Has("computer_use") {
 		computerReg, err = tools.CloneWithOpenAIComputerForRun(baseReg, runCfg)
 		if err != nil {
 			log.Printf(
@@ -3494,6 +3495,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	}
 
 	reg := tools.CloneWithRuntimeConfig(baseReg, runCfg)
+	applyImplicitPhysicalLocationToolPolicyV1(reg, visiblePrompt)
 	if agentOverride != nil {
 		reg = tools.ApplyToolFilter(reg, agentOverride)
 		// Enforce per-agent MCP server selection: drop MCP tools whose server is
@@ -3890,6 +3892,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// connection summary (degraded platforms only; healthy omitted → empty on a
 	// healthy new session). Preamble() is nil-safe.
 	stickyExtra := req.StickyContext
+	if implicitPhysicalLocation {
+		if stickyExtra != "" {
+			stickyExtra += "\n"
+		}
+		stickyExtra += implicitPhysicalLocationUnavailableContextV1
+	}
 	if req.NewSession && deps.ConnState != nil {
 		if pre := deps.ConnState.Preamble(); len(pre) > 0 {
 			if stickyExtra != "" {
