@@ -79,21 +79,18 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
-- Trusted `requires_approval=true` on an integration schema routes through the
-  normal approval flow (always-allow / auto_approve bypass as usual); absent is
-  false. Fetch + WS handshake advertise `integration_requires_approval`
-  (`client.CapIntegrationRequiresApproval`); Cloud withholds marked schemas
-  from daemons without it.
+- Integration `requires_approval=true` → normal approval flow (always-allow/
+  auto_approve bypasses apply); absent=false. Cloud withholds marked schemas
+  unless `integration_requires_approval` is advertised (fetch + WS).
 - Trusted `material_side_effect=false` permits observational batching without
-  the journal; absent is fail-closed. Calls use stable `request_id`; material
-  calls also use `Idempotency-Key`. Only pre-dispatch `provider_unavailable` is
-  known-no-effect; billing/provider/post-dispatch failures are not. Preserve
-  provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted material
-  `call_in_progress` is `outcome_unknown`: never commit/resend under a new ID.
-- Outcome-unknown material results are ordinary narratable tool errors (run
-  continues); the same-turn latch (`agent/unknown_outcome_gate.go`) rejects a
-  byte-identical tool+args repeat until the next user message.
-  Journal-unavailable (never executed) also continues as an ordinary error.
+  the journal; absent is fail-closed. Stable `request_id`; material calls add
+  `Idempotency-Key`. `provider_unavailable` and `provider_rejected` are
+  known-no-effect; others are not. Preserve
+  provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted
+  `call_in_progress` → `outcome_unknown`: never commit/resend under a new ID.
+- Outcome-unknown material results narrate as ordinary tool errors; the
+  same-turn latch (`agent/unknown_outcome_gate.go`) blocks byte-identical
+  tool+args repeats until the next user message.
 - SourceIntegration is identity-scoped. Key mutation invalidates generations
   before source clear, without the dispatch writer. Failed new-identity listing
   leaves it empty; same-identity refresh failure keeps it. ServerTool binds list
@@ -103,15 +100,10 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   preserving calendar/non-auth tools. The six concrete tools (`cloud_delegate`,
   publish/list/retract, generate/edit) lease generation through all `Run` retries;
   stale clones are known-no-effect. Serialize auth across accounts/keys.
-- X automation guardrails: `browser`,
-  `computer_use`, and canonical Playwright block X composer/publish controls but
-  preserve X reads/non-X mutation. Playwright omits `browser_run_code` and
-  `browser_evaluate`; CDP target check + call share a lock, and any X target
-  blocks mutation because X embeds a composer. Non-CDP has no target-state
-  guarantee. Native actions use guarded `computer_use`; shell/custom MCP are out
-  of scope. Browser-side only the user clicks X's Post button; agent posting
-  goes exclusively through the Cloud X tools (`x_prepare_post` removed,
-  superseded by `x_create_post`).
+- X publishing only via Cloud X tools (`x_prepare_post` removed).
+  `browser`/`computer_use`/builtin Playwright block X composer/publish
+  controls; Playwright omits `browser_run_code`/`browser_evaluate`; CDP: any
+  X target blocks mutation; non-CDP: no claim; shell/custom MCP unguarded.
 
 ## MCP
 
