@@ -230,12 +230,22 @@ On failure the tool probes FRESH health (never trusts the cached state at error 
 
 #### Integration tools (local agent)
 
-`tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`, `RequiresApproval()==false` — Cloud enforces access control). Each schema and tool is bound to the exact credential and verified-principal generation that listed it. Dispatch atomically rechecks that generation while capturing the credential, so a tool retained by an old agent loop or clone fails known-no-effect before reaching Cloud after any key/account mutation. Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
+`tools/register.go RegisterIntegrationTools` + `tools/server.go NewIntegrationTool` + `client/gateway.go`. The local agent loop does NOT go through Cloud's orchestrator, so Cloud's request-time tool injection never reaches it — the daemon MUST register the tools itself. `RegisterIntegrationTools` fetches active integration tool schemas from Cloud `GET /api/v1/integrations/tools` (X-API-Key, **no local allowlist** — Cloud already filters; local tool names still win on collision) and registers each as a `ServerTool` variant (`SourceIntegration`; `RequiresApproval()` reads the schema's optional `requires_approval` flag — absent means false, Cloud's own access control only). Each schema and tool is bound to the exact credential and verified-principal generation that listed it. Dispatch atomically rechecks that generation while capturing the credential, so a tool retained by an old agent loop or clone fails known-no-effect before reaching Cloud after any key/account mutation. Execution proxies to `POST /api/v1/integrations/tools/{name}/execute`.
 
 Cloud may add `material_side_effect` to a schema. Its presence is trusted
 policy: `false` keeps observational tools such as X identity reads out of the
 durable mutation journal and permits concurrent batching; absence stays
-fail-closed for older Cloud versions. Every execute body carries a stable
+fail-closed for older Cloud versions. Cloud may also add `requires_approval`
+(trusted policy too): `true` routes the tool through the normal local approval
+flow — first-use approval card, "Always Allow" persistence, per-agent
+`always_allow_tools`, and `daemon.auto_approve` all behave exactly as for
+local approval-requiring tools, with no integration special-casing. The list
+request advertises `integration_requires_approval` on `X-Kocoro-Capabilities`;
+Cloud fails closed and withholds `requires_approval:true` schemas from daemons
+without the token, because an older daemon would register them approval-free.
+The token is also on the WS handshake; its string constant lives in
+`internal/client` (`CapIntegrationRequiresApproval`), aliased into the daemon
+`Capabilities` slice. Every execute body carries a stable
 `request_id` when the agent dispatcher supplies a tool-use identity. Material
 calls additionally send the durable journal's `Idempotency-Key`; read-only
 calls never claim provider idempotency. Structured Cloud error codes preserve
@@ -246,9 +256,16 @@ material tools remain `outcome_unknown`. Integration usage preserves provider, m
 unit type/count, and cost through the tool result and usage emitter.
 `call_in_progress` is a separate known state: read-only calls may retry after
 waiting. Material calls poll only with the same durable request identity; if
-that bounded polling is exhausted, the result is journaled `outcome_unknown`,
-never committed, and the loop terminates rather than resending under a new
-identity.
+that bounded polling is exhausted, the result is journaled `outcome_unknown`
+and never committed. An outcome-unknown material result returns to the model
+as an ORDINARY narratable tool error (the run continues — no synthetic
+terminal assistant message), while the same-turn retry latch
+(`agent/unknown_outcome_gate.go`) locally rejects any byte-identical
+tool+arguments repeat for the rest of the user turn — before the approval
+flow, with zero network. The next user message (fresh run or committed
+mid-run injected follow-up) clears the latch; different arguments pass
+through. The journal-unavailable sibling (call definitively never executed)
+also continues as an ordinary error.
 
 #### Integration tools: refresh triggers
 
@@ -277,10 +294,9 @@ completes, out of band), so `connect`/`delete` fire a best-effort refresh but th
 reliable trigger is Desktop calling `POST /integrations/refresh`. Capability
 `integration_tools_v1`.
 
-`x_prepare_post` is a separate local Deferred tool, not an integration mutation.
-It builds `https://x.com/intent/tweet` without OAuth, network access, or a browser
-opener and reports `published:false`. Success is turn-terminal: remaining calls
-in the same model batch are discarded. The local `browser` tool rejects direct
+X automation guardrails (independent of the X integration tools — publishing
+happens ONLY through Cloud's authorized X API tools, never through browser or
+GUI automation): the local `browser` tool rejects direct
 X composer navigation and publish-capable mutation on an observed/cached X
 composer; URL-observation failure also rejects explicit composer controls. The
 `computer_use` guard rejects composer controls and coordinate clicks whose exact
@@ -298,9 +314,10 @@ any observed X target blocks publish-capable mutation without relying on element
 labels. Non-CDP Playwright keeps ordinary mutation available but makes no
 target-state X-protection claim. Observations, ordinary X links/read navigation,
 and mutation when no X target is present remain available. These runtime guards do
-not police arbitrary shell commands or custom MCP servers. Only the user's
-explicit link click and later click on X's Post button may publish. Audit summaries omit both draft text and
-the generated URL.
+not police arbitrary shell commands or custom MCP servers. Browser-side, only
+the user's own click on X's Post button may publish. (The former
+`x_prepare_post` Web Intent tool was removed — superseded by the Cloud
+`x_create_post` integration tool.)
 
 #### Attachments
 
@@ -621,5 +638,6 @@ Conditional:
 - `list_my_published_files` — same gating. Read-only, no approval. `limit` (≤100), `offset`, optional `kind` filter (same enum). Returns paged `UploadEntry` rows keyed by id; rendering surfaces a `kind=…` badge per row so the LLM can answer "which of these are session shares".
 - `retract_published_file` — same gating. Destructive, requires approval. Args: `id` (UUID from list) + `description`. 404 conflates not-found/already-retracted/not-yours to avoid existence leak.
 - `generate_image` / `edit_image` — same gating. Always approval (paid quota + permanent CDN). Edit requires `image_urls` 1-4 entries starting with `https://static.kocoro.ai/`.
+- `x_upload_media` — same gating. Always approval; explicit Deferred. Uploads one local image (jpg/jpeg/png/gif/webp; 5 MB, GIF 15 MB — X's own caps) for the X posting tools: local guards (publish_to_web's path blocklist + narrow media allowlist) → CDN staging upload (`kind=image`, metadata `{"purpose":"x_media"}`) → Cloud integration execute `x_upload_media` with `media_url` → best-effort delete of the staging upload (skipped when the Upload response has no `id`; failure logged, never overrides the result) → returns `media_id` + expiry hint. Cloud defines a same-named integration schema for execute-route authz; the local tool wins by the standard local-priority collision rules. `extractToolPath` recognizes the conventional `file_path` argument generically, so user-attached files ride the attachment auto-approve.
 - `tool_search` — registered Direct whenever the effective registry contains cold Deferred tools; keyword retrieval uses the internal deterministic BM25 index in `agent/toolsearch_index.go`
 - **`calendar_*` family (8 tools)** — registered only when daemon is a Kocoro Desktop subprocess (`tools.RegisterCalendarTools` no-ops when the `DesktopRPCBroker` is nil; TUI/one-shot/MCP/scheduled paths fall back to `applescript` + Calendar.app). Tools: `calendar_check_permission`, `calendar_request_permission` (approval, 5-min TCC-dialog timeout), `calendar_list_sources`, `calendar_list_events`, `calendar_get_event`, `calendar_create_event` / `_update_event` / `_delete_event` (approval). Backed by Calendar RPC v1 (Unix socket reverse RPC to Desktop's EventKit); protocol reference in the kocoro skill `references/calendar.md` + `references/desktop-rpc.md`. `attendees` is metadata-only — `invitations_sent` always `false` in v1. `update_event` rejects `scope=all`; use delete + create.

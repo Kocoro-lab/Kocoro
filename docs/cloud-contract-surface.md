@@ -114,9 +114,21 @@ This repo: `internal/client/gateway.go` (`ServerToolSchema`,
 Cloud: `go/orchestrator/cmd/gateway/internal/handlers/integrations_tools.go`.
 
 `GET /api/v1/integrations/tools` may add the optional trusted fields
-`provider` and `material_side_effect`. Missing materiality means material
-side effect for backward compatibility; only explicit `false` bypasses the
-durable mutation journal. `POST .../{name}/execute` accepts optional
+`provider`, `material_side_effect`, and `requires_approval`. Missing
+materiality means material side effect for backward compatibility; only
+explicit `false` bypasses the durable mutation journal.
+
+`requires_approval` (absent = false) routes the tool through the daemon's
+normal local approval flow; it is only the permission engine's default input,
+so persisted always-allow, per-agent `always_allow_tools`, and
+`daemon.auto_approve` bypass it like any other approval-requiring tool. The
+list request advertises `integration_requires_approval` on the
+`X-Kocoro-Capabilities` header (same comma-separated grammar as the WS
+handshake; constant `CapIntegrationRequiresApproval` in
+`internal/client/gateway.go`, also in the daemon's WS `Capabilities` slice).
+**Cloud MUST fail closed on this token**: a daemon that does not advertise it
+would register `requires_approval:true` tools approval-free, so Cloud only
+includes such schemas for advertising callers. `POST .../{name}/execute` accepts optional
 `request_id`, and material calls also send `Idempotency-Key`. Both identities
 must remain stable for a retry of one tool call and distinct across separate
 tool calls.

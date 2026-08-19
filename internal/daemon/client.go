@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
 // ErrWSAuthRejected is the sentinel returned by Connect / RunWithReconnect
@@ -237,6 +239,15 @@ const (
 	// pasted credential for token-mode providers; the wire behaviour it
 	// advertises (body forwarded verbatim) is unchanged, so it keeps the name.
 	CapIntegrationConnectBodyV1 = "integration_connect_body_v1"
+	// CapIntegrationRequiresApproval — this daemon honors the per-tool
+	// requires_approval flag on integration tool schemas by routing marked
+	// tools through the local approval flow. Cloud fails closed on it: only
+	// daemons advertising the token receive requires_approval:true schemas,
+	// because an older daemon would register them approval-free. The string
+	// is owned by internal/client (the schema fetch also sends it on
+	// X-Kocoro-Capabilities); aliased here so the WS handshake and GET
+	// /status advertise the same token without drift.
+	CapIntegrationRequiresApproval = client.CapIntegrationRequiresApproval
 	// CapMessageIdempotencyV1 — POST /message accepts idempotency_key together
 	// with a client-minted session_id. A completed retry returns the persisted
 	// result without invoking the LLM or tools again; interrupted/failed requests
@@ -362,6 +373,7 @@ var Capabilities = []string{
 	CapSearchV1,
 	CapIntegrationToolsV1,
 	CapIntegrationConnectBodyV1,
+	CapIntegrationRequiresApproval,
 	CapMessageIdempotencyV1,
 	CapMessageIdempotencyReceiptV2,
 	CapQuestionV1,

@@ -2757,12 +2757,32 @@ func (c *GatewayClient) Health(ctx context.Context) error {
 
 // --- Server tool types (used by tools.RegisterAll) ---
 
+// CapIntegrationRequiresApproval is the capability token that unlocks
+// approval-gated integration tools. Cloud fails closed: it only includes
+// `requires_approval: true` schemas in GET /api/v1/integrations/tools for a
+// caller advertising this token, because an older daemon would register them
+// with RequiresApproval()==false and execute consequential writes (e.g. X
+// posting) with zero approval. Advertised on the integration tool list
+// request here and on the WS handshake (internal/daemon aliases this
+// constant into its Capabilities slice).
+const CapIntegrationRequiresApproval = "integration_requires_approval"
+
+// integrationListCapabilities is the X-Kocoro-Capabilities value sent with
+// integration tool schema fetches. Comma-separated, same header grammar as
+// the WS handshake.
+var integrationListCapabilities = []string{CapIntegrationRequiresApproval}
+
 type ServerToolSchema struct {
 	Name               string         `json:"name"`
 	Description        string         `json:"description"`
 	Parameters         map[string]any `json:"parameters,omitempty"`
 	Provider           string         `json:"provider,omitempty"`
 	MaterialSideEffect *bool          `json:"material_side_effect,omitempty"`
+	// RequiresApproval marks a tool whose execution must pass the local
+	// approval flow (first-use approval card). Cloud sets it on consequential
+	// integration tools and omits it otherwise; absence means false so old
+	// Cloud responses keep today's no-approval behavior.
+	RequiresApproval bool `json:"requires_approval,omitempty"`
 }
 
 type ToolExecuteRequest struct {
@@ -2772,11 +2792,15 @@ type ToolExecuteRequest struct {
 }
 
 type ToolExecuteResponse struct {
-	Success         bool            `json:"success"`
-	Output          json.RawMessage `json:"output"`
-	Text            *string         `json:"text"`
-	Error           *string         `json:"error"`
-	ExecutionTimeMs int             `json:"execution_time_ms,omitempty"`
+	Success bool            `json:"success"`
+	Output  json.RawMessage `json:"output"`
+	Text    *string         `json:"text"`
+	Error   *string         `json:"error"`
+	// ErrorDetail optionally carries the provider's human-readable failure
+	// reason (e.g. X's "duplicate content" text on a provider_rejected
+	// failure). Absent on older Cloud deployments.
+	ErrorDetail     string `json:"error_detail,omitempty"`
+	ExecutionTimeMs int    `json:"execution_time_ms,omitempty"`
 	// Usage reports resource consumption from the underlying provider (e.g.
 	// xAI Grok tokens for x_search, SerpAPI query count for web_search).
 	// Server-populated when available; nil when the tool does not bill per call.
@@ -2847,8 +2871,12 @@ type IntegrationToolAPIError struct {
 	StatusCode int
 	Code       string
 	Message    string
-	Body       string
-	apiError   *APIError
+	// ErrorDetail is the optional provider-level failure reason forwarded by
+	// Cloud (execute response field `error_detail`). Empty on older Cloud
+	// deployments and on errors with no provider detail.
+	ErrorDetail string
+	Body        string
+	apiError    *APIError
 }
 
 func (e *IntegrationToolAPIError) Error() string {
@@ -3006,6 +3034,9 @@ func (c *GatewayClient) ListIntegrationToolsWithGeneration(ctx context.Context) 
 	if key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
+	// Cloud gates approval-requiring tool schemas on this advertisement
+	// (fail-closed against older daemons); see CapIntegrationRequiresApproval.
+	req.Header.Set("X-Kocoro-Capabilities", strings.Join(integrationListCapabilities, ","))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, generation, fmt.Errorf("request failed: %w", err)
@@ -3124,10 +3155,11 @@ func (c *GatewayClient) executeIntegrationToolWithIdentityForGeneration(
 		body := readResponseBody(resp)
 		legacy := &APIError{StatusCode: resp.StatusCode, Body: body}
 		var envelope struct {
-			Error     string `json:"error"`
-			Code      string `json:"code"`
-			ErrorCode string `json:"error_code"`
-			Message   string `json:"message"`
+			Error       string `json:"error"`
+			Code        string `json:"code"`
+			ErrorCode   string `json:"error_code"`
+			Message     string `json:"message"`
+			ErrorDetail string `json:"error_detail"`
 		}
 		_ = json.Unmarshal([]byte(body), &envelope)
 		code := strings.TrimSpace(envelope.ErrorCode)
@@ -3138,11 +3170,12 @@ func (c *GatewayClient) executeIntegrationToolWithIdentityForGeneration(
 			code = strings.TrimSpace(envelope.Error)
 		}
 		return nil, &IntegrationToolAPIError{
-			StatusCode: resp.StatusCode,
-			Code:       code,
-			Message:    strings.TrimSpace(envelope.Message),
-			Body:       body,
-			apiError:   legacy,
+			StatusCode:  resp.StatusCode,
+			Code:        code,
+			Message:     strings.TrimSpace(envelope.Message),
+			ErrorDetail: strings.TrimSpace(envelope.ErrorDetail),
+			Body:        body,
+			apiError:    legacy,
 		}
 	}
 	var result ToolExecuteResponse

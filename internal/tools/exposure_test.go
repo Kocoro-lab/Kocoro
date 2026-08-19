@@ -73,7 +73,6 @@ func TestRegisteredLocalToolExposureMatrix(t *testing.T) {
 		"system_info":         agent.ToolExposureDirect,
 		"calculate":           agent.ToolExposureDirect,
 		"current_time":        agent.ToolExposureDirect,
-		"x_prepare_post":      agent.ToolExposureDeferred,
 		"clipboard":           agent.ToolExposureDirect,
 		"notify":              agent.ToolExposureDirect,
 		"present_deliverable": agent.ToolExposureDirect,

@@ -284,6 +284,7 @@ func runApprovedToolCall(
 				digest,
 			)
 			executionResult.sideEffectResultTransformed = true
+			executionResult.sideEffectOutcomeUnknown = true
 			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, executionResult.result.Content)
 			fatalErr = wrapSideEffectExecutionError(
 				ErrSideEffectOutcomeUnknown, ac.fc.Name,
@@ -322,6 +323,7 @@ func runApprovedToolCall(
 		} else {
 			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
 			executionResult.sideEffectResultTransformed = true
+			executionResult.sideEffectOutcomeUnknown = true
 			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 			executionResult.err = nil
 			return executionResult, wrapSideEffectExecutionError(
@@ -341,6 +343,7 @@ func runApprovedToolCall(
 	if explicitUnknown {
 		markErr := journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
 		executionResult.sideEffectResultTransformed = true
+		executionResult.sideEffectOutcomeUnknown = true
 		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 		executionResult.err = nil
 		return executionResult, wrapSideEffectExecutionError(
@@ -353,6 +356,7 @@ func runApprovedToolCall(
 		} else {
 			_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
 			executionResult.sideEffectResultTransformed = true
+			executionResult.sideEffectOutcomeUnknown = true
 			executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 			executionResult.err = nil
 			return executionResult, wrapSideEffectExecutionError(
@@ -370,6 +374,7 @@ func runApprovedToolCall(
 	} else {
 		_ = journal.MarkOutcomeUnknown(journalCtx, prepared.ExecutionID, digest)
 		executionResult.sideEffectResultTransformed = true
+		executionResult.sideEffectOutcomeUnknown = true
 		executionResult.result = sideEffectOutcomeUnknownResult(ac.fc.Name, sideEffectOutcomeDetail(executionResult.result, executionResult.err))
 		executionResult.err = nil
 		return executionResult, wrapSideEffectExecutionError(

@@ -56,7 +56,7 @@ func TestUploadHappyPath(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{"url":"https://x/y/landing.html","key":"k","size":12,"content_type":"text/html"}`))
+		_, _ = w.Write([]byte(`{"id":"11111111-2222-3333-4444-555555555555","url":"https://x/y/landing.html","key":"k","size":12,"content_type":"text/html"}`))
 	}))
 	defer srv.Close()
 
@@ -67,6 +67,11 @@ func TestUploadHappyPath(t *testing.T) {
 	}
 	if res.URL != "https://x/y/landing.html" {
 		t.Errorf("URL = %q", res.URL)
+	}
+	// The row id is the deletion handle (x_upload_media retracts its staging
+	// copy with it); absent on older Cloud responses, so decode must be lax.
+	if res.ID != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("ID = %q", res.ID)
 	}
 	if !got.hadAPIKey {
 		t.Errorf("X-API-Key header missing")

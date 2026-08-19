@@ -12,7 +12,6 @@ import (
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
-	"github.com/Kocoro-lab/ShanClaw/internal/runstatus"
 )
 
 type recordingSideEffectJournal struct {
@@ -506,7 +505,11 @@ func TestExecuteBatches_ComputerUseNoCommitFailurePersistsDefinitiveResult(t *te
 type journalLoopClient struct{ calls atomic.Int32 }
 
 func (c *journalLoopClient) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
-	c.calls.Add(1)
+	// First turn issues the side-effect calls; later turns narrate and end,
+	// matching the loop's continue-and-narrate handling of uncertain outcomes.
+	if c.calls.Add(1) > 1 {
+		return &client.CompletionResponse{OutputText: "narrated", FinishReason: "end_turn"}, nil
+	}
 	return &client.CompletionResponse{
 		FinishReason: "tool_use",
 		ToolCalls: []client.FunctionCall{
@@ -621,15 +624,17 @@ func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing
 	})
 
 	text, _, err := loop.Run(context.Background(), "mutate external state", nil, nil)
-	if !errors.Is(err, ErrSideEffectOutcomeUnknown) {
-		t.Fatalf("Run error = %v, want outcome unknown", err)
+	// An uncertain outcome no longer hard-stops the run: the ordinary tool
+	// error returns to the model, which narrates on the next turn while the
+	// retry latch blocks a byte-identical automatic re-dispatch.
+	if err != nil {
+		t.Fatalf("Run error = %v, want clean narrated completion", err)
 	}
-	const wantText = "The external action may have completed, but its result could not be durably confirmed. It was not retried. Review the external system before retrying."
-	if text != wantText {
-		t.Fatalf("Run text = %q, want %q", text, wantText)
+	if text != "narrated" {
+		t.Fatalf("Run text = %q, want the model's narration turn", text)
 	}
-	if llm.calls.Load() != 1 {
-		t.Fatalf("LLM calls = %d, want 1", llm.calls.Load())
+	if llm.calls.Load() != 2 {
+		t.Fatalf("LLM calls = %d, want dispatch turn + narration turn", llm.calls.Load())
 	}
 	if tool.runs.Load() != 1 {
 		t.Fatalf("tool runs = %d, want only the first call dispatched", tool.runs.Load())
@@ -637,12 +642,25 @@ func TestAgentLoop_SideEffectJournalCheckpointsToolCallBeforeDispatch(t *testing
 	if len(handler.results) != 1 {
 		t.Fatalf("handler results = %+v, want only the dispatched call", handler.results)
 	}
-	if checkpointCalls != 2 {
-		t.Fatalf("checkpoint calls = %d, want pre-dispatch + terminal result", checkpointCalls)
+	if checkpointCalls < 2 {
+		t.Fatalf("checkpoint calls = %d, want pre-dispatch + forced result checkpoint", checkpointCalls)
 	}
-	status := loop.LastRunStatus()
-	if !status.Partial || status.FailureCode != runstatus.CodeSideEffectOutcomeUnknown {
-		t.Fatalf("run status = %+v", status)
+	if status := loop.LastRunStatus(); status.FailureCode != "" {
+		t.Fatalf("run status = %+v, want no failure code on a narrated completion", status)
+	}
+	unknownPaired := false
+	for _, message := range loop.RunMessages() {
+		for _, block := range message.Content.Blocks() {
+			if block.Type == "tool_result" && block.ToolUseID == "side-effect-call" {
+				resultText := client.ToolResultText(block)
+				unknownPaired = block.IsError &&
+					strings.Contains(resultText, "outcome could not be confirmed") &&
+					strings.Contains(resultText, "blocked locally for the rest of this turn")
+			}
+		}
+	}
+	if !unknownPaired {
+		t.Fatal("uncertain result was not paired as an ordinary narratable tool error")
 	}
 	skippedPaired := false
 	for _, message := range loop.RunMessages() {
