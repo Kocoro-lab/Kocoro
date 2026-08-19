@@ -903,6 +903,14 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	return nil
 }
 
+func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, retireCall bool) *koe.CallState {
+	if state == nil || !retireCall {
+		return state
+	}
+	mailbox.RetireBurst(state.BurstID())
+	return nil
+}
+
 // runDesktopCall is the resident control-port loop. Desktop keeps a warm Realtime
 // session ready while idle, but the audio device is call-scoped: /call/start opens
 // the selected backend, /call/end closes the used session and audio, then warms
@@ -933,9 +941,12 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	// startCall/interruptCall, and read only at call time.
 	var endCall func()
 	var callContext koe.StartCallRequest
-	newSessionState := func() (*koe.CallState, *koe.Dispatcher) {
-		state := koe.NewCallState(newBurstID(), cfg.agent)
-		resultMailbox.BeginBurst(state.BurstID())
+	newSessionState := func(existing *koe.CallState) (*koe.CallState, *koe.Dispatcher) {
+		state := existing
+		if state == nil {
+			state = koe.NewCallState(newBurstID(), cfg.agent)
+			resultMailbox.BeginBurst(state.BurstID())
+		}
 		state.SetCallContext(callContext)
 		disp := koe.NewDispatcher(client, resolverHolder.Load(), state, func(_ context.Context, action string) error {
 			if ctrl == nil {
@@ -1026,22 +1037,22 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			go audio.PlayReadyEarcon()
 		}
 	}
-	closeSessionLocked := func() (*koe.RealtimeConn, context.CancelFunc, *koe.AudioIO) {
+	closeSessionLocked := func(retireCall bool) (*koe.RealtimeConn, context.CancelFunc, *koe.AudioIO) {
 		sessionSeq++
 		conn, cancel := curConn, sessionCancel
 		audio := curAudio
-		if curState != nil {
-			resultMailbox.RetireBurst(curState.BurstID())
+		curState = closeDesktopSessionState(resultMailbox, curState, retireCall)
+		curConn, curAudio, sessionCancel = nil, nil, nil
+		if retireCall {
+			snapState.Store(nil)
+			callContext = koe.StartCallRequest{}
+			callStarted = time.Time{}
 		}
-		curConn, curState, curAudio, sessionCancel = nil, nil, nil, nil
-		snapState.Store(nil)
 		snapAudio.Store(nil)
 		curAudioStarted = false
-		callContext = koe.StartCallRequest{}
 		warming = false
 		sessionReady = false
 		readyEmitted = false
-		callStarted = time.Time{}
 		return conn, cancel, audio
 	}
 	var ensureWarmSessionLocked func(string)
@@ -1077,7 +1088,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				return
 			}
 			log.Printf("koe[timing]: refreshing idle warm session after %s reason=%s", idleSessionTTL, reason)
-			conn, cancel, audio := closeSessionLocked()
+			conn, cancel, audio := closeSessionLocked(true)
 			ensureWarmSessionLocked("ttl_refresh")
 			sessMu.Unlock()
 			stopSessionResources(conn, cancel, audio)
@@ -1090,16 +1101,43 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		log.Printf("koe: warm session closed: %v", err)
-		wasActive := callActive
-		callActive = false
-		conn, cancel, audio := closeSessionLocked()
-		if wasActive {
-			ctrl.EmitVoiceState("idle")
-			ctrl.EmitCallState("ended")
+		if !callActive {
+			conn, cancel, audio := closeSessionLocked(true)
+			ensureWarmSessionLocked("session_closed")
+			sessMu.Unlock()
+			stopSessionResources(conn, cancel, audio)
+			return
 		}
-		ensureWarmSessionLocked("session_closed")
+
+		// A provider session can expire while the logical Desktop call is still
+		// active. Preserve the CallState and ResultMailbox burst, replace only the
+		// transport, and let queued task results continue on the new connection.
+		ctrl.EmitCallState("connecting")
+		callStarted = time.Now()
+		conn, cancel, audio := closeSessionLocked(false)
 		sessMu.Unlock()
 		stopSessionResources(conn, cancel, audio)
+
+		sessMu.Lock()
+		if !callActive {
+			sessMu.Unlock()
+			return
+		}
+		ensureWarmSessionLocked("active_session_reconnect")
+		if err := startSessionAudioLocked("active_session_reconnect"); err != nil {
+			log.Printf("koe: audio restart failed: %v", err)
+			callActive = false
+			ctrl.EmitVoiceState("idle")
+			ctrl.EmitCallState("ended")
+			conn, cancel, audio := closeSessionLocked(true)
+			ensureWarmSessionLocked("audio_restart_retry")
+			sessMu.Unlock()
+			stopSessionResources(conn, cancel, audio)
+			return
+		}
+		emitReadyLocked()
+		resultMailbox.Wake()
+		sessMu.Unlock()
 	}
 	failActiveCallLocked := func(msg string, err error) {
 		log.Printf("koe: %s: %v", msg, err)
@@ -1137,7 +1175,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		readyEmitted = false
 		sessionSeq++
 		seq := sessionSeq
-		state, disp := newSessionState()
+		var existingState *koe.CallState
+		if callActive {
+			existingState = curState
+		}
+		state, disp := newSessionState(existingState)
 		curState = state
 		curAudio = audio
 		snapState.Store(state)
@@ -1219,7 +1261,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 			if cerr != nil {
 				failActiveCallLocked("connect failed", cerr)
-				conn, scancel, audio := closeSessionLocked()
+				conn, scancel, audio := closeSessionLocked(true)
 				scheduleWarmRetry("connect_retry")
 				sessMu.Unlock()
 				stopSessionResources(conn, scancel, audio)
@@ -1255,7 +1297,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			log.Printf("koe: audio start failed: %v", err)
 			ctrl.EmitVoiceState("idle")
 			ctrl.EmitCallState("ended")
-			conn, cancel, audio := closeSessionLocked()
+			conn, cancel, audio := closeSessionLocked(true)
 			ensureWarmSessionLocked("audio_start_retry")
 			sessMu.Unlock()
 			stopSessionResources(conn, cancel, audio)
@@ -1279,7 +1321,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		callActive = false
-		conn, cancel, audio := closeSessionLocked()
+		conn, cancel, audio := closeSessionLocked(true)
 		ctrl.EmitVoiceState("idle")
 		ctrl.EmitCallState("ended")
 		ensureWarmSessionLocked("post_call")
@@ -1427,7 +1469,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	controlClosing.Store(true)
 	_ = ln.Close()
 	sessMu.Lock()
-	conn, cancel, audio := closeSessionLocked()
+	conn, cancel, audio := closeSessionLocked(true)
 	sessMu.Unlock()
 	stopSessionResources(conn, cancel, audio)
 	return nil

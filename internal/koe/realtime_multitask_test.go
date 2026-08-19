@@ -221,14 +221,14 @@ func TestQwenParallelTaskGroupSubmitsAllOutputsBeforeOneContinuation(t *testing.
 	if !captured.sentContains(`"call_id":"call-weather"`) || !captured.sentContains(`"call_id":"call-news"`) {
 		t.Fatalf("Qwen batch lost provider call ids: %v", captured.types())
 	}
-	if captured.sentContains("TAIL-MUST-BE-BOUNDED") {
-		t.Fatal("Qwen function outputs included the tail of a full report")
+	if !captured.sentContains("TAIL-MUST-BE-BOUNDED") {
+		t.Fatal("Qwen function outputs lost the full daemon replies")
 	}
-	if !captured.sentContains("weather concise") || !captured.sentContains("news concise") {
-		t.Fatal("Qwen function outputs lost daemon spoken summaries")
+	if captured.sentContains("weather concise") || captured.sentContains("news concise") || captured.sentContains("spoken_summary") {
+		t.Fatal("Qwen function outputs revived the retired spoken-summary contract")
 	}
 	if !captured.sentContains("weather key facts") || !captured.sentContains("news key facts") {
-		t.Fatal("Qwen function outputs lost bounded factual excerpts")
+		t.Fatal("Qwen function outputs lost daemon result facts")
 	}
 }
 

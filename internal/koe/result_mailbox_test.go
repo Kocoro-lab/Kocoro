@@ -339,8 +339,17 @@ func TestResultDeliverySurvivesRealtimeTeardown(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("old connection never attempted result delivery")
 	}
+	select {
+	case <-m.notifications():
+	default:
+	}
 	cancel1() // no response.created: the old connection disappears mid-delivery
 	waitForMailboxOwner(t, m, "", time.Second)
+	select {
+	case <-m.notifications():
+	case <-time.After(time.Second):
+		t.Fatal("connection teardown released a result without waking its replacement")
+	}
 
 	secondCreate := make(chan string, 1)
 	resultContext := make(chan string, 1)

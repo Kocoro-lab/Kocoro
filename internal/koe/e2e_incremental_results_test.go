@@ -68,7 +68,7 @@ func TestKoeDefaultCompoundRequestUsesOneDoTaskE2E(t *testing.T) {
 
 	send := func(v any) error {
 		body, _ := json.Marshal(v)
-		return rc.dc.SendText(string(body))
+		return rc.sendText(string(body))
 	}
 	h := newEventHandler(disp, state, audio, send)
 	h.language = "zh"
@@ -173,8 +173,6 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	weatherRelease := make(chan struct{})
 	newsRelease := make(chan struct{})
 	var weatherOnce, newsOnce sync.Once
-	defer weatherOnce.Do(func() { close(weatherRelease) })
-	defer newsOnce.Do(func() { close(newsRelease) })
 	requests := make(chan DoTaskRequest, 2)
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/message" {
@@ -211,7 +209,11 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 			})
 		}
 	}))
-	defer mock.Close()
+	defer func() {
+		weatherOnce.Do(func() { close(weatherRelease) })
+		newsOnce.Do(func() { close(newsRelease) })
+		mock.Close()
+	}()
 
 	audio, err := NewAudioIO()
 	if err != nil {
@@ -262,20 +264,25 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	})
 	persona := "You are Kocoro, a concise Chinese voice assistant. For current weather and news, call do_task. " +
 		ParallelTaskInstructions + " Before the calls say only 我查一下 and nothing else."
-	rc.dc.OnOpen(func() {
-		dcOnce.Do(func() { close(dataChannelOpen) })
-		if provider == ProviderQwen {
-			_ = send(qwenSessionConfig(persona, DefaultQwenRealtimeVoice))
-			return
-		}
-		_ = send(sessionConfig(persona, DefaultOpenAIRealtimeVoice, false))
-	})
-	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
+	var configOnce sync.Once
+	sendConfig := func() {
+		configOnce.Do(func() {
+			if provider == ProviderQwen {
+				_ = send(qwenSessionConfig(persona, DefaultQwenRealtimeVoice))
+				return
+			}
+			_ = send(sessionConfig(persona, DefaultOpenAIRealtimeVoice, false))
+		})
+	}
+	handleMessage := func(m webrtc.DataChannelMessage) {
 		var ev struct {
 			Type       string `json:"type"`
 			Transcript string `json:"transcript"`
 		}
 		_ = json.Unmarshal(m.Data, &ev)
+		if provider == ProviderQwen && ev.Type == "session.created" {
+			sendConfig()
+		}
 		h.handleEvent(ctx, m.Data)
 		switch ev.Type {
 		case "session.updated":
@@ -291,7 +298,25 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 			apiErrors = append(apiErrors, string(m.Data))
 			eventMu.Unlock()
 		}
-	})
+	}
+	wireDataChannel := func(dc *webrtc.DataChannel, configureOnOpen bool) {
+		dc.OnOpen(func() {
+			dcOnce.Do(func() { close(dataChannelOpen) })
+			if configureOnOpen {
+				sendConfig()
+			}
+		})
+		dc.OnMessage(handleMessage)
+	}
+	wireDataChannel(rc.dc, provider == ProviderOpenAI)
+	if provider == ProviderQwen {
+		rc.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			if dc.Label() == "txt" {
+				rc.setDataChannel(dc)
+			}
+			wireDataChannel(dc, false)
+		})
+	}
 	if provider == ProviderQwen {
 		daemonURL := os.Getenv("KOE_E2E_DAEMON_URL")
 		if daemonURL == "" {
@@ -353,7 +378,10 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	eventMu.Lock()
 	initialSpeech := append([]string(nil), transcripts...)
 	eventMu.Unlock()
-	if len(initialSpeech) != 1 || strings.Trim(initialSpeech[0], " \t\r\n，。！？,.!?") != "我查一下" {
+	if provider == ProviderQwen && len(initialSpeech) == 0 {
+		// The provider may omit the optional acknowledgement and go directly to
+		// the requested tool calls. Silence is preferable to delivery narration.
+	} else if len(initialSpeech) != 1 || strings.Trim(initialSpeech[0], " \t\r\n，。！？,.!?") != "我查一下" {
 		t.Fatalf("task handoff speech=%q, want one bare acknowledgement and no delivery narration", initialSpeech)
 	}
 

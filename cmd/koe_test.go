@@ -829,6 +829,31 @@ func TestKoeCmdHasBargeInFlag(t *testing.T) {
 	}
 }
 
+func TestCloseDesktopSessionStatePreservesActiveCallResults(t *testing.T) {
+	mailbox := koe.NewResultMailbox()
+	state := koe.NewCallState("active-call", "")
+	mailbox.BeginBurst(state.BurstID())
+	ticket := mailbox.BeginTaskResult(state.BurstID(), "response-1", "call-1")
+
+	if got := closeDesktopSessionState(mailbox, state, false); got != state {
+		t.Fatal("provider reconnect replaced the logical call state")
+	}
+	if id := mailbox.EnqueueTaskResult(ticket, koe.SayResult{Status: "ok", Reply: "complete result"}, false); id == 0 {
+		t.Fatal("provider reconnect retired the active call result burst")
+	}
+
+	endedMailbox := koe.NewResultMailbox()
+	endedState := koe.NewCallState("ended-call", "")
+	endedMailbox.BeginBurst(endedState.BurstID())
+	endedTicket := endedMailbox.BeginTaskResult(endedState.BurstID(), "response-2", "call-2")
+	if got := closeDesktopSessionState(endedMailbox, endedState, true); got != nil {
+		t.Fatal("explicit call end kept the logical call state")
+	}
+	if id := endedMailbox.EnqueueTaskResult(endedTicket, koe.SayResult{Status: "ok", Reply: "late result"}, false); id != 0 {
+		t.Fatal("explicit call end kept accepting late voice results")
+	}
+}
+
 // TestApplyBargeInEnv locks the flag→env bridge: native floor is on while remote
 // irreversible interruption is off.
 func TestApplyBargeInEnv(t *testing.T) {

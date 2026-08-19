@@ -1005,6 +1005,8 @@ func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 		`"create_response":true`,
 		`"interrupt_response":false`,
 		`"function":{"name":"do_task"`,
+		`unless the user explicitly asked for detail`,
+		`Do not ask a follow-up question`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("qwenSessionConfig missing %s in %s", want, s)
