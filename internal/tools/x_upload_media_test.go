@@ -3,12 +3,16 @@ package tools
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
@@ -459,3 +463,153 @@ func TestXUploadMedia_UsagePropagatesFromExecuteResponse(t *testing.T) {
 		t.Errorf("usage = %#v", res.Usage)
 	}
 }
+
+// TestXUploadMedia_AmbiguousOutcomesAreOutcomeUnknown pins the ambiguity
+// classification: results that cannot prove the media never reached X must
+// carry SideEffectOutcomeUnknown so the journal records outcome_unknown and
+// the same-turn retry latch arms — never an ordinary error the model could
+// blindly re-send (duplicate media_id, double charge). Proven-no-dispatch
+// failures stay ordinary retryable errors.
+func TestXUploadMedia_AmbiguousOutcomesAreOutcomeUnknown(t *testing.T) {
+	cases := []struct {
+		name        string
+		err         error
+		wantUnknown bool
+	}{
+		{"outcome_unknown code", &client.IntegrationToolAPIError{StatusCode: 409, Code: "outcome_unknown"}, true},
+		{"call_in_progress code", &client.IntegrationToolAPIError{StatusCode: 409, Code: "call_in_progress"}, true},
+		{"post-dispatch 500", &client.IntegrationToolAPIError{StatusCode: 500, Code: "internal_error"}, true},
+		{"transport may have dispatched", &client.ToolDispatchError{MayHaveDispatched: true, Err: errors.New("response lost")}, true},
+		{"429 rejected before execution", &client.IntegrationToolAPIError{StatusCode: 429, Code: "rate_limited"}, false},
+		{"pre-dispatch transport failure", &client.ToolDispatchError{MayHaveDispatched: false, Retryable: true, Err: errors.New("connection refused")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool, uploader, _, path := newXMediaFixture(t, "photo.png", 128)
+			execErr := tc.err
+			tool.execute = func(context.Context, string, map[string]any, string, string) (*client.ToolExecuteResponse, error) {
+				return nil, execErr
+			}
+			res := runXMediaTool(t, tool, map[string]any{"file_path": path})
+			if !res.IsError {
+				t.Fatalf("want error result, got %#v", res)
+			}
+			if res.SideEffectOutcomeUnknown != tc.wantUnknown {
+				t.Fatalf("SideEffectOutcomeUnknown = %v, want %v (content: %s)",
+					res.SideEffectOutcomeUnknown, tc.wantUnknown, res.Content)
+			}
+			if tc.wantUnknown && !strings.Contains(res.Content, "outcome UNKNOWN") {
+				t.Fatalf("unknown result missing narratable wording: %s", res.Content)
+			}
+			if len(uploader.deleted) != 1 {
+				t.Errorf("staged upload cleanup must run regardless of outcome: %v", uploader.deleted)
+			}
+		})
+	}
+}
+
+// TestXUploadMedia_JournalBackedRunSendsIdempotencyKeyAndArmsLatch pins both
+// review findings end to end through the real dispatcher: (a) a
+// journal-backed call forwards the durable IdempotencyKey to the Cloud
+// execute seam (the material contract's provider-level dedup key), and (b) an
+// outcome_unknown execute journals outcome_unknown and arms the same-turn
+// retry latch so a byte-identical repeat never re-stages or re-dispatches.
+func TestXUploadMedia_JournalBackedRunSendsIdempotencyKeyAndArmsLatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photo.png")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0xAB}, 128), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	uploader := &fakeXMediaUploads{
+		uploadResp: &uploads.UploadResponse{ID: "upload-1", URL: "https://static.example/cdn/m.png"},
+	}
+	var execCalls []xMediaExecuteCall
+	execute := func(_ context.Context, name string, args map[string]any, requestID, idempotencyKey string) (*client.ToolExecuteResponse, error) {
+		execCalls = append(execCalls, xMediaExecuteCall{name: name, args: args, requestID: requestID, idempotencyKey: idempotencyKey})
+		return nil, &client.IntegrationToolAPIError{StatusCode: 409, Code: "outcome_unknown"}
+	}
+	reg := agent.NewToolRegistry()
+	reg.Register(NewXUploadMediaTool(uploader, execute))
+
+	argsJSON := `{"file_path":` + strconv.Quote(path) + `,"description":"upload to X"}`
+	llm := &xMediaScriptedLLM{argsJSON: argsJSON}
+	journal := &integrationIdentityJournal{}
+	loop := agent.NewAgentLoop(llm, reg, "medium", t.TempDir(), 6, 2000, 200, nil, nil, nil)
+	loop.SetCheckpointFunc(func(context.Context) error { return nil })
+	loop.SetSideEffectExecutionJournal(journal)
+	loop.SetHandler(xMediaApproveAllHandler{})
+
+	text, _, err := loop.Run(context.Background(), "upload the photo", nil, nil)
+	if err != nil || text != "done" {
+		t.Fatalf("Run = (%q, %v), want narrated completion", text, err)
+	}
+	// (a) durable identity forwarded on the wire seam.
+	if len(execCalls) != 1 {
+		t.Fatalf("execute calls = %d, want 1 (latched repeat must not dispatch)", len(execCalls))
+	}
+	if execCalls[0].requestID != "exec-x-create-1" || execCalls[0].idempotencyKey != "idem-x-create-1" {
+		t.Fatalf("identity = (%q, %q), want the journal's durable pair", execCalls[0].requestID, execCalls[0].idempotencyKey)
+	}
+	// (b) ambiguity journaled and the latch armed: the identical second call
+	// never re-staged an upload (one Upload, one cleanup Delete only).
+	if journal.committed != 0 || journal.unknown != 1 {
+		t.Fatalf("journal committed=%d unknown=%d, want 0/1", journal.committed, journal.unknown)
+	}
+	if len(uploader.uploadOpts) != 1 || len(uploader.deleted) != 1 {
+		t.Fatalf("uploads=%d deletes=%d, want 1/1 (latched repeat must not re-stage)",
+			len(uploader.uploadOpts), len(uploader.deleted))
+	}
+}
+
+// xMediaScriptedLLM issues the same x_upload_media call on two consecutive
+// turns (the second is the byte-identical automatic retry the latch must
+// reject) and then ends the turn.
+type xMediaScriptedLLM struct {
+	calls    int
+	argsJSON string
+}
+
+func (c *xMediaScriptedLLM) Complete(context.Context, client.CompletionRequest) (*client.CompletionResponse, error) {
+	c.calls++
+	if c.calls == 1 {
+		// x_upload_media is explicit Deferred: warm it first like production.
+		return &client.CompletionResponse{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID: "toolu_search_media", Name: "tool_search",
+				Arguments: json.RawMessage(`{"query":"select:x_upload_media"}`),
+			}},
+		}, nil
+	}
+	if c.calls <= 3 {
+		return &client.CompletionResponse{
+			FinishReason: "tool_use",
+			ToolCalls: []client.FunctionCall{{
+				ID:        fmt.Sprintf("toolu_media_%d", c.calls),
+				Name:      "x_upload_media",
+				Arguments: json.RawMessage(c.argsJSON),
+			}},
+		}, nil
+	}
+	return &client.CompletionResponse{OutputText: "done", FinishReason: "stop"}, nil
+}
+
+func (c *xMediaScriptedLLM) CompleteStream(ctx context.Context, req client.CompletionRequest, _ func(client.StreamDelta)) (*client.CompletionResponse, error) {
+	return c.Complete(ctx, req)
+}
+
+// xMediaApproveAllHandler approves every tool call so the Run-level tests can
+// exercise the dispatcher path of an approval-requiring tool.
+type xMediaApproveAllHandler struct{}
+
+func (xMediaApproveAllHandler) OnToolCall(string, string, string) {}
+func (xMediaApproveAllHandler) OnToolResult(string, string, string, agent.ToolResult, time.Duration) {
+}
+func (xMediaApproveAllHandler) OnText(string)                        {}
+func (xMediaApproveAllHandler) OnPreamble(string)                    {}
+func (xMediaApproveAllHandler) OnStreamDelta(string)                 {}
+func (xMediaApproveAllHandler) OnApprovalNeeded(string, string) bool { return true }
+func (xMediaApproveAllHandler) OnUsage(agent.TurnUsage)              {}
+func (xMediaApproveAllHandler) OnCloudAgent(string, string, string)  {}
+func (xMediaApproveAllHandler) OnCloudProgress(int, int)             {}
+func (xMediaApproveAllHandler) OnCloudPlan(string, string, bool)     {}

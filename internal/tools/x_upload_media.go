@@ -395,10 +395,23 @@ func classifyXMediaExecuteErr(err error) agent.ToolResult {
 			return agent.BusinessError(msg + ": X rejected the media and it was NOT uploaded. Adjust the file or arguments before retrying.")
 		case "provider_unavailable":
 			return agent.TransientError(msg + ": X is temporarily unavailable")
+		case "outcome_unknown":
+			// The media MAY have reached X (a media_id may exist that we never
+			// saw). Ambiguity must be journaled outcome_unknown — a committed
+			// record plus an unarmed retry latch would let the model re-send
+			// media X already accepted, minting a duplicate media_id and a
+			// second charge.
+			return xMediaOutcomeUnknown(msg + ": the media may have been delivered to X, but the outcome could not be confirmed")
+		case "call_in_progress":
+			return xMediaOutcomeUnknown(msg + ": the original request is still in progress and may still deliver the media")
 		}
-		if integrationErr.StatusCode >= http.StatusInternalServerError ||
-			integrationErr.StatusCode == http.StatusTooManyRequests {
+		// 429 proves the request was rejected before execution (mirrors the
+		// ServerTool material policy); 5xx after dispatch does not.
+		if integrationErr.StatusCode == http.StatusTooManyRequests {
 			return agent.TransientError(msg)
+		}
+		if integrationErr.StatusCode >= http.StatusInternalServerError {
+			return xMediaOutcomeUnknown(msg + ": Cloud failed after receiving the request")
 		}
 		if integrationErr.StatusCode == http.StatusBadRequest ||
 			integrationErr.StatusCode == http.StatusUnprocessableEntity {
@@ -406,7 +419,25 @@ func classifyXMediaExecuteErr(err error) agent.ToolResult {
 		}
 		return agent.BusinessError(msg)
 	}
+	var dispatchErr *client.ToolDispatchError
+	if errors.As(err, &dispatchErr) {
+		if dispatchErr.MayHaveDispatched {
+			return xMediaOutcomeUnknown(fmt.Sprintf(
+				"x_upload_media: %v: the request may have been dispatched without a complete response", err))
+		}
+		// Proven pre-dispatch transport failure: nothing reached Cloud.
+		return agent.TransientError(fmt.Sprintf("x_upload_media transport failed before dispatch: %v", err))
+	}
 	return agent.ToolResult{Content: fmt.Sprintf("x_upload_media error: %v", err), IsError: true}
+}
+
+// xMediaOutcomeUnknown builds the ambiguous-outcome result: the standard
+// outcome-unknown marker (journaled outcome_unknown, arms the same-turn retry
+// latch) with the narratable guidance the model relays to the user.
+func xMediaOutcomeUnknown(detail string) agent.ToolResult {
+	return externalOutcomeUnknown("External tool outcome UNKNOWN: " + detail +
+		". It was not retried, and a byte-identical retry is blocked locally for the rest of this turn. " +
+		"Tell the user, in their language, and verify on X before any retry.")
 }
 
 func (t *XUploadMediaTool) RequiresApproval() bool { return true }
