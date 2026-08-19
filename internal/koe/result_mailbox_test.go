@@ -525,6 +525,63 @@ func TestImmediateDoTaskResultWaitsForAcknowledgementPlaybackTail(t *testing.T) 
 	waitUntil(t, func() bool { return captured.countType("response.create") == 1 }, "result was not announced after acknowledgement playback drained")
 }
 
+func TestQwenLateRTPAfterResponseDoneReleasesFastTaskResult(t *testing.T) {
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "500")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "20")
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "60")
+
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	mailbox := NewResultMailbox()
+	state := NewCallState("burst-qwen-fast-result", "")
+	mailbox.BeginBurst(state.BurstID())
+	createSpeaking := make(chan bool, 1)
+	var h *eventHandler
+	h = newEventHandlerWithMailbox(nil, state, audio, func(v any) error {
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			createSpeaking <- audio.dropCapture()
+			h.handleEvent(context.Background(), responseCreatedForRequest("result-response", v))
+		}
+		return nil
+	}, mailbox, nil)
+	h.provider = string(ProviderQwen)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	// A fast task finishes while its acknowledgement is still playing. Qwen can
+	// deliver the last audible RTP frames after response.done and does not always
+	// emit output_audio_buffer.stopped.
+	h.handleEvent(ctx, []byte(`{"type":"response.created","response":{"id":"ack-response"}}`))
+	h.handleEvent(ctx, []byte(`{"type":"output_audio_buffer.started"}`))
+	mailbox.EnqueueForBurst(state.BurstID(), SayResult{TaskID: "fast-task", Status: "ok", Reply: "Done."}, false)
+	h.handleEvent(ctx, []byte(`{"type":"response.done","response":{"id":"ack-response","status":"completed"}}`))
+	loud := make([]int16, 480)
+	for i := range loud {
+		loud[i] = 1000
+	}
+	if !h.observeProviderRemoteAudio(loud) {
+		t.Fatal("late Qwen RTP frame was rejected inside the response tail")
+	}
+	audio.setOutputLevel(0)
+
+	select {
+	case speaking := <-createSpeaking:
+		if speaking {
+			t.Fatal("fast task result started before the acknowledgement speaking gate drained")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late Qwen RTP permanently blocked the completed fast task result")
+	}
+}
+
 func TestResultDeliveryIgnoresUnrelatedResponseLifecycle(t *testing.T) {
 	m := NewResultMailbox()
 	h := newEventHandlerWithMailbox(nil, nil, nil, func(any) error { return nil }, m, nil)

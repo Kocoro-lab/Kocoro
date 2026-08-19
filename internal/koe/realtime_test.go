@@ -857,6 +857,27 @@ func TestReleaseWaitsForPlaybackDrain(t *testing.T) {
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "drained playback did not release the mic")
 }
 
+func TestNewResponseCancelsPriorPlaybackDrain(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "500")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "40")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-drain-generation", ""), audio, func(any) error { return nil })
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"old"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"old"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"new"}}`))
+
+	time.Sleep(120 * time.Millisecond)
+	if !audio.dropCapture() {
+		t.Fatal("prior playback drain ungated capture during the new response")
+	}
+}
+
 // TestReleaseHardCapFiresWhileStillAudible pins the lost-stop-event backstop:
 // even if the level never drains (e.g. a wedged level reading), the hard cap
 // still releases the mic so the call cannot go permanently deaf.

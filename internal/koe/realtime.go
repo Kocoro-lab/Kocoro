@@ -89,6 +89,11 @@ type eventHandler struct {
 	// rejecting on the event boundary clips final phonemes that arrive afterward.
 	remoteAudioTailUntil atomic.Int64
 	speakingEpoch        atomic.Int64
+	// playbackDrainEpoch owns only the missing-stop-event watchdog. Audible RTP
+	// tail frames may refresh the ordinary speaking epoch, but must not cancel the
+	// one poller responsible for releasing the gate after local playout drains.
+	// New responses, explicit stops, and native-floor transitions invalidate it.
+	playbackDrainEpoch atomic.Int64
 	// barged is set when a barge-in / explicit interrupt supersedes the active
 	// response, and cleared on the next response.created. While set, markSpeaking
 	// ignores the cancelled response's trailing audio deltas so they cannot re-open
@@ -318,6 +323,7 @@ func (h *eventHandler) markSpeaking() {
 }
 
 func (h *eventHandler) releaseSpeakingAfter(delay time.Duration) {
+	h.playbackDrainEpoch.Add(1)
 	epoch := h.speakingEpoch.Add(1)
 	go func() {
 		timer := time.NewTimer(delay)
@@ -352,13 +358,15 @@ func (h *eventHandler) releaseSpeakingTail() {
 // once local playout has actually DRAINED (output level silent for the idle hold),
 // with the wait+tail hard cap as backstop. Releasing on a fixed clock cut long
 // result reads mid-word — audio playout routinely outlives response.done by
-// 15-30s. A real output_audio_buffer.stopped (or a new response) bumps the epoch
-// and this poller stands down.
+// 15-30s. A real output_audio_buffer.stopped (or a new response) bumps the drain
+// epoch and this poller stands down. Late audible RTP deliberately does not:
+// Qwen can deliver it after response.done and omit the stopped event entirely.
 func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 	wait := time.Duration(koeEnvInt("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", defaultOutputBufferStopWaitMS)) * time.Millisecond
 	tail := time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond
 	hold := time.Duration(koeEnvInt("KOE_PLAYBACK_IDLE_HOLD_MS", defaultPlaybackIdleHoldMS)) * time.Millisecond
-	epoch := h.speakingEpoch.Add(1)
+	h.speakingEpoch.Add(1)
+	drainEpoch := h.playbackDrainEpoch.Add(1)
 	go func() {
 		deadline := time.Now().Add(wait + tail)
 		ticker := time.NewTicker(playbackIdlePollInterval)
@@ -366,11 +374,12 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 		var idleSince time.Time
 		for {
 			<-ticker.C
-			if h.speakingEpoch.Load() != epoch {
+			if h.playbackDrainEpoch.Load() != drainEpoch {
 				return // the real stop event (or a new response) took over
 			}
 			now := time.Now()
-			if h.audio == nil || h.audio.PlaybackIdle() {
+			remoteTailOpen := h.provider == string(ProviderQwen) && now.UnixNano() <= h.remoteAudioTailUntil.Load()
+			if !remoteTailOpen && (h.audio == nil || h.audio.PlaybackIdle()) {
 				if idleSince.IsZero() {
 					idleSince = now
 				}
@@ -384,9 +393,10 @@ func (h *eventHandler) releaseSpeakingAfterOutputBufferWait() {
 				break // hard cap: never leave the mic muted on a lost stop event
 			}
 		}
-		if h.speakingEpoch.Load() != epoch {
+		if h.playbackDrainEpoch.Load() != drainEpoch {
 			return
 		}
+		h.remoteAudioTailUntil.Store(0)
 		h.outputBufferActive.Store(false)
 		if h.audio != nil {
 			h.audio.SetSpeaking(false)
@@ -420,6 +430,7 @@ func (h *eventHandler) stopOutput(keepInput bool) {
 		hadOutput = true
 	}
 	h.speakingEpoch.Add(1)
+	h.playbackDrainEpoch.Add(1)
 	h.barged.Store(true)
 	h.outputBufferActive.Store(false)
 	h.respBusy.Store(false)
@@ -1361,6 +1372,7 @@ func (h *eventHandler) pauseForNativeFloor() bool {
 		return false
 	}
 	h.speakingEpoch.Add(1)
+	h.playbackDrainEpoch.Add(1)
 	h.floorPausedAt = time.Now()
 	h.floorServerCleared.Store(false)
 	if h.audio != nil {
@@ -1433,6 +1445,7 @@ func (h *eventHandler) applyNativeFloorDecision(decision floorDecision) {
 
 func (h *eventHandler) discardNativeFloorPlayback(wakeResults bool, voiceState string) {
 	h.speakingEpoch.Add(1)
+	h.playbackDrainEpoch.Add(1)
 	h.outputBufferActive.Store(false)
 	if h.audio != nil {
 		h.audio.SetPlaybackPaused(false)
@@ -1461,6 +1474,7 @@ const floorContinueInstructions = "Your previous spoken reply was cut off mid-se
 // server-truncated point.
 func (h *eventHandler) resumeBySpeechAfterServerClear() {
 	h.speakingEpoch.Add(1)
+	h.playbackDrainEpoch.Add(1)
 	h.outputBufferActive.Store(false)
 	if h.audio != nil {
 		h.audio.SetPlaybackPaused(false)
@@ -2086,6 +2100,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		// re-opening the mic. Only the epoch is bumped, not markSpeaking(): there is no
 		// audio yet, so the voice_state must stay "thinking", not flip to "speaking".
 		h.speakingEpoch.Add(1)
+		h.playbackDrainEpoch.Add(1)
 		h.respBusy.Store(true)
 		if h.audio != nil {
 			h.audio.SetPlaybackTailProtected(false)
