@@ -47,6 +47,10 @@ func TestImplicitPhysicalLocationRequest(t *testing.T) {
 		"Open Maps and show its current-location marker.",
 		"查询东京今天的天气。",
 		"修复“当前位置”组件无法显示的问题。",
+		"帮我写一个获取当前位置的函数。",
+		"用 CoreLocation 实现获取设备位置，查一下 API 文档。",
+		"Implement a search box that finds my current location on the map.",
+		"現在地を取得する関数を実装して、動作を調べて。",
 	} {
 		if implicitPhysicalLocationRequestV1(request) {
 			t.Errorf("explicit or city request %q was blocked", request)

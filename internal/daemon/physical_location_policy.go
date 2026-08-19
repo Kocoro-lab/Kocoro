@@ -29,6 +29,18 @@ func implicitPhysicalLocationRequestV1(request string) bool {
 			return false
 		}
 	}
+	// Development work ABOUT location features is not a request FOR the device's
+	// location. Without this fence, "帮我写一个获取当前位置的函数" matches
+	// 当前位置+获取 and strips the entire tool registry from a coding run.
+	for _, developmentContext := range []string{
+		"function", "component", "implement", "debug", " code", "codebase",
+		"函数", "代码", "组件", "实现", "写一个", "写个", "修复", "实装",
+		"関数", "コード", "コンポーネント", "実装",
+	} {
+		if strings.Contains(request, developmentContext) {
+			return false
+		}
+	}
 	for _, directRequest := range []string{
 		"where am i", "locate me", "我在哪", "定位我", "どこにいる",
 	} {
