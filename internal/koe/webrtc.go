@@ -64,10 +64,15 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 type RealtimeConn struct {
 	pc          *webrtc.PeerConnection
 	sendTrack   *webrtc.TrackLocalStaticSample
-	videoTrack  videoSampleWriter
-	videoSource *RealtimeVideoSource
-	dc          *webrtc.DataChannel
-	dcMu        sync.RWMutex
+	sendTrackMu sync.Mutex
+	// Qwen rejects video RTP received before any audio RTP. The video pump sends
+	// one silent Opus primer after a call becomes active and before its first
+	// image; successful real mic audio satisfies the same gate.
+	outboundAudioReady atomic.Bool
+	videoTrack         videoSampleWriter
+	videoSource        *RealtimeVideoSource
+	dc                 *webrtc.DataChannel
+	dcMu               sync.RWMutex
 	// cancel stops this connection attempt's goroutines (response sender, event
 	// handling). Without it a failed OpenAI bootstrap's sender outlives its dead
 	// transport on the shared session ctx and keeps competing for the shared
@@ -222,6 +227,13 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 			if rc.callActive != nil && !rc.callActive() {
 				continue
 			}
+			if err := rc.primeQwenAudioBeforeVideo(); err != nil {
+				if !sourceFailed {
+					log.Printf("koe[video]: audio primer unavailable: %v", err)
+				}
+				sourceFailed = true
+				continue
+			}
 			frame, err := rc.videoSource.ReadFrame(ctx)
 			if err != nil {
 				if !sourceFailed {
@@ -250,6 +262,33 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (rc *RealtimeConn) primeQwenAudioBeforeVideo() error {
+	if rc == nil || rc.outboundAudioReady.Load() {
+		return nil
+	}
+	// Mechanism tests can exercise the video pump without constructing the
+	// concrete audio stack. Every production peer connection has both fields.
+	if rc.audio == nil || rc.sendTrack == nil {
+		return nil
+	}
+	rc.sendTrackMu.Lock()
+	defer rc.sendTrackMu.Unlock()
+	if rc.outboundAudioReady.Load() {
+		return nil
+	}
+	encoded, err := rc.audio.EncodeFrame(make([]int16, audioFrameSize))
+	if err != nil {
+		return fmt.Errorf("encode silence: %w", err)
+	}
+	if err := rc.sendTrack.WriteSample(media.Sample{
+		Data: encoded, Duration: audioFrameMs * time.Millisecond,
+	}); err != nil {
+		return fmt.Errorf("write silence: %w", err)
+	}
+	rc.outboundAudioReady.Store(true)
+	return nil
 }
 
 func (rc *RealtimeConn) setDataChannel(dc *webrtc.DataChannel) {
@@ -460,19 +499,26 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				startThreshold = bargeStartGate.threshold(assistantSpeaking, rc.audio.OutputLevel())
 			}
 			for _, out := range gate.processWithStartThreshold(frame, startThreshold) {
-				enc, err := rc.audio.EncodeFrame(out)
-				if err != nil {
-					stats.noteEncodeErr()
-					continue
-				}
 				select {
 				case <-ctx.Done():
 					return
 				case <-pacer.C:
 				}
-				stats.noteWrite(rc.sendTrack.WriteSample(media.Sample{
+				rc.sendTrackMu.Lock()
+				enc, err := rc.audio.EncodeFrame(out)
+				if err != nil {
+					rc.sendTrackMu.Unlock()
+					stats.noteEncodeErr()
+					continue
+				}
+				writeErr := rc.sendTrack.WriteSample(media.Sample{
 					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
-				}))
+				})
+				rc.sendTrackMu.Unlock()
+				stats.noteWrite(writeErr)
+				if writeErr == nil {
+					rc.outboundAudioReady.Store(true)
+				}
 			}
 			if !wasOpen && gate.open {
 				if assistantSpeaking && (eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1") {
@@ -524,10 +570,13 @@ func MintEphemeral(ctx context.Context, apiKey, model string) (string, error) {
 
 // ConnectOptions carries the optional Desktop/billing hooks (all nil/zero-safe).
 type ConnectOptions struct {
-	OnVoiceState func(string)          // G2: Desktop control channel voice state (listening/thinking/speaking)
-	Model        string                // G3: realtime model id stamped into usage reports
-	Voice        string                // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback
-	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
+	OnVoiceState func(string) // G2: Desktop control channel voice state (listening/thinking/speaking)
+	// OnAssistantTranscript is nil in product paths. Opt-in E2E diagnostics use
+	// it to assert provider output without making private transcript logs global.
+	OnAssistantTranscript func(string)
+	Model                 string                // G3: realtime model id stamped into usage reports
+	Voice                 string                // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback
+	OnUsage               func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
 	// OnEndCall (nil-safe) is invoked when the model calls the end_call voice tool
 	// (dismiss / hang up). In the Desktop path it is the endCall closure that plays
 	// the goodbye earcon and tears the call down; the standalone/CLI path wires it to
@@ -683,6 +732,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 		return rc.sendText(string(b))
 	}, opts.ResultMailbox, opts.CallActive)
 	h.onVoiceState = opts.OnVoiceState
+	h.onAssistantTranscript = opts.OnAssistantTranscript
 	h.onEndCall = opts.OnEndCall
 	h.provider = string(provider)
 	h.model = opts.Model

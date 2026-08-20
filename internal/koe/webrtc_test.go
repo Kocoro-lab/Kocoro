@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
@@ -108,6 +109,28 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestQwenVideoPrimesAudioBeforeFirstFrame(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	track, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 1},
+		"audio",
+		"koe-test",
+	)
+	if err != nil {
+		t.Fatalf("new audio track: %v", err)
+	}
+	rc := &RealtimeConn{audio: audio, sendTrack: track}
+	if err := rc.primeQwenAudioBeforeVideo(); err != nil {
+		t.Fatalf("prime Qwen audio: %v", err)
+	}
+	if !rc.outboundAudioReady.Load() {
+		t.Fatal("audio primer did not open Qwen's media-order gate")
+	}
 }
 
 func TestQwenVideoSourceRejectsUnsupportedCodec(t *testing.T) {

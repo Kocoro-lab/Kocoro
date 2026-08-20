@@ -34,6 +34,10 @@ type eventHandler struct {
 	// onVoiceState (nil-safe) pushes the ambient voice state to the Desktop control
 	// channel (G2) so the Kocoro Island sprite tracks listening/thinking/speaking.
 	onVoiceState func(string)
+	// onAssistantTranscript is an opt-in, content-bearing diagnostic hook. Product
+	// callers leave it nil; live vision tests use it to verify what the provider
+	// actually understood without enabling transcript logging globally.
+	onAssistantTranscript func(string)
 	// onEndCall (nil-safe) tears the call down when the model calls the end_call
 	// voice tool (dismiss / hang up). In the Desktop path it is the endCall closure
 	// (plays the goodbye earcon, then closes the session + audio); the standalone/CLI
@@ -2367,6 +2371,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		h.reportUsage(raw)
 	case "response.output_audio_transcript.done", "response.audio_transcript.done":
+		if h.onAssistantTranscript != nil && ev.Transcript != "" {
+			h.onAssistantTranscript(ev.Transcript)
+		}
 		if transcriptLogEnabled() && ev.Transcript != "" {
 			log.Printf("koe[assistant]: %q", shortLogString(ev.Transcript, 500))
 		}
