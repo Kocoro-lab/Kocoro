@@ -942,7 +942,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 			rc.setDataChannel(dc)
 			var payload map[string]any
 			if provider == ProviderQwen {
-				payload = qwenSessionConfig(persona, qwenVoice)
+				payload = qwenSessionConfigWithLiveVision(persona, qwenVoice, opts.VideoSource != nil)
 			} else {
 				payload = sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
 			}

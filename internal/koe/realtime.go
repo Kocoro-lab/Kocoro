@@ -2000,6 +2000,12 @@ func qwenSchemaAllowsNull(value any) bool {
 // are detected promptly; half-duplex calls keep semantic VAD's complete-thought
 // endpointing. KOE_QWEN_VAD_MODE remains the A/B and rollback override.
 func qwenSessionConfig(persona, voice string) map[string]any {
+	return qwenSessionConfigWithLiveVision(persona, voice, false)
+}
+
+const qwenLiveVisionInstructions = `Live visual context from the robot may be available as ambient context. Keep the user's spoken request as the topic. Do not volunteer a scene description or mention a video, camera, feed, image, frame, screen, or equivalent unless the user asks about something visible or the visual context is necessary to answer. When vision is relevant, describe the world directly instead of saying "in the video", "in the image", or "through the camera". Do not infer a person's identity or sensitive traits from appearance.`
+
+func qwenSessionConfigWithLiveVision(persona, voice string, hasLiveVideo bool) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	vadMode := strings.ToLower(strings.TrimSpace(os.Getenv("KOE_QWEN_VAD_MODE")))
 	if vadMode != "server_vad" && vadMode != "semantic_vad" {
@@ -2013,6 +2019,9 @@ func qwenSessionConfig(persona, voice string) map[string]any {
 			vadMode, providerBargeInEnabled(string(ProviderQwen)), vadSilenceMS)
 	}
 	instructions := strings.TrimSpace(persona + "\n\n" + deferredFunctionResultInstructions)
+	if hasLiveVideo {
+		instructions += "\n\n" + qwenLiveVisionInstructions
+	}
 	return map[string]any{
 		"event_id": fmt.Sprintf("event_%d", time.Now().UnixNano()),
 		"type":     "session.update",

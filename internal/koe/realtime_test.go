@@ -1085,6 +1085,24 @@ func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	}
 }
 
+func TestQwenLiveVisionInstructionsKeepVideoAsAmbientContext(t *testing.T) {
+	withoutVideo, _ := json.Marshal(qwenSessionConfigWithLiveVision("persona", "Tina", false))
+	if strings.Contains(string(withoutVideo), "ambient context") {
+		t.Fatalf("audio-only Qwen config unexpectedly contains live-vision instructions: %s", withoutVideo)
+	}
+
+	withVideo, _ := json.Marshal(qwenSessionConfigWithLiveVision("persona", "Tina", true))
+	for _, want := range []string{
+		"ambient context",
+		"Keep the user's spoken request as the topic",
+		`instead of saying \"in the video\"`,
+	} {
+		if !strings.Contains(string(withVideo), want) {
+			t.Fatalf("Qwen live-video config missing %q: %s", want, withVideo)
+		}
+	}
+}
+
 func TestQwenSessionConfigUsesEnabledBargeIn(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
