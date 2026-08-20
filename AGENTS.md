@@ -8,7 +8,7 @@ files silently from the tail. Cut prose, not rules.
 
 Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production path:
 daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WS, runs the
-agent loop locally, streams back. Also TUI, one-shot CLI, MCP server, schedules.
+agent loop locally, streams back. Also TUI, one-shot CLI, MCP, schedules.
 
 Layout: `cmd/` (Cobra) + `internal/<pkg>/`. Production path is
 `internal/daemon/` driving `internal/agent/`.
@@ -19,12 +19,12 @@ Layout: `cmd/` (Cobra) + `internal/<pkg>/`. Production path is
 - Prefer existing repo patterns over new abstractions; keep changes tied to the task.
 - Verify API response bodies, not just status codes.
 - No parallel `_enhanced` variants — update existing code in place.
-- For risky behavior changes, preserve operator-visible flags, rollback paths, focused tests.
-- Test locally before pushing when touching dependency or generated-code surfaces.
-- New `const max[A-Z]\w+ = <small_int>`: the comment MUST name (1) the workload
-  justifying the value, (2) the symptom when it binds, (3) the override path.
-  Prefer `viper.SetDefault(...)` for caps a power user might lift. Re-check
-  small-int caps on model-family upgrades — 200K-era defaults bind silently at 1M.
+- Risky behavior changes keep operator-visible flags, rollback paths, focused tests.
+- Test locally before pushing dependency or generated-code changes.
+- New `const max[A-Z]\w+ = <small_int>`: the comment MUST name (1) the workload,
+  (2) the symptom when it binds, (3) the override path. Prefer
+  `viper.SetDefault(...)` for liftable caps. Re-check small-int caps on
+  model-family upgrades — 200K-era defaults bind silently at 1M.
 
 ## Doc Co-Maintenance
 
@@ -40,10 +40,10 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 
 - **Required fields**: every `Run()` MUST check each `ToolInfo.Required` field is
   non-zero right after `json.Unmarshal` and return `agent.ValidationError(...)`,
-  NOT a bare `ToolResult{IsError: true}`. Go's decoder cannot distinguish missing
-  from zero, so a missing string arrives as `""` and `os.WriteFile` accepts it.
-  The `[validation error]` prefix is load-bearing — `LoopDetector.isValidationErrorSig`
-  force-stops on 3 consecutive, far below the all-errors 2x `ConsecutiveDup` budget.
+  NOT a bare `ToolResult{IsError: true}` (Go can't tell missing from zero — `""`
+  reaches `os.WriteFile`). The `[validation error]` prefix is load-bearing:
+  `LoopDetector.isValidationErrorSig` force-stops on 3 consecutive, far below
+  the all-errors 2x `ConsecutiveDup` budget.
 - **Priority**: local > MCP > gateway, deduped by name. MCP-vs-MCP collisions
   resolve to the alphabetically-first server (`RebuildRegistryForHealth`); the
   shadowed tool is logged, never registered.
@@ -70,12 +70,12 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   eligible; everything else stays in a size-1 serial batch.
 - `tool_status` running/completed carry `tool_use_id` (capability
   `tool_use_id_events`).
-- `set_work_plan` (`daemon/work_plan.go`): full-snapshot 2–8-step progress
-  checklist, daemon non-ephemeral runs only. Runtime owns
+- `set_work_plan` (`daemon/work_plan.go`): full-snapshot 2–8-step checklist,
+  daemon non-ephemeral runs only. Runtime owns
   plan_id/revision/lifecycle/close_reason; closure comes from `LastRunStatus`,
-  never a model claim, and bumps the revision. Persist-before-emit:
-  `work_plan.updated` fires only after the covering save. Not dup-exempt;
-  `SkillExempt`; never in the side-effect journal. Capability `work_plan_v1`.
+  never a model claim, and bumps the revision. `work_plan.updated` fires only
+  after the covering save. Not dup-exempt; `SkillExempt`; never journaled.
+  Capability `work_plan_v1`.
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
@@ -84,22 +84,21 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   unless `integration_requires_approval` is advertised (fetch + WS).
 - Trusted `material_side_effect=false` permits observational batching without
   the journal; absent is fail-closed. Stable `request_id`; material calls add
-  `Idempotency-Key`. `provider_unavailable` and `provider_rejected` are
-  known-no-effect; others are not. Preserve
-  provider/model/unit/cost via `ToolResult`/`EmitUsage`. Exhausted
-  `call_in_progress` → `outcome_unknown`: never commit/resend under a new ID.
+  `Idempotency-Key`. Only `provider_unavailable`/`provider_rejected` are
+  known-no-effect. Preserve provider/model/unit/cost via `ToolResult`/`EmitUsage`.
+  Exhausted `call_in_progress` → `outcome_unknown`: never resend under a new ID.
 - Outcome-unknown material results narrate as ordinary tool errors; the
   same-turn latch (`agent/unknown_outcome_gate.go`) blocks byte-identical
   tool+args repeats until the next user message.
 - SourceIntegration is identity-scoped. Key mutation invalidates generations
   before source clear, without the dispatch writer. Failed new-identity listing
   leaves it empty; same-identity refresh failure keeps it. ServerTool binds list
-  credential/principal generation; stale clones fail pre-dispatch and caches
-  cannot revive them. Auth/integration/MCP-health/reload swaps share one lock.
-  Auth rebuilds both overlays, dropping credential-bound cloud/publish/image but
-  preserving calendar/non-auth tools. The six concrete tools (`cloud_delegate`,
-  publish/list/retract, generate/edit) lease generation through all `Run` retries;
-  stale clones are known-no-effect. Serialize auth across accounts/keys.
+  credential/principal generation; stale clones fail pre-dispatch, caches can't
+  revive them. Auth/integration/MCP-health/reload swaps share one lock. Auth
+  rebuilds both overlays: credential-bound cloud/publish/image drop,
+  calendar/non-auth tools survive. `cloud_delegate`, publish/list/retract, and
+  generate/edit lease generation through all `Run` retries. Serialize auth
+  across accounts/keys.
 - X publishing only via Cloud X tools (`x_prepare_post` removed).
   `browser`/`computer_use`/builtin Playwright block X composer/publish
   controls; Playwright omits `browser_run_code`/`browser_evaluate`; CDP: any
@@ -113,24 +112,22 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   deadline still wins.
 - A post-dispatch transport failure repairs the connection but re-dispatches ONLY
   `mcp.ToolReplaySafe` tools (read-only/idempotent annotations) — a transport
-  error after dispatch does NOT prove the server never acted, since a stdio server
-  can commit its write and die before responding. Everything else returns
-  `mcp.OutcomeUnknownError`. Timeouts and protocol errors are never retried.
+  error after dispatch does NOT prove the server never acted (a stdio server can
+  commit its write and die before responding). Everything else returns
+  `mcp.OutcomeUnknownError`. Timeouts/protocol errors are never retried.
 - A failed async connect is NOT terminal: `ReconnectScheduler`
-  (`internal/mcp/reconnect.go`) retries with backoff (5s → 5min,
-  `reconnectMaxAttempts` 6). Retries are owned by the manager generation —
-  `SwapMCPReconnectScheduler` stops a superseded ladder on reload and
-  `ShutdownCleanup` stops it before closing connections, so a timer never respawns
-  a subprocess the cleanup is reaping. `ForgetMCPReconnect` re-arms an exhausted
-  streak.
+  (`internal/mcp/reconnect.go`) backs off 5s → 5min, `reconnectMaxAttempts` 6.
+  Retries are owned by the manager generation (`SwapMCPReconnectScheduler`,
+  `ShutdownCleanup`) so a timer never respawns a subprocess the cleanup is
+  reaping. `ForgetMCPReconnect` re-arms an exhausted streak.
 - Stdio subprocesses spawn in their own process group, killed via `-pgid` SIGTERM
   + 3s SIGKILL — npx-bridged servers are a process chain.
 - Artifact paths: servers with known path semantics (playwright, or any
-  `workspace_base`) get "Saved to:" absolute annotations for files that verifiably
-  exist. Screenshot filenames default into `~/.shannon/tmp/sessions/<id>/` (swept
-  by `daemon.scratch_max_age_days`, default 14). **`browser_snapshot` NEVER gets a
-  default filename** — omitting it returns the inline accessibility snapshot.
-  Model-supplied absolute paths always win.
+  `workspace_base`) get "Saved to:" absolute annotations for files that exist.
+  Screenshot filenames default into `~/.shannon/tmp/sessions/<id>/` (swept by
+  `daemon.scratch_max_age_days` 14). **`browser_snapshot` NEVER gets a default
+  filename** — omitted = inline accessibility snapshot. Model-supplied absolute
+  paths always win.
 
 ## Permissions and Approvals
 
@@ -150,23 +147,21 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   (`DisallowsAutoApproval`) = `computer`, `accessibility`, `applescript`,
   `ghostty`; `unattendedAutoApprovalDenyList` (`DisallowsUnattendedAutoApproval`)
   = those four plus `computer_use` and `screenshot`.
-- `computer_use` is deliberately absent from the FIRST list — its persisted global
-  grant IS the product's Computer Use permission, honored even unattended, scoped
-  BY NAME via `unattendedGrantHonored`. A blanket "any persisted always-allow"
-  rule would silently re-open unattended desktop capture for `screenshot`. Legacy
-  GUI names can never use the global grant; `computer_use` is rejected at
-  per-agent scope (`agents.ValidateAgentPermissionsConfig`) as the grant is
-  global-only.
+- `computer_use` is deliberately absent from the FIRST list — its persisted
+  global grant IS the product's Computer Use permission, honored even unattended,
+  scoped BY NAME via `unattendedGrantHonored` (a blanket rule would re-open
+  unattended capture for `screenshot`). Legacy GUI names never use the global
+  grant; per-agent `computer_use` is rejected
+  (`agents.ValidateAgentPermissionsConfig`) — the grant is global-only.
 
 ## Wire Contracts
 
-- **The surface list is `docs/cloud-contract-surface.md`** — what this repo owes Shannon
-  Cloud and Kocoro Desktop, with the counterpart symbol for each. Read it before changing
-  anything that crosses a process boundary.
+- **The surface list is `docs/cloud-contract-surface.md`** — what this repo owes
+  Shannon Cloud and Kocoro Desktop, with each counterpart symbol. Read it before
+  changing anything that crosses a process boundary.
 - Payloads decoded by UI clients are pinned by fixtures in
-  `docs/desktop-wire-fixtures/`, verified by `internal/daemon/wire_fixtures_test.go`
-  through the REAL producer path. Change a payload → update fixture + test in the
-  SAME PR.
+  `docs/desktop-wire-fixtures/` (verified by `wire_fixtures_test.go` through the
+  REAL producer path). Change a payload → update fixture + test in the SAME PR.
 - Every cross-version contract change mints a capability token in `Capabilities`
   (`internal/daemon/client.go`), surfaced on the WS handshake and `GET /status`.
   Clients gate on tokens — NEVER version sniffing or decode-failure probing.
@@ -177,13 +172,13 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   NOT copy a broker.
 - `ask_user_question` gates on `CanPresentQuestionUI` / `questionUISources` — an
   ALLOW-list, NOT the approval predicate: sources without a question UI DECLINE
-  (no safe auto-answer; IM channels have approval cards but no question channel).
-  Capability `question_v1`. Ephemeral runs get no asker (`shouldInjectQuestionAsker`).
+  (IM channels have approval cards but no question channel). Capability
+  `question_v1`. Ephemeral runs get no asker (`shouldInjectQuestionAsker`).
 - Conversation context actions (`conversation_context_actions_v1`, Desktop-only):
   `POST /sessions/{id}/{fork,side-chat}`; `message_index` = RAW-archive turn
   boundary (injected entries counted). Side chats run the NORMAL tool registry +
-  SSE approvals but stay ephemeral (no session, no bus events). Reply envelopes
-  strip head-only, only when they parse; limits 400 at `/message` + `/queue`.
+  SSE approvals but stay ephemeral. Reply envelopes strip head-only, only when
+  they parse; limits 400 at `/message` + `/queue`.
 - `delivery_ack`: ack an inbound message only AFTER reply delivery succeeds.
   Reply-failure paths skip the ack so replay stays correct.
 
@@ -191,18 +186,16 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 
 - Precedence: explicit session, threaded route, per-sender route, agent route,
   legacy channel route. Named agents are multi-session. Routed managers are
-  long-lived; bypass/heartbeat use short-lived managers. `tool_status` `running`
-  fires only when execution actually starts.
+  long-lived; bypass/heartbeat short-lived. `tool_status` `running` fires only
+  when execution actually starts.
 - Config reload is revision-based over ONLY `~/.shannon/config.yaml`
-  (`config_reload_state_v1`). Never infer project/local overlays are watched, and
-  never advance the applied revision after an unrelated internal mutation.
-- Schedule proactive push: `broadcast` (`auto`/`on`/`off`) gates whether a run
-  pushes to IM. **The target is always the channel the schedule was created in**
-  (snapshotted `im_status_context`), so a schedule created outside an IM chat
-  NEVER pushes, even with `broadcast=on`. `thread` resolves to
-  `ProactivePayload.UseThread *bool`: `nil` means anchored (current behavior),
-  only explicit off goes top-level. Capabilities `schedule_broadcast_gate` /
-  `proactive_thread_mode` are observability only.
+  (`config_reload_state_v1`). Project/local overlays are not watched; never
+  advance the applied revision after an unrelated internal mutation.
+- Schedule proactive push: `broadcast` (`auto`/`on`/`off`) gates IM push. **The
+  target is always the creating channel** (snapshotted `im_status_context`) — a
+  schedule created outside an IM chat NEVER pushes, even with `broadcast=on`.
+  `thread` → `ProactivePayload.UseThread *bool`: `nil` = anchored, only explicit
+  off goes top-level. The two capability tokens are observability only.
 - Output profiles, not per-channel syntax: `markdown` default, `plain` for
   Cloud-distributed channels. Feishu/Lark/Teams are cloud sources that stay
   `markdown` (`markdownCloudSources`); WeChat (iLink) stays `plain`.
@@ -213,13 +206,13 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   fail-closed, panics under `testing.Testing()` or `SHANNON_PHASE_STRICT=1`).
   Defaults: `agent.idle_soft_timeout_secs` 90, `agent.idle_hard_timeout_secs` 540,
   `agent.stream_idle_timeout_secs` 90.
-- Mid-turn checkpoints run after tool batches, after reactive compaction, and
-  before force-stop; the final save rebuilds from the same baseline.
-- Interrupted turns auto-resume at daemon start (newest first, serial) only within
-  `agent.interrupted_resume_max_age_hours` (default 4) — older checkpoints are
-  abandoned, NEVER executed. `agent.interrupted_resume_max_attempts` (default 3)
-  persists BEFORE the LLM call. Recovered runs ALWAYS classify as unattended so
-  the deny-list applies, and pin the session's original route key.
+- Mid-turn checkpoints run after tool batches, after reactive compaction, before
+  force-stop; the final save rebuilds from the same baseline.
+- Interrupted turns auto-resume at daemon start (newest first, serial) only
+  within `agent.interrupted_resume_max_age_hours` (default 4) — older checkpoints
+  are abandoned, NEVER executed. Attempt cap (default 3) persists BEFORE the LLM
+  call. Recovered runs ALWAYS classify as unattended and pin the original route
+  key.
 - `agent.context_window` (default 1_000_000) is only a seed;
   `maybeAutoAdjustContextWindow` resets it from `response.model` via
   `agent/modelcontext.go` unless a per-agent override locks it.
@@ -235,10 +228,10 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   3.5 chars/token is representative, not conservative. Over-cap transcripts fold
   chunk by chunk (tool pairs atomic, `maxSummaryFoldChunks`) with head+tail fallback.
 - Compaction NEVER rewrites the lossless `Session.Messages`;
-  `Session.CompactionCheckpoint` is the separate model-live state. Proactive and
+  `Session.CompactionCheckpoint` is the separate model-live state. Proactive/
   pre-flight re-inject recently read files; reactive skips restoration. Every
-  applied compaction snapshots pre-replacement state with `<private_memory>`
-  stripped and images replaced by text markers; snapshot failures never block it.
+  applied compaction snapshots pre-replacement state (`<private_memory>`
+  stripped, images → text markers); snapshot failures never block it.
 - Tool-result budgeting: per-result spill (`DefaultMaxToolResultSizeChars` 50K,
   grep 20K), per-turn `aggregateCapThreshold` 200K runes, persisted
   replacement/seen maps surviving turns and crash recovery. `file_read` is
@@ -246,11 +239,11 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 - Images/attachments: source-time compression, wire-time `filterOversizeImages`,
   persist-time `SanitizedRunMessages`. Any new path MUST pass all three. Caps:
   500 MB/file, 20/msg, inline doc <= 25 MB raw.
-- Thinking blocks: preserve `thinking` / `redacted_thinking` in order; sanitizers,
-  compaction, fork builders, and persistence MUST NOT rewrite them. Strip only
-  before sync upload (`internal/sync/strip_thinking.go`). The local `think` tool is
-  skipped on the default gateway+thinking path (`shouldRegisterThinkTool`) but
-  stays for disabled-thinking, Ollama, or `ForceThinkTool=true`.
+- Thinking blocks: preserve `thinking` / `redacted_thinking` in order —
+  sanitizers, compaction, fork builders, persistence MUST NOT rewrite them; strip
+  only before sync upload (`internal/sync/strip_thinking.go`). The local `think`
+  tool skips the default gateway+thinking path (`shouldRegisterThinkTool`), stays
+  for disabled-thinking, Ollama, `ForceThinkTool=true`.
 
 ## Prompt Cache and Suggestions
 
@@ -264,17 +257,16 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   inherits global, provider request effort unchanged. Strict machine-readable
   internal loops suppress it explicitly.
 - The suggestion fork MUST be byte-equal to the main request except the appended
-  assistant reply, suggestion prompt, `SkipCacheWrite`, and debug-only fork kind.
-  Do not change tools, max tokens, thinking budget, or ordering. Source-gated by
-  `wantsPromptSuggestion` / `promptSuggestionSources`: only `desktop`, `kocoro`,
-  `shanclaw` (legacy Desktop alias), `web`. It is an ALLOW-list, so new background
-  sources default to skipped.
+  assistant reply, suggestion prompt, `SkipCacheWrite`, and debug-only fork kind
+  — no tool/max-token/thinking/ordering changes. Source-gated by
+  `wantsPromptSuggestion` (`desktop`, `kocoro`, `shanclaw`, `web`); an
+  ALLOW-list, so new background sources default to skipped.
 
 ## Skills
 
-- `builtinSkills` (`internal/skills/api.go`: `kocoro`, `kocoro-generative-ui`) are
-  sha256-walk synced from `embed.FS` every startup — user edits are WIPED. Fork
-  under a different name.
+- `builtinSkills` (`internal/skills/api.go`: `kocoro`, `kocoro-generative-ui`)
+  sync from `embed.FS` every startup — user edits are WIPED; fork under a
+  different name.
 - `internal/daemon/skill_filter.go` filters `desktopOnlySkills` from the
   per-request list on cloud-distributed sources, applied ONCE producer-side right
   after `LoadGlobalSkills` so registry, listing, and semantic discovery stay
@@ -282,15 +274,13 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 - Skill-install recommendation discovery is binary-pinned and OFFLINE: production
   uses only the embedded eligible catalog (`official_catalog.json`), never the
   GitHub/static/ClawHub registries.
-- Two marketplace surfaces that MUST NEVER share a response shape:
-  `/skills/marketplace/*` (static registry, integer-page — **the frozen macOS
-  Desktop contract; do not add source-conditional branches**) and
-  `/skills/clawhub/*` (live catalog, opaque cursor). Catalog GETs retry 429/5xx +
-  network via `doGETWithRetry`; **4xx is never retried**. `isTransientListErr`
-  mirrors `isRetryableStatus`. `exclude_installed` is ClawHub-only and
-  page-granular: when `skills.marketplace.clawhub_exclude_fill_max_pages`
-  (default 5) binds, the page is short or empty with a non-empty cursor and the
-  client MUST keep paging.
+- Two marketplace surfaces MUST NEVER share a response shape:
+  `/skills/marketplace/*` (static registry, integer-page — **frozen macOS Desktop
+  contract, no source-conditional branches**) and `/skills/clawhub/*` (live
+  catalog, opaque cursor). Catalog GETs retry 429/5xx + network
+  (`doGETWithRetry`); **4xx never**. `exclude_installed` is ClawHub-only,
+  page-granular: when `clawhub_exclude_fill_max_pages` (default 5) binds, the
+  page is short/empty with a non-empty cursor and the client MUST keep paging.
 - Skill secrets: Keychain `com.shannon.skill.<name>` + a plaintext index of key
   NAMES only, env-var-only injection scoped to the current run's `use_skill`.
 
@@ -300,12 +290,11 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   **API key bytes MUST never hit disk or audit logs** — only a `sha256[:16]`
   fingerprint.
 - Episodic recall is model-driven: production paths expose `memory_recall` and
-  `session_search` directly and MUST NOT install the implicit small-model
-  preflight. Route unnamed references to session search; stop after a structured
-  no-data instead of retrying relation variants. Keep sidecar `temporal_status`
-  (`current` / `superseded_by_recency`) on recall groups; prefer current
-  unless the user asked about the past. Preserve unknown sidecar group
-  fields on the recall round-trip. `aggregator` is `direct_relation` only.
+  `session_search` directly, never the implicit small-model preflight. Unnamed
+  references → session search; stop after a structured no-data. Keep sidecar
+  `temporal_status` on recall groups (prefer `current` unless asked about the
+  past); preserve unknown sidecar group fields on the round-trip. `aggregator`
+  is `direct_relation` only.
 - Session sync is opt-in: single Run entry point, flock, atomic markers,
   per-session ACKs. Permanent failures remain until the source session changes.
 - Browser file previews stay fail-closed: only effective session CWD and attached
@@ -329,10 +318,9 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   `internal/memory/bundle_link_{unix,windows}.go` (symlink vs directory junction),
   `internal/keychain/backend_{keyring,linux,other}.go`.
 - Runtime callers MUST gate on `keychain.Supported()` (darwin||windows||linux),
-  never a raw `runtime.GOOS == "darwin"`; kept in sync with build tags by
-  `TestSupportedMatchesBuildTag`. Pass `config.ShannonDir()` to `NewOSStoreAt`.
-  Linux uses a deterministic 0600 file store, NOT go-keyring's Secret Service,
-  which reports success at construction then fails every read/write headless.
+  never raw `runtime.GOOS`; pinned by `TestSupportedMatchesBuildTag`. Pass
+  `config.ShannonDir()` to `NewOSStoreAt`. Linux uses a 0600 file store, NOT
+  go-keyring's Secret Service (constructs fine, fails every read/write headless).
 - **Do not reintroduce raw `syscall.Flock` / `syscall.Kill` / `Setpgid` /
   `os.Symlink` outside a `_unix.go` file** — it breaks the Windows build or fails
   unprivileged there.
@@ -342,14 +330,13 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 ## Auth
 
 `/local/auth/*` proxies to Cloud `/api/v1/auth/*`. `AuthManager`
-(`internal/daemon/auth.go`) owns the state machine and emits `auth_state_changed`.
-**WS runs ONLY in `signed_in`, and `WSController.Start` / `Stop` are the only
-allowed call sites for the reconnect loop.** api_key is the source-of-truth
-credential in the credential store (`ai.kocoro.daemon.api_key`); access/refresh
-tokens are RAM only. On `!keychain.Supported()`: `AuthManager` nil, endpoints 503
-`platform_unsupported`, legacy `cfg.APIKey` drives WS. The yaml→store migration
-strips `api_key` from `config.yaml` on every launch, so config-managed yaml that
-re-adds it keeps getting stripped. Endpoint matrix:
+(`internal/daemon/auth.go`) owns the state machine, emits `auth_state_changed`.
+**WS runs ONLY in `signed_in`; `WSController.Start`/`Stop` are the only allowed
+reconnect-loop call sites.** api_key is source-of-truth in the credential store
+(`ai.kocoro.daemon.api_key`); access/refresh tokens RAM only. On
+`!keychain.Supported()`: `AuthManager` nil, endpoints 503 `platform_unsupported`,
+legacy `cfg.APIKey` drives WS. The yaml→store migration re-strips `api_key` from
+config-managed yaml every launch. Endpoint matrix:
 `internal/skills/bundled/skills/kocoro/references/auth.md`.
 
 ## Anti-Hallucination
@@ -364,38 +351,32 @@ text. Unattended runs remain silent.
 
 `internal/koe`, macOS native speech-to-speech. Keep `stop_speaking` (current
 output), `cancel` (delegated work, by `task_id` or `all_running=true`), and
-terminal `end_call` (whole session) as SEPARATE authorities. `do_task` defaults to
-exactly one call per response; parallel calls need an explicit user request and
-disjoint scopes. Calls created by one Realtime response are one result-delivery
-group: wait for every call to become terminal, acknowledge them together, and
-request one spoken continuation. Qwen may wait for function outputs before
-`response.done`, so its group boundary also uses a tool-call quiet window.
-`MapDoTaskOutcome` maps a partial run to a canned `incomplete`
-line and seeds no digest, so a cut run's progress tail is never voiced as the
-result. ASR transcripts never admit barge-in or ordinary turns. When native
-floor control is unavailable, a terminal-only fixed vocabulary (exit/goodbye,
-never stop-speaking phrases) provides the default lifecycle backstop; the model
-still owns all other turn control.
+terminal `end_call` (whole session) as SEPARATE authorities. `do_task` defaults
+to one call per response; parallel calls need an explicit user request and
+disjoint scopes. Calls from one Realtime response are one result-delivery group:
+wait for every call to become terminal, acknowledge together, request one spoken
+continuation (Qwen may withhold `response.done` until outputs arrive, so its
+group boundary adds a tool-call quiet window). `MapDoTaskOutcome` maps a partial
+run to a canned `incomplete` line with no digest — a cut run's progress tail is
+never voiced as the result. ASR transcripts never admit barge-in or ordinary
+turns; without native floor control, a terminal-only fixed vocabulary
+(exit/goodbye, never stop-speaking phrases) is the lifecycle backstop and the
+model owns all other turn control.
 
-Realtime provider routing is WebRTC-only. Auto may change OpenAI→Qwen only for
-an eligible bootstrap failure before the session is ready and before any media,
-user input, tool action, or conversation history exists. Eligible means network
-error/timeout or a 5xx bootstrap response; Cloud's mint endpoint folds upstream
-OpenAI auth/config failures into 502, so those fall back by design, while
-gateway-authored 4xx stay terminal. Forced modes never
-fall back. Qwen does not support `conversation.item.truncate`, so native
-cognitive-floor control stays disabled there. Interruptible (barge-in on) Qwen
-calls use server VAD; barge-in-off calls keep semantic VAD. Ordinary VPIO
-barge-in stays available while a response is active. Because Qwen can emit
-final RTP after `response.done`, only that short local playback tail is protected
-from capture to prevent self-interruption. `KOE_QWEN_VAD_MODE` remains the
-controlled A/B and rollback override. Do not emulate truncation by replaying or
-rewriting an active call.
+Realtime provider routing is WebRTC-only. Auto changes OpenAI→Qwen only for an
+eligible bootstrap failure before the session is ready (network error/timeout
+or 5xx; Cloud's mint folds upstream OpenAI auth/config failures into 502, so
+those fall back by design; gateway-authored 4xx stay terminal). Forced modes
+never fall back. Qwen lacks `conversation.item.truncate`: native cognitive-floor
+control stays disabled there — never emulate truncation by replaying or
+rewriting an active call. Barge-in-on Qwen calls use server VAD, barge-in-off
+semantic VAD (`KOE_QWEN_VAD_MODE` overrides); VPIO barge-in stays available
+mid-response, and only the short post-`response.done` playback tail (late Qwen
+RTP) is protected from capture to prevent self-interruption.
 
 An active transport reconnect preserves the task ledger and result mailbox, not
-the provider's conversation history. The replacement persona must disclose that
-context boundary to the model so it asks for missing wording instead of guessing;
-newly injected task-result data remains authoritative.
+provider conversation history; the replacement persona must disclose that
+boundary, and injected task-result data stays authoritative.
 
 ## Tests
 
@@ -411,12 +392,11 @@ Koe tests link cgo audio deps: `brew install opus opusfile pkg-config`, and set
 Schedule tests use temp dirs and MUST NOT write to the real LaunchAgents directory.
 
 Live E2E uses the hidden foreground-only isolation flags in
-`docs/live-e2e-testing.md`. `--isolated` isolates filesystem state, port ownership,
-AND credential-store access (it calls `config.DisableCredentialStoreForProcess`,
-so config load skips OS credential reads and the yaml→keychain migration); the
-authorized key is piped in via `--isolated-api-key-stdin`. Cloud/background
-automation is suppressed, agent tool capabilities stay real, and MCP is disabled
-unless `--isolated-mcp` supplies an explicit startup allowlist.
+`docs/live-e2e-testing.md`. `--isolated` isolates filesystem, port, AND
+credential-store access (`config.DisableCredentialStoreForProcess` — no OS
+credential reads, no yaml→keychain migration); the key pipes in via
+`--isolated-api-key-stdin`. Cloud/background automation suppressed, agent tool
+capabilities real, MCP off unless `--isolated-mcp` gives an explicit allowlist.
 
 ## Build and Release
 
