@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -101,10 +102,11 @@ type RealtimeConn struct {
 }
 
 // RealtimeVideoSource supplies already-encoded keyframes for a provider-native
-// WebRTC video track. ReadFrame must honor its context and must not open a
-// second camera owner; body carriers read from their existing media pipeline.
-// Qwen consumes these frames continuously while a call is active instead of
-// receiving OpenAI input_image conversation items over the DataChannel.
+// WebRTC video track. ReadFrame must honor its context, return an independently
+// decodable Annex-B H.264 access unit, and must not open a second camera owner;
+// body carriers read from their existing media pipeline. Qwen consumes these
+// frames continuously while a call is active instead of receiving OpenAI
+// input_image conversation items over the DataChannel.
 type RealtimeVideoSource struct {
 	Codec         string
 	FrameInterval time.Duration
@@ -123,10 +125,15 @@ type audioSampleWriter interface {
 const VideoCodecH264 = "h264"
 
 const (
-	qwenAudioPrimerFrames      = 5
-	qwenAudioPrimerSpacing     = audioFrameMs * time.Millisecond
-	qwenAudioBeforeVideoLead   = 300 * time.Millisecond
-	qwenAudioPrimerMinDuration = (qwenAudioPrimerFrames-1)*qwenAudioPrimerSpacing + qwenAudioBeforeVideoLead
+	defaultRealtimeVideoFrameInterval = time.Second
+	minRealtimeVideoFrameInterval     = 100 * time.Millisecond
+
+	// Five paced packets plus a 300 ms audio lead survived repeated direct and
+	// Reachy product E2E runs; one unpaced packet intermittently arrived after
+	// video and Qwen rejected the image-before-audio ordering.
+	qwenAudioPrimerFrames    = 5
+	qwenAudioPrimerSpacing   = audioFrameMs * time.Millisecond
+	qwenAudioBeforeVideoLead = 300 * time.Millisecond
 )
 
 func (s *RealtimeVideoSource) codecCapability() (webrtc.RTPCodecCapability, error) {
@@ -147,7 +154,10 @@ func (s *RealtimeVideoSource) codecCapability() (webrtc.RTPCodecCapability, erro
 
 func (s *RealtimeVideoSource) frameInterval() time.Duration {
 	if s == nil || s.FrameInterval <= 0 {
-		return time.Second
+		return defaultRealtimeVideoFrameInterval
+	}
+	if s.FrameInterval < minRealtimeVideoFrameInterval {
+		return minRealtimeVideoFrameInterval
 	}
 	return s.FrameInterval
 }
@@ -236,7 +246,13 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 	interval := rc.videoSource.frameInterval()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	var sourceFailed bool
+	var lastFailure string
+	reportFailure := func(kind, message string) {
+		if lastFailure != kind {
+			log.Printf("koe[video]: %s", message)
+		}
+		lastFailure = kind
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -246,47 +262,48 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 				continue
 			}
 			if err := rc.primeQwenAudioBeforeVideo(ctx); err != nil {
-				if !sourceFailed {
-					log.Printf("koe[video]: audio primer unavailable: %v", err)
+				if errors.Is(err, context.Canceled) {
+					return
 				}
-				sourceFailed = true
+				reportFailure("audio_primer", fmt.Sprintf("audio primer unavailable: %v", err))
 				continue
 			}
 			readCtx, cancelRead := context.WithTimeout(ctx, interval)
 			frame, err := rc.videoSource.ReadFrame(readCtx)
 			cancelRead()
 			if err != nil {
-				if !sourceFailed {
-					log.Printf("koe[video]: frame source unavailable: %v", err)
-				}
-				sourceFailed = true
+				reportFailure("source_read", fmt.Sprintf("frame source unavailable: %v", err))
 				continue
 			}
 			if len(frame) == 0 {
-				if !sourceFailed {
-					log.Printf("koe[video]: frame source returned an empty frame")
-				}
-				sourceFailed = true
+				reportFailure("empty_frame", "frame source returned an empty frame")
 				continue
 			}
+			if !isAnnexBH264(frame) {
+				reportFailure("frame_format", "frame source returned non-Annex-B H.264")
+				continue
+			}
+			// The source cadence is the RTP timestamp cadence by contract. Reads are
+			// deadline-bound and late ticker events are dropped rather than queued.
 			if err := rc.videoTrack.WriteSample(media.Sample{Data: frame, Duration: interval}); err != nil {
-				if !sourceFailed {
-					log.Printf("koe[video]: frame write failed: %v", err)
-				}
-				sourceFailed = true
+				reportFailure("track_write", fmt.Sprintf("frame write failed: %v", err))
 				continue
 			}
-			if sourceFailed {
+			if lastFailure != "" {
 				log.Printf("koe[video]: frame stream recovered")
-				sourceFailed = false
+				lastFailure = ""
 			}
 		}
 	}
 }
 
+func isAnnexBH264(frame []byte) bool {
+	return bytes.HasPrefix(frame, []byte{0, 0, 1}) || bytes.HasPrefix(frame, []byte{0, 0, 0, 1})
+}
+
 func (rc *RealtimeConn) primeQwenAudioBeforeVideo(ctx context.Context) error {
 	if rc == nil {
-		return nil
+		return fmt.Errorf("realtime connection unavailable")
 	}
 	if !rc.outboundAudioReady.Load() {
 		if rc.audio == nil {
@@ -295,33 +312,36 @@ func (rc *RealtimeConn) primeQwenAudioBeforeVideo(ctx context.Context) error {
 		if rc.sendTrack == nil {
 			return fmt.Errorf("audio send track unavailable")
 		}
-		rc.outboundAudioMu.Lock()
-		if !rc.outboundAudioReady.Load() {
-			for primerFrame := 0; primerFrame < qwenAudioPrimerFrames; primerFrame++ {
-				encoded, err := rc.audio.EncodeFrame(make([]int16, audioFrameSize))
-				if err != nil {
-					rc.outboundAudioMu.Unlock()
-					return fmt.Errorf("encode silence: %w", err)
-				}
-				if err := rc.sendTrack.WriteSample(media.Sample{
-					Data: encoded, Duration: audioFrameMs * time.Millisecond,
-				}); err != nil {
-					rc.outboundAudioMu.Unlock()
-					return fmt.Errorf("write silence: %w", err)
-				}
-				if primerFrame+1 < qwenAudioPrimerFrames {
-					select {
-					case <-ctx.Done():
-						rc.outboundAudioMu.Unlock()
-						return ctx.Err()
-					case <-time.After(qwenAudioPrimerSpacing):
-					}
+		for primerFrame := 0; primerFrame < qwenAudioPrimerFrames; primerFrame++ {
+			rc.outboundAudioMu.Lock()
+			if primerFrame == 0 && rc.outboundAudioReady.Load() {
+				rc.outboundAudioMu.Unlock()
+				break
+			}
+			encoded, err := rc.audio.EncodeFrame(make([]int16, audioFrameSize))
+			if err != nil {
+				rc.outboundAudioMu.Unlock()
+				return fmt.Errorf("encode silence: %w", err)
+			}
+			if err := rc.sendTrack.WriteSample(media.Sample{
+				Data: encoded, Duration: audioFrameMs * time.Millisecond,
+			}); err != nil {
+				rc.outboundAudioMu.Unlock()
+				return fmt.Errorf("write silence: %w", err)
+			}
+			if !rc.outboundAudioReady.Load() {
+				rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
+				rc.outboundAudioReady.Store(true)
+			}
+			rc.outboundAudioMu.Unlock()
+			if primerFrame+1 < qwenAudioPrimerFrames {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(qwenAudioPrimerSpacing):
 				}
 			}
-			rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
-			rc.outboundAudioReady.Store(true)
 		}
-		rc.outboundAudioMu.Unlock()
 	}
 	readyAt := rc.outboundAudioReadyAt.Load()
 	if readyAt == 0 {
@@ -402,10 +422,33 @@ func (rc *RealtimeConn) dialQwen(ctx context.Context, exchange func(context.Cont
 	if err != nil {
 		return connectError(ProviderQwen, "sdp_exchange", err)
 	}
+	if rc.videoTrack != nil && !qwenAnswerAcceptsVideo(answer) {
+		return connectError(ProviderQwen, "remote_description", errors.New("qwen answer did not accept the video track"))
+	}
 	if err := rc.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
 		return connectError(ProviderQwen, "remote_description", err)
 	}
 	return nil
+}
+
+func qwenAnswerAcceptsVideo(answer string) bool {
+	inVideo, accepted := false, false
+	for _, rawLine := range strings.Split(strings.ReplaceAll(answer, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "m=") {
+			if inVideo {
+				return accepted
+			}
+			fields := strings.Fields(line)
+			inVideo = len(fields) >= 2 && fields[0] == "m=video"
+			accepted = inVideo && fields[1] != "0"
+			continue
+		}
+		if inVideo && (line == "a=inactive" || line == "a=sendonly") {
+			accepted = false
+		}
+	}
+	return inVideo && accepted
 }
 
 // exchangeSDP sends one create-call request. It deliberately does not replay a

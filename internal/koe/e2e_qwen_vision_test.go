@@ -124,26 +124,40 @@ func TestKoeQwenLiveVisionE2E(t *testing.T) {
 		t.Fatalf("request vision response: %v", err)
 	}
 
-	var transcript string
-	select {
-	case transcript = <-transcripts:
-	case err := <-closed:
-		t.Fatalf("Qwen session closed before answering: %v", err)
-	case <-ctx.Done():
-		t.Fatalf("Qwen vision response timed out: %v", ctx.Err())
-	}
-	t.Logf("Qwen live-vision transcript: %q (frames=%d)", transcript, framesRead.Load())
-
 	expected := strings.TrimSpace(os.Getenv("KOE_QWEN_VISION_EXPECT"))
-	if expected == "" {
-		return
+	var transcriptsSeen []string
+	for {
+		select {
+		case transcript := <-transcripts:
+			transcriptsSeen = append(transcriptsSeen, transcript)
+			t.Logf("Qwen live-vision transcript: %q (frames=%d)", transcript, framesRead.Load())
+			if expected == "" || transcriptMatchesAny(transcript, expected) {
+				return
+			}
+		case err := <-closed:
+			t.Fatalf("Qwen session closed before a matching answer: %v (transcripts=%q)", err, transcriptsSeen)
+		case <-ctx.Done():
+			t.Fatalf("Qwen vision response timed out: %v (expected=%q transcripts=%q)", ctx.Err(), expected, transcriptsSeen)
+		}
 	}
+}
+
+func transcriptMatchesAny(transcript, expected string) bool {
 	lower := strings.ToLower(transcript)
 	for _, term := range strings.Split(expected, ",") {
 		term = strings.TrimSpace(term)
 		if term != "" && strings.Contains(lower, strings.ToLower(term)) {
-			return
+			return true
 		}
 	}
-	t.Fatalf("Qwen transcript %q contains none of expected terms %q", transcript, expected)
+	return false
+}
+
+func TestTranscriptMatchesAny(t *testing.T) {
+	if !transcriptMatchesAny("椅子", "chair, 椅子") {
+		t.Fatal("matching transcript was rejected")
+	}
+	if transcriptMatchesAny("桌子", "chair, 椅子") {
+		t.Fatal("non-matching transcript was accepted")
+	}
 }

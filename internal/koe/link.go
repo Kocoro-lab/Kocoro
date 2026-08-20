@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
@@ -29,17 +30,25 @@ type DaemonClient struct {
 	// unbounded.
 	doTaskClient  *http.Client
 	controlClient *http.Client
+	tokenMu       sync.RWMutex
 	token         string
 }
 
 // SetToken sets the optional bearer attached to daemon requests. It is read by
 // the CLI from an environment variable so remote front brains do not expose the
 // secret in their process arguments.
-func (c *DaemonClient) SetToken(token string) { c.token = token }
+func (c *DaemonClient) SetToken(token string) {
+	c.tokenMu.Lock()
+	c.token = token
+	c.tokenMu.Unlock()
+}
 
 func (c *DaemonClient) authorize(req *http.Request) {
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	c.tokenMu.RLock()
+	token := c.token
+	c.tokenMu.RUnlock()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 }
 

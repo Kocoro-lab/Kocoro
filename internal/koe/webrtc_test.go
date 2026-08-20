@@ -74,14 +74,20 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	var active atomic.Bool
 	var reads atomic.Int32
 	order := make(chan string, qwenAudioPrimerFrames+1)
+	recordOrder := func(kind string) {
+		select {
+		case order <- kind:
+		default:
+		}
+	}
 	audio, err := NewAudioIO()
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
 	}
-	audioWriter := &recordingSampleWriter{onWrite: func() { order <- "audio" }}
+	audioWriter := &recordingSampleWriter{onWrite: func() { recordOrder("audio") }}
 	videoWriter := &recordingSampleWriter{
 		data:    make(chan []byte, 1),
-		onWrite: func() { order <- "video" },
+		onWrite: func() { recordOrder("video") },
 	}
 	rc := &RealtimeConn{
 		audio:      audio,
@@ -92,7 +98,7 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 			FrameInterval: 5 * time.Millisecond,
 			ReadFrame: func(context.Context) ([]byte, error) {
 				reads.Add(1)
-				return []byte{0x10, 0x00, 0x00, 0x00}, nil
+				return []byte{0x00, 0x00, 0x01, 0x65}, nil
 			},
 		},
 		callActive: active.Load,
@@ -102,6 +108,10 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	go func() {
 		defer close(done)
 		rc.pumpVideoTrack(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -122,7 +132,7 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	}
 	select {
 	case frame := <-videoWriter.data:
-		if string(frame) != string([]byte{0x10, 0x00, 0x00, 0x00}) {
+		if string(frame) != string([]byte{0x00, 0x00, 0x01, 0x65}) {
 			t.Fatalf("video frame = %v", frame)
 		}
 	default:
@@ -138,9 +148,31 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	if got := videoWriter.writes.Load(); got != idleWrites {
 		t.Fatalf("ended call video writes advanced from %d to %d", idleWrites, got)
 	}
+}
 
-	cancel()
-	<-done
+func TestRealtimeVideoSourceClampsFrameInterval(t *testing.T) {
+	if got := (&RealtimeVideoSource{FrameInterval: time.Millisecond}).frameInterval(); got != minRealtimeVideoFrameInterval {
+		t.Fatalf("frame interval = %v, want %v", got, minRealtimeVideoFrameInterval)
+	}
+	if got := (&RealtimeVideoSource{}).frameInterval(); got != defaultRealtimeVideoFrameInterval {
+		t.Fatalf("default frame interval = %v, want %v", got, defaultRealtimeVideoFrameInterval)
+	}
+}
+
+func TestQwenVideoFrameRequiresAnnexB(t *testing.T) {
+	for name, frame := range map[string][]byte{
+		"three-byte": {0, 0, 1, 0x65},
+		"four-byte":  {0, 0, 0, 1, 0x65},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !isAnnexBH264(frame) {
+				t.Fatalf("valid Annex-B frame rejected: %v", frame)
+			}
+		})
+	}
+	if isAnnexBH264([]byte{0, 0, 0, 4, 0x65}) {
+		t.Fatal("AVCC length-prefixed frame accepted as Annex-B")
+	}
 }
 
 func TestQwenVideoSourceRequiresCallActive(t *testing.T) {
@@ -183,16 +215,39 @@ func TestQwenVideoReadUsesFrameIntervalDeadline(t *testing.T) {
 		defer close(done)
 		rc.pumpVideoTrack(ctx)
 	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	rc.outboundAudioReadyAt.Store(time.Now().Add(-qwenAudioBeforeVideoLead).UnixNano())
+	rc.outboundAudioReady.Store(true)
 	select {
 	case err := <-readDone:
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("ReadFrame context error = %v", err)
 		}
-	case <-time.After(qwenAudioBeforeVideoLead + 200*time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 		t.Fatal("ReadFrame did not receive its frame-interval deadline")
 	}
-	cancel()
-	<-done
+}
+
+func TestQwenAnswerRequiresAcceptedVideo(t *testing.T) {
+	for name, fixture := range map[string]struct {
+		answer string
+		want   bool
+	}{
+		"recvonly": {"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=recvonly\r\n", true},
+		"sendrecv": {"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendrecv\r\n", true},
+		"missing":  {"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n", false},
+		"rejected": {"v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 102\r\na=inactive\r\n", false},
+		"sendonly": {"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendonly\r\n", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := qwenAnswerAcceptsVideo(fixture.answer); got != fixture.want {
+				t.Fatalf("accepted = %t, want %t", got, fixture.want)
+			}
+		})
+	}
 }
 
 func TestQwenVideoPrimesAudioBeforeFirstFrame(t *testing.T) {
@@ -212,9 +267,47 @@ func TestQwenVideoPrimesAudioBeforeFirstFrame(t *testing.T) {
 	if got := track.writes.Load(); got != qwenAudioPrimerFrames {
 		t.Fatalf("audio primer writes = %d, want %d", got, qwenAudioPrimerFrames)
 	}
-	if elapsed := time.Since(started); elapsed < qwenAudioPrimerMinDuration-20*time.Millisecond {
-		t.Fatalf("audio primer duration = %v, want at least %v", elapsed, qwenAudioPrimerMinDuration)
+	if elapsed := time.Since(started); elapsed < qwenAudioBeforeVideoLead-20*time.Millisecond {
+		t.Fatalf("audio primer duration = %v, want at least %v", elapsed, qwenAudioBeforeVideoLead)
 	}
+}
+
+func TestQwenVideoPrimerReleasesAudioLockBetweenFrames(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	firstWrite := make(chan struct{}, 1)
+	rc := &RealtimeConn{
+		audio: audio,
+		sendTrack: &recordingSampleWriter{onWrite: func() {
+			select {
+			case firstWrite <- struct{}{}:
+			default:
+			}
+		}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = rc.primeQwenAudioBeforeVideo(ctx)
+	}()
+	<-firstWrite
+	lockAcquired := make(chan struct{})
+	go func() {
+		rc.outboundAudioMu.Lock()
+		rc.outboundAudioMu.Unlock()
+		close(lockAcquired)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(60 * time.Millisecond):
+		t.Fatal("audio primer held the outbound lock across paced frames")
+	}
+	cancel()
+	<-done
 }
 
 func TestQwenVideoPrimerFailsClosedWithoutAudioPath(t *testing.T) {
