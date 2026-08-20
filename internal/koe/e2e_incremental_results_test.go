@@ -285,7 +285,7 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 				persona,
 				DefaultOpenAIRealtimeVoice,
 				DefaultQwenRealtimeVoice,
-				false,
+				ConnectOptions{},
 				rc.videoTrack != nil,
 			))
 		})

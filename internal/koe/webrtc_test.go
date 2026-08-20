@@ -67,6 +67,11 @@ func TestQwenVideoSourceAddsH264TrackOnlyToQwen(t *testing.T) {
 	if !strings.Contains(qwenOffer.SDP, "m=video") || !strings.Contains(qwenOffer.SDP, "H264/90000") || !strings.Contains(qwenOffer.SDP, "profile-level-id=42e01f") {
 		t.Fatalf("Qwen offer missing compatible H264 video track:\n%s", qwenOffer.SDP)
 	}
+	qwenPayload := realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", ConnectOptions{}, qwen.videoTrack != nil)
+	qwenSession := qwenPayload["session"].(map[string]any)
+	if instructions, _ := qwenSession["instructions"].(string); !strings.HasSuffix(instructions, qwenLiveVisionInstructions) {
+		t.Fatalf("attached Qwen video track did not enable live-vision guidance: %s", instructions)
+	}
 
 	openAI, err := newPeerConnectionForProviderWithVideo(nil, ProviderOpenAI, source)
 	if err != nil {
@@ -96,17 +101,29 @@ func TestRealtimeSessionPayloadMatchesProviderVideoPolicy(t *testing.T) {
 		return value
 	}
 
-	qwenAudio := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", false, false))
+	qwenAudio := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", ConnectOptions{}, false))
 	if strings.Contains(qwenAudio, qwenLiveVisionInstructions) {
 		t.Fatalf("audio-only Qwen payload unexpectedly contains live-vision instructions: %s", qwenAudio)
 	}
-	qwenVideo := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", false, true))
+	qwenVideo := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", ConnectOptions{}, true))
 	if !strings.HasSuffix(qwenVideo, qwenLiveVisionInstructions) {
 		t.Fatalf("Qwen video payload missing live-vision instructions: %s", qwenVideo)
 	}
-	openAIVideo := instructions(realtimeSessionPayload(ProviderOpenAI, "persona", "marin", "Tina", false, true))
+	openAIVideo := instructions(realtimeSessionPayload(ProviderOpenAI, "persona", "marin", "Tina", ConnectOptions{}, true))
 	if strings.Contains(openAIVideo, qwenLiveVisionInstructions) {
 		t.Fatalf("OpenAI payload unexpectedly contains Qwen live-vision instructions: %s", openAIVideo)
+	}
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
+	openAIAEC, _ := json.Marshal(realtimeSessionPayload(
+		ProviderOpenAI,
+		"persona",
+		"marin",
+		"Tina",
+		ConnectOptions{FullDuplexAEC: true},
+		false,
+	))
+	if !strings.Contains(string(openAIAEC), `"interrupt_response":true`) {
+		t.Fatalf("OpenAI payload lost FullDuplexAEC option: %s", openAIAEC)
 	}
 }
 

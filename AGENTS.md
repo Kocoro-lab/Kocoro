@@ -358,12 +358,13 @@ one spoken continuation. Qwen's boundary adds a tool-call quiet window because
 it may withhold `response.done`. `MapDoTaskOutcome` maps partial runs to
 `incomplete` without a digest; never voice a cut progress tail as the result.
 ASR never admits ordinary turns/barge-in. Without native floor control, only
-terminal exit/goodbye phrases are a lifecycle backstop; the model owns the rest.
+terminal exit/goodbye—not stop-speaking—phrases are a lifecycle backstop; the
+model owns the rest.
 
 Realtime providers use WebRTC. Auto falls back OpenAI→Qwen only on eligible
 pre-ready network/timeout/5xx failures (Cloud-wrapped OpenAI auth/config is 502;
 gateway 4xx is terminal); forced modes never fall back. Qwen has no
-`conversation.item.truncate`; never emulate it. Barge-in on/off uses
+`conversation.item.truncate`; never emulate it. Qwen barge-in on/off uses
 server/semantic VAD (`KOE_QWEN_VAD_MODE` overrides); capture protection covers
 only the late-RTP tail after `response.done`.
 
