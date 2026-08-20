@@ -854,6 +854,13 @@ func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Cont
 	})
 }
 
+func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwenVoice string, opts ConnectOptions, hasLiveVideo bool) map[string]any {
+	if provider == ProviderQwen {
+		return qwenSessionConfig(persona, qwenVoice, hasLiveVideo)
+	}
+	return sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
+}
+
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
 	if provider == ProviderQwen && opts.VideoSource != nil && opts.CallActive == nil {
 		return nil, connectError(provider, "local_setup", errors.New("realtime video source requires CallActive"))
@@ -864,6 +871,9 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	rc, err := newPeerConnectionForProviderWithVideo(audio, provider, opts.VideoSource)
 	if err != nil {
 		return nil, connectError(provider, "local_setup", err)
+	}
+	if opts.VideoSource != nil && rc.videoTrack == nil {
+		log.Printf("koe[video]: video source ignored: provider=%s does not negotiate video", provider)
 	}
 	// Scope every goroutine this attempt starts to the attempt, not the caller's
 	// session ctx: an Auto fallback continues on the same session ctx, and every
@@ -940,12 +950,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	sendConfig := func(dc *webrtc.DataChannel) {
 		sendConfigOnce.Do(func() {
 			rc.setDataChannel(dc)
-			var payload map[string]any
-			if provider == ProviderQwen {
-				payload = qwenSessionConfig(persona, qwenVoice)
-			} else {
-				payload = sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
-			}
+			payload := realtimeSessionPayload(provider, persona, openAIVoice, qwenVoice, opts, rc.videoTrack != nil)
 			b, _ := json.Marshal(payload)
 			if err := dc.SendText(string(b)); err != nil {
 				notifyClosed(fmt.Errorf("send session config: %w", err))
