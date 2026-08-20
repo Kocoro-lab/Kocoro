@@ -371,10 +371,9 @@ by replaying or rewriting an active call. Barge-in-on uses server VAD, off uses
 semantic VAD (`KOE_QWEN_VAD_MODE` overrides); only the short late-RTP tail after
 `response.done` is capture-protected.
 
-Qwen live vision adds an optional H.264 constrained-baseline track before SDP.
-A Qwen `VideoSource` without `CallActive` fails local setup. Bound each source
-read to its frame interval; idle/prewarm/end upload zero. Reuse the carrier
-camera owner; never send Qwen an OpenAI `input_image` item.
+Qwen live vision adds H.264 constrained-baseline before SDP. It requires a
+`VideoSource` with `CallActive` and per-frame deadlines; idle/prewarm/end send
+zero frames. Reuse the carrier camera; never send OpenAI `input_image` to Qwen.
 
 An active transport reconnect preserves the task ledger and result mailbox, not
 provider conversation history; the replacement persona must disclose that
