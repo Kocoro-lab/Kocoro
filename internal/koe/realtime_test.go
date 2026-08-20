@@ -165,6 +165,59 @@ func TestHandleFunctionCallDoTaskAsync(t *testing.T) {
 	t.Error("do_task complete result never reached mailbox")
 }
 
+func TestQwenDoTaskSendsOnlyCompletedFunctionOutput(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply": "Tokyo is nine hours ahead of UTC.", "spoken_summary": "Tokyo is nine hours ahead of UTC.", "agent": "default",
+		})
+	}))
+	defer srv.Close()
+
+	state := NewCallState("burst-provider-result", "")
+	disp := NewDispatcher(NewDaemonClient(srv.URL), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	cap := &captureSender{}
+	var h *eventHandler
+	h = newEventHandler(disp, state, nil, func(v any) error {
+		if err := cap.send(v); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"result-response"}}`))
+			h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"result-response","status":"completed"}}`))
+		}
+		return nil
+	})
+	h.provider = string(ProviderQwen)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.handleFunctionCallForResponse(ctx, "tool-response", "call-final", "do_task", []byte(`{"task":"check the Tokyo time offset"}`), false)
+	h.handleEvent(ctx, []byte(`{"type":"response.done","response":{"id":"tool-response","status":"completed"}}`))
+
+	waitUntil(t, func() bool {
+		return cap.countType("conversation.item.create") == 1 && cap.countType("response.create") == 1
+	}, "completed function result was not continued")
+	if got := cap.countType("conversation.item.create"); got != 1 {
+		t.Fatalf("function output count=%d, want 1", got)
+	}
+	if cap.sentContains(`"status":"running"`) {
+		t.Fatal("provider call id was consumed by a running acknowledgement")
+	}
+	if !cap.sentContains("Tokyo is nine hours ahead of UTC.") {
+		t.Fatalf("completed daemon result missing from function output: %v", cap.types())
+	}
+	if h.resultMailbox.pending() != 0 {
+		t.Fatal("provider-native result must not enter the unsupported message mailbox path")
+	}
+}
+
 // TestHandleFunctionCallDoTaskSurvivesSessionCtxCancel verifies S2: a hangup that
 // cancels the session ctx while a do_task is in flight must NOT abort the
 // delegation. The daemon reply is held until after the caller cancels the ctx; a
@@ -475,6 +528,113 @@ func TestInterruptOutputWhenIdleOnlyClearsInput(t *testing.T) {
 	}
 }
 
+func TestQwenInterruptSkipsUnsupportedOutputClear(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-provider-interrupt", ""), nil, cap.send)
+	h.provider = string(ProviderQwen)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.interruptOutput()
+
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("response.cancel count=%d, want 1", got)
+	}
+	if got := cap.countType("output_audio_buffer.clear"); got != 0 {
+		t.Fatalf("unsupported output clear count=%d, want 0", got)
+	}
+}
+
+func TestQwenSpeechStartedInterruptsPlaybackWhenBargeInEnabled(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-qwen-echo", ""), audio, cap.send)
+	h.provider = string(ProviderQwen)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	audio.SetSpeaking(true)
+	audio.Play(make([]int16, audioFrameSize))
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+
+	if h.respBusy.Load() || h.outputBufferActive.Load() {
+		t.Fatal("Qwen speech_started did not cancel active output while barge-in was enabled")
+	}
+	if got := len(audio.playBuf); got != 0 {
+		t.Fatalf("Qwen speech_started left %d playback frame(s), want none", got)
+	}
+	if got := cap.countType("response.cancel"); got != 1 {
+		t.Fatalf("Qwen speech_started sent %d response.cancel event(s), want 1", got)
+	}
+}
+
+func TestQwenSilentRTPDoesNotExtendSpeakingGate(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-provider-silence", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	if h.observeProviderRemoteAudio(make([]int16, audioFrameSize)) {
+		t.Fatal("idle keepalive RTP was accepted for playback")
+	}
+	if h.outputBufferActive.Load() || h.speakingEpoch.Load() != 0 {
+		t.Fatal("silent keepalive RTP opened the speaking gate")
+	}
+
+	h.respBusy.Store(true)
+	loud := make([]int16, audioFrameSize)
+	for i := range loud {
+		loud[i] = 2000
+	}
+	if !h.observeProviderRemoteAudio(loud) {
+		t.Fatal("active response RTP was rejected from playback")
+	}
+	if !h.outputBufferActive.Load() {
+		t.Fatal("audible RTP did not open the speaking gate")
+	}
+	epoch := h.speakingEpoch.Load()
+	if !h.observeProviderRemoteAudio(make([]int16, audioFrameSize)) {
+		t.Fatal("silence inside an active response was rejected from playback")
+	}
+	if got := h.speakingEpoch.Load(); got != epoch {
+		t.Fatalf("silent keepalive RTP extended speaking epoch from %d to %d", epoch, got)
+	}
+	h.respBusy.Store(false)
+	h.beginProviderRemoteAudioTail()
+	if !h.observeProviderRemoteAudio(loud) {
+		t.Fatal("Qwen RTP racing response.done was rejected from playback")
+	}
+	h.remoteAudioTailUntil.Store(time.Now().Add(-time.Millisecond).UnixNano())
+	if h.observeProviderRemoteAudio(loud) {
+		t.Fatal("expired post-response RTP tail was accepted for playback")
+	}
+}
+
+func TestQwenResponseDoneProtectsPlaybackTailFromEchoBargeIn(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	audio.SetRealtimeProvider(ProviderQwen)
+	audio.SetSpeaking(true)
+	h := newEventHandler(nil, NewCallState("burst-qwen-tail-guard", ""), audio, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"resp-1","status":"completed"}}`))
+
+	if audio.shouldForwardVPIOCapture(0.2) {
+		t.Fatal("Qwen post-response playback tail was forwarded to server VAD")
+	}
+	audio.SetSpeaking(false)
+	if !audio.shouldForwardVPIOCapture(0.2) {
+		t.Fatal("Qwen capture did not reopen after playback tail drained")
+	}
+}
+
 func sentContains(types []string, want string) bool {
 	for _, t := range types {
 		if t == want {
@@ -697,6 +857,27 @@ func TestReleaseWaitsForPlaybackDrain(t *testing.T) {
 	waitUntil(t, func() bool { return !audio.dropCapture() }, "drained playback did not release the mic")
 }
 
+func TestNewResponseCancelsPriorPlaybackDrain(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "500")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "40")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-drain-generation", ""), audio, func(any) error { return nil })
+
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"old"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"old"}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"new"}}`))
+
+	time.Sleep(120 * time.Millisecond)
+	if !audio.dropCapture() {
+		t.Fatal("prior playback drain ungated capture during the new response")
+	}
+}
+
 // TestReleaseHardCapFiresWhileStillAudible pins the lost-stop-event backstop:
 // even if the level never drains (e.g. a wedged level reading), the hard cap
 // still releases the mic so the call cannot go permanently deaf.
@@ -857,6 +1038,135 @@ func TestSessionConfigCanDisableNoiseReduction(t *testing.T) {
 	raw, _ := json.Marshal(cfg)
 	if strings.Contains(string(raw), `"noise_reduction"`) {
 		t.Fatalf("KOE_NOISE_REDUCTION=off should remove noise_reduction: %s", raw)
+	}
+}
+
+func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
+	s := string(raw)
+
+	for _, want := range []string{
+		`"event_id":"event_`,
+		`"modalities":["text","audio"]`,
+		`"voice":"Tina"`,
+		`"input_audio_format":"pcm"`,
+		`"output_audio_format":"pcm"`,
+		`"input_audio_transcription":{"model":"qwen3-asr-flash-realtime"}`,
+		`"type":"semantic_vad"`,
+		`"create_response":true`,
+		`"interrupt_response":false`,
+		`"function":{"name":"do_task"`,
+		`unless the user explicitly asked for detail`,
+		`Do not ask a follow-up question`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("qwenSessionConfig missing %s in %s", want, s)
+		}
+	}
+	for _, forbidden := range []string{`"reasoning"`, `"output_modalities"`, `"noise_reduction"`, `"tool_choice"`} {
+		if strings.Contains(s, forbidden) {
+			t.Fatalf("qwenSessionConfig contains OpenAI-only field %s in %s", forbidden, s)
+		}
+	}
+	for _, forbidden := range []string{`"type":["string","null"]`, `"additionalProperties"`, `"enum":["new","follow_up",null]`} {
+		if strings.Contains(s, forbidden) {
+			t.Fatalf("qwenSessionConfig contains unsupported tool schema %s in %s", forbidden, s)
+		}
+	}
+}
+
+func TestQwenSessionConfigUsesEnabledBargeIn(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
+	s := string(raw)
+	for _, want := range []string{`"type":"server_vad"`, `"interrupt_response":true`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("Qwen enabled barge-in missing %s in %s", want, s)
+		}
+	}
+}
+
+func TestQwenSessionConfigCanKeepSemanticVADWithBargeIn(t *testing.T) {
+	t.Setenv("KOE_QWEN_VAD_MODE", "semantic_vad")
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina"))
+	s := string(raw)
+	for _, want := range []string{`"type":"semantic_vad"`, `"interrupt_response":true`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("Qwen semantic VAD override missing %s in %s", want, s)
+		}
+	}
+}
+
+func TestQwenResponseCreateUsesProviderSchema(t *testing.T) {
+	payload := responseCreatePayloadForProvider(responseCreateRequest{
+		instructions: "speak this result",
+		purpose:      responsePurposeTaskResult,
+		toolMode:     responseToolsDisabled,
+		requestID:    "request-1",
+	}, string(ProviderQwen))
+	raw, _ := json.Marshal(payload)
+	if got, want := string(raw), `{"response":{"instructions":"speak this result","modalities":["text","audio"]},"type":"response.create"}`; got != want {
+		t.Fatalf("response.create payload=%s, want %s", got, want)
+	}
+}
+
+func TestQwenActiveResponseErrorSignalsRetry(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.handleEvent(context.Background(), []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"","message":"Conversation already has an active response"}}`))
+	select {
+	case <-h.respRejected:
+	default:
+		t.Fatal("Qwen active-response rejection did not wake the response sender")
+	}
+}
+
+func TestQwenResponseStreamTimeoutTerminatesSession(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	fatal := make(chan error, 1)
+	h.onProviderFatal = func(err error) { fatal <- err }
+	h.handleEvent(context.Background(), []byte(`{"type":"error","error":{"message":"Response stream timeout (timeout_seconds=298, elapsed_ms=298012)"}}`))
+	select {
+	case err := <-fatal:
+		if err == nil || !strings.Contains(err.Error(), "Response stream timeout") {
+			t.Fatalf("fatal error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Qwen response-stream timeout did not terminate the session")
+	}
+}
+
+func TestQwenCreatedResponseBindsWithoutMetadata(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.setPendingResponse(responseCreateRequest{
+		purpose: responsePurposeTaskResult, requestID: "request-1",
+	})
+	if !h.bindCreatedResponse("response-1", nil) {
+		t.Fatal("provider response without metadata did not acknowledge the pending response.create")
+	}
+}
+
+func TestQwenDisablesNativeFloorAndConversationTruncate(t *testing.T) {
+	cap := &captureSender{}
+	h := newEventHandler(nil, nil, nil, cap.send)
+	h.provider = string(ProviderQwen)
+	h.fullDuplexAEC = true
+	if h.nativeFloorEnabled() {
+		t.Fatal("Qwen must not enable the native cognitive floor")
+	}
+	if !h.floor.begin("resp_qwen") {
+		t.Fatal("failed to arrange held response")
+	}
+	h.speechItemResp = "resp_qwen"
+	h.speechItemID = "item_qwen"
+	h.outputStartedAt = time.Now().Add(-time.Second)
+	h.floorPausedAt = time.Now()
+	h.truncateHeldSpeech()
+	if cap.sentContains("conversation.item.truncate") {
+		t.Fatal("Qwen must not receive unsupported conversation.item.truncate")
 	}
 }
 
@@ -1219,12 +1529,9 @@ func TestLocalCommitFallbackSkipsWhenTaskStartsDuringDelay(t *testing.T) {
 	}
 }
 
-// TestDismissContainmentHangsUpWhileTaskInFlight pins the task-in-flight split of
-// the deterministic dismiss gate: ambiguous stop words (停/stop) are left to the
-// model mid-task (they usually mean "cancel the task", the cancel tool's job), but
-// a strong dismiss like "闭嘴" — including its decorated containment form — is about
-// talking, not the task, and must still hang up.
-func TestDismissContainmentHangsUpWhileTaskInFlight(t *testing.T) {
+// TestStopSpeakingNeverHangsUpWhileTaskInFlight keeps speech control separate
+// from call lifecycle even while background work is still running.
+func TestStopSpeakingNeverHangsUpWhileTaskInFlight(t *testing.T) {
 	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "1")
 	state := NewCallState("burst-x", "")
 	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
@@ -1235,18 +1542,13 @@ func TestDismissContainmentHangsUpWhileTaskInFlight(t *testing.T) {
 
 	state.SetInFlightForAgent("查一下特斯拉股价", "")
 
-	h.handleInputTranscript("停") // ambiguous while a task runs — left to the model
-	select {
-	case <-ended:
-		t.Fatal("ambiguous stop word must not hang up while a task is in flight")
-	case <-time.After(80 * time.Millisecond):
-	}
-
-	h.handleInputTranscript("不需要了,闭嘴吧。") // strong containment — still a hang-up
-	select {
-	case <-ended:
-	case <-time.After(2 * time.Second):
-		t.Fatal("strong dismiss containment must hang up even while a task is in flight")
+	for _, transcript := range []string{"停", "不需要了,闭嘴吧。"} {
+		h.handleInputTranscript(transcript)
+		select {
+		case <-ended:
+			t.Fatalf("stop-speaking transcript %q hung up while a task was in flight", transcript)
+		case <-time.After(80 * time.Millisecond):
+		}
 	}
 }
 

@@ -738,9 +738,13 @@ func TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
+		mint := func(context.Context) (string, error) { return "", fmt.Errorf("no mint in test") }
 		done <- runDesktopCall(ctx, koeConfig{controlPort: port, daemonURL: daemon.URL, model: "gpt-realtime-mini"},
 			koe.NewDaemonClient(daemon.URL),
-			func(context.Context) (string, error) { return "", fmt.Errorf("no mint in test") },
+			&realtimeConnector{
+				mode: koe.ProviderOpenAI, openAIModel: "gpt-realtime-mini", mint: mint,
+				circuit: koe.NewOpenAICircuit(time.Minute),
+			},
 			func(json.RawMessage) {})
 	}()
 
@@ -825,25 +829,68 @@ func TestKoeCmdHasBargeInFlag(t *testing.T) {
 	}
 }
 
+func TestCloseDesktopSessionStatePreservesActiveCallResults(t *testing.T) {
+	mailbox := koe.NewResultMailbox()
+	state := koe.NewCallState("active-call", "")
+	mailbox.BeginBurst(state.BurstID())
+	ticket := mailbox.BeginTaskResult(state.BurstID(), "response-1", "call-1")
+
+	if got := closeDesktopSessionState(mailbox, state, false); got != state {
+		t.Fatal("provider reconnect replaced the logical call state")
+	}
+	if id := mailbox.EnqueueTaskResult(ticket, koe.SayResult{Status: "ok", Reply: "complete result"}, false); id == 0 {
+		t.Fatal("provider reconnect retired the active call result burst")
+	}
+
+	endedMailbox := koe.NewResultMailbox()
+	endedState := koe.NewCallState("ended-call", "")
+	endedMailbox.BeginBurst(endedState.BurstID())
+	endedTicket := endedMailbox.BeginTaskResult(endedState.BurstID(), "response-2", "call-2")
+	if got := closeDesktopSessionState(endedMailbox, endedState, true); got != nil {
+		t.Fatal("explicit call end kept the logical call state")
+	}
+	if id := endedMailbox.EnqueueTaskResult(endedTicket, koe.SayResult{Status: "ok", Reply: "late result"}, false); id != 0 {
+		t.Fatal("explicit call end kept accepting late voice results")
+	}
+}
+
+func TestDesktopSessionPersonaDisclosesActiveReconnectContextBoundary(t *testing.T) {
+	const base = "base voice persona"
+	if got := desktopSessionPersona(base, "startup"); got != base {
+		t.Fatalf("startup persona changed: %q", got)
+	}
+	recovered := desktopSessionPersona(base, "active_session_reconnect")
+	for _, want := range []string{base, "does not contain the earlier voice conversation", "ask the user to restate", "task-result data"} {
+		if !strings.Contains(recovered, want) {
+			t.Fatalf("active reconnect persona missing %q: %s", want, recovered)
+		}
+	}
+}
+
 // TestApplyBargeInEnv locks the flag→env bridge: native floor is on while remote
 // irreversible interruption is off.
 func TestApplyBargeInEnv(t *testing.T) {
-	t.Setenv("KOE_VPIO_BARGE_IN", "")
-	t.Setenv("KOE_NATIVE_FLOOR", "")
-	t.Setenv("KOE_INTERRUPT_RESPONSE", "")
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_NATIVE_FLOOR", "1")
+	t.Setenv("KOE_INTERRUPT_RESPONSE", "1")
 
-	applyBargeInEnv(false)
-	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "" {
-		t.Fatalf("barge-in off set KOE_VPIO_BARGE_IN=%q, want unchanged", v)
-	}
-	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "" {
-		t.Fatalf("barge-in off set KOE_INTERRUPT_RESPONSE=%q, want unchanged", v)
-	}
-	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "" {
-		t.Fatalf("barge-in off set KOE_NATIVE_FLOOR=%q, want unchanged", v)
+	applyBargeInEnv(false, false)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
+		t.Fatalf("implicit barge-in setting changed KOE_VPIO_BARGE_IN=%q", v)
 	}
 
-	applyBargeInEnv(true)
+	applyBargeInEnv(false, true)
+	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "0" {
+		t.Fatalf("explicit barge-in off left KOE_VPIO_BARGE_IN=%q, want 0", v)
+	}
+	if v := os.Getenv("KOE_INTERRUPT_RESPONSE"); v != "0" {
+		t.Fatalf("explicit barge-in off left KOE_INTERRUPT_RESPONSE=%q, want 0", v)
+	}
+	if v := os.Getenv("KOE_NATIVE_FLOOR"); v != "0" {
+		t.Fatalf("explicit barge-in off left KOE_NATIVE_FLOOR=%q, want 0", v)
+	}
+
+	applyBargeInEnv(true, true)
 	if v := os.Getenv("KOE_VPIO_BARGE_IN"); v != "1" {
 		t.Fatalf("KOE_VPIO_BARGE_IN=%q, want 1", v)
 	}

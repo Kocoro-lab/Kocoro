@@ -68,7 +68,7 @@ func TestKoeDefaultCompoundRequestUsesOneDoTaskE2E(t *testing.T) {
 
 	send := func(v any) error {
 		body, _ := json.Marshal(v)
-		return rc.dc.SendText(string(body))
+		return rc.sendText(string(body))
 	}
 	h := newEventHandler(disp, state, audio, send)
 	h.language = "zh"
@@ -142,19 +142,37 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 	if os.Getenv("KOE_E2E") != "1" {
 		t.Skip("staggered full-path E2E: set KOE_E2E=1 (uses OPENAI_API_KEY or the running daemon mint relay)")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	runKoeStaggeredParallelDeliveryE2E(t, ProviderOpenAI)
+}
+
+func TestKoeQwenStaggeredParallelDeliveryE2E(t *testing.T) {
+	if os.Getenv("KOE_QWEN_E2E") != "1" {
+		t.Skip("Qwen staggered full-path E2E: set KOE_QWEN_E2E=1 (uses the running daemon SDP relay)")
+	}
+	runKoeStaggeredParallelDeliveryE2E(t, ProviderQwen)
+}
+
+func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider) {
+	t.Helper()
+	timeout := 150 * time.Second
+	if provider == ProviderQwen {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	ek, err := mintE2EEphemeral(ctx)
-	if err != nil {
-		t.Fatalf("mint Realtime token: %v", err)
+	var ek string
+	var err error
+	if provider == ProviderOpenAI {
+		ek, err = mintE2EEphemeral(ctx)
+		if err != nil {
+			t.Fatalf("mint Realtime token: %v", err)
+		}
 	}
 
 	weatherRelease := make(chan struct{})
 	newsRelease := make(chan struct{})
 	var weatherOnce, newsOnce sync.Once
-	defer weatherOnce.Do(func() { close(weatherRelease) })
-	defer newsOnce.Do(func() { close(newsRelease) })
 	requests := make(chan DoTaskRequest, 2)
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/message" {
@@ -191,39 +209,51 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 			})
 		}
 	}))
-	defer mock.Close()
+	defer func() {
+		weatherOnce.Do(func() { close(weatherRelease) })
+		newsOnce.Do(func() { close(newsRelease) })
+		mock.Close()
+	}()
 
 	audio, err := NewAudioIO()
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
 	}
-	state := NewCallState("burst-staggered-e2e", "")
+	state := NewCallState("burst-staggered-e2e-"+string(provider), "")
 	disp := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
-	rc, err := newPeerConnection(audio)
+	rc, err := newPeerConnectionForProvider(audio, provider)
 	if err != nil {
 		t.Fatalf("newPeerConnection: %v", err)
 	}
 	defer rc.Close()
 
-	firstBatchInjected := make(chan struct{}, 1)
 	var resultInjections atomic.Int32
+	var functionOutputs atomic.Int32
 	var h *eventHandler
 	send := func(v any) error {
 		body, _ := json.Marshal(v)
 		if strings.Contains(string(body), "kocoro.task_results.v1") {
-			if resultInjections.Add(1) == 1 {
-				signalNonBlocking(firstBatchInjected)
-			}
+			resultInjections.Add(1)
+		}
+		if strings.Contains(string(body), `"type":"function_call_output"`) {
+			functionOutputs.Add(1)
 		}
 		return rc.dc.SendText(string(body))
 	}
 	h = newEventHandler(disp, state, audio, send)
+	h.provider = string(provider)
+	if provider == ProviderQwen {
+		h.model = DefaultQwenRealtimeModel
+	} else {
+		h.model = DefaultOpenAIRealtimeModel
+	}
 	h.language = "zh"
 	go h.runResponseSender(ctx)
 
 	connected := make(chan struct{})
+	dataChannelOpen := make(chan struct{})
 	configured := make(chan struct{})
-	var connOnce, cfgOnce sync.Once
+	var connOnce, dcOnce, cfgOnce sync.Once
 	var eventMu sync.Mutex
 	var transcripts []string
 	var apiErrors []string
@@ -234,18 +264,30 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 	})
 	persona := "You are Kocoro, a concise Chinese voice assistant. For current weather and news, call do_task. " +
 		ParallelTaskInstructions + " Before the calls say only 我查一下 and nothing else."
-	rc.dc.OnOpen(func() { _ = send(sessionConfig(persona, "marin", false)) })
-	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
+	var configOnce sync.Once
+	sendConfig := func() {
+		configOnce.Do(func() {
+			if provider == ProviderQwen {
+				_ = send(qwenSessionConfig(persona, DefaultQwenRealtimeVoice))
+				return
+			}
+			_ = send(sessionConfig(persona, DefaultOpenAIRealtimeVoice, false))
+		})
+	}
+	handleMessage := func(m webrtc.DataChannelMessage) {
 		var ev struct {
 			Type       string `json:"type"`
 			Transcript string `json:"transcript"`
 		}
 		_ = json.Unmarshal(m.Data, &ev)
+		if provider == ProviderQwen && ev.Type == "session.created" {
+			sendConfig()
+		}
 		h.handleEvent(ctx, m.Data)
 		switch ev.Type {
 		case "session.updated":
 			cfgOnce.Do(func() { close(configured) })
-		case "response.output_audio_transcript.done":
+		case "response.output_audio_transcript.done", "response.audio_transcript.done":
 			eventMu.Lock()
 			transcripts = append(transcripts, ev.Transcript)
 			index := len(transcripts)
@@ -256,12 +298,43 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 			apiErrors = append(apiErrors, string(m.Data))
 			eventMu.Unlock()
 		}
-	})
-	if err := rc.dialOpenAI(ctx, ek); err != nil {
-		t.Fatalf("dial OpenAI: %v", err)
+	}
+	wireDataChannel := func(dc *webrtc.DataChannel, configureOnOpen bool) {
+		dc.OnOpen(func() {
+			dcOnce.Do(func() { close(dataChannelOpen) })
+			if configureOnOpen {
+				sendConfig()
+			}
+		})
+		dc.OnMessage(handleMessage)
+	}
+	wireDataChannel(rc.dc, provider == ProviderOpenAI)
+	if provider == ProviderQwen {
+		rc.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			if dc.Label() == "txt" {
+				rc.setDataChannel(dc)
+			}
+			wireDataChannel(dc, false)
+		})
+	}
+	if provider == ProviderQwen {
+		daemonURL := os.Getenv("KOE_E2E_DAEMON_URL")
+		if daemonURL == "" {
+			daemonURL = "http://127.0.0.1:7533"
+		}
+		relay := NewDaemonClient(daemonURL)
+		err = rc.dialQwen(ctx, func(exchangeCtx context.Context, offer string) (string, error) {
+			return relay.ExchangeSDPViaDaemon(exchangeCtx, string(ProviderQwen), DefaultQwenRealtimeModel, offer)
+		})
+	} else {
+		err = rc.dialOpenAI(ctx, ek)
+	}
+	if err != nil {
+		t.Fatalf("dial %s: %v", provider, err)
 	}
 	go rc.pumpSendTrack(ctx)
 	waitIncrementalSignal(t, ctx, connected, "peer connection did not connect")
+	waitIncrementalSignal(t, ctx, dataChannelOpen, "Realtime data channel did not open")
 	waitIncrementalSignal(t, ctx, configured, "session did not configure")
 
 	turnID := h.inputCommitSeq.Add(1)
@@ -305,13 +378,28 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 	eventMu.Lock()
 	initialSpeech := append([]string(nil), transcripts...)
 	eventMu.Unlock()
-	if len(initialSpeech) != 1 || strings.Trim(initialSpeech[0], " \t\r\n，。！？,.!?") != "我查一下" {
+	if provider == ProviderQwen && len(initialSpeech) == 0 {
+		// The provider may omit the optional acknowledgement and go directly to
+		// the requested tool calls. Silence is preferable to delivery narration.
+	} else if len(initialSpeech) != 1 || strings.Trim(initialSpeech[0], " \t\r\n，。！？,.!?") != "我查一下" {
 		t.Fatalf("task handoff speech=%q, want one bare acknowledgement and no delivery narration", initialSpeech)
 	}
 
 	weatherOnce.Do(func() { close(weatherRelease) })
-	waitIncrementalSignal(t, ctx, firstBatchInjected, "weather result was not claimed")
+	waitUntil(t, func() bool { return h.resultMailbox.pending() == 1 }, "weather result did not land")
 	time.Sleep(250 * time.Millisecond)
+	if got := resultInjections.Load(); got != 0 {
+		t.Fatalf("partial parallel group injected %d result item(s), want 0", got)
+	}
+	if provider == ProviderQwen {
+		if got := functionOutputs.Load(); got != 0 {
+			t.Fatalf("partial Qwen group submitted %d function outputs, want 0", got)
+		}
+	} else if got := functionOutputs.Load(); got != 2 {
+		// OpenAI receives one immediate status=running output per background task;
+		// these release the model's tool loop and are not final result delivery.
+		t.Fatalf("OpenAI running acknowledgements=%d, want 2", got)
+	}
 	newsOnce.Do(func() { close(newsRelease) })
 
 	deadline := time.Now().Add(90 * time.Second)
@@ -325,16 +413,19 @@ func TestKoeStaggeredParallelDeliveryE2E(t *testing.T) {
 		}
 		var resultSpeech []string
 		for _, speech := range allSpeech {
-			if strings.Contains(speech, "36") || strings.Contains(speech, "37") {
+			if strings.Contains(speech, "36") && strings.Contains(speech, "37") {
 				resultSpeech = append(resultSpeech, speech)
 			}
 		}
-		if len(resultSpeech) >= 2 && h.resultMailbox.pending() == 0 {
-			assertIncrementalResultSpeech(t, resultSpeech[:2])
-			if got := resultInjections.Load(); got != 2 {
-				t.Fatalf("result injections=%d, want 2", got)
+		if len(resultSpeech) >= 1 && h.resultMailbox.pending() == 0 {
+			if provider == ProviderQwen {
+				if got := functionOutputs.Load(); got != 2 {
+					t.Fatalf("Qwen function outputs=%d, want 2", got)
+				}
+			} else if got := resultInjections.Load(); got != 1 {
+				t.Fatalf("OpenAI result injections=%d, want 1", got)
 			}
-			t.Logf("VERDICT: one live Response dispatched two daemon tasks on distinct lanes; staggered results produced two scoped updates")
+			t.Logf("VERDICT: %s dispatched two daemon tasks on distinct lanes; staggered results produced one combined update", provider)
 			return
 		}
 		time.Sleep(50 * time.Millisecond)

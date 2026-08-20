@@ -458,6 +458,8 @@ type vpioDebugStats struct {
 	OutputFrames    uint64
 	PlayUnderruns   uint64
 	PlayOverwrites  uint64
+	PlayQueueDrops  uint64
+	PlayQueueMax    int64
 	PlayBuffered    int
 	PlayCapacity    int
 	ForwardedFrames uint64
@@ -648,6 +650,8 @@ func (a *AudioIO) vpioDebugStats() vpioDebugStats {
 		OutputFrames:    uint64(C.vpioOutputFrameCount()),
 		PlayUnderruns:   uint64(C.vpioPlayUnderrunCount()),
 		PlayOverwrites:  uint64(C.vpioPlayOverwriteCount()),
+		PlayQueueDrops:  a.playbackQueueDrops.Load(),
+		PlayQueueMax:    a.playbackQueueMax.Load(),
 		PlayBuffered:    int(C.vpioPlayCount()),
 		PlayCapacity:    int(C.vpioPlayCapacity()),
 		ForwardedFrames: a.vpioForwarded.Load(),

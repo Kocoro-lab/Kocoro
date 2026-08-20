@@ -4,7 +4,9 @@ package koe
 
 import (
 	"math"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,5 +81,22 @@ func TestFeedFramesContinuesSilenceUntilStopped(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("feedFrames stopped early after %d silence frames", got)
 		}
+	}
+}
+
+func TestSynthSpeechChineseProducesNonTrivialAudio(t *testing.T) {
+	if out, err := exec.Command("say", "-v", "?").Output(); err != nil || !strings.Contains(string(out), "Tingting") {
+		t.Skip("Tingting system voice not installed; skipping Chinese synthesis check")
+	}
+	t.Setenv("KOE_SAY_VOICE", "")
+	pcm, err := synthSpeech("请查询东京今天的天气，并告诉我结果。")
+	if err != nil {
+		t.Fatalf("synthSpeech: %v", err)
+	}
+	if len(pcm) < audioSampleRate {
+		t.Fatalf("Chinese synthesis produced only %.3fs of audio", float64(len(pcm))/audioSampleRate)
+	}
+	if got := wavMetrics(pcm).RMS; got < 0.005 {
+		t.Fatalf("Chinese synthesis is effectively silent: rms=%.4f", got)
 	}
 }

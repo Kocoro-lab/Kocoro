@@ -151,12 +151,15 @@ func synthSpeech(text string) ([]int16, error) {
 	aiff := filepath.Join(dir, "s.aiff")
 	wav := filepath.Join(dir, "s.wav")
 	// say's default voice on some Macs is a Siri/Premium voice that renders to a
-	// file (`-o`) as near-empty audio (~0.4 s regardless of text) — which silently
-	// truncates every synthesized utterance. Pin an always-present classic voice;
-	// override via KOE_SAY_VOICE.
+	// file (`-o`) as near-empty audio. A classic voice must also match the script:
+	// Samantha renders Han text as roughly 12 ms of silence, so Chinese E2E input
+	// otherwise never reaches Realtime. Keep an explicit override for other locales.
 	voice := os.Getenv("KOE_SAY_VOICE")
 	if voice == "" {
 		voice = "Samantha"
+		if containsHan(text) {
+			voice = "Tingting"
+		}
 	}
 	if out, err := exec.Command("say", "-v", voice, text, "-o", aiff).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("say: %v: %s", err, out)

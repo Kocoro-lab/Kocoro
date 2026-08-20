@@ -2058,3 +2058,32 @@ func TestCompletionResponse_LegacyShapeStillDecodes(t *testing.T) {
 		t.Errorf("OutputText not parsed: %q", resp.OutputText)
 	}
 }
+
+func TestExchangeRealtimeSDP(t *testing.T) {
+	var gotPath, gotKey string
+	var gotBody map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotKey = r.Header.Get("X-API-Key")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"qwen","answer_sdp":"v=0\\r\\n"}`))
+	}))
+	defer server.Close()
+
+	raw, err := NewGatewayClient(server.URL, "cloud-key").ExchangeRealtimeSDP(
+		context.Background(), "qwen", "qwen3.5-omni-flash-realtime", "v=0\r\n",
+	)
+	if err != nil {
+		t.Fatalf("ExchangeRealtimeSDP: %v", err)
+	}
+	if gotPath != "/v1/realtime/sdp" || gotKey != "cloud-key" {
+		t.Errorf("path/key = %q/%q", gotPath, gotKey)
+	}
+	if gotBody["provider"] != "qwen" || gotBody["offer_sdp"] != "v=0\r\n" {
+		t.Errorf("body = %#v", gotBody)
+	}
+	if !bytes.Contains(raw, []byte(`"answer_sdp"`)) {
+		t.Errorf("response = %s", raw)
+	}
+}

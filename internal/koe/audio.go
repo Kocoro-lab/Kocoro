@@ -60,6 +60,10 @@ type AudioIO struct {
 	// this hold: forwarding a known local cue makes server VAD answer its own sound.
 	// The capture clock still advances through silent keepalive frames.
 	knownOutputCaptureHold atomic.Bool
+	// playbackTailProtected closes the narrow post-response echo window for Qwen.
+	// Its response.done event can precede local RTP/CoreAudio drain; during that
+	// tail, forwarding the still-audible reply makes server VAD interrupt itself.
+	playbackTailProtected atomic.Bool
 	// userMicSticky marks a MANUAL mute (user muted outside a task window).
 	// Sticky mutes survive maybeRestoreUserMic — only the user restores them.
 	userMicSticky atomic.Bool
@@ -71,6 +75,8 @@ type AudioIO struct {
 	preferredMicUID     string
 	preferredSpeakerUID string
 	playback            atomic.Bool
+	playbackQueueDrops  atomic.Uint64
+	playbackQueueMax    atomic.Int64
 	// playbackPaused is a reversible local floor hold. Unlike playback=false it
 	// keeps accepting and retaining inbound assistant PCM so a backchannel can
 	// resume the exact response instead of restarting or discarding it.
@@ -84,6 +90,7 @@ type AudioIO struct {
 	// Explicit barge-in experiments can opt into a stricter local energy gate.
 	vpioActive                atomic.Bool
 	vpioBypassVoiceProcessing atomic.Bool
+	realtimeProvider          atomic.Value
 	vpioDone                  chan struct{}
 	vpioWG                    sync.WaitGroup
 	vpioForwarded             atomic.Uint64
@@ -186,9 +193,18 @@ func NewAudioIO() (*AudioIO, error) {
 func (a *AudioIO) markSendReady() { a.sendReadyOnce.Do(func() { close(a.sendReady) }) }
 
 // SetSpeaking marks playback as active. Production treats it as a hard mute while
-// Kocoro speaks unless experimental VPIO barge-in is explicitly enabled.
-func (a *AudioIO) SetSpeaking(s bool) { a.speaking.Store(s) }
-func (a *AudioIO) dropCapture() bool  { return a.speaking.Load() }
+// Kocoro speaks unless VPIO barge-in is explicitly enabled.
+func (a *AudioIO) SetSpeaking(s bool) {
+	a.speaking.Store(s)
+	if !s {
+		a.playbackTailProtected.Store(false)
+	}
+}
+func (a *AudioIO) dropCapture() bool { return a.speaking.Load() }
+
+func (a *AudioIO) SetPlaybackTailProtected(protected bool) {
+	a.playbackTailProtected.Store(protected)
+}
 
 // SetUserMicOff toggles the user mic-off gate (koe-mic-off design). Task-window
 // enforcement lives in the /call/mic handler; auto-restore in maybeRestoreUserMic.
@@ -229,6 +245,22 @@ func (a *AudioIO) VPIOActive() bool { return a.vpioActive.Load() }
 // input from devices or apps that already perform voice cleanup.
 func (a *AudioIO) SetVPIOVoiceProcessingBypassed(bypass bool) {
 	a.vpioBypassVoiceProcessing.Store(bypass)
+}
+
+// SetRealtimeProvider binds playback-time capture policy to the active WebRTC
+// provider. Qwen requires a separate experimental opt-in because it lacks Koe's
+// native cognitive-floor controller and otherwise turns echoed playback into a
+// new user turn.
+func (a *AudioIO) SetRealtimeProvider(provider RealtimeProvider) {
+	a.realtimeProvider.Store(string(provider))
+}
+
+func (a *AudioIO) currentRealtimeProvider() string {
+	if value := a.realtimeProvider.Load(); value != nil {
+		provider, _ := value.(string)
+		return provider
+	}
+	return ""
 }
 
 // VPIOVoiceProcessingBypassed exposes the pending StartVPIO setting for tests and
@@ -279,13 +311,18 @@ func (a *AudioIO) shouldForwardVPIOCapture(level float64) bool {
 		a.vpioGateDropped.Add(1)
 		return false
 	}
+	if a.playbackTailProtected.Load() {
+		a.vpioGateDropped.Add(1)
+		return false
+	}
 	if !a.dropCapture() {
 		a.vpioForwarded.Add(1)
 		return true
 	}
 	// Kocoro is speaking. Default policy is half-duplex: drop the mic so its own
 	// voice cannot loop back (barge-in off).
-	if !koeEnvBool("KOE_VPIO_BARGE_IN", false) {
+	provider := a.currentRealtimeProvider()
+	if !providerBargeInEnabled(provider) {
 		a.vpioGateDropped.Add(1)
 		return false
 	}
@@ -358,7 +395,15 @@ func (a *AudioIO) Play(pcm []int16) {
 	}
 	select {
 	case a.playBuf <- pcm:
+		queued := int64(len(a.playBuf))
+		for {
+			current := a.playbackQueueMax.Load()
+			if queued <= current || a.playbackQueueMax.CompareAndSwap(current, queued) {
+				break
+			}
+		}
 	default: // drop on overflow rather than block the decode path
+		a.playbackQueueDrops.Add(1)
 	}
 }
 
@@ -608,7 +653,9 @@ func (a *AudioIO) LogDebugStats() {
 		// Barge-in diagnostics: with barge-in on, ForwardedFrames should climb while
 		// speaking (mic stays live for the server VAD). enabled=false means the
 		// flag→env wiring failed.
-		log.Printf("koe[barge]: enabled=%v", koeEnvBool("KOE_VPIO_BARGE_IN", false))
+		provider := a.currentRealtimeProvider()
+		log.Printf("koe[barge]: requested=%v effective=%v provider=%q",
+			koeEnvBool("KOE_VPIO_BARGE_IN", false), providerBargeInEnabled(provider), provider)
 	}
 }
 
@@ -621,8 +668,10 @@ func (a *AudioIO) resetVPIOCallStats() {
 	a.vpioStatsBase = a.vpioDebugStats()
 	a.vpioMaxInput.Store(0)
 	a.vpioMaxOutput.Store(0)
+	a.playbackQueueMax.Store(0)
 	a.vpioStatsBase.MaxInputLevel = 0
 	a.vpioStatsBase.MaxOutputLevel = 0
+	a.vpioStatsBase.PlayQueueMax = 0
 }
 
 func (a *AudioIO) vpioDebugStatsSinceBase() vpioDebugStats {
@@ -637,6 +686,8 @@ func (a *AudioIO) vpioDebugStatsSinceBase() vpioDebugStats {
 		OutputFrames:    subUint64(cur.OutputFrames, base.OutputFrames),
 		PlayUnderruns:   subUint64(cur.PlayUnderruns, base.PlayUnderruns),
 		PlayOverwrites:  subUint64(cur.PlayOverwrites, base.PlayOverwrites),
+		PlayQueueDrops:  subUint64(cur.PlayQueueDrops, base.PlayQueueDrops),
+		PlayQueueMax:    cur.PlayQueueMax,
 		PlayBuffered:    cur.PlayBuffered,
 		PlayCapacity:    cur.PlayCapacity,
 		ForwardedFrames: subUint64(cur.ForwardedFrames, base.ForwardedFrames),

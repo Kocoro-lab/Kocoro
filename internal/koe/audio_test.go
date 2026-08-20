@@ -2,7 +2,10 @@
 
 package koe
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestOpusRoundTrip(t *testing.T) {
 	a, err := NewAudioIO()
@@ -63,6 +66,23 @@ func TestRenderIntoReportsOutputLevelAndIdle(t *testing.T) {
 	}
 	if !a.PlaybackIdle() {
 		t.Fatalf("underrun must zero the output level and report idle, level=%f", a.OutputLevel())
+	}
+}
+
+func TestPlaybackQueueReportsDroppedFrames(t *testing.T) {
+	a, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	frame := make([]int16, audioFrameSize)
+	for i := 0; i < playbackBufferFrames+1; i++ {
+		a.Play(frame)
+	}
+	if got := a.playbackQueueDrops.Load(); got != 1 {
+		t.Fatalf("playback queue drops=%d, want 1", got)
+	}
+	if got := a.playbackQueueMax.Load(); got != playbackBufferFrames {
+		t.Fatalf("playback queue max=%d, want %d", got, playbackBufferFrames)
 	}
 }
 
@@ -264,6 +284,21 @@ func TestVPIOBargeInForwardsContinuouslyWhileSpeaking(t *testing.T) {
 	}
 }
 
+func TestVPIOQwenBargeInFollowsUserSetting(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	a, _ := NewAudioIO()
+	a.SetRealtimeProvider(ProviderQwen)
+	a.SetSpeaking(true)
+
+	if !a.shouldForwardVPIOCapture(0.5) {
+		t.Fatal("Qwen playback capture should flow when barge-in is enabled")
+	}
+	t.Setenv("KOE_VPIO_BARGE_IN", "0")
+	if a.shouldForwardVPIOCapture(0.5) {
+		t.Fatal("Qwen playback capture must stay gated when barge-in is disabled")
+	}
+}
+
 func TestVPIOBargeInNeverOverridesUserMicOff(t *testing.T) {
 	// User mic-off outranks barge-in: never forward while the user asked for silence.
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
@@ -348,6 +383,86 @@ func TestVPIOMicNoiseGateOpensOnPostAECQuietSpeechLevel(t *testing.T) {
 	}
 	if out := g.process(quietSpeech); len(out) != required || !sameSamples(out[0], quietSpeech) {
 		t.Fatalf("VPIO gate should open on sustained post-AEC quiet speech, got %d frame(s)", len(out))
+	}
+}
+
+func TestVPIOMicNoiseGateRaisesStartThresholdDuringAssistantPlayback(t *testing.T) {
+	g := newVPIOMicNoiseGate()
+	residualEcho := make([]int16, audioFrameSize)
+	for i := range residualEcho {
+		residualEcho[i] = 200
+	}
+
+	required := requiredMicGateHotEvidenceFrames(msToAudioFrames(defaultMicGateStartMS))
+	for i := 0; i < required+2; i++ {
+		if out := g.processWithStartThreshold(residualEcho, defaultMicGateThreshold); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("assistant playback residual frame %d should stay muted", i)
+		}
+	}
+	if got := g.stats.SpeechStarts; got != 0 {
+		t.Fatalf("assistant playback residual opened the gate %d time(s)", got)
+	}
+
+	userSpeech := make([]int16, audioFrameSize)
+	for i := range userSpeech {
+		userSpeech[i] = 1200
+	}
+	for i := 0; i < required-1; i++ {
+		if out := g.processWithStartThreshold(userSpeech, defaultMicGateThreshold); len(out) != 1 || !allZeroSamples(out[0]) {
+			t.Fatalf("talk-over frame %d should wait for sustained start evidence", i)
+		}
+	}
+	if out := g.processWithStartThreshold(userSpeech, defaultMicGateThreshold); len(out) != required || !sameSamples(out[0], userSpeech) {
+		t.Fatalf("sustained talk-over should open with pre-roll, got %d frame(s)", len(out))
+	}
+}
+
+func TestMicNoiseGateStartThresholdDoesNotCutOffOpenTalkOver(t *testing.T) {
+	t.Setenv("KOE_MIC_GATE_START_MS", "20")
+	g := newVPIOMicNoiseGate()
+	userSpeech := make([]int16, audioFrameSize)
+	for i := range userSpeech {
+		userSpeech[i] = 1200
+	}
+	if out := g.processWithStartThreshold(userSpeech, defaultMicGateThreshold); len(out) != 1 || !sameSamples(out[0], userSpeech) {
+		t.Fatal("talk-over should open the gate")
+	}
+
+	quietContinuation := make([]int16, audioFrameSize)
+	for i := range quietContinuation {
+		quietContinuation[i] = 140
+	}
+	if out := g.processWithStartThreshold(quietContinuation, defaultMicGateThreshold); len(out) != 1 || !sameSamples(out[0], quietContinuation) {
+		t.Fatal("higher start threshold must not cut off an already-open talk-over segment")
+	}
+}
+
+func TestVPIOBargeStartGateWaitsForAudibleAssistantOutput(t *testing.T) {
+	g := newVPIOBargeStartGate()
+	if got := g.threshold(false, 0); got != 0 {
+		t.Fatalf("idle threshold = %.4f, want 0", got)
+	}
+	if got := g.threshold(true, 0); !math.IsInf(got, 1) {
+		t.Fatalf("pre-roll threshold = %.4f, want +Inf", got)
+	}
+	if got := g.threshold(true, 0.10); math.Abs(got-0.03) > 0.0001 {
+		t.Fatalf("audible playback threshold = %.4f, want 0.0300", got)
+	}
+}
+
+func TestVPIOBargeStartGateTracksOutputEnvelopeAndResetsBetweenResponses(t *testing.T) {
+	g := newVPIOBargeStartGate()
+	if got := g.threshold(true, 0.30); math.Abs(got-defaultVPIOBargeStartCeiling) > 0.0001 {
+		t.Fatalf("loud playback threshold = %.4f, want capped %.4f", got, defaultVPIOBargeStartCeiling)
+	}
+	if got := g.threshold(true, 0); got <= defaultVPIOBargeStartThreshold {
+		t.Fatalf("one silent playback frame discarded the output envelope: %.4f", got)
+	}
+	if got := g.threshold(false, 0); got != 0 {
+		t.Fatalf("idle threshold = %.4f, want 0", got)
+	}
+	if got := g.threshold(true, 0); !math.IsInf(got, 1) {
+		t.Fatalf("new response inherited the prior output envelope: %.4f", got)
 	}
 }
 

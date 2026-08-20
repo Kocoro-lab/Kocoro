@@ -284,6 +284,9 @@ const (
 	// pins it across checkpoints, and forks fast->full follow-ups before generic
 	// injection. Missing/invalid/failed resolution preserves full Agent config.
 	CapKoeFastProfileV1 = "koe_fast_profile_v1"
+	// CapKoeRealtimeProviderV1 means Koe config/status supports provider-aware
+	// Auto/OpenAI/Qwen WebRTC routing plus separate model and voice selections.
+	CapKoeRealtimeProviderV1 = "koe_realtime_provider_v1"
 	// CapAgentServiceTierV1 means global agent.service_tier is validated,
 	// checkpointed, and forwarded on ordinary completion requests while sealed
 	// Koe/computer profiles and named-agent model overrides remain isolated.
@@ -386,6 +389,7 @@ var Capabilities = []string{
 	CapComputerUsePhysicalInterferenceV1,
 	CapComputerUseRiskConfirmationV1,
 	CapKoeFastProfileV1,
+	CapKoeRealtimeProviderV1,
 	CapAgentServiceTierV1,
 	CapWebSearchUsageV1,
 	CapSkillInstallRecommendationV1,

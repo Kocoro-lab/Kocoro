@@ -64,11 +64,17 @@ type KoeConfig struct {
 	// the key is absent — Kocoro Desktop treats nil as enabled — so a plain
 	// bool could not round-trip the user's opt-out (omitempty swallowed
 	// false; dropping omitempty would serialize false for untouched configs).
-	Enabled  *bool  `mapstructure:"enabled"  yaml:"enabled,omitempty"  json:"enabled,omitempty"`
-	Model    string `mapstructure:"model"    yaml:"model,omitempty"    json:"model,omitempty"`
-	Voice    string `mapstructure:"voice"    yaml:"voice,omitempty"    json:"voice,omitempty"`
-	Agent    string `mapstructure:"agent"    yaml:"agent,omitempty"    json:"agent,omitempty"`
-	Language string `mapstructure:"language" yaml:"language,omitempty" json:"language,omitempty"`
+	Enabled *bool `mapstructure:"enabled"  yaml:"enabled,omitempty"  json:"enabled,omitempty"`
+	// Provider is a developer override: ""/"auto" tries OpenAI first and only
+	// falls back to Qwen for pre-media availability failures; forced providers
+	// never fall back. Model/Voice remain the OpenAI selections for compatibility.
+	Provider  string `mapstructure:"provider"  yaml:"provider,omitempty"  json:"provider,omitempty"`
+	Model     string `mapstructure:"model"    yaml:"model,omitempty"    json:"model,omitempty"`
+	Voice     string `mapstructure:"voice"    yaml:"voice,omitempty"    json:"voice,omitempty"`
+	QwenModel string `mapstructure:"qwen_model" yaml:"qwen_model,omitempty" json:"qwen_model,omitempty"`
+	QwenVoice string `mapstructure:"qwen_voice" yaml:"qwen_voice,omitempty" json:"qwen_voice,omitempty"`
+	Agent     string `mapstructure:"agent"    yaml:"agent,omitempty"    json:"agent,omitempty"`
+	Language  string `mapstructure:"language" yaml:"language,omitempty" json:"language,omitempty"`
 	// MicDevice / SpeakerDevice are CoreAudio device UIDs the user bound in
 	// Kocoro Desktop (Settings → Voice → Audio Devices). Empty = system
 	// default. Desktop forwards them to `shan koe` as --mic-device /

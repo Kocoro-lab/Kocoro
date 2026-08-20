@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -122,5 +123,47 @@ func TestLoad_KoeExplicitFalse(t *testing.T) {
 	}
 	if cfg.Koe.Enabled == nil || *cfg.Koe.Enabled {
 		t.Errorf("koe.enabled = %v, want explicit false", cfg.Koe.Enabled)
+	}
+}
+
+func TestKoeRealtimeCatalogOnlyPublishesCompatibleQwenModels(t *testing.T) {
+	catalog := KoeRealtimeCatalog()
+	providers, ok := catalog["providers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("providers=%T", catalog["providers"])
+	}
+	qwen, ok := providers["qwen"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("qwen provider=%T", providers["qwen"])
+	}
+	models, ok := qwen["models"].([]string)
+	if !ok {
+		t.Fatalf("qwen models=%T", qwen["models"])
+	}
+	want := []string{"qwen3.5-omni-flash-realtime", "qwen3.5-omni-plus-realtime"}
+	if !reflect.DeepEqual(models, want) {
+		t.Fatalf("qwen models=%v, want %v", models, want)
+	}
+}
+
+func TestIsValidKoeRealtimeVoice(t *testing.T) {
+	tests := []struct {
+		provider, voice string
+		want            bool
+	}{
+		{"openai", "", true}, // empty = use default
+		{"openai", "marin", true},
+		{"openai", "cedar", true},
+		{"openai", "Tina", false}, // Qwen voice on the OpenAI axis
+		{"openai", "nova", false},
+		{"qwen", "", true},
+		{"qwen", "Tina", true},
+		{"qwen", "tina", false}, // Qwen voice ids are case-sensitive
+		{"qwen", "marin", false},
+	}
+	for _, tt := range tests {
+		if got := IsValidKoeRealtimeVoice(tt.provider, tt.voice); got != tt.want {
+			t.Errorf("IsValidKoeRealtimeVoice(%q, %q)=%t, want %t", tt.provider, tt.voice, got, tt.want)
+		}
 	}
 }

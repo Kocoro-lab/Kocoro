@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -47,7 +49,7 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("mint failed: HTTP %d: %s", resp.StatusCode, string(raw))
+		return "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: string(raw)}
 	}
 	var mint struct {
 		Value string `json:"value"`
@@ -63,10 +65,17 @@ type RealtimeConn struct {
 	pc                   *webrtc.PeerConnection
 	sendTrack            *webrtc.TrackLocalStaticSample
 	dc                   *webrtc.DataChannel
+	dcMu                 sync.RWMutex
+	// cancel stops this connection attempt's goroutines (response sender, event
+	// handling). Without it a failed OpenAI bootstrap's sender outlives its dead
+	// transport on the shared session ctx and keeps competing for the shared
+	// ResultMailbox wake channel against the Qwen fallback session.
+	cancel               context.CancelFunc
 	audio                *AudioIO
 	interruptOutput      func()
 	onLocalSpeechStarted func()
 	onLocalSpeechEnded   func()
+	onRemoteAudio        func([]int16) bool
 	// callActive (nil-safe) gates mic capture: when set and it returns false, the
 	// send pump drops mic audio so Koe is NOT listening (Desktop press-to-talk —
 	// a call must be started via the control channel). nil = always send (the
@@ -80,9 +89,15 @@ type RealtimeConn struct {
 // newPeerConnection builds the pion PC with a send track + recvonly transceiver +
 // the oai-events data channel. Grounded in spike stage2-webrtc + stage2b-duplex.
 func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
-	})
+	return newPeerConnectionForProvider(audio, ProviderOpenAI)
+}
+
+func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*RealtimeConn, error) {
+	configuration := webrtc.Configuration{}
+	if provider == ProviderOpenAI {
+		configuration.ICEServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
+	}
+	pc, err := webrtc.NewPeerConnection(configuration)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +125,9 @@ func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
 			}
 			pcm, derr := audio.DecodeFrame(pkt.Payload)
 			if derr == nil {
-				audio.Play(pcm)
+				if rc.onRemoteAudio == nil || rc.onRemoteAudio(pcm) {
+					audio.Play(pcm)
+				}
 			}
 		}
 	})
@@ -124,6 +141,22 @@ func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
 	return rc, nil
 }
 
+func (rc *RealtimeConn) setDataChannel(dc *webrtc.DataChannel) {
+	rc.dcMu.Lock()
+	rc.dc = dc
+	rc.dcMu.Unlock()
+}
+
+func (rc *RealtimeConn) sendText(text string) error {
+	rc.dcMu.RLock()
+	dc := rc.dc
+	rc.dcMu.RUnlock()
+	if dc == nil {
+		return fmt.Errorf("realtime data channel is not ready")
+	}
+	return dc.SendText(text)
+}
+
 // dialOpenAI does the non-trickle SDP exchange: gather all candidates, POST raw
 // offer SDP, set the answer. Grounded in the spike.
 func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
@@ -134,15 +167,45 @@ func (rc *RealtimeConn) dialOpenAI(ctx context.Context, ek string) error {
 	if err := rc.pc.SetLocalDescription(offer); err != nil {
 		return err
 	}
-	<-webrtc.GatheringCompletePromise(rc.pc)
+	select {
+	case <-webrtc.GatheringCompletePromise(rc.pc):
+	case <-ctx.Done():
+		return connectError(ProviderOpenAI, "ice", ctx.Err())
+	}
 
 	answer, err := exchangeSDP(ctx, openAICallsURL, ek, []byte(rc.pc.LocalDescription().SDP))
 	if err != nil {
-		return err
+		return connectError(ProviderOpenAI, "sdp_exchange", err)
 	}
-	return rc.pc.SetRemoteDescription(webrtc.SessionDescription{
+	if err := rc.pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer, SDP: answer,
-	})
+	}); err != nil {
+		return connectError(ProviderOpenAI, "remote_description", err)
+	}
+	return nil
+}
+
+func (rc *RealtimeConn) dialQwen(ctx context.Context, exchange func(context.Context, string) (string, error)) error {
+	offer, err := rc.pc.CreateOffer(nil)
+	if err != nil {
+		return connectError(ProviderQwen, "local_setup", err)
+	}
+	if err := rc.pc.SetLocalDescription(offer); err != nil {
+		return connectError(ProviderQwen, "local_setup", err)
+	}
+	select {
+	case <-webrtc.GatheringCompletePromise(rc.pc):
+	case <-ctx.Done():
+		return connectError(ProviderQwen, "sdp_exchange", ctx.Err())
+	}
+	answer, err := exchange(ctx, rc.pc.LocalDescription().SDP)
+	if err != nil {
+		return connectError(ProviderQwen, "sdp_exchange", err)
+	}
+	if err := rc.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
+		return connectError(ProviderQwen, "remote_description", err)
+	}
+	return nil
 }
 
 // exchangeSDP sends one create-call request. It deliberately does not replay a
@@ -167,10 +230,11 @@ func exchangeSDP(ctx context.Context, url, ek string, offer []byte) (string, err
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 		return string(answer), nil
 	}
+	body := string(answer)
 	if requestID := resp.Header.Get("x-request-id"); requestID != "" {
-		return "", fmt.Errorf("sdp exchange failed: HTTP %d request_id=%s: %s", resp.StatusCode, requestID, string(answer))
+		body = fmt.Sprintf("request_id=%s: %s", requestID, body)
 	}
-	return "", fmt.Errorf("sdp exchange failed: HTTP %d: %s", resp.StatusCode, string(answer))
+	return "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: body}
 }
 
 // sendTrackStats reconciles "gate passed N frames" with "track actually wrote M
@@ -219,6 +283,18 @@ func (s *sendTrackStats) totalsLine() string {
 	return fmt.Sprintf("written=%d write_err=%d encode_err=%d", s.written, s.writeErrs, s.encodeErrs)
 }
 
+func resetMicGateAtAssistantBoundary(gate *micNoiseGate, wasSpeaking, speaking bool) bool {
+	if gate == nil || !speaking || wasSpeaking {
+		return false
+	}
+	gate.resetState()
+	return true
+}
+
+func qwenBargeProtectionEnabled(fullDuplexAEC bool, provider string) bool {
+	return fullDuplexAEC && provider == string(ProviderQwen)
+}
+
 // pumpSendTrack Opus-encodes captured frames and writes them to the send track.
 func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	rc.audio.markSendReady() // unblock the file backend's feedFrames — the session is configured
@@ -233,6 +309,9 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			log.Printf("koe[audio]: send track stats: %s", stats.totalsLine())
 		}
 	}()
+	assistantWasSpeaking := false
+	bargeStartGate := newVPIOBargeStartGate()
+	protectQwenBarge := qwenBargeProtectionEnabled(rc.fullDuplexAEC, rc.audio.currentRealtimeProvider())
 	pacer := time.NewTicker(audioFrameMs * time.Millisecond)
 	defer pacer.Stop()
 	for {
@@ -245,10 +324,31 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 			// to keep the capture pipeline from backing up.
 			if rc.callActive != nil && !rc.callActive() {
 				gate.resetState()
+				assistantWasSpeaking = false
 				continue
 			}
 			wasOpen := gate.open
-			for _, out := range gate.process(frame) {
+			assistantSpeaking := rc.audio.dropCapture()
+			// A user turn can leave the local noise gate open for its two-second
+			// hangover. Qwen often starts replying before that closes; carrying the
+			// open gate into playback forwards low residual speaker echo directly to
+			// server VAD and creates a false second user turn. Close the prior segment
+			// exactly once when assistant output takes the floor. A genuine barge-in
+			// reopens through the normal speech-start evidence window.
+			if protectQwenBarge {
+				resetMicGateAtAssistantBoundary(gate, assistantWasSpeaking, assistantSpeaking)
+			}
+			assistantWasSpeaking = assistantSpeaking
+			startThreshold := 0.0
+			if protectQwenBarge {
+				// The lower VPIO threshold is needed for quiet speech while listening,
+				// but speaker residue at that level can reopen the gate during playback.
+				// Do not admit a talk-over before output is audible, then scale its start
+				// floor with the decaying playback envelope. Once open, the lower VPIO
+				// threshold and hangover preserve quiet syllables.
+				startThreshold = bargeStartGate.threshold(assistantSpeaking, rc.audio.OutputLevel())
+			}
+			for _, out := range gate.processWithStartThreshold(frame, startThreshold) {
 				enc, err := rc.audio.EncodeFrame(out)
 				if err != nil {
 					stats.noteEncodeErr()
@@ -264,6 +364,10 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				}))
 			}
 			if !wasOpen && gate.open {
+				if assistantSpeaking && (eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1") {
+					log.Printf("koe[barge]: local talk-over admitted input_rms=%.4f output_rms=%.4f start_threshold=%.4f",
+						rmsLevel(frame), rc.audio.OutputLevel(), startThreshold)
+				}
 				stats.beginSegment(gate.stats.PassedFrames)
 				if rc.onLocalSpeechStarted != nil {
 					rc.onLocalSpeechStarted()
@@ -282,7 +386,12 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 }
 
 // Close tears down the peer connection.
-func (rc *RealtimeConn) Close() { _ = rc.pc.Close() }
+func (rc *RealtimeConn) Close() {
+	if rc.cancel != nil {
+		rc.cancel()
+	}
+	_ = rc.pc.Close()
+}
 
 // InterruptOutput stops any local assistant playback and asks Realtime to cancel
 // the active response / clear buffered output. It is an explicit user action, not
@@ -350,6 +459,8 @@ type ConnectOptions struct {
 // warm session + emits call_state ended. OVERRIDE: KOE_SESSION_CONFIG_TIMEOUT_MS.
 const defaultSessionConfigTimeoutMS = 10000
 
+var errSessionConfigTimeout = errors.New("session config timeout")
+
 // sessionConfigWatcher tracks the session.update handshake over the oai-events
 // stream so a rejected config can't wedge the call in "connecting". session.updated
 // is the ack (closes configured, fires onConfigured once); an error arriving BEFORE
@@ -416,7 +527,7 @@ func (w *sessionConfigWatcher) wait(ctx context.Context, timeout time.Duration) 
 	case <-w.configFailed:
 		return w.cfgErr
 	case <-time.After(timeout):
-		return fmt.Errorf("session config timeout after %s", timeout)
+		return fmt.Errorf("%w after %s", errSessionConfigTimeout, timeout)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -426,16 +537,39 @@ func (w *sessionConfigWatcher) wait(ctx context.Context, timeout time.Duration) 
 // starts the send-pump + event-dispatch loops. Returns once connected. opts
 // carries the optional Desktop (G2) + billing (G3) hooks.
 func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions) (*RealtimeConn, error) {
-	rc, err := newPeerConnection(audio)
-	if err != nil {
-		return nil, err
+	return connectRealtime(ctx, audio, ProviderOpenAI, persona, state, disp, opts, func(rc *RealtimeConn) error {
+		return rc.dialOpenAI(ctx, ek)
+	})
+}
+
+// ConnectQwen builds a Qwen WebRTC session. The caller supplies a one-shot SDP
+// exchange backed by daemon→Cloud; no long-lived Qwen credential enters Koe.
+func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Context, string) (string, error), persona string, state *CallState, disp *Dispatcher, opts ConnectOptions) (*RealtimeConn, error) {
+	return connectRealtime(ctx, audio, ProviderQwen, persona, state, disp, opts, func(rc *RealtimeConn) error {
+		return rc.dialQwen(ctx, exchange)
+	})
+}
+
+func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
+	if audio != nil {
+		audio.SetRealtimeProvider(provider)
 	}
+	rc, err := newPeerConnectionForProvider(audio, provider)
+	if err != nil {
+		return nil, connectError(provider, "local_setup", err)
+	}
+	// Scope every goroutine this attempt starts to the attempt, not the caller's
+	// session ctx: an Auto fallback continues on the same session ctx, and every
+	// failure path below funnels through rc.Close().
+	ctx, cancel := context.WithCancel(ctx)
+	rc.cancel = cancel
 	h := newEventHandlerWithMailbox(disp, state, audio, func(v any) error {
 		b, _ := json.Marshal(v)
-		return rc.dc.SendText(string(b))
+		return rc.sendText(string(b))
 	}, opts.ResultMailbox, opts.CallActive)
 	h.onVoiceState = opts.OnVoiceState
 	h.onEndCall = opts.OnEndCall
+	h.provider = string(provider)
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	h.language = opts.Language
@@ -445,13 +579,23 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	rc.onLocalSpeechEnded = func() { h.observeLocalSpeechEnded(ctx) }
 	rc.callActive = opts.CallActive
 	rc.fullDuplexAEC = opts.FullDuplexAEC
+	if provider == ProviderQwen {
+		rc.onRemoteAudio = h.observeProviderRemoteAudio
+	}
 	var closedOnce sync.Once
+	var live atomic.Bool
+	transportFailed := make(chan error, 1)
 	notifyClosed := func(err error) {
-		if opts.OnClosed == nil {
+		select {
+		case transportFailed <- err:
+		default:
+		}
+		if opts.OnClosed == nil || !live.Load() {
 			return
 		}
 		closedOnce.Do(func() { opts.OnClosed(err) })
 	}
+	h.onProviderFatal = notifyClosed
 	rc.pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		switch s {
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
@@ -471,29 +615,67 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	// call in "connecting"; the watcher closes configFailed on that so Connect returns
 	// an error (below) and the caller retires the session.
 	watcher := newSessionConfigWatcher(func() {
+		live.Store(true)
 		if opts.OnCallState != nil {
 			opts.OnCallState("on_call") // session is live — Koe is ready
 		}
 	})
-	rc.dc.OnOpen(func() {
-		voice := opts.Voice
-		if voice == "" {
-			voice = "marin" // CLI/E2E and any caller that didn't set a voice keep the original default
-		}
-		b, _ := json.Marshal(sessionConfig(persona, voice, opts.FullDuplexAEC))
-		_ = rc.dc.SendText(string(b))
-	})
-	rc.dc.OnClose(func() {
-		notifyClosed(fmt.Errorf("data channel closed"))
-	})
-	rc.dc.OnError(func(err error) {
-		notifyClosed(fmt.Errorf("data channel error: %w", err))
-	})
-	rc.dc.OnMessage(func(m webrtc.DataChannelMessage) {
-		watcher.observe(m.Data)
-		h.handleEvent(ctx, m.Data)
-	})
-	if err := rc.dialOpenAI(ctx, ek); err != nil {
+	openAIVoice := opts.Voice
+	if openAIVoice == "" {
+		openAIVoice = DefaultOpenAIRealtimeVoice
+	}
+	qwenVoice := opts.Voice
+	if qwenVoice == "" {
+		qwenVoice = DefaultQwenRealtimeVoice
+	}
+	var sendConfigOnce sync.Once
+	sendConfig := func(dc *webrtc.DataChannel) {
+		sendConfigOnce.Do(func() {
+			rc.setDataChannel(dc)
+			var payload map[string]any
+			if provider == ProviderQwen {
+				payload = qwenSessionConfig(persona, qwenVoice)
+			} else {
+				payload = sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
+			}
+			b, _ := json.Marshal(payload)
+			if err := dc.SendText(string(b)); err != nil {
+				notifyClosed(fmt.Errorf("send session config: %w", err))
+			}
+		})
+	}
+	wireDataChannel := func(dc *webrtc.DataChannel, configureOnOpen bool) {
+		dc.OnOpen(func() {
+			if configureOnOpen {
+				sendConfig(dc)
+			}
+		})
+		dc.OnClose(func() { notifyClosed(fmt.Errorf("data channel %q closed", dc.Label())) })
+		dc.OnError(func(err error) { notifyClosed(fmt.Errorf("data channel %q error: %w", dc.Label(), err)) })
+		dc.OnMessage(func(m webrtc.DataChannelMessage) {
+			if provider == ProviderQwen {
+				var envelope struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal(m.Data, &envelope)
+				if envelope.Type == "session.created" {
+					sendConfig(dc)
+				}
+			}
+			watcher.observe(m.Data)
+			h.handleEvent(ctx, m.Data)
+		})
+	}
+	wireDataChannel(rc.dc, provider == ProviderOpenAI)
+	if provider == ProviderQwen {
+		rc.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			if dc.Label() == "txt" {
+				rc.setDataChannel(dc)
+			}
+			wireDataChannel(dc, false)
+		})
+	}
+	if err := dial(rc); err != nil {
 		rc.Close()
 		return nil, err
 	}
@@ -505,9 +687,27 @@ func Connect(ctx context.Context, audio *AudioIO, ek, persona string, state *Cal
 	// runKoeCall via defer cancel, warm path via stopSessionResources), so the send /
 	// level pumps below unblock and the session is retired + emits call_state ended.
 	timeout := time.Duration(koeEnvInt("KOE_SESSION_CONFIG_TIMEOUT_MS", defaultSessionConfigTimeoutMS)) * time.Millisecond
-	if err := watcher.wait(ctx, timeout); err != nil {
+	waitCtx, waitCancel := context.WithCancel(ctx)
+	waitResult := make(chan error, 1)
+	go func() { waitResult <- watcher.wait(waitCtx, timeout) }()
+	var waitErr error
+	select {
+	case waitErr = <-waitResult:
+	case transportErr := <-transportFailed:
+		waitErr = connectError(provider, "data_channel", transportErr)
+	}
+	waitCancel()
+	if waitErr != nil {
 		rc.Close()
-		return nil, err
+		var ce *RealtimeConnectError
+		if errors.As(waitErr, &ce) {
+			return nil, waitErr
+		}
+		stage := "session_config_rejected"
+		if errors.Is(waitErr, errSessionConfigTimeout) {
+			stage = "session_ready_timeout"
+		}
+		return nil, connectError(provider, stage, waitErr)
 	}
 	go func() {
 		select {
