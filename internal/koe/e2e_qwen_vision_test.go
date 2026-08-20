@@ -18,7 +18,11 @@ import (
 // expected terms. It is opt-in because it uses the running daemon's Qwen relay.
 func TestKoeQwenLiveVisionE2E(t *testing.T) {
 	if os.Getenv("KOE_QWEN_VISION_E2E") != "1" {
-		t.Skip("live Qwen vision E2E: set KOE_QWEN_VISION_E2E=1 and KOE_QWEN_VISION_H264")
+		t.Skip("live Qwen vision E2E: set KOE_QWEN_VISION_E2E=1, KOE_QWEN_VISION_H264, and KOE_QWEN_VISION_EXPECT")
+	}
+	expected := strings.TrimSpace(os.Getenv("KOE_QWEN_VISION_EXPECT"))
+	if expected == "" {
+		t.Fatal("KOE_QWEN_VISION_EXPECT is required")
 	}
 	framePath := strings.TrimSpace(os.Getenv("KOE_QWEN_VISION_H264"))
 	if framePath == "" {
@@ -58,6 +62,7 @@ func TestKoeQwenLiveVisionE2E(t *testing.T) {
 		relayURL = "http://127.0.0.1:7533"
 	}
 	relay := NewDaemonClient(relayURL)
+	relay.SetToken(strings.TrimSpace(os.Getenv("KOE_DAEMON_TOKEN")))
 	rc, err := ConnectQwen(
 		ctx,
 		audio,
@@ -124,14 +129,13 @@ func TestKoeQwenLiveVisionE2E(t *testing.T) {
 		t.Fatalf("request vision response: %v", err)
 	}
 
-	expected := strings.TrimSpace(os.Getenv("KOE_QWEN_VISION_EXPECT"))
 	var transcriptsSeen []string
 	for {
 		select {
 		case transcript := <-transcripts:
 			transcriptsSeen = append(transcriptsSeen, transcript)
 			t.Logf("Qwen live-vision transcript: %q (frames=%d)", transcript, framesRead.Load())
-			if expected == "" || transcriptMatchesAny(transcript, expected) {
+			if transcriptMatchesAny(transcript, expected) {
 				return
 			}
 		case err := <-closed:
