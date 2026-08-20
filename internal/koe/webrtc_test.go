@@ -338,15 +338,20 @@ func TestQwenVideoReadUsesFrameIntervalDeadline(t *testing.T) {
 }
 
 func TestQwenAnswerRequiresAcceptedVideo(t *testing.T) {
+	const answerHeader = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
 	for name, fixture := range map[string]struct {
 		answer string
 		want   bool
 	}{
-		"recvonly": {"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=recvonly\r\n", true},
-		"sendrecv": {"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendrecv\r\n", true},
-		"missing":  {"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n", false},
-		"rejected": {"v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 102\r\na=inactive\r\n", false},
-		"sendonly": {"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendonly\r\n", false},
+		"recvonly":                {answerHeader + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=recvonly\r\n", true},
+		"sendrecv":                {answerHeader + "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendrecv\r\n", true},
+		"missing":                 {answerHeader + "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n", false},
+		"rejected":                {answerHeader + "m=video 0 UDP/TLS/RTP/SAVPF 102\r\na=inactive\r\n", false},
+		"sendonly":                {answerHeader + "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendonly\r\n", false},
+		"session inactive":        {answerHeader + "a=inactive\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\n", false},
+		"session sendonly":        {answerHeader + "a=sendonly\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\n", false},
+		"media overrides session": {answerHeader + "a=inactive\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=recvonly\r\n", true},
+		"malformed":               {"v=0\r\nm=video nope\r\n", false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := qwenAnswerAcceptsVideo(fixture.answer); got != fixture.want {

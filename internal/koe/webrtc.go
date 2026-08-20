@@ -12,7 +12,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -459,23 +458,32 @@ func (rc *RealtimeConn) dialQwen(ctx context.Context, exchange func(context.Cont
 }
 
 func qwenAnswerAcceptsVideo(answer string) bool {
-	inVideo, accepted := false, false
-	for _, rawLine := range strings.Split(strings.ReplaceAll(answer, "\r\n", "\n"), "\n") {
-		line := strings.TrimSpace(rawLine)
-		if strings.HasPrefix(line, "m=") {
-			if inVideo {
-				return accepted
-			}
-			fields := strings.Fields(line)
-			inVideo = len(fields) >= 2 && fields[0] == "m=video"
-			accepted = inVideo && fields[1] != "0"
-			continue
-		}
-		if inVideo && (line == "a=inactive" || line == "a=sendonly") {
-			accepted = false
+	description := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}
+	parsed, err := description.Unmarshal()
+	if err != nil {
+		return false
+	}
+	sessionDirection := ""
+	for _, attribute := range parsed.Attributes {
+		switch attribute.Key {
+		case "inactive", "sendonly", "recvonly", "sendrecv":
+			sessionDirection = attribute.Key
 		}
 	}
-	return inVideo && accepted
+	for _, mediaDescription := range parsed.MediaDescriptions {
+		if mediaDescription.MediaName.Media != "video" {
+			continue
+		}
+		direction := sessionDirection
+		for _, attribute := range mediaDescription.Attributes {
+			switch attribute.Key {
+			case "inactive", "sendonly", "recvonly", "sendrecv":
+				direction = attribute.Key
+			}
+		}
+		return mediaDescription.MediaName.Port.Value != 0 && direction != "inactive" && direction != "sendonly"
+	}
+	return false
 }
 
 // exchangeSDP sends one create-call request. It deliberately does not replay a
