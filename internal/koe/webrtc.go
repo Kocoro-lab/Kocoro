@@ -62,10 +62,12 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 
 // RealtimeConn is one connected WebRTC session to OpenAI Realtime.
 type RealtimeConn struct {
-	pc                   *webrtc.PeerConnection
-	sendTrack            *webrtc.TrackLocalStaticSample
-	dc                   *webrtc.DataChannel
-	dcMu                 sync.RWMutex
+	pc          *webrtc.PeerConnection
+	sendTrack   *webrtc.TrackLocalStaticSample
+	videoTrack  videoSampleWriter
+	videoSource *RealtimeVideoSource
+	dc          *webrtc.DataChannel
+	dcMu        sync.RWMutex
 	// cancel stops this connection attempt's goroutines (response sender, event
 	// handling). Without it a failed OpenAI bootstrap's sender outlives its dead
 	// transport on the shared session ctx and keeps competing for the shared
@@ -86,6 +88,47 @@ type RealtimeConn struct {
 	fullDuplexAEC bool
 }
 
+// RealtimeVideoSource supplies already-encoded keyframes for a provider-native
+// WebRTC video track. ReadFrame must not open a second camera owner; body
+// carriers read from their existing media pipeline. Qwen consumes these frames
+// continuously while a call is active instead of receiving OpenAI input_image
+// conversation items over the DataChannel.
+type RealtimeVideoSource struct {
+	Codec         string
+	FrameInterval time.Duration
+	ReadFrame     func(context.Context) ([]byte, error)
+}
+
+type videoSampleWriter interface {
+	WriteSample(media.Sample) error
+}
+
+// VideoCodecH264 is the encoded-frame format accepted by the Qwen video track.
+const VideoCodecH264 = "h264"
+
+func (s *RealtimeVideoSource) codecCapability() (webrtc.RTPCodecCapability, error) {
+	if s == nil || s.ReadFrame == nil {
+		return webrtc.RTPCodecCapability{}, fmt.Errorf("realtime video source is incomplete")
+	}
+	switch s.Codec {
+	case VideoCodecH264:
+		return webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		}, nil
+	default:
+		return webrtc.RTPCodecCapability{}, fmt.Errorf("unsupported realtime video codec %q", s.Codec)
+	}
+}
+
+func (s *RealtimeVideoSource) frameInterval() time.Duration {
+	if s == nil || s.FrameInterval <= 0 {
+		return time.Second
+	}
+	return s.FrameInterval
+}
+
 // newPeerConnection builds the pion PC with a send track + recvonly transceiver +
 // the oai-events data channel. Grounded in spike stage2-webrtc + stage2b-duplex.
 func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
@@ -93,6 +136,10 @@ func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
 }
 
 func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*RealtimeConn, error) {
+	return newPeerConnectionForProviderWithVideo(audio, provider, nil)
+}
+
+func newPeerConnectionForProviderWithVideo(audio *AudioIO, provider RealtimeProvider, videoSource *RealtimeVideoSource) (*RealtimeConn, error) {
 	configuration := webrtc.Configuration{}
 	if provider == ProviderOpenAI {
 		configuration.ICEServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
@@ -115,6 +162,24 @@ func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*R
 		return nil, err
 	}
 	rc := &RealtimeConn{pc: pc, sendTrack: track, audio: audio}
+	if provider == ProviderQwen && videoSource != nil {
+		capability, videoErr := videoSource.codecCapability()
+		if videoErr != nil {
+			pc.Close()
+			return nil, videoErr
+		}
+		videoTrack, videoErr := webrtc.NewTrackLocalStaticSample(capability, "video", "koe")
+		if videoErr != nil {
+			pc.Close()
+			return nil, videoErr
+		}
+		if _, videoErr = pc.AddTrack(videoTrack); videoErr != nil {
+			pc.Close()
+			return nil, videoErr
+		}
+		rc.videoTrack = videoTrack
+		rc.videoSource = videoSource
+	}
 
 	// Inbound audio: decode Opus → playback.
 	pc.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -139,6 +204,52 @@ func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*R
 	}
 	rc.dc = dc
 	return rc, nil
+}
+
+func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
+	if rc == nil || rc.videoTrack == nil || rc.videoSource == nil {
+		return
+	}
+	interval := rc.videoSource.frameInterval()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var sourceFailed bool
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if rc.callActive != nil && !rc.callActive() {
+				continue
+			}
+			frame, err := rc.videoSource.ReadFrame(ctx)
+			if err != nil {
+				if !sourceFailed {
+					log.Printf("koe[video]: frame source unavailable: %v", err)
+				}
+				sourceFailed = true
+				continue
+			}
+			if len(frame) == 0 {
+				if !sourceFailed {
+					log.Printf("koe[video]: frame source returned an empty frame")
+				}
+				sourceFailed = true
+				continue
+			}
+			if err := rc.videoTrack.WriteSample(media.Sample{Data: frame, Duration: interval}); err != nil {
+				if !sourceFailed {
+					log.Printf("koe[video]: frame write failed: %v", err)
+				}
+				sourceFailed = true
+				continue
+			}
+			if sourceFailed {
+				log.Printf("koe[video]: frame stream recovered")
+				sourceFailed = false
+			}
+		}
+	}
 }
 
 func (rc *RealtimeConn) setDataChannel(dc *webrtc.DataChannel) {
@@ -449,6 +560,10 @@ type ConnectOptions struct {
 	// Desktop warm sessions use this to retire stale idle sessions before the next
 	// double-tap can land on a dead connection.
 	OnClosed func(error)
+	// VideoSource adds provider-native live vision to Qwen. Its encoded frames are
+	// read only while CallActive is true; idle and prewarmed sessions upload none.
+	// OpenAI ignores this field and keeps its existing image-input path.
+	VideoSource *RealtimeVideoSource
 }
 
 // defaultSessionConfigTimeoutMS bounds how long Connect waits for OpenAI to ack our
@@ -554,7 +669,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	if audio != nil {
 		audio.SetRealtimeProvider(provider)
 	}
-	rc, err := newPeerConnectionForProvider(audio, provider)
+	rc, err := newPeerConnectionForProviderWithVideo(audio, provider, opts.VideoSource)
 	if err != nil {
 		return nil, connectError(provider, "local_setup", err)
 	}
@@ -717,6 +832,9 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 		}
 		rc.pumpSendTrack(ctx)
 	}()
+	if provider == ProviderQwen && rc.videoTrack != nil {
+		go rc.pumpVideoTrack(ctx)
+	}
 	// Level pump (D3w): emit the reactive RMS amplitude for the Desktop Island sprite
 	// at animation cadence while listening/speaking. thinking/idle carry no level
 	// (the sprite is self-driven there).

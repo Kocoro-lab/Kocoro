@@ -13,7 +13,112 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4/pkg/media"
 )
+
+type recordingVideoWriter struct {
+	writes atomic.Int32
+	data   chan []byte
+}
+
+func (w *recordingVideoWriter) WriteSample(sample media.Sample) error {
+	w.writes.Add(1)
+	select {
+	case w.data <- append([]byte(nil), sample.Data...):
+	default:
+	}
+	return nil
+}
+
+func TestQwenVideoSourceAddsH264TrackOnlyToQwen(t *testing.T) {
+	source := &RealtimeVideoSource{
+		Codec: VideoCodecH264,
+		ReadFrame: func(context.Context) ([]byte, error) {
+			return []byte{0x10, 0x00, 0x00, 0x00}, nil
+		},
+	}
+
+	qwen, err := newPeerConnectionForProviderWithVideo(nil, ProviderQwen, source)
+	if err != nil {
+		t.Fatalf("new Qwen peer: %v", err)
+	}
+	defer qwen.Close()
+	qwenOffer, err := qwen.pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("create Qwen offer: %v", err)
+	}
+	if !strings.Contains(qwenOffer.SDP, "m=video") || !strings.Contains(qwenOffer.SDP, "H264/90000") || !strings.Contains(qwenOffer.SDP, "profile-level-id=42e01f") {
+		t.Fatalf("Qwen offer missing compatible H264 video track:\n%s", qwenOffer.SDP)
+	}
+
+	openAI, err := newPeerConnectionForProviderWithVideo(nil, ProviderOpenAI, source)
+	if err != nil {
+		t.Fatalf("new OpenAI peer: %v", err)
+	}
+	defer openAI.Close()
+	openAIOffer, err := openAI.pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("create OpenAI offer: %v", err)
+	}
+	if strings.Contains(openAIOffer.SDP, "m=video") {
+		t.Fatalf("OpenAI offer unexpectedly contains Qwen video track:\n%s", openAIOffer.SDP)
+	}
+}
+
+func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
+	var active atomic.Bool
+	var reads atomic.Int32
+	writer := &recordingVideoWriter{data: make(chan []byte, 1)}
+	rc := &RealtimeConn{
+		videoTrack: writer,
+		videoSource: &RealtimeVideoSource{
+			Codec:         VideoCodecH264,
+			FrameInterval: 5 * time.Millisecond,
+			ReadFrame: func(context.Context) ([]byte, error) {
+				reads.Add(1)
+				return []byte{0x10, 0x00, 0x00, 0x00}, nil
+			},
+		},
+		callActive: active.Load,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rc.pumpVideoTrack(ctx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if got := reads.Load(); got != 0 {
+		cancel()
+		<-done
+		t.Fatalf("idle video source reads = %d, want 0", got)
+	}
+	active.Store(true)
+	waitUntil(t, func() bool { return writer.writes.Load() > 0 }, "active call did not send a video frame")
+	select {
+	case frame := <-writer.data:
+		if string(frame) != string([]byte{0x10, 0x00, 0x00, 0x00}) {
+			t.Fatalf("video frame = %v", frame)
+		}
+	default:
+		t.Fatal("video write did not carry frame bytes")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestQwenVideoSourceRejectsUnsupportedCodec(t *testing.T) {
+	_, err := newPeerConnectionForProviderWithVideo(nil, ProviderQwen, &RealtimeVideoSource{
+		Codec:     "jpeg",
+		ReadFrame: func(context.Context) ([]byte, error) { return []byte{1}, nil },
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported realtime video codec") {
+		t.Fatalf("unsupported codec error = %v", err)
+	}
+}
 
 // TestSessionConfigWatcherAcksOnSessionUpdated: a clean session.updated closes the
 // handshake, fires onConfigured exactly once, and wait returns nil.
