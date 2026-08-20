@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
@@ -74,7 +73,7 @@ func TestQwenVideoSourceAddsH264TrackOnlyToQwen(t *testing.T) {
 func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	var active atomic.Bool
 	var reads atomic.Int32
-	order := make(chan string, 4)
+	order := make(chan string, qwenAudioPrimerFrames+1)
 	audio, err := NewAudioIO()
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
@@ -113,8 +112,13 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	}
 	active.Store(true)
 	waitUntil(t, func() bool { return videoWriter.writes.Load() > 0 }, "active call did not send a video frame")
-	if first, second := <-order, <-order; first != "audio" || second != "video" {
-		t.Fatalf("first media writes = %q then %q, want audio then video", first, second)
+	for primerFrame := 0; primerFrame < qwenAudioPrimerFrames; primerFrame++ {
+		if got := <-order; got != "audio" {
+			t.Fatalf("media write %d = %q, want audio primer", primerFrame, got)
+		}
+	}
+	if got := <-order; got != "video" {
+		t.Fatalf("first post-primer media write = %q, want video", got)
 	}
 	select {
 	case frame := <-videoWriter.data:
@@ -184,7 +188,7 @@ func TestQwenVideoReadUsesFrameIntervalDeadline(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("ReadFrame context error = %v", err)
 		}
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(qwenAudioBeforeVideoLead + 200*time.Millisecond):
 		t.Fatal("ReadFrame did not receive its frame-interval deadline")
 	}
 	cancel()
@@ -196,20 +200,20 @@ func TestQwenVideoPrimesAudioBeforeFirstFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAudioIO: %v", err)
 	}
-	track, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 1},
-		"audio",
-		"koe-test",
-	)
-	if err != nil {
-		t.Fatalf("new audio track: %v", err)
-	}
+	track := &recordingSampleWriter{}
 	rc := &RealtimeConn{audio: audio, sendTrack: track}
-	if err := rc.primeQwenAudioBeforeVideo(); err != nil {
+	started := time.Now()
+	if err := rc.primeQwenAudioBeforeVideo(context.Background()); err != nil {
 		t.Fatalf("prime Qwen audio: %v", err)
 	}
 	if !rc.outboundAudioReady.Load() {
 		t.Fatal("audio primer did not open Qwen's media-order gate")
+	}
+	if got := track.writes.Load(); got != qwenAudioPrimerFrames {
+		t.Fatalf("audio primer writes = %d, want %d", got, qwenAudioPrimerFrames)
+	}
+	if elapsed := time.Since(started); elapsed < qwenAudioPrimerMinDuration-20*time.Millisecond {
+		t.Fatalf("audio primer duration = %v, want at least %v", elapsed, qwenAudioPrimerMinDuration)
 	}
 }
 
@@ -223,7 +227,7 @@ func TestQwenVideoPrimerFailsClosedWithoutAudioPath(t *testing.T) {
 		"track":   {audio: audio},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := rc.primeQwenAudioBeforeVideo(); err == nil {
+			if err := rc.primeQwenAudioBeforeVideo(context.Background()); err == nil {
 				t.Fatal("missing audio path must not report a successful primer")
 			}
 		})

@@ -72,10 +72,14 @@ type RealtimeConn struct {
 	// one silent Opus primer after a call becomes active and before its first
 	// image; successful real mic audio satisfies the same gate.
 	outboundAudioReady atomic.Bool
-	videoTrack         videoSampleWriter
-	videoSource        *RealtimeVideoSource
-	dc                 *webrtc.DataChannel
-	dcMu               sync.RWMutex
+	// Audio and video use separate RTP streams, so local write order does not
+	// guarantee remote arrival order. Keep the first audio write timestamp and
+	// give it a short lead before the first video sample is written.
+	outboundAudioReadyAt atomic.Int64
+	videoTrack           videoSampleWriter
+	videoSource          *RealtimeVideoSource
+	dc                   *webrtc.DataChannel
+	dcMu                 sync.RWMutex
 	// cancel stops this connection attempt's goroutines (response sender, event
 	// handling). Without it a failed OpenAI bootstrap's sender outlives its dead
 	// transport on the shared session ctx and keeps competing for the shared
@@ -117,6 +121,13 @@ type audioSampleWriter interface {
 
 // VideoCodecH264 is the encoded-frame format accepted by the Qwen video track.
 const VideoCodecH264 = "h264"
+
+const (
+	qwenAudioPrimerFrames      = 5
+	qwenAudioPrimerSpacing     = audioFrameMs * time.Millisecond
+	qwenAudioBeforeVideoLead   = 300 * time.Millisecond
+	qwenAudioPrimerMinDuration = (qwenAudioPrimerFrames-1)*qwenAudioPrimerSpacing + qwenAudioBeforeVideoLead
+)
 
 func (s *RealtimeVideoSource) codecCapability() (webrtc.RTPCodecCapability, error) {
 	if s == nil || s.ReadFrame == nil {
@@ -234,7 +245,7 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 			if rc.callActive == nil || !rc.callActive() {
 				continue
 			}
-			if err := rc.primeQwenAudioBeforeVideo(); err != nil {
+			if err := rc.primeQwenAudioBeforeVideo(ctx); err != nil {
 				if !sourceFailed {
 					log.Printf("koe[video]: audio primer unavailable: %v", err)
 				}
@@ -273,32 +284,61 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 	}
 }
 
-func (rc *RealtimeConn) primeQwenAudioBeforeVideo() error {
-	if rc == nil || rc.outboundAudioReady.Load() {
+func (rc *RealtimeConn) primeQwenAudioBeforeVideo(ctx context.Context) error {
+	if rc == nil {
 		return nil
 	}
-	if rc.audio == nil {
-		return fmt.Errorf("audio encoder unavailable")
+	if !rc.outboundAudioReady.Load() {
+		if rc.audio == nil {
+			return fmt.Errorf("audio encoder unavailable")
+		}
+		if rc.sendTrack == nil {
+			return fmt.Errorf("audio send track unavailable")
+		}
+		rc.outboundAudioMu.Lock()
+		if !rc.outboundAudioReady.Load() {
+			for primerFrame := 0; primerFrame < qwenAudioPrimerFrames; primerFrame++ {
+				encoded, err := rc.audio.EncodeFrame(make([]int16, audioFrameSize))
+				if err != nil {
+					rc.outboundAudioMu.Unlock()
+					return fmt.Errorf("encode silence: %w", err)
+				}
+				if err := rc.sendTrack.WriteSample(media.Sample{
+					Data: encoded, Duration: audioFrameMs * time.Millisecond,
+				}); err != nil {
+					rc.outboundAudioMu.Unlock()
+					return fmt.Errorf("write silence: %w", err)
+				}
+				if primerFrame+1 < qwenAudioPrimerFrames {
+					select {
+					case <-ctx.Done():
+						rc.outboundAudioMu.Unlock()
+						return ctx.Err()
+					case <-time.After(qwenAudioPrimerSpacing):
+					}
+				}
+			}
+			rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
+			rc.outboundAudioReady.Store(true)
+		}
+		rc.outboundAudioMu.Unlock()
 	}
-	if rc.sendTrack == nil {
-		return fmt.Errorf("audio send track unavailable")
+	readyAt := rc.outboundAudioReadyAt.Load()
+	if readyAt == 0 {
+		return fmt.Errorf("audio primer readiness timestamp unavailable")
 	}
-	rc.outboundAudioMu.Lock()
-	defer rc.outboundAudioMu.Unlock()
-	if rc.outboundAudioReady.Load() {
+	remaining := qwenAudioBeforeVideoLead - time.Since(time.Unix(0, readyAt))
+	if remaining <= 0 {
 		return nil
 	}
-	encoded, err := rc.audio.EncodeFrame(make([]int16, audioFrameSize))
-	if err != nil {
-		return fmt.Errorf("encode silence: %w", err)
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	if err := rc.sendTrack.WriteSample(media.Sample{
-		Data: encoded, Duration: audioFrameMs * time.Millisecond,
-	}); err != nil {
-		return fmt.Errorf("write silence: %w", err)
-	}
-	rc.outboundAudioReady.Store(true)
-	return nil
 }
 
 func (rc *RealtimeConn) setDataChannel(dc *webrtc.DataChannel) {
@@ -524,11 +564,12 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				writeErr := rc.sendTrack.WriteSample(media.Sample{
 					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
 				})
-				rc.outboundAudioMu.Unlock()
-				stats.noteWrite(writeErr)
-				if writeErr == nil {
+				if writeErr == nil && !rc.outboundAudioReady.Load() {
+					rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
 					rc.outboundAudioReady.Store(true)
 				}
+				rc.outboundAudioMu.Unlock()
+				stats.noteWrite(writeErr)
 			}
 			if !wasOpen && gate.open {
 				if assistantSpeaking && (eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1") {
