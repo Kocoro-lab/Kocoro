@@ -187,6 +187,11 @@ type RunAgentRequest struct {
 	InterruptedResumeMaxAge              time.Duration `json:"-"`
 	InterruptedResumeCheckpointUpdatedAt time.Time     `json:"-"`
 	InterruptedResumeSessionUpdatedAt    time.Time     `json:"-"`
+	// ImplicitPhysicalLocation carries the location-policy classification of the
+	// ORIGINAL request into a resumed continuation (whose Text is a fixed marker
+	// the classifier can never match). Set from the interrupted-turn checkpoint;
+	// internal only.
+	ImplicitPhysicalLocation bool `json:"-"`
 }
 
 // ForegroundHint identifies the app that was frontmost when the user summoned
@@ -2294,7 +2299,10 @@ func interruptedTurnSnapshot(req RunAgentRequest, agentName, effectiveCWD string
 		AttemptID:       req.AttemptID,
 		ExecutionRun:    cloneExecutionRun(req.ExecutionRun),
 		ExecutionConfig: agent.CloneExecutionConfig(req.ExecutionConfig),
-		UpdatedAt:       updatedAt,
+
+		ImplicitPhysicalLocation: req.ImplicitPhysicalLocation,
+
+		UpdatedAt: updatedAt,
 	}
 }
 
@@ -3465,9 +3473,16 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// and when the parent delegates a desktop goal, so ordinary Sonnet turns
 	// never pay provider-native preparation latency.
 	modelIntent := effectiveRunModelIntent(runCfg, agentOverride, req)
+	// req.ImplicitPhysicalLocation carries a persisted classification from an
+	// interrupted-turn checkpoint: the resume Text is a fixed continuation
+	// marker that never re-classifies, but the original location request is
+	// still the run's intent. Write the merged verdict back so the next
+	// checkpoint persists it too.
+	implicitPhysicalLocation := req.ImplicitPhysicalLocation || implicitPhysicalLocationRequestV1(visiblePrompt)
+	req.ImplicitPhysicalLocation = implicitPhysicalLocation
 	var computerReg *agent.ToolRegistry
 	var openAIComputerPrivate *daemonOpenAIComputerPrivateRuntimeV1
-	if baseReg.Has("computer_use") {
+	if !implicitPhysicalLocation && baseReg.Has("computer_use") {
 		computerReg, err = tools.CloneWithOpenAIComputerForRun(baseReg, runCfg)
 		if err != nil {
 			log.Printf(
@@ -3705,6 +3720,14 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	if req.DisableTools {
 		reg = agent.NewToolRegistry()
 	}
+	if implicitPhysicalLocation {
+		// MUST stay the last registry mutation before the loop: every
+		// tools.Register* above (use_skill, session_search, memory_recall,
+		// set_work_plan, skill recommendations) would otherwise escape the strip,
+		// and session_search/memory_recall can surface a stored address.
+		applyImplicitPhysicalLocationToolPolicyV1(reg)
+		log.Printf("daemon: implicit physical-location request — tool registry restricted source=%s resume=%t", req.Source, req.ResumeInterrupted)
+	}
 
 	loop := agent.NewAgentLoop(deps.GW, reg, runCfg.ModelTier, deps.ShannonDir,
 		runCfg.Agent.MaxIterations, runCfg.Tools.ResultTruncation, runCfg.Tools.ArgsTruncation,
@@ -3890,6 +3913,12 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// connection summary (degraded platforms only; healthy omitted → empty on a
 	// healthy new session). Preamble() is nil-safe.
 	stickyExtra := req.StickyContext
+	if implicitPhysicalLocation {
+		if stickyExtra != "" {
+			stickyExtra += "\n"
+		}
+		stickyExtra += implicitPhysicalLocationUnavailableContextV1
+	}
 	if req.NewSession && deps.ConnState != nil {
 		if pre := deps.ConnState.Preamble(); len(pre) > 0 {
 			if stickyExtra != "" {

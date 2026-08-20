@@ -1080,7 +1080,11 @@ func TestMacOSAutomationGuidance_ComputerUsePreferred(t *testing.T) {
 		t.Skip("darwin-only guidance")
 	}
 	out := macOSAutomationGuidance([]string{"computer_use", "accessibility", "computer", "browser"})
-	for _, want := range []string{"Use `computer_use`", "exact app name", "state_id", "target window", "include_screenshot", "coordinate", "`browser`"} {
+	for _, want := range []string{
+		"Use `computer_use`", "exact app name", "state_id", "target window",
+		"include_screenshot", "coordinate", "`browser`",
+		"cannot determine the device's physical location", "public-IP geolocation", "ask for a city",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("computer_use guidance missing %q: %s", want, out)
 		}
