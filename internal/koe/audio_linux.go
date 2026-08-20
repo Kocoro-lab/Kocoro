@@ -39,19 +39,25 @@ type AudioIO struct {
 	frames  chan []int16
 	playBuf chan []int16
 
-	speaking          atomic.Bool
-	bargeAllowed      atomic.Bool // sustained robot-local DOA/VAD authorized talk-over
-	earconCaptureMute atomic.Bool // unconditional; full-duplex barge-in cannot bypass cues
-	userMicOff        atomic.Bool
-	userMicSticky     atomic.Bool
-	playback          atomic.Bool
-	playbackGain      atomic.Uint64
-	encMu             sync.Mutex
-	decMu             sync.Mutex
-	writeMu           sync.Mutex // serialize speaker and control frames on the UDS
-	stopOnce          sync.Once
-	sendReady         chan struct{}
-	sendReadyOnce     sync.Once
+	speaking               atomic.Bool
+	bargeAllowed           atomic.Bool // sustained robot-local DOA/VAD authorized talk-over
+	earconCaptureMute      atomic.Bool // unconditional; full-duplex barge-in cannot bypass cues
+	knownOutputCaptureHold atomic.Bool // unconditional; full-duplex barge-in cannot bypass known local cues
+	playbackTailProtected  atomic.Bool // Qwen response.done can precede carrier playout drain
+	userMicOff             atomic.Bool
+	userMicSticky          atomic.Bool
+	playback               atomic.Bool
+	// playbackPaused is the reversible local floor hold (shared native-floor
+	// controller). Queued carrier PCM is retained; only local playout is silenced.
+	playbackPaused   atomic.Bool
+	playbackGain     atomic.Uint64
+	realtimeProvider atomic.Value
+	encMu            sync.Mutex
+	decMu            sync.Mutex
+	writeMu          sync.Mutex // serialize speaker and control frames on the UDS
+	stopOnce         sync.Once
+	sendReady        chan struct{}
+	sendReadyOnce    sync.Once
 
 	inLevel  atomic.Uint64
 	outLevel atomic.Uint64
@@ -150,9 +156,13 @@ func (a *AudioIO) SetSpeaking(s bool) {
 	a.speaking.Store(s)
 	if !s {
 		a.bargeAllowed.Store(false)
+		a.playbackTailProtected.Store(false)
 	}
 }
 func (a *AudioIO) Speaking() bool { return a.speaking.Load() }
+func (a *AudioIO) SetPlaybackTailProtected(protected bool) {
+	a.playbackTailProtected.Store(protected)
+}
 func (a *AudioIO) SetBargeInAuthorized(allowed bool) {
 	a.bargeAllowed.Store(allowed)
 }
@@ -161,8 +171,18 @@ func (a *AudioIO) SetUserMicOff(off bool)  { a.userMicOff.Store(off) }
 func (a *AudioIO) UserMicOff() bool        { return a.userMicOff.Load() }
 func (a *AudioIO) SetUserMicSticky(s bool) { a.userMicSticky.Store(s) }
 func (a *AudioIO) UserMicSticky() bool     { return a.userMicSticky.Load() }
+func (a *AudioIO) SetRealtimeProvider(provider RealtimeProvider) {
+	a.realtimeProvider.Store(string(provider))
+}
+func (a *AudioIO) currentRealtimeProvider() string {
+	if value := a.realtimeProvider.Load(); value != nil {
+		provider, _ := value.(string)
+		return provider
+	}
+	return ""
+}
 func (a *AudioIO) captureSuppressed() bool {
-	if a.earconCaptureMute.Load() || a.userMicOff.Load() {
+	if a.earconCaptureMute.Load() || a.knownOutputCaptureHold.Load() || a.playbackTailProtected.Load() || a.userMicOff.Load() {
 		return true
 	}
 	if !a.dropCapture() {
@@ -193,6 +213,14 @@ func (a *AudioIO) SetPreferredDevices(micUID, speakerUID string) {
 
 // VPIO knobs are inert on linux (VoiceProcessingIO is macOS-only). Kept so the
 // cross-platform callers (realtime/cmd) compile and behave sensibly (never active).
+func (a *AudioIO) SetPlaybackPaused(paused bool) {
+	a.playbackPaused.Store(paused)
+	if paused {
+		a.setOutputLevel(0)
+	}
+}
+func (a *AudioIO) PlaybackPaused() bool { return a.playbackPaused.Load() }
+
 func (a *AudioIO) VPIOActive() bool                      { return false }
 func (a *AudioIO) SetVPIOVoiceProcessingBypassed(_ bool) {}
 func (a *AudioIO) VPIOVoiceProcessingBypassed() bool     { return false }
@@ -292,6 +320,7 @@ func drain(ch chan []int16) {
 func (a *AudioIO) SetPlaybackEnabled(s bool) {
 	a.playback.Store(s)
 	if !s {
+		a.SetPlaybackPaused(false)
 		a.setOutputLevel(0)
 		a.spkEpoch.Add(1)
 		drain(a.playBuf)
@@ -565,6 +594,16 @@ func (a *AudioIO) spkPump() {
 		case <-a.done:
 			return
 		case queued := <-ring:
+			// Reversible floor hold: stall (do not drop) so a resume replays the
+			// exact retained PCM. An epoch bump or playback-off ends the hold's
+			// claim on this frame and falls through to the normal drop check.
+			for a.playbackPaused.Load() && queued.epoch == a.spkEpoch.Load() && a.playback.Load() {
+				select {
+				case <-a.done:
+					return
+				case <-time.After(audioFrameMs * time.Millisecond):
+				}
+			}
 			if queued.epoch != a.spkEpoch.Load() || !a.playback.Load() {
 				continue
 			}

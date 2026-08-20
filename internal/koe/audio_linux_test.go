@@ -59,6 +59,33 @@ func TestWirelessBargeInNeverOverridesEarconCaptureMute(t *testing.T) {
 	}
 }
 
+func TestWirelessQwenPlaybackTailSuppressesCapture(t *testing.T) {
+	a := &AudioIO{}
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	a.SetRealtimeProvider(ProviderQwen)
+	if got := a.currentRealtimeProvider(); got != string(ProviderQwen) {
+		t.Fatalf("realtime provider = %q, want %q", got, ProviderQwen)
+	}
+	a.SetPlaybackTailProtected(true)
+	if !a.captureSuppressed() {
+		t.Fatal("Qwen playback tail must suppress Wireless capture")
+	}
+	a.SetSpeaking(false)
+	if a.captureSuppressed() {
+		t.Fatal("releasing speaking must release Wireless playback-tail protection")
+	}
+}
+
+func TestWirelessDisablingPlaybackClearsFloorPause(t *testing.T) {
+	a := &AudioIO{playBuf: make(chan []int16, 1)}
+	a.playback.Store(true)
+	a.SetPlaybackPaused(true)
+	a.SetPlaybackEnabled(false)
+	if a.PlaybackPaused() {
+		t.Fatal("disabling playback must clear the reversible floor pause")
+	}
+}
+
 func TestWirelessQueuedCaptureIsRegatedAtSendTime(t *testing.T) {
 	a := &AudioIO{}
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
