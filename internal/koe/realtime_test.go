@@ -2121,6 +2121,14 @@ func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	}
 }
 
+func TestQwenSessionConfigDisablesServerResponseWhenClientOwnsTurn(t *testing.T) {
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	raw, _ := json.Marshal(qwenSessionConfig("persona", "Tina", false))
+	if !strings.Contains(string(raw), `"create_response":false`) {
+		t.Fatalf("Qwen client-owned turn config must disable the server response: %s", raw)
+	}
+}
+
 func TestQwenSessionConfigPreservesBodyToolsButOmitsSnapshotCamera(t *testing.T) {
 	base, _ := json.Marshal(qwenSessionConfig("persona", "Tina", false))
 	for _, forbidden := range []string{`"name":"express"`, `"name":"camera"`} {

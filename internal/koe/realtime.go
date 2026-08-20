@@ -2829,7 +2829,7 @@ func qwenSessionConfigForCarrier(persona, voice string, expressIntents []string,
 				"threshold":           koeEnvFloat("KOE_VAD_THRESHOLD", 0.5),
 				"prefix_padding_ms":   500,
 				"silence_duration_ms": vadSilenceMS,
-				"create_response":     true,
+				"create_response":     !clientOwnsTurnResponse(),
 				"interrupt_response":  providerBargeInEnabled(string(ProviderQwen)),
 			},
 			// Qwen vision is an RTP video track. The OpenAI-only camera tool
