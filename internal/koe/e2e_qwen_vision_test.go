@@ -3,7 +3,6 @@
 package koe
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -32,7 +31,7 @@ func TestKoeQwenLiveVisionE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read H264 frame: %v", err)
 	}
-	if !bytes.Contains(frame, []byte{0, 0, 1}) {
+	if !isAnnexBH264(frame) {
 		t.Fatal("H264 frame is not Annex-B")
 	}
 

@@ -93,7 +93,7 @@ func TestExchangeSDPViaDaemon(t *testing.T) {
 	defer srv.Close()
 
 	client := NewDaemonClient(srv.URL)
-	client.SetToken("robot-backbrain-token")
+	client.SetToken("  robot-backbrain-token\n")
 	answer, err := client.ExchangeSDPViaDaemon(
 		context.Background(), "qwen", "qwen3.5-omni-flash-realtime", "v=0\r\n",
 	)

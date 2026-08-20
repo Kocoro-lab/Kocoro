@@ -39,7 +39,7 @@ type DaemonClient struct {
 // secret in their process arguments.
 func (c *DaemonClient) SetToken(token string) {
 	c.tokenMu.Lock()
-	c.token = token
+	c.token = strings.TrimSpace(token)
 	c.tokenMu.Unlock()
 }
 

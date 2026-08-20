@@ -157,6 +157,7 @@ func TestQwenVideoPumpRechecksCallAfterPrimer(t *testing.T) {
 	var active atomic.Bool
 	active.Store(true)
 	var reads atomic.Int32
+	var primerWrites atomic.Int32
 	primerStarted := make(chan struct{}, 1)
 	audio, err := NewAudioIO()
 	if err != nil {
@@ -165,6 +166,7 @@ func TestQwenVideoPumpRechecksCallAfterPrimer(t *testing.T) {
 	rc := &RealtimeConn{
 		audio: audio,
 		sendTrack: &recordingSampleWriter{onWrite: func() {
+			primerWrites.Add(1)
 			select {
 			case primerStarted <- struct{}{}:
 			default:
@@ -198,8 +200,12 @@ func TestQwenVideoPumpRechecksCallAfterPrimer(t *testing.T) {
 		t.Fatal("video pump did not start the audio primer")
 	}
 	active.Store(false)
-	waitUntil(t, rc.outboundAudioReady.Load, "audio primer did not finish")
-	time.Sleep(20 * time.Millisecond)
+	waitUntil(t, func() bool {
+		return primerWrites.Load() >= int32(qwenAudioPrimerFrames)
+	}, "audio primer did not write every frame")
+	// The fifth write precedes the provider-observed audio lead. Wait past that
+	// lead so this assertion exercises the post-primer activity recheck.
+	time.Sleep(qwenAudioBeforeVideoLead + minRealtimeVideoFrameInterval)
 	if got := reads.Load(); got != 0 {
 		t.Fatalf("video source reads after call ended during primer = %d, want 0", got)
 	}
