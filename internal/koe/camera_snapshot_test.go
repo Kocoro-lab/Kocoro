@@ -73,11 +73,11 @@ func TestCaptureCameraSnapshotCanonicalRoundTrip(t *testing.T) {
 
 func TestProbeCameraCarrierDoesNotRequestJPEG(t *testing.T) {
 	path := runCameraServer(t, func(conn net.Conn, req cameraSnapshotRequest) {
-		if req.Type != "camera.probe" {
-			t.Errorf("probe request type = %q", req.Type)
+		if req.Type != "camera.probe" || req.Proto != cameraVideoProto {
+			t.Errorf("probe request = %#v", req)
 		}
 		writeCameraResponse(t, conn, cameraSnapshotResponse{
-			Type: "camera.probe.result", Proto: cameraSnapshotProto, RequestID: req.RequestID, OK: true,
+			Type: "camera.probe.result", Proto: cameraVideoProto, RequestID: req.RequestID, OK: true,
 		}, nil)
 	})
 	if err := ProbeCameraCarrier(context.Background(), path); err != nil {
@@ -107,5 +107,48 @@ func TestCaptureCameraSnapshotRejectsBadJPEG(t *testing.T) {
 	})
 	if _, err := CaptureCameraSnapshot(context.Background(), path); err == nil {
 		t.Fatal("bad JPEG must fail")
+	}
+}
+
+func TestCaptureCameraVideoFrameCanonicalRoundTrip(t *testing.T) {
+	want := []byte{0, 0, 0, 1, 0x67, 1, 2, 3, 0, 0, 0, 1, 0x65, 4, 5, 6}
+	path := runCameraServer(t, func(conn net.Conn, req cameraSnapshotRequest) {
+		if req.Type != "camera.video_frame" || req.Proto != cameraVideoProto || req.RequestID == "" {
+			t.Errorf("request = %#v", req)
+		}
+		writeCameraResponse(t, conn, cameraSnapshotResponse{
+			Type: "camera.video_frame.result", Proto: cameraVideoProto,
+			RequestID: req.RequestID, OK: true, MediaType: "video/h264", CapturedAt: "2026-08-20T00:00:00Z",
+		}, want)
+	})
+	got, err := CaptureCameraVideoFrame(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("video frame = %x, want %x", got, want)
+	}
+}
+
+func TestCaptureCameraVideoFrameRejectsWrongMediaAndPayload(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mediaType string
+		payload   []byte
+	}{
+		{name: "wrong media", mediaType: "image/jpeg", payload: []byte{0, 0, 0, 1, 0x65}},
+		{name: "not annex b", mediaType: "video/h264", payload: []byte("not-h264")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := runCameraServer(t, func(conn net.Conn, req cameraSnapshotRequest) {
+				writeCameraResponse(t, conn, cameraSnapshotResponse{
+					Type: "camera.video_frame.result", Proto: cameraVideoProto,
+					RequestID: req.RequestID, OK: true, MediaType: test.mediaType,
+				}, test.payload)
+			})
+			if _, err := CaptureCameraVideoFrame(context.Background(), path); err == nil {
+				t.Fatal("invalid video frame must fail")
+			}
+		})
 	}
 }

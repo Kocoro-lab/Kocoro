@@ -1056,6 +1056,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		Language:      cfg.language,
 		FullDuplexAEC: fullDuplexAEC,
 		CameraEnabled: cameraEnabled,
+		VideoSource:   newReachyVideoSource(cameraEnabled, cfg.cameraSocket),
 	})
 	if err != nil {
 		return fmt.Errorf("connect: %v", err)
@@ -1073,6 +1074,19 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 			m.Samples, float64(m.Samples)/48000, m.RMS, m.Peak, m.DiscontinuityRatio, m.SilenceRatio, m.ClippingRatio)
 	}
 	return nil
+}
+
+func newReachyVideoSource(enabled bool, socketPath string) *koe.RealtimeVideoSource {
+	if !enabled || socketPath == "" {
+		return nil
+	}
+	return &koe.RealtimeVideoSource{
+		Codec:         koe.VideoCodecH264,
+		FrameInterval: time.Second,
+		ReadFrame: func(ctx context.Context) ([]byte, error) {
+			return koe.CaptureCameraVideoFrame(ctx, socketPath)
+		},
+	}
 }
 
 func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, retireCall bool) *koe.CallState {
@@ -1113,7 +1127,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			if err := probeCameraCarrier(ctx, cfg.cameraSocket); err != nil {
 				return fmt.Errorf("wireless camera carrier readiness: %w", err)
 			}
-			log.Printf("koe[camera]: wireless carrier v0.1 startup probe verified; no frame captured")
+			log.Printf("koe[camera]: wireless carrier v0.2 startup probe verified; no frame captured")
 			wirelessCameraVerified = true
 		}
 		var err error
@@ -1552,6 +1566,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				OnClosed:          func(err error) { handleSessionClosed(seq, err) },
 				ExpressIntents:    expressIntents,
 				CameraEnabled:     wirelessLazy && cfg.carrier.HasCap(koe.CapHasCamera),
+				VideoSource:       newReachyVideoSource(wirelessLazy && cfg.carrier.HasCap(koe.CapHasCamera), cfg.cameraSocket),
 				OnResponseStarted: onResponseStarted,
 				OnSpeechStarted:   onSpeechStarted,
 				OnUserTranscript:  onUserTranscript,

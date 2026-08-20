@@ -2121,6 +2121,23 @@ func TestQwenSessionConfigUsesSemanticVADByDefault(t *testing.T) {
 	}
 }
 
+func TestQwenSessionConfigPreservesBodyToolsButOmitsSnapshotCamera(t *testing.T) {
+	base, _ := json.Marshal(qwenSessionConfig("persona", "Tina", false))
+	for _, forbidden := range []string{`"name":"express"`, `"name":"camera"`} {
+		if strings.Contains(string(base), forbidden) {
+			t.Fatalf("base Qwen config unexpectedly contains carrier tool %s: %s", forbidden, base)
+		}
+	}
+
+	raw, _ := json.Marshal(qwenSessionConfigForCarrier("persona", "Tina", []string{"happy"}, true))
+	if !strings.Contains(string(raw), `"name":"express"`) {
+		t.Fatalf("Qwen carrier config missing express: %s", raw)
+	}
+	if strings.Contains(string(raw), `"name":"camera"`) {
+		t.Fatalf("Qwen live-video config unexpectedly contains snapshot camera tool: %s", raw)
+	}
+}
+
 func TestQwenLiveVisionInstructionsKeepVideoAsAmbientContext(t *testing.T) {
 	instructions := func(config map[string]any) string {
 		t.Helper()

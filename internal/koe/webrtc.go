@@ -1009,7 +1009,7 @@ func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Cont
 
 func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwenVoice string, opts ConnectOptions, hasLiveVideo bool) map[string]any {
 	if provider == ProviderQwen {
-		return qwenSessionConfig(persona, qwenVoice, hasLiveVideo)
+		return qwenSessionConfigForCarrier(persona, qwenVoice, opts.ExpressIntents, hasLiveVideo)
 	}
 	return sessionConfigForCarrierLanguage(persona, openAIVoice, opts.Language, opts.FullDuplexAEC, opts.ExpressIntents, opts.CameraEnabled)
 }

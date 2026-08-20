@@ -917,10 +917,11 @@ Remote workflows (`/research`, `/swarm`) stream events:
 
 ## Building & Testing
 
-Reachy Wireless builds can expose a capability-gated `camera` voice tool. It
-requests one current JPEG from the robot audio carrier's existing WebRTC stream
-only when the user asks Koe to look; it does not start a second camera session,
-persist frames, or route ordinary visual description through the back-brain.
+Reachy Wireless reuses the robot audio carrier's existing Local camera branch.
+OpenAI exposes a capability-gated `camera` tool for one current JPEG; Qwen gets
+one-fps constrained-baseline H264 over its negotiated live video track and does
+not expose that tool. Neither path starts a second camera owner, persists frames,
+or routes ordinary visual description through the back-brain.
 
 ```bash
 go build -o shan .           # build

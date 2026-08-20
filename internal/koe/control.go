@@ -651,7 +651,7 @@ func (s *ControlServer) writeCarrierStatus(w http.ResponseWriter) {
 		cameraProto := ""
 		if s.wirelessCameraVerified.Load() {
 			cameraState = "ready"
-			cameraProto = cameraSnapshotProto
+			cameraProto = cameraVideoProto
 		}
 		cameraStatus = &carrierCameraStatus{
 			State: cameraState, Transport: "uds", Proto: cameraProto, SocketConfigured: cameraConfigured,

@@ -95,6 +95,32 @@ Both `stop_speaking` and `end_call` say nothing and send no
   (`conversation.item.truncate` to the audio actually heard) so the model never
   treats unspoken text as said.
 
+#### Reachy Wireless carrier
+
+The Wireless implementation lives on `spike/koe-undarwin-arm64` until its
+feature stack is split and landed. `cmd/koe.go` resolves `--carrier`, `--caps`,
+`--bridge-socket`, `--audio-socket`, `--camera-socket`, and
+`--reachy-daemon-url` into one immutable `CarrierProfile`. The default `mac`
+profile must stay behaviorally unchanged.
+
+- `internal/koe/reachy/` is the tagless motion-bridge UDS client. It mirrors the
+  closed frame/method/error sets and byte fixtures in the local
+  `kocoro-robot-runtime` repo. Change both sides together.
+- `audio_linux.go` owns the independent Wireless PCM carrier; JPEG snapshots and
+  Qwen H264 frames reuse that carrier's existing camera branch. Motion loss degrades gestures but
+  must not block conversation; audio loss is voice-critical.
+- A remote Koe reaches the daemon only when `koe.lan_bind` and at least one
+  per-robot bearer token are configured. Non-loopback requests pass
+  `withKoeLANAuth`; `/config` protects both fields from mutation.
+- The XVF3800 carrier is an AEC-capable full-duplex path. Wireless still defaults
+  `KOE_NATIVE_FLOOR=0` plus `KOE_CLIENT_RESPONSE=1`: field tests showed residual
+  speaker echo falsely claiming the native floor. Operators may opt in with an
+  explicit environment override; do not change the default until the claim is
+  gated by front-speech evidence.
+- A prepared Wireless session keeps a bounded local mic pre-roll but uploads no
+  idle-room audio. Robot-hosted Koe ignores launcher reparenting and exits only
+  with its own context/signal; Mac/Lite retain Desktop-parent ownership.
+
 ### Provider Architecture
 
 `provider` config key selects the LLM backend: default → `GatewayClient` (Cloud); `ollama` → `OllamaClient` (OpenAI-compatible). Both implement `Complete` / `CompleteStream`.

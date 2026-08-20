@@ -2662,7 +2662,11 @@ type qwenToolDef struct {
 }
 
 func qwenToolDefs() []qwenToolDef {
-	defs := ToolDefs()
+	return qwenToolDefsForCarrier(nil)
+}
+
+func qwenToolDefsForCarrier(expressIntents []string, hasCamera ...bool) []qwenToolDef {
+	defs := ToolDefsForCarrier(expressIntents, hasCamera...)
 	result := make([]qwenToolDef, 0, len(defs))
 	for _, def := range defs {
 		result = append(result, qwenToolDef{
@@ -2788,6 +2792,10 @@ const qwenLiveVisionInstructions = `Live visual context from the robot may be av
 // VAD's complete-thought endpointing. KOE_QWEN_VAD_MODE remains the A/B and
 // rollback override.
 func qwenSessionConfig(persona, voice string, hasLiveVideo bool) map[string]any {
+	return qwenSessionConfigForCarrier(persona, voice, nil, hasLiveVideo)
+}
+
+func qwenSessionConfigForCarrier(persona, voice string, expressIntents []string, hasLiveVideo bool) map[string]any {
 	vadSilenceMS := koeEnvInt("KOE_VAD_SILENCE_MS", defaultVADSilenceMS)
 	vadMode := strings.ToLower(strings.TrimSpace(os.Getenv("KOE_QWEN_VAD_MODE")))
 	if vadMode != "server_vad" && vadMode != "semantic_vad" {
@@ -2824,7 +2832,10 @@ func qwenSessionConfig(persona, voice string, hasLiveVideo bool) map[string]any 
 				"create_response":     true,
 				"interrupt_response":  providerBargeInEnabled(string(ProviderQwen)),
 			},
-			"tools": qwenToolDefs(),
+			// Qwen vision is an RTP video track. The OpenAI-only camera tool
+			// injects input_image conversation items and must never be exposed
+			// in a Qwen session.
+			"tools": qwenToolDefsForCarrier(expressIntents, false),
 		},
 	}
 }

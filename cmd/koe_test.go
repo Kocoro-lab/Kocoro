@@ -63,6 +63,19 @@ func TestKoeConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestNewReachyVideoSourceIsCapabilityAndSocketGated(t *testing.T) {
+	if source := newReachyVideoSource(false, "/tmp/camera.sock"); source != nil {
+		t.Fatal("camera-disabled carrier must not create a video source")
+	}
+	if source := newReachyVideoSource(true, ""); source != nil {
+		t.Fatal("missing camera socket must not create a video source")
+	}
+	source := newReachyVideoSource(true, "/tmp/camera.sock")
+	if source == nil || source.Codec != koe.VideoCodecH264 || source.FrameInterval != time.Second || source.ReadFrame == nil {
+		t.Fatalf("video source = %#v", source)
+	}
+}
+
 // The pinned default is only defensible because --model still overrides it —
 // that is the escape hatch for CLI and on-robot callers who want another tier.
 func TestKoeModelFlagOverridesDefault(t *testing.T) {
