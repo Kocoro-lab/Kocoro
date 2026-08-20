@@ -280,11 +280,14 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	var configOnce sync.Once
 	sendConfig := func() {
 		configOnce.Do(func() {
-			if provider == ProviderQwen {
-				_ = send(qwenSessionConfig(persona, DefaultQwenRealtimeVoice, videoSource != nil))
-				return
-			}
-			_ = send(sessionConfig(persona, DefaultOpenAIRealtimeVoice, false))
+			_ = send(realtimeSessionPayload(
+				provider,
+				persona,
+				DefaultOpenAIRealtimeVoice,
+				DefaultQwenRealtimeVoice,
+				false,
+				rc.videoTrack != nil,
+			))
 		})
 	}
 	handleMessage := func(m webrtc.DataChannelMessage) {

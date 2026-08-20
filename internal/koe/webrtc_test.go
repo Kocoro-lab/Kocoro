@@ -96,16 +96,15 @@ func TestRealtimeSessionPayloadMatchesProviderVideoPolicy(t *testing.T) {
 		return value
 	}
 
-	video := &RealtimeVideoSource{}
-	qwenAudio := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", ConnectOptions{}))
+	qwenAudio := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", false, false))
 	if strings.Contains(qwenAudio, qwenLiveVisionInstructions) {
 		t.Fatalf("audio-only Qwen payload unexpectedly contains live-vision instructions: %s", qwenAudio)
 	}
-	qwenVideo := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", ConnectOptions{VideoSource: video}))
+	qwenVideo := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", false, true))
 	if !strings.HasSuffix(qwenVideo, qwenLiveVisionInstructions) {
 		t.Fatalf("Qwen video payload missing live-vision instructions: %s", qwenVideo)
 	}
-	openAIVideo := instructions(realtimeSessionPayload(ProviderOpenAI, "persona", "marin", "Tina", ConnectOptions{VideoSource: video}))
+	openAIVideo := instructions(realtimeSessionPayload(ProviderOpenAI, "persona", "marin", "Tina", false, true))
 	if strings.Contains(openAIVideo, qwenLiveVisionInstructions) {
 		t.Fatalf("OpenAI payload unexpectedly contains Qwen live-vision instructions: %s", openAIVideo)
 	}

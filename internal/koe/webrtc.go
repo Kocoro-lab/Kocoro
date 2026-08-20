@@ -854,13 +854,11 @@ func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Cont
 	})
 }
 
-// A Qwen VideoSource implies live vision because connectRealtime rejects a
-// missing, inactive, or unaccepted video track before session configuration.
-func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwenVoice string, opts ConnectOptions) map[string]any {
+func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwenVoice string, fullDuplexAEC, hasLiveVideo bool) map[string]any {
 	if provider == ProviderQwen {
-		return qwenSessionConfig(persona, qwenVoice, opts.VideoSource != nil)
+		return qwenSessionConfig(persona, qwenVoice, hasLiveVideo)
 	}
-	return sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
+	return sessionConfig(persona, openAIVoice, fullDuplexAEC)
 }
 
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
@@ -873,6 +871,9 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	rc, err := newPeerConnectionForProviderWithVideo(audio, provider, opts.VideoSource)
 	if err != nil {
 		return nil, connectError(provider, "local_setup", err)
+	}
+	if opts.VideoSource != nil && rc.videoTrack == nil {
+		log.Printf("koe[video]: video source inactive for provider=%s", provider)
 	}
 	// Scope every goroutine this attempt starts to the attempt, not the caller's
 	// session ctx: an Auto fallback continues on the same session ctx, and every
@@ -949,7 +950,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	sendConfig := func(dc *webrtc.DataChannel) {
 		sendConfigOnce.Do(func() {
 			rc.setDataChannel(dc)
-			payload := realtimeSessionPayload(provider, persona, openAIVoice, qwenVoice, opts)
+			payload := realtimeSessionPayload(provider, persona, openAIVoice, qwenVoice, opts.FullDuplexAEC, rc.videoTrack != nil)
 			b, _ := json.Marshal(payload)
 			if err := dc.SendText(string(b)); err != nil {
 				notifyClosed(fmt.Errorf("send session config: %w", err))

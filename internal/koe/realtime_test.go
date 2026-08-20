@@ -1108,6 +1108,11 @@ func TestQwenLiveVisionInstructionsKeepVideoAsAmbientContext(t *testing.T) {
 	if !strings.HasSuffix(withVideo, qwenLiveVisionInstructions) {
 		t.Fatalf("Qwen live-video instructions are not appended last: %s", withVideo)
 	}
+	for _, retained := range []string{"persona", deferredFunctionResultInstructions} {
+		if !strings.Contains(withVideo, retained) {
+			t.Fatalf("Qwen live-video config replaced required instructions %q: %s", retained, withVideo)
+		}
+	}
 	for _, want := range []string{
 		"ambient context",
 		"Keep the user's spoken request as the topic",
