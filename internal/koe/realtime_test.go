@@ -23,6 +23,16 @@ type captureSender struct {
 	sent []map[string]any
 }
 
+func TestAssistantTranscriptHookIsExplicitAndContentBearing(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("transcript-hook", ""), nil, func(any) error { return nil })
+	var got string
+	h.onAssistantTranscript = func(text string) { got = text }
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_audio_transcript.done","transcript":"椅子"}`))
+	if got != "椅子" {
+		t.Fatalf("assistant transcript hook = %q", got)
+	}
+}
+
 func (c *captureSender) send(v any) error {
 	b, _ := json.Marshal(v)
 	var m map[string]any

@@ -5,12 +5,36 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
+
+func TestDaemonClientTokenCanChangeDuringAuthorization(t *testing.T) {
+	client := NewDaemonClient("http://127.0.0.1:7533")
+	var wg sync.WaitGroup
+	for attempt := 0; attempt < 100; attempt++ {
+		wg.Add(2)
+		go func(token string) {
+			defer wg.Done()
+			client.SetToken(token)
+		}(fmt.Sprintf("token-%d", attempt))
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequest(http.MethodGet, client.baseURL+"/status", nil)
+			if err != nil {
+				t.Errorf("new request: %v", err)
+				return
+			}
+			client.authorize(req)
+		}()
+	}
+	wg.Wait()
+}
 
 func TestDoTaskCompleted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

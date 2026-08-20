@@ -364,15 +364,16 @@ turns; without native floor control, a terminal-only fixed vocabulary
 model owns all other turn control.
 
 Realtime provider routing is WebRTC-only. Auto changes OpenAI→Qwen only for an
-eligible bootstrap failure before the session is ready (network error/timeout
-or 5xx; Cloud's mint folds upstream OpenAI auth/config failures into 502, so
-those fall back by design; gateway-authored 4xx stay terminal). Forced modes
-never fall back. Qwen lacks `conversation.item.truncate`: native cognitive-floor
-control stays disabled there — never emulate truncation by replaying or
-rewriting an active call. Barge-in-on Qwen calls use server VAD, barge-in-off
-semantic VAD (`KOE_QWEN_VAD_MODE` overrides); VPIO barge-in stays available
-mid-response, and only the short post-`response.done` playback tail (late Qwen
-RTP) is protected from capture to prevent self-interruption.
+eligible pre-ready bootstrap failure (network/timeout/5xx; Cloud folds upstream
+OpenAI auth/config failures into 502, while gateway 4xx stay terminal). Forced
+modes never fall back. Qwen lacks `conversation.item.truncate`; never emulate it
+by replaying or rewriting an active call. Barge-in-on uses server VAD, off uses
+semantic VAD (`KOE_QWEN_VAD_MODE` overrides); only the short late-RTP tail after
+`response.done` is capture-protected.
+
+Qwen live vision adds H.264 constrained-baseline before SDP. It requires a
+`VideoSource` with `CallActive` and per-frame deadlines; idle/prewarm/end send
+zero frames. Reuse the carrier camera; never send OpenAI `input_image` to Qwen.
 
 An active transport reconnect preserves the task ledger and result mailbox, not
 provider conversation history; the replacement persona must disclose that

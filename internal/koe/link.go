@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
@@ -29,6 +30,26 @@ type DaemonClient struct {
 	// unbounded.
 	doTaskClient  *http.Client
 	controlClient *http.Client
+	tokenMu       sync.RWMutex
+	token         string
+}
+
+// SetToken sets the optional bearer attached to daemon requests. It is read by
+// the CLI from an environment variable so remote front brains do not expose the
+// secret in their process arguments.
+func (c *DaemonClient) SetToken(token string) {
+	c.tokenMu.Lock()
+	c.token = strings.TrimSpace(token)
+	c.tokenMu.Unlock()
+}
+
+func (c *DaemonClient) authorize(req *http.Request) {
+	c.tokenMu.RLock()
+	token := c.token
+	c.tokenMu.RUnlock()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 // NewDaemonClient builds a client against e.g. "http://127.0.0.1:7533".
@@ -52,6 +73,7 @@ func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string,
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
 		return "", err
@@ -81,6 +103,7 @@ func (c *DaemonClient) ExchangeSDPViaDaemon(ctx context.Context, provider, model
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
 		return "", err
@@ -118,6 +141,7 @@ func (c *DaemonClient) FetchPersona(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
 		return "", err
@@ -197,6 +221,7 @@ func (c *DaemonClient) postRealtimeUsage(ctx context.Context, usage json.RawMess
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
 		return 0, err
@@ -288,6 +313,7 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 		return DoTaskOutcome{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	c.authorize(httpReq)
 	resp, err := c.doTaskClient.Do(httpReq)
 	if err != nil {
 		return DoTaskOutcome{}, err
@@ -369,6 +395,7 @@ func (c *DaemonClient) Cancel(ctx context.Context, req CancelRequest) error {
 		return err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	c.authorize(httpReq)
 	resp, err := c.controlClient.Do(httpReq)
 	if err != nil {
 		return err
@@ -395,6 +422,7 @@ func (c *DaemonClient) ListAgents(ctx context.Context) ([]AgentSummary, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.authorize(httpReq)
 	resp, err := c.controlClient.Do(httpReq)
 	if err != nil {
 		return nil, err
