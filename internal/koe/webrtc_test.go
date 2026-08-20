@@ -150,6 +150,103 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	}
 }
 
+func TestQwenVideoPumpRechecksCallAfterPrimer(t *testing.T) {
+	var active atomic.Bool
+	active.Store(true)
+	var reads atomic.Int32
+	primerStarted := make(chan struct{}, 1)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	rc := &RealtimeConn{
+		audio: audio,
+		sendTrack: &recordingSampleWriter{onWrite: func() {
+			select {
+			case primerStarted <- struct{}{}:
+			default:
+			}
+		}},
+		videoTrack: &recordingSampleWriter{},
+		videoSource: &RealtimeVideoSource{
+			Codec:         VideoCodecH264,
+			FrameInterval: minRealtimeVideoFrameInterval,
+			ReadFrame: func(context.Context) ([]byte, error) {
+				reads.Add(1)
+				return []byte{0, 0, 1, 0x65}, nil
+			},
+		},
+		callActive: active.Load,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rc.pumpVideoTrack(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	select {
+	case <-primerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("video pump did not start the audio primer")
+	}
+	active.Store(false)
+	waitUntil(t, rc.outboundAudioReady.Load, "audio primer did not finish")
+	time.Sleep(20 * time.Millisecond)
+	if got := reads.Load(); got != 0 {
+		t.Fatalf("video source reads after call ended during primer = %d, want 0", got)
+	}
+}
+
+func TestQwenVideoPumpRechecksCallAfterRead(t *testing.T) {
+	var active atomic.Bool
+	active.Store(true)
+	readStarted := make(chan struct{}, 1)
+	releaseRead := make(chan struct{})
+	videoWriter := &recordingSampleWriter{}
+	rc := &RealtimeConn{
+		videoTrack: videoWriter,
+		videoSource: &RealtimeVideoSource{
+			Codec:         VideoCodecH264,
+			FrameInterval: minRealtimeVideoFrameInterval,
+			ReadFrame: func(context.Context) ([]byte, error) {
+				readStarted <- struct{}{}
+				<-releaseRead
+				return []byte{0, 0, 1, 0x65}, nil
+			},
+		},
+		callActive: active.Load,
+	}
+	rc.outboundAudioReadyAt.Store(time.Now().Add(-qwenAudioBeforeVideoLead).UnixNano())
+	rc.outboundAudioReady.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rc.pumpVideoTrack(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("video pump did not start the camera read")
+	}
+	active.Store(false)
+	close(releaseRead)
+	time.Sleep(20 * time.Millisecond)
+	if got := videoWriter.writes.Load(); got != 0 {
+		t.Fatalf("video writes after call ended during read = %d, want 0", got)
+	}
+}
+
 func TestRealtimeVideoSourceClampsFrameInterval(t *testing.T) {
 	if got := (&RealtimeVideoSource{FrameInterval: time.Millisecond}).frameInterval(); got != minRealtimeVideoFrameInterval {
 		t.Fatalf("frame interval = %v, want %v", got, minRealtimeVideoFrameInterval)

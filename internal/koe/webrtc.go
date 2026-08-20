@@ -258,7 +258,7 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if rc.callActive == nil || !rc.callActive() {
+			if !rc.videoCallIsActive() {
 				continue
 			}
 			if err := rc.primeQwenAudioBeforeVideo(ctx); err != nil {
@@ -268,9 +268,15 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 				reportFailure("audio_primer", fmt.Sprintf("audio primer unavailable: %v", err))
 				continue
 			}
+			if !rc.videoCallIsActive() {
+				continue
+			}
 			readCtx, cancelRead := context.WithTimeout(ctx, interval)
 			frame, err := rc.videoSource.ReadFrame(readCtx)
 			cancelRead()
+			if !rc.videoCallIsActive() {
+				continue
+			}
 			if err != nil {
 				reportFailure("source_read", fmt.Sprintf("frame source unavailable: %v", err))
 				continue
@@ -285,6 +291,9 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 			}
 			// The source cadence is the RTP timestamp cadence by contract. Reads are
 			// deadline-bound and late ticker events are dropped rather than queued.
+			if !rc.videoCallIsActive() {
+				continue
+			}
 			if err := rc.videoTrack.WriteSample(media.Sample{Data: frame, Duration: interval}); err != nil {
 				reportFailure("track_write", fmt.Sprintf("frame write failed: %v", err))
 				continue
@@ -295,6 +304,10 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (rc *RealtimeConn) videoCallIsActive() bool {
+	return rc != nil && rc.callActive != nil && rc.callActive()
 }
 
 func isAnnexBH264(frame []byte) bool {
