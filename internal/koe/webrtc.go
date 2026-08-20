@@ -328,6 +328,12 @@ func (rc *RealtimeConn) primeQwenAudioBeforeVideo(ctx context.Context) error {
 		return fmt.Errorf("realtime connection unavailable")
 	}
 	if !rc.outboundAudioReady.Load() {
+		resetPartialPrimer := func() {
+			if !rc.micAudioWritten.Load() {
+				rc.outboundAudioReadyAt.Store(0)
+				rc.outboundAudioReady.Store(false)
+			}
+		}
 		if rc.audio == nil {
 			return fmt.Errorf("audio encoder unavailable")
 		}
@@ -346,12 +352,14 @@ func (rc *RealtimeConn) primeQwenAudioBeforeVideo(ctx context.Context) error {
 			}
 			encoded, err := rc.audio.EncodeFrame(make([]int16, audioFrameSize))
 			if err != nil {
+				resetPartialPrimer()
 				rc.outboundAudioMu.Unlock()
 				return fmt.Errorf("encode silence: %w", err)
 			}
 			if err := rc.sendTrack.WriteSample(media.Sample{
 				Data: encoded, Duration: audioFrameMs * time.Millisecond,
 			}); err != nil {
+				resetPartialPrimer()
 				rc.outboundAudioMu.Unlock()
 				return fmt.Errorf("write silence: %w", err)
 			}

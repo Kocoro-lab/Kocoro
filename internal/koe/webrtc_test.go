@@ -23,6 +23,18 @@ type recordingSampleWriter struct {
 	onWrite func()
 }
 
+type failOnceSampleWriter struct {
+	writes atomic.Int32
+	failAt int32
+}
+
+func (w *failOnceSampleWriter) WriteSample(media.Sample) error {
+	if write := w.writes.Add(1); write == w.failAt {
+		return errors.New("injected sample write failure")
+	}
+	return nil
+}
+
 func (w *recordingSampleWriter) WriteSample(sample media.Sample) error {
 	w.writes.Add(1)
 	if w.onWrite != nil {
@@ -447,6 +459,27 @@ func TestQwenVideoPrimerStopsWhenMicAudioTakesOver(t *testing.T) {
 	}
 	if got := track.writes.Load(); got != 1 {
 		t.Fatalf("primer writes after mic audio took over = %d, want 1", got)
+	}
+}
+
+func TestQwenVideoPrimerRetriesAfterPartialFailure(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	track := &failOnceSampleWriter{failAt: 2}
+	rc := &RealtimeConn{audio: audio, sendTrack: track}
+	if err := rc.primeQwenAudioBeforeVideo(context.Background()); err == nil {
+		t.Fatal("partial primer write failure must surface")
+	}
+	if rc.outboundAudioReady.Load() {
+		t.Fatal("partial primer failure left the video gate open")
+	}
+	if err := rc.primeQwenAudioBeforeVideo(context.Background()); err != nil {
+		t.Fatalf("retry Qwen audio primer: %v", err)
+	}
+	if got, want := track.writes.Load(), int32(qwenAudioPrimerFrames+2); got != want {
+		t.Fatalf("primer writes after retry = %d, want %d", got, want)
 	}
 }
 
