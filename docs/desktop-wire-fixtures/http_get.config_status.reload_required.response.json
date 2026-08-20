@@ -6,62 +6,62 @@
     "fast_effort": null,
     "language": "",
     "model": "",
-	"provider": "",
-	"qwen_model": "",
-	"qwen_voice": "",
-	"realtime_catalog": {
-	  "provider_modes": [
-		"auto",
-		"openai",
-		"qwen"
-	  ],
-	  "providers": {
-		"openai": {
-		  "default_model": "gpt-realtime-2.1",
-		  "default_voice": "marin",
-		  "models": [
-			"gpt-realtime-2.1",
-			"gpt-realtime-2.1-mini"
-		  ],
-		  "voices": [
-			"alloy",
-			"ash",
-			"ballad",
-			"coral",
-			"echo",
-			"marin",
-			"sage",
-			"shimmer",
-			"verse",
-			"cedar"
-		  ]
-		},
-		"qwen": {
-		  "default_model": "qwen3.5-omni-flash-realtime",
-		  "default_voice": "Tina",
-		  "models": [
-			"qwen3.5-omni-flash-realtime",
-			"qwen3.5-omni-plus-realtime"
-		  ],
-		  "voices": [
-			"Tina",
-			"Serena",
-			"Ethan",
-			"Jennifer",
-			"Ryan",
-			"Katerina",
-			"Dylan",
-			"Sunny",
-			"Kiki",
-			"Eric",
-			"Marcus",
-			"Peter",
-			"Rocky",
-			"Li"
-		  ]
-		}
-	  }
-	},
+    "provider": "",
+    "qwen_model": "",
+    "qwen_voice": "",
+    "realtime_catalog": {
+      "provider_modes": [
+        "auto",
+        "openai",
+        "qwen"
+      ],
+      "providers": {
+        "openai": {
+          "default_model": "gpt-realtime-2.1",
+          "default_voice": "marin",
+          "models": [
+            "gpt-realtime-2.1",
+            "gpt-realtime-2.1-mini"
+          ],
+          "voices": [
+            "alloy",
+            "ash",
+            "ballad",
+            "coral",
+            "echo",
+            "marin",
+            "sage",
+            "shimmer",
+            "verse",
+            "cedar"
+          ]
+        },
+        "qwen": {
+          "default_model": "qwen3.5-omni-flash-realtime",
+          "default_voice": "Tina",
+          "models": [
+            "qwen3.5-omni-flash-realtime",
+            "qwen3.5-omni-plus-realtime"
+          ],
+          "voices": [
+            "Tina",
+            "Serena",
+            "Ethan",
+            "Jennifer",
+            "Ryan",
+            "Katerina",
+            "Dylan",
+            "Sunny",
+            "Kiki",
+            "Eric",
+            "Marcus",
+            "Peter",
+            "Rocky",
+            "Li"
+          ]
+        }
+      }
+    },
     "voice": ""
   },
   "reload_reason": "config.yaml changed on disk after the running config was loaded; call POST /config/reload or restart the daemon",

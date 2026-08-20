@@ -259,6 +259,12 @@ func TestQwenTaskGroupDoesNotResubmitOutputsWhenContinuationAckIsUnknown(t *test
 		return nil
 	}, mailbox, nil)
 	h.provider = string(ProviderQwen)
+	// This test drives the mailbox directly instead of through
+	// handleFunctionCallForResponse, so register the call ids as this
+	// transport's own — otherwise they classify as recovered-from-reconnect
+	// and take the context-injection path instead of function outputs.
+	h.sessionCallIDs.Store("call-weather", struct{}{})
+	h.sessionCallIDs.Store("call-news", struct{}{})
 
 	ctx, cancelFirst := context.WithCancel(context.Background())
 	cancel = cancelFirst
@@ -429,4 +435,57 @@ func TestRejectedExecutionRunKeepsBusyStateWhileAnotherTaskRuns(t *testing.T) {
 
 	releaseAll()
 	waitUntil(t, func() bool { return mailbox.pending() == 1 }, "surviving task's result must land in the mailbox")
+}
+
+// A transport replacement preserves mailbox entries whose function call_ids
+// belong to the OLD provider conversation. Submitting those as
+// function_call_output is rejected by the replacement session (it has no such
+// call), losing the result — recovered entries must go out as provider-neutral
+// context injection instead, like the OpenAI path.
+func TestQwenRecoveredResultsUseContextInjectionNotStaleCallIDs(t *testing.T) {
+	state := NewCallState("burst-qwen-recovered", "")
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
+	weather := mailbox.BeginTaskResult(state.BurstID(), "response-old-session", "call-old-weather")
+	news := mailbox.BeginTaskResult(state.BurstID(), "response-old-session", "call-old-news")
+	mailbox.SealTaskResponse(state.BurstID(), "response-old-session")
+	mailbox.EnqueueTaskResult(weather, SayResult{TaskID: "weather", Status: "ok", Reply: "Sunny."}, false)
+	mailbox.EnqueueTaskResult(news, SayResult{TaskID: "news", Status: "ok", Reply: "Shipped."}, false)
+
+	captured := &captureSender{}
+	var h *eventHandler
+	h = newEventHandlerWithMailbox(nil, state, nil, func(v any) error {
+		if err := captured.send(v); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"qwen-recovered"}}`))
+		}
+		return nil
+	}, mailbox, nil)
+	h.provider = string(ProviderQwen)
+	// Deliberately NOT registered in h.sessionCallIDs: this handler is the
+	// replacement transport and never saw these function calls.
+
+	h.sendResultBatch(context.Background())
+	if got := captured.countType("conversation.item.create"); got != 1 {
+		t.Fatalf("recovered batch sent %d conversation items, want 1 context injection", got)
+	}
+	if captured.sentContains(`"call_id":"call-old-weather"`) || captured.sentContains(`"call_id":"call-old-news"`) {
+		t.Fatal("recovered batch submitted stale call_ids as function_call_output")
+	}
+	if !captured.sentContains("kocoro.task_results.v1") {
+		t.Fatal("recovered batch did not use the context-injection envelope")
+	}
+	if !captured.sentContains("Sunny.") || !captured.sentContains("Shipped.") {
+		t.Fatal("recovered batch lost result content")
+	}
+	if got := captured.countType("response.create"); got != 1 {
+		t.Fatalf("recovered batch requested %d continuations, want 1", got)
+	}
 }

@@ -99,6 +99,12 @@ type eventHandler struct {
 	// ignores the cancelled response's trailing audio deltas so they cannot re-open
 	// the playback the interrupt just stopped.
 	barged atomic.Bool
+	// sessionCallIDs records the function call_ids minted by THIS transport's
+	// events. A ResultMailbox entry that survives a transport replacement carries
+	// a call_id the replacement provider conversation has never seen; submitting
+	// it as function_call_output is rejected there and the result is lost.
+	sessionCallIDs sync.Map
+
 	// asyncTaskPending keeps Desktop/--once in "thinking" after the model's short
 	// spoken ack while do_task is still running or its result speech is queued.
 	asyncTaskPending atomic.Bool
@@ -196,6 +202,11 @@ type responseCreateRequest struct {
 	toolMode        responseToolMode
 	dropIfPreempted bool
 	requestID       string
+	// commitSeq snapshots inputCommitSeq when the request became pending. Qwen
+	// carries no response metadata, so this is the only signal separating our
+	// response.created from a create_response:true server response for a user
+	// turn that committed while our create was in flight.
+	commitSeq int64
 }
 
 type deferredFunctionResult struct {
@@ -236,6 +247,15 @@ const (
 	// response onset feels delayed. OVERRIDE: KOE_VAD_SILENCE_MS. Keep fixed until
 	// HIL measurements establish the latency/false-cutoff curve.
 	defaultVADSilenceMS = 1500
+
+	// defaultQwenTaskGroupSealMS closes a Qwen parallel do_task response group
+	// after this long with no further tool call joining it. WORKLOAD: Qwen can
+	// withhold response.done until function outputs arrive, so response.done
+	// alone cannot seal its groups; parallel calls in one response land within a
+	// few hundred ms of each other. SYMPTOM when too low: a slow sibling call
+	// splits into a second spoken delivery; too high: single-task results wait
+	// the full window before speaking. OVERRIDE: KOE_QWEN_TASK_GROUP_SEAL_MS.
+	defaultQwenTaskGroupSealMS = 1500
 	// A lost/malformed native floor response must not leave playback frozen.
 	// This exceeds the response.create acknowledgement timeout and is only a hard
 	// recovery cap. OVERRIDE: KOE_NATIVE_FLOOR_RESOLVE_MS.
@@ -885,6 +905,7 @@ func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreat
 func (h *eventHandler) setPendingResponse(req responseCreateRequest) {
 	h.pendingResponseMu.Lock()
 	copy := req
+	copy.commitSeq = h.inputCommitSeq.Load()
 	h.pendingResponse = &copy
 	h.pendingResponseMu.Unlock()
 }
@@ -934,6 +955,15 @@ func (h *eventHandler) bindCreatedResponse(responseID string, metadata map[strin
 	h.pendingResponseMu.Lock()
 	pending := h.pendingResponse
 	matched := pending != nil && responseCreatedMatchesProvider(*pending, metadata, h.provider)
+	if matched && h.provider == string(ProviderQwen) && pending.commitSeq != h.inputCommitSeq.Load() {
+		// A user turn committed while our response.create was in flight, so this
+		// created response is (or races with) the server's create_response:true
+		// answer to that turn. Binding it would let its response.done acknowledge
+		// a result batch that was never spoken. Leave the pending request armed;
+		// our own created (if any) still acknowledges it, else the sender times
+		// out into its bounded retry.
+		matched = false
+	}
 	if matched {
 		h.pendingResponse = nil
 	}
@@ -1039,7 +1069,17 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 	}
 	var err error
 	if h.provider == string(ProviderQwen) {
+		// Entries whose call_id was not minted on THIS transport (they survived a
+		// reconnect in the mailbox) cannot go out as function_call_output — the
+		// replacement conversation has no matching function call and rejects the
+		// item, losing the result. Deliver those as provider-independent context
+		// injection instead, same as the OpenAI path.
+		var recovered []resultAnnouncement
 		for _, result := range results {
+			if _, ok := h.sessionCallIDs.Load(result.callID); !ok || result.callID == "" {
+				recovered = append(recovered, result)
+				continue
+			}
 			output, marshalErr := json.Marshal(result.result)
 			if marshalErr != nil {
 				err = marshalErr
@@ -1049,6 +1089,9 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 				err = sendErr
 				break
 			}
+		}
+		if err == nil && len(recovered) > 0 {
+			err = h.injectTaskResultBatch(recovered)
 		}
 	} else {
 		err = h.injectTaskResultBatch(results)
@@ -1061,24 +1104,47 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 		h.releaseResultBatch(ctx.Err() != nil)
 		return
 	}
-	accepted := h.sendResponseCreate(ctx, responseCreateRequest{
+	resultReq := responseCreateRequest{
 		instructions: taskResultResponseInstructions(h.language, results),
 		purpose:      responsePurposeTaskResult,
 		toolMode:     responseToolsDisabled,
-	})
+	}
+	accepted := h.sendResponseCreate(ctx, resultReq)
+	if !accepted && h.provider == string(ProviderQwen) && ctx.Err() == nil {
+		// function_call_output is not idempotent, but a bare response.create is:
+		// the outputs are already in the conversation, and if the first create had
+		// produced a response we would have seen response.created. Re-request the
+		// continuation once before giving up.
+		select {
+		case <-ctx.Done():
+		case <-time.After(responseRejectRetryDelay):
+		}
+		if ctx.Err() == nil {
+			accepted = h.sendResponseCreate(ctx, resultReq)
+		}
+	}
 	if accepted {
 		h.resultRetries = 0
 		return // response.done owns the delivery acknowledgement
 	}
 	if h.provider == string(ProviderQwen) {
-		// function_call_output is not idempotent. Once the provider has accepted the
-		// items, an unacknowledged response.create is outcome_unknown: replaying the
-		// whole batch can make the model repeat the same result. Keep the lease until
-		// response.done or connection teardown; sendResponseCreate already retries
-		// explicit active-response rejections without resubmitting these outputs.
-		if eventLogEnabled() {
-			log.Printf("koe[result]: continuation outcome unknown; retaining submitted batch task_ids=%q", resultTaskIDs(results))
+		if ctx.Err() != nil {
+			// Teardown: runResponseSender's deferred release re-queues the entries
+			// for the replacement transport.
+			return
 		}
+		// Live session, continuation still unacknowledged after the retry. Holding
+		// the lease forever would silently wedge every later result behind this
+		// batch (only response.done, teardown, or stop_speaking can clear it), with
+		// voice stuck in "thinking". Drop the spoken delivery loudly instead — the
+		// task results themselves remain persisted in the daemon session.
+		log.Printf("koe[result]: continuation unacknowledged after retry — dropping spoken delivery task_ids=%q", resultTaskIDs(results))
+		h.resultBatchMu.Lock()
+		h.resultBatch = resultBatchState{}
+		h.resultBatchMu.Unlock()
+		h.resultMailbox.complete(h.resultOwner)
+		h.asyncTaskPending.Store(false)
+		h.resultMailbox.Wake()
 		return
 	}
 	h.releaseResultBatch(ctx.Err() != nil)
@@ -1853,11 +1919,19 @@ func normalizeQwenToolSchema(value any) any {
 				continue
 			case "type":
 				if types, ok := item.([]any); ok {
+					assigned := false
 					for _, candidate := range types {
 						if name, ok := candidate.(string); ok && name != "null" {
 							result[key] = name
+							assigned = true
 							break
 						}
+					}
+					if !assigned {
+						// e.g. "type": ["null"] — no non-null member to collapse
+						// to; keep the original rather than silently dropping the
+						// key and corrupting the schema.
+						result[key] = item
 					}
 					continue
 				}
@@ -2436,6 +2510,9 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 	if h == nil || h.ending.Load() {
 		return
 	}
+	if callID != "" {
+		h.sessionCallIDs.Store(callID, struct{}{})
+	}
 	if name == "do_task" {
 		// Resolve the mechanical-fallback language once for this call: the pinned koe
 		// language wins, else the utterance decides (the task text is a JSON string
@@ -2473,9 +2550,9 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 		originBurstID := h.state.BurstID()
 		resultTicket := h.resultMailbox.BeginTaskResult(originBurstID, responseID, callID)
 		if h.provider == string(ProviderQwen) && resultTicket.groupID != "" {
-			sealMS := koeEnvInt("KOE_QWEN_TASK_GROUP_SEAL_MS", 1500)
+			sealMS := koeEnvInt("KOE_QWEN_TASK_GROUP_SEAL_MS", defaultQwenTaskGroupSealMS)
 			if sealMS <= 0 {
-				sealMS = 1500
+				sealMS = defaultQwenTaskGroupSealMS
 			}
 			sealDelay := time.Duration(sealMS) * time.Millisecond
 			h.resultMailbox.ScheduleTaskGroupSeal(resultTicket, sealDelay)

@@ -4,7 +4,9 @@ package koe
 
 import (
 	"math"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -83,6 +85,9 @@ func TestFeedFramesContinuesSilenceUntilStopped(t *testing.T) {
 }
 
 func TestSynthSpeechChineseProducesNonTrivialAudio(t *testing.T) {
+	if out, err := exec.Command("say", "-v", "?").Output(); err != nil || !strings.Contains(string(out), "Tingting") {
+		t.Skip("Tingting system voice not installed; skipping Chinese synthesis check")
+	}
 	t.Setenv("KOE_SAY_VOICE", "")
 	pcm, err := synthSpeech("请查询东京今天的天气，并告诉我结果。")
 	if err != nil {

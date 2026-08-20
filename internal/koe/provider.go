@@ -106,6 +106,14 @@ func AutoFallbackEligible(err error) bool {
 	case "mint", "sdp_exchange":
 		var bootstrapErr *RealtimeBootstrapError
 		if errors.As(ce.Err, &bootstrapErr) {
+			if bootstrapErr.StatusCode == http.StatusServiceUnavailable &&
+				strings.Contains(bootstrapErr.Body, "cloud not configured") {
+				// The daemon's own signed-out 503. Qwen bootstrap rides the same
+				// daemon relay, so falling back cannot succeed — and opening the
+				// OpenAI circuit on it keeps Auto off OpenAI for the whole
+				// cooldown after the user signs back in.
+				return false
+			}
 			return bootstrapErr.StatusCode >= http.StatusInternalServerError
 		}
 		var netErr net.Error

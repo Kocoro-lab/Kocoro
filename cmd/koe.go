@@ -22,6 +22,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/koe"
 )
 
@@ -304,6 +305,17 @@ var koeCmd = &cobra.Command{
 		if err := koe.ValidateRealtimeModel(koe.ProviderQwen, cfg.qwenModel); err != nil {
 			return err
 		}
+		// Voices degrade instead of hard-failing: a legacy config value would
+		// otherwise brick voice at startup, and the engine substitutes its
+		// default for an empty voice. New writes are rejected at PATCH /config.
+		if !config.IsValidKoeRealtimeVoice("openai", cfg.voice) {
+			log.Printf("koe[provider]: --voice %q is not an advertised OpenAI Realtime voice; using the default", cfg.voice)
+			cfg.voice = ""
+		}
+		if !config.IsValidKoeRealtimeVoice("qwen", cfg.qwenVoice) {
+			log.Printf("koe[provider]: --qwen-voice %q is not an advertised Qwen Realtime voice; using the default", cfg.qwenVoice)
+			cfg.qwenVoice = ""
+		}
 		mode, err := normalizeAudioProcessingMode(cfg.audioProcessing)
 		if err != nil {
 			return err
@@ -569,7 +581,12 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 	openAIOpts := opts
 	openAIOpts.Model = c.openAIModel
 	openAIOpts.Voice = c.openAIVoice
-	secret, cached, err := c.takeOpenAISecret(ctx)
+	// Bound the synchronous mint like the pre-provider warm path did (15s). The
+	// session ctx is long-lived; without this the only bound is the daemon
+	// client's 30s HTTP timeout, doubling worst-case time-to-fallback.
+	mctx, mcancel := context.WithTimeout(ctx, 15*time.Second)
+	secret, cached, err := c.takeOpenAISecret(mctx)
+	mcancel()
 	if err != nil {
 		err = koe.OpenAIMintError(err)
 		if c.mode == koe.ProviderAuto && koe.AutoFallbackEligible(err) {
@@ -583,7 +600,9 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 	conn, err := koe.Connect(ctx, audio, secret, persona, state, disp, openAIOpts)
 	if err != nil && cached && (c.mode == koe.ProviderOpenAI || !koe.AutoFallbackEligible(err)) {
 		log.Printf("koe[provider]: cached OpenAI secret rejected; retrying once with a fresh mint: %v", err)
-		fresh, mintErr := c.mint(ctx)
+		fctx, fcancel := context.WithTimeout(ctx, 15*time.Second)
+		fresh, mintErr := c.mint(fctx)
+		fcancel()
 		if mintErr != nil {
 			err = koe.OpenAIMintError(mintErr)
 		} else {

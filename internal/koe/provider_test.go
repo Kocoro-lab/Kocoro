@@ -43,6 +43,10 @@ func TestAutoFallbackEligibility(t *testing.T) {
 		{"transport", connectError(ProviderOpenAI, "sdp_exchange", netFailure), true},
 		{"deadline", connectError(ProviderOpenAI, "sdp_exchange", context.DeadlineExceeded), true},
 		{"upstream 500", connectError(ProviderOpenAI, "sdp_exchange", &RealtimeBootstrapError{StatusCode: 502}), true},
+		// The daemon's own signed-out 503: Qwen rides the same relay, so falling
+		// back cannot succeed and must not open the OpenAI circuit either.
+		{"daemon signed out", connectError(ProviderOpenAI, "mint", &RealtimeBootstrapError{StatusCode: 503, Body: `{"error":"cloud not configured (sign in, or set cloud.enabled + api_key)"}`}), false},
+		{"genuine 503", connectError(ProviderOpenAI, "mint", &RealtimeBootstrapError{StatusCode: 503, Body: `{"detail":"provider_rate_limited"}`}), true},
 		{"auth", connectError(ProviderOpenAI, "sdp_exchange", &RealtimeBootstrapError{StatusCode: 401}), false},
 		{"quota", connectError(ProviderOpenAI, "sdp_exchange", &RealtimeBootstrapError{StatusCode: 429}), false},
 		{"config rejected", connectError(ProviderOpenAI, "session_config_rejected", errors.New("bad voice")), false},

@@ -7207,6 +7207,14 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("koe.qwen_model %q is not an allowed Qwen Realtime model", model))
 			return
 		}
+		if voice, ok := koePatch["voice"].(string); ok && !config.IsValidKoeRealtimeVoice("openai", voice) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("koe.voice %q is not an allowed OpenAI Realtime voice", voice))
+			return
+		}
+		if voice, ok := koePatch["qwen_voice"].(string); ok && !config.IsValidKoeRealtimeVoice("qwen", voice) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("koe.qwen_voice %q is not an allowed Qwen Realtime voice", voice))
+			return
+		}
 	}
 
 	if err := s.patchGlobalConfig(patch); err != nil {

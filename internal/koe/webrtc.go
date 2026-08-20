@@ -66,6 +66,11 @@ type RealtimeConn struct {
 	sendTrack            *webrtc.TrackLocalStaticSample
 	dc                   *webrtc.DataChannel
 	dcMu                 sync.RWMutex
+	// cancel stops this connection attempt's goroutines (response sender, event
+	// handling). Without it a failed OpenAI bootstrap's sender outlives its dead
+	// transport on the shared session ctx and keeps competing for the shared
+	// ResultMailbox wake channel against the Qwen fallback session.
+	cancel               context.CancelFunc
 	audio                *AudioIO
 	interruptOutput      func()
 	onLocalSpeechStarted func()
@@ -381,7 +386,12 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 }
 
 // Close tears down the peer connection.
-func (rc *RealtimeConn) Close() { _ = rc.pc.Close() }
+func (rc *RealtimeConn) Close() {
+	if rc.cancel != nil {
+		rc.cancel()
+	}
+	_ = rc.pc.Close()
+}
 
 // InterruptOutput stops any local assistant playback and asks Realtime to cancel
 // the active response / clear buffered output. It is an explicit user action, not
@@ -548,6 +558,11 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	if err != nil {
 		return nil, connectError(provider, "local_setup", err)
 	}
+	// Scope every goroutine this attempt starts to the attempt, not the caller's
+	// session ctx: an Auto fallback continues on the same session ctx, and every
+	// failure path below funnels through rc.Close().
+	ctx, cancel := context.WithCancel(ctx)
+	rc.cancel = cancel
 	h := newEventHandlerWithMailbox(disp, state, audio, func(v any) error {
 		b, _ := json.Marshal(v)
 		return rc.sendText(string(b))

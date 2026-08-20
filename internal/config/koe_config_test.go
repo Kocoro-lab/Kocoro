@@ -145,3 +145,25 @@ func TestKoeRealtimeCatalogOnlyPublishesCompatibleQwenModels(t *testing.T) {
 		t.Fatalf("qwen models=%v, want %v", models, want)
 	}
 }
+
+func TestIsValidKoeRealtimeVoice(t *testing.T) {
+	tests := []struct {
+		provider, voice string
+		want            bool
+	}{
+		{"openai", "", true}, // empty = use default
+		{"openai", "marin", true},
+		{"openai", "cedar", true},
+		{"openai", "Tina", false}, // Qwen voice on the OpenAI axis
+		{"openai", "nova", false},
+		{"qwen", "", true},
+		{"qwen", "Tina", true},
+		{"qwen", "tina", false}, // Qwen voice ids are case-sensitive
+		{"qwen", "marin", false},
+	}
+	for _, tt := range tests {
+		if got := IsValidKoeRealtimeVoice(tt.provider, tt.voice); got != tt.want {
+			t.Errorf("IsValidKoeRealtimeVoice(%q, %q)=%t, want %t", tt.provider, tt.voice, got, tt.want)
+		}
+	}
+}

@@ -17,6 +17,11 @@ var koeRealtimeModels = map[string][]string{
 	},
 }
 
+var koeRealtimeVoices = map[string][]string{
+	"openai": {"alloy", "ash", "ballad", "coral", "echo", "marin", "sage", "shimmer", "verse", "cedar"},
+	"qwen":   {"Tina", "Serena", "Ethan", "Jennifer", "Ryan", "Katerina", "Dylan", "Sunny", "Kiki", "Eric", "Marcus", "Peter", "Rocky", "Li"},
+}
+
 func IsValidKoeRealtimeProvider(raw string) bool {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", "auto", "openai", "qwen":
@@ -38,19 +43,34 @@ func IsValidKoeRealtimeModel(provider, model string) bool {
 	return false
 }
 
+// IsValidKoeRealtimeVoice mirrors the catalog's advertised voices. Empty means
+// "use the default" and is always valid; a bad voice otherwise only surfaces as
+// a rejected session.update, i.e. a call wedged in "connecting".
+func IsValidKoeRealtimeVoice(provider, voice string) bool {
+	if strings.TrimSpace(voice) == "" {
+		return true
+	}
+	for _, allowed := range koeRealtimeVoices[provider] {
+		if voice == allowed {
+			return true
+		}
+	}
+	return false
+}
+
 func KoeRealtimeCatalog() map[string]interface{} {
 	return map[string]interface{}{
 		"provider_modes": []string{"auto", "openai", "qwen"},
 		"providers": map[string]interface{}{
 			"openai": map[string]interface{}{
 				"models":        koeRealtimeModels["openai"],
-				"voices":        []string{"alloy", "ash", "ballad", "coral", "echo", "marin", "sage", "shimmer", "verse", "cedar"},
+				"voices":        koeRealtimeVoices["openai"],
 				"default_model": KoeDefaultOpenAIModel,
 				"default_voice": KoeDefaultOpenAIVoice,
 			},
 			"qwen": map[string]interface{}{
 				"models":        koeRealtimeModels["qwen"],
-				"voices":        []string{"Tina", "Serena", "Ethan", "Jennifer", "Ryan", "Katerina", "Dylan", "Sunny", "Kiki", "Eric", "Marcus", "Peter", "Rocky", "Li"},
+				"voices":        koeRealtimeVoices["qwen"],
 				"default_model": KoeDefaultQwenModel,
 				"default_voice": KoeDefaultQwenVoice,
 			},

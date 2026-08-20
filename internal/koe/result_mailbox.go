@@ -218,8 +218,11 @@ func (m *ResultMailbox) EnqueueTaskResult(ticket taskResultTicket, result SayRes
 	}
 	group := m.taskGroups[ticket.groupID]
 	if group == nil {
+		// The response group was already sealed, claimed, and completed (a very
+		// late sibling on a response Qwen held open past the seal window). Fall
+		// back to a standalone burst-scoped entry rather than dropping the result.
 		m.mu.Unlock()
-		return 0
+		return m.enqueue(ticket.burstID, "", ticket.callID, result, resumptive)
 	}
 	if _, expected := group.expected[ticket.callID]; !expected {
 		m.mu.Unlock()
