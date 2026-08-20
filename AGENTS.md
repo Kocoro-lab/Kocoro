@@ -402,6 +402,6 @@ capabilities real, MCP off unless `--isolated-mcp` gives an explicit allowlist.
 
 - GoReleaser builds releases; npm package is `@kocoro/kocoro`.
 - **Versioning is PATCH-only by default** — do not bump minor/major unless asked.
-- Release: tag, push tag, CI builds and publishes.
+- Release: push a tag; CI publishes.
 - `docs/` is gitignored by default; tracked docs are allowlisted in `.gitignore`.
   Add new docs there before committing.
