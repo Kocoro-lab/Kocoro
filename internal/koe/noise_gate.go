@@ -181,15 +181,17 @@ func (g *micNoiseGate) processWithStartThreshold(frame []int16, startThreshold f
 		}
 	}
 
-	// Always retain a bounded real-audio prefix while closed. Start evidence often
-	// begins only after a low-energy consonant or interjection; retaining frames only
-	// after the first hot frame clipped those leading phonemes (for example Japanese
-	// "待って" became "で"), even though the sustained-evidence gate itself opened
-	// correctly. The ring is released only after the same evidence threshold passes,
-	// so this preserves speech onset without making ambient noise open the gate.
-	g.pending = append(g.pending, append([]int16(nil), frame...))
-	if len(g.pending) > g.prefixFrames {
-		g.pending = g.pending[len(g.pending)-g.prefixFrames:]
+	// Retain a bounded real-audio prefix while closed. During assistant playback,
+	// however, startThreshold separates plausible near-end speech from residual
+	// output: keeping frames below it would replay the very echo this gate rejected
+	// once a later user frame opens the gate.
+	if startThreshold > 0 && level < startThreshold {
+		g.pending = g.pending[:0]
+	} else {
+		g.pending = append(g.pending, append([]int16(nil), frame...))
+		if len(g.pending) > g.prefixFrames {
+			g.pending = g.pending[len(g.pending)-g.prefixFrames:]
+		}
 	}
 
 	// Real speech often has low-energy consonant gaps; score evidence lets those
