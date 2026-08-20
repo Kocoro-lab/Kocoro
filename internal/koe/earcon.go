@@ -32,9 +32,11 @@ const (
 	// drained and releases the speaking gate. WORKLOAD: a ~540ms brand cue on the
 	// Desktop call-open path. SYMPTOM if too low: the gate releases while a
 	// buffering-delayed tail is still audible on the speaker, re-opening the
-	// self-trigger window; if too high: a brief dead mic after the cue ends.
+	// self-trigger window; if too high: the first word spoken immediately after
+	// the cue is clipped. VPIO already cancels the known speaker output, so one
+	// additional audio-frame window is enough after the measured output drains.
 	// OVERRIDE: KOE_EARCON_IDLE_HOLD_MS.
-	earconDrainIdleHoldMS = 250
+	earconDrainIdleHoldMS = 20
 	// earconDrainMaxExtraMS is the slack added to the cue's nominal playout length to
 	// form the hard cap on how long PlayReadyEarcon holds the speaking gate waiting
 	// for drain. WORKLOAD: the same ~540ms cue under real device buffering. SYMPTOM if

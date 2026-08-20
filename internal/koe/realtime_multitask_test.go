@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -97,6 +98,187 @@ func TestDoTaskImmediateAckAndParallelLanes(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("results did not land: mailbox=%d", mailbox.pending())
+}
+
+func TestSameResponseParallelTasksBecomeOneSpeakableBatch(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	weatherRelease := make(chan struct{})
+	newsRelease := make(chan struct{})
+	var weatherOnce, newsOnce sync.Once
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req DoTaskRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Text {
+		case "weather":
+			<-weatherRelease
+		case "news":
+			<-newsRelease
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply": req.Text + " done", "spoken_summary": req.Text + " done",
+		})
+	}))
+	defer func() {
+		weatherOnce.Do(func() { close(weatherRelease) })
+		newsOnce.Do(func() { close(newsRelease) })
+		mock.Close()
+	}()
+
+	state := NewCallState("burst-group", "")
+	dispatcher := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
+	h := newEventHandlerWithMailbox(dispatcher, state, nil, func(any) error { return nil }, mailbox, nil)
+
+	h.handleFunctionCallForResponse(context.Background(), "response-parallel", "call-weather", "do_task", []byte(`{"task":"weather","relationship":"new"}`), false)
+	h.handleFunctionCallForResponse(context.Background(), "response-parallel", "call-news", "do_task", []byte(`{"task":"news","relationship":"new"}`), true)
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"response-parallel","status":"completed"}}`))
+
+	weatherOnce.Do(func() { close(weatherRelease) })
+	waitUntil(t, func() bool { return mailbox.pending() == 1 }, "first grouped task result did not land")
+	if got := mailbox.claimForBurst("connection", state.BurstID()); len(got) != 0 {
+		t.Fatalf("first staggered result became independently speakable: %+v", got)
+	}
+
+	newsOnce.Do(func() { close(newsRelease) })
+	waitUntil(t, func() bool { return mailbox.pending() == 2 }, "second grouped task result did not land")
+	got := mailbox.claimForBurst("connection", state.BurstID())
+	if len(got) != 2 {
+		t.Fatalf("complete parallel result claim=%d, want 2: %+v", len(got), got)
+	}
+}
+
+func TestQwenParallelTaskGroupSubmitsAllOutputsBeforeOneContinuation(t *testing.T) {
+	t.Setenv("KOE_TASK_LEDGER", "1")
+	t.Setenv("KOE_QWEN_TASK_GROUP_SEAL_MS", "10")
+	weatherRelease := make(chan struct{})
+	newsRelease := make(chan struct{})
+	var weatherOnce, newsOnce sync.Once
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req DoTaskRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch req.Text {
+		case "weather":
+			<-weatherRelease
+		case "news":
+			<-newsRelease
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"reply":          req.Text + " key facts " + strings.Repeat("detail ", 100) + "TAIL-MUST-BE-BOUNDED",
+			"spoken_summary": req.Text + " concise",
+		})
+	}))
+	defer func() {
+		weatherOnce.Do(func() { close(weatherRelease) })
+		newsOnce.Do(func() { close(newsRelease) })
+		mock.Close()
+	}()
+
+	state := NewCallState("burst-qwen-group", "")
+	dispatcher := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
+	captured := &captureSender{}
+	var h *eventHandler
+	h = newEventHandlerWithMailbox(dispatcher, state, nil, func(v any) error {
+		if err := captured.send(v); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"qwen-result"}}`))
+		}
+		return nil
+	}, mailbox, nil)
+	h.provider = string(ProviderQwen)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	h.handleFunctionCallForResponse(ctx, "response-qwen-parallel", "call-weather", "do_task", []byte(`{"task":"weather","relationship":"new"}`), false)
+	h.handleFunctionCallForResponse(ctx, "response-qwen-parallel", "call-news", "do_task", []byte(`{"task":"news","relationship":"new"}`), true)
+	// Qwen may keep the response open until every function output arrives. The
+	// group must therefore close after the tool-call stream goes quiet instead of
+	// requiring response.done, or both sides wait forever.
+
+	weatherOnce.Do(func() { close(weatherRelease) })
+	waitUntil(t, func() bool { return mailbox.pending() == 1 }, "first Qwen result did not land")
+	if got := captured.countType("conversation.item.create"); got != 0 {
+		t.Fatalf("partial Qwen group submitted %d function outputs, want 0", got)
+	}
+	if got := captured.countType("response.create"); got != 0 {
+		t.Fatalf("partial Qwen group requested %d continuations, want 0", got)
+	}
+
+	newsOnce.Do(func() { close(newsRelease) })
+	waitUntil(t, func() bool {
+		return captured.countType("conversation.item.create") == 2 && captured.countType("response.create") == 1
+	}, "complete Qwen group was not submitted as one continuation")
+	if !captured.sentContains(`"call_id":"call-weather"`) || !captured.sentContains(`"call_id":"call-news"`) {
+		t.Fatalf("Qwen batch lost provider call ids: %v", captured.types())
+	}
+	if !captured.sentContains("TAIL-MUST-BE-BOUNDED") {
+		t.Fatal("Qwen function outputs lost the full daemon replies")
+	}
+	if captured.sentContains("weather concise") || captured.sentContains("news concise") || captured.sentContains("spoken_summary") {
+		t.Fatal("Qwen function outputs revived the retired spoken-summary contract")
+	}
+	if !captured.sentContains("weather key facts") || !captured.sentContains("news key facts") {
+		t.Fatal("Qwen function outputs lost daemon result facts")
+	}
+}
+
+func TestQwenTaskGroupDoesNotResubmitOutputsWhenContinuationAckIsUnknown(t *testing.T) {
+	state := NewCallState("burst-qwen-outcome-unknown", "")
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
+	weather := mailbox.BeginTaskResult(state.BurstID(), "response-parallel", "call-weather")
+	news := mailbox.BeginTaskResult(state.BurstID(), "response-parallel", "call-news")
+	mailbox.SealTaskResponse(state.BurstID(), "response-parallel")
+	mailbox.EnqueueTaskResult(weather, SayResult{TaskID: "weather", Status: "ok", Reply: "Sunny."}, false)
+	mailbox.EnqueueTaskResult(news, SayResult{TaskID: "news", Status: "ok", Reply: "Shipped."}, false)
+
+	captured := &captureSender{}
+	var cancel context.CancelFunc
+	h := newEventHandlerWithMailbox(nil, state, nil, func(v any) error {
+		if err := captured.send(v); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" && cancel != nil {
+			cancel()
+		}
+		return nil
+	}, mailbox, nil)
+	h.provider = string(ProviderQwen)
+	// This test drives the mailbox directly instead of through
+	// handleFunctionCallForResponse, so register the call ids as this
+	// transport's own — otherwise they classify as recovered-from-reconnect
+	// and take the context-injection path instead of function outputs.
+	h.sessionCallIDs.Store("call-weather", struct{}{})
+	h.sessionCallIDs.Store("call-news", struct{}{})
+
+	ctx, cancelFirst := context.WithCancel(context.Background())
+	cancel = cancelFirst
+	h.sendResultBatch(ctx)
+	if got := captured.countType("conversation.item.create"); got != 2 {
+		t.Fatalf("initial function output count=%d, want 2", got)
+	}
+
+	ctx, cancelSecond := context.WithCancel(context.Background())
+	cancel = cancelSecond
+	h.sendResultBatch(ctx)
+	if got := captured.countType("conversation.item.create"); got != 2 {
+		t.Fatalf("continuation outcome retry resubmitted function outputs: count=%d, want 2", got)
+	}
 }
 
 func waitDoTaskPost(t *testing.T, posts <-chan DoTaskRequest) DoTaskRequest {
@@ -253,4 +435,57 @@ func TestRejectedExecutionRunKeepsBusyStateWhileAnotherTaskRuns(t *testing.T) {
 
 	releaseAll()
 	waitUntil(t, func() bool { return mailbox.pending() == 1 }, "surviving task's result must land in the mailbox")
+}
+
+// A transport replacement preserves mailbox entries whose function call_ids
+// belong to the OLD provider conversation. Submitting those as
+// function_call_output is rejected by the replacement session (it has no such
+// call), losing the result — recovered entries must go out as provider-neutral
+// context injection instead, like the OpenAI path.
+func TestQwenRecoveredResultsUseContextInjectionNotStaleCallIDs(t *testing.T) {
+	state := NewCallState("burst-qwen-recovered", "")
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst(state.BurstID())
+	weather := mailbox.BeginTaskResult(state.BurstID(), "response-old-session", "call-old-weather")
+	news := mailbox.BeginTaskResult(state.BurstID(), "response-old-session", "call-old-news")
+	mailbox.SealTaskResponse(state.BurstID(), "response-old-session")
+	mailbox.EnqueueTaskResult(weather, SayResult{TaskID: "weather", Status: "ok", Reply: "Sunny."}, false)
+	mailbox.EnqueueTaskResult(news, SayResult{TaskID: "news", Status: "ok", Reply: "Shipped."}, false)
+
+	captured := &captureSender{}
+	var h *eventHandler
+	h = newEventHandlerWithMailbox(nil, state, nil, func(v any) error {
+		if err := captured.send(v); err != nil {
+			return err
+		}
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"qwen-recovered"}}`))
+		}
+		return nil
+	}, mailbox, nil)
+	h.provider = string(ProviderQwen)
+	// Deliberately NOT registered in h.sessionCallIDs: this handler is the
+	// replacement transport and never saw these function calls.
+
+	h.sendResultBatch(context.Background())
+	if got := captured.countType("conversation.item.create"); got != 1 {
+		t.Fatalf("recovered batch sent %d conversation items, want 1 context injection", got)
+	}
+	if captured.sentContains(`"call_id":"call-old-weather"`) || captured.sentContains(`"call_id":"call-old-news"`) {
+		t.Fatal("recovered batch submitted stale call_ids as function_call_output")
+	}
+	if !captured.sentContains("kocoro.task_results.v1") {
+		t.Fatal("recovered batch did not use the context-injection envelope")
+	}
+	if !captured.sentContains("Sunny.") || !captured.sentContains("Shipped.") {
+		t.Fatal("recovered batch lost result content")
+	}
+	if got := captured.countType("response.create"); got != 1 {
+		t.Fatalf("recovered batch requested %d continuations, want 1", got)
+	}
 }

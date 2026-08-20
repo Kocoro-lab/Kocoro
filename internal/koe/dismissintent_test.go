@@ -28,21 +28,18 @@ func TestNormalizeDismissPhrase(t *testing.T) {
 
 func TestIsDismissPhraseHits(t *testing.T) {
 	hits := []string{
-		// en quit / stop-talking / goodbye
-		"stop", "shut up", "quiet", "enough", "goodbye", "bye", "exit", "quit", "that's all",
+		// en quit / goodbye
+		"goodbye", "bye", "exit", "quit", "that's all",
 		// zh
-		"停", "停止", "闭嘴", "别说了", "够了", "退出", "结束", "结束对话", "再见", "拜拜", "就这样",
-		"取消并且退出", "住口", "打住",
+		"退出", "结束", "结束对话", "再见", "拜拜", "就这样", "取消并且退出",
 		// zh traditional
-		"閉嘴", "夠了", "結束對話", "再見",
+		"結束對話", "再見",
 		// ja
-		"やめて", "黙れ", "ストップ", "もういい", "終わり", "さようなら",
-		// real ASR outputs observed live 2026-07-08
-		"退出", "闭嘴。", "Стоп.",
+		"終わり", "さようなら",
 		// colloquial particle variants (live gap: "退出吧" missed both paths)
-		"退出吧", "够了吧", "停止吧", "闭嘴吧", "再见啦",
+		"退出吧", "再见啦",
 		// trailing punctuation
-		"再见。", "黙れ！",
+		"再见。",
 	}
 	for _, h := range hits {
 		if !isDismissPhrase(h) {
@@ -55,6 +52,9 @@ func TestIsDismissPhraseMisses(t *testing.T) {
 	misses := []string{
 		"",
 		"取消", // bare cancel = the cancel TOOL's job (stop a task), NOT hang up
+		"stop", "stop talking", "shut up", "quiet", "enough",
+		"停", "停止", "停一下", "闭嘴", "别说了", "够了", "住口", "打住",
+		"やめて", "黙れ", "ストップ", "もういい", "Стоп.",
 		"继续", // keep going
 		"别停", // don't stop
 		"don't stop",
@@ -70,47 +70,11 @@ func TestIsDismissPhraseMisses(t *testing.T) {
 	}
 }
 
-// TestIsDismissPhraseStrongContainment: a short utterance that CONTAINS an
-// unambiguous dismiss word ("闭嘴" / "shut up" / "黙れ" …) with light decoration is
-// still a deterministic hang-up. Both zh hits were observed live 2026-07-09: the
-// whole-utterance gate missed them (prefix "不需要了,"), and gpt-realtime-2.1-mini
-// answered the first with a non-sequitur instead of calling end_call.
-func TestIsDismissPhraseStrongContainment(t *testing.T) {
-	hits := []string{
-		"不需要了,闭嘴吧。", // live 2026-07-09 16:31:26 — model offered to continue the topic
-		"我说不需要你闭嘴。", // live 2026-07-09 16:31:37 — model got this one right; gate should too
-		"好了闭嘴",
-		"I said shut up",
-		"もういいから黙れ",
-	}
-	for _, h := range hits {
-		if !isDismissPhrase(h) {
-			t.Errorf("isDismissPhrase(%q) = false, want true (strong containment)", h)
+func TestStopSpeakingPhrasesNeverDismiss(t *testing.T) {
+	for _, phrase := range []string{"闭嘴", "不需要了,闭嘴吧。", "shut up", "I said shut up", "黙れ", "もういいから黙れ"} {
+		if isDismissPhrase(phrase) {
+			t.Errorf("stop-speaking phrase %q dismissed the whole call", phrase)
 		}
-	}
-	misses := []string{
-		"别闭嘴",                 // negated
-		"没让你闭嘴",               // negated
-		"我又没有让你闭嘴",            // negated
-		"谁让你闭嘴了",              // negated
-		"i didn't say shut up", // negated
-		"刚才开会他老让我闭嘴你说这人讨厌不讨厌",  // meta-talk mentioning the word — over the length cap
-		"停一下再继续",              // weak word only, never containment-matched
-	}
-	for _, m := range misses {
-		if isDismissPhrase(m) {
-			t.Errorf("isDismissPhrase(%q) = true, want false", m)
-		}
-	}
-}
-
-func TestIsDismissPhraseStrongContainmentKillSwitch(t *testing.T) {
-	t.Setenv("KOE_DISMISS_CONTAIN", "0")
-	if isDismissPhrase("不需要了,闭嘴吧。") {
-		t.Error("KOE_DISMISS_CONTAIN=0 must disable the containment rule")
-	}
-	if !isDismissPhrase("闭嘴") {
-		t.Error("whole-utterance match must survive KOE_DISMISS_CONTAIN=0")
 	}
 }
 

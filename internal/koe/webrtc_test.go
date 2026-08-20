@@ -102,6 +102,35 @@ func TestSendTrackStatsSegmentsAndTotals(t *testing.T) {
 	}
 }
 
+func TestAssistantBoundaryClosesPriorUserMicSegment(t *testing.T) {
+	gate := newVPIOMicNoiseGate()
+	gate.open = true
+	gate.hangover = gate.hangoverFrames
+	gate.pending = append(gate.pending, make([]int16, audioFrameSize))
+
+	if !resetMicGateAtAssistantBoundary(gate, false, true) {
+		t.Fatal("assistant speech start did not reset the mic gate")
+	}
+	if gate.open || gate.hangover != 0 || len(gate.pending) != 0 {
+		t.Fatalf("assistant speech start left prior user segment open: open=%v hangover=%d pending=%d", gate.open, gate.hangover, len(gate.pending))
+	}
+	if resetMicGateAtAssistantBoundary(gate, true, true) {
+		t.Fatal("steady assistant speech reset the mic gate more than once")
+	}
+}
+
+func TestQwenBargeProtectionDoesNotChangeOpenAIAdmission(t *testing.T) {
+	if !qwenBargeProtectionEnabled(true, string(ProviderQwen)) {
+		t.Fatal("Qwen VPIO call should enable playback echo admission")
+	}
+	if qwenBargeProtectionEnabled(true, string(ProviderOpenAI)) {
+		t.Fatal("OpenAI VPIO call should retain its existing native-floor admission")
+	}
+	if qwenBargeProtectionEnabled(false, string(ProviderQwen)) {
+		t.Fatal("non-VPIO Qwen call should not enable VPIO playback echo admission")
+	}
+}
+
 func TestMintEphemeralRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer dev-key" {

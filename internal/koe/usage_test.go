@@ -5,6 +5,7 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -77,9 +78,52 @@ func TestSendRealtimeUsageDoesNotRetryOn400(t *testing.T) {
 	}
 }
 
+func TestExchangeSDPViaDaemon(t *testing.T) {
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/koe/realtime/sdp" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"provider":"qwen","model":"qwen3.5-omni-flash-realtime","answer_sdp":"v=0\r\n"}`))
+	}))
+	defer srv.Close()
+
+	answer, err := NewDaemonClient(srv.URL).ExchangeSDPViaDaemon(
+		context.Background(), "qwen", "qwen3.5-omni-flash-realtime", "v=0\r\n",
+	)
+	if err != nil {
+		t.Fatalf("ExchangeSDPViaDaemon: %v", err)
+	}
+	if answer != "v=0\r\n" {
+		t.Errorf("answer = %q", answer)
+	}
+	if got["provider"] != "qwen" || got["model"] != "qwen3.5-omni-flash-realtime" || got["offer_sdp"] != "v=0\r\n" {
+		t.Errorf("request = %#v", got)
+	}
+}
+
+func TestExchangeSDPViaDaemonPreservesErrorStatusAndCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"detail":{"code":"provider_auth_failed"}}`))
+	}))
+	defer srv.Close()
+
+	_, err := NewDaemonClient(srv.URL).ExchangeSDPViaDaemon(context.Background(), "qwen", "m", "v=0\r\n")
+	var bootstrapErr *RealtimeBootstrapError
+	if !errors.As(err, &bootstrapErr) {
+		t.Fatalf("error = %T %v, want RealtimeBootstrapError", err, err)
+	}
+	if bootstrapErr.StatusCode != http.StatusBadGateway || !strings.Contains(bootstrapErr.Body, "provider_auth_failed") {
+		t.Errorf("bootstrap error = %#v", bootstrapErr)
+	}
+}
+
 func TestReportUsageBuildsBillingBody(t *testing.T) {
 	var got json.RawMessage
-	h := &eventHandler{model: "gpt-realtime-2.1-mini", onUsage: func(b json.RawMessage) { got = b }}
+	h := &eventHandler{provider: "openai", model: "gpt-realtime-2.1-mini", onUsage: func(b json.RawMessage) { got = b }}
 	h.reportUsage([]byte(`{"type":"response.done","response":{"id":"resp_1","usage":{"total_tokens":42,"output_token_details":{"audio_tokens":30}}}}`))
 
 	if got == nil {
@@ -87,9 +131,28 @@ func TestReportUsageBuildsBillingBody(t *testing.T) {
 	}
 	s := string(got)
 	if !strings.Contains(s, `"response_id":"resp_1"`) ||
+		!strings.Contains(s, `"provider":"openai"`) ||
 		!strings.Contains(s, `"model":"gpt-realtime-2.1-mini"`) ||
 		!strings.Contains(s, `"total_tokens":42`) {
 		t.Errorf("billing body missing fields: %s", s)
+	}
+}
+
+func TestReportUsagePreservesQwenPluralTokenDetails(t *testing.T) {
+	var got json.RawMessage
+	h := &eventHandler{provider: "qwen", model: "qwen3.5-omni-flash-realtime", onUsage: func(b json.RawMessage) { got = b }}
+	h.reportUsage([]byte(`{"type":"response.done","response":{"id":"resp_qwen","usage":{"input_tokens_details":{"audio_tokens":12},"output_tokens_details":{"audio_tokens":34}}}}`))
+
+	var body map[string]any
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("billing body: %v", err)
+	}
+	if body["provider"] != "qwen" || body["model"] != "qwen3.5-omni-flash-realtime" {
+		t.Fatalf("provider/model = %#v/%#v", body["provider"], body["model"])
+	}
+	usage, ok := body["usage"].(map[string]any)
+	if !ok || usage["input_tokens_details"] == nil || usage["output_tokens_details"] == nil {
+		t.Fatalf("Qwen plural token details were not preserved: %#v", body)
 	}
 }
 

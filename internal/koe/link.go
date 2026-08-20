@@ -57,7 +57,7 @@ func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string,
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("daemon mint failed: HTTP %d: %s", resp.StatusCode, string(raw))
+		return "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: string(raw)}
 	}
 	var mint struct {
 		Value string `json:"value"`
@@ -66,6 +66,44 @@ func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string,
 		return "", fmt.Errorf("daemon mint parse failed: %v (body %d bytes)", err, len(raw))
 	}
 	return mint.Value, nil
+}
+
+// ExchangeSDPViaDaemon sends a WebRTC offer through daemon→Cloud so Qwen's
+// long-lived API key never enters the Koe process.
+func (c *DaemonClient) ExchangeSDPViaDaemon(ctx context.Context, provider, model, offerSDP string) (string, error) {
+	body, _ := json.Marshal(map[string]string{
+		"provider": provider, "model": model, "offer_sdp": offerSDP,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/koe/realtime/sdp", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.controlClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+	var out struct {
+		AnswerSDP string `json:"answer_sdp"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || strings.TrimSpace(out.AnswerSDP) == "" {
+		return "", fmt.Errorf("daemon SDP parse failed: %v (body %d bytes)", err, len(raw))
+	}
+	return out.AnswerSDP, nil
+}
+
+type RealtimeBootstrapError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *RealtimeBootstrapError) Error() string {
+	return fmt.Sprintf("realtime bootstrap failed: HTTP %d: %s", e.StatusCode, e.Body)
 }
 
 // FetchPersona pulls the small-tier-distilled spoken-persona context (who the

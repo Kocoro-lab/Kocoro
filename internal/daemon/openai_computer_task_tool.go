@@ -827,6 +827,7 @@ func (t *openAIComputerTaskToolV1) Info() agent.ToolInfo {
 			"For reading or summarization, this call returns the requested content itself; " +
 			"treat that result as final rather than calling computer_use again to retrieve hidden observations. " +
 			"Do not omit a later step or app from the user's request. " +
+			"This tool cannot infer the device's physical location unless the user explicitly asks to read a named location-capable app. " +
 			"List only apps whose UI may be read or changed in controlled_apps; never list an app " +
 			"merely because the user wants it to remain frontmost and untouched.",
 		Parameters: map[string]any{
@@ -882,6 +883,25 @@ func (t *openAIComputerTaskToolV1) Run(
 	}
 	if args.Description == "" {
 		return agent.ValidationError("description is required"), nil
+	}
+	// UserRequest tracks the LATEST user text, including mid-run injected
+	// follow-ups — but the registry was built from the ORIGINAL prompt, so for a
+	// location ask injected mid-run this guard covers computer_use only;
+	// bash/http/browser stay registered on that path. The registry-level strip
+	// in RunAgent covers only run-start classification.
+	if invocation, ok := agent.ToolInvocationFromContext(ctx); ok &&
+		implicitPhysicalLocationRequestV1(invocation.UserRequest) {
+		return withOpenAIComputerTaskFailureOutcomeV1(
+			agent.BusinessError(
+				"computer_use_error: physical_location_unavailable\n"+
+					"message: Computer Use cannot determine the device's current physical location from an implicit location request\n"+
+					"recovery: do not retry desktop control, shell, browser, or network/IP geolocation; ask the user for a city or region",
+			),
+			agent.ComputerUseTaskNotCompleted,
+			agent.ComputerUseCommitNone,
+			"physical_location_unavailable",
+			agent.ComputerUseRecoveryNone,
+		), nil
 	}
 	if t == nil || t.gateway == nil ||
 		t.childTools == nil || t.workflow == nil || t.runtime == nil {

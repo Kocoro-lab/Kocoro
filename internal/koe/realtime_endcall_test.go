@@ -105,13 +105,22 @@ func TestDismissTranscriptHangsUp(t *testing.T) {
 		h.handleEvent(context.Background(), raw)
 	}
 
-	t.Run("dismiss phrase hangs up", func(t *testing.T) {
+	t.Run("stop-speaking phrase stays on call", func(t *testing.T) {
 		h, hung := newH()
 		feed(h, "闭嘴。")
 		select {
 		case <-hung:
+			t.Fatal("stop-speaking transcript hung up the call")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+	t.Run("terminal dismiss phrase hangs up", func(t *testing.T) {
+		h, hung := newH()
+		feed(h, "退出吧。")
+		select {
+		case <-hung:
 		case <-time.After(2 * time.Second):
-			t.Fatal("dismiss transcript did not hang up")
+			t.Fatal("terminal dismiss transcript did not hang up")
 		}
 	})
 	t.Run("non-dismiss transcript stays on the call", func(t *testing.T) {
@@ -133,14 +142,14 @@ func TestDismissTranscriptHangsUp(t *testing.T) {
 		case <-time.After(300 * time.Millisecond):
 		}
 	})
-	t.Run("explicit dismiss still hangs up while task running", func(t *testing.T) {
+	t.Run("stop speaking still stays on call while task running", func(t *testing.T) {
 		h, hung := newH()
 		h.state.SetInFlight("running task")
 		feed(h, "闭嘴")
 		select {
 		case <-hung:
-		case <-time.After(2 * time.Second):
-			t.Fatal("explicit dismiss during a task did not hang up")
+			t.Fatal("stop speaking during a task hung up the call")
+		case <-time.After(100 * time.Millisecond):
 		}
 	})
 }
@@ -155,6 +164,56 @@ func TestTranscriptIsEvidenceOnlyByDefault(t *testing.T) {
 	case <-hung:
 		t.Fatal("default ASR evidence path must not own call control")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestQwenDismissTranscriptUsesBackstopByDefault(t *testing.T) {
+	t.Setenv("KOE_ASR_DISMISS_BACKSTOP", "")
+	h := newEventHandler(nil, NewCallState("burst-qwen-dismiss", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleInputTranscript("退出吧。")
+
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Qwen dismiss transcript did not use the deterministic backstop by default")
+	}
+}
+
+func TestQwenDismissAcknowledgementDoesNotEndAfterFailedTranscript(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-qwen-dismiss-ack", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.failed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.audio_transcript.done","transcript":"好的，再见。"}`))
+
+	select {
+	case <-ended:
+		t.Fatal("assistant goodbye translation ended the call without user-side dismissal evidence")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestFailedTranscriptNormalReplyDoesNotEndCall(t *testing.T) {
+	h := newEventHandler(nil, NewCallState("burst-qwen-normal-ack", ""), nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	ended := make(chan struct{}, 1)
+	h.onEndCall = func() { ended <- struct{}{} }
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.failed"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.audio_transcript.done","transcript":"好的，我来帮你。"}`))
+
+	select {
+	case <-ended:
+		t.Fatal("normal acknowledgement after failed input transcription ended the call")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

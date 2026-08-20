@@ -73,17 +73,24 @@ Both `stop_speaking` and `end_call` say nothing and send no
 - `do_task` defaults to exactly ONE call per response. Multiple calls in one
   response require an explicit user request for parallel execution, and each
   call must carry one disjoint work scope.
+- Results from `do_task` calls created by the same Realtime response form one
+  delivery group. Do not make a partial group speakable: wait until every
+  registered call is terminal, submit all provider acknowledgements together,
+  and request exactly one spoken continuation. OpenAI seals on `response.done`;
+  Qwen also seals after a provider-specific tool-call quiet window because it
+  can withhold `response.done` until function outputs arrive.
 - `do_task` does not expose execution routing to Realtime — see Provider
   Architecture for the daemon-side Fast/Full decision.
 - `MapDoTaskOutcome` maps a partial run (soft idle/deadline timeout,
   `iteration_limit`, force-stop — but NOT `user_cancelled`, which stays silent)
   to a canned per-language `incomplete` line and seeds no digest, so a cut run's
   progress tail is NEVER voiced as the result.
-- ASR transcripts are asynchronous evidence/logging only. They are not ordinary
-  turn control, not barge-in admission, and not the default dismissal path. The
-  transcript dismiss backstop is opt-in (`KOE_ASR_DISMISS_BACKSTOP=1`, default
-  off) and converges on `realtime.go`'s handler-local terminal rather than
-  firing teardown independently; model-judged `end_call` stays authoritative.
+- ASR transcripts never admit barge-in or ordinary turns. When native floor
+  control is unavailable, a terminal-only fixed vocabulary (exit/goodbye,
+  never stop-speaking phrases) provides the default lifecycle backstop. Set
+  `KOE_ASR_DISMISS_BACKSTOP=0` to disable it. The backstop converges on
+  `realtime.go`'s handler-local terminal rather than firing teardown
+  independently; model-judged `end_call` remains authoritative elsewhere.
 - An accepted interruption truncates the paused assistant item server-side
   (`conversation.item.truncate` to the audio actually heard) so the model never
   treats unspoken text as said.
@@ -95,6 +102,8 @@ Both `stop_speaking` and `end_call` say nothing and send no
 **`agent.service_tier`** (`""`/`default`/`fast`, validated in `validateConfig` + `PATCH /config`) is a PROCESS-GLOBAL OpenAI processing lane sent on ordinary requests. It never rides an isolated route: `applyAgentModelOverlayToLoop` clears it whenever a named agent selects either its own model tier or an exact model, and `requestServiceTier` returns "" whenever a sealed execution profile (kfp1 Koe fast / ep1 computer) owns the request. Capability token `agent_service_tier_v1`.
 
 **Koe Fast/Full execution** (`internal/executionprofile` + daemon `resolveKoeExecutionRun` / `authorizeKoeExecutionLineage`): Realtime's `do_task` schema contains no routing fields; each new `source=koe` request asks for Fast. The daemon remains authoritative: `koe.fast_effort=false`, a failed/missing Cloud profile, or a validated inherited Full lineage keeps the normal global/per-agent configuration byte-for-byte. Fast resolves the opaque Luna kfp1 profile from Cloud (`ResolveKoeExecutionProfile`, 5s bound). The validated `Run` (lineage ids + profile + digest-only evidence) is persisted in `Session.ExecutionRuns` and returned on `done` as `execution_run` for Koe's call ledger; interrupted recovery restores the pinned profile from the checkpoint and validates it against the ledger, abandoning on `ErrInvalidPersistedRun` (legacy zero-run checkpoints instead mint a fresh Full run under the route lock). The wire still carries admitted mode fields for compatibility and recovery. Capability token `koe_fast_profile_v1`; wire fixtures `message_koe_execution_{fast,full}_request.json` + `sse_event.done.with_execution_run.json`.
+
+**Koe Realtime provider routing** (`internal/koe/provider.go`, `webrtc.go`, `cmd/koe.go`): every provider uses WebRTC. `auto` tries the pinned OpenAI route and changes to Qwen only for a classified pre-media bootstrap failure (network error/timeout, 5xx bootstrap response, ICE/DataChannel/session-ready timeout). Cloud's mint endpoint folds every upstream OpenAI failure — including upstream credential and configuration rejections — into 502, so those Cloud-side failures ARE fallback-eligible by design (a broken Cloud-held OpenAI credential degrades voice to Qwen instead of killing it). What stays terminal: gateway-authored 4xx (client auth, quota denial), locally validated invalid model/voice, and rejected `session.update`. The OpenAI negative-health cache only affects later calls during its cooldown; a ready call never switches provider. Forced OpenAI/Qwen never fall back. Qwen SDP goes through `DaemonClient.ExchangeSDPViaDaemon`; media remains direct and no provider credential enters Koe. Qwen lacks `conversation.item.truncate`, so `eventHandler.nativeFloorEnabled` and `truncateHeldSpeech` disable that capability for Qwen. Interruptible (barge-in on) Qwen calls use server VAD so short first turns and talk-over are detected promptly; barge-in-off calls keep semantic VAD's complete-thought endpointing. Ordinary VPIO barge-in stays available while the response is active; only the short local playback tail after `response.done` is protected from capture to prevent self-interruption. An active transport reconnect preserves the task ledger/mailbox but marks prior voice wording unavailable in the replacement persona; it never pretends provider conversation history transferred. `KOE_QWEN_VAD_MODE` remains the A/B and rollback override in either direction. Capability token `koe_realtime_provider_v1`; the provider/model/voice catalog is additive under `GET /config/status`.
 
 ### Tool Priority
 

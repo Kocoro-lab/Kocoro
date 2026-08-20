@@ -683,6 +683,7 @@ func macOSAutomationGuidance(toolNames []string) string {
 	var bullets strings.Builder
 	if has("computer_use") {
 		bullets.WriteString("- Use `computer_use` for native macOS UI. Start with an exact app name unless this run already identifies the user's original foreground app, then act with the returned state_id and ref.\n")
+		bullets.WriteString("- `computer_use` cannot determine the device's physical location. Do not use shell commands, network lookups, public-IP geolocation, System Settings, Maps, or another app to infer it, unless the user explicitly asks to read a named location-capable app (e.g. \"open Maps\"). Use a location the user already stated in the conversation; otherwise ask for a city or region.\n")
 		bullets.WriteString("- One state belongs to one existing app window. Re-observe after a mutation or stale-state error. screenshot and include_screenshot capture only that target window and should be requested only when pixels are needed.\n")
 		bullets.WriteString("- Use coordinate click/move only when the Accessibility tree has no usable ref.\n")
 	} else if has("accessibility") {

@@ -54,6 +54,99 @@ func TestResultMailboxDeliversStaggeredTasksIndependently(t *testing.T) {
 	}
 }
 
+func TestResultMailboxWaitsForWholeResponseTaskGroup(t *testing.T) {
+	m := NewResultMailbox()
+	m.BeginBurst("call")
+	weather := m.BeginTaskResult("call", "response-1", "call-weather")
+	news := m.BeginTaskResult("call", "response-1", "call-news")
+
+	if id := m.EnqueueTaskResult(weather, SayResult{TaskID: "weather", Status: "ok", Reply: "Sunny."}, false); id == 0 {
+		t.Fatal("first grouped result was rejected")
+	}
+	m.SealTaskResponse("call", "response-1")
+	if got := m.claimForBurst("connection", "call"); len(got) != 0 {
+		t.Fatalf("partial task group became speakable: %+v", got)
+	}
+
+	if id := m.EnqueueTaskResult(news, SayResult{TaskID: "news", Status: "ok", Reply: "Atlas shipped."}, false); id == 0 {
+		t.Fatal("second grouped result was rejected")
+	}
+	got := m.claimForBurst("connection", "call")
+	if len(got) != 2 {
+		t.Fatalf("complete task group claim=%d, want 2: %+v", len(got), got)
+	}
+	if got[0].callID != "call-weather" || got[1].callID != "call-news" {
+		t.Fatalf("group lost provider call ids: %+v", got)
+	}
+}
+
+func TestResultMailboxAbandonedTaskDoesNotBlockSiblingResult(t *testing.T) {
+	m := NewResultMailbox()
+	m.BeginBurst("call")
+	abandoned := m.BeginTaskResult("call", "response-1", "call-abandoned")
+	completed := m.BeginTaskResult("call", "response-1", "call-completed")
+	m.SealTaskResponse("call", "response-1")
+	m.AbandonTaskResult(abandoned)
+	m.EnqueueTaskResult(completed, SayResult{TaskID: "done", Status: "ok", Reply: "Done."}, false)
+
+	got := m.claimForBurst("connection", "call")
+	if len(got) != 1 || got[0].callID != "call-completed" {
+		t.Fatalf("abandoned sibling blocked or polluted the result batch: %+v", got)
+	}
+}
+
+func TestResultMailboxCompletionWakesNextReadyTaskGroup(t *testing.T) {
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst("burst")
+	first := mailbox.BeginTaskResult("burst", "response-1", "call-1")
+	second := mailbox.BeginTaskResult("burst", "response-2", "call-2")
+	mailbox.SealTaskResponse("burst", "response-1")
+	mailbox.SealTaskResponse("burst", "response-2")
+	mailbox.EnqueueTaskResult(first, SayResult{TaskID: "task-1", Say: "first"}, false)
+	mailbox.EnqueueTaskResult(second, SayResult{TaskID: "task-2", Say: "second"}, false)
+
+	select {
+	case <-mailbox.notifications():
+	default:
+		t.Fatal("ready groups did not notify the sender")
+	}
+	claimed := mailbox.claimForBurst("owner-1", "burst")
+	if len(claimed) != 1 || claimed[0].result.TaskID != "task-1" {
+		t.Fatalf("first claim=%+v, want only task-1", claimed)
+	}
+	mailbox.complete("owner-1")
+
+	select {
+	case <-mailbox.notifications():
+	default:
+		t.Fatal("completing the first group did not wake the already-ready second group")
+	}
+	claimed = mailbox.claimForBurst("owner-2", "burst")
+	if len(claimed) != 1 || claimed[0].result.TaskID != "task-2" {
+		t.Fatalf("second claim=%+v, want only task-2", claimed)
+	}
+}
+
+func TestResultMailboxTaskGroupSealWaitsForLatestCall(t *testing.T) {
+	mailbox := NewResultMailbox()
+	mailbox.BeginBurst("burst")
+	first := mailbox.BeginTaskResult("burst", "response", "call-1")
+	mailbox.ScheduleTaskGroupSeal(first, 40*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	second := mailbox.BeginTaskResult("burst", "response", "call-2")
+	mailbox.ScheduleTaskGroupSeal(second, 40*time.Millisecond)
+	mailbox.EnqueueTaskResult(first, SayResult{TaskID: "task-1", Say: "first"}, false)
+	mailbox.EnqueueTaskResult(second, SayResult{TaskID: "task-2", Say: "second"}, false)
+
+	time.Sleep(25 * time.Millisecond)
+	if got := mailbox.claimForBurst("early", "burst"); len(got) != 0 {
+		t.Fatalf("older seal timer split a still-growing task group: %+v", got)
+	}
+	waitUntil(t, func() bool {
+		return len(mailbox.claimForBurst("ready", "burst")) == 2
+	}, "latest task-call quiet window did not seal the complete group")
+}
+
 func TestResultMailboxReleasesAcrossConnectionTeardown(t *testing.T) {
 	m := NewResultMailbox()
 	m.Enqueue(SayResult{TaskID: "task-a", Status: "ok", Reply: "Done."}, false)
@@ -246,8 +339,17 @@ func TestResultDeliverySurvivesRealtimeTeardown(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("old connection never attempted result delivery")
 	}
+	select {
+	case <-m.notifications():
+	default:
+	}
 	cancel1() // no response.created: the old connection disappears mid-delivery
 	waitForMailboxOwner(t, m, "", time.Second)
+	select {
+	case <-m.notifications():
+	case <-time.After(time.Second):
+		t.Fatal("connection teardown released a result without waking its replacement")
+	}
 
 	secondCreate := make(chan string, 1)
 	resultContext := make(chan string, 1)
@@ -421,6 +523,63 @@ func TestImmediateDoTaskResultWaitsForAcknowledgementPlaybackTail(t *testing.T) 
 	}
 
 	waitUntil(t, func() bool { return captured.countType("response.create") == 1 }, "result was not announced after acknowledgement playback drained")
+}
+
+func TestQwenLateRTPAfterResponseDoneReleasesFastTaskResult(t *testing.T) {
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "500")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "20")
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "60")
+
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	mailbox := NewResultMailbox()
+	state := NewCallState("burst-qwen-fast-result", "")
+	mailbox.BeginBurst(state.BurstID())
+	createSpeaking := make(chan bool, 1)
+	var h *eventHandler
+	h = newEventHandlerWithMailbox(nil, state, audio, func(v any) error {
+		payload, _ := json.Marshal(v)
+		var frame struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &frame)
+		if frame.Type == "response.create" {
+			createSpeaking <- audio.dropCapture()
+			h.handleEvent(context.Background(), responseCreatedForRequest("result-response", v))
+		}
+		return nil
+	}, mailbox, nil)
+	h.provider = string(ProviderQwen)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.runResponseSender(ctx)
+
+	// A fast task finishes while its acknowledgement is still playing. Qwen can
+	// deliver the last audible RTP frames after response.done and does not always
+	// emit output_audio_buffer.stopped.
+	h.handleEvent(ctx, []byte(`{"type":"response.created","response":{"id":"ack-response"}}`))
+	h.handleEvent(ctx, []byte(`{"type":"output_audio_buffer.started"}`))
+	mailbox.EnqueueForBurst(state.BurstID(), SayResult{TaskID: "fast-task", Status: "ok", Reply: "Done."}, false)
+	h.handleEvent(ctx, []byte(`{"type":"response.done","response":{"id":"ack-response","status":"completed"}}`))
+	loud := make([]int16, 480)
+	for i := range loud {
+		loud[i] = 1000
+	}
+	if !h.observeProviderRemoteAudio(loud) {
+		t.Fatal("late Qwen RTP frame was rejected inside the response tail")
+	}
+	audio.setOutputLevel(0)
+
+	select {
+	case speaking := <-createSpeaking:
+		if speaking {
+			t.Fatal("fast task result started before the acknowledgement speaking gate drained")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late Qwen RTP permanently blocked the completed fast task result")
+	}
 }
 
 func TestResultDeliveryIgnoresUnrelatedResponseLifecycle(t *testing.T) {

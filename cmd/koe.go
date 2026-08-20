@@ -22,6 +22,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/koe"
 )
 
@@ -30,8 +31,11 @@ type koeConfig struct {
 	openAIKey       string // DEV-KEY: replaced by the deferred daemon mint relay (→ Plan D Cloud mint)
 	daemonURL       string
 	agent           string
+	provider        koe.RealtimeProvider
 	model           string
-	voice           string // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback in sessionConfig
+	voice           string
+	qwenModel       string
+	qwenVoice       string
 	language        string
 	controlPort     string // Desktop↔Koe control server port (Kocoro Desktop passes it); empty = no control channel
 	controlToken    string // Desktop-owned Bearer token from KOE_CONTROL_TOKEN; never passed via argv
@@ -39,7 +43,8 @@ type koeConfig struct {
 	audioProcessing string // auto | mac_voice | clean_device; controls whether VPIO applies or bypasses Apple's voice processing
 	micDevice       string // --mic-device: CoreAudio input device UID (empty = system default; vpio only)
 	speakerDevice   string // --speaker-device: CoreAudio output device UID (empty = system default; vpio only)
-	bargeIn         bool   // --barge-in: reversible native-S2S floor control while Kocoro speaks (vpio backend only)
+	bargeIn         bool   // --barge-in: allow interruption while Kocoro speaks (vpio backend only)
+	bargeInSet      bool   // whether --barge-in was explicit; false must override an inherited debug env
 	// Debug harness (workstream A): headless file-backed audio so a run needs no
 	// mic/ears. All empty/zero = normal mic+speaker device.
 	sayText     string // --say: synthesize this text (macOS say) as the mic input
@@ -53,7 +58,9 @@ type koeConfig struct {
 func defaultKoeConfig() koeConfig {
 	return koeConfig{
 		daemonURL:       "http://127.0.0.1:7533", // must match the daemon's listen addr; Desktop (Plan E) passes the real one
-		model:           "gpt-realtime-2.1",
+		provider:        koe.ProviderAuto,
+		model:           koe.DefaultOpenAIRealtimeModel,
+		qwenModel:       koe.DefaultQwenRealtimeModel,
 		audioProcessing: audioProcessingAuto,
 	}
 }
@@ -78,8 +85,14 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 // Realtime then chooses resume_playback or accept_turn without ASR admission.
 // KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1 remains the rollback to the old
 // irreversible server-cancel experiment.
-func applyBargeInEnv(bargeIn bool) {
+func applyBargeInEnv(bargeIn, explicit bool) {
+	if !bargeIn && !explicit {
+		return
+	}
 	if !bargeIn {
+		os.Setenv("KOE_VPIO_BARGE_IN", "0")
+		os.Setenv("KOE_NATIVE_FLOOR", "0")
+		os.Setenv("KOE_INTERRUPT_RESPONSE", "0")
 		return
 	}
 	os.Setenv("KOE_VPIO_BARGE_IN", "1")
@@ -241,10 +254,20 @@ var koeCmd = &cobra.Command{
 			cfg.daemonURL = v
 		}
 		cfg.agent, _ = cmd.Flags().GetString("agent")
+		providerRaw, _ := cmd.Flags().GetString("provider")
+		provider, err := koe.ParseRealtimeProvider(providerRaw)
+		if err != nil {
+			return err
+		}
+		cfg.provider = provider
 		if v, _ := cmd.Flags().GetString("model"); v != "" {
 			cfg.model = v
 		}
 		cfg.voice, _ = cmd.Flags().GetString("voice")
+		if v, _ := cmd.Flags().GetString("qwen-model"); v != "" {
+			cfg.qwenModel = v
+		}
+		cfg.qwenVoice, _ = cmd.Flags().GetString("qwen-voice")
 		cfg.language, _ = cmd.Flags().GetString("language")
 		cfg.controlPort, _ = cmd.Flags().GetString("control-port")
 		cfg.controlToken = os.Getenv("KOE_CONTROL_TOKEN")
@@ -262,6 +285,7 @@ var koeCmd = &cobra.Command{
 		cfg.micDevice, _ = cmd.Flags().GetString("mic-device")
 		cfg.speakerDevice, _ = cmd.Flags().GetString("speaker-device")
 		cfg.bargeIn, _ = cmd.Flags().GetBool("barge-in")
+		cfg.bargeInSet = cmd.Flags().Changed("barge-in")
 		cfg.sayText, _ = cmd.Flags().GetString("say")
 		cfg.audioIn, _ = cmd.Flags().GetString("audio-in")
 		cfg.audioOut, _ = cmd.Flags().GetString("audio-out")
@@ -274,6 +298,23 @@ var koeCmd = &cobra.Command{
 		// takes the direct mint path instead.
 		if cfg.aec != "" && cfg.aec != "gate" && cfg.aec != "vpio" {
 			return fmt.Errorf("invalid --aec %q (want gate or vpio)", cfg.aec)
+		}
+		if err := koe.ValidateRealtimeModel(koe.ProviderOpenAI, cfg.model); err != nil {
+			return err
+		}
+		if err := koe.ValidateRealtimeModel(koe.ProviderQwen, cfg.qwenModel); err != nil {
+			return err
+		}
+		// Voices degrade instead of hard-failing: a legacy config value would
+		// otherwise brick voice at startup, and the engine substitutes its
+		// default for an empty voice. New writes are rejected at PATCH /config.
+		if !config.IsValidKoeRealtimeVoice("openai", cfg.voice) {
+			log.Printf("koe[provider]: --voice %q is not an advertised OpenAI Realtime voice; using the default", cfg.voice)
+			cfg.voice = ""
+		}
+		if !config.IsValidKoeRealtimeVoice("qwen", cfg.qwenVoice) {
+			log.Printf("koe[provider]: --qwen-voice %q is not an advertised Qwen Realtime voice; using the default", cfg.qwenVoice)
+			cfg.qwenVoice = ""
 		}
 		mode, err := normalizeAudioProcessingMode(cfg.audioProcessing)
 		if err != nil {
@@ -288,8 +329,11 @@ func init() {
 	koeCmd.Flags().String("openai-key", "", "OpenAI API key (dev; C-minimal only)")
 	koeCmd.Flags().String("daemon-url", "", "daemon base URL (default http://127.0.0.1:7533)")
 	koeCmd.Flags().String("agent", "", "bound back-brain agent slug (empty = daemon default)")
+	koeCmd.Flags().String("provider", "auto", "realtime provider: auto (OpenAI then Qwen) | openai | qwen")
 	koeCmd.Flags().String("model", "", "realtime model (default gpt-realtime-2.1)")
 	koeCmd.Flags().String("voice", "", "realtime output voice (marin/cedar/shimmer/…; empty = marin)")
+	koeCmd.Flags().String("qwen-model", "", "Qwen fallback model (default qwen3.5-omni-flash-realtime)")
+	koeCmd.Flags().String("qwen-voice", "", "Qwen fallback voice (empty = Tina)")
 	koeCmd.Flags().String("language", "", "conversation language hint")
 	koeCmd.Flags().String("control-port", "", "Desktop↔Koe control server port (Kocoro Desktop passes it)")
 	koeCmd.Flags().String("aec", "", "echo control: gate (default, oto half-duplex) | vpio (Apple VoiceProcessingIO full-duplex AEC)")
@@ -431,6 +475,19 @@ const (
 // server lifetime and retry with a fresh mint if a cached secret is rejected.
 const warmMintTTL = 8 * time.Minute
 
+func koeOpenAICircuitCooldown() time.Duration {
+	const fallback = 5 * time.Minute
+	raw := strings.TrimSpace(os.Getenv("KOE_OPENAI_FAILURE_COOLDOWN_MS"))
+	if raw == "" {
+		return fallback
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 type warmMint struct {
 	mint func(context.Context) (string, error)
 	ttl  time.Duration
@@ -490,6 +547,87 @@ func (w *warmMint) prefetch(ctx context.Context) {
 		w.mintedAt = time.Now()
 		log.Printf("koe[timing]: warm mint ready")
 	}()
+}
+
+type realtimeConnector struct {
+	mode        koe.RealtimeProvider
+	openAIModel string
+	openAIVoice string
+	qwenModel   string
+	qwenVoice   string
+	mint        func(context.Context) (string, error)
+	warm        *warmMint
+	exchange    func(context.Context, string) (string, error)
+	circuit     *koe.OpenAICircuit
+}
+
+func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, persona string, state *koe.CallState, disp *koe.Dispatcher, opts koe.ConnectOptions) (*koe.RealtimeConn, koe.RealtimeProvider, error) {
+	connectQwen := func() (*koe.RealtimeConn, error) {
+		qwenOpts := opts
+		qwenOpts.Model = c.qwenModel
+		qwenOpts.Voice = c.qwenVoice
+		return koe.ConnectQwen(ctx, audio, c.exchange, persona, state, disp, qwenOpts)
+	}
+	if c.mode == koe.ProviderQwen {
+		conn, err := connectQwen()
+		return conn, koe.ProviderQwen, err
+	}
+	if c.mode == koe.ProviderAuto && c.circuit.Skip() {
+		log.Printf("koe[provider]: auto skipped OpenAI during availability cooldown; connecting Qwen")
+		conn, err := connectQwen()
+		return conn, koe.ProviderQwen, err
+	}
+
+	openAIOpts := opts
+	openAIOpts.Model = c.openAIModel
+	openAIOpts.Voice = c.openAIVoice
+	// Bound the synchronous mint like the pre-provider warm path did (15s). The
+	// session ctx is long-lived; without this the only bound is the daemon
+	// client's 30s HTTP timeout, doubling worst-case time-to-fallback.
+	mctx, mcancel := context.WithTimeout(ctx, 15*time.Second)
+	secret, cached, err := c.takeOpenAISecret(mctx)
+	mcancel()
+	if err != nil {
+		err = koe.OpenAIMintError(err)
+		if c.mode == koe.ProviderAuto && koe.AutoFallbackEligible(err) {
+			c.circuit.RecordFailure(err)
+			log.Printf("koe[provider]: OpenAI mint unavailable; falling back to Qwen: %v", err)
+			conn, qerr := connectQwen()
+			return conn, koe.ProviderQwen, qerr
+		}
+		return nil, koe.ProviderOpenAI, err
+	}
+	conn, err := koe.Connect(ctx, audio, secret, persona, state, disp, openAIOpts)
+	if err != nil && cached && (c.mode == koe.ProviderOpenAI || !koe.AutoFallbackEligible(err)) {
+		log.Printf("koe[provider]: cached OpenAI secret rejected; retrying once with a fresh mint: %v", err)
+		fctx, fcancel := context.WithTimeout(ctx, 15*time.Second)
+		fresh, mintErr := c.mint(fctx)
+		fcancel()
+		if mintErr != nil {
+			err = koe.OpenAIMintError(mintErr)
+		} else {
+			conn, err = koe.Connect(ctx, audio, fresh, persona, state, disp, openAIOpts)
+		}
+	}
+	if err == nil {
+		c.circuit.RecordSuccess()
+		return conn, koe.ProviderOpenAI, nil
+	}
+	if c.mode != koe.ProviderAuto || !koe.AutoFallbackEligible(err) {
+		return nil, koe.ProviderOpenAI, err
+	}
+	c.circuit.RecordFailure(err)
+	log.Printf("koe[provider]: OpenAI connection unavailable before media; falling back to Qwen: %v", err)
+	conn, qerr := connectQwen()
+	return conn, koe.ProviderQwen, qerr
+}
+
+func (c *realtimeConnector) takeOpenAISecret(ctx context.Context) (string, bool, error) {
+	if c.warm != nil {
+		return c.warm.take(ctx)
+	}
+	secret, err := c.mint(ctx)
+	return secret, false, err
 }
 
 func newBurstID() string {
@@ -634,13 +772,22 @@ func baseKoePersona(cfg koeConfig) string {
 	return persona
 }
 
+const activeReconnectContextBoundary = "CONNECTION RECOVERY: This Realtime session does not contain the earlier voice conversation. Do not pretend to remember wording from before the reconnect. If the user's next request depends on that missing wording, briefly ask the user to restate it instead of guessing. Newly injected task-result data is authoritative and must still be delivered normally."
+
+func desktopSessionPersona(persona, reason string) string {
+	if reason != "active_session_reconnect" {
+		return persona
+	}
+	return persona + "\n\n" + activeReconnectContextBoundary
+}
+
 func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	// --barge-in selects native floor control before any audio/session code reads
 	// the env gates (covers both Desktop and standalone branches below).
-	applyBargeInEnv(cfg.bargeIn)
+	applyBargeInEnv(cfg.bargeIn, cfg.bargeInSet)
 	if w := bargeInBackendWarning(cfg.bargeIn, cfg.aec); w != "" {
 		log.Printf("koe[barge]: WARNING — %s", w)
 	}
@@ -667,6 +814,18 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		}
 		return client.MintViaDaemon(mctx, cfg.model)
 	}
+	connector := &realtimeConnector{
+		mode:        cfg.provider,
+		openAIModel: cfg.model,
+		openAIVoice: cfg.voice,
+		qwenModel:   cfg.qwenModel,
+		qwenVoice:   cfg.qwenVoice,
+		mint:        mintEK,
+		exchange: func(sctx context.Context, offer string) (string, error) {
+			return client.ExchangeSDPViaDaemon(sctx, string(koe.ProviderQwen), cfg.qwenModel, offer)
+		},
+		circuit: koe.NewOpenAICircuit(koeOpenAICircuitCooldown()),
+	}
 
 	// ── Kocoro Desktop (control-port) mode: warm session + call-scoped audio ──
 	// Koe pre-warms the next OpenAI session while idle, but it opens the local audio
@@ -675,7 +834,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// reach koe during a slow-daemon window (those fetches used to run here first,
 	// blocking for up to ~33s while koe's control port stayed unbound).
 	if cfg.controlPort != "" {
-		return runDesktopCall(ctx, cfg, client, mintEK, onUsage)
+		return runDesktopCall(ctx, cfg, client, connector, onUsage)
 	}
 
 	// ── Standalone / headless mode: always-on (CLI + E2E + --say/--audio-in) ──
@@ -728,11 +887,6 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	disarmAudioWatchdog()
 	defer audio.Stop()
 
-	ek, err := mintEK(ctx)
-	if err != nil {
-		return fmt.Errorf("mint: %v", err)
-	}
-
 	// Debug harness: --once exits a short grace after the reply finishes (→
 	// "listening"), pausing the timer while thinking/speaking so do_task latency
 	// doesn't trip it; --timeout is a hard fallback.
@@ -745,7 +899,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	}
 
 	var dismissOnce sync.Once
-	conn, err := koe.Connect(ctx, audio, ek, persona, state, disp, koe.ConnectOptions{
+	conn, provider, err := connector.connect(ctx, audio, persona, state, disp, koe.ConnectOptions{
 		OnVoiceState:  onVoiceState,
 		Model:         cfg.model,
 		Voice:         cfg.voice,
@@ -770,6 +924,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	if err != nil {
 		return fmt.Errorf("connect: %v", err)
 	}
+	log.Printf("koe[provider]: connected provider=%s model=%s", provider, map[koe.RealtimeProvider]string{koe.ProviderOpenAI: cfg.model, koe.ProviderQwen: cfg.qwenModel}[provider])
 	defer conn.Close()
 
 	if !fileMode {
@@ -784,12 +939,20 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	return nil
 }
 
+func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, retireCall bool) *koe.CallState {
+	if state == nil || !retireCall {
+		return state
+	}
+	mailbox.RetireBurst(state.BurstID())
+	return nil
+}
+
 // runDesktopCall is the resident control-port loop. Desktop keeps a warm Realtime
 // session ready while idle, but the audio device is call-scoped: /call/start opens
 // the selected backend, /call/end closes the used session and audio, then warms
 // the next session without touching the mic.
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
-	mintEK func(context.Context) (string, error), onUsage func(json.RawMessage)) error {
+	connector *realtimeConnector, onUsage func(json.RawMessage)) error {
 
 	fullDuplexAEC := cfg.aec == "vpio"
 	// One mailbox spans every warm Realtime session in this resident process. A
@@ -814,9 +977,12 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	// startCall/interruptCall, and read only at call time.
 	var endCall func()
 	var callContext koe.StartCallRequest
-	newSessionState := func() (*koe.CallState, *koe.Dispatcher) {
-		state := koe.NewCallState(newBurstID(), cfg.agent)
-		resultMailbox.BeginBurst(state.BurstID())
+	newSessionState := func(existing *koe.CallState) (*koe.CallState, *koe.Dispatcher) {
+		state := existing
+		if state == nil {
+			state = koe.NewCallState(newBurstID(), cfg.agent)
+			resultMailbox.BeginBurst(state.BurstID())
+		}
 		state.SetCallContext(callContext)
 		disp := koe.NewDispatcher(client, resolverHolder.Load(), state, func(_ context.Context, action string) error {
 			if ctrl == nil {
@@ -827,7 +993,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		})
 		return state, disp
 	}
-	warm := newWarmMint(ctx, mintEK, warmMintTTL)
+	if cfg.provider != koe.ProviderQwen {
+		connector.warm = newWarmMint(ctx, connector.mint, warmMintTTL)
+	}
 
 	// The RealtimeConn is warmed while idle, then consumed by one foreground call.
 	// callActive gates mic frames inside pumpSendTrack; inactive sessions drain and
@@ -905,22 +1073,22 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			go audio.PlayReadyEarcon()
 		}
 	}
-	closeSessionLocked := func() (*koe.RealtimeConn, context.CancelFunc, *koe.AudioIO) {
+	closeSessionLocked := func(retireCall bool) (*koe.RealtimeConn, context.CancelFunc, *koe.AudioIO) {
 		sessionSeq++
 		conn, cancel := curConn, sessionCancel
 		audio := curAudio
-		if curState != nil {
-			resultMailbox.RetireBurst(curState.BurstID())
+		curState = closeDesktopSessionState(resultMailbox, curState, retireCall)
+		curConn, curAudio, sessionCancel = nil, nil, nil
+		if retireCall {
+			snapState.Store(nil)
+			callContext = koe.StartCallRequest{}
+			callStarted = time.Time{}
 		}
-		curConn, curState, curAudio, sessionCancel = nil, nil, nil, nil
-		snapState.Store(nil)
 		snapAudio.Store(nil)
 		curAudioStarted = false
-		callContext = koe.StartCallRequest{}
 		warming = false
 		sessionReady = false
 		readyEmitted = false
-		callStarted = time.Time{}
 		return conn, cancel, audio
 	}
 	var ensureWarmSessionLocked func(string)
@@ -956,7 +1124,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				return
 			}
 			log.Printf("koe[timing]: refreshing idle warm session after %s reason=%s", idleSessionTTL, reason)
-			conn, cancel, audio := closeSessionLocked()
+			conn, cancel, audio := closeSessionLocked(true)
 			ensureWarmSessionLocked("ttl_refresh")
 			sessMu.Unlock()
 			stopSessionResources(conn, cancel, audio)
@@ -969,16 +1137,44 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		log.Printf("koe: warm session closed: %v", err)
-		wasActive := callActive
-		callActive = false
-		conn, cancel, audio := closeSessionLocked()
-		if wasActive {
-			ctrl.EmitVoiceState("idle")
-			ctrl.EmitCallState("ended")
+		if !callActive {
+			conn, cancel, audio := closeSessionLocked(true)
+			ensureWarmSessionLocked("session_closed")
+			sessMu.Unlock()
+			stopSessionResources(conn, cancel, audio)
+			return
 		}
-		ensureWarmSessionLocked("session_closed")
+
+		// A provider session can expire while the logical Desktop call is still
+		// active. Preserve the CallState and ResultMailbox burst so queued task results
+		// survive, but give the replacement session an explicit context boundary: the
+		// provider conversation itself cannot be transferred across WebRTC sessions.
+		ctrl.EmitCallState("connecting")
+		callStarted = time.Now()
+		conn, cancel, audio := closeSessionLocked(false)
 		sessMu.Unlock()
 		stopSessionResources(conn, cancel, audio)
+
+		sessMu.Lock()
+		if !callActive {
+			sessMu.Unlock()
+			return
+		}
+		ensureWarmSessionLocked("active_session_reconnect")
+		if err := startSessionAudioLocked("active_session_reconnect"); err != nil {
+			log.Printf("koe: audio restart failed: %v", err)
+			callActive = false
+			ctrl.EmitVoiceState("idle")
+			ctrl.EmitCallState("ended")
+			conn, cancel, audio := closeSessionLocked(true)
+			ensureWarmSessionLocked("audio_restart_retry")
+			sessMu.Unlock()
+			stopSessionResources(conn, cancel, audio)
+			return
+		}
+		emitReadyLocked()
+		resultMailbox.Wake()
+		sessMu.Unlock()
 	}
 	failActiveCallLocked := func(msg string, err error) {
 		log.Printf("koe: %s: %v", msg, err)
@@ -1016,7 +1212,11 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		readyEmitted = false
 		sessionSeq++
 		seq := sessionSeq
-		state, disp := newSessionState()
+		var existingState *koe.CallState
+		if callActive {
+			existingState = curState
+		}
+		state, disp := newSessionState(existingState)
 		curState = state
 		curAudio = audio
 		snapState.Store(state)
@@ -1027,29 +1227,6 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		log.Printf("koe[timing]: warming realtime session reason=%s burst=%s", reason, state.BurstID())
 
 		go func() {
-			mctx, mcancel := context.WithTimeout(sessionCtx, 15*time.Second)
-			ek, cachedMint, merr := warm.take(mctx)
-			mcancel()
-			if merr != nil {
-				var conn *koe.RealtimeConn
-				var scancel context.CancelFunc
-				var audio *koe.AudioIO
-				sessMu.Lock()
-				if seq == sessionSeq {
-					failActiveCallLocked("mint failed", merr)
-					conn, scancel, audio = closeSessionLocked()
-					scheduleWarmRetry("mint_retry")
-				}
-				sessMu.Unlock()
-				if conn != nil || scancel != nil || audio != nil {
-					stopSessionResources(conn, scancel, audio)
-				} else {
-					cancel()
-				}
-				return
-			}
-			log.Printf("koe[timing]: warm session mint ready in %dms warm=%t reason=%s", time.Since(started).Milliseconds(), cachedMint, reason)
-
 			isActive := func() bool {
 				sessMu.Lock()
 				defer sessMu.Unlock()
@@ -1090,37 +1267,26 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				return seq == sessionSeq && callActive
 			}
 
-			connectWith := func(secret string) (*koe.RealtimeConn, error) {
-				return koe.Connect(sessionCtx, audio, secret, *personaHolder.Load(), state, disp, koe.ConnectOptions{
-					OnVoiceState:  onVoiceState,
-					OnCallState:   onCallState,
-					OnVoiceLevel:  onVoiceLevel,
-					CallActive:    callActiveFn,
-					ResultMailbox: resultMailbox,
-					Model:         cfg.model,
-					Voice:         cfg.voice,
-					OnUsage:       onUsage,
-					OnEndCall: func() {
-						if endCall != nil {
-							endCall()
-						}
-					}, // end_call voice tool → hang up + goodbye earcon; endCall is forward-declared (assigned below)
-					Language:      cfg.language,
-					FullDuplexAEC: fullDuplexAEC,
-					OnClosed:      func(err error) { handleSessionClosed(seq, err) },
-				})
+			connectOpts := koe.ConnectOptions{
+				OnVoiceState:  onVoiceState,
+				OnCallState:   onCallState,
+				OnVoiceLevel:  onVoiceLevel,
+				CallActive:    callActiveFn,
+				ResultMailbox: resultMailbox,
+				OnUsage:       onUsage,
+				OnEndCall: func() {
+					if endCall != nil {
+						endCall()
+					}
+				}, // end_call voice tool → hang up + goodbye earcon; endCall is forward-declared (assigned below)
+				Language:      cfg.language,
+				FullDuplexAEC: fullDuplexAEC,
+				OnClosed:      func(err error) { handleSessionClosed(seq, err) },
 			}
-			conn, cerr := connectWith(ek)
-			if cerr != nil && cachedMint {
-				log.Printf("koe[timing]: warm session cached mint connect failed after %dms, retrying fresh: %v", time.Since(started).Milliseconds(), cerr)
-				fctx, fcancel := context.WithTimeout(sessionCtx, 15*time.Second)
-				fresh, ferr := mintEK(fctx)
-				fcancel()
-				if ferr == nil {
-					conn, cerr = connectWith(fresh)
-				} else {
-					log.Printf("koe[timing]: warm session fresh mint retry failed: %v", ferr)
-				}
+			persona := desktopSessionPersona(*personaHolder.Load(), reason)
+			conn, provider, cerr := connector.connect(sessionCtx, audio, persona, state, disp, connectOpts)
+			if cerr == nil {
+				log.Printf("koe[provider]: warm session connected provider=%s in %dms reason=%s", provider, time.Since(started).Milliseconds(), reason)
 			}
 			sessMu.Lock()
 			if seq != sessionSeq {
@@ -1133,7 +1299,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			}
 			if cerr != nil {
 				failActiveCallLocked("connect failed", cerr)
-				conn, scancel, audio := closeSessionLocked()
+				conn, scancel, audio := closeSessionLocked(true)
 				scheduleWarmRetry("connect_retry")
 				sessMu.Unlock()
 				stopSessionResources(conn, scancel, audio)
@@ -1169,7 +1335,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			log.Printf("koe: audio start failed: %v", err)
 			ctrl.EmitVoiceState("idle")
 			ctrl.EmitCallState("ended")
-			conn, cancel, audio := closeSessionLocked()
+			conn, cancel, audio := closeSessionLocked(true)
 			ensureWarmSessionLocked("audio_start_retry")
 			sessMu.Unlock()
 			stopSessionResources(conn, cancel, audio)
@@ -1193,7 +1359,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			return
 		}
 		callActive = false
-		conn, cancel, audio := closeSessionLocked()
+		conn, cancel, audio := closeSessionLocked(true)
 		ctrl.EmitVoiceState("idle")
 		ctrl.EmitCallState("ended")
 		ensureWarmSessionLocked("post_call")
@@ -1341,7 +1507,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	controlClosing.Store(true)
 	_ = ln.Close()
 	sessMu.Lock()
-	conn, cancel, audio := closeSessionLocked()
+	conn, cancel, audio := closeSessionLocked(true)
 	sessMu.Unlock()
 	stopSessionResources(conn, cancel, audio)
 	return nil

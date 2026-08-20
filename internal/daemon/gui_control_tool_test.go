@@ -22,9 +22,13 @@ type guiProbeTool struct {
 	descriptor agent.GUIActionDescriptor
 	started    chan struct{}
 	finished   chan struct{}
-	wait       bool
-	calls      int
-	outcome    *agent.GUIActionOutcome
+	// release gates the return of a cancelled wait probe so a test can observe
+	// the coordinator's intermediate Stopping state before runTool's deferred
+	// FinishAction clears the lease.
+	release chan struct{}
+	wait    bool
+	calls   int
+	outcome *agent.GUIActionOutcome
 }
 
 func (t *guiProbeTool) Info() agent.ToolInfo   { return agent.ToolInfo{Name: t.name} }
@@ -44,6 +48,9 @@ func (t *guiProbeTool) Run(ctx context.Context, _ string) (agent.ToolResult, err
 		<-ctx.Done()
 		if t.finished != nil {
 			close(t.finished)
+		}
+		if t.release != nil {
+			<-t.release
 		}
 		return agent.BusinessError("probe cancelled"), nil
 	}
@@ -737,6 +744,7 @@ func TestDaemonGUIWorkflowStopCancelsToolAndAcknowledgesBeforeTerminal(t *testin
 	workflow := testGUIWorkflow(coordinator, "sess-stop", "turn-stop")
 	tool := &guiProbeTool{
 		name: "computer", wait: true, started: make(chan struct{}), finished: make(chan struct{}),
+		release: make(chan struct{}),
 		descriptor: agent.GUIActionDescriptor{
 			Participates: true, ActionKind: "hotkey", Effect: agent.GUIActionMutation,
 			TargetBundleID: "com.example.Editor", TargetAppName: "Editor",
@@ -764,6 +772,7 @@ func TestDaemonGUIWorkflowStopCancelsToolAndAcknowledgesBeforeTerminal(t *testin
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop context did not reach tool")
 	}
+	close(tool.release)
 	result := <-done
 	if !result.IsError || !strings.Contains(result.Content, "commit status is unknown") || !strings.Contains(result.Content, "do not retry") {
 		t.Fatalf("cancelled result=%+v", result)

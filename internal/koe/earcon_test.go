@@ -92,10 +92,9 @@ func TestReadyEarconEnabledEnv(t *testing.T) {
 //
 // PlayReadyEarcon now holds the gate via the drain-aware PlaybackIdle poll (not a
 // fixed sleep), so the release keys on the file backend's real 20ms-ticked output
-// level draining, then the idle hold. Shrink the hold so the drained-then-released
-// transition happens promptly; the ~540ms cue keeps the 300ms mid-check inside it.
+// level draining, then the default one-frame idle hold. The ~540ms cue keeps the
+// 300ms mid-check inside it.
 func TestPlayReadyEarconMutesMicAndPlays(t *testing.T) {
-	t.Setenv("KOE_EARCON_IDLE_HOLD_MS", "40")
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	a, err := NewAudioIO()
 	if err != nil {
