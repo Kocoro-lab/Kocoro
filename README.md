@@ -199,7 +199,7 @@ Voice transport is WebRTC for every provider. `--provider auto` (the default) co
 
 Remote Koe front brains can set `KOE_DAEMON_TOKEN` to attach a bearer to daemon mint, SDP, task, cancellation, and usage requests. The receiving robot facade or reverse proxy validates it; use plaintext HTTP only on a trusted private LAN, and use TLS outside that boundary.
 
-Qwen body carriers may attach a native H.264 video track before SDP negotiation. The frame source is read only while a call is active, at the carrier-selected cadence; idle and prewarmed sessions upload no images. This is the Qwen live-vision transport seam, not an OpenAI `input_image` DataChannel event.
+Qwen body carriers may attach a native H.264 video track before SDP negotiation. The frame source is read only while a call is active, at the carrier-selected cadence; idle and prewarmed sessions upload no images. If Qwen does not accept the offered video track, setup fails instead of silently presenting an audio-only call as vision-capable. This is the Qwen live-vision transport seam, not an OpenAI `input_image` DataChannel event.
 
 With `shan koe --barge-in` on the VPIO audio backend, Kocoro remains interruptible while it speaks. OpenAI can pause and resume around a backchannel with native truncation; Qwen accepts the overlapping user turn directly and protects only the short local playback tail after `response.done`, where speaker echo would otherwise make it interrupt itself. `KOE_QWEN_VAD_MODE=server_vad` remains available for controlled A/B testing. Stopping speech, cancelling work, and ending the call are separate actions; work already in progress survives a hang-up. Double-tap Option to talk again.
 

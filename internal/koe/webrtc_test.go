@@ -95,7 +95,7 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 		videoTrack: videoWriter,
 		videoSource: &RealtimeVideoSource{
 			Codec:         VideoCodecH264,
-			FrameInterval: 5 * time.Millisecond,
+			FrameInterval: minRealtimeVideoFrameInterval,
 			ReadFrame: func(context.Context) ([]byte, error) {
 				reads.Add(1)
 				return []byte{0x00, 0x00, 0x01, 0x65}, nil
@@ -114,7 +114,7 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 		<-done
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(2*minRealtimeVideoFrameInterval + 20*time.Millisecond)
 	if got := reads.Load(); got != 0 {
 		cancel()
 		<-done
@@ -139,9 +139,12 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 		t.Fatal("video write did not carry frame bytes")
 	}
 	active.Store(false)
-	time.Sleep(10 * time.Millisecond)
+	// Let any tick already past its first activity check settle, then observe
+	// more than two complete cadence windows so this assertion cannot pass only
+	// because the minimum frame interval has not elapsed.
+	time.Sleep(minRealtimeVideoFrameInterval + 20*time.Millisecond)
 	idleReads, idleWrites := reads.Load(), videoWriter.writes.Load()
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(2*minRealtimeVideoFrameInterval + 20*time.Millisecond)
 	if got := reads.Load(); got != idleReads {
 		t.Fatalf("ended call video source reads advanced from %d to %d", idleReads, got)
 	}
@@ -405,6 +408,35 @@ func TestQwenVideoPrimerReleasesAudioLockBetweenFrames(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestQwenVideoPrimerStopsWhenMicAudioTakesOver(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	firstWrite := make(chan struct{}, 1)
+	track := &recordingSampleWriter{onWrite: func() {
+		select {
+		case firstWrite <- struct{}{}:
+		default:
+		}
+	}}
+	rc := &RealtimeConn{audio: audio, sendTrack: track}
+	done := make(chan error, 1)
+	go func() { done <- rc.primeQwenAudioBeforeVideo(context.Background()) }()
+	select {
+	case <-firstWrite:
+	case <-time.After(time.Second):
+		t.Fatal("audio primer did not write its first frame")
+	}
+	rc.micAudioWritten.Store(true)
+	if err := <-done; err != nil {
+		t.Fatalf("prime Qwen audio: %v", err)
+	}
+	if got := track.writes.Load(); got != 1 {
+		t.Fatalf("primer writes after mic audio took over = %d, want 1", got)
+	}
 }
 
 func TestQwenVideoPrimerFailsClosedWithoutAudioPath(t *testing.T) {

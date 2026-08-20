@@ -73,6 +73,9 @@ type RealtimeConn struct {
 	// one silent Opus primer after a call becomes active and before its first
 	// image; successful real mic audio satisfies the same gate.
 	outboundAudioReady atomic.Bool
+	// micAudioWritten distinguishes real send-pump ownership from the silent
+	// primer so priming stops instead of splicing silence into a live utterance.
+	micAudioWritten atomic.Bool
 	// Audio and video use separate RTP streams, so local write order does not
 	// guarantee remote arrival order. Keep the first audio write timestamp and
 	// give it a short lead before the first video sample is written.
@@ -126,7 +129,10 @@ const VideoCodecH264 = "h264"
 
 const (
 	defaultRealtimeVideoFrameInterval = time.Second
-	minRealtimeVideoFrameInterval     = 100 * time.Millisecond
+	// Current carriers send independently decodable visual-context keyframes,
+	// not full-motion video. Ten frames per second bounds a misconfigured or
+	// failing in-process camera source without reducing the 1 fps product cadence.
+	minRealtimeVideoFrameInterval = 100 * time.Millisecond
 
 	// Five paced packets plus a 300 ms audio lead survived repeated direct and
 	// Reachy product E2E runs; one unpaced packet intermittently arrived after
@@ -244,6 +250,9 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 		return
 	}
 	interval := rc.videoSource.frameInterval()
+	if requested := rc.videoSource.FrameInterval; requested > 0 && requested < interval {
+		log.Printf("koe[video]: frame interval %s clamped to %s", requested, interval)
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var lastFailure string
@@ -289,8 +298,9 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 				reportFailure("frame_format", "frame source returned non-Annex-B H.264")
 				continue
 			}
-			// The source cadence is the RTP timestamp cadence by contract. Reads are
-			// deadline-bound and late ticker events are dropped rather than queued.
+			// The configured cadence is the nominal RTP timestamp cadence. Reads are
+			// deadline-bound and late or failed frames are dropped rather than queued;
+			// their wall-clock gaps intentionally do not advance this low-rate stream.
 			if !rc.videoCallIsActive() {
 				continue
 			}
@@ -327,6 +337,10 @@ func (rc *RealtimeConn) primeQwenAudioBeforeVideo(ctx context.Context) error {
 		}
 		for primerFrame := 0; primerFrame < qwenAudioPrimerFrames; primerFrame++ {
 			rc.outboundAudioMu.Lock()
+			if rc.micAudioWritten.Load() {
+				rc.outboundAudioMu.Unlock()
+				break
+			}
 			if primerFrame == 0 && rc.outboundAudioReady.Load() {
 				rc.outboundAudioMu.Unlock()
 				break
@@ -620,9 +634,12 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				writeErr := rc.sendTrack.WriteSample(media.Sample{
 					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
 				})
-				if writeErr == nil && !rc.outboundAudioReady.Load() {
-					rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
-					rc.outboundAudioReady.Store(true)
+				if writeErr == nil {
+					rc.micAudioWritten.Store(true)
+					if !rc.outboundAudioReady.Load() {
+						rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
+						rc.outboundAudioReady.Store(true)
+					}
 				}
 				rc.outboundAudioMu.Unlock()
 				stats.noteWrite(writeErr)
