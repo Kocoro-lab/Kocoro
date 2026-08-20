@@ -884,6 +884,11 @@ func (t *openAIComputerTaskToolV1) Run(
 	if args.Description == "" {
 		return agent.ValidationError("description is required"), nil
 	}
+	// UserRequest tracks the LATEST user text, including mid-run injected
+	// follow-ups — but the registry was built from the ORIGINAL prompt, so for a
+	// location ask injected mid-run this guard covers computer_use only;
+	// bash/http/browser stay registered on that path. The registry-level strip
+	// in RunAgent covers only run-start classification.
 	if invocation, ok := agent.ToolInvocationFromContext(ctx); ok &&
 		implicitPhysicalLocationRequestV1(invocation.UserRequest) {
 		return withOpenAIComputerTaskFailureOutcomeV1(

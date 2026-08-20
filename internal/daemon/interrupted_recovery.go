@@ -226,6 +226,7 @@ func buildInterruptedResumeRequest(candidate interruptedTurnCandidate, maxAttemp
 		Channel:                              state.Channel,
 		ThreadID:                             state.ThreadID,
 		CWD:                                  state.CWD,
+		ImplicitPhysicalLocation:             state.ImplicitPhysicalLocation,
 		RouteKey:                             state.RouteKey,
 		PinnedRouteKey:                       state.RouteKey,
 		CloudMessageID:                       state.CloudMessageID,

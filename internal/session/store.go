@@ -86,7 +86,12 @@ type InterruptedTurn struct {
 	AttemptID       string                 `json:"attempt_id,omitempty"`
 	ExecutionRun    executionprofile.Run   `json:"execution_run,omitempty"`
 	ExecutionConfig *agent.ExecutionConfig `json:"execution_config,omitempty"`
-	UpdatedAt       time.Time              `json:"updated_at"`
+	// ImplicitPhysicalLocation persists the location-policy classification of
+	// the original request: a resumed continuation's Text is a fixed marker the
+	// classifier cannot match, and without this the resume rebuilds the full
+	// tool registry around the still-pending location intent.
+	ImplicitPhysicalLocation bool      `json:"implicit_physical_location,omitempty"`
+	UpdatedAt                time.Time `json:"updated_at"`
 }
 
 type Session struct {
