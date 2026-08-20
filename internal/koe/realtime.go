@@ -167,18 +167,21 @@ type eventHandler struct {
 	// second utterance before the first item's auxiliary transcript completes, so
 	// one global speechStartedAt/speechStoppedAt pair cannot safely classify short
 	// noise or deduplicate eager response.create requests.
-	turnMu                sync.Mutex
-	vadStartMS            map[string]int
-	vadDurationMS         map[string]int
-	turnSpeechSeq         map[string]int64
-	turnSuppressedEcho    map[string]bool
-	turnServerCleared     map[string]bool
-	turnLanguage          map[string]string
-	conversationLanguage  string
-	latestInputItem       string
-	activeSuppressedEcho  string
-	turnResponseRequested map[string]bool
-	turnResponseCanceled  map[string]bool
+	turnMu                  sync.Mutex
+	vadStartMS              map[string]int
+	vadDurationMS           map[string]int
+	turnSpeechSeq           map[string]int64
+	turnSuppressedEcho      map[string]bool
+	turnServerCleared       map[string]bool
+	turnLanguage            map[string]string
+	conversationLanguage    string
+	latestInputItem         string
+	activeSuppressedEcho    string
+	anonymousSuppressedEcho atomic.Bool
+	turnResponseRequested   map[string]bool
+	turnResponseCanceled    map[string]bool
+	assistantTranscriptMu   sync.Mutex
+	lastAssistantTranscript string
 	// commitEmptySeq counts input_audio_buffer_commit_empty rejections. The
 	// fallback's ack wait snapshots it before the manual commit: a bump means the
 	// buffer held (nearly) no audio — the gate opened on a fragment, not a lost
@@ -2097,6 +2100,7 @@ func (h *eventHandler) vadDuration(itemID string) (int, bool) {
 
 func (h *eventHandler) markTurnSuppressedEcho(itemID string) {
 	if itemID == "" {
+		h.anonymousSuppressedEcho.Store(true)
 		return
 	}
 	h.turnMu.Lock()
@@ -2137,11 +2141,18 @@ func (h *eventHandler) turnWasServerCleared(itemID string) bool {
 
 func (h *eventHandler) turnIsSuppressedEcho(itemID string) bool {
 	if itemID == "" {
-		return false
+		return h.anonymousSuppressedEcho.Load()
 	}
 	h.turnMu.Lock()
-	defer h.turnMu.Unlock()
-	return h.turnSuppressedEcho[itemID]
+	suppressed, tracked := h.turnSuppressedEcho[itemID]
+	h.turnMu.Unlock()
+	if tracked {
+		return suppressed
+	}
+	// Qwen can omit item_id on VAD events and attach one only when its
+	// auxiliary transcript completes. Carry the anonymous classification across
+	// that protocol boundary so playback echo does not become a user turn.
+	return h.anonymousSuppressedEcho.Load()
 }
 
 func (h *eventHandler) turnHasNewerSpeech(itemID string) bool {
@@ -2184,12 +2195,20 @@ func (h *eventHandler) observeFusedBargeReattack() bool {
 	}
 	h.turnMu.Lock()
 	itemID := h.activeSuppressedEcho
-	if itemID == "" || !h.turnSuppressedEcho[itemID] {
+	tracked := itemID != "" && h.turnSuppressedEcho[itemID]
+	if !tracked && h.anonymousSuppressedEcho.Load() {
+		tracked = true
+	}
+	if !tracked {
 		h.turnMu.Unlock()
 		return false
 	}
-	h.turnSuppressedEcho[itemID] = false
-	h.activeSuppressedEcho = ""
+	if itemID == "" {
+		h.anonymousSuppressedEcho.Store(false)
+	} else {
+		h.turnSuppressedEcho[itemID] = false
+		h.activeSuppressedEcho = ""
+	}
 	h.turnMu.Unlock()
 	gain := koeEnvFloat("KOE_BARGE_SOFT_DUCK_GAIN", defaultBargeSoftDuckGain)
 	if !h.beginBargeCandidate(gain, true, "server_vad_plus_front_speech") {
@@ -2430,6 +2449,7 @@ func (h *eventHandler) consumeTurnResponseCancellation(itemID string) bool {
 }
 
 func (h *eventHandler) finishInputTurn(itemID string) {
+	h.anonymousSuppressedEcho.Store(false)
 	if itemID == "" {
 		return
 	}
@@ -2481,6 +2501,46 @@ func shortLogString(s string, max int) string {
 		return string(r[:max]) + "..."
 	}
 	return s
+}
+
+func normalizeEchoTranscript(s string) string {
+	var normalized strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			normalized.WriteRune(r)
+		}
+	}
+	return normalized.String()
+}
+
+func (h *eventHandler) recordAssistantTranscript(transcript string) {
+	normalized := normalizeEchoTranscript(transcript)
+	if normalized == "" {
+		return
+	}
+	h.assistantTranscriptMu.Lock()
+	h.lastAssistantTranscript = normalized
+	h.assistantTranscriptMu.Unlock()
+}
+
+func (h *eventHandler) matchesLastAssistantTranscript(transcript string) bool {
+	normalized := normalizeEchoTranscript(transcript)
+	if normalized == "" {
+		return false
+	}
+	h.assistantTranscriptMu.Lock()
+	last := h.lastAssistantTranscript
+	h.assistantTranscriptMu.Unlock()
+	if last == "" {
+		return false
+	}
+	if normalized == last {
+		return true
+	}
+	if len([]rune(normalized)) < 4 || len([]rune(last)) < 4 {
+		return false
+	}
+	return strings.Contains(last, normalized) || strings.Contains(normalized, last)
 }
 
 func elapsedMS(from, to time.Time) int64 {
@@ -2935,9 +2995,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			withinGateReattack := !freshOnsetEvidence && inputLevel >= reattackLevel
 			hasBargeEvidence := freshOnsetEvidence || withinGateReattack || frontSpeechEvidence
 			if !hasBargeEvidence {
-				if ev.ItemID != "" {
-					h.markTurnSuppressedEcho(ev.ItemID)
-				}
+				h.markTurnSuppressedEcho(ev.ItemID)
 				if eventLogEnabled() {
 					log.Printf(
 						"koe[barge]: server VAD ignored — insufficient near-end evidence after_local_gate_ms=%d after_playback_release_ms=%d input_level=%.4f fresh_min_level=%.4f reattack_level=%.4f front_speech=%t front_min_level=%.4f",
@@ -3301,6 +3359,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 		h.reportUsage(raw)
 	case "response.output_audio_transcript.done", "response.audio_transcript.done":
+		h.recordAssistantTranscript(ev.Transcript)
 		if h.onAssistantTranscript != nil && ev.Transcript != "" {
 			h.onAssistantTranscript(ev.Transcript)
 		}
@@ -3449,7 +3508,7 @@ func (h *eventHandler) handleInputTranscriptForItem(itemID, transcript string) {
 	}
 	wasSuppressedEcho := h.turnIsSuppressedEcho(itemID)
 	wasCandidate := h.bargeCandidateForItem(itemID)
-	if (wasSuppressedEcho || wasCandidate) && shouldSuppressUncorroboratedBarge(transcript, speechMS) {
+	if (wasSuppressedEcho || wasCandidate) && (h.matchesLastAssistantTranscript(transcript) || shouldSuppressUncorroboratedBarge(transcript, speechMS)) {
 		if eventLogEnabled() {
 			log.Printf("koe[barge]: suppressing short uncorroborated interruption")
 		}

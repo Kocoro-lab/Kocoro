@@ -1189,6 +1189,93 @@ func TestAdaptiveBargeSuppressesShortPostPlaybackEcho(t *testing.T) {
 	}
 }
 
+func TestQwenClientOwnedTurnSuppressesAnonymousPlaybackEcho(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-qwen-anonymous-echo", ""), audio, (&captureSender{}).send)
+	h.provider = string(ProviderQwen)
+	h.fullDuplexAEC = true
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.005)
+	h.localSpeechStartedNS.Store(time.Now().Add(-6 * time.Second).UnixNano())
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_audio_transcript.done","transcript":"视频里看到的是桌子。"}`))
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","audio_start_ms":1000}`))
+	h.speechStartedAt = time.Now().Add(-2200 * time.Millisecond)
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","audio_end_ms":3200}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"视频里看到的是桌子"}`))
+
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("anonymous Qwen playback echo queued %d responses", got)
+	}
+	if h.turnIsSuppressedEcho("") {
+		t.Fatal("anonymous Qwen echo bookkeeping survived transcript completion")
+	}
+}
+
+func TestQwenClientOwnedTurnCarriesAnonymousEchoToIdentifiedTranscript(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-qwen-mixed-id-echo", ""), audio, (&captureSender{}).send)
+	h.provider = string(ProviderQwen)
+	h.fullDuplexAEC = true
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.005)
+	h.localSpeechStartedNS.Store(time.Now().Add(-6 * time.Second).UnixNano())
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_audio_transcript.done","transcript":"视频里看到的是桌子。"}`))
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","audio_start_ms":1000}`))
+	h.speechStartedAt = time.Now().Add(-3200 * time.Millisecond)
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","audio_end_ms":4200}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-echo","transcript":"视频里看到的是桌子"}`))
+
+	if got := len(h.respReq); got != 0 {
+		t.Fatalf("mixed-ID Qwen playback echo queued %d responses", got)
+	}
+	if h.turnIsSuppressedEcho("") {
+		t.Fatal("anonymous Qwen echo bookkeeping survived identified transcript completion")
+	}
+}
+
+func TestQwenClientOwnedTurnAcceptsAnonymousPlaybackQuestion(t *testing.T) {
+	t.Setenv("KOE_VPIO_BARGE_IN", "1")
+	t.Setenv("KOE_CLIENT_RESPONSE", "1")
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	h := newEventHandler(nil, NewCallState("burst-qwen-anonymous-question", ""), audio, (&captureSender{}).send)
+	h.provider = string(ProviderQwen)
+	h.fullDuplexAEC = true
+	h.respBusy.Store(true)
+	h.outputBufferActive.Store(true)
+	audio.SetSpeaking(true)
+	audio.setInputLevel(0.005)
+	h.localSpeechStartedNS.Store(time.Now().Add(-6 * time.Second).UnixNano())
+	h.handleEvent(context.Background(), []byte(`{"type":"response.output_audio_transcript.done","transcript":"四"}`))
+
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_started","audio_start_ms":1000}`))
+	h.speechStartedAt = time.Now().Add(-2200 * time.Millisecond)
+	h.handleEvent(context.Background(), []byte(`{"type":"input_audio_buffer.speech_stopped","audio_end_ms":3200}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"conversation.item.input_audio_transcription.completed","transcript":"现在几点？"}`))
+
+	if got := len(h.respReq); got != 1 {
+		t.Fatalf("anonymous Qwen playback question queued %d responses, want 1", got)
+	}
+}
+
 func TestAdaptiveBargePromotesTailVADOnFrontSpeechReattack(t *testing.T) {
 	t.Setenv("KOE_VPIO_BARGE_IN", "1")
 	t.Setenv("KOE_CLIENT_RESPONSE", "1")
