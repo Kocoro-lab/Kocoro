@@ -336,6 +336,7 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 			daemonURL = "http://127.0.0.1:7533"
 		}
 		relay := NewDaemonClient(daemonURL)
+		relay.SetToken(strings.TrimSpace(os.Getenv("KOE_DAEMON_TOKEN")))
 		err = rc.dialQwen(ctx, func(exchangeCtx context.Context, offer string) (string, error) {
 			answer, exchangeErr := relay.ExchangeSDPViaDaemon(exchangeCtx, string(ProviderQwen), DefaultQwenRealtimeModel, offer)
 			if exchangeErr == nil {
