@@ -62,9 +62,12 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 
 // RealtimeConn is one connected WebRTC session to OpenAI Realtime.
 type RealtimeConn struct {
-	pc          *webrtc.PeerConnection
-	sendTrack   *webrtc.TrackLocalStaticSample
-	sendTrackMu sync.Mutex
+	pc        *webrtc.PeerConnection
+	sendTrack audioSampleWriter
+	// outboundAudioMu keeps stateful Opus encoding and the corresponding RTP
+	// sample write in one order. Moving encode outside this lock can let the Qwen
+	// silence primer overtake a real mic frame and desynchronize decoder state.
+	outboundAudioMu sync.Mutex
 	// Qwen rejects video RTP received before any audio RTP. The video pump sends
 	// one silent Opus primer after a call becomes active and before its first
 	// image; successful real mic audio satisfies the same gate.
@@ -94,10 +97,10 @@ type RealtimeConn struct {
 }
 
 // RealtimeVideoSource supplies already-encoded keyframes for a provider-native
-// WebRTC video track. ReadFrame must not open a second camera owner; body
-// carriers read from their existing media pipeline. Qwen consumes these frames
-// continuously while a call is active instead of receiving OpenAI input_image
-// conversation items over the DataChannel.
+// WebRTC video track. ReadFrame must honor its context and must not open a
+// second camera owner; body carriers read from their existing media pipeline.
+// Qwen consumes these frames continuously while a call is active instead of
+// receiving OpenAI input_image conversation items over the DataChannel.
 type RealtimeVideoSource struct {
 	Codec         string
 	FrameInterval time.Duration
@@ -105,6 +108,10 @@ type RealtimeVideoSource struct {
 }
 
 type videoSampleWriter interface {
+	WriteSample(media.Sample) error
+}
+
+type audioSampleWriter interface {
 	WriteSample(media.Sample) error
 }
 
@@ -224,7 +231,7 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if rc.callActive != nil && !rc.callActive() {
+			if rc.callActive == nil || !rc.callActive() {
 				continue
 			}
 			if err := rc.primeQwenAudioBeforeVideo(); err != nil {
@@ -234,7 +241,9 @@ func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
 				sourceFailed = true
 				continue
 			}
-			frame, err := rc.videoSource.ReadFrame(ctx)
+			readCtx, cancelRead := context.WithTimeout(ctx, interval)
+			frame, err := rc.videoSource.ReadFrame(readCtx)
+			cancelRead()
 			if err != nil {
 				if !sourceFailed {
 					log.Printf("koe[video]: frame source unavailable: %v", err)
@@ -268,13 +277,14 @@ func (rc *RealtimeConn) primeQwenAudioBeforeVideo() error {
 	if rc == nil || rc.outboundAudioReady.Load() {
 		return nil
 	}
-	// Mechanism tests can exercise the video pump without constructing the
-	// concrete audio stack. Every production peer connection has both fields.
-	if rc.audio == nil || rc.sendTrack == nil {
-		return nil
+	if rc.audio == nil {
+		return fmt.Errorf("audio encoder unavailable")
 	}
-	rc.sendTrackMu.Lock()
-	defer rc.sendTrackMu.Unlock()
+	if rc.sendTrack == nil {
+		return fmt.Errorf("audio send track unavailable")
+	}
+	rc.outboundAudioMu.Lock()
+	defer rc.outboundAudioMu.Unlock()
 	if rc.outboundAudioReady.Load() {
 		return nil
 	}
@@ -504,17 +514,17 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 					return
 				case <-pacer.C:
 				}
-				rc.sendTrackMu.Lock()
+				rc.outboundAudioMu.Lock()
 				enc, err := rc.audio.EncodeFrame(out)
 				if err != nil {
-					rc.sendTrackMu.Unlock()
+					rc.outboundAudioMu.Unlock()
 					stats.noteEncodeErr()
 					continue
 				}
 				writeErr := rc.sendTrack.WriteSample(media.Sample{
 					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
 				})
-				rc.sendTrackMu.Unlock()
+				rc.outboundAudioMu.Unlock()
 				stats.noteWrite(writeErr)
 				if writeErr == nil {
 					rc.outboundAudioReady.Store(true)
@@ -715,6 +725,9 @@ func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Cont
 }
 
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
+	if provider == ProviderQwen && opts.VideoSource != nil && opts.CallActive == nil {
+		return nil, connectError(provider, "local_setup", errors.New("realtime video source requires CallActive"))
+	}
 	if audio != nil {
 		audio.SetRealtimeProvider(provider)
 	}

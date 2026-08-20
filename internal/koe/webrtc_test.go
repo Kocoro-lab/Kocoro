@@ -18,13 +18,17 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 )
 
-type recordingVideoWriter struct {
-	writes atomic.Int32
-	data   chan []byte
+type recordingSampleWriter struct {
+	writes  atomic.Int32
+	data    chan []byte
+	onWrite func()
 }
 
-func (w *recordingVideoWriter) WriteSample(sample media.Sample) error {
+func (w *recordingSampleWriter) WriteSample(sample media.Sample) error {
 	w.writes.Add(1)
+	if w.onWrite != nil {
+		w.onWrite()
+	}
 	select {
 	case w.data <- append([]byte(nil), sample.Data...):
 	default:
@@ -70,9 +74,20 @@ func TestQwenVideoSourceAddsH264TrackOnlyToQwen(t *testing.T) {
 func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	var active atomic.Bool
 	var reads atomic.Int32
-	writer := &recordingVideoWriter{data: make(chan []byte, 1)}
+	order := make(chan string, 4)
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	audioWriter := &recordingSampleWriter{onWrite: func() { order <- "audio" }}
+	videoWriter := &recordingSampleWriter{
+		data:    make(chan []byte, 1),
+		onWrite: func() { order <- "video" },
+	}
 	rc := &RealtimeConn{
-		videoTrack: writer,
+		audio:      audio,
+		sendTrack:  audioWriter,
+		videoTrack: videoWriter,
 		videoSource: &RealtimeVideoSource{
 			Codec:         VideoCodecH264,
 			FrameInterval: 5 * time.Millisecond,
@@ -97,16 +112,81 @@ func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 		t.Fatalf("idle video source reads = %d, want 0", got)
 	}
 	active.Store(true)
-	waitUntil(t, func() bool { return writer.writes.Load() > 0 }, "active call did not send a video frame")
+	waitUntil(t, func() bool { return videoWriter.writes.Load() > 0 }, "active call did not send a video frame")
+	if first, second := <-order, <-order; first != "audio" || second != "video" {
+		t.Fatalf("first media writes = %q then %q, want audio then video", first, second)
+	}
 	select {
-	case frame := <-writer.data:
+	case frame := <-videoWriter.data:
 		if string(frame) != string([]byte{0x10, 0x00, 0x00, 0x00}) {
 			t.Fatalf("video frame = %v", frame)
 		}
 	default:
 		t.Fatal("video write did not carry frame bytes")
 	}
+	active.Store(false)
+	time.Sleep(10 * time.Millisecond)
+	idleReads, idleWrites := reads.Load(), videoWriter.writes.Load()
+	time.Sleep(20 * time.Millisecond)
+	if got := reads.Load(); got != idleReads {
+		t.Fatalf("ended call video source reads advanced from %d to %d", idleReads, got)
+	}
+	if got := videoWriter.writes.Load(); got != idleWrites {
+		t.Fatalf("ended call video writes advanced from %d to %d", idleWrites, got)
+	}
 
+	cancel()
+	<-done
+}
+
+func TestQwenVideoSourceRequiresCallActive(t *testing.T) {
+	_, err := ConnectQwen(
+		context.Background(), nil, nil, "", nil, nil,
+		ConnectOptions{VideoSource: &RealtimeVideoSource{
+			Codec:     VideoCodecH264,
+			ReadFrame: func(context.Context) ([]byte, error) { return []byte{1}, nil },
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "realtime video source requires CallActive") {
+		t.Fatalf("ConnectQwen error = %v", err)
+	}
+}
+
+func TestQwenVideoReadUsesFrameIntervalDeadline(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	readDone := make(chan error, 1)
+	rc := &RealtimeConn{
+		audio:      audio,
+		sendTrack:  &recordingSampleWriter{},
+		videoTrack: &recordingSampleWriter{},
+		videoSource: &RealtimeVideoSource{
+			Codec:         VideoCodecH264,
+			FrameInterval: 10 * time.Millisecond,
+			ReadFrame: func(ctx context.Context) ([]byte, error) {
+				<-ctx.Done()
+				readDone <- ctx.Err()
+				return nil, ctx.Err()
+			},
+		},
+		callActive: func() bool { return true },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rc.pumpVideoTrack(ctx)
+	}()
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ReadFrame context error = %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ReadFrame did not receive its frame-interval deadline")
+	}
 	cancel()
 	<-done
 }
@@ -130,6 +210,23 @@ func TestQwenVideoPrimesAudioBeforeFirstFrame(t *testing.T) {
 	}
 	if !rc.outboundAudioReady.Load() {
 		t.Fatal("audio primer did not open Qwen's media-order gate")
+	}
+}
+
+func TestQwenVideoPrimerFailsClosedWithoutAudioPath(t *testing.T) {
+	audio, err := NewAudioIO()
+	if err != nil {
+		t.Fatalf("NewAudioIO: %v", err)
+	}
+	for name, rc := range map[string]*RealtimeConn{
+		"encoder": {sendTrack: &recordingSampleWriter{}},
+		"track":   {audio: audio},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := rc.primeQwenAudioBeforeVideo(); err == nil {
+				t.Fatal("missing audio path must not report a successful primer")
+			}
+		})
 	}
 }
 
