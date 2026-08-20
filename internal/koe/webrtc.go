@@ -854,6 +854,15 @@ func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Cont
 	})
 }
 
+// A Qwen VideoSource implies live vision because connectRealtime rejects a
+// missing, inactive, or unaccepted video track before session configuration.
+func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwenVoice string, opts ConnectOptions) map[string]any {
+	if provider == ProviderQwen {
+		return qwenSessionConfig(persona, qwenVoice, opts.VideoSource != nil)
+	}
+	return sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
+}
+
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
 	if provider == ProviderQwen && opts.VideoSource != nil && opts.CallActive == nil {
 		return nil, connectError(provider, "local_setup", errors.New("realtime video source requires CallActive"))
@@ -940,12 +949,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	sendConfig := func(dc *webrtc.DataChannel) {
 		sendConfigOnce.Do(func() {
 			rc.setDataChannel(dc)
-			var payload map[string]any
-			if provider == ProviderQwen {
-				payload = qwenSessionConfigWithLiveVision(persona, qwenVoice, opts.VideoSource != nil)
-			} else {
-				payload = sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
-			}
+			payload := realtimeSessionPayload(provider, persona, openAIVoice, qwenVoice, opts)
 			b, _ := json.Marshal(payload)
 			if err := dc.SendText(string(b)); err != nil {
 				notifyClosed(fmt.Errorf("send session config: %w", err))

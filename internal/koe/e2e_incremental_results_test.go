@@ -281,7 +281,7 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	sendConfig := func() {
 		configOnce.Do(func() {
 			if provider == ProviderQwen {
-				_ = send(qwenSessionConfig(persona, DefaultQwenRealtimeVoice))
+				_ = send(qwenSessionConfig(persona, DefaultQwenRealtimeVoice, videoSource != nil))
 				return
 			}
 			_ = send(sessionConfig(persona, DefaultOpenAIRealtimeVoice, false))

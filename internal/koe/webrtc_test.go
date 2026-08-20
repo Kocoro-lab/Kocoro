@@ -82,6 +82,35 @@ func TestQwenVideoSourceAddsH264TrackOnlyToQwen(t *testing.T) {
 	}
 }
 
+func TestRealtimeSessionPayloadMatchesProviderVideoPolicy(t *testing.T) {
+	instructions := func(payload map[string]any) string {
+		t.Helper()
+		session, ok := payload["session"].(map[string]any)
+		if !ok {
+			t.Fatalf("session payload missing session: %#v", payload)
+		}
+		value, ok := session["instructions"].(string)
+		if !ok {
+			t.Fatalf("session payload missing instructions: %#v", session)
+		}
+		return value
+	}
+
+	video := &RealtimeVideoSource{}
+	qwenAudio := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", ConnectOptions{}))
+	if strings.Contains(qwenAudio, qwenLiveVisionInstructions) {
+		t.Fatalf("audio-only Qwen payload unexpectedly contains live-vision instructions: %s", qwenAudio)
+	}
+	qwenVideo := instructions(realtimeSessionPayload(ProviderQwen, "persona", "marin", "Tina", ConnectOptions{VideoSource: video}))
+	if !strings.HasSuffix(qwenVideo, qwenLiveVisionInstructions) {
+		t.Fatalf("Qwen video payload missing live-vision instructions: %s", qwenVideo)
+	}
+	openAIVideo := instructions(realtimeSessionPayload(ProviderOpenAI, "persona", "marin", "Tina", ConnectOptions{VideoSource: video}))
+	if strings.Contains(openAIVideo, qwenLiveVisionInstructions) {
+		t.Fatalf("OpenAI payload unexpectedly contains Qwen live-vision instructions: %s", openAIVideo)
+	}
+}
+
 func TestQwenVideoPumpReadsOnlyDuringActiveCall(t *testing.T) {
 	var active atomic.Bool
 	var reads atomic.Int32
