@@ -11,6 +11,7 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -221,7 +222,19 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	}
 	state := NewCallState("burst-staggered-e2e-"+string(provider), "")
 	disp := NewDispatcher(NewDaemonClient(mock.URL), NewAgentResolver(nil, NoopSemanticMatcher{}), state, nil)
-	rc, err := newPeerConnectionForProvider(audio, provider)
+	var videoSource *RealtimeVideoSource
+	if provider == ProviderQwen {
+		// The active-call path below is text-injected, so the source is never read;
+		// attaching it still proves the real Qwen SDP relay accepts Koe's H264 video
+		// m-line alongside the existing audio and DataChannel transports.
+		videoSource = &RealtimeVideoSource{
+			Codec: VideoCodecH264,
+			ReadFrame: func(context.Context) ([]byte, error) {
+				return nil, errors.New("unexpected video read in text-only E2E")
+			},
+		}
+	}
+	rc, err := newPeerConnectionForProviderWithVideo(audio, provider, videoSource)
 	if err != nil {
 		t.Fatalf("newPeerConnection: %v", err)
 	}
@@ -267,11 +280,14 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 	var configOnce sync.Once
 	sendConfig := func() {
 		configOnce.Do(func() {
-			if provider == ProviderQwen {
-				_ = send(qwenSessionConfig(persona, DefaultQwenRealtimeVoice))
-				return
-			}
-			_ = send(sessionConfig(persona, DefaultOpenAIRealtimeVoice, false))
+			_ = send(realtimeSessionPayload(
+				provider,
+				persona,
+				DefaultOpenAIRealtimeVoice,
+				DefaultQwenRealtimeVoice,
+				ConnectOptions{},
+				rc.videoTrack != nil,
+			))
 		})
 	}
 	handleMessage := func(m webrtc.DataChannelMessage) {
@@ -323,8 +339,18 @@ func runKoeStaggeredParallelDeliveryE2E(t *testing.T, provider RealtimeProvider)
 			daemonURL = "http://127.0.0.1:7533"
 		}
 		relay := NewDaemonClient(daemonURL)
+		relay.SetToken(strings.TrimSpace(os.Getenv("KOE_DAEMON_TOKEN")))
 		err = rc.dialQwen(ctx, func(exchangeCtx context.Context, offer string) (string, error) {
-			return relay.ExchangeSDPViaDaemon(exchangeCtx, string(ProviderQwen), DefaultQwenRealtimeModel, offer)
+			answer, exchangeErr := relay.ExchangeSDPViaDaemon(exchangeCtx, string(ProviderQwen), DefaultQwenRealtimeModel, offer)
+			if exchangeErr == nil {
+				for _, line := range strings.Split(answer, "\n") {
+					line = strings.TrimSpace(line)
+					if strings.HasPrefix(line, "m=video") || strings.HasPrefix(line, "a=rtpmap:") || strings.HasPrefix(line, "a=fmtp:") {
+						t.Logf("Qwen answer SDP: %s", line)
+					}
+				}
+			}
+			return answer, exchangeErr
 		})
 	} else {
 		err = rc.dialOpenAI(ctx, ek)

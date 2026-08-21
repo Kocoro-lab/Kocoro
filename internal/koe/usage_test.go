@@ -80,17 +80,21 @@ func TestSendRealtimeUsageDoesNotRetryOn400(t *testing.T) {
 
 func TestExchangeSDPViaDaemon(t *testing.T) {
 	var got map[string]string
+	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/koe/realtime/sdp" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
+		gotAuth = r.Header.Get("Authorization")
 		_ = json.NewDecoder(r.Body).Decode(&got)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"provider":"qwen","model":"qwen3.5-omni-flash-realtime","answer_sdp":"v=0\r\n"}`))
 	}))
 	defer srv.Close()
 
-	answer, err := NewDaemonClient(srv.URL).ExchangeSDPViaDaemon(
+	client := NewDaemonClient(srv.URL)
+	client.SetToken("  robot-backbrain-token\n")
+	answer, err := client.ExchangeSDPViaDaemon(
 		context.Background(), "qwen", "qwen3.5-omni-flash-realtime", "v=0\r\n",
 	)
 	if err != nil {
@@ -98,6 +102,9 @@ func TestExchangeSDPViaDaemon(t *testing.T) {
 	}
 	if answer != "v=0\r\n" {
 		t.Errorf("answer = %q", answer)
+	}
+	if gotAuth != "Bearer robot-backbrain-token" {
+		t.Errorf("Authorization = %q", gotAuth)
 	}
 	if got["provider"] != "qwen" || got["model"] != "qwen3.5-omni-flash-realtime" || got["offer_sdp"] != "v=0\r\n" {
 		t.Errorf("request = %#v", got)

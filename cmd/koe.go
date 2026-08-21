@@ -794,6 +794,9 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 
 	// Plan B wiring: link to the daemon back-brain.
 	client := koe.NewDaemonClient(cfg.daemonURL)
+	// The robot facade or reverse proxy validates this optional bearer. Plain HTTP
+	// is limited to the trusted private LAN used by Wireless carriers.
+	client.SetToken(os.Getenv("KOE_DAEMON_TOKEN"))
 
 	// G3: relay each turn's token usage via the daemon to Cloud (fire-and-forget; a
 	// usage failure never interrupts the call, and Koe never sees pricing).

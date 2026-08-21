@@ -62,8 +62,25 @@ func mintEphemeralAt(ctx context.Context, url, apiKey, model string) (string, er
 
 // RealtimeConn is one connected WebRTC session to OpenAI Realtime.
 type RealtimeConn struct {
-	pc                   *webrtc.PeerConnection
-	sendTrack            *webrtc.TrackLocalStaticSample
+	pc        *webrtc.PeerConnection
+	sendTrack audioSampleWriter
+	// outboundAudioMu keeps stateful Opus encoding and the corresponding RTP
+	// sample write in one order. Moving encode outside this lock can let the Qwen
+	// silence primer overtake a real mic frame and desynchronize decoder state.
+	outboundAudioMu sync.Mutex
+	// Qwen rejects video RTP received before any audio RTP. The video pump sends
+	// one silent Opus primer after a call becomes active and before its first
+	// image; successful real mic audio satisfies the same gate.
+	outboundAudioReady atomic.Bool
+	// micAudioWritten distinguishes real send-pump ownership from the silent
+	// primer so priming stops instead of splicing silence into a live utterance.
+	micAudioWritten atomic.Bool
+	// Audio and video use separate RTP streams, so local write order does not
+	// guarantee remote arrival order. Keep the first audio write timestamp and
+	// give it a short lead before the first video sample is written.
+	outboundAudioReadyAt atomic.Int64
+	videoTrack           videoSampleWriter
+	videoSource          *RealtimeVideoSource
 	dc                   *webrtc.DataChannel
 	dcMu                 sync.RWMutex
 	// cancel stops this connection attempt's goroutines (response sender, event
@@ -86,6 +103,70 @@ type RealtimeConn struct {
 	fullDuplexAEC bool
 }
 
+// RealtimeVideoSource supplies already-encoded keyframes for a provider-native
+// WebRTC video track. ReadFrame must honor its context, return an independently
+// decodable Annex-B H.264 access unit, and must not open a second camera owner;
+// body carriers read from their existing media pipeline. Qwen consumes these
+// frames continuously while a call is active instead of receiving OpenAI
+// input_image conversation items over the DataChannel.
+type RealtimeVideoSource struct {
+	Codec         string
+	FrameInterval time.Duration
+	ReadFrame     func(context.Context) ([]byte, error)
+}
+
+type videoSampleWriter interface {
+	WriteSample(media.Sample) error
+}
+
+type audioSampleWriter interface {
+	WriteSample(media.Sample) error
+}
+
+// VideoCodecH264 is the encoded-frame format accepted by the Qwen video track.
+const VideoCodecH264 = "h264"
+
+const (
+	defaultRealtimeVideoFrameInterval = time.Second
+	// Current carriers send independently decodable visual-context keyframes,
+	// not full-motion video. Ten frames per second bounds a misconfigured or
+	// failing in-process camera source without reducing the 1 fps product cadence.
+	minRealtimeVideoFrameInterval = 100 * time.Millisecond
+
+	// Five paced packets plus a 300 ms audio lead survived repeated direct and
+	// Reachy product E2E runs; one unpaced packet intermittently arrived after
+	// video and Qwen rejected the image-before-audio ordering.
+	qwenAudioPrimerFrames    = 5
+	qwenAudioPrimerSpacing   = audioFrameMs * time.Millisecond
+	qwenAudioBeforeVideoLead = 300 * time.Millisecond
+)
+
+func (s *RealtimeVideoSource) codecCapability() (webrtc.RTPCodecCapability, error) {
+	if s == nil || s.ReadFrame == nil {
+		return webrtc.RTPCodecCapability{}, fmt.Errorf("realtime video source is incomplete")
+	}
+	switch s.Codec {
+	case VideoCodecH264:
+		return webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		}, nil
+	default:
+		return webrtc.RTPCodecCapability{}, fmt.Errorf("unsupported realtime video codec %q", s.Codec)
+	}
+}
+
+func (s *RealtimeVideoSource) frameInterval() time.Duration {
+	if s == nil || s.FrameInterval <= 0 {
+		return defaultRealtimeVideoFrameInterval
+	}
+	if s.FrameInterval < minRealtimeVideoFrameInterval {
+		return minRealtimeVideoFrameInterval
+	}
+	return s.FrameInterval
+}
+
 // newPeerConnection builds the pion PC with a send track + recvonly transceiver +
 // the oai-events data channel. Grounded in spike stage2-webrtc + stage2b-duplex.
 func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
@@ -93,6 +174,10 @@ func newPeerConnection(audio *AudioIO) (*RealtimeConn, error) {
 }
 
 func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*RealtimeConn, error) {
+	return newPeerConnectionForProviderWithVideo(audio, provider, nil)
+}
+
+func newPeerConnectionForProviderWithVideo(audio *AudioIO, provider RealtimeProvider, videoSource *RealtimeVideoSource) (*RealtimeConn, error) {
 	configuration := webrtc.Configuration{}
 	if provider == ProviderOpenAI {
 		configuration.ICEServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
@@ -115,6 +200,24 @@ func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*R
 		return nil, err
 	}
 	rc := &RealtimeConn{pc: pc, sendTrack: track, audio: audio}
+	if provider == ProviderQwen && videoSource != nil {
+		capability, videoErr := videoSource.codecCapability()
+		if videoErr != nil {
+			pc.Close()
+			return nil, videoErr
+		}
+		videoTrack, videoErr := webrtc.NewTrackLocalStaticSample(capability, "video", "koe")
+		if videoErr != nil {
+			pc.Close()
+			return nil, videoErr
+		}
+		if _, videoErr = pc.AddTrack(videoTrack); videoErr != nil {
+			pc.Close()
+			return nil, videoErr
+		}
+		rc.videoTrack = videoTrack
+		rc.videoSource = videoSource
+	}
 
 	// Inbound audio: decode Opus → playback.
 	pc.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -139,6 +242,157 @@ func newPeerConnectionForProvider(audio *AudioIO, provider RealtimeProvider) (*R
 	}
 	rc.dc = dc
 	return rc, nil
+}
+
+func (rc *RealtimeConn) pumpVideoTrack(ctx context.Context) {
+	if rc == nil || rc.videoTrack == nil || rc.videoSource == nil {
+		return
+	}
+	interval := rc.videoSource.frameInterval()
+	if requested := rc.videoSource.FrameInterval; requested > 0 && requested < interval {
+		log.Printf("koe[video]: frame interval %s clamped to %s", requested, interval)
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var lastFailure string
+	reportFailure := func(kind, message string) {
+		if lastFailure != kind {
+			log.Printf("koe[video]: %s", message)
+		}
+		lastFailure = kind
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !rc.videoCallIsActive() {
+				continue
+			}
+			if err := rc.primeQwenAudioBeforeVideo(ctx); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				reportFailure("audio_primer", fmt.Sprintf("audio primer unavailable: %v", err))
+				continue
+			}
+			if !rc.videoCallIsActive() {
+				continue
+			}
+			readCtx, cancelRead := context.WithTimeout(ctx, interval)
+			frame, err := rc.videoSource.ReadFrame(readCtx)
+			cancelRead()
+			if !rc.videoCallIsActive() {
+				continue
+			}
+			if err != nil {
+				reportFailure("source_read", fmt.Sprintf("frame source unavailable: %v", err))
+				continue
+			}
+			if len(frame) == 0 {
+				reportFailure("empty_frame", "frame source returned an empty frame")
+				continue
+			}
+			if !isAnnexBH264(frame) {
+				reportFailure("frame_format", "frame source returned non-Annex-B H.264")
+				continue
+			}
+			// The configured cadence is the nominal RTP timestamp cadence. Reads are
+			// deadline-bound and late or failed frames are dropped rather than queued;
+			// their wall-clock gaps intentionally do not advance this low-rate stream.
+			if !rc.videoCallIsActive() {
+				continue
+			}
+			if err := rc.videoTrack.WriteSample(media.Sample{Data: frame, Duration: interval}); err != nil {
+				reportFailure("track_write", fmt.Sprintf("frame write failed: %v", err))
+				continue
+			}
+			if lastFailure != "" {
+				log.Printf("koe[video]: frame stream recovered")
+				lastFailure = ""
+			}
+		}
+	}
+}
+
+func (rc *RealtimeConn) videoCallIsActive() bool {
+	return rc != nil && rc.callActive != nil && rc.callActive()
+}
+
+func isAnnexBH264(frame []byte) bool {
+	return bytes.HasPrefix(frame, []byte{0, 0, 1}) || bytes.HasPrefix(frame, []byte{0, 0, 0, 1})
+}
+
+func (rc *RealtimeConn) primeQwenAudioBeforeVideo(ctx context.Context) error {
+	if rc == nil {
+		return fmt.Errorf("realtime connection unavailable")
+	}
+	if !rc.outboundAudioReady.Load() {
+		resetPartialPrimer := func() {
+			if !rc.micAudioWritten.Load() {
+				rc.outboundAudioReadyAt.Store(0)
+				rc.outboundAudioReady.Store(false)
+			}
+		}
+		if rc.audio == nil {
+			return fmt.Errorf("audio encoder unavailable")
+		}
+		if rc.sendTrack == nil {
+			return fmt.Errorf("audio send track unavailable")
+		}
+		for primerFrame := 0; primerFrame < qwenAudioPrimerFrames; primerFrame++ {
+			rc.outboundAudioMu.Lock()
+			if rc.micAudioWritten.Load() {
+				rc.outboundAudioMu.Unlock()
+				break
+			}
+			if primerFrame == 0 && rc.outboundAudioReady.Load() {
+				rc.outboundAudioMu.Unlock()
+				break
+			}
+			encoded, err := rc.audio.EncodeFrame(make([]int16, audioFrameSize))
+			if err != nil {
+				resetPartialPrimer()
+				rc.outboundAudioMu.Unlock()
+				return fmt.Errorf("encode silence: %w", err)
+			}
+			if err := rc.sendTrack.WriteSample(media.Sample{
+				Data: encoded, Duration: audioFrameMs * time.Millisecond,
+			}); err != nil {
+				resetPartialPrimer()
+				rc.outboundAudioMu.Unlock()
+				return fmt.Errorf("write silence: %w", err)
+			}
+			if !rc.outboundAudioReady.Load() {
+				rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
+				rc.outboundAudioReady.Store(true)
+			}
+			rc.outboundAudioMu.Unlock()
+			if primerFrame+1 < qwenAudioPrimerFrames {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(qwenAudioPrimerSpacing):
+				}
+			}
+		}
+	}
+	readyAt := rc.outboundAudioReadyAt.Load()
+	if readyAt == 0 {
+		return fmt.Errorf("audio primer readiness timestamp unavailable")
+	}
+	remaining := qwenAudioBeforeVideoLead - time.Since(time.Unix(0, readyAt))
+	if remaining <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (rc *RealtimeConn) setDataChannel(dc *webrtc.DataChannel) {
@@ -202,10 +456,42 @@ func (rc *RealtimeConn) dialQwen(ctx context.Context, exchange func(context.Cont
 	if err != nil {
 		return connectError(ProviderQwen, "sdp_exchange", err)
 	}
+	if rc.videoTrack != nil && !qwenAnswerAcceptsVideo(answer) {
+		return connectError(ProviderQwen, "remote_description", errors.New("qwen answer did not accept the video track"))
+	}
 	if err := rc.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
 		return connectError(ProviderQwen, "remote_description", err)
 	}
 	return nil
+}
+
+func qwenAnswerAcceptsVideo(answer string) bool {
+	description := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}
+	parsed, err := description.Unmarshal()
+	if err != nil {
+		return false
+	}
+	sessionDirection := ""
+	for _, attribute := range parsed.Attributes {
+		switch attribute.Key {
+		case "inactive", "sendonly", "recvonly", "sendrecv":
+			sessionDirection = attribute.Key
+		}
+	}
+	for _, mediaDescription := range parsed.MediaDescriptions {
+		if mediaDescription.MediaName.Media != "video" {
+			continue
+		}
+		direction := sessionDirection
+		for _, attribute := range mediaDescription.Attributes {
+			switch attribute.Key {
+			case "inactive", "sendonly", "recvonly", "sendrecv":
+				direction = attribute.Key
+			}
+		}
+		return mediaDescription.MediaName.Port.Value != 0 && direction != "inactive" && direction != "sendonly"
+	}
+	return false
 }
 
 // exchangeSDP sends one create-call request. It deliberately does not replay a
@@ -349,19 +635,30 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 				startThreshold = bargeStartGate.threshold(assistantSpeaking, rc.audio.OutputLevel())
 			}
 			for _, out := range gate.processWithStartThreshold(frame, startThreshold) {
-				enc, err := rc.audio.EncodeFrame(out)
-				if err != nil {
-					stats.noteEncodeErr()
-					continue
-				}
 				select {
 				case <-ctx.Done():
 					return
 				case <-pacer.C:
 				}
-				stats.noteWrite(rc.sendTrack.WriteSample(media.Sample{
+				rc.outboundAudioMu.Lock()
+				enc, err := rc.audio.EncodeFrame(out)
+				if err != nil {
+					rc.outboundAudioMu.Unlock()
+					stats.noteEncodeErr()
+					continue
+				}
+				writeErr := rc.sendTrack.WriteSample(media.Sample{
 					Data: enc, Duration: audioFrameMs * time.Millisecond, // 20 ms frame
-				}))
+				})
+				if writeErr == nil {
+					rc.micAudioWritten.Store(true)
+					if !rc.outboundAudioReady.Load() {
+						rc.outboundAudioReadyAt.Store(time.Now().UnixNano())
+						rc.outboundAudioReady.Store(true)
+					}
+				}
+				rc.outboundAudioMu.Unlock()
+				stats.noteWrite(writeErr)
 			}
 			if !wasOpen && gate.open {
 				if assistantSpeaking && (eventLogEnabled() || os.Getenv("KOE_AUDIO_LOG") == "1") {
@@ -413,10 +710,13 @@ func MintEphemeral(ctx context.Context, apiKey, model string) (string, error) {
 
 // ConnectOptions carries the optional Desktop/billing hooks (all nil/zero-safe).
 type ConnectOptions struct {
-	OnVoiceState func(string)          // G2: Desktop control channel voice state (listening/thinking/speaking)
-	Model        string                // G3: realtime model id stamped into usage reports
-	Voice        string                // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback
-	OnUsage      func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
+	OnVoiceState func(string) // G2: Desktop control channel voice state (listening/thinking/speaking)
+	// OnAssistantTranscript is nil in product paths. Opt-in E2E diagnostics use
+	// it to assert provider output without making private transcript logs global.
+	OnAssistantTranscript func(string)
+	Model                 string                // G3: realtime model id stamped into usage reports
+	Voice                 string                // realtime output voice (marin/cedar/shimmer/…); empty → "marin" fallback
+	OnUsage               func(json.RawMessage) // G3: per-turn usage relay (→ daemon → Cloud)
 	// OnEndCall (nil-safe) is invoked when the model calls the end_call voice tool
 	// (dismiss / hang up). In the Desktop path it is the endCall closure that plays
 	// the goodbye earcon and tears the call down; the standalone/CLI path wires it to
@@ -449,6 +749,10 @@ type ConnectOptions struct {
 	// Desktop warm sessions use this to retire stale idle sessions before the next
 	// double-tap can land on a dead connection.
 	OnClosed func(error)
+	// VideoSource adds provider-native live vision to Qwen. Its encoded frames are
+	// read only while CallActive is true; idle and prewarmed sessions upload none.
+	// OpenAI ignores this field and keeps its existing image-input path.
+	VideoSource *RealtimeVideoSource
 }
 
 // defaultSessionConfigTimeoutMS bounds how long Connect waits for OpenAI to ack our
@@ -550,13 +854,26 @@ func ConnectQwen(ctx context.Context, audio *AudioIO, exchange func(context.Cont
 	})
 }
 
+func realtimeSessionPayload(provider RealtimeProvider, persona, openAIVoice, qwenVoice string, opts ConnectOptions, hasLiveVideo bool) map[string]any {
+	if provider == ProviderQwen {
+		return qwenSessionConfig(persona, qwenVoice, hasLiveVideo)
+	}
+	return sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
+}
+
 func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvider, persona string, state *CallState, disp *Dispatcher, opts ConnectOptions, dial func(*RealtimeConn) error) (*RealtimeConn, error) {
+	if provider == ProviderQwen && opts.VideoSource != nil && opts.CallActive == nil {
+		return nil, connectError(provider, "local_setup", errors.New("realtime video source requires CallActive"))
+	}
 	if audio != nil {
 		audio.SetRealtimeProvider(provider)
 	}
-	rc, err := newPeerConnectionForProvider(audio, provider)
+	rc, err := newPeerConnectionForProviderWithVideo(audio, provider, opts.VideoSource)
 	if err != nil {
 		return nil, connectError(provider, "local_setup", err)
+	}
+	if opts.VideoSource != nil && rc.videoTrack == nil {
+		log.Printf("koe[video]: video source ignored: provider=%s does not negotiate video", provider)
 	}
 	// Scope every goroutine this attempt starts to the attempt, not the caller's
 	// session ctx: an Auto fallback continues on the same session ctx, and every
@@ -568,6 +885,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 		return rc.sendText(string(b))
 	}, opts.ResultMailbox, opts.CallActive)
 	h.onVoiceState = opts.OnVoiceState
+	h.onAssistantTranscript = opts.OnAssistantTranscript
 	h.onEndCall = opts.OnEndCall
 	h.provider = string(provider)
 	h.model = opts.Model
@@ -632,12 +950,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	sendConfig := func(dc *webrtc.DataChannel) {
 		sendConfigOnce.Do(func() {
 			rc.setDataChannel(dc)
-			var payload map[string]any
-			if provider == ProviderQwen {
-				payload = qwenSessionConfig(persona, qwenVoice)
-			} else {
-				payload = sessionConfig(persona, openAIVoice, opts.FullDuplexAEC)
-			}
+			payload := realtimeSessionPayload(provider, persona, openAIVoice, qwenVoice, opts, rc.videoTrack != nil)
 			b, _ := json.Marshal(payload)
 			if err := dc.SendText(string(b)); err != nil {
 				notifyClosed(fmt.Errorf("send session config: %w", err))
@@ -717,6 +1030,9 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 		}
 		rc.pumpSendTrack(ctx)
 	}()
+	if provider == ProviderQwen && rc.videoTrack != nil {
+		go rc.pumpVideoTrack(ctx)
+	}
 	// Level pump (D3w): emit the reactive RMS amplitude for the Desktop Island sprite
 	// at animation cadence while listening/speaking. thinking/idle carry no level
 	// (the sprite is self-driven there).
