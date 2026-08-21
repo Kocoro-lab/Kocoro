@@ -852,33 +852,35 @@ func (h *eventHandler) dropQueuedFloor(turnID int64) {
 }
 
 // maybeMintCommitlessTurn backfills the turn-boundary signal for providers
-// that never emit input_audio_buffer.committed (Qwen's wireless dialect).
-// Under client-owned response mode this user-turn response.create IS the
-// authoritative "the user's turn ended" decision, so it mints the commit the
-// provider withheld: the ledger then runs with real turn ids and its
-// dedup/budget/preemption semantics are unchanged from the OAI world. When a
-// real commit already registered the current sequence (OAI, Qwen dialects
-// that do send it, or a typed /call/text turn), this is a no-op — the
-// provider event stays the preferred signal and can never be double-counted.
-func (h *eventHandler) maybeMintCommitlessTurn(purpose responsePurpose) {
+// that never emit input_audio_buffer.committed (Qwen's server-VAD wireless
+// dialect). It fires ONLY for an explicit user-purpose response.create — on
+// the wireless carrier (client-owned response mode) that request is the
+// authoritative "the user's turn ended" decision; a zero-value purpose is a
+// mid-turn "say something" request and never a turn boundary. Minted turns go
+// into the ledger's own counter (mintedTurnBase id space): inputCommitSeq
+// stays a pure provider-commit signal, so local-commit salvage and
+// userSpokeSinceLastDoTask never observe a mint. Sequence ownership is
+// bimodal — a provider whose commits flow keeps owning the sequence (the
+// latch never arms); once a mint happens, every later user turn mints.
+func (h *eventHandler) maybeMintCommitlessTurn(purpose responsePurpose) int64 {
 	if h == nil || h.provider != string(ProviderQwen) || !ToolContinuationEnabled() {
-		return
+		return 0
 	}
-	if purpose != "" && purpose != responsePurposeUser {
-		return
+	if purpose != responsePurposeUser {
+		return 0
 	}
 	if !h.commitlessTurns.Load() {
 		if seq := h.inputCommitSeq.Load(); seq > 0 && h.toolLoop.hasTurn(seq) {
 			// The provider's own commits are flowing — they own the sequence.
-			return
+			return 0
 		}
 		h.commitlessTurns.Store(true)
+		log.Printf("koe[loop]: commitless turn minting engaged (no provider commit before first user response)")
 	}
-	h.toolLoop.noteUserCommit(h.inputCommitSeq.Add(1))
+	return h.toolLoop.mintUserTurn()
 }
 
 func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreateRequest) bool {
-	h.maybeMintCommitlessTurn(req.purpose)
 	for attempt := 0; attempt <= maxResponseCreateRetries; attempt++ {
 		if h.ending.Load() {
 			return false
@@ -900,6 +902,15 @@ func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreat
 		}
 		drainSignal(h.respCreated) // clear stale acks from the previous turn
 		drainSignal(h.respRejected)
+		// Mint at most once per request, only when it is actually about to be
+		// sent, and never for a request that already carries a turn (a
+		// native-floor accepted turn must not preempt itself). Retries reuse
+		// the minted turn.
+		if req.turnID == 0 {
+			if minted := h.maybeMintCommitlessTurn(req.purpose); minted > 0 {
+				req.turnID = minted
+			}
+		}
 		attemptReq := req
 		attemptReq.requestID = fmt.Sprintf("koe-%d", responseRequestSeq.Add(1))
 		h.terminalMu.Lock()
@@ -2278,6 +2289,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 					"message": "This tool action was not executed.",
 				}))
 				break
+			}
+			if claim.lazyBound {
+				log.Printf("koe[loop]: lazily bound unannounced response_id=%q turn=%d", ev.ResponseID, claim.turnID)
 			}
 			sameResponseDoTask = claim.sameResponseDoTaskCall
 		}

@@ -5,6 +5,7 @@ package koe
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,6 +186,7 @@ func TestToolLoopDeduplicatesCanonicalActionAcrossCallIDs(t *testing.T) {
 
 func TestToolLoopUnboundResponseLazilyBindsToCurrentTurn(t *testing.T) {
 	loop := newToolLoopLedger()
+	loop.setLazyBind(true)
 	loop.noteUserCommit(1)
 	claim := loop.claimAction("unbound", "call-1", "do_task", []byte(`{"task":"weather"}`))
 	if !claim.allowed || !claim.known || claim.turnID != 1 {
@@ -532,25 +534,32 @@ func TestToolLoopBudgetRejectsFifthSideEffectAndClosesWithoutTools(t *testing.T)
 func TestMintCommitlessTurnOwnsSequenceForQwen(t *testing.T) {
 	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
 	h.provider = string(ProviderQwen)
-	h.maybeMintCommitlessTurn(responsePurposeUser)
-	if h.inputCommitSeq.Load() != 1 || !h.toolLoop.isCurrent(1) {
-		t.Fatalf("first commitless user turn not minted: seq=%d", h.inputCommitSeq.Load())
+	h.toolLoop.setLazyBind(true)
+	first := h.maybeMintCommitlessTurn(responsePurposeUser)
+	if first != mintedTurnBase+1 || !h.toolLoop.isCurrent(first) {
+		t.Fatalf("first commitless user turn not minted: id=%d", first)
 	}
-	// A follow-up user turn mints the NEXT turn even though turn 1 exists —
-	// once minting owns the sequence, every user turn advances it.
-	h.maybeMintCommitlessTurn("")
-	if h.inputCommitSeq.Load() != 2 || !h.toolLoop.isCurrent(2) {
-		t.Fatalf("follow-up commitless user turn not minted: seq=%d", h.inputCommitSeq.Load())
+	// A follow-up user turn mints the NEXT turn — once minting owns the
+	// sequence, every user turn advances it.
+	second := h.maybeMintCommitlessTurn(responsePurposeUser)
+	if second != mintedTurnBase+2 || !h.toolLoop.isCurrent(second) {
+		t.Fatalf("follow-up commitless user turn not minted: id=%d", second)
 	}
-	// Non-user purposes never mint.
-	h.maybeMintCommitlessTurn(responsePurposeTaskResult)
-	h.maybeMintCommitlessTurn(responsePurposeContinuation)
-	if h.inputCommitSeq.Load() != 2 {
-		t.Fatalf("non-user purpose minted a turn: seq=%d", h.inputCommitSeq.Load())
+	// Only the explicit user purpose mints: the zero value is a mid-turn
+	// "say something" request, never a turn boundary.
+	for _, p := range []responsePurpose{"", responsePurposeTaskResult, responsePurposeContinuation, responsePurposeClosure, responsePurposeFloor} {
+		if id := h.maybeMintCommitlessTurn(p); id != 0 {
+			t.Fatalf("purpose %q minted a turn: id=%d", p, id)
+		}
 	}
-	// A tool call riding an unbound response now lazily binds to the real turn.
+	// The mint never touches inputCommitSeq — it stays a pure provider-commit
+	// signal (local-commit salvage / userSpokeSinceLastDoTask never see mints).
+	if h.inputCommitSeq.Load() != 0 {
+		t.Fatalf("mint perturbed inputCommitSeq: %d", h.inputCommitSeq.Load())
+	}
+	// A tool call riding an unannounced response lazily binds to the minted turn.
 	claim := h.toolLoop.claimAction("unbound", "call-1", "do_task", []byte(`{"task":"weather"}`))
-	if !claim.allowed || claim.turnID != 2 {
+	if !claim.allowed || claim.turnID != second || !claim.lazyBound {
 		t.Fatalf("tool call on minted turn denied: %+v", claim)
 	}
 }
@@ -560,16 +569,93 @@ func TestMintCommitlessTurnDefersToRealCommits(t *testing.T) {
 	h.provider = string(ProviderQwen)
 	// The provider's own committed event registered the current turn first.
 	h.toolLoop.noteUserCommit(h.inputCommitSeq.Add(1))
-	h.maybeMintCommitlessTurn(responsePurposeUser)
-	if h.inputCommitSeq.Load() != 1 {
-		t.Fatalf("minted over a flowing provider commit: seq=%d", h.inputCommitSeq.Load())
+	if id := h.maybeMintCommitlessTurn(responsePurposeUser); id != 0 {
+		t.Fatalf("minted over a flowing provider commit: id=%d", id)
+	}
+	if h.inputCommitSeq.Load() != 1 || !h.toolLoop.isCurrent(1) {
+		t.Fatalf("provider commit ownership perturbed: seq=%d", h.inputCommitSeq.Load())
 	}
 }
 
 func TestMintCommitlessTurnSkipsNonQwen(t *testing.T) {
 	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
-	h.maybeMintCommitlessTurn(responsePurposeUser)
-	if h.inputCommitSeq.Load() != 0 {
-		t.Fatalf("non-Qwen provider minted a turn: seq=%d", h.inputCommitSeq.Load())
+	if id := h.maybeMintCommitlessTurn(responsePurposeUser); id != 0 {
+		t.Fatalf("non-Qwen provider minted a turn: id=%d", id)
+	}
+}
+
+func TestMintCommitlessTurnRespectsContinuationKillSwitch(t *testing.T) {
+	t.Setenv("KOE_TOOL_CONTINUATION", "0")
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	if id := h.maybeMintCommitlessTurn(responsePurposeUser); id != 0 {
+		t.Fatalf("mint fired with the continuation loop disabled: id=%d", id)
+	}
+}
+
+func TestUnboundResponseHasNoAuthorityWithoutLazyBindDialect(t *testing.T) {
+	// The OpenAI contract: a response the ledger never bound has no authority,
+	// even with a current turn. Only the unannounced-id dialect flag (Qwen)
+	// enables the lazy bind.
+	loop := newToolLoopLedger()
+	loop.noteUserCommit(1)
+	claim := loop.claimAction("unbound", "call-1", "do_task", []byte(`{"task":"weather"}`))
+	if claim.allowed || claim.reason != "unknown_response" {
+		t.Fatalf("unbound response acted without the lazy-bind dialect: %+v", claim)
+	}
+}
+
+func TestSendResponseCreateMintsOnlyUserTurns(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.toolLoop.setLazyBind(true)
+
+	respSeq := 0
+	run := func(req responseCreateRequest) bool {
+		respSeq++
+		id := fmt.Sprintf("resp-test-%d", respSeq)
+		done := make(chan bool, 1)
+		go func() { done <- h.sendResponseCreate(context.Background(), req) }()
+		deadline := time.After(2 * time.Second)
+		for {
+			select {
+			case ok := <-done:
+				// Finish the response so the next create's waitRespIdle passes.
+				h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"`+id+`","status":"completed"}}`))
+				return ok
+			case <-deadline:
+				t.Fatal("sendResponseCreate did not settle")
+			case <-time.After(10 * time.Millisecond):
+				// Ack the pending create the way the wire would.
+				h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{"id":"`+id+`"}}`))
+			}
+		}
+	}
+
+	// The production entry point mints for a user-purpose request...
+	if !run(responseCreateRequest{purpose: responsePurposeUser}) {
+		t.Fatal("user response.create failed")
+	}
+	if got := h.toolLoop.currentTurn(); got != mintedTurnBase+1 {
+		t.Fatalf("production entry did not mint: current=%d", got)
+	}
+	// ...but not for a mid-turn zero-purpose or task-result request.
+	if !run(responseCreateRequest{}) {
+		t.Fatal("zero-purpose response.create failed")
+	}
+	if !run(responseCreateRequest{purpose: responsePurposeTaskResult, toolMode: responseToolsDisabled}) {
+		t.Fatal("task-result response.create failed")
+	}
+	if got := h.toolLoop.currentTurn(); got != mintedTurnBase+1 {
+		t.Fatalf("non-user request minted: current=%d", got)
+	}
+	// A request already carrying a turn never mints (a native-floor accepted
+	// turn must not preempt itself), and a preempted request drops without
+	// minting.
+	if h.sendResponseCreate(context.Background(), responseCreateRequest{purpose: responsePurposeUser, turnID: 7, dropIfPreempted: true}) {
+		t.Fatal("preempted request was sent")
+	}
+	if got := h.toolLoop.currentTurn(); got != mintedTurnBase+1 {
+		t.Fatalf("dropped request minted a turn: current=%d", got)
 	}
 }
