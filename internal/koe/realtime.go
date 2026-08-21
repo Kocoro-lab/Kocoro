@@ -1023,6 +1023,15 @@ func (h *eventHandler) injectUserText(text string) error {
 	}); err != nil {
 		return err
 	}
+	// A typed turn carries the same tool authority as a committed audio turn:
+	// advance the commit sequence and the tool-loop ledger before requesting the
+	// response, exactly as input_audio_buffer.committed does. Without this the
+	// ledger's current turn stays stale (or zero on an all-typed call) and every
+	// tool call the model makes for this turn is denied.
+	turnID := h.inputCommitSeq.Add(1)
+	if ToolContinuationEnabled() {
+		h.toolLoop.noteUserCommit(turnID)
+	}
 	h.requestResponse()
 	return nil
 }

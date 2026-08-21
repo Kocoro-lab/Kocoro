@@ -659,3 +659,23 @@ func TestSendResponseCreateMintsOnlyUserTurns(t *testing.T) {
 		t.Fatalf("dropped request minted a turn: current=%d", got)
 	}
 }
+
+func TestTypedTurnGrantsToolAuthorityOnUnboundResponse(t *testing.T) {
+	state := NewCallState("burst-typed", "")
+	controlCalls := 0
+	dispatcher := NewDispatcher(NewDaemonClient(""), NewAgentResolver(nil, NoopSemanticMatcher{}), state, func(context.Context, string) error {
+		controlCalls++
+		return nil
+	})
+	h := newEventHandler(dispatcher, state, nil, func(any) error { return nil })
+	// A typed /call/text turn must advance the tool-loop ledger like an audio
+	// commit; the model's tool call then rides a response whose created event
+	// never bound (Qwen), which the ledger now lazily binds instead of denying.
+	if err := h.injectUserText("查一下天气"); err != nil {
+		t.Fatalf("inject typed turn: %v", err)
+	}
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"resp_unbound","call_id":"c1","name":"control_app","arguments":"{\"action\":\"show\"}"}`))
+	if controlCalls != 1 {
+		t.Fatalf("typed turn denied tool authority: control side effects=%d, want 1", controlCalls)
+	}
+}
