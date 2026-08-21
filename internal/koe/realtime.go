@@ -123,6 +123,10 @@ type eventHandler struct {
 	localStartCommitSeq   atomic.Int64
 	localStartResponseSeq atomic.Int64
 	inputCommitSeq        atomic.Int64
+	// commitlessTurns marks that maybeMintCommitlessTurn owns the commit
+	// sequence: the provider proved it sends no input_audio_buffer.committed,
+	// so every user-turn response.create mints the turn boundary itself.
+	commitlessTurns atomic.Bool
 	// commitEmptySeq counts input_audio_buffer_commit_empty rejections. The
 	// fallback's ack wait snapshots it before the manual commit: a bump means the
 	// buffer held (nearly) no audio — the gate opened on a fragment, not a lost
@@ -847,7 +851,34 @@ func (h *eventHandler) dropQueuedFloor(turnID int64) {
 	}
 }
 
+// maybeMintCommitlessTurn backfills the turn-boundary signal for providers
+// that never emit input_audio_buffer.committed (Qwen's wireless dialect).
+// Under client-owned response mode this user-turn response.create IS the
+// authoritative "the user's turn ended" decision, so it mints the commit the
+// provider withheld: the ledger then runs with real turn ids and its
+// dedup/budget/preemption semantics are unchanged from the OAI world. When a
+// real commit already registered the current sequence (OAI, Qwen dialects
+// that do send it, or a typed /call/text turn), this is a no-op — the
+// provider event stays the preferred signal and can never be double-counted.
+func (h *eventHandler) maybeMintCommitlessTurn(purpose responsePurpose) {
+	if h == nil || h.provider != string(ProviderQwen) || !ToolContinuationEnabled() {
+		return
+	}
+	if purpose != "" && purpose != responsePurposeUser {
+		return
+	}
+	if !h.commitlessTurns.Load() {
+		if seq := h.inputCommitSeq.Load(); seq > 0 && h.toolLoop.hasTurn(seq) {
+			// The provider's own commits are flowing — they own the sequence.
+			return
+		}
+		h.commitlessTurns.Store(true)
+	}
+	h.toolLoop.noteUserCommit(h.inputCommitSeq.Add(1))
+}
+
 func (h *eventHandler) sendResponseCreate(ctx context.Context, req responseCreateRequest) bool {
+	h.maybeMintCommitlessTurn(req.purpose)
 	for attempt := 0; attempt <= maxResponseCreateRetries; attempt++ {
 		if h.ending.Load() {
 			return false
@@ -1068,9 +1099,7 @@ func (h *eventHandler) sendResultBatch(ctx context.Context) {
 	}
 	h.beginResultBatch()
 
-	if eventLogEnabled() {
-		log.Printf("koe[result]: announcing count=%d task_ids=%q", len(results), resultTaskIDs(results))
-	}
+	log.Printf("koe[result]: announcing count=%d task_ids=%q", len(results), resultTaskIDs(results))
 	var err error
 	if h.provider == string(ProviderQwen) {
 		// Entries whose call_id was not minted on THIS transport (they survived a
@@ -1305,9 +1334,7 @@ func (h *eventHandler) finishResultBatch(responseID string, delivered bool) {
 func (h *eventHandler) completeOrReleaseResultBatch(delivered bool) {
 	if delivered {
 		removed := h.resultMailbox.complete(h.resultOwner)
-		if eventLogEnabled() {
-			log.Printf("koe[result]: delivered count=%d", removed)
-		}
+		log.Printf("koe[result]: delivered count=%d", removed)
 		return
 	}
 	h.resultMailbox.release(h.resultOwner)
@@ -2223,13 +2250,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		}
 	case "response.function_call_arguments.done":
 		args := unwrapArgs(ev.Arguments)
-		if eventLogEnabled() {
-			log.Printf("koe[tool]: call name=%q call_id=%q args=%s", ev.Name, ev.CallID, logMaybeBytes(args, 500))
-		}
+		log.Printf("koe[tool]: call name=%q call_id=%q args=%s", ev.Name, ev.CallID, logMaybeBytes(args, 500))
 		if h.ending.Load() {
-			if eventLogEnabled() {
-				log.Printf("koe[call]: ignored late tool after end_call name=%q call_id=%q", ev.Name, ev.CallID)
-			}
+			log.Printf("koe[call]: ignored late tool after end_call name=%q call_id=%q", ev.Name, ev.CallID)
 			break
 		}
 		sameResponseDoTask := false
@@ -2239,9 +2262,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if ToolContinuationEnabled() {
 			claim := h.toolLoop.claimAction(ev.ResponseID, ev.CallID, ev.Name, args)
 			if claim.duplicate {
-				if eventLogEnabled() {
-					log.Printf("koe[loop]: duplicate tool ignored response_id=%q call_id=%q name=%q reason=%s", ev.ResponseID, ev.CallID, ev.Name, claim.reason)
-				}
+				log.Printf("koe[loop]: duplicate tool ignored response_id=%q call_id=%q name=%q reason=%s", ev.ResponseID, ev.CallID, ev.Name, claim.reason)
 				if claim.duplicateAction {
 					h.sendFunctionOutput(ev.CallID, mustJSON(map[string]any{
 						"status": "ignored", "error_code": claim.reason,
@@ -2251,9 +2272,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 				break
 			}
 			if !claim.allowed {
-				if eventLogEnabled() {
-					log.Printf("koe[loop]: tool denied response_id=%q name=%q reason=%s", ev.ResponseID, ev.Name, claim.reason)
-				}
+				log.Printf("koe[loop]: tool denied response_id=%q name=%q reason=%s turn=%d", ev.ResponseID, ev.Name, claim.reason, claim.turnID)
 				h.sendFunctionOutput(ev.CallID, mustJSON(map[string]any{
 					"status": "failed", "error_code": claim.reason,
 					"message": "This tool action was not executed.",
@@ -2665,11 +2684,9 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 			} else {
 				r.TaskID = callID
 			}
-			if eventLogEnabled() {
-				log.Printf("koe[task]: done call_id=%q kind=%s status=%s session=%q partial=%t failure=%q reason=%q reply_len=%d deliverables=%d revision=%d supersedes=%t duration_ms=%d err=%v",
-					callID, outcomeKindLog(out.Kind), r.Status, out.SessionID, out.Partial, out.FailureCode, out.Reason,
-					len([]rune(r.Reply)), len(r.Deliverables), r.Revision, r.Supersedes, time.Since(started).Milliseconds(), derr)
-			}
+			log.Printf("koe[task]: done call_id=%q kind=%s status=%s session=%q partial=%t failure=%q reason=%q reply_len=%d deliverables=%d revision=%d supersedes=%t duration_ms=%d err=%v",
+				callID, outcomeKindLog(out.Kind), r.Status, out.SessionID, out.Partial, out.FailureCode, out.Reason,
+				len([]rune(r.Reply)), len(r.Deliverables), r.Revision, r.Supersedes, time.Since(started).Milliseconds(), derr)
 			b, _ := json.Marshal(r)
 			if h.provider == string(ProviderQwen) && resultTicket.groupID == "" {
 				h.queueDeferredFunctionResult(ctx, callID, b)
@@ -2738,9 +2755,7 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 	// Fast tools (cancel/get_status/control_app/switch_agent).
 	outBytes, err := h.disp.Dispatch(ctx, name, args)
 	if err != nil {
-		if eventLogEnabled() {
-			log.Printf("koe[tool]: dispatch failed name=%q call_id=%q err=%v args=%s", name, callID, err, logMaybeBytes(args, 500))
-		}
+		log.Printf("koe[tool]: dispatch failed name=%q call_id=%q err=%v args=%s", name, callID, err, logMaybeBytes(args, 500))
 		h.sendOutputForResponse(responseID, callID, SayResult{Status: "failed", FailReason: err.Error()})
 		return
 	}

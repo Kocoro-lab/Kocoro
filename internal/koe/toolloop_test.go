@@ -183,12 +183,36 @@ func TestToolLoopDeduplicatesCanonicalActionAcrossCallIDs(t *testing.T) {
 	}
 }
 
-func TestToolLoopUnknownResponseHasNoAuthority(t *testing.T) {
+func TestToolLoopUnboundResponseLazilyBindsToCurrentTurn(t *testing.T) {
 	loop := newToolLoopLedger()
 	loop.noteUserCommit(1)
+	claim := loop.claimAction("unbound", "call-1", "do_task", []byte(`{"task":"weather"}`))
+	if !claim.allowed || !claim.known || claim.turnID != 1 {
+		t.Fatalf("unbound response on an active turn should lazily bind and allow: %+v", claim)
+	}
+	// The lazily-bound response keeps full dedup authority.
+	dup := loop.claimAction("unbound", "call-1", "do_task", []byte(`{"task":"weather"}`))
+	if !dup.duplicate || dup.reason != "duplicate_tool_event" {
+		t.Fatalf("lazy bind lost call dedup: %+v", dup)
+	}
+	action := loop.claimAction("unbound", "call-2", "do_task", []byte(`{"task":"weather"}`))
+	if !action.duplicate || !action.duplicateAction {
+		t.Fatalf("lazy bind lost action dedup: %+v", action)
+	}
+	// A stale-turn tool call still cannot act: lazy binding targets the current
+	// turn, and preemption applies as usual.
+	loop.noteUserCommit(2)
+	stale := loop.claimAction("unbound", "call-3", "do_task", []byte(`{"task":"news"}`))
+	if stale.allowed || stale.reason != "turn_preempted" {
+		t.Fatalf("stale lazily-bound response acted after preemption: %+v", stale)
+	}
+}
+
+func TestToolLoopUnknownResponseWithoutTurnHasNoAuthority(t *testing.T) {
+	loop := newToolLoopLedger()
 	claim := loop.claimAction("unbound", "call-1", "do_task", nil)
 	if claim.allowed || claim.known || claim.reason != "unknown_response" {
-		t.Fatalf("unbound response acquired authority: %+v", claim)
+		t.Fatalf("unbound response with no committed turn acquired authority: %+v", claim)
 	}
 }
 
@@ -502,5 +526,50 @@ func TestToolLoopBudgetRejectsFifthSideEffectAndClosesWithoutTools(t *testing.T)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("budget closure was not created")
+	}
+}
+
+func TestMintCommitlessTurnOwnsSequenceForQwen(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.maybeMintCommitlessTurn(responsePurposeUser)
+	if h.inputCommitSeq.Load() != 1 || !h.toolLoop.isCurrent(1) {
+		t.Fatalf("first commitless user turn not minted: seq=%d", h.inputCommitSeq.Load())
+	}
+	// A follow-up user turn mints the NEXT turn even though turn 1 exists —
+	// once minting owns the sequence, every user turn advances it.
+	h.maybeMintCommitlessTurn("")
+	if h.inputCommitSeq.Load() != 2 || !h.toolLoop.isCurrent(2) {
+		t.Fatalf("follow-up commitless user turn not minted: seq=%d", h.inputCommitSeq.Load())
+	}
+	// Non-user purposes never mint.
+	h.maybeMintCommitlessTurn(responsePurposeTaskResult)
+	h.maybeMintCommitlessTurn(responsePurposeContinuation)
+	if h.inputCommitSeq.Load() != 2 {
+		t.Fatalf("non-user purpose minted a turn: seq=%d", h.inputCommitSeq.Load())
+	}
+	// A tool call riding an unbound response now lazily binds to the real turn.
+	claim := h.toolLoop.claimAction("unbound", "call-1", "do_task", []byte(`{"task":"weather"}`))
+	if !claim.allowed || claim.turnID != 2 {
+		t.Fatalf("tool call on minted turn denied: %+v", claim)
+	}
+}
+
+func TestMintCommitlessTurnDefersToRealCommits(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	// The provider's own committed event registered the current turn first.
+	h.toolLoop.noteUserCommit(h.inputCommitSeq.Add(1))
+	h.maybeMintCommitlessTurn(responsePurposeUser)
+	if h.inputCommitSeq.Load() != 1 {
+		t.Fatalf("minted over a flowing provider commit: seq=%d", h.inputCommitSeq.Load())
+	}
+}
+
+func TestMintCommitlessTurnSkipsNonQwen(t *testing.T) {
+	h := newEventHandler(nil, nil, nil, func(any) error { return nil })
+	h.maybeMintCommitlessTurn(responsePurposeUser)
+	if h.inputCommitSeq.Load() != 0 {
+		t.Fatalf("non-Qwen provider minted a turn: seq=%d", h.inputCommitSeq.Load())
 	}
 }

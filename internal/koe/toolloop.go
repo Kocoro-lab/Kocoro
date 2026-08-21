@@ -136,6 +136,19 @@ func (l *toolLoopLedger) noteUserCommit(turnID int64) {
 	}
 }
 
+// hasTurn reports whether a committed turn is registered for turnID. It lets
+// the commitless-provider backfill in sendResponseCreate distinguish "a real
+// commit already recorded this turn" from "no commit signal ever arrived".
+func (l *toolLoopLedger) hasTurn(turnID int64) bool {
+	if l == nil || turnID <= 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.turns[turnID]
+	return ok
+}
+
 func (l *toolLoopLedger) isCurrent(turnID int64) bool {
 	if l == nil || turnID <= 0 {
 		return false
@@ -190,7 +203,19 @@ func (l *toolLoopLedger) claimAction(responseID, callID, tool string, args []byt
 	defer l.mu.Unlock()
 	response, ok := l.responses[responseID]
 	if !ok {
-		return toolActionClaim{reason: "unknown_response"}
+		// Qwen can attach a function call to a response whose response.created
+		// never bound (an id-less created event, or a server-created response
+		// racing our own). Denying would silence the whole voice tool lane, so
+		// bind the response lazily to the current turn instead; per-response
+		// dedup, turn preemption, and the action budget all still apply below.
+		if l.current <= 0 {
+			return toolActionClaim{reason: "unknown_response"}
+		}
+		response = &loopResponse{
+			turnID: l.current, purpose: responsePurposeUser,
+			claimedCalls: make(map[string]struct{}), claimedActions: make(map[string]struct{}),
+		}
+		l.responses[responseID] = response
 	}
 	claim := toolActionClaim{known: true, turnID: response.turnID}
 	fingerprint := callID
