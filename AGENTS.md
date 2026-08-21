@@ -365,8 +365,8 @@ Realtime providers use WebRTC. Auto falls back OpenAI→Qwen only on eligible
 pre-ready network/timeout/5xx failures (Cloud-wrapped OpenAI auth/config is 502;
 gateway 4xx is terminal); forced modes never fall back. Qwen has no
 `conversation.item.truncate`; never emulate it. Qwen server-VAD sends no
-`input_audio_buffer.committed`/metadata echo: user turns are minted at the
-user-purpose `response.create`; unannounced-id tool calls lazy-bind (Qwen-only).
+`input_audio_buffer.committed`: user-purpose `response.create` mints the
+turn; unannounced-id tool calls lazy-bind (Qwen-only).
 Qwen barge-in on/off uses
 server/semantic VAD (`KOE_QWEN_VAD_MODE` overrides); capture protection covers
 only the late-RTP tail after `response.done`.
