@@ -3987,9 +3987,7 @@ func (h *eventHandler) handleCameraFunctionCall(ctx context.Context, callID stri
 	started := time.Now()
 	snapshot, err := h.disp.CaptureCamera(ctx)
 	if err != nil {
-		if eventLogEnabled() {
-			log.Printf("koe[camera]: capture failed call_id=%q duration_ms=%d err=%v", callID, time.Since(started).Milliseconds(), err)
-		}
+		log.Printf("koe[camera]: capture failed call_id=%q duration_ms=%d err=%v", callID, time.Since(started).Milliseconds(), err)
 		h.sendFunctionOutput(callID, mustJSON(map[string]string{
 			"status": "failed", "error": "camera_unavailable",
 		}))
@@ -4015,9 +4013,7 @@ func (h *eventHandler) handleCameraFunctionCall(ctx context.Context, callID stri
 		log.Printf("koe[camera]: image injection failed call_id=%q err=%v", callID, err)
 		return
 	}
-	if eventLogEnabled() {
-		log.Printf("koe[camera]: captured call_id=%q bytes=%d duration_ms=%d", callID, len(snapshot.JPEG), time.Since(started).Milliseconds())
-	}
+	log.Printf("koe[camera]: captured call_id=%q bytes=%d duration_ms=%d", callID, len(snapshot.JPEG), time.Since(started).Milliseconds())
 	h.requestResponse()
 }
 
