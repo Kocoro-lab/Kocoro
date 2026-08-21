@@ -21,6 +21,11 @@ const (
 	// Raise this code-level retention cap with the tool-loop tests if calls longer
 	// than 64 tracked turns need stale-event protection farther into history.
 	maxTrackedToolLoopTurns = 64
+	// mintedTurnBase offsets turns minted client-side for providers that never
+	// emit input_audio_buffer.committed (see maybeMintCommitlessTurn). Provider
+	// commit ids stay small, so the two id spaces can never collide; whichever
+	// signal arrives later owns l.current.
+	mintedTurnBase = int64(1) << 32
 )
 
 func ToolContinuationEnabled() bool { return koeEnvBool("KOE_TOOL_CONTINUATION", true) }
@@ -53,6 +58,7 @@ type loopResponse struct {
 	deferredTasks  int
 	claimedCalls   map[string]struct{}
 	claimedActions map[string]struct{}
+	lazyBound      bool
 	budgetHit      bool
 	finished       bool
 	messageItems   int
@@ -87,6 +93,7 @@ type toolActionClaim struct {
 	allowed                bool
 	duplicate              bool
 	duplicateAction        bool
+	lazyBound              bool
 	turnID                 int64
 	sameResponseDoTaskCall bool
 	reason                 string
@@ -98,6 +105,8 @@ type toolActionClaim struct {
 type toolLoopLedger struct {
 	mu        sync.Mutex
 	current   int64
+	minted    int64 // count of client-minted turns (ids offset by mintedTurnBase)
+	lazyBind  bool  // provider dialect delivers tool calls on unannounced response ids
 	turns     map[int64]*loopTurn
 	responses map[string]*loopResponse
 	order     []int64
@@ -119,6 +128,45 @@ func (l *toolLoopLedger) noteUserCommit(turnID int64) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.registerTurnLocked(turnID)
+}
+
+// mintUserTurn opens a client-minted turn for a commitless provider dialect and
+// makes it current. Minted ids live above mintedTurnBase so they can never
+// collide with provider commit ids; a later real commit simply takes ownership.
+func (l *toolLoopLedger) mintUserTurn() int64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.minted++
+	turnID := mintedTurnBase + l.minted
+	l.registerTurnLocked(turnID)
+	return turnID
+}
+
+func (l *toolLoopLedger) currentTurn() int64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.current
+}
+
+// setLazyBind enables claimAction's lazy bind for provider dialects that
+// deliver tool calls on response ids whose response.created never bound.
+func (l *toolLoopLedger) setLazyBind(enabled bool) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lazyBind = enabled
+}
+
+func (l *toolLoopLedger) registerTurnLocked(turnID int64) {
 	l.current = turnID
 	if _, ok := l.turns[turnID]; !ok {
 		l.turns[turnID] = &loopTurn{}
@@ -134,6 +182,19 @@ func (l *toolLoopLedger) noteUserCommit(turnID int64) {
 			}
 		}
 	}
+}
+
+// hasTurn reports whether a committed turn is registered for turnID. It lets
+// the commitless-provider backfill in sendResponseCreate distinguish "a real
+// commit already recorded this turn" from "no commit signal ever arrived".
+func (l *toolLoopLedger) hasTurn(turnID int64) bool {
+	if l == nil || turnID <= 0 {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.turns[turnID]
+	return ok
 }
 
 func (l *toolLoopLedger) isCurrent(turnID int64) bool {
@@ -190,9 +251,23 @@ func (l *toolLoopLedger) claimAction(responseID, callID, tool string, args []byt
 	defer l.mu.Unlock()
 	response, ok := l.responses[responseID]
 	if !ok {
-		return toolActionClaim{reason: "unknown_response"}
+		if !l.lazyBind || l.current <= 0 {
+			return toolActionClaim{reason: "unknown_response"}
+		}
+		// This provider dialect (Qwen) attaches function calls to responses
+		// whose response.created never bound (id-less created events, or a
+		// server-created response racing our own). Denying would silence the
+		// whole voice tool lane, so bind the response lazily to the current
+		// turn instead; per-response dedup, turn preemption, and the action
+		// budget all still apply below. Other providers keep the strict
+		// contract: no bind, no authority.
+		response = &loopResponse{
+			turnID: l.current, purpose: responsePurposeUser, lazyBound: true,
+			claimedCalls: make(map[string]struct{}), claimedActions: make(map[string]struct{}),
+		}
+		l.responses[responseID] = response
 	}
-	claim := toolActionClaim{known: true, turnID: response.turnID}
+	claim := toolActionClaim{known: true, turnID: response.turnID, lazyBound: response.lazyBound}
 	fingerprint := callID
 	if fingerprint == "" {
 		fingerprint = tool + "\x00" + string(args)
