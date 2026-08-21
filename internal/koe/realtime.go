@@ -2312,7 +2312,10 @@ func (h *eventHandler) requestTurnResponseWithInstructions(itemID, instructions 
 		h.turnResponseRequested[itemID] = true
 		h.turnMu.Unlock()
 	}
-	h.requestResponseWith(responseCreateRequest{turnItemID: itemID, instructions: instructions})
+	// This is the wireless carrier's authoritative end-of-turn decision: the
+	// explicit user purpose is what lets maybeMintCommitlessTurn back-fill the
+	// turn boundary Qwen's server-VAD dialect never commits.
+	h.requestResponseWith(responseCreateRequest{purpose: responsePurposeUser, turnItemID: itemID, instructions: instructions})
 	return true
 }
 

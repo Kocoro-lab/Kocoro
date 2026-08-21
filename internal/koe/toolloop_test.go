@@ -668,9 +668,12 @@ func TestTypedTurnGrantsToolAuthorityOnUnboundResponse(t *testing.T) {
 		return nil
 	})
 	h := newEventHandler(dispatcher, state, nil, func(any) error { return nil })
+	h.provider = string(ProviderQwen)
+	h.toolLoop.setLazyBind(true)
 	// A typed /call/text turn must advance the tool-loop ledger like an audio
 	// commit; the model's tool call then rides a response whose created event
-	// never bound (Qwen), which the ledger now lazily binds instead of denying.
+	// never bound (the Qwen dialect, so the lazy bind is enabled), which the
+	// ledger lazily binds instead of denying.
 	if err := h.injectUserText("查一下天气"); err != nil {
 		t.Fatalf("inject typed turn: %v", err)
 	}
