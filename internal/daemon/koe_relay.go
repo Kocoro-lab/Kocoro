@@ -5,17 +5,18 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
-// handleKoeRealtimeMint relays Koe's request for an OpenAI Realtime ephemeral
+// handleKoeRealtimeMint relays Koe's request for a Realtime ephemeral
 // client secret to the Cloud gateway. Koe (the voice front brain) runs as a
 // separate `shan koe` process and must never hold a long-lived credential — it
 // asks the daemon, which mints via Cloud using its own API key (the via-daemon
-// design; Koe never sees the OpenAI key). This replaces C-minimal's direct
-// dev-key mint. The gateway's {value, expires_at, session} body is forwarded
-// verbatim. Localhost-only, like the rest of the daemon HTTP surface.
+// design; Koe never sees the provider key). This replaces C-minimal's direct
+// dev-key mint. The gateway's {value, expires_at, session} shape is forwarded
+// with an opaque usage-principal binding. Localhost-only, like the rest of the daemon HTTP surface.
 func (s *Server) handleKoeRealtimeMint(w http.ResponseWriter, r *http.Request) {
 	gw := s.cloudGateway()
 	if gw == nil {
@@ -29,7 +30,9 @@ func (s *Server) handleKoeRealtimeMint(w http.ResponseWriter, r *http.Request) {
 	// Both fields are optional — the gateway defaults the allowlisted model.
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	raw, err := gw.MintRealtime(r.Context(), req.Model, req.Voice)
+	raw, principal, err := s.withRealtimeUsageGatewayLease(gw, func(string) (json.RawMessage, error) {
+		return gw.MintRealtime(r.Context(), req.Model, req.Voice)
+	})
 	if err != nil {
 		// Forward the Cloud status so Koe distinguishes 503 (no OpenAI key) /
 		// 400 (model not allowlisted) from a flat relay failure.
@@ -39,6 +42,11 @@ func (s *Server) handleKoeRealtimeMint(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusBadGateway, "mint relay failed: "+err.Error())
+		return
+	}
+	raw, err = addRealtimeUsagePrincipal(raw, principal)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "mint response invalid")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -60,7 +68,9 @@ func (s *Server) handleKoeRealtimeSDP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid SDP request")
 		return
 	}
-	raw, err := gw.ExchangeRealtimeSDP(r.Context(), req.Provider, req.Model, req.OfferSDP)
+	raw, principal, err := s.withRealtimeUsageGatewayLease(gw, func(string) (json.RawMessage, error) {
+		return gw.ExchangeRealtimeSDP(r.Context(), req.Provider, req.Model, req.OfferSDP)
+	})
 	if err != nil {
 		var apiErr *client.APIError
 		if errors.As(err, &apiErr) {
@@ -72,37 +82,50 @@ func (s *Server) handleKoeRealtimeSDP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "SDP relay failed: "+err.Error())
 		return
 	}
+	raw, err = addRealtimeUsagePrincipal(raw, principal)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "SDP response invalid")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(raw)
 }
 
-// handleKoeRealtimeUsage relays Koe's realtime usage report (from a response.done
-// event: model, response_id, token details) to the Cloud usage-ingest endpoint
-// via the daemon's API key. Koe never holds a credential and never sees pricing —
-// it sends token counts, Cloud computes cost server-side + debits quota. Mirrors
-// handleKoeRealtimeMint. The Cloud {cost_usd, billable_tokens, ...} body is
-// forwarded verbatim (Koe ignores it; it's for observability).
+// handleKoeRealtimeUsage durably accepts Koe's realtime usage report (from a
+// response.done event: model, response_id, token details). The daemon returns
+// after the private outbox handoff; its worker forwards the raw body to Cloud,
+// where cost and quota are computed server-side.
 func (s *Server) handleKoeRealtimeUsage(w http.ResponseWriter, r *http.Request) {
-	gw := s.cloudGateway()
-	if gw == nil {
-		writeError(w, http.StatusServiceUnavailable, "cloud not configured (sign in, or set cloud.enabled + api_key)")
-		return
-	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, realtimeUsageMaxBodyBytes))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "read usage body: "+err.Error())
 		return
 	}
-	raw, err := gw.SendRealtimeUsage(r.Context(), body)
-	if err != nil {
-		var apiErr *client.APIError
-		if errors.As(err, &apiErr) {
-			writeError(w, apiErr.StatusCode, "usage ingest failed: "+apiErr.Body)
-			return
-		}
-		writeError(w, http.StatusBadGateway, "usage relay failed: "+err.Error())
+	if _, err := realtimeUsageResponseID(body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid usage body")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(raw)
+	principal := strings.TrimSpace(r.Header.Get(client.RealtimeUsagePrincipalHeader))
+	if !validRealtimeUsagePrincipal(principal) {
+		writeError(w, http.StatusServiceUnavailable, "realtime usage principal unavailable")
+		return
+	}
+	outbox := s.realtimeUsageOutboxStore()
+	if outbox == nil {
+		writeError(w, http.StatusServiceUnavailable, "realtime usage persistence is not configured")
+		return
+	}
+	created, err := outbox.enqueue(body, principal)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "realtime usage persistence failed")
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "queued", "deduplicated": "true"})
+		return
+	}
+	// The durable handoff is the request's success boundary. Cloud delivery is
+	// owned by the background worker so a Koe process can safely return from its
+	// synchronous report call without waiting for an external provider.
+	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }

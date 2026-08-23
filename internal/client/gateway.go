@@ -1354,6 +1354,11 @@ type GatewayClient struct {
 	bindingsCachedAt time.Time
 }
 
+// RealtimeUsagePrincipalHeader carries the daemon-issued opaque account
+// binding from Koe bootstrap to the durable usage handoff. It is not a
+// credential and must never contain an account ID or API key directly.
+const RealtimeUsagePrincipalHeader = "X-Kocoro-Realtime-Principal"
+
 func NewGatewayClient(baseURL, apiKey string) *GatewayClient {
 	return &GatewayClient{
 		baseURL:                    baseURL,
@@ -1435,6 +1440,19 @@ func (c *GatewayClient) IntegrationGeneration() (uint64, bool) {
 	c.keyMu.RLock()
 	defer c.keyMu.RUnlock()
 	return c.integrationGeneration, c.integrationPrincipalActive
+}
+
+// IntegrationPrincipal returns the verified account currently bound to the
+// live gateway credential. It is an identity check for local durable relays;
+// callers must not expose the returned account ID on a wire surface.
+func (c *GatewayClient) IntegrationPrincipal() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	c.keyMu.RLock()
+	accountID, active := c.integrationPrincipalAccountID, c.integrationPrincipalActive
+	c.keyMu.RUnlock()
+	return accountID, active
 }
 
 // IsIntegrationGenerationCurrent reports whether a fetched schema/tool still

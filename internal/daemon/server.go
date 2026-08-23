@@ -162,6 +162,12 @@ type Server struct {
 	// pullDone closes, read by the push worker (which only pushes after the gate
 	// opens), so a plain atomic is sufficient.
 	agentPullClean atomic.Bool
+
+	// realtimeUsageOutbox is the private disk queue used by the Koe realtime
+	// relay. The mutex protects lazy construction for lightweight test servers
+	// that do not go through NewServer.
+	realtimeUsageOutboxMu sync.Mutex
+	realtimeUsageOutbox   *realtimeUsageOutbox
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500
@@ -471,6 +477,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		pullDone:                        make(chan struct{}),
 		loadConfigWithRevision:          config.LoadWithRevision,
 	}
+	s.realtimeUsageOutbox = newRealtimeUsageOutbox(shannonDir)
 	if deps != nil {
 		// These callbacks close over the fully constructed Server and are consumed
 		// by later auth/config mutation paths through the shared deps pointer. Keep
@@ -1169,6 +1176,13 @@ func (s *Server) startBackgroundServices(ctx context.Context) func() {
 
 	// Serialized, debounced worker that pushes agent changes to Cloud.
 	go s.agentSyncWorker(ctx)
+
+	// Replay any realtime usage reports that were persisted before a provider
+	// outage or daemon restart. The worker re-reads the active gateway each pass
+	// so a later sign-in/config reload can drain an existing queue.
+	if outbox := s.realtimeUsageOutboxStore(); outbox != nil {
+		outbox.start(ctx, s.realtimeUsagePrincipal, s.cloudGateway, s.sendRealtimeUsageWithGatewayLease)
+	}
 
 	// Warm the default ClawHub browse page ONCE at startup so the first open of
 	// the marketplace tab has a stale fallback and doesn't surface the
