@@ -286,9 +286,9 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 
 ## Memory, Sync, Browser Bridge
 
-- Sidecar lifecycle belongs to the daemon; CLI/TUI attach or probe, never spawn.
-  **API key bytes MUST never hit disk or audit logs** — only a `sha256[:16]`
-  fingerprint.
+- Daemon owns sidecar lifecycle; CLI/TUI attach/probe. Bundles:
+  `[0.4.0,0.9.0)`; 0.8 W-prior, 0.9 breaking. **API keys never hit disk or
+  logs** — only a `sha256[:16]` fingerprint.
 - Episodic recall is model-driven: production paths expose `memory_recall` and
   `session_search` directly, never the implicit small-model preflight. Unnamed
   references → session search; stop after a structured no-data. Keep sidecar
