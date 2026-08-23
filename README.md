@@ -740,6 +740,10 @@ Disabled by default. Skipped when the prompt cache is cold
 - `memory.provider: "cloud"` — daemon pulls fresh memory bundles from Kocoro Cloud every 24h. Requires `cloud.api_key` + `cloud.endpoint` (overridable via `memory.api_key` / `memory.endpoint`)
 - `memory.provider: "local"` — daemon runs the sidecar against bundles you build locally; no Cloud calls
 
+The daemon accepts bundle schema versions in `[0.4.0, 0.9.0)`. Version 0.8
+carries the expanded W-prior manifest contract; 0.9.0 is the next
+breaking-schema boundary.
+
 ### Quickstart (cloud mode)
 
 1. Install the `tlm` binary somewhere on `$PATH` (or set `memory.tlm_path`).

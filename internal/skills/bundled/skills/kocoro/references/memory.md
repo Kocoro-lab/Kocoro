@@ -15,6 +15,10 @@ modes:
 - **local**: self-host. User builds + publishes bundles themselves; daemon
   spawns the sidecar but never calls Cloud.
 
+The daemon accepts bundle schema versions in `[0.4.0, 0.9.0)`. Version 0.8
+carries the expanded W-prior manifest contract; 0.9.0 is the next
+breaking-schema boundary.
+
 ## Required configuration (cloud mode)
 
 ```yaml

@@ -2,6 +2,16 @@
 
 All notable changes to Kocoro (`shan` CLI / daemon) are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.4.9 — 2026-08-23 — Accept 0.8.0 memory bundle format
+
+Compatibility patch. The daemon's memory bundle version gate widens from `[0.4.0, 0.8.0)` to `[0.4.0, 0.9.0)` so it accepts the `0.8.0` bundle format (explicit W-prior and continuity manifest fields). The daemon does not parse bundle internals — it only pulls, gates, downloads, and hands off to the sidecar — so admitting `0.8.0` is safe; without this, `Puller.tick` would reject the `0.8.0` package at the download step and memory updates would stall on the last-good bundle (not downgrade).
+
+> **Cross-repo contract:** coordinated with TLM source RC `v0.10.3` (writes `bundle_version` 0.8.0) and Desktop `0.4.9`. Do not consume a 0.8.0 producer until this daemon and a matching TLM sidecar are actually running on the machine. A pre-upgrade puller keeps 0.8.0 away from v0.10.2 TLM installs.
+
+### Changed
+
+- **Memory bundle version gate → `[0.4.0, 0.9.0)`** (`internal/memory/bundle.go`) — `versionInRange` now admits minor versions `4`–`8`. The sidecar stays the schema-parsing authority; the daemon is the stricter series gate in front of it.
+
 ## v0.4.8 — 2026-08-19 — Approved writes, attached media
 
 **Cloud can now ship X mutation tools, but only to a daemon that will put a first-use card in front of them.** v0.4.6 fenced browser posting and handed the model a URL-only composer link; this release is the daemon half of Cloud's X full-capability expansion. The daemon advertises `integration_requires_approval`, honors the per-schema flag through the existing permission engine, stages a local image through `x_upload_media`, and treats an outcome-unknown material result as a narratable tool error instead of a hard-stop English template. A same-turn latch blocks that identical write from firing again until the next user message.

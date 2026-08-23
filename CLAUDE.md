@@ -455,7 +455,7 @@ Recovered runs are ALWAYS unattended (`IsUnattendedRun()==true` regardless of th
 
 #### Memory client
 
-`internal/memory/`. The daemon owns sidecar lifecycle + the 24h bundle pull. `memory_recall` -> `Service.Query` over UDS; falls back to `session_search` + MEMORY.md when not `Ready`. **The API key never hits disk** — only a `sha256[:16]` fingerprint. Schema-mismatch lockout surfaces as `memory.reason=tlm_binary_too_old` on `GET /status` and triggers a one-shot self-heal pull before degrading. `Sidecar.Shutdown` is idempotent so failed children do not accumulate as orphans.
+`internal/memory/`. The daemon owns sidecar lifecycle + the 24h bundle pull. `memory_recall` -> `Service.Query` over UDS; falls back to `session_search` + MEMORY.md when not `Ready`. The puller accepts bundle versions `[0.4.0, 0.9.0)`; 0.8 carries the expanded W-prior manifest contract and 0.9 is the next breaking boundary. **The API key never hits disk** — only a `sha256[:16]` fingerprint. Schema-mismatch lockout surfaces as `memory.reason=tlm_binary_too_old` on `GET /status` and triggers a one-shot self-heal pull before degrading. `Sidecar.Shutdown` is idempotent so failed children do not accumulate as orphans.
 
 #### Episodic recall routing
 
