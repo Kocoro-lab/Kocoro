@@ -589,10 +589,33 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 	return tools, nil
 }
 
-// CallTool invokes a tool on the specified MCP server.
+// ToolCallImage is one image an MCP tools/call returned, kept structured
+// rather than folded into the result text. Base64 is passed through verbatim;
+// the tool layer decodes, compresses, and re-encodes it on the way to a real
+// image content block.
+type ToolCallImage struct {
+	MIMEType string
+	Base64   string
+}
+
+// ToolCallContent is an MCP tools/call result split by what the agent loop
+// does with each part: Text goes through the normal result pipeline
+// (normalization, path annotation, truncation), Images bypass all of it and
+// become image content blocks.
+type ToolCallContent struct {
+	Text          string
+	Images        []ToolCallImage
+	DroppedImages int
+}
+
+// CallTool invokes a tool on the specified MCP server and returns only the
+// text part of the result. Retained for callers that cannot consume images —
+// health probes and the supervisor's ToolCaller interface. Anything that
+// reaches the model must use CallToolGuarded so images are not silently lost.
 // If the call fails with a connection error, it attempts to reconnect once and retry.
 func (m *ClientManager) CallTool(ctx context.Context, serverName, toolName string, args map[string]any) (string, bool, error) {
-	return m.CallToolGuarded(ctx, serverName, toolName, args, nil)
+	out, isErr, err := m.CallToolGuarded(ctx, serverName, toolName, args, nil)
+	return out.Text, isErr, err
 }
 
 // CallToolGuarded holds one per-server mutex across an optional pre-dispatch
@@ -604,9 +627,9 @@ func (m *ClientManager) CallToolGuarded(
 	serverName, toolName string,
 	args map[string]any,
 	guard func() error,
-) (string, bool, error) {
+) (ToolCallContent, bool, error) {
 	if m == nil {
-		return "", true, fmt.Errorf("MCP client manager is nil")
+		return ToolCallContent{}, true, fmt.Errorf("MCP client manager is nil")
 	}
 	m.mu.Lock()
 	serverCallMu := m.callMu[serverName]
@@ -619,7 +642,7 @@ func (m *ClientManager) CallToolGuarded(
 	defer serverCallMu.Unlock()
 	if guard != nil {
 		if err := guard(); err != nil {
-			return "", true, err
+			return ToolCallContent{}, true, err
 		}
 	}
 
@@ -633,7 +656,7 @@ func (m *ClientManager) CallToolGuarded(
 	// Never lazy-start a disabled server — a stale registry can still hold its
 	// tools right after a disable, and dispatching must not relaunch it.
 	if !ok && hasCfg && cfg.Disabled {
-		return "", true, fmt.Errorf("MCP server %q is disabled", serverName)
+		return ToolCallContent{}, true, fmt.Errorf("MCP server %q is disabled", serverName)
 	}
 	if !ok && hasCfg {
 		m.mu.Lock()
@@ -655,7 +678,7 @@ func (m *ClientManager) CallToolGuarded(
 			if _, err := m.connect(reconnectCtx, serverName, cfg); err != nil {
 				cancel()
 				rmu.Unlock()
-				return "", true, fmt.Errorf("MCP server %q on-demand connect failed: %w", serverName, err)
+				return ToolCallContent{}, true, fmt.Errorf("MCP server %q on-demand connect failed: %w", serverName, err)
 			}
 			cancel()
 			m.mu.Lock()
@@ -664,7 +687,7 @@ func (m *ClientManager) CallToolGuarded(
 		}
 		rmu.Unlock()
 	} else if !ok {
-		return "", true, fmt.Errorf("MCP server %q not connected", serverName)
+		return ToolCallContent{}, true, fmt.Errorf("MCP server %q not connected", serverName)
 	}
 
 	// Per-attempt timeout: a wedged-alive MCP subprocess accepts the request
@@ -694,7 +717,7 @@ func (m *ClientManager) CallToolGuarded(
 		skip := m.supervised
 		m.mu.Unlock()
 		if skip {
-			return "", true, fmt.Errorf("tools/call failed (supervised, no inline reconnect): %w", err)
+			return ToolCallContent{}, true, fmt.Errorf("tools/call failed (supervised, no inline reconnect): %w", err)
 		}
 		// Transport failure (process died, broken pipe, EOF) AFTER the
 		// request was written to a server that was alive at dispatch time.
@@ -743,7 +766,7 @@ func (m *ClientManager) CallToolGuarded(
 			} else if replaySafe {
 				if guard != nil {
 					if guardErr := guard(); guardErr != nil {
-						return "", true, guardErr
+						return ToolCallContent{}, true, guardErr
 					}
 				}
 				m.mu.Lock()
@@ -756,36 +779,69 @@ func (m *ClientManager) CallToolGuarded(
 		}
 		if err != nil {
 			if !replaySafe {
-				return "", true, &OutcomeUnknownError{Server: serverName, Tool: toolName, Err: origErr}
+				return ToolCallContent{}, true, &OutcomeUnknownError{Server: serverName, Tool: toolName, Err: origErr}
 			}
 			// Preserve the original transport error for diagnostics.
-			return "", true, fmt.Errorf("tools/call failed: %w (reconnect attempted after: %v)", origErr, err)
+			return ToolCallContent{}, true, fmt.Errorf("tools/call failed: %w (reconnect attempted after: %v)", origErr, err)
 		}
 	} else if err != nil {
-		return "", true, fmt.Errorf("tools/call failed: %w", err)
+		return ToolCallContent{}, true, fmt.Errorf("tools/call failed: %w", err)
 	}
 
-	// Extract text content from result
+	return splitToolCallContent(result.Content), result.IsError, nil
+}
+
+// maxToolCallImages caps how many images one tools/call result may contribute
+// to the model-visible request.
+//
+//   - Workload: an MCP server that returns a gallery (a page's images, a
+//     multi-page render) as one result.
+//   - Symptom when it binds: images past the cap are replaced by a one-line
+//     note naming how many were dropped; the text content is unaffected.
+//   - Override: none by design. Each image costs thousands of tokens and the
+//     wire-level image guard would strip an oversized set anyway; a server
+//     returning more than this should be paginated, not accommodated.
+const maxToolCallImages = 8
+
+// splitToolCallContent separates an MCP tools/call result into model-visible
+// text and structured images.
+//
+// Images MUST NOT be folded into the text. An mcp.ImageContent carries
+// base64 pixel data; json.Marshal-ing it produced a string that the vision
+// path can never consume, that the generic result truncation then cut
+// mid-base64, and that still billed as thousands of input tokens. The model
+// received line noise and paid for it. Keeping them structured lets the tool
+// layer hand them to ToolResult.Images, which is the only route to a real
+// image content block.
+//
+// Audio and embedded resources keep the legacy JSON-marshal fallback: there
+// is no consumer for them in the loop, so a self-describing JSON blob is
+// still the most useful thing the model can see.
+func splitToolCallContent(blocks []mcp.Content) ToolCallContent {
+	out := ToolCallContent{}
 	var texts []string
-	for _, block := range result.Content {
-		if textContent, ok := block.(mcp.TextContent); ok {
-			texts = append(texts, textContent.Text)
-		} else {
-			// For non-text content, marshal to JSON
+
+	for _, block := range blocks {
+		switch c := block.(type) {
+		case mcp.TextContent:
+			texts = append(texts, c.Text)
+		case mcp.ImageContent:
+			if len(out.Images) >= maxToolCallImages {
+				out.DroppedImages++
+				continue
+			}
+			out.Images = append(out.Images, ToolCallImage{
+				MIMEType: c.MIMEType,
+				Base64:   c.Data,
+			})
+		default:
 			b, _ := json.Marshal(block)
 			texts = append(texts, string(b))
 		}
 	}
 
-	content := ""
-	if len(texts) > 0 {
-		content = texts[0]
-		for _, t := range texts[1:] {
-			content += "\n" + t
-		}
-	}
-
-	return content, result.IsError, nil
+	out.Text = strings.Join(texts, "\n")
+	return out
 }
 
 // Close shuts down all connected MCP servers in parallel.

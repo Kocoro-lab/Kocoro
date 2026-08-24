@@ -823,6 +823,26 @@ func TestConfig_BrowserTrimmingDefaults(t *testing.T) {
 	if cfg.Agent.ObservationWindow != 3 {
 		t.Errorf("ObservationWindow default = %d, want 3", cfg.Agent.ObservationWindow)
 	}
+	if cfg.Agent.ObservationWindowTrigger.Mode != "hybrid" {
+		t.Errorf("ObservationWindowTrigger.Mode default = %q, want hybrid", cfg.Agent.ObservationWindowTrigger.Mode)
+	}
+	if cfg.Agent.ObservationWindowTrigger.AggregateCapRunes != 0 {
+		t.Errorf("ObservationWindowTrigger.AggregateCapRunes default = %d, want zero sentinel",
+			cfg.Agent.ObservationWindowTrigger.AggregateCapRunes)
+	}
+	if cfg.Agent.ObservationWindowTrigger.ColdCacheGapMinutes != 60 {
+		t.Errorf("ObservationWindowTrigger.ColdCacheGapMinutes default = %d, want 60",
+			cfg.Agent.ObservationWindowTrigger.ColdCacheGapMinutes)
+	}
+	for _, key := range []string{
+		"agent.observation_window_trigger.mode",
+		"agent.observation_window_trigger.aggregate_cap_runes",
+		"agent.observation_window_trigger.cold_cache_gap_minutes",
+	} {
+		if src := cfg.Sources[key]; src.Level != "default" {
+			t.Errorf("Sources[%q].Level = %q, want default", key, src.Level)
+		}
+	}
 	if cfg.Agent.MaxRecentImages != 50 {
 		t.Errorf("MaxRecentImages default = %d, want 50", cfg.Agent.MaxRecentImages)
 	}
@@ -844,6 +864,8 @@ func TestConfig_BrowserTrimmingNegativeRejected(t *testing.T) {
 		want string
 	}{
 		{"observation_window", "agent:\n  observation_window: -1\n", "agent.observation_window"},
+		{"observation_window_aggregate", "agent:\n  observation_window_trigger:\n    aggregate_cap_runes: -1\n", "agent.observation_window_trigger.aggregate_cap_runes"},
+		{"observation_window_cold_gap", "agent:\n  observation_window_trigger:\n    cold_cache_gap_minutes: -1\n", "agent.observation_window_trigger.cold_cache_gap_minutes"},
 		{"max_recent_images", "agent:\n  max_recent_images: -1\n", "agent.max_recent_images"},
 		{"max_recent_browser_images", "agent:\n  max_recent_browser_images: -1\n", "agent.max_recent_browser_images"},
 		{"browser_result_truncation", "tools:\n  browser_result_truncation: -1\n", "tools.browser_result_truncation"},
@@ -894,7 +916,7 @@ func TestConfig_BrowserTrimmingYamlOverrides(t *testing.T) {
 	if err := os.MkdirAll(shannonDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	yaml := "agent:\n  observation_window: 5\n  max_recent_images: 2\n  max_recent_browser_images: 3\ntools:\n  browser_result_truncation: 0\n"
+	yaml := "agent:\n  observation_window: 5\n  observation_window_trigger:\n    mode: budget\n    aggregate_cap_runes: 777\n    cold_cache_gap_minutes: 45\n  max_recent_images: 2\n  max_recent_browser_images: 3\ntools:\n  browser_result_truncation: 0\n"
 	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte(yaml), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -904,6 +926,9 @@ func TestConfig_BrowserTrimmingYamlOverrides(t *testing.T) {
 	}
 	if cfg.Agent.ObservationWindow != 5 {
 		t.Errorf("ObservationWindow = %d, want 5 (yaml override)", cfg.Agent.ObservationWindow)
+	}
+	if got := cfg.Agent.ObservationWindowTrigger; got.Mode != "budget" || got.AggregateCapRunes != 777 || got.ColdCacheGapMinutes != 45 {
+		t.Errorf("ObservationWindowTrigger = %+v, want budget/777/45", got)
 	}
 	if cfg.Agent.MaxRecentImages != 2 {
 		t.Errorf("MaxRecentImages = %d, want 2 (yaml override)", cfg.Agent.MaxRecentImages)
@@ -917,7 +942,11 @@ func TestConfig_BrowserTrimmingYamlOverrides(t *testing.T) {
 	// Provenance: values set in the GLOBAL config file must report source
 	// "global", not "default" (markGlobalSources must mark the new keys).
 	for _, key := range []string{
-		"agent.observation_window", "agent.max_recent_images",
+		"agent.observation_window",
+		"agent.observation_window_trigger.mode",
+		"agent.observation_window_trigger.aggregate_cap_runes",
+		"agent.observation_window_trigger.cold_cache_gap_minutes",
+		"agent.max_recent_images",
 		"agent.max_recent_browser_images", "tools.browser_result_truncation",
 	} {
 		if src := cfg.Sources[key]; src.Level != "global" {
