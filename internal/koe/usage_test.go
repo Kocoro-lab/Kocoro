@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
@@ -140,11 +141,15 @@ func TestExchangeSDPViaDaemonPreservesErrorStatusAndCode(t *testing.T) {
 }
 
 func TestReportUsageBuildsBillingBody(t *testing.T) {
+	gotUsage := make(chan json.RawMessage, 1)
+	h := &eventHandler{provider: "openai", model: "gpt-realtime-2.1-mini", onUsage: func(b json.RawMessage) { gotUsage <- b }}
+	if !h.reportUsage([]byte(`{"type":"response.done","response":{"id":"resp_1","usage":{"total_tokens":42,"output_token_details":{"audio_tokens":30}}}}`)) {
+		t.Fatal("reportUsage rejected a response.done carrying usage")
+	}
 	var got json.RawMessage
-	h := &eventHandler{provider: "openai", model: "gpt-realtime-2.1-mini", onUsage: func(b json.RawMessage) { got = b }}
-	h.reportUsage([]byte(`{"type":"response.done","response":{"id":"resp_1","usage":{"total_tokens":42,"output_token_details":{"audio_tokens":30}}}}`))
-
-	if got == nil {
+	select {
+	case got = <-gotUsage:
+	case <-time.After(time.Second):
 		t.Fatal("onUsage was not fired for a response.done carrying usage")
 	}
 	s := string(got)
@@ -157,9 +162,17 @@ func TestReportUsageBuildsBillingBody(t *testing.T) {
 }
 
 func TestReportUsagePreservesQwenPluralTokenDetails(t *testing.T) {
+	gotUsage := make(chan json.RawMessage, 1)
+	h := &eventHandler{provider: "qwen", model: "qwen3.5-omni-flash-realtime", onUsage: func(b json.RawMessage) { gotUsage <- b }}
+	if !h.reportUsage([]byte(`{"type":"response.done","response":{"id":"resp_qwen","usage":{"input_tokens_details":{"audio_tokens":12},"output_tokens_details":{"audio_tokens":34}}}}`)) {
+		t.Fatal("reportUsage rejected a response.done carrying usage")
+	}
 	var got json.RawMessage
-	h := &eventHandler{provider: "qwen", model: "qwen3.5-omni-flash-realtime", onUsage: func(b json.RawMessage) { got = b }}
-	h.reportUsage([]byte(`{"type":"response.done","response":{"id":"resp_qwen","usage":{"input_tokens_details":{"audio_tokens":12},"output_tokens_details":{"audio_tokens":34}}}}`))
+	select {
+	case got = <-gotUsage:
+	case <-time.After(time.Second):
+		t.Fatal("onUsage was not fired for a response.done carrying usage")
+	}
 
 	var body map[string]any
 	if err := json.Unmarshal(got, &body); err != nil {

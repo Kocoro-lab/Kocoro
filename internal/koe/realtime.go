@@ -806,11 +806,12 @@ func (h *eventHandler) waitForActiveUsage(grace time.Duration) bool {
 }
 
 // reportUsage extracts response_id + usage from a response.done event and fires
-// the billing relay. The terminal waiter is signalled only after this callback
-// returns, so a caller can safely close the transport after the bounded wait.
-func (h *eventHandler) reportUsage(raw []byte) {
+// the billing relay asynchronously. The terminal waiter is signalled only after
+// the callback returns, so the event loop stays live while Close still waits for
+// the existing durable handoff.
+func (h *eventHandler) reportUsage(raw []byte) bool {
 	if h.onUsage == nil {
-		return
+		return false
 	}
 	var rd struct {
 		Response struct {
@@ -819,7 +820,7 @@ func (h *eventHandler) reportUsage(raw []byte) {
 		} `json:"response"`
 	}
 	if err := json.Unmarshal(raw, &rd); err != nil || rd.Response.ID == "" || len(rd.Response.Usage) == 0 {
-		return // no usage on this response.done (e.g. an early/failed turn)
+		return false // no usage on this response.done (e.g. an early/failed turn)
 	}
 	body, err := json.Marshal(map[string]any{
 		"provider":    h.provider,
@@ -828,9 +829,14 @@ func (h *eventHandler) reportUsage(raw []byte) {
 		"usage":       rd.Response.Usage,
 	})
 	if err != nil {
-		return
+		return false
 	}
-	h.onUsage(body)
+	responseID := rd.Response.ID
+	go func() {
+		h.onUsage(body)
+		h.signalTerminalUsage(responseID)
+	}()
+	return true
 }
 
 var (
@@ -2579,8 +2585,9 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 		if !h.outputBufferActive.Load() {
 			h.clearActiveResponseID(ev.Response.ID)
 		}
-		h.reportUsage(raw)
-		h.signalTerminalUsage(ev.Response.ID)
+		if !h.reportUsage(raw) {
+			h.signalTerminalUsage(ev.Response.ID)
+		}
 	case "response.output_audio_transcript.done", "response.audio_transcript.done":
 		if h.onAssistantTranscript != nil && ev.Transcript != "" {
 			h.onAssistantTranscript(ev.Transcript)

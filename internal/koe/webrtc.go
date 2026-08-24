@@ -684,9 +684,9 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 }
 
 // Close gives an active response a bounded opportunity to emit response.done
-// before tearing down the peer connection. reportUsage runs synchronously from
-// that event, so the caller can close the local durable relay immediately after
-// Close without dropping the final accepted usage report.
+// before tearing down the peer connection. Its usage callback runs asynchronously
+// from that event, while the terminal waiter keeps Close open until the durable
+// handoff returns or the grace period expires.
 func (rc *RealtimeConn) Close() {
 	if rc == nil {
 		return

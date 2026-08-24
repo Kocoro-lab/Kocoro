@@ -119,6 +119,11 @@ func TestRealtimeConnCloseWaitsForInFlightUsageCallback(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("usage callback did not start")
 	}
+	select {
+	case <-responseDone:
+	case <-time.After(time.Second):
+		t.Fatal("response.done handler remained blocked on usage callback")
+	}
 	if h.respBusy.Load() {
 		t.Fatal("response.done callback test did not reach the respBusy=false race window")
 	}
@@ -142,11 +147,6 @@ func TestRealtimeConnCloseWaitsForInFlightUsageCallback(t *testing.T) {
 	case <-callbackFinished:
 	case <-time.After(time.Second):
 		t.Fatal("usage callback did not finish")
-	}
-	select {
-	case <-responseDone:
-	case <-time.After(time.Second):
-		t.Fatal("response.done handler did not finish")
 	}
 	select {
 	case <-closed:
