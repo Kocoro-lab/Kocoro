@@ -22,6 +22,15 @@ import (
 // re-stubbed) and by tests.
 const observationStubPrefix = "[elided browser observation:"
 
+// isObservationStubContent reports whether a tool_result's string content has
+// already been reclaimed by the observation window. Shared by the clearing
+// pass (idempotency) and the aggregate-budget accounting in
+// observation_trigger.go, which must not count already-reclaimed bytes toward
+// the trigger.
+func isObservationStubContent(s string) bool {
+	return strings.HasPrefix(s, observationStubPrefix)
+}
+
 // defaultObservationWindow is the number of most-recent browser/GUI
 // observations kept at full fidelity.
 //
@@ -175,7 +184,7 @@ func filterOldObservations(messages []client.Message, keep int) int {
 			if b.Type == "tool_result" && stubSet[b.ToolUseID] {
 				// Only string content is bulky page text; nested-block results
 				// (screenshots) are handled by filterOldImages, so leave them.
-				if existing, ok := b.ToolContent.(string); ok && !strings.HasPrefix(existing, observationStubPrefix) {
+				if existing, ok := b.ToolContent.(string); ok && !isObservationStubContent(existing) {
 					b.ToolContent = browserObservationStub(names[b.ToolUseID], utf8.RuneCountInString(existing))
 					touched = true
 					stubbed++

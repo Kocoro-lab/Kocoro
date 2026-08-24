@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
 	"github.com/Kocoro-lab/ShanClaw/internal/fslock"
 	"github.com/Kocoro-lab/ShanClaw/internal/hooks"
 	"github.com/Kocoro-lab/ShanClaw/internal/keychain"
@@ -292,6 +293,15 @@ type AgentConfig struct {
 	// internal/agent/timebasedcompact.go.
 	TimeBasedCompact TimeBasedCompactConfig `mapstructure:"time_based_compact" yaml:"time_based_compact" json:"time_based_compact"`
 
+	// ObservationWindowTrigger selects WHEN the browser/GUI observation
+	// window clears — a separate question from ObservationWindow's "how many
+	// to keep". Evaluating it every iteration walks the stub boundary forward
+	// one slot per turn, rewriting history mid-prefix on every turn and
+	// paying prompt-cache WRITE for bytes that would otherwise be reads.
+	// Default hybrid (clear on a cold prefix, or on an aggregate budget).
+	// See internal/agent/observation_trigger.go.
+	ObservationWindowTrigger ObservationWindowTriggerConfig `mapstructure:"observation_window_trigger" yaml:"observation_window_trigger" json:"observation_window_trigger"`
+
 	// PromptSuggestion controls the ghost-text "next prompt" suggestion that
 	// appears in the Desktop follow-up input after each assistant turn.
 	// Disabled by default. When enabled, after each turn the daemon runs a
@@ -309,6 +319,31 @@ type TimeBasedCompactConfig struct {
 	Enabled             bool `mapstructure:"enabled"               yaml:"enabled"               json:"enabled"`
 	GapThresholdMinutes int  `mapstructure:"gap_threshold_minutes" yaml:"gap_threshold_minutes" json:"gap_threshold_minutes"`
 	KeepRecent          int  `mapstructure:"keep_recent"           yaml:"keep_recent"           json:"keep_recent"`
+}
+
+// ObservationWindowTriggerConfig is the YAML/JSON-bindable view of the
+// observation-window trigger policy. The runtime view lives in
+// internal/agent.ObservationWindowConfig — they are kept in lockstep.
+//
+// Mode is one of every_turn / cold_cache / budget / hybrid / off; validated by
+// agent.ValidObservationTriggerMode so a typo fails at startup rather than
+// silently resolving to a default the operator did not choose.
+type ObservationWindowTriggerConfig struct {
+	Mode                string `mapstructure:"mode"                   yaml:"mode"                   json:"mode"`
+	AggregateCapRunes   int    `mapstructure:"aggregate_cap_runes"    yaml:"aggregate_cap_runes"    json:"aggregate_cap_runes"`
+	ColdCacheGapMinutes int    `mapstructure:"cold_cache_gap_minutes" yaml:"cold_cache_gap_minutes" json:"cold_cache_gap_minutes"`
+}
+
+// Runtime converts the bindable view into the agent package's runtime config.
+// Zero-valued fields are left zero on purpose — the agent side resolves them
+// to its own documented defaults, so there is one source of truth for each
+// default rather than two that can drift.
+func (c ObservationWindowTriggerConfig) Runtime() agent.ObservationWindowConfig {
+	return agent.ObservationWindowConfig{
+		Mode:                agent.ObservationTriggerMode(c.Mode),
+		AggregateCapRunes:   c.AggregateCapRunes,
+		ColdCacheGapMinutes: c.ColdCacheGapMinutes,
+	}
 }
 
 // PromptSuggestionConfig controls the post-turn next-prompt suggestion feature.
@@ -555,6 +590,12 @@ func Load() (*Config, error) {
 	// Defaults ON: they bound the accumulated page/DOM history a long browser
 	// loop re-sends each iteration. observation_window=0 disables the window.
 	viper.SetDefault("agent.observation_window", 3)
+	// Trigger policy for the window above — see agent/observation_trigger.go.
+	// hybrid clears on a cold prefix (free) or an aggregate budget (bounded
+	// growth); every_turn is the legacy cache-hostile behavior.
+	viper.SetDefault("agent.observation_window_trigger.mode", "hybrid")
+	viper.SetDefault("agent.observation_window_trigger.aggregate_cap_runes", 120000)
+	viper.SetDefault("agent.observation_window_trigger.cold_cache_gap_minutes", 60)
 	viper.SetDefault("agent.max_recent_images", 50)
 	viper.SetDefault("agent.warm_set_max_schemas", 16)
 	viper.SetDefault("agent.warm_set_max_schema_tokens", 8000)
@@ -952,6 +993,8 @@ type overlayAgentConfig struct {
 
 	TimeBasedCompact *overlayTimeBasedCompactConfig `yaml:"time_based_compact"`
 
+	ObservationWindowTrigger *overlayObservationWindowTriggerConfig `yaml:"observation_window_trigger"`
+
 	PromptSuggestion *overlayPromptSuggestionConfig `yaml:"prompt_suggestion"`
 }
 
@@ -959,6 +1002,12 @@ type overlayTimeBasedCompactConfig struct {
 	Enabled             *bool `yaml:"enabled"`
 	GapThresholdMinutes *int  `yaml:"gap_threshold_minutes"`
 	KeepRecent          *int  `yaml:"keep_recent"`
+}
+
+type overlayObservationWindowTriggerConfig struct {
+	Mode                *string `yaml:"mode"`
+	AggregateCapRunes   *int    `yaml:"aggregate_cap_runes"`
+	ColdCacheGapMinutes *int    `yaml:"cold_cache_gap_minutes"`
 }
 
 type overlayPromptSuggestionConfig struct {
@@ -1306,6 +1355,21 @@ func mergeRuntimeOverlayFile(cfg *Config, file string, level string) {
 				cfg.Sources["agent.time_based_compact.keep_recent"] = src
 			}
 		}
+		if overlay.Agent.ObservationWindowTrigger != nil {
+			owt := overlay.Agent.ObservationWindowTrigger
+			if owt.Mode != nil {
+				cfg.Agent.ObservationWindowTrigger.Mode = *owt.Mode
+				cfg.Sources["agent.observation_window_trigger.mode"] = src
+			}
+			if owt.AggregateCapRunes != nil {
+				cfg.Agent.ObservationWindowTrigger.AggregateCapRunes = *owt.AggregateCapRunes
+				cfg.Sources["agent.observation_window_trigger.aggregate_cap_runes"] = src
+			}
+			if owt.ColdCacheGapMinutes != nil {
+				cfg.Agent.ObservationWindowTrigger.ColdCacheGapMinutes = *owt.ColdCacheGapMinutes
+				cfg.Sources["agent.observation_window_trigger.cold_cache_gap_minutes"] = src
+			}
+		}
 		if overlay.Agent.PromptSuggestion != nil {
 			ps := overlay.Agent.PromptSuggestion
 			if ps.Enabled != nil {
@@ -1515,6 +1579,15 @@ func validateConfig(cfg *Config) error {
 	}
 	// Browser/GUI context-trimming knobs: 0 is a valid "disabled/fallback"
 	// sentinel; negative is a typo that would silently disable the feature.
+	if m := cfg.Agent.ObservationWindowTrigger.Mode; m != "" && !agent.ValidObservationTriggerMode(m) {
+		return fmt.Errorf("agent.observation_window_trigger.mode (%q) must be one of every_turn, cold_cache, budget, hybrid, off", m)
+	}
+	if cfg.Agent.ObservationWindowTrigger.AggregateCapRunes < 0 {
+		return fmt.Errorf("agent.observation_window_trigger.aggregate_cap_runes (%d) must be >= 0 (0 = package default)", cfg.Agent.ObservationWindowTrigger.AggregateCapRunes)
+	}
+	if cfg.Agent.ObservationWindowTrigger.ColdCacheGapMinutes < 0 {
+		return fmt.Errorf("agent.observation_window_trigger.cold_cache_gap_minutes (%d) must be >= 0 (0 = package default)", cfg.Agent.ObservationWindowTrigger.ColdCacheGapMinutes)
+	}
 	if cfg.Agent.ObservationWindow < 0 {
 		return fmt.Errorf("agent.observation_window (%d) must be >= 0 (0 = disabled)", cfg.Agent.ObservationWindow)
 	}

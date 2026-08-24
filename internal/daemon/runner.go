@@ -3745,6 +3745,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	loop.SetTemperature(runCfg.Agent.Temperature)
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
 	loop.SetObservationWindow(runCfg.Agent.ObservationWindow)
+	loop.SetObservationWindowConfig(runCfg.Agent.ObservationWindowTrigger.Runtime())
 	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)
