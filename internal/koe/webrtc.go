@@ -888,6 +888,11 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	h.onAssistantTranscript = opts.OnAssistantTranscript
 	h.onEndCall = opts.OnEndCall
 	h.provider = string(provider)
+	// Qwen delivers tool calls on response ids whose response.created never
+	// bound (id-less created events, server-created responses racing ours).
+	// Only that dialect gets the ledger's lazy bind; other providers keep the
+	// original no-authority-without-a-bind contract.
+	h.toolLoop.setLazyBind(provider == ProviderQwen)
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
 	h.language = opts.Language

@@ -286,9 +286,9 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 
 ## Memory, Sync, Browser Bridge
 
-- Sidecar lifecycle belongs to the daemon; CLI/TUI attach or probe, never spawn.
-  **API key bytes MUST never hit disk or audit logs** — only a `sha256[:16]`
-  fingerprint.
+- Daemon owns sidecar lifecycle; CLI/TUI attach/probe. Bundles:
+  `[0.4.0,0.9.0)`; 0.8 W-prior, 0.9 breaking. **API keys never hit disk or
+  logs** — only a `sha256[:16]` fingerprint.
 - Episodic recall is model-driven: production paths expose `memory_recall` and
   `session_search` directly, never the implicit small-model preflight. Unnamed
   references → session search; stop after a structured no-data. Keep sidecar
@@ -364,7 +364,10 @@ model owns the rest.
 Realtime providers use WebRTC. Auto falls back OpenAI→Qwen only on eligible
 pre-ready network/timeout/5xx failures (Cloud-wrapped OpenAI auth/config is 502;
 gateway 4xx is terminal); forced modes never fall back. Qwen has no
-`conversation.item.truncate`; never emulate it. Qwen barge-in on/off uses
+`conversation.item.truncate`; never emulate it. Qwen server-VAD sends no
+`input_audio_buffer.committed`: user-purpose `response.create` mints the
+turn; unannounced-id tool calls lazy-bind (Qwen-only).
+Qwen barge-in on/off uses
 server/semantic VAD (`KOE_QWEN_VAD_MODE` overrides); capture protection covers
 only the late-RTP tail after `response.done`.
 
