@@ -81,6 +81,41 @@ func resolveDevKey(flagKey, envKey, controlPort string) string {
 	return ""
 }
 
+// shouldRelayRealtimeUsage keeps usage from a personal provider credential out
+// of Cloud while still metering a Cloud-backed fallback session. The provider
+// is stamped by the Realtime event handler, so the decision follows the actual
+// connected route rather than the requested auto mode.
+func shouldRelayRealtimeUsage(openAIKey string, usage json.RawMessage) bool {
+	if strings.TrimSpace(openAIKey) == "" {
+		return true
+	}
+	var envelope struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.Unmarshal(usage, &envelope); err != nil {
+		// A malformed report must not accidentally debit the Cloud account for a
+		// direct-key session. The normal Cloud-backed path still sends it so the
+		// server can reject and diagnose the malformed payload.
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(envelope.Provider), string(koe.ProviderQwen))
+}
+
+func reportRealtimeUsageRelayFailure(opts koe.ConnectOptions, err error) {
+	if err == nil {
+		return
+	}
+	wrapped := fmt.Errorf("realtime usage relay admission failed: %w", err)
+	log.Printf("koe: %v", wrapped)
+	if opts.OnClosed != nil {
+		opts.OnClosed(wrapped)
+		return
+	}
+	if opts.OnEndCall != nil {
+		opts.OnEndCall()
+	}
+}
+
 // applyBargeInEnv enables the VPIO raw-audio floor loop. Playback pauses locally;
 // Realtime then chooses resume_playback or accept_turn without ASR admission.
 // KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1 remains the rollback to the old
@@ -489,35 +524,52 @@ func koeOpenAICircuitCooldown() time.Duration {
 }
 
 type warmMint struct {
-	mint func(context.Context) (string, error)
-	ttl  time.Duration
+	mint              func(context.Context) (string, error)
+	mintWithPrincipal func(context.Context) (string, string, error)
+	ttl               time.Duration
 
-	mu       sync.Mutex
-	value    string
-	mintedAt time.Time
-	inFlight bool
+	mu             sync.Mutex
+	value          string
+	valuePrincipal string
+	mintedAt       time.Time
+	inFlight       bool
 }
 
 func newWarmMint(ctx context.Context, mint func(context.Context) (string, error), ttl time.Duration) *warmMint {
-	w := &warmMint{mint: mint, ttl: ttl}
+	return newWarmMintWithPrincipal(ctx, mint, nil, ttl)
+}
+
+func newWarmMintWithPrincipal(
+	ctx context.Context,
+	mint func(context.Context) (string, error),
+	mintWithPrincipal func(context.Context) (string, string, error),
+	ttl time.Duration,
+) *warmMint {
+	w := &warmMint{mint: mint, mintWithPrincipal: mintWithPrincipal, ttl: ttl}
 	w.prefetch(ctx)
 	return w
 }
 
-func (w *warmMint) take(ctx context.Context) (string, bool, error) {
+func (w *warmMint) take(ctx context.Context) (string, bool, string, error) {
 	now := time.Now()
 	w.mu.Lock()
 	if w.value != "" && now.Sub(w.mintedAt) < w.ttl {
-		v := w.value
-		w.value = ""
+		v, p := w.value, w.valuePrincipal
+		w.value, w.valuePrincipal = "", ""
 		w.mintedAt = time.Time{}
 		w.mu.Unlock()
 		w.prefetch(context.Background())
-		return v, true, nil
+		return v, true, p, nil
 	}
 	w.mu.Unlock()
-	v, err := w.mint(ctx)
-	return v, false, err
+	var v, p string
+	var err error
+	if w.mintWithPrincipal != nil {
+		v, p, err = w.mintWithPrincipal(ctx)
+	} else {
+		v, err = w.mint(ctx)
+	}
+	return v, false, p, err
 }
 
 func (w *warmMint) prefetch(ctx context.Context) {
@@ -532,7 +584,13 @@ func (w *warmMint) prefetch(ctx context.Context) {
 	go func() {
 		pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
-		v, err := w.mint(pctx)
+		var v, p string
+		var err error
+		if w.mintWithPrincipal != nil {
+			v, p, err = w.mintWithPrincipal(pctx)
+		} else {
+			v, err = w.mint(pctx)
+		}
 
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -544,21 +602,25 @@ func (w *warmMint) prefetch(ctx context.Context) {
 			return
 		}
 		w.value = v
+		w.valuePrincipal = p
 		w.mintedAt = time.Now()
 		log.Printf("koe[timing]: warm mint ready")
 	}()
 }
 
 type realtimeConnector struct {
-	mode        koe.RealtimeProvider
-	openAIModel string
-	openAIVoice string
-	qwenModel   string
-	qwenVoice   string
-	mint        func(context.Context) (string, error)
-	warm        *warmMint
-	exchange    func(context.Context, string) (string, error)
-	circuit     *koe.OpenAICircuit
+	mode                  koe.RealtimeProvider
+	openAIModel           string
+	openAIVoice           string
+	qwenModel             string
+	qwenVoice             string
+	mint                  func(context.Context) (string, error)
+	mintWithPrincipal     func(context.Context) (string, string, error)
+	warm                  *warmMint
+	exchange              func(context.Context, string) (string, error)
+	exchangeWithPrincipal func(context.Context, string) (string, string, error)
+	relayUsage            func(string, json.RawMessage) error
+	circuit               *koe.OpenAICircuit
 }
 
 func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, persona string, state *koe.CallState, disp *koe.Dispatcher, opts koe.ConnectOptions) (*koe.RealtimeConn, koe.RealtimeProvider, error) {
@@ -566,6 +628,44 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 		qwenOpts := opts
 		qwenOpts.Model = c.qwenModel
 		qwenOpts.Voice = c.qwenVoice
+		var principalMu sync.RWMutex
+		qwenPrincipal := ""
+		qwenExchange := func(sctx context.Context, offer string) (string, error) {
+			var answer, principal string
+			var err error
+			if c.exchangeWithPrincipal != nil {
+				answer, principal, err = c.exchangeWithPrincipal(sctx, offer)
+			} else {
+				answer, err = c.exchange(sctx, offer)
+			}
+			if err == nil {
+				principalMu.Lock()
+				qwenPrincipal = strings.TrimSpace(principal)
+				principalMu.Unlock()
+			}
+			return answer, err
+		}
+		if c.relayUsage != nil {
+			var usageFailureOnce sync.Once
+			reportUsageFailure := func(err error) {
+				usageFailureOnce.Do(func() {
+					go reportRealtimeUsageRelayFailure(opts, err)
+				})
+			}
+			original := qwenOpts.OnUsage
+			qwenOpts.OnUsage = func(raw json.RawMessage) {
+				principalMu.RLock()
+				principal := qwenPrincipal
+				principalMu.RUnlock()
+				if err := c.relayUsage(principal, raw); err != nil {
+					reportUsageFailure(err)
+				}
+				if original != nil {
+					original(raw)
+				}
+			}
+			return koe.ConnectQwen(ctx, audio, qwenExchange, persona, state, disp, qwenOpts)
+		}
 		return koe.ConnectQwen(ctx, audio, c.exchange, persona, state, disp, qwenOpts)
 	}
 	if c.mode == koe.ProviderQwen {
@@ -585,7 +685,7 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 	// session ctx is long-lived; without this the only bound is the daemon
 	// client's 30s HTTP timeout, doubling worst-case time-to-fallback.
 	mctx, mcancel := context.WithTimeout(ctx, 15*time.Second)
-	secret, cached, err := c.takeOpenAISecret(mctx)
+	secret, cached, principal, err := c.takeOpenAISecret(mctx)
 	mcancel()
 	if err != nil {
 		err = koe.OpenAIMintError(err)
@@ -597,15 +697,46 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 		}
 		return nil, koe.ProviderOpenAI, err
 	}
+	var reportUsageFailure func(error)
+	if c.relayUsage != nil {
+		var usageFailureOnce sync.Once
+		reportUsageFailure = func(err error) {
+			usageFailureOnce.Do(func() {
+				go reportRealtimeUsageRelayFailure(opts, err)
+			})
+		}
+		original := openAIOpts.OnUsage
+		openAIOpts.OnUsage = func(raw json.RawMessage) {
+			if err := c.relayUsage(principal, raw); err != nil {
+				reportUsageFailure(err)
+			}
+			if original != nil {
+				original(raw)
+			}
+		}
+	}
 	conn, err := koe.Connect(ctx, audio, secret, persona, state, disp, openAIOpts)
 	if err != nil && cached && (c.mode == koe.ProviderOpenAI || !koe.AutoFallbackEligible(err)) {
 		log.Printf("koe[provider]: cached OpenAI secret rejected; retrying once with a fresh mint: %v", err)
 		fctx, fcancel := context.WithTimeout(ctx, 15*time.Second)
-		fresh, mintErr := c.mint(fctx)
+		fresh, freshPrincipal, mintErr := c.mintOpenAISecret(fctx)
 		fcancel()
 		if mintErr != nil {
 			err = koe.OpenAIMintError(mintErr)
 		} else {
+			if c.relayUsage != nil {
+				original := opts.OnUsage
+				openAIOpts.OnUsage = func(raw json.RawMessage) {
+					if err := c.relayUsage(freshPrincipal, raw); err != nil {
+						if reportUsageFailure != nil {
+							reportUsageFailure(err)
+						}
+					}
+					if original != nil {
+						original(raw)
+					}
+				}
+			}
 			conn, err = koe.Connect(ctx, audio, fresh, persona, state, disp, openAIOpts)
 		}
 	}
@@ -622,12 +753,20 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 	return conn, koe.ProviderQwen, qerr
 }
 
-func (c *realtimeConnector) takeOpenAISecret(ctx context.Context) (string, bool, error) {
+func (c *realtimeConnector) takeOpenAISecret(ctx context.Context) (string, bool, string, error) {
 	if c.warm != nil {
 		return c.warm.take(ctx)
 	}
+	secret, principal, err := c.mintOpenAISecret(ctx)
+	return secret, false, principal, err
+}
+
+func (c *realtimeConnector) mintOpenAISecret(ctx context.Context) (string, string, error) {
+	if c.mintWithPrincipal != nil {
+		return c.mintWithPrincipal(ctx)
+	}
 	secret, err := c.mint(ctx)
-	return secret, false, err
+	return secret, "", err
 }
 
 func newBurstID() string {
@@ -798,34 +937,42 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// is limited to the trusted private LAN used by Wireless carriers.
 	client.SetToken(os.Getenv("KOE_DAEMON_TOKEN"))
 
-	// G3: relay each turn's token usage via the daemon to Cloud (fire-and-forget; a
-	// usage failure never interrupts the call, and Koe never sees pricing).
-	onUsage := func(usage json.RawMessage) {
-		go func() {
-			if uerr := client.SendRealtimeUsage(context.Background(), usage); uerr != nil {
-				log.Printf("koe: usage relay failed: %v", uerr)
-			}
-		}()
-	}
+	// G3: hand each turn's token usage to the daemon without blocking the
+	// Realtime event callback. The relay durably spools accepted reports before
+	// fixed workers drain them; Cloud delivery happens in the daemon worker.
+	usageRelay := newRealtimeUsageRelay(client, cfg.openAIKey)
+	defer usageRelay.Close()
+	onUsage := usageRelay.Enqueue
 	// mintEK mints a fresh ephemeral secret (ephemeral keys are short-lived, so this
 	// runs per call): a dev key (--openai-key/OPENAI_API_KEY) takes the direct mint,
 	// else the via-daemon relay (Koe holds no long-lived credential).
 	mintEK := func(mctx context.Context) (string, error) {
-		if cfg.openAIKey != "" {
+		if strings.TrimSpace(cfg.openAIKey) != "" {
 			log.Printf("koe: using dev OpenAI key (direct mint, bypassing daemon relay)")
 			return koe.MintEphemeral(mctx, cfg.openAIKey, cfg.model)
 		}
 		return client.MintViaDaemon(mctx, cfg.model)
 	}
+	var mintWithPrincipal func(context.Context) (string, string, error)
+	if strings.TrimSpace(cfg.openAIKey) == "" {
+		mintWithPrincipal = func(mctx context.Context) (string, string, error) {
+			return client.MintViaDaemonWithPrincipal(mctx, cfg.model)
+		}
+	}
 	connector := &realtimeConnector{
-		mode:        cfg.provider,
-		openAIModel: cfg.model,
-		openAIVoice: cfg.voice,
-		qwenModel:   cfg.qwenModel,
-		qwenVoice:   cfg.qwenVoice,
-		mint:        mintEK,
+		mode:              cfg.provider,
+		openAIModel:       cfg.model,
+		openAIVoice:       cfg.voice,
+		qwenModel:         cfg.qwenModel,
+		qwenVoice:         cfg.qwenVoice,
+		mint:              mintEK,
+		mintWithPrincipal: mintWithPrincipal,
+		relayUsage:        onUsage,
 		exchange: func(sctx context.Context, offer string) (string, error) {
 			return client.ExchangeSDPViaDaemon(sctx, string(koe.ProviderQwen), cfg.qwenModel, offer)
+		},
+		exchangeWithPrincipal: func(sctx context.Context, offer string) (string, string, error) {
+			return client.ExchangeSDPViaDaemonWithPrincipal(sctx, string(koe.ProviderQwen), cfg.qwenModel, offer)
 		},
 		circuit: koe.NewOpenAICircuit(koeOpenAICircuitCooldown()),
 	}
@@ -906,7 +1053,7 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		OnVoiceState:  onVoiceState,
 		Model:         cfg.model,
 		Voice:         cfg.voice,
-		OnUsage:       onUsage,
+		OnUsage:       nil,
 		ResultMailbox: resultMailbox,
 		// Standalone/CLI dismiss (end_call tool or a dismiss phrase) = play the goodbye
 		// cue, then exit the process (there is no warm-session teardown to return to).
@@ -955,7 +1102,7 @@ func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, 
 // the selected backend, /call/end closes the used session and audio, then warms
 // the next session without touching the mic.
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
-	connector *realtimeConnector, onUsage func(json.RawMessage)) error {
+	connector *realtimeConnector, onUsage func(string, json.RawMessage) error) error {
 
 	fullDuplexAEC := cfg.aec == "vpio"
 	// One mailbox spans every warm Realtime session in this resident process. A
@@ -997,7 +1144,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		return state, disp
 	}
 	if cfg.provider != koe.ProviderQwen {
-		connector.warm = newWarmMint(ctx, connector.mint, warmMintTTL)
+		connector.warm = newWarmMintWithPrincipal(ctx, connector.mint, connector.mintWithPrincipal, warmMintTTL)
 	}
 
 	// The RealtimeConn is warmed while idle, then consumed by one foreground call.
@@ -1276,7 +1423,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				OnVoiceLevel:  onVoiceLevel,
 				CallActive:    callActiveFn,
 				ResultMailbox: resultMailbox,
-				OnUsage:       onUsage,
+				OnUsage:       nil,
 				OnEndCall: func() {
 					if endCall != nil {
 						endCall()

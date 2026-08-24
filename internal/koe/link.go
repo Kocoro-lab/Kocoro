@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/executionprofile"
 )
 
@@ -67,59 +68,78 @@ func NewDaemonClient(baseURL string) *DaemonClient {
 // returns the ephemeral "value" (ek_...). This is the production mint path that
 // replaces C-minimal's direct dev-key mint. A fast localhost call → controlClient.
 func (c *DaemonClient) MintViaDaemon(ctx context.Context, model string) (string, error) {
+	value, _, err := c.MintViaDaemonWithPrincipal(ctx, model)
+	return value, err
+}
+
+// MintViaDaemonWithPrincipal returns the daemon-issued opaque account binding
+// captured in the same bootstrap response as the ephemeral secret. Callers
+// that keep a realtime session alive must carry this value with that session;
+// reading the client's current principal later could cross an account switch.
+func (c *DaemonClient) MintViaDaemonWithPrincipal(ctx context.Context, model string) (string, string, error) {
 	body, _ := json.Marshal(map[string]any{"model": model})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/koe/realtime/mint", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: string(raw)}
+		return "", "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: string(raw)}
 	}
 	var mint struct {
-		Value string `json:"value"`
+		Value          string `json:"value"`
+		UsagePrincipal string `json:"usage_principal"`
 	}
 	if err := json.Unmarshal(raw, &mint); err != nil || mint.Value == "" {
-		return "", fmt.Errorf("daemon mint parse failed: %v (body %d bytes)", err, len(raw))
+		return "", "", fmt.Errorf("daemon mint parse failed: %v (body %d bytes)", err, len(raw))
 	}
-	return mint.Value, nil
+	return mint.Value, strings.TrimSpace(mint.UsagePrincipal), nil
 }
 
 // ExchangeSDPViaDaemon sends a WebRTC offer through daemon→Cloud so Qwen's
 // long-lived API key never enters the Koe process.
 func (c *DaemonClient) ExchangeSDPViaDaemon(ctx context.Context, provider, model, offerSDP string) (string, error) {
+	answer, _, err := c.ExchangeSDPViaDaemonWithPrincipal(ctx, provider, model, offerSDP)
+	return answer, err
+}
+
+// ExchangeSDPViaDaemonWithPrincipal returns the answer and the opaque account
+// binding from the same daemon SDP response. The binding is the lease for the
+// resulting realtime session and must not be replaced with a later account.
+func (c *DaemonClient) ExchangeSDPViaDaemonWithPrincipal(ctx context.Context, provider, model, offerSDP string) (string, string, error) {
 	body, _ := json.Marshal(map[string]string{
 		"provider": provider, "model": model, "offer_sdp": offerSDP,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/koe/realtime/sdp", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: string(raw)}
+		return "", "", &RealtimeBootstrapError{StatusCode: resp.StatusCode, Body: string(raw)}
 	}
 	var out struct {
-		AnswerSDP string `json:"answer_sdp"`
+		AnswerSDP      string `json:"answer_sdp"`
+		UsagePrincipal string `json:"usage_principal"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil || strings.TrimSpace(out.AnswerSDP) == "" {
-		return "", fmt.Errorf("daemon SDP parse failed: %v (body %d bytes)", err, len(raw))
+		return "", "", fmt.Errorf("daemon SDP parse failed: %v (body %d bytes)", err, len(raw))
 	}
-	return out.AnswerSDP, nil
+	return out.AnswerSDP, strings.TrimSpace(out.UsagePrincipal), nil
 }
 
 type RealtimeBootstrapError struct {
@@ -164,9 +184,9 @@ func (c *DaemonClient) FetchPersona(ctx context.Context) (string, error) {
 // usage-ingest endpoint returns 503 (retryable) when a realtime usage report fails
 // to persist transiently, and the daemon propagates that status back to Koe; each
 // voice turn emits exactly one usage report, so dropping it on the first 503
-// silently under-bills that turn. SYMPTOM if too low: a transient Cloud/DB blip
-// drops a turn's usage; if too high: a persistent outage keeps the fire-and-forget
-// goroutine spinning longer before giving up. OVERRIDE: KOE_USAGE_RELAY_MAX_ATTEMPTS.
+// silently under-bills that turn. SYMPTOM if too low: a transient daemon/filesystem blip
+// drops a turn's usage; if too high: a persistent local outage delays the
+// synchronous durable handoff longer before giving up. OVERRIDE: KOE_USAGE_RELAY_MAX_ATTEMPTS.
 const realtimeUsageMaxAttempts = 3
 
 // realtimeUsageRetryBackoffMS is the base backoff between usage-relay attempts
@@ -175,20 +195,33 @@ const realtimeUsageMaxAttempts = 3
 const realtimeUsageRetryBackoffMS = 200
 
 // SendRealtimeUsage reports a realtime usage record (model, response_id, token
-// details — built from a response.done event) to the daemon, which relays it to
-// Cloud for server-side cost + quota. Fire-and-forget from the call loop: a usage
-// POST failing must never interrupt the conversation. Koe never sees pricing.
+// details — built from a response.done event) to the daemon's durable outbox.
+// The daemon returns after local persistence; Cloud delivery is asynchronous.
+// A handoff failure is reported to logs but never interrupts the conversation.
+// Koe never sees pricing.
 //
 // Cloud returns 503 when the usage report fails to persist transiently (the daemon
 // forwards that status verbatim), so a 5xx or a transport error is retried with a
 // short backoff up to realtimeUsageMaxAttempts. A 4xx (bad body / auth) is permanent
 // and returns immediately without retry.
 func (c *DaemonClient) SendRealtimeUsage(ctx context.Context, usage json.RawMessage) error {
+	return c.sendRealtimeUsage(ctx, usage, "")
+}
+
+// SendRealtimeUsageWithPrincipal performs the durable handoff with the
+// session's captured bootstrap principal. Keeping this explicit avoids an
+// account switch between bootstrap and response.done silently rebinding an
+// older realtime session to the new account.
+func (c *DaemonClient) SendRealtimeUsageWithPrincipal(ctx context.Context, usage json.RawMessage, principal string) error {
+	return c.sendRealtimeUsage(ctx, usage, principal)
+}
+
+func (c *DaemonClient) sendRealtimeUsage(ctx context.Context, usage json.RawMessage, principal string) error {
 	attempts := koeEnvInt("KOE_USAGE_RELAY_MAX_ATTEMPTS", realtimeUsageMaxAttempts)
 	backoff := time.Duration(koeEnvInt("KOE_USAGE_RELAY_BACKOFF_MS", realtimeUsageRetryBackoffMS)) * time.Millisecond
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		status, err := c.postRealtimeUsage(ctx, usage)
+		status, err := c.postRealtimeUsage(ctx, usage, principal)
 		switch {
 		case err != nil:
 			lastErr = err // transport error — retryable
@@ -215,12 +248,15 @@ func (c *DaemonClient) SendRealtimeUsage(ctx context.Context, usage json.RawMess
 
 // postRealtimeUsage performs one POST /koe/realtime/usage attempt, returning the
 // HTTP status (0 on transport error) so SendRealtimeUsage can gate its retry on 5xx.
-func (c *DaemonClient) postRealtimeUsage(ctx context.Context, usage json.RawMessage) (int, error) {
+func (c *DaemonClient) postRealtimeUsage(ctx context.Context, usage json.RawMessage, principal string) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/koe/realtime/usage", bytes.NewReader(usage))
 	if err != nil {
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if principal = strings.TrimSpace(principal); principal != "" {
+		req.Header.Set(client.RealtimeUsagePrincipalHeader, principal)
+	}
 	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
