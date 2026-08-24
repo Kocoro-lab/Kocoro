@@ -594,7 +594,10 @@ func Load() (*Config, error) {
 	// hybrid clears on a cold prefix (free) or an aggregate budget (bounded
 	// growth); every_turn is the legacy cache-hostile behavior.
 	viper.SetDefault("agent.observation_window_trigger.mode", "hybrid")
-	viper.SetDefault("agent.observation_window_trigger.aggregate_cap_runes", 120000)
+	// Zero is the package-default sentinel. Keeping it unresolved here lets the
+	// agent size the effective cap against observation_window while preserving a
+	// positive YAML value as an explicit operator override.
+	viper.SetDefault("agent.observation_window_trigger.aggregate_cap_runes", 0)
 	viper.SetDefault("agent.observation_window_trigger.cold_cache_gap_minutes", 60)
 	viper.SetDefault("agent.max_recent_images", 50)
 	viper.SetDefault("agent.warm_set_max_schemas", 16)
@@ -1029,44 +1032,47 @@ type overlayToolsConfig struct {
 // buildDefaultSources returns source entries for all config keys set to "default".
 func buildDefaultSources() map[string]ConfigSource {
 	return map[string]ConfigSource{
-		"endpoint":                               {Level: "default"},
-		"api_key":                                {Level: "default"},
-		"model_tier":                             {Level: "default"},
-		"auto_update_check":                      {Level: "default"},
-		"agent.max_iterations":                   {Level: "default"},
-		"agent.temperature":                      {Level: "default"},
-		"agent.max_tokens":                       {Level: "default"},
-		"agent.thinking":                         {Level: "default"},
-		"agent.thinking_mode":                    {Level: "default"},
-		"agent.thinking_budget":                  {Level: "default"},
-		"agent.force_think_tool":                 {Level: "default"},
-		"agent.reasoning_effort":                 {Level: "default"},
-		"agent.effort_tier":                      {Level: "default"},
-		"agent.response_detail":                  {Level: "default"},
-		"agent.service_tier":                     {Level: "default"},
-		"agent.model":                            {Level: "default"},
-		"agent.context_window":                   {Level: "default"},
-		"agent.observation_window":               {Level: "default"},
-		"agent.max_recent_images":                {Level: "default"},
-		"agent.max_recent_browser_images":        {Level: "default"},
-		"agent.warm_set_max_schemas":             {Level: "default"},
-		"agent.warm_set_max_schema_tokens":       {Level: "default"},
-		"agent.idle_soft_timeout_secs":           {Level: "default"},
-		"agent.idle_hard_timeout_secs":           {Level: "default"},
-		"agent.stream_idle_timeout_secs":         {Level: "default"},
-		"agent.interrupted_resume_max_attempts":  {Level: "default"},
-		"agent.interrupted_resume_max_age_hours": {Level: "default"},
-		"agent.interrupted_resume_enabled":       {Level: "default"},
-		"agent.run_event_retention":              {Level: "default"},
-		"agent.run_event_max_age_days":           {Level: "default"},
-		"agent.bash_concurrency_enabled":         {Level: "default"},
-		"tools.bash_timeout":                     {Level: "default"},
-		"tools.bash_max_timeout":                 {Level: "default"},
-		"tools.bash_max_output":                  {Level: "default"},
-		"tools.result_truncation":                {Level: "default"},
-		"tools.browser_result_truncation":        {Level: "default"},
-		"tools.args_truncation":                  {Level: "default"},
-		"tools.server_tool_timeout":              {Level: "default"},
+		"endpoint":                              {Level: "default"},
+		"api_key":                               {Level: "default"},
+		"model_tier":                            {Level: "default"},
+		"auto_update_check":                     {Level: "default"},
+		"agent.max_iterations":                  {Level: "default"},
+		"agent.temperature":                     {Level: "default"},
+		"agent.max_tokens":                      {Level: "default"},
+		"agent.thinking":                        {Level: "default"},
+		"agent.thinking_mode":                   {Level: "default"},
+		"agent.thinking_budget":                 {Level: "default"},
+		"agent.force_think_tool":                {Level: "default"},
+		"agent.reasoning_effort":                {Level: "default"},
+		"agent.effort_tier":                     {Level: "default"},
+		"agent.response_detail":                 {Level: "default"},
+		"agent.service_tier":                    {Level: "default"},
+		"agent.model":                           {Level: "default"},
+		"agent.context_window":                  {Level: "default"},
+		"agent.observation_window":              {Level: "default"},
+		"agent.observation_window_trigger.mode": {Level: "default"},
+		"agent.observation_window_trigger.aggregate_cap_runes":    {Level: "default"},
+		"agent.observation_window_trigger.cold_cache_gap_minutes": {Level: "default"},
+		"agent.max_recent_images":                                 {Level: "default"},
+		"agent.max_recent_browser_images":                         {Level: "default"},
+		"agent.warm_set_max_schemas":                              {Level: "default"},
+		"agent.warm_set_max_schema_tokens":                        {Level: "default"},
+		"agent.idle_soft_timeout_secs":                            {Level: "default"},
+		"agent.idle_hard_timeout_secs":                            {Level: "default"},
+		"agent.stream_idle_timeout_secs":                          {Level: "default"},
+		"agent.interrupted_resume_max_attempts":                   {Level: "default"},
+		"agent.interrupted_resume_max_age_hours":                  {Level: "default"},
+		"agent.interrupted_resume_enabled":                        {Level: "default"},
+		"agent.run_event_retention":                               {Level: "default"},
+		"agent.run_event_max_age_days":                            {Level: "default"},
+		"agent.bash_concurrency_enabled":                          {Level: "default"},
+		"tools.bash_timeout":                                      {Level: "default"},
+		"tools.bash_max_timeout":                                  {Level: "default"},
+		"tools.bash_max_output":                                   {Level: "default"},
+		"tools.result_truncation":                                 {Level: "default"},
+		"tools.browser_result_truncation":                         {Level: "default"},
+		"tools.args_truncation":                                   {Level: "default"},
+		"tools.server_tool_timeout":                               {Level: "default"},
 	}
 }
 
@@ -1127,6 +1133,15 @@ func markGlobalSources(cfg *Config, file string) {
 	}
 	if viper.IsSet("agent.observation_window") {
 		cfg.Sources["agent.observation_window"] = src
+	}
+	if viper.InConfig("agent.observation_window_trigger.mode") {
+		cfg.Sources["agent.observation_window_trigger.mode"] = src
+	}
+	if viper.InConfig("agent.observation_window_trigger.aggregate_cap_runes") {
+		cfg.Sources["agent.observation_window_trigger.aggregate_cap_runes"] = src
+	}
+	if viper.InConfig("agent.observation_window_trigger.cold_cache_gap_minutes") {
+		cfg.Sources["agent.observation_window_trigger.cold_cache_gap_minutes"] = src
 	}
 	if viper.IsSet("agent.max_recent_images") {
 		cfg.Sources["agent.max_recent_images"] = src

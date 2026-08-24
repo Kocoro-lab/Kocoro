@@ -49,17 +49,13 @@ func TestSplitToolCallContent_ImageStaysStructured(t *testing.T) {
 	}
 }
 
-func TestSplitToolCallContent_ImageGetsTextualAnchor(t *testing.T) {
-	// An image-only result must not arrive as an empty string: once the image
-	// ages out of the recent-image window the tool_result would carry no
-	// trace that anything was returned.
+func TestSplitToolCallContent_ImageSummaryWaitsForDecode(t *testing.T) {
+	// The client layer cannot know whether base64 decode/compression will
+	// succeed, so it must not claim that an image was delivered yet.
 	out := splitToolCallContent([]mcpproto.Content{imageBlock("Zm9v", "image/png")})
 
-	if out.Text == "" {
-		t.Fatal("image-only result produced empty text")
-	}
-	if !strings.Contains(out.Text, "1 image returned") {
-		t.Fatalf("anchor missing from %q", out.Text)
+	if out.Text != "" {
+		t.Fatalf("pre-decode image summary leaked into text: %q", out.Text)
 	}
 }
 
@@ -86,7 +82,7 @@ func TestSplitToolCallContent_EmptyResult(t *testing.T) {
 	}
 }
 
-func TestSplitToolCallContent_ImageCapDropsExcessAndSaysSo(t *testing.T) {
+func TestSplitToolCallContent_ImageCapReportsDropCount(t *testing.T) {
 	blocks := []mcpproto.Content{textBlock("gallery")}
 	for i := 0; i < maxToolCallImages+3; i++ {
 		blocks = append(blocks, imageBlock(fmt.Sprintf("img%d", i), "image/png"))
@@ -97,10 +93,8 @@ func TestSplitToolCallContent_ImageCapDropsExcessAndSaysSo(t *testing.T) {
 	if len(out.Images) != maxToolCallImages {
 		t.Fatalf("kept %d images, want the cap %d", len(out.Images), maxToolCallImages)
 	}
-	// Silent truncation reads as "we returned everything" — the drop must be
-	// visible to the model.
-	if !strings.Contains(out.Text, "3 beyond the per-result cap were dropped") {
-		t.Fatalf("drop not disclosed in %q", out.Text)
+	if out.DroppedImages != 3 {
+		t.Fatalf("dropped count = %d, want 3", out.DroppedImages)
 	}
 	// The kept images must be the FIRST ones, in order.
 	for i, img := range out.Images {
@@ -131,8 +125,8 @@ func TestSplitToolCallContent_NonImageNonTextKeepsJSONFallback(t *testing.T) {
 
 func TestSplitToolCallContent_MixedOrderTextPreserved(t *testing.T) {
 	// Text ordering carries meaning (playwright emits "### Result" then
-	// "### Page" then "### Snapshot"); the image anchor is appended last so
-	// it never splits a text sequence.
+	// "### Page" then "### Snapshot"). Image reporting happens after decode
+	// in the tool layer, so the split itself keeps only source text here.
 	out := splitToolCallContent([]mcpproto.Content{
 		textBlock("A"),
 		imageBlock("Zm9v", "image/jpeg"),
@@ -140,10 +134,7 @@ func TestSplitToolCallContent_MixedOrderTextPreserved(t *testing.T) {
 	})
 
 	lines := strings.Split(out.Text, "\n")
-	if len(lines) != 3 || lines[0] != "A" || lines[1] != "B" {
+	if len(lines) != 2 || lines[0] != "A" || lines[1] != "B" {
 		t.Fatalf("text order broken: %q", out.Text)
-	}
-	if !strings.Contains(lines[2], "1 image returned") {
-		t.Fatalf("anchor not last: %q", out.Text)
 	}
 }

@@ -392,12 +392,60 @@ func TestObservationWindow_ZeroValueConfigResolvesToDefaults(t *testing.T) {
 		t.Fatalf("default cap at keep=%d resolved to %d, want the headroom floor %d",
 			defaultObservationWindow, got, wantDefault)
 	}
+	if def.AggregateCapRunes != 0 {
+		t.Fatalf("constructor default aggregate cap = %d, want unresolved zero sentinel", def.AggregateCapRunes)
+	}
+	if got := def.aggregateCapFor(defaultObservationWindow); got != wantDefault {
+		t.Fatalf("constructor default cap at keep=%d resolved to %d, want %d",
+			defaultObservationWindow, got, wantDefault)
+	}
 	explicit := ObservationWindowConfig{AggregateCapRunes: 1_000}
 	if got := explicit.aggregateCapFor(defaultObservationWindow); got != 1_000 {
 		t.Fatalf("explicit cap was overridden to %d; an operator's value must stand", got)
 	}
 	if zero.coldCacheGap() != defaultObservationColdCacheGapMinutes*time.Minute {
 		t.Fatalf("zero cold-cache gap resolved to %v", zero.coldCacheGap())
+	}
+}
+
+func TestObservationWindow_NestedImageResultCountsTowardBudgetAndKeepsImage(t *testing.T) {
+	msgs := []client.Message{{Role: "system", Content: client.NewTextContent("system")}}
+	for i := 0; i < 4; i++ {
+		toolID := fmt.Sprintf("img%02d", i)
+		text := strings.Repeat(fmt.Sprintf("page-%02d ", i), 100)
+		msgs = append(msgs,
+			client.Message{Role: "assistant", Content: client.NewBlockContent([]client.ContentBlock{{
+				Type: "tool_use", ID: toolID, Name: "browser_snapshot", Input: json.RawMessage(`{}`),
+			}})},
+			client.Message{Role: "user", Content: client.NewBlockContent([]client.ContentBlock{
+				client.NewToolResultBlockWithImages(toolID, text, []client.ContentBlock{{
+					Type: "image", Source: &client.ImageSource{Type: "base64", MediaType: "image/png", Data: "aW1hZ2U="},
+				}}, false),
+			})},
+		)
+	}
+
+	if got := filterOldBrowserImages(msgs, 1); got != 3 {
+		t.Fatalf("aged out %d nested images, want 3", got)
+	}
+	if got := observationAggregateRunes(msgs); got == 0 {
+		t.Fatal("nested text+image observations did not count toward the aggregate budget")
+	}
+	cfg := ObservationWindowConfig{Mode: ObservationTriggerBudget, AggregateCapRunes: 1}
+	if got := applyObservationWindow(msgs, 1, time.Now(), cfg); got != 3 {
+		t.Fatalf("stubbed %d nested observations, want 3", got)
+	}
+	if got := toolResultImageCount(msgs); got != 1 {
+		t.Fatalf("image aging plus observation clearing left %d images, want 1", got)
+	}
+	for i := 0; i < 4; i++ {
+		text := browserResultContent(t, msgs, fmt.Sprintf("img%02d", i))
+		if i < 3 && !isObservationStubContent(text) {
+			t.Fatalf("nested observation %d was not stubbed: %q", i, text)
+		}
+		if i == 3 && isObservationStubContent(text) {
+			t.Fatal("most recent nested observation was stubbed")
+		}
 	}
 }
 

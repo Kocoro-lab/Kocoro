@@ -116,7 +116,6 @@ type ObservationWindowConfig struct {
 func DefaultObservationWindowConfig() ObservationWindowConfig {
 	return ObservationWindowConfig{
 		Mode:                ObservationTriggerHybrid,
-		AggregateCapRunes:   defaultObservationAggregateCapRunes,
 		ColdCacheGapMinutes: defaultObservationColdCacheGapMinutes,
 	}
 }
@@ -197,7 +196,7 @@ func observationAggregateRunes(messages []client.Message) int {
 			if b.Type != "tool_result" || !obsIDs[b.ToolUseID] {
 				continue
 			}
-			s, ok := b.ToolContent.(string)
+			s, ok := observationToolResultText(b)
 			if !ok || isObservationStubContent(s) {
 				continue
 			}

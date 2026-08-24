@@ -265,8 +265,12 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	}
 
 	content := normalizeMCPResult(t.serverName, t.tool.Name, out.Text, isError)
+	images, decodeDropped := decodeMCPImages(t.serverName, t.tool.Name, out.Images)
+	content = appendMCPImageSummary(content, len(images), out.DroppedImages+decodeDropped)
 	if isError && looksLikeRemoteValidationError(content) {
-		return agent.ValidationError(strings.TrimPrefix(content, "[validation error] ")), nil
+		result := agent.ValidationError(strings.TrimPrefix(content, "[validation error] "))
+		result.Images = images
+		return result, nil
 	}
 	if !isError && rewrittenOutPath != "" {
 		content = annotateAbsPath(content, rewrittenOutPath)
@@ -277,15 +281,35 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		// can act on. No-op for servers with unknown path semantics.
 		content = maybeAnnotateResultPaths(t.serverName, content, t.manager)
 	}
-	result := agent.ToolResult{Content: content, IsError: isError}
-	// An error result's images are not worth the tokens — the text carries the
-	// failure. A successful one routes them through the same source-time
-	// compression every other image path uses (imaging.go), so the wire-level
-	// and persist-time guards see an already-bounded payload.
-	if !isError {
-		result.Images = decodeMCPImages(t.serverName, t.tool.Name, out.Images)
-	}
+	result := agent.ToolResult{Content: content, IsError: isError, Images: images}
 	return result, nil
+}
+
+func appendMCPImageSummary(content string, delivered, dropped int) string {
+	if delivered == 0 && dropped == 0 {
+		return content
+	}
+	imageNoun := "images"
+	if delivered == 1 {
+		imageNoun = "image"
+	}
+	droppedNoun := "images"
+	if dropped == 1 {
+		droppedNoun = "image"
+	}
+	var note string
+	switch {
+	case delivered > 0 && dropped > 0:
+		note = fmt.Sprintf("[%d %s returned; %d could not be delivered]", delivered, imageNoun, dropped)
+	case delivered > 0:
+		note = fmt.Sprintf("[%d %s returned]", delivered, imageNoun)
+	default:
+		note = fmt.Sprintf("[%d %s could not be delivered]", dropped, droppedNoun)
+	}
+	if content == "" {
+		return note
+	}
+	return content + "\n" + note
 }
 
 // decodeMCPImages converts an MCP result's images into vision-compatible
@@ -293,15 +317,17 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 // line rather than failing the call: the text content is usually the primary
 // answer, and a broken image must never turn a completed tool call into an
 // error.
-func decodeMCPImages(serverName, toolName string, imgs []mcp.ToolCallImage) []agent.ImageBlock {
+func decodeMCPImages(serverName, toolName string, imgs []mcp.ToolCallImage) ([]agent.ImageBlock, int) {
 	if len(imgs) == 0 {
-		return nil
+		return nil, 0
 	}
 	blocks := make([]agent.ImageBlock, 0, len(imgs))
+	dropped := 0
 	for i, img := range imgs {
 		raw, err := base64.StdEncoding.DecodeString(img.Base64)
 		if err != nil {
 			log.Printf("[mcp-tool] %s/%s: image %d has undecodable base64 (%v), dropped", serverName, toolName, i, err)
+			dropped++
 			continue
 		}
 		mediaType := img.MIMEType
@@ -311,14 +337,15 @@ func decodeMCPImages(serverName, toolName string, imgs []mcp.ToolCallImage) []ag
 		block, err := EncodeImageBytes(raw, mediaType)
 		if err != nil {
 			log.Printf("[mcp-tool] %s/%s: image %d failed compression (%v), dropped", serverName, toolName, i, err)
+			dropped++
 			continue
 		}
 		blocks = append(blocks, block)
 	}
 	if len(blocks) == 0 {
-		return nil
+		return nil, dropped
 	}
-	return blocks
+	return blocks, dropped
 }
 
 func (t *MCPTool) blockPlaywrightXComposerNavigation(args map[string]any) (bool, agent.ToolResult) {

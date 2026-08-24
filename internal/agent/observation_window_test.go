@@ -10,10 +10,8 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
-// browserResultContent extracts the string content of the tool_result block
-// carrying the given tool_use ID. Fails the test if it is absent or not a
-// string (screenshot image results use nested blocks and are out of scope for
-// the text observation window).
+// browserResultContent extracts the observation text from either string or
+// nested text+image tool_result content.
 func browserResultContent(t *testing.T, msgs []client.Message, toolID string) string {
 	t.Helper()
 	for _, m := range msgs {
@@ -22,9 +20,9 @@ func browserResultContent(t *testing.T, msgs []client.Message, toolID string) st
 		}
 		for _, b := range m.Content.Blocks() {
 			if b.Type == "tool_result" && b.ToolUseID == toolID {
-				s, ok := b.ToolContent.(string)
+				s, ok := observationToolResultText(b)
 				if !ok {
-					t.Fatalf("tool_result %s content is %T, want string", toolID, b.ToolContent)
+					t.Fatalf("tool_result %s content is %T, want observation text", toolID, b.ToolContent)
 				}
 				return s
 			}

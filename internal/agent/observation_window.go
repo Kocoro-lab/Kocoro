@@ -31,6 +31,54 @@ func isObservationStubContent(s string) bool {
 	return strings.HasPrefix(s, observationStubPrefix)
 }
 
+// observationToolResultText returns the model-visible observation text from
+// either legacy string content or a nested text+image tool result. The loop
+// uses the nested shape whenever a tool returns images, so treating only the
+// string form as text would let screenshot-bearing browser results bypass both
+// the aggregate budget and the observation window.
+func observationToolResultText(b client.ContentBlock) (string, bool) {
+	if b.Type != "tool_result" {
+		return "", false
+	}
+	switch content := b.ToolContent.(type) {
+	case string:
+		return content, true
+	case []client.ContentBlock:
+		for _, nested := range content {
+			if nested.Type == "text" {
+				return nested.Text, true
+			}
+		}
+	}
+	return "", false
+}
+
+// stubObservationToolResult replaces only the observation text and preserves
+// nested images or image-removal markers. Image aging is a separate policy;
+// clearing old page text must not silently remove the remaining visual state.
+func stubObservationToolResult(b client.ContentBlock, tool string) (client.ContentBlock, bool) {
+	existing, ok := observationToolResultText(b)
+	if !ok || isObservationStubContent(existing) {
+		return b, false
+	}
+	stub := browserObservationStub(tool, utf8.RuneCountInString(existing))
+	switch content := b.ToolContent.(type) {
+	case string:
+		b.ToolContent = stub
+		return b, true
+	case []client.ContentBlock:
+		nested := append([]client.ContentBlock(nil), content...)
+		for i := range nested {
+			if nested[i].Type == "text" {
+				nested[i].Text = stub
+				b.ToolContent = nested
+				return b, true
+			}
+		}
+	}
+	return b, false
+}
+
 // defaultObservationWindow is the number of most-recent browser/GUI
 // observations kept at full fidelity.
 //
@@ -151,8 +199,9 @@ func collectObservationToolUseIDs(messages []client.Message) (ids []string, name
 //   - keep <= 0 disables it entirely (no-op).
 //   - Only browser/GUI tools (isGUIToolName) are touched; file_read, bash,
 //     grep, http and conversational user/assistant turns are never trimmed here.
-//   - Only string tool_result content is stubbed; screenshot/image results use
-//     nested blocks and are aged out separately by filterOldImages.
+//   - String and nested text+image tool_result content are both supported; only
+//     the observation text is stubbed, while nested images are preserved for
+//     the separate image-aging policies.
 //   - Idempotent: already-stubbed content is skipped so re-runs don't redirty
 //     bytes or fragment the prompt-cache prefix.
 //
@@ -182,10 +231,8 @@ func filterOldObservations(messages []client.Message, keep int) int {
 		touched := false
 		for j, b := range blocks {
 			if b.Type == "tool_result" && stubSet[b.ToolUseID] {
-				// Only string content is bulky page text; nested-block results
-				// (screenshots) are handled by filterOldImages, so leave them.
-				if existing, ok := b.ToolContent.(string); ok && !isObservationStubContent(existing) {
-					b.ToolContent = browserObservationStub(names[b.ToolUseID], utf8.RuneCountInString(existing))
+				if stubbedBlock, changed := stubObservationToolResult(b, names[b.ToolUseID]); changed {
+					b = stubbedBlock
 					touched = true
 					stubbed++
 				}

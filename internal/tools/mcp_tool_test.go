@@ -212,6 +212,56 @@ func (c *countingSuccessClient) CallTool(ctx context.Context, r mcpgo.CallToolRe
 	return c.successCallToolClient.CallTool(ctx, r)
 }
 
+type fixedToolResultClient struct {
+	successCallToolClient
+	result *mcpgo.CallToolResult
+}
+
+func (c *fixedToolResultClient) CallTool(context.Context, mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	return c.result, nil
+}
+
+func TestMCPTool_Run_ErrorImageIsPreservedAndAccuratelyReported(t *testing.T) {
+	const onePixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	fake := &fixedToolResultClient{result: &mcpgo.CallToolResult{
+		Content: []mcpgo.Content{
+			mcpgo.TextContent{Type: "text", Text: "remote failure"},
+			mcpgo.ImageContent{Type: "image", Data: onePixelPNG, MIMEType: "image/png"},
+		},
+		IsError: true,
+	}}
+	mgr := mcp.NewClientManager()
+	mgr.SeedConfig("vision", mcp.MCPServerConfig{Command: "dummy"})
+	mgr.SeedClient("vision", fake)
+
+	result, err := NewMCPTool("vision", mcpgo.Tool{Name: "inspect"}, mgr).Run(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("MCP isError was lost")
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("error result delivered %d images, want 1", len(result.Images))
+	}
+	if !strings.Contains(result.Content, "[1 image returned]") {
+		t.Fatalf("delivered image summary missing from %q", result.Content)
+	}
+}
+
+func TestDecodeMCPImages_DropSummaryMatchesDelivery(t *testing.T) {
+	images, dropped := decodeMCPImages("vision", "inspect", []mcp.ToolCallImage{{
+		MIMEType: "image/png",
+		Base64:   "not-base64",
+	}})
+	if len(images) != 0 || dropped != 1 {
+		t.Fatalf("images=%d dropped=%d, want 0/1", len(images), dropped)
+	}
+	if got := appendMCPImageSummary("", len(images), dropped); got != "[1 image could not be delivered]" {
+		t.Fatalf("drop summary = %q", got)
+	}
+}
+
 // alwaysErrClient fails every CallTool with a fixed error (ListTools stays
 // healthy so supervisor probes succeed). Optional onCall hook fires before
 // returning.

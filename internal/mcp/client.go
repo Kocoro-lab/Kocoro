@@ -603,8 +603,9 @@ type ToolCallImage struct {
 // (normalization, path annotation, truncation), Images bypass all of it and
 // become image content blocks.
 type ToolCallContent struct {
-	Text   string
-	Images []ToolCallImage
+	Text          string
+	Images        []ToolCallImage
+	DroppedImages int
 }
 
 // CallTool invokes a tool on the specified MCP server and returns only the
@@ -819,7 +820,6 @@ const maxToolCallImages = 8
 func splitToolCallContent(blocks []mcp.Content) ToolCallContent {
 	out := ToolCallContent{}
 	var texts []string
-	dropped := 0
 
 	for _, block := range blocks {
 		switch c := block.(type) {
@@ -827,7 +827,7 @@ func splitToolCallContent(blocks []mcp.Content) ToolCallContent {
 			texts = append(texts, c.Text)
 		case mcp.ImageContent:
 			if len(out.Images) >= maxToolCallImages {
-				dropped++
+				out.DroppedImages++
 				continue
 			}
 			out.Images = append(out.Images, ToolCallImage{
@@ -838,22 +838,6 @@ func splitToolCallContent(blocks []mcp.Content) ToolCallContent {
 			b, _ := json.Marshal(block)
 			texts = append(texts, string(b))
 		}
-	}
-
-	// Give the images a textual anchor. Without it a result whose only
-	// content was an image arrives as an empty string, and once the image
-	// ages out of the recent-image window the tool_result carries no trace
-	// that anything was ever returned.
-	if n := len(out.Images); n > 0 {
-		noun := "image"
-		if n > 1 {
-			noun = "images"
-		}
-		note := fmt.Sprintf("[%d %s returned]", n, noun)
-		if dropped > 0 {
-			note = fmt.Sprintf("[%d %s returned; %d beyond the per-result cap were dropped]", n, noun, dropped)
-		}
-		texts = append(texts, note)
 	}
 
 	out.Text = strings.Join(texts, "\n")
