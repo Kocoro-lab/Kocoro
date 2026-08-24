@@ -168,6 +168,13 @@ type Server struct {
 	// that do not go through NewServer.
 	realtimeUsageOutboxMu sync.Mutex
 	realtimeUsageOutbox   *realtimeUsageOutbox
+	// realtimeUsageLegacy is the one-account compatibility binding for
+	// pre-principal Koe clients. It is intentionally separate from the durable
+	// outbox: a headerless report may be admitted only within the same verified
+	// auth epoch that first established this binding.
+	realtimeUsageLegacyMu    sync.Mutex
+	realtimeUsageLegacy      realtimeUsageLegacyBinding
+	realtimeUsageLegacyBound bool
 }
 
 // requireDeps returns true if s.deps is non-nil, otherwise writes a 500

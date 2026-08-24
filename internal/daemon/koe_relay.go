@@ -10,6 +10,51 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 )
 
+// realtimeUsageLegacyBinding is the daemon-local identity for a pre-principal
+// Koe process. Older clients cannot echo the bootstrap principal, so the first
+// headerless report is admitted only against the currently verified account and
+// its auth epoch. Keeping that epoch pinned makes a later account switch fail
+// closed instead of rebinding an old session's report to the new account.
+type realtimeUsageLegacyBinding struct {
+	auth      *AuthManager
+	gateway   *client.GatewayClient
+	accountID string
+	epoch     uint64
+	principal string
+}
+
+func (s *Server) realtimeUsageLegacyPrincipal() (string, bool) {
+	if s == nil || s.auth == nil || s.deps == nil || s.deps.GW == nil {
+		return "", false
+	}
+	accountID, epoch, ok := s.auth.VerifiedPrincipal()
+	if !ok {
+		return "", false
+	}
+	boundAccount, bound := s.deps.GW.IntegrationPrincipal()
+	if !bound || boundAccount != accountID {
+		return "", false
+	}
+	candidate := realtimeUsageLegacyBinding{
+		auth:      s.auth,
+		gateway:   s.deps.GW,
+		accountID: accountID,
+		epoch:     epoch,
+		principal: realtimeUsagePrincipalFingerprint("account", accountID),
+	}
+	s.realtimeUsageLegacyMu.Lock()
+	defer s.realtimeUsageLegacyMu.Unlock()
+	if s.realtimeUsageLegacyBound {
+		if s.realtimeUsageLegacy != candidate {
+			return "", false
+		}
+		return candidate.principal, true
+	}
+	s.realtimeUsageLegacy = candidate
+	s.realtimeUsageLegacyBound = true
+	return candidate.principal, true
+}
+
 // handleKoeRealtimeMint relays Koe's request for a Realtime ephemeral
 // client secret to the Cloud gateway. Koe (the voice front brain) runs as a
 // separate `shan koe` process and must never hold a long-lived credential — it
@@ -107,18 +152,21 @@ func (s *Server) handleKoeRealtimeUsage(w http.ResponseWriter, r *http.Request) 
 	}
 	principal := strings.TrimSpace(r.Header.Get(client.RealtimeUsagePrincipalHeader))
 	if principal == "" {
-		// Auth-managed daemons cannot infer which long-lived realtime session
-		// produced a legacy report after an account switch. Only the legacy
-		// endpoint/key deployment, whose credential is process-scoped and does
-		// not support in-process account switching, may derive this binding.
-		if s.auth != nil {
-			writeError(w, http.StatusBadRequest, "realtime usage principal required")
-			return
-		}
 		var ok bool
-		principal, ok = s.realtimeUsagePrincipal()
+		if s.auth != nil {
+			// Rolling upgrades leave an older Koe process without the principal
+			// header. Admit its first report only under the verified local
+			// account+epoch captured by realtimeUsageLegacyPrincipal; a later
+			// account switch therefore cannot rebind the old process to the new
+			// account.
+			principal, ok = s.realtimeUsageLegacyPrincipal()
+		} else {
+			principal, ok = s.realtimeUsagePrincipal()
+		}
 		if !ok {
-			writeError(w, http.StatusBadRequest, "realtime usage principal required")
+			// 503 keeps pre-upgrade clients' retry path alive while the daemon
+			// is signed out, switching accounts, or still binding its gateway.
+			writeError(w, http.StatusServiceUnavailable, "realtime usage principal unavailable")
 			return
 		}
 	} else if !validRealtimeUsagePrincipal(principal) {
