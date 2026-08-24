@@ -2244,6 +2244,27 @@ func historySnapshotForRequest(sess *session.Session, req RunAgentRequest) []cli
 	return sess.HistoryForLoop()
 }
 
+// lastAssistantAtForSession recovers prompt-cache warmth across daemon
+// requests, where each RunAgent call creates a fresh AgentLoop. MessageMeta is
+// authoritative for current sessions. UpdatedAt is only a compatibility
+// fallback when a legacy session contains an assistant message without a
+// timestamp; callers invoke this before saving the new user message.
+func lastAssistantAtForSession(sess *session.Session) time.Time {
+	if sess == nil {
+		return time.Time{}
+	}
+	for i := len(sess.Messages) - 1; i >= 0; i-- {
+		if sess.Messages[i].Role != "assistant" {
+			continue
+		}
+		if i < len(sess.MessageMeta) && sess.MessageMeta[i].Timestamp != nil {
+			return *sess.MessageMeta[i].Timestamp
+		}
+		return sess.UpdatedAt
+	}
+	return time.Time{}
+}
+
 func configureDaemonComputerUseDispatcher(
 	reg *agent.ToolRegistry,
 	dispatcherReady bool,
@@ -3077,6 +3098,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 		sessMgr.NewSession()
 	}
 	sess := sessMgr.Current()
+	lastAssistantAt := lastAssistantAtForSession(sess)
 	if route != nil && sess != nil {
 		route.storeSessionID(sess.ID)
 	}
@@ -3746,6 +3768,7 @@ func RunAgent(ctx context.Context, deps *ServerDeps, req RunAgentRequest, handle
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
 	loop.SetObservationWindow(runCfg.Agent.ObservationWindow)
 	loop.SetObservationWindowConfig(runCfg.Agent.ObservationWindowTrigger.Runtime())
+	loop.SetLastAssistantAt(lastAssistantAt)
 	loop.SetBrowserObservationMaxChars(runCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runCfg.Agent.MaxRecentBrowserImages)

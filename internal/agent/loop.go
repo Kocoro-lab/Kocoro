@@ -836,7 +836,7 @@ type AgentLoop struct {
 	// Browser/GUI context trimming (see observation_window.go). All default to
 	// the package-level defaults in NewAgentLoop so every construction path
 	// (daemon/TUI/one-shot) gets the cost reduction; runner overrides from config.
-	observationWindow      int // full-fidelity browser/GUI observations retained; 0 disables
+	observationWindow int // full-fidelity browser/GUI observations retained; 0 disables
 	// observationWindowCfg selects WHEN the observation window clears (see
 	// observation_trigger.go). Per-iteration evaluation is cache-hostile;
 	// the default policy clears on a cold prefix or an aggregate budget.
@@ -1053,9 +1053,9 @@ type AgentLoop struct {
 	// compressOldToolResults directly under context-pressure.
 	timeBasedCompactCfg TimeBasedCompactConfig
 	// lastAssistantAt is updated to time.Now() after every successful LLM
-	// response. Persists across Run() calls when the AgentLoop instance is
-	// reused (e.g. routed daemon sessions, TUI). Zero-valued for fresh loops
-	// — evaluateTimeBasedCompactTrigger short-circuits in that case.
+	// response. Callers that create a loop per request seed it from durable
+	// session history with SetLastAssistantAt. Zero means no prior assistant
+	// response is known.
 	lastAssistantAt time.Time
 
 	// Watchdog thresholds (0 = disabled). The watchdog observes the loop's
@@ -2116,11 +2116,25 @@ func (a *AgentLoop) SetObservationWindowConfig(cfg ObservationWindowConfig) {
 	a.observationWindowCfg = cfg
 }
 
+// SetLastAssistantAt restores the most recent durable assistant-response time
+// for callers that create a fresh AgentLoop for every request.
+func (a *AgentLoop) SetLastAssistantAt(at time.Time) {
+	a.lastAssistantAt = at
+}
+
 // SetBrowserObservationMaxChars overrides the per-observation capture cap for
 // browser/GUI tool results (runes). A non-positive value falls back to the
 // generic tools.result_truncation cap.
 func (a *AgentLoop) SetBrowserObservationMaxChars(n int) {
 	a.browserObsMaxChars = n
+}
+
+func (a *AgentLoop) browserObservationMaxChars() int {
+	maxChars := a.resultTrunc
+	if a.browserObsMaxChars > 0 && (maxChars <= 0 || a.browserObsMaxChars < maxChars) {
+		maxChars = a.browserObsMaxChars
+	}
+	return maxChars
 }
 
 // SetMaxRecentImages overrides how many recent image-bearing messages are kept
@@ -4555,10 +4569,11 @@ iterationLoop:
 		// cold (free) or when accumulated observation text crosses its
 		// aggregate budget (bounded growth), not on a fixed per-turn count.
 		// No-op when the window is disabled (<=0) or the trigger does not fire.
-		_ = applyObservationWindow(
+		_ = applyObservationWindowWithCaptureCap(
 			messages,
 			a.observationWindow,
 			a.lastAssistantAt,
+			a.browserObservationMaxChars(),
 			a.observationWindowCfg,
 		)
 

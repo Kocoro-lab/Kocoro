@@ -131,7 +131,7 @@ func (c ObservationWindowConfig) mode() ObservationTriggerMode {
 // The floor keeps minObservationHeadroom observations' worth of room above
 // what a pass leaves behind, so the trigger cannot re-fire immediately at a
 // larger keep.
-func (c ObservationWindowConfig) aggregateCapFor(keep int) int {
+func (c ObservationWindowConfig) aggregateCapFor(keep, observationMaxRunes int) int {
 	// An explicitly configured cap is honored verbatim, floor included. An
 	// operator who sets a deliberately tight value is choosing frequent
 	// clearing with its cache cost; silently widening it would be the same
@@ -142,8 +142,11 @@ func (c ObservationWindowConfig) aggregateCapFor(keep int) int {
 		return c.AggregateCapRunes
 	}
 	cap := defaultObservationAggregateCapRunes
+	if observationMaxRunes <= 0 {
+		observationMaxRunes = defaultBrowserObservationMaxChars
+	}
 	if keep > 0 {
-		if floor := (keep + minObservationHeadroom) * defaultBrowserObservationMaxChars; floor > cap {
+		if floor := (keep + minObservationHeadroom) * observationMaxRunes; floor > cap {
 			cap = floor
 		}
 	}
@@ -212,6 +215,7 @@ func observationWindowShouldFire(
 	messages []client.Message,
 	keep int,
 	lastAssistantAt time.Time,
+	observationMaxRunes int,
 	cfg ObservationWindowConfig,
 ) (reason string, fire bool) {
 	switch cfg.mode() {
@@ -228,7 +232,7 @@ func observationWindowShouldFire(
 		return "warm_cache", false
 
 	case ObservationTriggerBudget:
-		if observationAggregateRunes(messages) > cfg.aggregateCapFor(keep) {
+		if observationAggregateRunes(messages) > cfg.aggregateCapFor(keep, observationMaxRunes) {
 			return "budget", true
 		}
 		return "under_budget", false
@@ -237,7 +241,7 @@ func observationWindowShouldFire(
 		if observationCacheIsCold(lastAssistantAt, cfg) {
 			return "cold_cache", true
 		}
-		if observationAggregateRunes(messages) > cfg.aggregateCapFor(keep) {
+		if observationAggregateRunes(messages) > cfg.aggregateCapFor(keep, observationMaxRunes) {
 			return "budget", true
 		}
 		return "warm_under_budget", false
@@ -270,10 +274,28 @@ func applyObservationWindow(
 	lastAssistantAt time.Time,
 	cfg ObservationWindowConfig,
 ) int {
+	return applyObservationWindowWithCaptureCap(
+		messages, keep, lastAssistantAt, defaultBrowserObservationMaxChars, cfg,
+	)
+}
+
+// applyObservationWindowWithCaptureCap keeps the derived aggregate threshold
+// coherent with the actual per-observation capture cap. This matters when an
+// operator raises tools.browser_result_truncation above its default: after a
+// clearing pass, retained observations still leave the configured headroom.
+func applyObservationWindowWithCaptureCap(
+	messages []client.Message,
+	keep int,
+	lastAssistantAt time.Time,
+	observationMaxRunes int,
+	cfg ObservationWindowConfig,
+) int {
 	if keep <= 0 {
 		return 0
 	}
-	if _, fire := observationWindowShouldFire(messages, keep, lastAssistantAt, cfg); !fire {
+	if _, fire := observationWindowShouldFire(
+		messages, keep, lastAssistantAt, observationMaxRunes, cfg,
+	); !fire {
 		return 0
 	}
 	return filterOldObservations(messages, keep)

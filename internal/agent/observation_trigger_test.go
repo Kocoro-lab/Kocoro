@@ -388,23 +388,42 @@ func TestObservationWindow_ZeroValueConfigResolvesToDefaults(t *testing.T) {
 	// The DEFAULT cap is raised to the headroom floor so it stays coherent as
 	// keep is tuned; an explicit cap is honored verbatim.
 	wantDefault := (defaultObservationWindow + minObservationHeadroom) * defaultBrowserObservationMaxChars
-	if got := zero.aggregateCapFor(defaultObservationWindow); got != wantDefault {
+	if got := zero.aggregateCapFor(defaultObservationWindow, defaultBrowserObservationMaxChars); got != wantDefault {
 		t.Fatalf("default cap at keep=%d resolved to %d, want the headroom floor %d",
 			defaultObservationWindow, got, wantDefault)
 	}
 	if def.AggregateCapRunes != 0 {
 		t.Fatalf("constructor default aggregate cap = %d, want unresolved zero sentinel", def.AggregateCapRunes)
 	}
-	if got := def.aggregateCapFor(defaultObservationWindow); got != wantDefault {
+	if got := def.aggregateCapFor(defaultObservationWindow, defaultBrowserObservationMaxChars); got != wantDefault {
 		t.Fatalf("constructor default cap at keep=%d resolved to %d, want %d",
 			defaultObservationWindow, got, wantDefault)
 	}
 	explicit := ObservationWindowConfig{AggregateCapRunes: 1_000}
-	if got := explicit.aggregateCapFor(defaultObservationWindow); got != 1_000 {
+	if got := explicit.aggregateCapFor(defaultObservationWindow, 60_000); got != 1_000 {
 		t.Fatalf("explicit cap was overridden to %d; an operator's value must stand", got)
+	}
+	raisedCaptureCap := 60_000
+	wantRaised := (defaultObservationWindow + minObservationHeadroom) * raisedCaptureCap
+	if got := zero.aggregateCapFor(defaultObservationWindow, raisedCaptureCap); got != wantRaised {
+		t.Fatalf("default cap with %d-rune captures resolved to %d, want %d",
+			raisedCaptureCap, got, wantRaised)
 	}
 	if zero.coldCacheGap() != defaultObservationColdCacheGapMinutes*time.Minute {
 		t.Fatalf("zero cold-cache gap resolved to %v", zero.coldCacheGap())
+	}
+}
+
+func TestAgentLoopBrowserObservationMaxCharsUsesEffectiveCaptureCap(t *testing.T) {
+	loop := NewAgentLoop(nil, NewToolRegistry(), "", "", 1, 100_000, 1, nil, nil, nil)
+	loop.SetBrowserObservationMaxChars(60_000)
+	if got := loop.browserObservationMaxChars(); got != 60_000 {
+		t.Fatalf("effective browser observation cap = %d, want 60000", got)
+	}
+
+	loop.SetBrowserObservationMaxChars(0)
+	if got := loop.browserObservationMaxChars(); got != 100_000 {
+		t.Fatalf("fallback browser observation cap = %d, want generic 100000", got)
 	}
 }
 

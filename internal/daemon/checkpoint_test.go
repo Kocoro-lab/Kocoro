@@ -22,6 +22,54 @@ type usageStub struct{ usage agent.AccumulatedUsage }
 
 func (u *usageStub) Usage() agent.AccumulatedUsage { return u.usage }
 
+func TestLastAssistantAtForSession(t *testing.T) {
+	assistantAt := time.Now().Add(-2 * time.Minute).Round(0)
+	legacyUpdatedAt := assistantAt.Add(time.Minute)
+	tests := []struct {
+		name string
+		sess *session.Session
+		want time.Time
+	}{
+		{name: "nil session"},
+		{
+			name: "current user message does not hide prior assistant timestamp",
+			sess: &session.Session{
+				UpdatedAt: legacyUpdatedAt,
+				Messages: []client.Message{
+					{Role: "user"}, {Role: "assistant"}, {Role: "user"},
+				},
+				MessageMeta: []session.MessageMeta{
+					{}, {Timestamp: session.TimePtr(assistantAt)}, {Timestamp: session.TimePtr(time.Now())},
+				},
+			},
+			want: assistantAt,
+		},
+		{
+			name: "legacy assistant falls back to pre-turn session update",
+			sess: &session.Session{
+				UpdatedAt: legacyUpdatedAt,
+				Messages:  []client.Message{{Role: "assistant"}},
+			},
+			want: legacyUpdatedAt,
+		},
+		{
+			name: "session without assistant stays cold",
+			sess: &session.Session{
+				UpdatedAt: legacyUpdatedAt,
+				Messages:  []client.Message{{Role: "user"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := lastAssistantAtForSession(tt.sess); !got.Equal(tt.want) {
+				t.Fatalf("last assistant time = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // Here we exercise applyRunMessagesToSession directly with a hand-built
 // session and fake loop-messages via agent.SetRunMessagesForTest. The
 // function is the idempotency linchpin, so it deserves direct coverage.
