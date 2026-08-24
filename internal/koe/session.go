@@ -27,6 +27,25 @@ type SessionConfig struct {
 	// ControlApp asks the host UI to act (show/hide/new_conversation/open_settings).
 	// Optional.
 	ControlApp func(action string)
+	// TaskBackend executes delegated work (do_task/cancel/agent listing) through
+	// the host application. Optional; nil keeps the DaemonClient path against
+	// BackendURL. On iOS the host relays to Shannon Cloud's remote-run channel —
+	// BackendURL alone is a dead end there because Cloud does not speak the
+	// daemon's local /message protocol.
+	TaskBackend ExternalTaskBackend
+	// FullDuplexAEC declares that the host's audio path has echo cancellation
+	// and keeps the mic live while Kocoro speaks (iOS WebRTC runs Apple's VPIO
+	// voice processing). It arms the same runtime floor gate webrtc.go arms on
+	// macOS; without it nativeFloorEnabled() is false and barge-in cannot work
+	// no matter what the session.update advertised.
+	FullDuplexAEC bool
+	// OnEndCall tears the call down when the brain accepts a hang-up — the
+	// end_call voice tool or the ASR dismiss-phrase backstop (which stays
+	// disarmed while this is nil). The brain has already stopped its output and
+	// entered its local terminal when this fires; the host closes transport and
+	// audio. macOS wires the equivalent closure in cmd/koe.go. Optional, but a
+	// host that leaves it nil cannot be hung up by voice.
+	OnEndCall func()
 }
 
 // Session is the exported handle on the front brain.
@@ -41,6 +60,7 @@ type Session struct {
 	state     *CallState
 	send      func(any) error
 	sendCount int64
+	cancel    context.CancelFunc
 }
 
 // NewSession wires the front brain against host-supplied audio and transport.
@@ -48,7 +68,12 @@ func NewSession(cfg SessionConfig) *Session {
 	s := &Session{}
 	s.state = NewCallState(cfg.BurstID, cfg.BoundAgent)
 
-	client := NewDaemonClient(cfg.BackendURL)
+	var client Backend
+	if cfg.TaskBackend != nil {
+		client = newExternalBackend(cfg.TaskBackend)
+	} else {
+		client = NewDaemonClient(cfg.BackendURL)
+	}
 	resolver := NewAgentResolver(nil, nil)
 
 	var controlApp ControlAppFunc
@@ -59,6 +84,19 @@ func NewSession(cfg SessionConfig) *Session {
 		}
 	}
 	disp := NewDispatcher(client, resolver, s.state, controlApp)
+	if cfg.TaskBackend != nil {
+		// Registry fetch stays off the call-start critical path (ListAgents can
+		// block up to 30s — same rule as cmd/koe.go's deferred resolverHolder).
+		// Until it lands, named agents are unresolved, exactly like an empty
+		// registry; a fetch error keeps that state.
+		go func() {
+			agents, err := client.ListAgents(context.Background())
+			if err != nil || len(agents) == 0 {
+				return
+			}
+			disp.SetResolver(NewAgentResolver(agents, NoopSemanticMatcher{}))
+		}()
+	}
 
 	sendFn := func(v any) error {
 		atomic.AddInt64(&s.sendCount, 1)
@@ -74,7 +112,28 @@ func NewSession(cfg SessionConfig) *Session {
 
 	s.send = sendFn
 	s.handler = newEventHandler(disp, s.state, NewExternalAudioController(cfg.Audio), sendFn)
+	s.handler.onEndCall = cfg.OnEndCall
+	s.handler.fullDuplexAEC = cfg.FullDuplexAEC
+	// The mailbox delivery worker. macOS starts it in Connect (webrtc.go); the
+	// façade owns it here because the host owns the transport. Without it a
+	// completed do_task result stays parked in the mailbox forever — never
+	// injected, never spoken — and the model keeps answering "no news yet"
+	// about work the daemon finished long ago (2026-08-21 iOS device log).
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	go s.handler.runResponseSender(ctx)
 	return s
+}
+
+// Close ends the call's delivery scope: it stops the mailbox worker and retires
+// the burst so results landing after hang-up are dropped from voice delivery
+// (the daemon session still holds the durable report — same contract as
+// cmd/koe.go's RetireBurst on call end). Safe to call more than once.
+func (s *Session) Close() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.handler.resultMailbox.RetireBurst(s.state.BurstID())
 }
 
 // HandleEvent feeds one Realtime server event to the brain. `raw` is the JSON

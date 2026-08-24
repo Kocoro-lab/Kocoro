@@ -8,8 +8,26 @@
 package koebind
 
 import (
+	"os"
+
 	"github.com/Kocoro-lab/ShanClaw/internal/koe"
 )
+
+// SetBargeIn allows the user to interrupt Kocoro by talking over it. It arms
+// the same env gate cmd/koe.go's --barge-in flag arms, so the shared brain's
+// talk-over path (server-VAD speech_started → pause playback → native floor
+// judge) behaves identically on both platforms. Call it before NewBridge.
+//
+// It must be a Go-side setter: the Go runtime snapshots the process environment
+// at init, so a setenv from Swift after the framework loads is invisible to
+// os.Getenv.
+func SetBargeIn(enabled bool) {
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	os.Setenv("KOE_VPIO_BARGE_IN", v)
+}
 
 // AudioSink is implemented in Swift by the app's audio layer. gomobile turns it
 // into an Objective-C protocol.
@@ -39,6 +57,31 @@ type ControlHost interface {
 	ControlApp(action string)
 }
 
+// TaskBackend is implemented in Swift: it executes delegated work by relaying
+// to Shannon Cloud's remote-run channel (the paired Mac's daemon runs the
+// task). Strings in, strings out — gobind supports neither maps nor struct
+// slices. Calls may block: the brain only ever invokes DoTask from its
+// detached do_task goroutine, never from the event loop.
+//
+// DoTask receives a DoTaskRequest JSON extended with an opaque route_key and
+// must return a /message-shaped response body. Cancel receives a CancelRequest
+// JSON carrying the same route_key. ListAgents returns {"agents":[...]}.
+type TaskBackend interface {
+	DoTask(requestJSON string) (string, error)
+	Cancel(requestJSON string) error
+	ListAgents() (string, error)
+}
+
+// CallHost is implemented in Swift: the brain telling the app the call must
+// end — the model called the end_call voice tool, or the ASR dismiss-phrase
+// backstop fired (it stays disarmed when no CallHost is supplied). The brain
+// has already stopped its output and entered its local terminal when EndCall
+// arrives; the app closes transport and audio, exactly what its own hang-up
+// button does. Fired from a fresh goroutine, never the event loop.
+type CallHost interface {
+	EndCall()
+}
+
 // sinkAdapter bridges the Swift-facing interface to the brain's own. They differ
 // only in that koe keeps dropCapture unexported on its internal interface.
 type sinkAdapter struct{ s AudioSink }
@@ -66,11 +109,18 @@ func NewBridge(
 	sink AudioSink,
 	sender EventSender,
 	host ControlHost,
+	taskBackend TaskBackend,
+	callHost CallHost,
 ) *Bridge {
 	cfg := koe.SessionConfig{
 		BurstID:    burstID,
 		BoundAgent: boundAgent,
 		BackendURL: backendURL,
+		// iOS WebRTC captures through Apple's VPIO voice processing, so the
+		// uplink is already echo-cancelled — the precondition for the floor
+		// gate. Without this the brain treats the host as half-duplex and
+		// nativeFloorEnabled() stays false regardless of SetBargeIn.
+		FullDuplexAEC: true,
 	}
 	// gomobile hands over a non-nil interface wrapping a nil Objective-C object
 	// when Swift passes nil, so each hook is guarded rather than assumed present.
@@ -83,12 +133,23 @@ func NewBridge(
 	if host != nil {
 		cfg.ControlApp = host.ControlApp
 	}
+	if taskBackend != nil {
+		cfg.TaskBackend = taskBackend
+	}
+	if callHost != nil {
+		cfg.OnEndCall = callHost.EndCall
+	}
 	return &Bridge{session: koe.NewSession(cfg)}
 }
 
 // HandleEvent feeds one Realtime server event, raw JSON straight off the data
 // channel. This is the front brain's only input.
 func (b *Bridge) HandleEvent(raw []byte) { b.session.HandleEvent(raw) }
+
+// Close ends the call's brain: it stops the result-delivery worker and retires
+// the call's voice scope, so a task finishing after hang-up is not spoken into
+// a dead transport. Call it exactly when the app tears the call down.
+func (b *Bridge) Close() { b.session.Close() }
 
 // BurstID identifies this call's task lineage.
 func (b *Bridge) BurstID() string { return b.session.BurstID() }
