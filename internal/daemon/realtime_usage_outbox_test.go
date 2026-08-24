@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 )
 
 const (
@@ -532,5 +537,65 @@ func TestRealtimeUsageOutboxRejectsOversizedBody(t *testing.T) {
 	body := make([]byte, realtimeUsageMaxBodyBytes+1)
 	if _, err := outbox.enqueue(body, testRealtimePrincipalA); err == nil {
 		t.Fatal("oversized body must be rejected")
+	}
+}
+
+func TestSendRealtimeUsageWithGatewayLeaseTimesOutAndReleasesCredentialLease(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var startOnce sync.Once
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startOnce.Do(func() { close(requestStarted) })
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
+	}))
+	defer cloud.Close()
+	defer close(releaseHandler)
+
+	gw := client.NewGatewayClient(cloud.URL, "key-a")
+	gw.BindIntegrationPrincipal("account-a", 1)
+	server := &Server{
+		deps: &ServerDeps{
+			Config: &config.Config{Endpoint: cloud.URL, Cloud: config.CloudConfig{Enabled: true}},
+			GW:     gw,
+		},
+		auth: &AuthManager{},
+	}
+	principal := realtimeUsagePrincipalFingerprint("account", "account-a")
+	body := json.RawMessage(`{"provider":"cloud","response_id":"timeout","usage":{"input_tokens":1}}`)
+
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- server.sendRealtimeUsageWithGatewayLease(context.Background(), gw, principal, body)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage request did not reach Cloud")
+	}
+
+	rotationDone := make(chan struct{})
+	go func() {
+		gw.SetAPIKey("key-b")
+		close(rotationDone)
+	}()
+
+	select {
+	case <-rotationDone:
+	case <-time.After(realtimeUsageSendTimeout + 2*time.Second):
+		t.Fatalf("credential rotation remained blocked beyond usage timeout")
+	}
+	select {
+	case err := <-sendDone:
+		if err == nil {
+			t.Fatal("stalled usage send unexpectedly succeeded")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("stalled usage send error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage send did not return after credential rotation")
 	}
 }

@@ -21,7 +21,10 @@ import (
 const (
 	realtimeUsageOutboxName     = "realtime-usage-outbox"
 	realtimeUsageOutboxInterval = 5 * time.Second
-	realtimeUsageMaxBodyBytes   = 64 << 10
+	// Usage payloads are small and should not hold the credential-generation
+	// lease for the gateway client's long-lived default HTTP timeout.
+	realtimeUsageSendTimeout  = 10 * time.Second
+	realtimeUsageMaxBodyBytes = 64 << 10
 )
 
 // realtimeUsageOutbox is a private, file-backed relay queue. The provider,
@@ -183,6 +186,11 @@ func (s *Server) sendRealtimeUsageWithGatewayLease(ctx context.Context, gw *clie
 	if gw == nil || !validRealtimeUsagePrincipal(principal) {
 		return errors.New("realtime usage principal unavailable")
 	}
+	// Start the short usage deadline before taking the integration lease. A
+	// stalled usage POST must release the lease promptly so sign-out or key
+	// rotation is never held behind GatewayClient's 600-second default timeout.
+	sendCtx, cancel := context.WithTimeout(ctx, realtimeUsageSendTimeout)
+	defer cancel()
 	generation, active := gw.IntegrationGeneration()
 	if !active {
 		return errors.New("realtime usage principal unavailable")
@@ -194,7 +202,11 @@ func (s *Server) sendRealtimeUsageWithGatewayLease(ctx context.Context, gw *clie
 			sendErr = errors.New("realtime usage principal changed")
 			return
 		}
-		_, sendErr = gw.SendRealtimeUsage(ctx, body)
+		if err := sendCtx.Err(); err != nil {
+			sendErr = err
+			return
+		}
+		_, sendErr = gw.SendRealtimeUsage(sendCtx, body)
 	})
 	if leaseErr != nil {
 		return leaseErr
