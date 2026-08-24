@@ -84,6 +84,45 @@ func TestShouldRelayRealtimeUsage(t *testing.T) {
 	}
 }
 
+func TestRealtimeUsageRelayDoesNotBlockRealtimeCallback(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	served := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(started) })
+		<-release
+		w.WriteHeader(http.StatusOK)
+		close(served)
+	}))
+	defer srv.Close()
+
+	relay := newRealtimeUsageRelay(koe.NewDaemonClient(srv.URL), "")
+	returned := make(chan struct{})
+	go func() {
+		relay("", json.RawMessage(`{"provider":"openai","response_id":"resp-1","usage":{"input_tokens":1}}`))
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("usage relay blocked the Realtime callback")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("usage relay did not start the durable handoff")
+	}
+	close(release)
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("usage relay did not finish after the daemon accepted it")
+	}
+}
+
 // The pinned default is only defensible because --model still overrides it —
 // that is the escape hatch for CLI and on-robot callers who want another tier.
 func TestKoeModelFlagOverridesDefault(t *testing.T) {

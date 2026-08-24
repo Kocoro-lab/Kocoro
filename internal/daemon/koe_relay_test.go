@@ -61,7 +61,7 @@ func TestHandleKoeRealtimeUsageQueuesWithoutWaitingForGateway(t *testing.T) {
 	}
 }
 
-func TestHandleKoeRealtimeUsageRequiresSessionPrincipal(t *testing.T) {
+func TestHandleKoeRealtimeUsageUsesCurrentPrincipalForLegacyClient(t *testing.T) {
 	deps := &ServerDeps{
 		Config:     &config.Config{Endpoint: "https://cloud.example", APIKey: "test-key", Cloud: config.CloudConfig{Enabled: true}},
 		ShannonDir: t.TempDir(),
@@ -70,16 +70,59 @@ func TestHandleKoeRealtimeUsageRequiresSessionPrincipal(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/koe/realtime/usage", bytes.NewReader(realtimeUsageFixture("response-no-principal")))
 	res := httptest.NewRecorder()
 	s.handleKoeRealtimeUsage(res, req)
-	if res.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, body=%s; want fail-closed 503", res.Code, res.Body.String())
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s; want durable legacy handoff", res.Code, res.Body.String())
 	}
-	if outbox := s.realtimeUsageOutboxStore(); outbox != nil {
-		principal, ok := s.realtimeUsagePrincipal()
-		if ok {
-			if paths, err := outbox.pendingPaths(principal); err != nil || len(paths) != 0 {
-				t.Fatalf("no-principal request queued paths=%v err=%v", paths, err)
-			}
-		}
+	principal, ok := s.realtimeUsagePrincipal()
+	if !ok {
+		t.Fatal("current principal unavailable")
+	}
+	paths, err := s.realtimeUsageOutboxStore().pendingPaths(principal)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("legacy request queued paths=%v err=%v; want one", paths, err)
+	}
+}
+
+func TestHandleKoeRealtimeUsageUsesVerifiedAccountForLegacyClient(t *testing.T) {
+	gw := client.NewGatewayClient("https://cloud.example", "test-key")
+	deps := &ServerDeps{
+		Config:     &config.Config{Endpoint: "https://cloud.example", APIKey: "test-key", Cloud: config.CloudConfig{Enabled: true}},
+		ShannonDir: t.TempDir(),
+		GW:         gw,
+	}
+	s := NewServer(0, nil, deps, "test")
+	auth := NewAuthManager(AuthManagerConfig{Gateway: gw})
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "account-a"}, "")
+	s.SetAuth(auth)
+
+	req := httptest.NewRequest(http.MethodPost, "/koe/realtime/usage", bytes.NewReader(realtimeUsageFixture("response-auth-legacy")))
+	res := httptest.NewRecorder()
+	s.handleKoeRealtimeUsage(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s; want durable authenticated legacy handoff", res.Code, res.Body.String())
+	}
+	principal, ok := s.realtimeUsagePrincipal()
+	if !ok {
+		t.Fatal("verified account principal unavailable")
+	}
+	paths, err := s.realtimeUsageOutboxStore().pendingPaths(principal)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("authenticated legacy request queued paths=%v err=%v; want one", paths, err)
+	}
+}
+
+func TestHandleKoeRealtimeUsageRejectsMalformedSessionPrincipal(t *testing.T) {
+	deps := &ServerDeps{
+		Config:     &config.Config{Endpoint: "https://cloud.example", APIKey: "test-key", Cloud: config.CloudConfig{Enabled: true}},
+		ShannonDir: t.TempDir(),
+	}
+	s := NewServer(0, nil, deps, "test")
+	req := httptest.NewRequest(http.MethodPost, "/koe/realtime/usage", bytes.NewReader(realtimeUsageFixture("response-bad-principal")))
+	req.Header.Set(client.RealtimeUsagePrincipalHeader, "not-a-principal")
+	res := httptest.NewRecorder()
+	s.handleKoeRealtimeUsage(res, req)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body=%s; want 503", res.Code, res.Body.String())
 	}
 }
 

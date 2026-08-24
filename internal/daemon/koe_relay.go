@@ -106,7 +106,14 @@ func (s *Server) handleKoeRealtimeUsage(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	principal := strings.TrimSpace(r.Header.Get(client.RealtimeUsagePrincipalHeader))
-	if !validRealtimeUsagePrincipal(principal) {
+	if principal == "" {
+		var ok bool
+		principal, ok = s.realtimeUsagePrincipal()
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "realtime usage principal unavailable")
+			return
+		}
+	} else if !validRealtimeUsagePrincipal(principal) {
 		writeError(w, http.StatusServiceUnavailable, "realtime usage principal unavailable")
 		return
 	}

@@ -101,6 +101,24 @@ func shouldRelayRealtimeUsage(openAIKey string, usage json.RawMessage) bool {
 	return strings.EqualFold(strings.TrimSpace(envelope.Provider), string(koe.ProviderQwen))
 }
 
+const realtimeUsageHandoffTimeout = 10 * time.Second
+
+func newRealtimeUsageRelay(client *koe.DaemonClient, openAIKey string) func(string, json.RawMessage) {
+	return func(principal string, usage json.RawMessage) {
+		if client == nil || !shouldRelayRealtimeUsage(openAIKey, usage) {
+			return
+		}
+		body := append(json.RawMessage(nil), usage...)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), realtimeUsageHandoffTimeout)
+			defer cancel()
+			if err := client.SendRealtimeUsageWithPrincipal(ctx, body, principal); err != nil {
+				log.Printf("koe: usage relay failed: %v", err)
+			}
+		}()
+	}
+}
+
 // applyBargeInEnv enables the VPIO raw-audio floor loop. Playback pauses locally;
 // Realtime then chooses resume_playback or accept_turn without ASR admission.
 // KOE_NATIVE_FLOOR=0 plus KOE_INTERRUPT_RESPONSE=1 remains the rollback to the old
@@ -901,16 +919,10 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	// is limited to the trusted private LAN used by Wireless carriers.
 	client.SetToken(os.Getenv("KOE_DAEMON_TOKEN"))
 
-	// G3: hand each turn's token usage to the daemon synchronously. The daemon's
-	// 200 is the durable outbox handoff; Cloud delivery happens in its worker.
-	onUsage := func(principal string, usage json.RawMessage) {
-		if !shouldRelayRealtimeUsage(cfg.openAIKey, usage) {
-			return
-		}
-		if uerr := client.SendRealtimeUsageWithPrincipal(context.Background(), usage, principal); uerr != nil {
-			log.Printf("koe: usage relay failed: %v", uerr)
-		}
-	}
+	// G3: hand each turn's token usage to the daemon without blocking the
+	// Realtime event callback. The daemon's 200 is the durable outbox handoff;
+	// Cloud delivery happens in its worker.
+	onUsage := newRealtimeUsageRelay(client, cfg.openAIKey)
 	// mintEK mints a fresh ephemeral secret (ephemeral keys are short-lived, so this
 	// runs per call): a dev key (--openai-key/OPENAI_API_KEY) takes the direct mint,
 	// else the via-daemon relay (Koe holds no long-lived credential).
