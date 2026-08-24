@@ -107,14 +107,22 @@ func (s *Server) handleKoeRealtimeUsage(w http.ResponseWriter, r *http.Request) 
 	}
 	principal := strings.TrimSpace(r.Header.Get(client.RealtimeUsagePrincipalHeader))
 	if principal == "" {
+		// Auth-managed daemons cannot infer which long-lived realtime session
+		// produced a legacy report after an account switch. Only the legacy
+		// endpoint/key deployment, whose credential is process-scoped and does
+		// not support in-process account switching, may derive this binding.
+		if s.auth != nil {
+			writeError(w, http.StatusBadRequest, "realtime usage principal required")
+			return
+		}
 		var ok bool
 		principal, ok = s.realtimeUsagePrincipal()
 		if !ok {
-			writeError(w, http.StatusServiceUnavailable, "realtime usage principal unavailable")
+			writeError(w, http.StatusBadRequest, "realtime usage principal required")
 			return
 		}
 	} else if !validRealtimeUsagePrincipal(principal) {
-		writeError(w, http.StatusServiceUnavailable, "realtime usage principal unavailable")
+		writeError(w, http.StatusBadRequest, "invalid realtime usage principal")
 		return
 	}
 	outbox := s.realtimeUsageOutboxStore()

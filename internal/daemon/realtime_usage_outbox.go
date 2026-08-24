@@ -24,9 +24,10 @@ const (
 	realtimeUsageMaxBodyBytes   = 64 << 10
 )
 
-// realtimeUsageOutbox is a private, file-backed relay queue. A response ID is
-// the durable key: a repeated report while the first one is pending never
-// overwrites the original payload or creates a second file.
+// realtimeUsageOutbox is a private, file-backed relay queue. The provider,
+// response ID, and principal form the durable identity: a repeated report while
+// the first one is pending never overwrites the original payload or creates a
+// second file, while equal response IDs from different providers remain distinct.
 type realtimeUsageOutbox struct {
 	dir      string
 	mu       sync.Mutex
@@ -94,11 +95,22 @@ func (s *Server) realtimeUsagePrincipal() (string, bool) {
 		return realtimeUsagePrincipalFingerprint("account", accountID), true
 	}
 	cfg, _, _ := s.deps.Snapshot()
-	key := s.liveAPIKey(cfg)
-	if cfg == nil || strings.TrimSpace(cfg.Endpoint) == "" || strings.TrimSpace(key) == "" {
+	if cfg == nil {
 		return "", false
 	}
-	return realtimeUsagePrincipalFingerprint("legacy", strings.TrimRight(strings.TrimSpace(cfg.Endpoint), "/")+"\x00"+key), true
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	key := strings.TrimSpace(cfg.APIKey)
+	if s.deps.GW != nil {
+		// The legacy client is process-scoped and its GatewayClient credential
+		// is immutable until restart. Use that live pair instead of a freshly
+		// reloaded yaml value that the client has not adopted yet.
+		endpoint = strings.TrimSpace(s.deps.GW.BaseURL())
+		key = strings.TrimSpace(s.deps.GW.APIKey())
+	}
+	if endpoint == "" || key == "" {
+		return "", false
+	}
+	return realtimeUsagePrincipalFingerprint("legacy", strings.TrimRight(endpoint, "/")+"\x00"+key), true
 }
 
 // withRealtimeUsageGatewayLease binds the bootstrap response to the exact
@@ -154,10 +166,17 @@ func (s *Server) realtimeUsagePrincipalForGatewayLease(gw *client.GatewayClient)
 	}
 	cfg, _, _ := s.deps.Snapshot()
 	key := gw.APIKey()
-	if cfg == nil || strings.TrimSpace(cfg.Endpoint) == "" || strings.TrimSpace(key) == "" {
+	endpoint := ""
+	if gw != nil {
+		endpoint = strings.TrimSpace(gw.BaseURL())
+	}
+	if endpoint == "" && cfg != nil {
+		endpoint = strings.TrimSpace(cfg.Endpoint)
+	}
+	if endpoint == "" || strings.TrimSpace(key) == "" {
 		return "", false
 	}
-	return realtimeUsagePrincipalFingerprint("legacy", strings.TrimRight(strings.TrimSpace(cfg.Endpoint), "/")+"\x00"+key), true
+	return realtimeUsagePrincipalFingerprint("legacy", strings.TrimRight(endpoint, "/")+"\x00"+key), true
 }
 
 func (s *Server) sendRealtimeUsageWithGatewayLease(ctx context.Context, gw *client.GatewayClient, principal string, body json.RawMessage) error {
@@ -231,26 +250,158 @@ func (o *realtimeUsageOutbox) ensurePrincipalDir(principal string) error {
 	return nil
 }
 
-func realtimeUsageResponseID(body []byte) (string, error) {
+func realtimeUsageIdentity(body []byte) (provider, responseID string, err error) {
 	var payload struct {
+		Provider   string          `json:"provider"`
 		ResponseID string          `json:"response_id"`
 		Usage      json.RawMessage `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", fmt.Errorf("decode realtime usage: %w", err)
+		return "", "", fmt.Errorf("decode realtime usage: %w", err)
 	}
-	if strings.TrimSpace(payload.ResponseID) == "" {
-		return "", errors.New("realtime usage response_id is required")
+	provider = strings.ToLower(strings.TrimSpace(payload.Provider))
+	if provider == "" {
+		return "", "", errors.New("realtime usage provider is required")
+	}
+	responseID = strings.TrimSpace(payload.ResponseID)
+	if responseID == "" {
+		return "", "", errors.New("realtime usage response_id is required")
 	}
 	if len(payload.Usage) == 0 || string(payload.Usage) == "null" {
-		return "", errors.New("realtime usage usage is required")
+		return "", "", errors.New("realtime usage usage is required")
 	}
-	return strings.TrimSpace(payload.ResponseID), nil
+	return provider, responseID, nil
 }
 
-func (o *realtimeUsageOutbox) targetPath(principal, responseID string) string {
-	sum := sha256.Sum256([]byte(responseID))
+func realtimeUsageResponseID(body []byte) (string, error) {
+	_, responseID, err := realtimeUsageIdentity(body)
+	return responseID, err
+}
+
+func (o *realtimeUsageOutbox) targetPath(principal, provider, responseID string) string {
+	identity := strings.TrimSpace(principal) + "\x00" + strings.ToLower(strings.TrimSpace(provider)) + "\x00" + strings.TrimSpace(responseID)
+	sum := sha256.Sum256([]byte(identity))
 	return filepath.Join(o.dir, principal, hex.EncodeToString(sum[:])+".json")
+}
+
+func (o *realtimeUsageOutbox) legacyTargetPath(principal, responseID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(responseID)))
+	return filepath.Join(o.dir, principal, hex.EncodeToString(sum[:])+".json")
+}
+
+// installRealtimeUsageOutboxFile uses a hard link as an atomic no-replace
+// install. os.Rename would overwrite an existing canonical file on POSIX,
+// which could lose a different provider's report during recovery.
+func installRealtimeUsageOutboxFile(tmpPath, target string) (bool, error) {
+	if err := os.Link(tmpPath, target); err != nil {
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (o *realtimeUsageOutbox) canonicalEntryMatches(canonical, principal, provider, responseID string) (bool, error) {
+	body, err := os.ReadFile(canonical)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	storedProvider, storedResponseID, err := realtimeUsageIdentity(body)
+	if err != nil {
+		return false, fmt.Errorf("decode canonical realtime usage outbox entry: %w", err)
+	}
+	if storedProvider != strings.ToLower(strings.TrimSpace(provider)) ||
+		storedResponseID != strings.TrimSpace(responseID) ||
+		o.targetPath(principal, storedProvider, storedResponseID) != canonical {
+		return false, fmt.Errorf("canonical realtime usage outbox entry identity mismatch")
+	}
+	return true, nil
+}
+
+func (o *realtimeUsageOutbox) migrateLegacyFile(principal, responseID string) (string, bool, error) {
+	legacyTarget := o.legacyTargetPath(principal, responseID)
+	if _, err := os.Stat(legacyTarget); err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	body, err := os.ReadFile(legacyTarget)
+	if err != nil {
+		return "", false, err
+	}
+	provider, storedID, err := realtimeUsageIdentity(body)
+	if err != nil || storedID != responseID {
+		if renameErr := os.Rename(legacyTarget, legacyTarget+".invalid"); renameErr != nil && !os.IsNotExist(renameErr) {
+			return "", false, renameErr
+		}
+		// A pre-provider or corrupt legacy entry cannot be charged safely, but it
+		// must not block a new valid report that happens to reuse its response ID.
+		return "", false, nil
+	}
+	canonical := o.targetPath(principal, provider, storedID)
+	if canonical == legacyTarget {
+		return canonical, true, nil
+	}
+	_, err = installRealtimeUsageOutboxFile(legacyTarget, canonical)
+	if err != nil {
+		return "", false, err
+	}
+	matched, err := o.canonicalEntryMatches(canonical, principal, provider, storedID)
+	if err != nil {
+		return "", false, err
+	}
+	if !matched {
+		return "", false, errors.New("canonical realtime usage outbox entry disappeared during migration")
+	}
+	if err := os.Remove(legacyTarget); err != nil && !os.IsNotExist(err) {
+		return canonical, true, err
+	}
+	if err := syncDirectory(filepath.Dir(canonical)); err != nil {
+		return canonical, true, err
+	}
+	return canonical, true, nil
+}
+
+func (o *realtimeUsageOutbox) migrateLegacyEntriesLocked(principal string) error {
+	entries, err := os.ReadDir(filepath.Join(o.dir, principal))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(o.dir, principal, entry.Name())
+		body, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		provider, responseID, err := realtimeUsageIdentity(body)
+		if err != nil {
+			continue
+		}
+		if o.targetPath(principal, provider, responseID) == path || o.legacyTargetPath(principal, responseID) != path {
+			continue
+		}
+		if _, _, err := o.migrateLegacyFile(principal, responseID); err != nil {
+			return fmt.Errorf("migrate legacy realtime usage outbox entry: %w", err)
+		}
+	}
+	return nil
 }
 
 // enqueue durably installs body before any Cloud relay. It returns false
@@ -260,7 +411,7 @@ func (o *realtimeUsageOutbox) enqueue(body []byte, principal string) (created bo
 	if len(body) == 0 || len(body) > realtimeUsageMaxBodyBytes {
 		return false, fmt.Errorf("realtime usage body must be between 1 and %d bytes", realtimeUsageMaxBodyBytes)
 	}
-	responseID, err := realtimeUsageResponseID(body)
+	provider, responseID, err := realtimeUsageIdentity(body)
 	if err != nil {
 		return false, err
 	}
@@ -279,7 +430,14 @@ func (o *realtimeUsageOutbox) enqueue(body []byte, principal string) (created bo
 	if err := o.recoverPendingLocked(principal); err != nil {
 		return false, err
 	}
-	target := o.targetPath(principal, responseID)
+	target := o.targetPath(principal, provider, responseID)
+	legacyCanonical, legacyExists, legacyErr := o.migrateLegacyFile(principal, responseID)
+	if legacyErr != nil {
+		return false, fmt.Errorf("migrate legacy realtime usage outbox entry: %w", legacyErr)
+	}
+	if legacyExists && legacyCanonical == target {
+		return false, nil
+	}
 	if _, err := os.Stat(target); err == nil {
 		return false, nil
 	} else if !os.IsNotExist(err) {
@@ -312,14 +470,19 @@ func (o *realtimeUsageOutbox) enqueue(body []byte, principal string) (created bo
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("check realtime usage outbox entry: %w", err)
 	}
-	// The daemon is single-instance (the parent pid lock owns ShannonDir), so
-	// the existence check above plus the in-process mutex makes rename
-	// non-overwriting while giving readers an all-or-nothing target file.
-	if err := os.Rename(tmpPath, target); err != nil {
-		if os.IsExist(err) {
-			return false, nil
+	installed, installErr := installRealtimeUsageOutboxFile(tmpPath, target)
+	if installErr != nil {
+		return false, fmt.Errorf("install realtime usage outbox entry: %w", installErr)
+	}
+	if !installed {
+		matched, verifyErr := o.canonicalEntryMatches(target, principal, provider, responseID)
+		if verifyErr != nil {
+			return false, fmt.Errorf("verify existing realtime usage outbox entry: %w", verifyErr)
 		}
-		return false, fmt.Errorf("install realtime usage outbox entry: %w", err)
+		if !matched {
+			return false, errors.New("existing realtime usage outbox entry disappeared during install")
+		}
+		return false, nil
 	}
 	if err := syncDirectory(filepath.Dir(target)); err != nil {
 		// The target is already visible, so leave it queued. A later replay can
@@ -352,7 +515,7 @@ func (o *realtimeUsageOutbox) recoverPendingLocked(principal string) error {
 		}
 		pendingPath := filepath.Join(o.dir, principal, entry.Name())
 		body, readErr := os.ReadFile(pendingPath)
-		responseID, bodyErr := realtimeUsageResponseID(body)
+		provider, responseID, bodyErr := realtimeUsageIdentity(body)
 		if readErr != nil || bodyErr != nil || len(body) == 0 || len(body) > realtimeUsageMaxBodyBytes {
 			if removeErr := os.Remove(pendingPath); removeErr != nil && !os.IsNotExist(removeErr) && firstErr == nil {
 				firstErr = fmt.Errorf("remove invalid realtime usage temp: %w", removeErr)
@@ -385,7 +548,7 @@ func (o *realtimeUsageOutbox) recoverPendingLocked(principal string) error {
 			}
 			continue
 		}
-		target := o.targetPath(principal, responseID)
+		target := o.targetPath(principal, provider, responseID)
 		if _, err := os.Stat(target); err == nil {
 			if removeErr := os.Remove(pendingPath); removeErr != nil && !os.IsNotExist(removeErr) && firstErr == nil {
 				firstErr = fmt.Errorf("remove duplicate realtime usage temp: %w", removeErr)
@@ -398,13 +561,19 @@ func (o *realtimeUsageOutbox) recoverPendingLocked(principal string) error {
 			}
 			continue
 		}
-		if err := os.Rename(pendingPath, target); err != nil {
+		installed, installErr := installRealtimeUsageOutboxFile(pendingPath, target)
+		if installErr != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("recover realtime usage temp: %w", err)
+				firstErr = fmt.Errorf("recover realtime usage temp: %w", installErr)
 			}
 			continue
 		}
 		changed = true
+		if !installed {
+			if removeErr := os.Remove(pendingPath); removeErr != nil && !os.IsNotExist(removeErr) && firstErr == nil {
+				firstErr = fmt.Errorf("remove duplicate realtime usage temp: %w", removeErr)
+			}
+		}
 	}
 	if changed {
 		if err := syncDirectory(filepath.Join(o.dir, principal)); err != nil && firstErr == nil {
@@ -464,6 +633,12 @@ func (o *realtimeUsageOutbox) replay(ctx context.Context, principal string, send
 	// enqueue another durable report while a replay is waiting on Cloud.
 	o.mu.Lock()
 	recoveryErr := o.recoverPendingLocked(principal)
+	if recoveryErr == nil {
+		if migrationErr := o.migrateLegacyEntriesLocked(principal); migrationErr != nil {
+			o.mu.Unlock()
+			return migrationErr
+		}
+	}
 	paths, err := o.pendingPaths(principal)
 	o.mu.Unlock()
 	if err != nil {

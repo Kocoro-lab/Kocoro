@@ -101,21 +101,18 @@ func shouldRelayRealtimeUsage(openAIKey string, usage json.RawMessage) bool {
 	return strings.EqualFold(strings.TrimSpace(envelope.Provider), string(koe.ProviderQwen))
 }
 
-const realtimeUsageHandoffTimeout = 10 * time.Second
-
-func newRealtimeUsageRelay(client *koe.DaemonClient, openAIKey string) func(string, json.RawMessage) {
-	return func(principal string, usage json.RawMessage) {
-		if client == nil || !shouldRelayRealtimeUsage(openAIKey, usage) {
-			return
-		}
-		body := append(json.RawMessage(nil), usage...)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), realtimeUsageHandoffTimeout)
-			defer cancel()
-			if err := client.SendRealtimeUsageWithPrincipal(ctx, body, principal); err != nil {
-				log.Printf("koe: usage relay failed: %v", err)
-			}
-		}()
+func reportRealtimeUsageRelayFailure(opts koe.ConnectOptions, err error) {
+	if err == nil {
+		return
+	}
+	wrapped := fmt.Errorf("realtime usage relay admission failed: %w", err)
+	log.Printf("koe: %v", wrapped)
+	if opts.OnClosed != nil {
+		opts.OnClosed(wrapped)
+		return
+	}
+	if opts.OnEndCall != nil {
+		opts.OnEndCall()
 	}
 }
 
@@ -622,7 +619,7 @@ type realtimeConnector struct {
 	warm                  *warmMint
 	exchange              func(context.Context, string) (string, error)
 	exchangeWithPrincipal func(context.Context, string) (string, string, error)
-	relayUsage            func(string, json.RawMessage)
+	relayUsage            func(string, json.RawMessage) error
 	circuit               *koe.OpenAICircuit
 }
 
@@ -649,12 +646,20 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 			return answer, err
 		}
 		if c.relayUsage != nil {
+			var usageFailureOnce sync.Once
+			reportUsageFailure := func(err error) {
+				usageFailureOnce.Do(func() {
+					go reportRealtimeUsageRelayFailure(opts, err)
+				})
+			}
 			original := qwenOpts.OnUsage
 			qwenOpts.OnUsage = func(raw json.RawMessage) {
 				principalMu.RLock()
 				principal := qwenPrincipal
 				principalMu.RUnlock()
-				c.relayUsage(principal, raw)
+				if err := c.relayUsage(principal, raw); err != nil {
+					reportUsageFailure(err)
+				}
 				if original != nil {
 					original(raw)
 				}
@@ -692,10 +697,19 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 		}
 		return nil, koe.ProviderOpenAI, err
 	}
+	var reportUsageFailure func(error)
 	if c.relayUsage != nil {
+		var usageFailureOnce sync.Once
+		reportUsageFailure = func(err error) {
+			usageFailureOnce.Do(func() {
+				go reportRealtimeUsageRelayFailure(opts, err)
+			})
+		}
 		original := openAIOpts.OnUsage
 		openAIOpts.OnUsage = func(raw json.RawMessage) {
-			c.relayUsage(principal, raw)
+			if err := c.relayUsage(principal, raw); err != nil {
+				reportUsageFailure(err)
+			}
 			if original != nil {
 				original(raw)
 			}
@@ -713,7 +727,11 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 			if c.relayUsage != nil {
 				original := opts.OnUsage
 				openAIOpts.OnUsage = func(raw json.RawMessage) {
-					c.relayUsage(freshPrincipal, raw)
+					if err := c.relayUsage(freshPrincipal, raw); err != nil {
+						if reportUsageFailure != nil {
+							reportUsageFailure(err)
+						}
+					}
 					if original != nil {
 						original(raw)
 					}
@@ -920,9 +938,11 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 	client.SetToken(os.Getenv("KOE_DAEMON_TOKEN"))
 
 	// G3: hand each turn's token usage to the daemon without blocking the
-	// Realtime event callback. The daemon's 200 is the durable outbox handoff;
-	// Cloud delivery happens in its worker.
-	onUsage := newRealtimeUsageRelay(client, cfg.openAIKey)
+	// Realtime event callback. The relay durably spools accepted reports before
+	// fixed workers drain them; Cloud delivery happens in the daemon worker.
+	usageRelay := newRealtimeUsageRelay(client, cfg.openAIKey)
+	defer usageRelay.Close()
+	onUsage := usageRelay.Enqueue
 	// mintEK mints a fresh ephemeral secret (ephemeral keys are short-lived, so this
 	// runs per call): a dev key (--openai-key/OPENAI_API_KEY) takes the direct mint,
 	// else the via-daemon relay (Koe holds no long-lived credential).
@@ -1082,7 +1102,7 @@ func closeDesktopSessionState(mailbox *koe.ResultMailbox, state *koe.CallState, 
 // the selected backend, /call/end closes the used session and audio, then warms
 // the next session without touching the mic.
 func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient,
-	connector *realtimeConnector, onUsage func(string, json.RawMessage)) error {
+	connector *realtimeConnector, onUsage func(string, json.RawMessage) error) error {
 
 	fullDuplexAEC := cfg.aec == "vpio"
 	// One mailbox spans every warm Realtime session in this resident process. A

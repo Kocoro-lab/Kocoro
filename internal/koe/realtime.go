@@ -52,6 +52,16 @@ type eventHandler struct {
 	// ending becomes true.
 	terminalMu sync.Mutex
 	ending     atomic.Bool
+	// terminalUsageWaiters lets end_call and transport shutdown give the provider a
+	// bounded opportunity to deliver the response.done that carries the final token
+	// usage. The wait is keyed by response ID and is signalled only after reportUsage
+	// has synchronously admitted the report to the local durable relay.
+	terminalUsageMu        sync.Mutex
+	terminalUsageWaiters   map[string]chan struct{}
+	terminalUsageCompleted map[string]struct{}
+	// Pending response IDs survive stopOutput clearing the active response. Close
+	// waits for their eventual response.done, bounded by the close grace period.
+	terminalUsagePending map[string]struct{}
 	// curState holds the last emitted voice state (string) so the D3w level pump
 	// knows whether to report input (listening) or output (speaking) RMS.
 	curState atomic.Value
@@ -642,8 +652,162 @@ func (h *eventHandler) observeLocalSpeechEnded(ctx context.Context) {
 	}()
 }
 
+const (
+	defaultRealtimeUsageCloseGrace = time.Second
+	maxRealtimeUsageCloseGrace     = 5 * time.Second
+)
+
+func realtimeUsageCloseGrace() time.Duration {
+	ms := koeEnvInt("KOE_REALTIME_USAGE_CLOSE_GRACE_MS", int(defaultRealtimeUsageCloseGrace/time.Millisecond))
+	if ms <= 0 {
+		return 0
+	}
+	grace := time.Duration(ms) * time.Millisecond
+	if grace > maxRealtimeUsageCloseGrace {
+		return maxRealtimeUsageCloseGrace
+	}
+	return grace
+}
+
+func (h *eventHandler) armTerminalUsageWait(responseID string) <-chan struct{} {
+	responseID = strings.TrimSpace(responseID)
+	if h == nil || responseID == "" || h.onUsage == nil {
+		return nil
+	}
+	h.terminalUsageMu.Lock()
+	defer h.terminalUsageMu.Unlock()
+	if h.terminalUsageCompleted != nil {
+		if _, ok := h.terminalUsageCompleted[responseID]; ok {
+			delete(h.terminalUsageCompleted, responseID)
+			closed := make(chan struct{})
+			close(closed)
+			return closed
+		}
+	}
+	if h.terminalUsageWaiters == nil {
+		h.terminalUsageWaiters = make(map[string]chan struct{})
+	}
+	if ch := h.terminalUsageWaiters[responseID]; ch != nil {
+		return ch
+	}
+	ch := make(chan struct{})
+	h.terminalUsageWaiters[responseID] = ch
+	return ch
+}
+
+func (h *eventHandler) trackTerminalUsage(responseID string) {
+	responseID = strings.TrimSpace(responseID)
+	if h == nil || responseID == "" || h.onUsage == nil {
+		return
+	}
+	h.terminalUsageMu.Lock()
+	defer h.terminalUsageMu.Unlock()
+	if h.terminalUsageCompleted != nil {
+		if _, ok := h.terminalUsageCompleted[responseID]; ok {
+			delete(h.terminalUsageCompleted, responseID)
+			return
+		}
+	}
+	if h.terminalUsagePending == nil {
+		h.terminalUsagePending = make(map[string]struct{})
+	}
+	h.terminalUsagePending[responseID] = struct{}{}
+}
+
+func (h *eventHandler) pendingTerminalUsageWaiters() []<-chan struct{} {
+	if h == nil || h.onUsage == nil {
+		return nil
+	}
+	h.terminalUsageMu.Lock()
+	defer h.terminalUsageMu.Unlock()
+	if len(h.terminalUsagePending) == 0 {
+		return nil
+	}
+	if h.terminalUsageWaiters == nil {
+		h.terminalUsageWaiters = make(map[string]chan struct{})
+	}
+	waiters := make([]<-chan struct{}, 0, len(h.terminalUsagePending))
+	for responseID := range h.terminalUsagePending {
+		ch := h.terminalUsageWaiters[responseID]
+		if ch == nil {
+			ch = make(chan struct{})
+			h.terminalUsageWaiters[responseID] = ch
+		}
+		waiters = append(waiters, ch)
+	}
+	return waiters
+}
+
+func (h *eventHandler) signalTerminalUsage(responseID string) {
+	responseID = strings.TrimSpace(responseID)
+	if h == nil || responseID == "" {
+		return
+	}
+	h.terminalUsageMu.Lock()
+	defer h.terminalUsageMu.Unlock()
+	if h.terminalUsagePending != nil {
+		delete(h.terminalUsagePending, responseID)
+	}
+	if ch := h.terminalUsageWaiters[responseID]; ch != nil {
+		delete(h.terminalUsageWaiters, responseID)
+		close(ch)
+		return
+	}
+	if h.terminalUsageCompleted == nil {
+		h.terminalUsageCompleted = make(map[string]struct{})
+	}
+	// Keep this best-effort history bounded. It only closes the small race where
+	// response.done wins immediately before end_call arms its waiter.
+	if len(h.terminalUsageCompleted) >= 32 {
+		for completed := range h.terminalUsageCompleted {
+			delete(h.terminalUsageCompleted, completed)
+			break
+		}
+	}
+	h.terminalUsageCompleted[responseID] = struct{}{}
+}
+
+func waitForRealtimeUsage(ch <-chan struct{}, grace time.Duration) bool {
+	if ch == nil {
+		return true
+	}
+	if grace <= 0 {
+		return false
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (h *eventHandler) waitForActiveUsage(grace time.Duration) bool {
+	if h == nil || h.onUsage == nil {
+		return true
+	}
+	waiters := h.pendingTerminalUsageWaiters()
+	if len(waiters) == 0 {
+		return true
+	}
+	if grace <= 0 {
+		return false
+	}
+	deadline := time.Now().Add(grace)
+	for _, waiter := range waiters {
+		remaining := time.Until(deadline)
+		if remaining <= 0 || !waitForRealtimeUsage(waiter, remaining) {
+			return false
+		}
+	}
+	return true
+}
+
 // reportUsage extracts response_id + usage from a response.done event and fires
-// the billing relay (fire-and-forget; a usage failure must not break the call).
+// the billing relay. The terminal waiter is signalled only after this callback
+// returns, so a caller can safely close the transport after the bounded wait.
 func (h *eventHandler) reportUsage(raw []byte) {
 	if h.onUsage == nil {
 		return
@@ -1683,7 +1847,7 @@ func (h *eventHandler) handleNativeFloorTool(responseID, callID, name string) bo
 		// Teardown is the function result. Do not inject an output or queue the
 		// ordinary accepted-turn response: either would race a terminal call.
 		h.applyNativeFloorDecision(claim.decision)
-		h.requestEndCall(callID)
+		h.requestEndCall(callID, responseID)
 		return true
 	}
 	status := "resumed"
@@ -2197,6 +2361,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			}
 			break
 		}
+		h.trackTerminalUsage(ev.Response.ID)
 		matchedPending := h.bindCreatedResponse(ev.Response.ID, ev.Response.Metadata)
 		h.setActiveResponseID(ev.Response.ID)
 		h.responseSeq.Add(1)
@@ -2410,6 +2575,7 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.clearActiveResponseID(ev.Response.ID)
 		}
 		h.reportUsage(raw)
+		h.signalTerminalUsage(ev.Response.ID)
 	case "response.output_audio_transcript.done", "response.audio_transcript.done":
 		if h.onAssistantTranscript != nil && ev.Transcript != "" {
 			h.onAssistantTranscript(ev.Transcript)
@@ -2473,7 +2639,7 @@ func (h *eventHandler) handleInputTranscript(transcript string) {
 		}
 		// Cut any in-progress auto-response audio immediately and enter the same
 		// idempotent terminal used by the model-owned end_call tool.
-		h.requestEndCall("asr-dismiss-backstop")
+		h.requestEndCall("asr-dismiss-backstop", h.activeResponseID())
 	}
 }
 
@@ -2510,7 +2676,7 @@ func shouldVoiceDoTaskResult(r SayResult, userSpokeSinceLastDoTask bool) bool {
 	return !userSpokeSinceLastDoTask
 }
 
-func (h *eventHandler) requestEndCall(callID string) bool {
+func (h *eventHandler) requestEndCall(callID string, responseIDs ...string) bool {
 	if h == nil || h.onEndCall == nil {
 		return false
 	}
@@ -2522,6 +2688,10 @@ func (h *eventHandler) requestEndCall(callID string) bool {
 		}
 		return false
 	}
+	var responseDone <-chan struct{}
+	if len(responseIDs) > 0 {
+		responseDone = h.armTerminalUsageWait(responseIDs[0])
+	}
 	h.terminalMu.Unlock()
 	if eventLogEnabled() {
 		log.Printf("koe[call]: end_call requested call_id=%q", callID)
@@ -2531,7 +2701,10 @@ func (h *eventHandler) requestEndCall(callID string) bool {
 	// continuation can speak during the teardown race.
 	h.floor.abort()
 	h.interruptOutput()
-	go h.onEndCall()
+	go func() {
+		waitForRealtimeUsage(responseDone, realtimeUsageCloseGrace())
+		h.onEndCall()
+	}()
 	return true
 }
 
@@ -2763,7 +2936,7 @@ func (h *eventHandler) handleFunctionCallForResponse(ctx context.Context, respon
 	if name == "end_call" {
 		// Teardown is the complete response. requestEndCall owns idempotency and
 		// suppresses all later response requests before the connection closes.
-		h.requestEndCall(callID)
+		h.requestEndCall(callID, responseID)
 		return
 	}
 	// Fast tools (cancel/get_status/control_app/switch_agent).

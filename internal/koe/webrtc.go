@@ -90,6 +90,7 @@ type RealtimeConn struct {
 	cancel               context.CancelFunc
 	audio                *AudioIO
 	interruptOutput      func()
+	waitForUsage         func(time.Duration) bool
 	onLocalSpeechStarted func()
 	onLocalSpeechEnded   func()
 	onRemoteAudio        func([]int16) bool
@@ -682,12 +683,23 @@ func (rc *RealtimeConn) pumpSendTrack(ctx context.Context) {
 	}
 }
 
-// Close tears down the peer connection.
+// Close gives an active response a bounded opportunity to emit response.done
+// before tearing down the peer connection. reportUsage runs synchronously from
+// that event, so the caller can close the local durable relay immediately after
+// Close without dropping the final accepted usage report.
 func (rc *RealtimeConn) Close() {
+	if rc == nil {
+		return
+	}
+	if rc.waitForUsage != nil {
+		rc.waitForUsage(realtimeUsageCloseGrace())
+	}
 	if rc.cancel != nil {
 		rc.cancel()
 	}
-	_ = rc.pc.Close()
+	if rc.pc != nil {
+		_ = rc.pc.Close()
+	}
 }
 
 // InterruptOutput stops any local assistant playback and asks Realtime to cancel
@@ -895,6 +907,7 @@ func connectRealtime(ctx context.Context, audio *AudioIO, provider RealtimeProvi
 	h.toolLoop.setLazyBind(provider == ProviderQwen)
 	h.model = opts.Model
 	h.onUsage = opts.OnUsage
+	rc.waitForUsage = h.waitForActiveUsage
 	h.language = opts.Language
 	h.fullDuplexAEC = opts.FullDuplexAEC
 	rc.interruptOutput = h.interruptOutput

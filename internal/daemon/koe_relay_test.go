@@ -83,7 +83,7 @@ func TestHandleKoeRealtimeUsageUsesCurrentPrincipalForLegacyClient(t *testing.T)
 	}
 }
 
-func TestHandleKoeRealtimeUsageUsesVerifiedAccountForLegacyClient(t *testing.T) {
+func TestHandleKoeRealtimeUsageRejectsMissingPrincipalForAuthenticatedClient(t *testing.T) {
 	gw := client.NewGatewayClient("https://cloud.example", "test-key")
 	deps := &ServerDeps{
 		Config:     &config.Config{Endpoint: "https://cloud.example", APIKey: "test-key", Cloud: config.CloudConfig{Enabled: true}},
@@ -98,16 +98,77 @@ func TestHandleKoeRealtimeUsageUsesVerifiedAccountForLegacyClient(t *testing.T) 
 	req := httptest.NewRequest(http.MethodPost, "/koe/realtime/usage", bytes.NewReader(realtimeUsageFixture("response-auth-legacy")))
 	res := httptest.NewRecorder()
 	s.handleKoeRealtimeUsage(res, req)
-	if res.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s; want durable authenticated legacy handoff", res.Code, res.Body.String())
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body=%s; want missing-principal 400", res.Code, res.Body.String())
 	}
 	principal, ok := s.realtimeUsagePrincipal()
 	if !ok {
 		t.Fatal("verified account principal unavailable")
 	}
 	paths, err := s.realtimeUsageOutboxStore().pendingPaths(principal)
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("authenticated legacy request queued paths=%v err=%v; want none", paths, err)
+	}
+}
+
+func TestHandleKoeRealtimeUsageMissingPrincipalStaysFailClosedAcrossAccountSwitch(t *testing.T) {
+	gw := client.NewGatewayClient("https://cloud.example", "test-key")
+	deps := &ServerDeps{
+		Config:     &config.Config{Endpoint: "https://cloud.example", APIKey: "test-key", Cloud: config.CloudConfig{Enabled: true}},
+		ShannonDir: t.TempDir(),
+		GW:         gw,
+	}
+	s := NewServer(0, nil, deps, "test")
+	auth := NewAuthManager(AuthManagerConfig{Gateway: gw})
+	s.SetAuth(auth)
+
+	for _, account := range []string{"account-a", "account-b"} {
+		auth.setState(AuthStateSignedIn, &client.AuthUser{ID: account}, "")
+		req := httptest.NewRequest(http.MethodPost, "/koe/realtime/usage", bytes.NewReader(realtimeUsageFixture("response-"+account)))
+		res := httptest.NewRecorder()
+		s.handleKoeRealtimeUsage(res, req)
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("account %s status = %d, body=%s; want missing-principal 400", account, res.Code, res.Body.String())
+		}
+	}
+	for _, account := range []string{"account-a", "account-b"} {
+		principal := realtimeUsagePrincipalFingerprint("account", account)
+		paths, err := s.realtimeUsageOutboxStore().pendingPaths(principal)
+		if err != nil || len(paths) != 0 {
+			t.Fatalf("account %s queued paths=%v err=%v; want none", account, paths, err)
+		}
+	}
+}
+
+func TestHandleKoeRealtimeUsageKeepsExplicitPrincipalAcrossAccountSwitch(t *testing.T) {
+	gw := client.NewGatewayClient("https://cloud.example", "test-key")
+	deps := &ServerDeps{
+		Config:     &config.Config{Endpoint: "https://cloud.example", APIKey: "test-key", Cloud: config.CloudConfig{Enabled: true}},
+		ShannonDir: t.TempDir(),
+		GW:         gw,
+	}
+	s := NewServer(0, nil, deps, "test")
+	auth := NewAuthManager(AuthManagerConfig{Gateway: gw})
+	s.SetAuth(auth)
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "account-a"}, "")
+	principalA := realtimeUsagePrincipalFingerprint("account", "account-a")
+	auth.setState(AuthStateSignedIn, &client.AuthUser{ID: "account-b"}, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/koe/realtime/usage", bytes.NewReader(realtimeUsageFixture("response-explicit-a")))
+	req.Header.Set(client.RealtimeUsagePrincipalHeader, principalA)
+	res := httptest.NewRecorder()
+	s.handleKoeRealtimeUsage(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s; want explicit principal accepted", res.Code, res.Body.String())
+	}
+	paths, err := s.realtimeUsageOutboxStore().pendingPaths(principalA)
 	if err != nil || len(paths) != 1 {
-		t.Fatalf("authenticated legacy request queued paths=%v err=%v; want one", paths, err)
+		t.Fatalf("old account paths=%v err=%v; want one", paths, err)
+	}
+	principalB := realtimeUsagePrincipalFingerprint("account", "account-b")
+	paths, err = s.realtimeUsageOutboxStore().pendingPaths(principalB)
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("new account paths=%v err=%v; want none", paths, err)
 	}
 }
 
@@ -121,8 +182,8 @@ func TestHandleKoeRealtimeUsageRejectsMalformedSessionPrincipal(t *testing.T) {
 	req.Header.Set(client.RealtimeUsagePrincipalHeader, "not-a-principal")
 	res := httptest.NewRecorder()
 	s.handleKoeRealtimeUsage(res, req)
-	if res.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, body=%s; want 503", res.Code, res.Body.String())
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body=%s; want 400", res.Code, res.Body.String())
 	}
 }
 

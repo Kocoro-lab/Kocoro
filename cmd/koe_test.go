@@ -97,10 +97,13 @@ func TestRealtimeUsageRelayDoesNotBlockRealtimeCallback(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	relay := newRealtimeUsageRelay(koe.NewDaemonClient(srv.URL), "")
+	relay := newRealtimeUsageRelayWithSpool(koe.NewDaemonClient(srv.URL), "", t.TempDir())
+	t.Cleanup(relay.Close)
 	returned := make(chan struct{})
 	go func() {
-		relay("", json.RawMessage(`{"provider":"openai","response_id":"resp-1","usage":{"input_tokens":1}}`))
+		if err := relay.Enqueue("", json.RawMessage(`{"provider":"openai","response_id":"resp-1","usage":{"input_tokens":1}}`)); err != nil {
+			t.Errorf("enqueue report: %v", err)
+		}
 		close(returned)
 	}()
 	select {
@@ -812,7 +815,7 @@ func TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch(t *testing.T) {
 				mode: koe.ProviderOpenAI, openAIModel: "gpt-realtime-mini", mint: mint,
 				circuit: koe.NewOpenAICircuit(time.Minute),
 			},
-			func(string, json.RawMessage) {})
+			func(string, json.RawMessage) error { return nil })
 	}()
 
 	select {
