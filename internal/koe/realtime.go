@@ -2425,6 +2425,11 @@ func (h *eventHandler) handleEvent(ctx context.Context, raw []byte) {
 			h.providerFatal.Do(func() { go h.onProviderFatal(err) })
 		}
 	case "response.function_call_arguments.done":
+		// Qwen may announce a response.created without an ID, then reveal the
+		// response ID only on its tool event. Register it before any tool/close
+		// path can clear the active response so shutdown still waits for the
+		// response.done usage report.
+		h.trackTerminalUsage(ev.ResponseID)
 		args := unwrapArgs(ev.Arguments)
 		log.Printf("koe[tool]: call name=%q call_id=%q args=%s", ev.Name, ev.CallID, logMaybeBytes(args, 500))
 		if h.ending.Load() {

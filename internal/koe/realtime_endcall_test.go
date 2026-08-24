@@ -214,6 +214,75 @@ func TestRealtimeConnCloseAfterInterruptWaitsForLateUsage(t *testing.T) {
 	}
 }
 
+func TestQwenLateResponseIDFromToolKeepsCloseWaitingForUsage(t *testing.T) {
+	t.Setenv("KOE_TOOL_CONTINUATION", "1")
+	t.Setenv("KOE_REALTIME_USAGE_CLOSE_GRACE_MS", "500")
+	cap := &captureSender{}
+	h := newEventHandler(nil, NewCallState("burst-qwen-late-id-close", ""), nil, cap.send)
+	h.provider = string(ProviderQwen)
+	h.toolLoop.setLazyBind(true)
+	h.toolLoop.noteUserCommit(1)
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	callbackFinished := make(chan struct{})
+	h.onUsage = func(json.RawMessage) {
+		close(callbackStarted)
+		<-releaseCallback
+		close(callbackFinished)
+	}
+
+	// Qwen can omit response.created.response.id, then identify the same
+	// response on its tool event. The tool event must establish the terminal
+	// usage waiter before stop_speaking clears the active response locally.
+	h.handleEvent(context.Background(), []byte(`{"type":"response.created","response":{}}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.function_call_arguments.done","response_id":"qwen-late-response","call_id":"late-stop","name":"stop_speaking","arguments":"{}"}`))
+	if waiters := h.pendingTerminalUsageWaiters(); len(waiters) != 1 {
+		t.Fatalf("pending terminal usage waiters=%d, want 1 after late-ID tool event", len(waiters))
+	}
+
+	cancelled := make(chan struct{})
+	closed := make(chan struct{})
+	rc := &RealtimeConn{
+		waitForUsage: h.waitForActiveUsage,
+		cancel:       func() { close(cancelled) },
+	}
+	go func() {
+		rc.Close()
+		close(closed)
+	}()
+	responseDone := make(chan struct{})
+	go func() {
+		h.handleEvent(context.Background(), []byte(`{"type":"response.done","response":{"id":"qwen-late-response","status":"cancelled","usage":{"input_tokens":3,"output_tokens":2}}}`))
+		close(responseDone)
+	}()
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("late-ID response.done usage callback did not start")
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("Close cancelled transport before late-ID usage admission finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseCallback)
+	select {
+	case <-callbackFinished:
+	case <-time.After(time.Second):
+		t.Fatal("late-ID usage callback did not finish")
+	}
+	select {
+	case <-responseDone:
+	case <-time.After(time.Second):
+		t.Fatal("late-ID response.done handler did not finish")
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after late-ID response.done")
+	}
+}
+
 func TestEndCallToolClearsActiveOutputBeforeHangup(t *testing.T) {
 	audio, err := NewAudioIO()
 	if err != nil {
