@@ -61,8 +61,27 @@ const (
 //     before batching.
 //   - Symptom when it binds: several observations become stubs in one turn
 //     (one cache break) instead of one per turn (a break every turn).
-//   - Override: agent.observation_window.aggregate_cap_runes.
+//   - Override: agent.observation_window_trigger.aggregate_cap_runes.
 const defaultObservationAggregateCapRunes = 120_000
+
+// minObservationHeadroom is how many further observations must fit between a
+// clearing pass and the next one. It exists because the aggregate cap and the
+// retained count interact: right after a pass the aggregate is already up to
+// keep x browserObsMaxChars, so a cap near that product leaves no gap and the
+// trigger fires again on the very next observation — silently degenerating
+// into the per-turn behavior this policy exists to remove. Measured at
+// keep=5 with a 120K cap: 15 breaks in 20 turns, byte-identical to every_turn.
+//
+// Same shape as the compaction trigger/landing hysteresis band.
+//
+//   - Workload: any operator who raises agent.observation_window above the
+//     default 3, which the config explicitly permits.
+//   - Symptom when it binds: the effective cap is larger than configured, so
+//     more observation text accumulates before a batch (~4 observations
+//     between passes at any keep).
+//   - Override: none directly; raise aggregate_cap_runes past the floor to
+//     widen the band further.
+const minObservationHeadroom = 4
 
 // defaultObservationColdCacheGapMinutes is the idle gap after which the
 // prompt cache is treated as expired for cold_cache/hybrid mode.
@@ -109,11 +128,27 @@ func (c ObservationWindowConfig) mode() ObservationTriggerMode {
 	return c.Mode
 }
 
-func (c ObservationWindowConfig) aggregateCap() int {
-	if c.AggregateCapRunes <= 0 {
-		return defaultObservationAggregateCapRunes
+// aggregateCapFor resolves the trigger threshold for a given window size.
+// The floor keeps minObservationHeadroom observations' worth of room above
+// what a pass leaves behind, so the trigger cannot re-fire immediately at a
+// larger keep.
+func (c ObservationWindowConfig) aggregateCapFor(keep int) int {
+	// An explicitly configured cap is honored verbatim, floor included. An
+	// operator who sets a deliberately tight value is choosing frequent
+	// clearing with its cache cost; silently widening it would be the same
+	// "resolved to a value you did not choose" failure the mode validation
+	// exists to prevent. The headroom floor protects only the DEFAULT, which
+	// nobody chose and which must stay coherent as keep is tuned.
+	if c.AggregateCapRunes > 0 {
+		return c.AggregateCapRunes
 	}
-	return c.AggregateCapRunes
+	cap := defaultObservationAggregateCapRunes
+	if keep > 0 {
+		if floor := (keep + minObservationHeadroom) * defaultBrowserObservationMaxChars; floor > cap {
+			cap = floor
+		}
+	}
+	return cap
 }
 
 func (c ObservationWindowConfig) coldCacheGap() time.Duration {
@@ -176,6 +211,7 @@ func observationAggregateRunes(messages []client.Message) int {
 // iteration, and returns the reason for observability.
 func observationWindowShouldFire(
 	messages []client.Message,
+	keep int,
 	lastAssistantAt time.Time,
 	cfg ObservationWindowConfig,
 ) (reason string, fire bool) {
@@ -193,7 +229,7 @@ func observationWindowShouldFire(
 		return "warm_cache", false
 
 	case ObservationTriggerBudget:
-		if observationAggregateRunes(messages) > cfg.aggregateCap() {
+		if observationAggregateRunes(messages) > cfg.aggregateCapFor(keep) {
 			return "budget", true
 		}
 		return "under_budget", false
@@ -202,7 +238,7 @@ func observationWindowShouldFire(
 		if observationCacheIsCold(lastAssistantAt, cfg) {
 			return "cold_cache", true
 		}
-		if observationAggregateRunes(messages) > cfg.aggregateCap() {
+		if observationAggregateRunes(messages) > cfg.aggregateCapFor(keep) {
 			return "budget", true
 		}
 		return "warm_under_budget", false
@@ -238,7 +274,7 @@ func applyObservationWindow(
 	if keep <= 0 {
 		return 0
 	}
-	if _, fire := observationWindowShouldFire(messages, lastAssistantAt, cfg); !fire {
+	if _, fire := observationWindowShouldFire(messages, keep, lastAssistantAt, cfg); !fire {
 		return 0
 	}
 	return filterOldObservations(messages, keep)

@@ -385,9 +385,16 @@ func TestObservationWindow_ZeroValueConfigResolvesToDefaults(t *testing.T) {
 	if zero.mode() != def.Mode {
 		t.Fatalf("zero mode resolved to %q, want %q", zero.mode(), def.Mode)
 	}
-	if zero.aggregateCap() != defaultObservationAggregateCapRunes {
-		t.Fatalf("zero aggregate cap resolved to %d, want %d",
-			zero.aggregateCap(), defaultObservationAggregateCapRunes)
+	// The DEFAULT cap is raised to the headroom floor so it stays coherent as
+	// keep is tuned; an explicit cap is honored verbatim.
+	wantDefault := (defaultObservationWindow + minObservationHeadroom) * defaultBrowserObservationMaxChars
+	if got := zero.aggregateCapFor(defaultObservationWindow); got != wantDefault {
+		t.Fatalf("default cap at keep=%d resolved to %d, want the headroom floor %d",
+			defaultObservationWindow, got, wantDefault)
+	}
+	explicit := ObservationWindowConfig{AggregateCapRunes: 1_000}
+	if got := explicit.aggregateCapFor(defaultObservationWindow); got != 1_000 {
+		t.Fatalf("explicit cap was overridden to %d; an operator's value must stand", got)
 	}
 	if zero.coldCacheGap() != defaultObservationColdCacheGapMinutes*time.Minute {
 		t.Fatalf("zero cold-cache gap resolved to %v", zero.coldCacheGap())
@@ -441,4 +448,60 @@ func TestObservationWindow_RetainedContentIdenticalAcrossModes(t *testing.T) {
 	if string(want) != string(got) {
 		t.Fatal("cold_cache produced different retained bytes than the legacy pass")
 	}
+}
+
+// TestKeepSensitivitySweep measures what the retained-observation count
+// actually buys. The count window is the SECOND bound on observation bytes —
+// each observation is already capped at capture (browserObsMaxChars), so the
+// worst case is keep x cap regardless. This reports whether the count is
+// carrying its weight or just adding a knob.
+func TestKeepSensitivitySweep(t *testing.T) {
+	modes := []ObservationTriggerMode{ObservationTriggerEveryTurn, ObservationTriggerHybrid}
+	keeps := []int{1, 3, 5, 8}
+
+	t.Logf("20-iteration browser session, warm cache, capture cap=%d runes", simObsCap)
+	t.Logf("%-11s %5s %8s %14s %13s %9s", "mode", "keep", "breaks", "cacheWriteKB", "finalCtxKB", "fullObs")
+	for _, mode := range modes {
+		for _, keep := range keeps {
+			r := runSessionWithKeep(t, mode, keep)
+			t.Logf("%-11s %5d %8d %14.1f %13.1f %9d",
+				mode, keep, r.breaks,
+				float64(r.cacheWriteBytes)/1024,
+				float64(r.finalCtxBytes)/1024,
+				r.fullObsAtEnd)
+		}
+	}
+}
+
+// runSessionWithKeep is runSession with the window size as a parameter.
+func runSessionWithKeep(t *testing.T, mode ObservationTriggerMode, keep int) simResult {
+	t.Helper()
+
+	cfg := ObservationWindowConfig{Mode: mode}
+	msgs := []client.Message{{Role: "system", Content: client.NewTextContent("system")}}
+
+	var prev [][]byte
+	res := simResult{mode: mode}
+	for turn := 0; turn < simTurns; turn++ {
+		msgs = appendBrowserTurn(msgs, turn)
+		applyObservationWindow(msgs, keep, time.Now().Add(-2*time.Second), cfg)
+		cur := snapshotTurn(t, msgs)
+		if prev != nil {
+			wb, broke := turnCacheWriteBytes(prev, cur)
+			res.cacheWriteBytes += wb
+			if broke {
+				res.breaks++
+			}
+		}
+		prev = cur
+	}
+	for _, b := range prev {
+		res.finalCtxBytes += len(b)
+	}
+	for turn := 0; turn < simTurns; turn++ {
+		if !isObservationStubContent(browserResultContent(t, msgs, fmt.Sprintf("tc%02d", turn))) {
+			res.fullObsAtEnd++
+		}
+	}
+	return res
 }
