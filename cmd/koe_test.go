@@ -62,6 +62,70 @@ func TestKoeConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestShouldRelayRealtimeUsage(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		body string
+		want bool
+	}{
+		{name: "cloud-backed openai", body: `{"provider":"openai"}`, want: true},
+		{name: "cloud-backed qwen", body: `{"provider":"qwen"}`, want: true},
+		{name: "direct openai", key: "personal-key", body: `{"provider":"openai"}`, want: false},
+		{name: "direct qwen fallback", key: "personal-key", body: `{"provider":"qwen"}`, want: true},
+		{name: "direct malformed", key: "personal-key", body: `{`, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRelayRealtimeUsage(tt.key, json.RawMessage(tt.body)); got != tt.want {
+				t.Fatalf("shouldRelayRealtimeUsage(%q, %s) = %t, want %t", tt.key, tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRealtimeUsageRelayDoesNotBlockRealtimeCallback(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	served := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(started) })
+		<-release
+		w.WriteHeader(http.StatusOK)
+		close(served)
+	}))
+	defer srv.Close()
+
+	relay := newRealtimeUsageRelayWithSpool(koe.NewDaemonClient(srv.URL), "", t.TempDir())
+	t.Cleanup(relay.Close)
+	returned := make(chan struct{})
+	go func() {
+		if err := relay.Enqueue("", json.RawMessage(`{"provider":"openai","response_id":"resp-1","usage":{"input_tokens":1}}`)); err != nil {
+			t.Errorf("enqueue report: %v", err)
+		}
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("usage relay blocked the Realtime callback")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("usage relay did not start the durable handoff")
+	}
+	close(release)
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("usage relay did not finish after the daemon accepted it")
+	}
+}
+
 // The pinned default is only defensible because --model still overrides it —
 // that is the escape hatch for CLI and on-robot callers who want another tier.
 func TestKoeModelFlagOverridesDefault(t *testing.T) {
@@ -633,12 +697,15 @@ func TestWarmMintTakeUsesCachedSecret(t *testing.T) {
 		mintedAt: time.Now(),
 		inFlight: true, // suppress async refill; this test only covers cache consumption
 	}
-	got, cached, err := w.take(context.Background())
+	got, cached, principal, err := w.take(context.Background())
 	if err != nil {
 		t.Fatalf("take: %v", err)
 	}
 	if got != "ek_cached" || !cached {
 		t.Fatalf("take = %q cached=%v, want cached secret", got, cached)
+	}
+	if principal != "" {
+		t.Fatalf("cached principal = %q, want empty", principal)
 	}
 	if w.value != "" {
 		t.Fatal("cached secret should be consumed exactly once")
@@ -656,12 +723,15 @@ func TestWarmMintTakeMintsWhenExpired(t *testing.T) {
 		value:    "ek_old",
 		mintedAt: time.Now().Add(-time.Second),
 	}
-	got, cached, err := w.take(context.Background())
+	got, cached, principal, err := w.take(context.Background())
 	if err != nil {
 		t.Fatalf("take: %v", err)
 	}
 	if got != "ek_fresh" || cached || calls != 1 {
 		t.Fatalf("take = %q cached=%v calls=%d, want fresh mint", got, cached, calls)
+	}
+	if principal != "" {
+		t.Fatalf("fresh principal = %q, want empty", principal)
 	}
 }
 
@@ -745,7 +815,7 @@ func TestRunDesktopCallBindsControlPortBeforeSlowAgentFetch(t *testing.T) {
 				mode: koe.ProviderOpenAI, openAIModel: "gpt-realtime-mini", mint: mint,
 				circuit: koe.NewOpenAICircuit(time.Minute),
 			},
-			func(json.RawMessage) {})
+			func(string, json.RawMessage) error { return nil })
 	}()
 
 	select {

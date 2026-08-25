@@ -11,7 +11,7 @@ daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WS, runs th
 agent loop locally, streams back. Also TUI, one-shot CLI, MCP, schedules.
 
 Layout: `cmd/` (Cobra) + `internal/<pkg>/`. Production path is
-`internal/daemon/` driving `internal/agent/`.
+`daemon/` driving `agent/`.
 
 ## Working Rules
 
@@ -31,8 +31,8 @@ Layout: `cmd/` (Cobra) + `internal/<pkg>/`. Production path is
 Feature changes update `README.md`, `CLAUDE.md`, and this file.
 
 **The bundled `kocoro` skill is the AI-facing source of truth for the daemon HTTP
-API.** Every `mux.HandleFunc(...)` in `internal/daemon/server.go` the agent calls
-needs a matching `internal/skills/bundled/skills/kocoro/references/*.md` entry in
+API.** Every `mux.HandleFunc(...)` in `daemon/server.go` the agent calls
+needs a matching `skills/bundled/skills/kocoro/references/*.md` entry in
 the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 `docs/desktop-wire-fixtures/`.
 
@@ -116,7 +116,7 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   commit its write and die before responding). Everything else returns
   `mcp.OutcomeUnknownError`. Timeouts/protocol errors are never retried.
 - A failed async connect is NOT terminal: `ReconnectScheduler`
-  (`internal/mcp/reconnect.go`) backs off 5s → 5min, `reconnectMaxAttempts` 6.
+  (`mcp/reconnect.go`) backs off 5s → 5min, `reconnectMaxAttempts` 6.
   Retries are owned by the manager generation (`SwapMCPReconnectScheduler`,
   `ShutdownCleanup`) so a timer never respawns a subprocess the cleanup is
   reaping. `ForgetMCPReconnect` re-arms an exhausted streak.
@@ -143,7 +143,7 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   `loop.go checkPermissionAndApproval`).
 - `HandleAlwaysAllowDecision` (`alwaysallow.go`) is the single decision path
   shared by SSE and WS so transports cannot drift.
-- Two deny-lists in `internal/agent/tools.go`: `autoApprovalDenyList`
+- Two deny-lists in `agent/tools.go`: `autoApprovalDenyList`
   (`DisallowsAutoApproval`) = `computer`, `accessibility`, `applescript`,
   `ghostty`; `unattendedAutoApprovalDenyList` (`DisallowsUnattendedAutoApproval`)
   = those four plus `computer_use` and `screenshot`.
@@ -163,7 +163,7 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   `docs/desktop-wire-fixtures/` (verified by `wire_fixtures_test.go` through the
   REAL producer path). Change a payload → update fixture + test in the SAME PR.
 - Every cross-version contract change mints a capability token in `Capabilities`
-  (`internal/daemon/client.go`), surfaced on the WS handshake and `GET /status`.
+  (`daemon/client.go`), surfaced on the WS handshake and `GET /status`.
   Clients gate on tokens — NEVER version sniffing or decode-failure probing.
 - New event domains use dotted types with a common envelope; existing flat types
   are additive-only, never repurposed.
@@ -247,29 +247,29 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 
 ## Prompt Cache and Suggestions
 
-- Cloud owns TTL policy. Preserve `cache_source` as attribution, never a
-  Kocoro-side TTL selector, and preserve `normalizeToolInput` canonicalization.
-  Skill listing lives in the scaffolded user message, not the system prompt.
+- Cloud owns TTL policy. `cache_source` is attribution only, never a Kocoro-side
+  TTL selector; preserve `normalizeToolInput` canonicalization. Skill listing
+  lives in the scaffolded user message, not the system prompt.
 - Any in-place `messages[idx].Content` rewrite MUST call
   `client.LogCacheCompactEvent` — uninstrumented rewrites break drift attribution.
-- `agent.response_detail` renders provider-neutral final-answer guidance in BP3
-  StableContext: global missing/empty → `balanced`, named-agent missing/empty
-  inherits global, provider request effort unchanged. Strict machine-readable
-  internal loops suppress it explicitly.
+- A rewrite pass MUST NOT run per iteration: a per-turn sliding window advances
+  the divergence point every turn and charges cache WRITE for the suffix behind
+  it. Fire on a cold prefix or budget — `observation_trigger.go`.
+- `agent.response_detail` renders final-answer guidance in BP3 StableContext:
+  missing/empty → `balanced` (named agents inherit global), request effort
+  unchanged; strict internal loops suppress it explicitly.
 - The suggestion fork MUST be byte-equal to the main request except the appended
-  assistant reply, suggestion prompt, `SkipCacheWrite`, and debug-only fork kind
-  — no tool/max-token/thinking/ordering changes. Source-gated by
-  `wantsPromptSuggestion` (`desktop`, `kocoro`, `shanclaw`, `web`); an
-  ALLOW-list, so new background sources default to skipped.
+  reply, suggestion prompt, `SkipCacheWrite`, and fork kind — no tool/max-token/
+  thinking/ordering changes. `wantsPromptSuggestion` is an ALLOW-list (`desktop`,
+  `kocoro`, `shanclaw`, `web`), so new background sources default to skipped.
 
 ## Skills
 
-- `builtinSkills` (`internal/skills/api.go`: `kocoro`, `kocoro-generative-ui`)
-  sync from `embed.FS` every startup — user edits are WIPED; fork under a
-  different name.
-- `internal/daemon/skill_filter.go` filters `desktopOnlySkills` from the
-  per-request list on cloud-distributed sources, applied ONCE producer-side right
-  after `LoadGlobalSkills` so registry, listing, and semantic discovery stay
+- `builtinSkills` (`skills/api.go`: `kocoro`, `kocoro-generative-ui`) sync from
+  `embed.FS` every startup — user edits are WIPED; fork under a new name.
+- `daemon/skill_filter.go` filters `desktopOnlySkills` from the per-request list
+  on cloud sources, applied ONCE producer-side right after `LoadGlobalSkills`
+  so registry, listing, and semantic discovery stay
   consistent. Drift test `skill_filter_test.go`.
 - Skill-install recommendation discovery is binary-pinned and OFFLINE: production
   uses only the embedded eligible catalog (`official_catalog.json`), never the
@@ -330,14 +330,14 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
 ## Auth
 
 `/local/auth/*` proxies to Cloud `/api/v1/auth/*`. `AuthManager`
-(`internal/daemon/auth.go`) owns the state machine, emits `auth_state_changed`.
+(`daemon/auth.go`) owns the state machine, emits `auth_state_changed`.
 **WS runs ONLY in `signed_in`; `WSController.Start`/`Stop` are the only allowed
 reconnect-loop call sites.** api_key is source-of-truth in the credential store
 (`ai.kocoro.daemon.api_key`); access/refresh tokens RAM only. On
 `!keychain.Supported()`: `AuthManager` nil, endpoints 503 `platform_unsupported`,
 legacy `cfg.APIKey` drives WS. The yaml→store migration re-strips `api_key` from
 config-managed yaml every launch. Endpoint matrix:
-`internal/skills/bundled/skills/kocoro/references/auth.md`.
+`skills/bundled/skills/kocoro/references/auth.md`.
 
 ## Anti-Hallucination
 

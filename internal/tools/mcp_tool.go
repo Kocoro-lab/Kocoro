@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -206,10 +207,10 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 	// file_read agree on the same location. Unrelated tools are not touched.
 	rewrittenOutPath := maybeRewriteFileProducingArg(ctx, t.serverName, t.tool.Name, args)
 
-	callTool := func() (string, bool, error) {
+	callTool := func() (mcp.ToolCallContent, bool, error) {
 		return t.manager.CallToolGuarded(ctx, t.serverName, t.tool.Name, args, preDispatchGuard)
 	}
-	content, isError, err := callTool()
+	out, isError, err := callTool()
 	if err != nil && t.supervisor != nil && ctx.Err() == nil && mcp.IsTransportError(err) {
 		// Post-dispatch TRANSPORT failure. The request was already written to
 		// a server that was alive at dispatch time, and "connection died"
@@ -244,7 +245,7 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		if !mcp.ToolReplaySafe(t.tool) {
 			err = &mcp.OutcomeUnknownError{Server: t.serverName, Tool: t.tool.Name, Err: err}
 		} else if reconHealth.State == mcp.StateHealthy {
-			content, isError, err = callTool()
+			out, isError, err = callTool()
 		}
 	}
 	if err != nil {
@@ -263,9 +264,13 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		return agent.ToolResult{Content: fmt.Sprintf("MCP call failed: %v", err), IsError: true}, nil
 	}
 
-	content = normalizeMCPResult(t.serverName, t.tool.Name, content, isError)
+	content := normalizeMCPResult(t.serverName, t.tool.Name, out.Text, isError)
+	images, decodeDropped := decodeMCPImages(t.serverName, t.tool.Name, out.Images)
+	content = appendMCPImageSummary(content, len(images), out.DroppedImages+decodeDropped)
 	if isError && looksLikeRemoteValidationError(content) {
-		return agent.ValidationError(strings.TrimPrefix(content, "[validation error] ")), nil
+		result := agent.ValidationError(strings.TrimPrefix(content, "[validation error] "))
+		result.Images = images
+		return result, nil
 	}
 	if !isError && rewrittenOutPath != "" {
 		content = annotateAbsPath(content, rewrittenOutPath)
@@ -276,7 +281,71 @@ func (t *MCPTool) Run(ctx context.Context, argsJSON string) (agent.ToolResult, e
 		// can act on. No-op for servers with unknown path semantics.
 		content = maybeAnnotateResultPaths(t.serverName, content, t.manager)
 	}
-	return agent.ToolResult{Content: content, IsError: isError}, nil
+	result := agent.ToolResult{Content: content, IsError: isError, Images: images}
+	return result, nil
+}
+
+func appendMCPImageSummary(content string, delivered, dropped int) string {
+	if delivered == 0 && dropped == 0 {
+		return content
+	}
+	imageNoun := "images"
+	if delivered == 1 {
+		imageNoun = "image"
+	}
+	droppedNoun := "images"
+	if dropped == 1 {
+		droppedNoun = "image"
+	}
+	var note string
+	switch {
+	case delivered > 0 && dropped > 0:
+		note = fmt.Sprintf("[%d %s returned; %d could not be delivered]", delivered, imageNoun, dropped)
+	case delivered > 0:
+		note = fmt.Sprintf("[%d %s returned]", delivered, imageNoun)
+	default:
+		note = fmt.Sprintf("[%d %s could not be delivered]", dropped, droppedNoun)
+	}
+	if content == "" {
+		return note
+	}
+	return content + "\n" + note
+}
+
+// decodeMCPImages converts an MCP result's images into vision-compatible
+// blocks. An image that fails to decode or compress is dropped with a log
+// line rather than failing the call: the text content is usually the primary
+// answer, and a broken image must never turn a completed tool call into an
+// error.
+func decodeMCPImages(serverName, toolName string, imgs []mcp.ToolCallImage) ([]agent.ImageBlock, int) {
+	if len(imgs) == 0 {
+		return nil, 0
+	}
+	blocks := make([]agent.ImageBlock, 0, len(imgs))
+	dropped := 0
+	for i, img := range imgs {
+		raw, err := base64.StdEncoding.DecodeString(img.Base64)
+		if err != nil {
+			log.Printf("[mcp-tool] %s/%s: image %d has undecodable base64 (%v), dropped", serverName, toolName, i, err)
+			dropped++
+			continue
+		}
+		mediaType := img.MIMEType
+		if mediaType == "" {
+			mediaType = "image/png"
+		}
+		block, err := EncodeImageBytes(raw, mediaType)
+		if err != nil {
+			log.Printf("[mcp-tool] %s/%s: image %d failed compression (%v), dropped", serverName, toolName, i, err)
+			dropped++
+			continue
+		}
+		blocks = append(blocks, block)
+	}
+	if len(blocks) == 0 {
+		return nil, dropped
+	}
+	return blocks, dropped
 }
 
 func (t *MCPTool) blockPlaywrightXComposerNavigation(args map[string]any) (bool, agent.ToolResult) {

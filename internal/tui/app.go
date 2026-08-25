@@ -475,6 +475,7 @@ func New(cfg *config.Config, version string, agentOverride *agents.Agent) *Model
 	loop.SetTemperature(runtimeCfg.Agent.Temperature)
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
 	loop.SetObservationWindow(runtimeCfg.Agent.ObservationWindow)
+	loop.SetObservationWindowConfig(runtimeCfg.Agent.ObservationWindowTrigger.Runtime())
 	loop.SetBrowserObservationMaxChars(runtimeCfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(runtimeCfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(runtimeCfg.Agent.MaxRecentBrowserImages)
@@ -681,6 +682,7 @@ func (m *Model) rebuildAgentLoop() {
 	loop.SetTemperature(m.cfg.Agent.Temperature)
 	// Browser/GUI context trimming (config-gated; defaults ON via viper).
 	loop.SetObservationWindow(m.cfg.Agent.ObservationWindow)
+	loop.SetObservationWindowConfig(m.cfg.Agent.ObservationWindowTrigger.Runtime())
 	loop.SetBrowserObservationMaxChars(m.cfg.Tools.BrowserResultTruncation)
 	loop.SetMaxRecentImages(m.cfg.Agent.MaxRecentImages)
 	loop.SetMaxRecentBrowserImages(m.cfg.Agent.MaxRecentBrowserImages)

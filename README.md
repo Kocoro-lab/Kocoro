@@ -499,6 +499,12 @@ permissions:
 
 See [docs/config-reference.md](docs/config-reference.md) for the full key list including `agent.*`, `tools.*`, `mcp_servers`, `cloud`, `memory`, `sync`, `daemon`, `hooks`, UI settings, etc. Run `/config` in the TUI to see the merged config with sources.
 
+Long browser/GUI sessions use `agent.observation_window_trigger.mode: hybrid`
+by default: old page observations are cleared when the prompt cache is already
+cold or when their aggregate text crosses a bounded budget. See
+[Browser/GUI context trimming](docs/config-reference.md#agent-settings) for the
+available trigger modes, idle gap, and aggregate-budget overrides.
+
 Per-agent overrides live in `~/.shannon/agents/<name>/_attached.yaml` — including `agent.model_tier` so individual agents can opt into the Large (Opus) tier without changing the global default. `agent.effort_tier` (`low` / `high` / `xhigh` / `max`, empty = inherit) works the same way, overriding the unified reasoning-effort tier per agent. `agent.response_detail` (`concise` / `balanced` / `detailed`, global default `balanced`, empty per-agent value = inherit) controls final-answer style without changing reasoning effort. See [docs/agents-reference.md](docs/agents-reference.md) for the precedence chain.
 
 ## Instructions & Memory

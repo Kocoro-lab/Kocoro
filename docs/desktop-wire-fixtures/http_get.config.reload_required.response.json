@@ -19,6 +19,11 @@
       "max_tokens": 0,
       "model": "",
       "observation_window": 0,
+      "observation_window_trigger": {
+        "aggregate_cap_runes": 0,
+        "cold_cache_gap_minutes": 0,
+        "mode": ""
+      },
       "prompt_suggestion": {
         "cache_cold_threshold_tokens": 0,
         "enabled": false,

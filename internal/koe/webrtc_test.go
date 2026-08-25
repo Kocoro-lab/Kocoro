@@ -545,6 +545,21 @@ func TestQwenVideoPrimerFailsClosedWithoutAudioPath(t *testing.T) {
 	}
 }
 
+func TestRealtimeConnCloseWaitsForUsageBeforeCancel(t *testing.T) {
+	var order []string
+	rc := &RealtimeConn{
+		waitForUsage: func(time.Duration) bool {
+			order = append(order, "wait")
+			return true
+		},
+		cancel: func() { order = append(order, "cancel") },
+	}
+	rc.Close()
+	if got, want := strings.Join(order, ","), "wait,cancel"; got != want {
+		t.Fatalf("close order = %q, want %q", got, want)
+	}
+}
+
 func TestQwenVideoSourceRejectsUnsupportedCodec(t *testing.T) {
 	_, err := newPeerConnectionForProviderWithVideo(nil, ProviderQwen, &RealtimeVideoSource{
 		Codec:     "jpeg",

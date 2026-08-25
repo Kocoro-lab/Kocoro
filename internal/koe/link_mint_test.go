@@ -24,16 +24,20 @@ func TestMintViaDaemon(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		// Mirror the gateway's forwarded shape (value + top-level expires_at).
-		_ = json.NewEncoder(w).Encode(map[string]any{"value": "ek_relay123", "expires_at": 1782380235})
+		_ = json.NewEncoder(w).Encode(map[string]any{"value": "ek_relay123", "expires_at": 1782380235, "usage_principal": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	}))
 	defer srv.Close()
 
-	ek, err := NewDaemonClient(srv.URL).MintViaDaemon(context.Background(), "gpt-realtime-2.1-mini")
+	client := NewDaemonClient(srv.URL)
+	ek, principal, err := client.MintViaDaemonWithPrincipal(context.Background(), "gpt-realtime-2.1-mini")
 	if err != nil {
 		t.Fatalf("MintViaDaemon: %v", err)
 	}
 	if ek != "ek_relay123" {
 		t.Errorf("ek = %q, want ek_relay123", ek)
+	}
+	if principal != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Errorf("usage principal = %q", principal)
 	}
 }
 

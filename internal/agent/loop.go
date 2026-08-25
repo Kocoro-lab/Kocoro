@@ -836,7 +836,11 @@ type AgentLoop struct {
 	// Browser/GUI context trimming (see observation_window.go). All default to
 	// the package-level defaults in NewAgentLoop so every construction path
 	// (daemon/TUI/one-shot) gets the cost reduction; runner overrides from config.
-	observationWindow      int // sliding-window size for browser/GUI observations; 0 disables
+	observationWindow int // full-fidelity browser/GUI observations retained; 0 disables
+	// observationWindowCfg selects WHEN the observation window clears (see
+	// observation_trigger.go). Per-iteration evaluation is cache-hostile;
+	// the default policy clears on a cold prefix or an aggregate budget.
+	observationWindowCfg   ObservationWindowConfig
 	browserObsMaxChars     int // per-observation capture cap for browser/GUI results; 0 = generic cap
 	maxRecentImages        int // count-based old-image pruning, all images (filterOldImages); 0 disables
 	maxRecentBrowserImages int // browser-scoped screenshot pruning (filterOldBrowserImages); 0 disables
@@ -1049,9 +1053,9 @@ type AgentLoop struct {
 	// compressOldToolResults directly under context-pressure.
 	timeBasedCompactCfg TimeBasedCompactConfig
 	// lastAssistantAt is updated to time.Now() after every successful LLM
-	// response. Persists across Run() calls when the AgentLoop instance is
-	// reused (e.g. routed daemon sessions, TUI). Zero-valued for fresh loops
-	// — evaluateTimeBasedCompactTrigger short-circuits in that case.
+	// response. Callers that create a loop per request seed it from durable
+	// session history with SetLastAssistantAt. Zero means no prior assistant
+	// response is known.
 	lastAssistantAt time.Time
 
 	// Watchdog thresholds (0 = disabled). The watchdog observes the loop's
@@ -1149,6 +1153,7 @@ func NewAgentLoop(gw client.LLMClient, tools *ToolRegistry, modelTier string, sh
 		readTracker:            NewReadTracker(),
 		toolResultReplacements: NewToolResultReplacementState(nil),
 		observationWindow:      defaultObservationWindow,
+		observationWindowCfg:   DefaultObservationWindowConfig(),
 		browserObsMaxChars:     defaultBrowserObservationMaxChars,
 		maxRecentImages:        defaultMaxRecentImages,
 		maxRecentBrowserImages: defaultMaxRecentBrowserImages,
@@ -2104,11 +2109,32 @@ func (a *AgentLoop) SetObservationWindow(n int) {
 	a.observationWindow = n
 }
 
+// SetObservationWindowConfig selects when the observation window clears (see
+// observation_trigger.go). Zero-valued fields resolve to the package defaults,
+// so a caller may set only Mode.
+func (a *AgentLoop) SetObservationWindowConfig(cfg ObservationWindowConfig) {
+	a.observationWindowCfg = cfg
+}
+
+// SetLastAssistantAt restores the most recent durable assistant-response time
+// for callers that create a fresh AgentLoop for every request.
+func (a *AgentLoop) SetLastAssistantAt(at time.Time) {
+	a.lastAssistantAt = at
+}
+
 // SetBrowserObservationMaxChars overrides the per-observation capture cap for
 // browser/GUI tool results (runes). A non-positive value falls back to the
 // generic tools.result_truncation cap.
 func (a *AgentLoop) SetBrowserObservationMaxChars(n int) {
 	a.browserObsMaxChars = n
+}
+
+func (a *AgentLoop) browserObservationMaxChars() int {
+	maxChars := a.resultTrunc
+	if a.browserObsMaxChars > 0 && (maxChars <= 0 || a.browserObsMaxChars < maxChars) {
+		maxChars = a.browserObsMaxChars
+	}
+	return maxChars
 }
 
 // SetMaxRecentImages overrides how many recent image-bearing messages are kept
@@ -4530,12 +4556,26 @@ iterationLoop:
 			filterOldImages(messages, a.maxRecentImages)
 		}
 
-		// Sliding window over browser/GUI text observations: keep the most
-		// recent a.observationWindow at full fidelity, stub older ones. This
-		// bounds the accumulated page/DOM history that a long browser loop
-		// otherwise re-sends every iteration (see observation_window.go).
-		// No-op when the window is disabled (<=0) or history is within it.
-		_ = filterOldObservations(messages, a.observationWindow)
+		// Window over browser/GUI text observations: keep the most recent
+		// a.observationWindow at full fidelity, stub older ones. This bounds
+		// the accumulated page/DOM history that a long browser loop otherwise
+		// re-sends every iteration (see observation_window.go).
+		//
+		// The pass is TRIGGER-GATED (see observation_trigger.go). Evaluating
+		// it every iteration walked the stub boundary forward one slot per
+		// turn, rewriting history mid-prefix on every turn and paying cache
+		// WRITE (1.25x) for bytes that would otherwise have been cache READS
+		// (0.1x). The default policy now clears when the prefix is already
+		// cold (free) or when accumulated observation text crosses its
+		// aggregate budget (bounded growth), not on a fixed per-turn count.
+		// No-op when the window is disabled (<=0) or the trigger does not fire.
+		_ = applyObservationWindowWithCaptureCap(
+			messages,
+			a.observationWindow,
+			a.lastAssistantAt,
+			a.browserObservationMaxChars(),
+			a.observationWindowCfg,
+		)
 
 		// Time-based microcompact (see timebasedcompact.go). No-op unless
 		// Enabled AND the gap since the last assistant response exceeds
