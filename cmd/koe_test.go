@@ -467,7 +467,7 @@ func TestKoePersonaAckIsBareAndNoPreAnswer(t *testing.T) {
 }
 
 func TestKoePersonaSeparatesCurrentHandoffFromLaterTurns(t *testing.T) {
-	combined := strings.ToLower(koePersona + koeMultiTaskPersona)
+	combined := strings.ToLower(koePersona + koe.MultiTaskPersona)
 	for _, want := range []string{
 		"after the do_task call, emit no more audio in this response",
 		"later user turns may continue normally while the task is running",
@@ -525,7 +525,7 @@ func TestKoePersonaUsesRealtimeStructureAndVoiceStyle(t *testing.T) {
 }
 
 func TestKoePersonaDefaultsToOneTaskAndMakesExplicitParallelScopesDisjoint(t *testing.T) {
-	combined := koePersona + koeMultiTaskPersona + koe.ParallelTaskInstructions
+	combined := koePersona + koe.MultiTaskPersona + koe.ParallelTaskInstructions
 	for _, want := range []string{
 		"Default to exactly one do_task call.",
 		"only when the user explicitly asks",
@@ -743,12 +743,12 @@ func TestBaseKoePersona(t *testing.T) {
 		t.Errorf("empty language should give the bare base persona")
 	}
 	zh := baseKoePersona(koeConfig{language: "zh"})
-	if !strings.Contains(zh, koeLanguageInstruction("zh")) ||
-		strings.Contains(zh, koeDefaultLanguageSection) || strings.Count(zh, "# Language") != 1 {
+	if !strings.Contains(zh, koe.PersonaLanguageSection("zh")) ||
+		strings.Contains(zh, koe.PersonaLanguageSection("")) || strings.Count(zh, "# Language") != 1 {
 		t.Errorf("zh base persona missing base or language pin: %q", zh)
 	}
 	t.Setenv("KOE_TASK_LEDGER", "1")
-	if got := baseKoePersona(koeConfig{}); !strings.Contains(got, koeMultiTaskPersona) {
+	if got := baseKoePersona(koeConfig{}); !strings.Contains(got, koe.MultiTaskPersona) {
 		t.Error("ledger persona must teach immediate ack and multi-task addressing")
 	}
 }
@@ -767,12 +767,12 @@ func TestBuildKoePersonaAssembly(t *testing.T) {
 
 	agents := []koe.AgentSummary{{Slug: "finance", DisplayName: "Finance"}}
 	got := buildKoePersona(context.Background(), koe.NewDaemonClient(daemon.URL), koeConfig{language: "en"}, agents)
-	for _, want := range []string{"# Role and Objective", "USER_CONTEXT_MARKER", koeAgentListLine(agents), koeLanguageInstruction("en"), koeMultiTaskPersona} {
+	for _, want := range []string{"# Role and Objective", "USER_CONTEXT_MARKER", koeAgentListLine(agents), koe.PersonaLanguageSection("en"), koe.MultiTaskPersona} {
 		if !strings.Contains(got, want) {
 			t.Errorf("buildKoePersona missing %q", want)
 		}
 	}
-	if strings.Contains(got, koeDefaultLanguageSection) || strings.Count(got, "# Language") != 1 {
+	if strings.Contains(got, koe.PersonaLanguageSection("")) || strings.Count(got, "# Language") != 1 {
 		t.Errorf("buildKoePersona has conflicting language authorities: %q", got)
 	}
 }

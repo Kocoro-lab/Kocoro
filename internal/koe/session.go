@@ -25,8 +25,11 @@ type SessionConfig struct {
 	// transport. The brain never owns a socket.
 	Send func(payloadJSON string) error
 	// ControlApp asks the host UI to act (show/hide/new_conversation/open_settings).
-	// Optional.
-	ControlApp func(action string)
+	// Optional. A non-nil error is the host declining the action; it reaches the
+	// model as a failed tool result with this reason, so a host with a reduced
+	// shell (the iOS app) can degrade honestly instead of faking success or
+	// falling back to the generic "not wired" of a missing hook.
+	ControlApp func(action string) error
 	// TaskBackend executes delegated work (do_task/cancel/agent listing) through
 	// the host application. Optional; nil keeps the DaemonClient path against
 	// BackendURL. On iOS the host relays to Shannon Cloud's remote-run channel —
@@ -46,6 +49,19 @@ type SessionConfig struct {
 	// audio. macOS wires the equivalent closure in cmd/koe.go. Optional, but a
 	// host that leaves it nil cannot be hung up by voice.
 	OnEndCall func()
+	// Model is the realtime model the call runs on, stamped into each usage
+	// report. Cloud rejects a report with an empty model, and only webrtc.go's
+	// Connect (the macOS path) ever set the handler's copy — a façade host must
+	// supply it here, from the authoritative mint response.
+	Model string
+	// OnUsage receives one billing report per completed response — the brain's
+	// verbatim {provider, model, response_id, usage} JSON. The host relays it
+	// unparsed to Cloud's usage-ingest endpoint, exactly as macOS forwards the
+	// same bytes through the daemon (cmd/koe.go onUsage → POST
+	// /koe/realtime/usage → Cloud). Fired from a fresh goroutine, never the
+	// event loop. Optional, but a host that leaves it nil is never billed for
+	// its realtime turns.
+	OnUsage func(usageJSON string)
 }
 
 // Session is the exported handle on the front brain.
@@ -79,8 +95,7 @@ func NewSession(cfg SessionConfig) *Session {
 	var controlApp ControlAppFunc
 	if cfg.ControlApp != nil {
 		controlApp = func(_ context.Context, action string) error {
-			cfg.ControlApp(action)
-			return nil
+			return cfg.ControlApp(action)
 		}
 	}
 	disp := NewDispatcher(client, resolver, s.state, controlApp)
@@ -114,6 +129,15 @@ func NewSession(cfg SessionConfig) *Session {
 	s.handler = newEventHandler(disp, s.state, NewExternalAudioController(cfg.Audio), sendFn)
 	s.handler.onEndCall = cfg.OnEndCall
 	s.handler.fullDuplexAEC = cfg.FullDuplexAEC
+	s.handler.model = cfg.Model
+	if cfg.OnUsage != nil {
+		onUsage := cfg.OnUsage
+		// Detach the relay from the event loop — the same fire-and-forget
+		// cmd/koe.go's onUsage closure does; the host's HTTP retries may block.
+		s.handler.onUsage = func(usage json.RawMessage) {
+			go onUsage(string(usage))
+		}
+	}
 	// The mailbox delivery worker. macOS starts it in Connect (webrtc.go); the
 	// façade owns it here because the host owns the transport. Without it a
 	// completed do_task result stays parked in the mailbox forever — never

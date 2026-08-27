@@ -52,9 +52,14 @@ type EventSender interface {
 	Send(payloadJSON string) error
 }
 
-// ControlHost is implemented in Swift: the brain asking the app's UI to act.
+// ControlHost is implemented in Swift: the brain asking the app's UI to act
+// (show/hide/new_conversation/open_settings). Returning an error declines the
+// action; the reason travels back to the model as a failed tool result, so a
+// reduced shell degrades honestly — the iOS app accepts only "show" (the app
+// is already on screen) and declines the rest with a spoken-word reason.
+// gomobile surfaces the error return as a throwing method in Swift.
 type ControlHost interface {
-	ControlApp(action string)
+	ControlApp(action string) error
 }
 
 // TaskBackend is implemented in Swift: it executes delegated work by relaying
@@ -82,6 +87,17 @@ type CallHost interface {
 	EndCall()
 }
 
+// UsageReporter is implemented in Swift: it relays one turn's billing report
+// to Shannon Cloud's usage-ingest endpoint (POST /api/v1/usage/realtime). The
+// string is the brain's verbatim {provider, model, response_id, usage} JSON —
+// the host posts it unparsed, exactly as the daemon forwards the same bytes
+// for macOS, so Cloud sees one shape from every platform. Called from a fresh
+// goroutine, never the event loop; a host that supplies none is never billed
+// for its realtime turns.
+type UsageReporter interface {
+	ReportUsage(usageJSON string)
+}
+
 // sinkAdapter bridges the Swift-facing interface to the brain's own. They differ
 // only in that koe keeps dropCapture unexported on its internal interface.
 type sinkAdapter struct{ s AudioSink }
@@ -101,7 +117,9 @@ type Bridge struct {
 }
 
 // NewBridge starts a call's front brain against Swift-supplied audio and
-// transport. backendURL is Shannon Cloud on iOS, where there is no local daemon.
+// transport. backendURL is Shannon Cloud on iOS, where there is no local
+// daemon. model is what the mint response pinned — it stamps usage reports,
+// which Cloud rejects without a model.
 func NewBridge(
 	burstID string,
 	boundAgent string,
@@ -111,11 +129,14 @@ func NewBridge(
 	host ControlHost,
 	taskBackend TaskBackend,
 	callHost CallHost,
+	model string,
+	usageReporter UsageReporter,
 ) *Bridge {
 	cfg := koe.SessionConfig{
 		BurstID:    burstID,
 		BoundAgent: boundAgent,
 		BackendURL: backendURL,
+		Model:      model,
 		// iOS WebRTC captures through Apple's VPIO voice processing, so the
 		// uplink is already echo-cancelled — the precondition for the floor
 		// gate. Without this the brain treats the host as half-duplex and
@@ -138,6 +159,9 @@ func NewBridge(
 	}
 	if callHost != nil {
 		cfg.OnEndCall = callHost.EndCall
+	}
+	if usageReporter != nil {
+		cfg.OnUsage = usageReporter.ReportUsage
 	}
 	return &Bridge{session: koe.NewSession(cfg)}
 }
@@ -163,4 +187,14 @@ func (b *Bridge) SentEventCount() int64 { return b.session.SentEventCount() }
 // opens; a call that skips it connects and then does nothing at all.
 func (b *Bridge) SendSessionUpdate(persona string, voice string, fullDuplexAEC bool) error {
 	return b.session.SendSessionUpdate(persona, voice, fullDuplexAEC)
+}
+
+// DefaultPersona is the mobile spoken persona for one reply language ("" mirrors
+// the user's utterance): the same personality, tool discipline, and stop/cancel/
+// end-call vocabulary macOS composes, with host guidance adjusted to the iPhone
+// shell, plus the concurrent-tasks section when the task ledger is enabled.
+// Pass the result to SendSessionUpdate — a call configured with an empty persona
+// runs with tools but no personality, which is how the first iOS calls shipped.
+func DefaultPersona(language string) string {
+	return koe.AppendTaskLedgerPersona(koe.SpokenPersona(language, koe.HostMobile))
 }

@@ -1,6 +1,7 @@
 package koe
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -238,4 +239,168 @@ func TestSessionFullDuplexAECArmsNativeFloor(t *testing.T) {
 	if off.handler.nativeFloorEnabled() {
 		t.Fatal("floor gate must stay off for a half-duplex host")
 	}
+}
+
+// Usage reporting must cross the façade: the brain fires reportUsage on every
+// response.done (realtime.go), but the relay closure lived only in cmd/koe.go
+// (macOS main), so a Session host never received a report and iOS realtime
+// turns were never billed (2026-08-24 assessment, outstanding item #4). The
+// façade hands the host the brain's verbatim report body; Cloud requires
+// model and response_id, and model only ever comes from webrtc.go's Connect
+// on macOS — the façade must carry it for hosts with no Connect.
+func TestSessionReportsUsageToHost(t *testing.T) {
+	reports := make(chan string, 1)
+	s := NewSession(SessionConfig{
+		BurstID: "burst-usage",
+		Audio:   &fakeExternalAudio{},
+		Model:   "gpt-realtime-test",
+		OnUsage: func(usageJSON string) { reports <- usageJSON },
+	})
+
+	s.HandleEvent([]byte(`{"type":"response.done","response":{"id":"resp-u1","status":"completed","usage":{"total_tokens":42,"input_tokens":30,"output_tokens":12,"input_token_details":{"audio_tokens":25,"text_tokens":5}}}}`))
+
+	var got string
+	select {
+	case got = <-reports:
+	case <-time.After(2 * time.Second):
+		t.Fatal("response.done with usage never reached the host's OnUsage")
+	}
+
+	var report struct {
+		Provider   string          `json:"provider"`
+		Model      string          `json:"model"`
+		ResponseID string          `json:"response_id"`
+		Usage      json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(got), &report); err != nil {
+		t.Fatalf("usage report is not valid JSON: %v; body=%s", err, got)
+	}
+	if report.Model != "gpt-realtime-test" {
+		t.Fatalf("report.model = %q, want the config's model (Cloud 400s an empty model); body=%s", report.Model, got)
+	}
+	if report.ResponseID != "resp-u1" {
+		t.Fatalf("report.response_id = %q, want %q; body=%s", report.ResponseID, "resp-u1", got)
+	}
+	// The usage object must be the provider's verbatim shape — the host and
+	// daemon both forward it unparsed, so Cloud sees one shape from every
+	// platform (including fields this build does not know about).
+	var usage map[string]any
+	if err := json.Unmarshal(report.Usage, &usage); err != nil {
+		t.Fatalf("report.usage is not an object: %v; body=%s", err, got)
+	}
+	if usage["total_tokens"] != float64(42) {
+		t.Fatalf("usage.total_tokens = %v, want 42 (verbatim passthrough); body=%s", usage["total_tokens"], got)
+	}
+	if _, ok := usage["input_token_details"]; !ok {
+		t.Fatalf("usage.input_token_details missing — nested detail fields must survive passthrough; body=%s", got)
+	}
+}
+
+// A response.done without usage (an early or failed turn) must not produce a
+// report: Cloud requires response_id as the quota idempotency key and rejects
+// an empty report, so the brain's own skip guard is the contract here.
+func TestSessionSkipsUsageReportWithoutUsage(t *testing.T) {
+	reports := make(chan string, 1)
+	s := NewSession(SessionConfig{
+		BurstID: "burst-usage-empty",
+		Audio:   &fakeExternalAudio{},
+		Model:   "gpt-realtime-test",
+		OnUsage: func(usageJSON string) { reports <- usageJSON },
+	})
+
+	s.HandleEvent([]byte(`{"type":"response.done","response":{"id":"resp-u2","status":"completed"}}`))
+
+	select {
+	case got := <-reports:
+		t.Fatalf("usage-less response.done must not be reported; got %s", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// waitForSentPayload polls the send log until one client event contains every
+// marker, or fails the test. Tool outputs are submitted asynchronously.
+func waitForSentPayload(t *testing.T, snapshot func() []string, markers ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, payload := range snapshot() {
+			ok := true
+			for _, m := range markers {
+				if !strings.Contains(payload, m) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return payload
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no sent payload contained %q; sent: %v", markers, snapshot())
+	return ""
+}
+
+// A host that cannot perform a UI action must be able to say so: the error
+// comes back to the model as a failed tool result with the host's own reason,
+// not the generic "not wired" of a missing hook — that is the whole honest-
+// degradation contract the iOS host relies on.
+func TestSessionControlAppHostErrorReachesModel(t *testing.T) {
+	var mu sync.Mutex
+	var sent []string
+	snapshot := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), sent...)
+	}
+	s := NewSession(SessionConfig{
+		BurstID: "burst-control-err",
+		Audio:   &fakeExternalAudio{},
+		Send: func(payloadJSON string) error {
+			mu.Lock()
+			sent = append(sent, payloadJSON)
+			mu.Unlock()
+			return nil
+		},
+		ControlApp: func(action string) error {
+			if action == "open_settings" {
+				return fmt.Errorf("on iPhone the user opens settings by hand in the app")
+			}
+			return nil
+		},
+	})
+
+	s.HandleEvent([]byte(`{"type":"input_audio_buffer.committed"}`))
+	s.HandleEvent([]byte(`{"type":"response.created","response":{"id":"ctl-response"}}`))
+	s.HandleEvent([]byte(`{"type":"response.function_call_arguments.done","response_id":"ctl-response","name":"control_app","call_id":"ctl-1","arguments":"{\"action\":\"open_settings\"}"}`))
+
+	waitForSentPayload(t, snapshot, "function_call_output", "failed", "opens settings by hand")
+}
+
+// The same seam must keep reporting success for actions the host does honor.
+func TestSessionControlAppHostSuccess(t *testing.T) {
+	var mu sync.Mutex
+	var sent []string
+	snapshot := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), sent...)
+	}
+	s := NewSession(SessionConfig{
+		BurstID: "burst-control-ok",
+		Audio:   &fakeExternalAudio{},
+		Send: func(payloadJSON string) error {
+			mu.Lock()
+			sent = append(sent, payloadJSON)
+			mu.Unlock()
+			return nil
+		},
+		ControlApp: func(string) error { return nil },
+	})
+
+	s.HandleEvent([]byte(`{"type":"input_audio_buffer.committed"}`))
+	s.HandleEvent([]byte(`{"type":"response.created","response":{"id":"ctl-response-2"}}`))
+	s.HandleEvent([]byte(`{"type":"response.function_call_arguments.done","response_id":"ctl-response-2","name":"control_app","call_id":"ctl-2","arguments":"{\"action\":\"show\"}"}`))
+
+	waitForSentPayload(t, snapshot, "function_call_output", "ok")
 }
