@@ -40,6 +40,7 @@ type controlEvent struct {
 	Level       float64 `json:"level,omitempty"`        // voice_state reactive RMS amplitude (0..1)
 	TaskPending bool    `json:"task_pending,omitempty"` // voice_state: a do_task is in flight (koe-mic-off)
 	Mic         string  `json:"mic,omitempty"`          // voice_state: "off" while user mic-off; absent = on
+	Reason      string  `json:"reason,omitempty"`       // call_state "ended": why it failed; absent = a normal hang-up
 }
 
 // StartCallRequest is the optional Desktop→Koe context payload for POST
@@ -261,6 +262,27 @@ func (s *ControlServer) EmitControlApp(action string) {
 // EmitCallState reports the call lifecycle to Desktop.
 func (s *ControlServer) EmitCallState(state string) {
 	s.broadcast(controlEvent{Type: "call_state", State: state})
+}
+
+// EmitCallFailed reports a call that never came up, or died on its own, as
+// `ended` PLUS a reason code (see ClassifyCallFailure).
+//
+// The state stays "ended" deliberately. Desktop's decoder drops a call_state
+// event whose `state` it does not recognize, so introducing a new state value
+// would make an older Desktop ignore the event entirely and leave the call UI
+// open forever — strictly worse than the silence this fixes. `reason` is an
+// additive field on the same event instead: older builds ignore it and keep
+// today's behaviour, newer builds can finally tell the user what happened.
+// Same discipline as voice_state's task_pending/mic.
+//
+// An empty reason falls back to a plain `ended`, so a normal hang-up can never
+// be dressed up as a failure.
+func (s *ControlServer) EmitCallFailed(state, reason string) {
+	if reason == "" {
+		s.EmitCallState(state)
+		return
+	}
+	s.broadcast(controlEvent{Type: "call_state", State: state, Reason: reason})
 }
 
 // EmitMicStatus reports microphone health to Desktop. "silent" = the bound input

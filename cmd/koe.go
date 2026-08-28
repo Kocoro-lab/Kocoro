@@ -1215,7 +1215,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 			log.Printf("koe: audio restart failed: %v", err)
 			callActive = false
 			ctrl.EmitVoiceState("idle")
-			ctrl.EmitCallState("ended")
+			ctrl.EmitCallFailed("ended", koe.CallFailureAudio)
 			conn, cancel, audio := closeSessionLocked(true)
 			ensureWarmSessionLocked("audio_restart_retry")
 			sessMu.Unlock()
@@ -1226,14 +1226,22 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		resultMailbox.Wake()
 		sessMu.Unlock()
 	}
-	failActiveCallLocked := func(msg string, err error) {
+	// A failed bringup used to reach Desktop as a bare `ended` — the same event
+	// a normal hang-up sends — with the cause going only to this log. The user
+	// saw the call screen open and shut instantly and could not find out why;
+	// two days of "realtime usage principal unavailable" read as "it hangs up
+	// the second it connects". The reason now rides the event.
+	failActiveCallLocked := func(msg string, err error, reason string) {
 		log.Printf("koe: %s: %v", msg, err)
+		if reason == "" {
+			reason = koe.ClassifyCallFailure(err)
+		}
 		if callActive {
 			callActive = false
 			callStarted = time.Time{}
 			readyEmitted = false
 			ctrl.EmitVoiceState("idle")
-			ctrl.EmitCallState("ended")
+			ctrl.EmitCallFailed("ended", reason)
 		}
 	}
 	ensureWarmSessionLocked = func(reason string) {
@@ -1245,13 +1253,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		}
 		audio, aerr := koe.NewAudioIO()
 		if aerr != nil {
-			failActiveCallLocked("audio init failed", aerr)
+			failActiveCallLocked("audio init failed", aerr, koe.CallFailureAudio)
 			scheduleWarmRetry("audio_init_retry")
 			return
 		}
 		audio.SetPreferredDevices(cfg.micDevice, cfg.speakerDevice)
 		if _, err := applyAudioProcessing(audio, cfg, fullDuplexAEC); err != nil {
-			failActiveCallLocked("audio processing config failed", err)
+			failActiveCallLocked("audio processing config failed", err, koe.CallFailureAudio)
 			scheduleWarmRetry("audio_processing_retry")
 			return
 		}
@@ -1348,7 +1356,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				return
 			}
 			if cerr != nil {
-				failActiveCallLocked("connect failed", cerr)
+				failActiveCallLocked("connect failed", cerr, "")
 				conn, scancel, audio := closeSessionLocked(true)
 				scheduleWarmRetry("connect_retry")
 				sessMu.Unlock()
@@ -1384,7 +1392,7 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		if err := startSessionAudioLocked("call_start"); err != nil {
 			log.Printf("koe: audio start failed: %v", err)
 			ctrl.EmitVoiceState("idle")
-			ctrl.EmitCallState("ended")
+			ctrl.EmitCallFailed("ended", koe.CallFailureAudio)
 			conn, cancel, audio := closeSessionLocked(true)
 			ensureWarmSessionLocked("audio_start_retry")
 			sessMu.Unlock()

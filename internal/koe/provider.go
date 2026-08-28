@@ -1,6 +1,11 @@
-//go:build darwin && cgo
-
 package koe
+
+// Realtime provider identity, model allowlist, connect-error taxonomy and the
+// OpenAI health circuit. Deliberately untagged, same rule as audio_level.go:
+// realtime.go is built for iOS via gomobile and references ProviderQwen, so
+// keeping these behind `darwin && cgo` broke `go build ./...` for linux,
+// windows and darwin-without-cgo — the exact matrix ci.yml gates on. Nothing
+// here touches cgo; it is pure Go and compiles everywhere the brain does.
 
 import (
 	"context"
