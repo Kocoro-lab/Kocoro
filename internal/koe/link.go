@@ -84,7 +84,9 @@ func (c *DaemonClient) MintViaDaemonWithPrincipal(ctx context.Context, model str
 	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
-		return "", "", err
+		// Typed so provider selection can tell "the local relay is down" from
+		// "Cloud said no" — see DaemonRelayError.
+		return "", "", &DaemonRelayError{Err: err}
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
@@ -123,7 +125,9 @@ func (c *DaemonClient) ExchangeSDPViaDaemonWithPrincipal(ctx context.Context, pr
 	c.authorize(req)
 	resp, err := c.controlClient.Do(req)
 	if err != nil {
-		return "", "", err
+		// Typed so provider selection can tell "the local relay is down" from
+		// "Cloud said no" — see DaemonRelayError.
+		return "", "", &DaemonRelayError{Err: err}
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
@@ -148,6 +152,25 @@ type RealtimeBootstrapError struct {
 func (e *RealtimeBootstrapError) Error() string {
 	return fmt.Sprintf("realtime bootstrap failed: HTTP %d: %s", e.StatusCode, e.Body)
 }
+
+// DaemonRelayError marks a failure to REACH the local daemon relay, as opposed
+// to a failure the relay reported back from Cloud.
+//
+// The distinction is load-bearing for provider selection. Both providers mint
+// and exchange SDP through this same localhost relay, so being unable to reach
+// it says nothing whatsoever about OpenAI — and falling back to Qwen cannot
+// help, because Qwen rides the identical dead path. Measured 2026-08-27: a
+// three-second window where koe outlived a daemon restart was classified as
+// "OpenAI unavailable", opened the 5-minute circuit, and pinned every
+// subsequent call onto a provider the backend had not even configured. Voice
+// stayed broken for five minutes with OpenAI healthy the whole time.
+type DaemonRelayError struct{ Err error }
+
+func (e *DaemonRelayError) Error() string {
+	return "daemon relay unreachable: " + e.Err.Error()
+}
+
+func (e *DaemonRelayError) Unwrap() error { return e.Err }
 
 // FetchPersona pulls the small-tier-distilled spoken-persona context (who the
 // user is, how to address them — derived from the user's instructions + memory)

@@ -536,6 +536,29 @@ type realtimeConnector struct {
 	exchangeWithPrincipal func(context.Context, string) (string, string, error)
 	relayUsage            func(string, json.RawMessage) error
 	circuit               *koe.OpenAICircuit
+	// qwenHealth stops Auto mode trading a working OpenAI for a fallback the
+	// backend has said it cannot serve. See koe.FallbackHealth.
+	qwenHealth *koe.FallbackHealth
+}
+
+// noteQwenOutcome feeds the fallback-availability cache from a Qwen attempt.
+func (c *realtimeConnector) noteQwenOutcome(err error) {
+	if err == nil {
+		c.qwenHealth.RecordAvailable()
+		return
+	}
+	if koe.IsProviderNotConfigured(err) {
+		c.qwenHealth.RecordUnavailable()
+		log.Printf("koe[provider]: Qwen is not configured on this backend — Auto will stop treating it as a fallback")
+	}
+}
+
+// openAICircuitWorthOpening reports whether recording an OpenAI failure can
+// actually help. It cannot when the only fallback is known unusable: opening
+// the circuit would pin every later call onto a provider that will refuse, so
+// the honest move is to keep trying OpenAI and report its real error.
+func (c *realtimeConnector) openAICircuitWorthOpening() bool {
+	return !c.qwenHealth.Unavailable()
 }
 
 func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, persona string, state *koe.CallState, disp *koe.Dispatcher, opts koe.ConnectOptions) (*koe.RealtimeConn, koe.RealtimeProvider, error) {
@@ -585,11 +608,13 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 	}
 	if c.mode == koe.ProviderQwen {
 		conn, err := connectQwen()
+		c.noteQwenOutcome(err)
 		return conn, koe.ProviderQwen, err
 	}
 	if c.mode == koe.ProviderAuto && c.circuit.Skip() {
 		log.Printf("koe[provider]: auto skipped OpenAI during availability cooldown; connecting Qwen")
 		conn, err := connectQwen()
+		c.noteQwenOutcome(err)
 		return conn, koe.ProviderQwen, err
 	}
 
@@ -604,10 +629,11 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 	mcancel()
 	if err != nil {
 		err = koe.OpenAIMintError(err)
-		if c.mode == koe.ProviderAuto && koe.AutoFallbackEligible(err) {
+		if c.mode == koe.ProviderAuto && koe.AutoFallbackEligible(err) && c.openAICircuitWorthOpening() {
 			c.circuit.RecordFailure(err)
 			log.Printf("koe[provider]: OpenAI mint unavailable; falling back to Qwen: %v", err)
 			conn, qerr := connectQwen()
+			c.noteQwenOutcome(qerr)
 			return conn, koe.ProviderQwen, qerr
 		}
 		return nil, koe.ProviderOpenAI, err
@@ -659,12 +685,13 @@ func (c *realtimeConnector) connect(ctx context.Context, audio *koe.AudioIO, per
 		c.circuit.RecordSuccess()
 		return conn, koe.ProviderOpenAI, nil
 	}
-	if c.mode != koe.ProviderAuto || !koe.AutoFallbackEligible(err) {
+	if c.mode != koe.ProviderAuto || !koe.AutoFallbackEligible(err) || !c.openAICircuitWorthOpening() {
 		return nil, koe.ProviderOpenAI, err
 	}
 	c.circuit.RecordFailure(err)
 	log.Printf("koe[provider]: OpenAI connection unavailable before media; falling back to Qwen: %v", err)
 	conn, qerr := connectQwen()
+	c.noteQwenOutcome(qerr)
 	return conn, koe.ProviderQwen, qerr
 }
 
@@ -874,7 +901,8 @@ func runKoeCall(ctx context.Context, cfg koeConfig) error {
 		exchangeWithPrincipal: func(sctx context.Context, offer string) (string, string, error) {
 			return client.ExchangeSDPViaDaemonWithPrincipal(sctx, string(koe.ProviderQwen), cfg.qwenModel, offer)
 		},
-		circuit: koe.NewOpenAICircuit(koeOpenAICircuitCooldown()),
+		circuit:    koe.NewOpenAICircuit(koeOpenAICircuitCooldown()),
+		qwenHealth: koe.NewFallbackHealth(0),
 	}
 
 	// ── Kocoro Desktop (control-port) mode: warm session + call-scoped audio ──
@@ -1143,16 +1171,60 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 	}
 	var ensureWarmSessionLocked func(string)
 	var scheduleWarmRotationLocked func(uint64, string)
+	// Idle pre-warm retry state. All three are guarded by sessMu.
+	var scheduleWarmRetryLocked func(reason, failureCode string)
+	var warmRetry koe.WarmRetryPolicy
+	// warmRetryGen retires superseded retry lanes; see scheduleWarmRetryLocked.
+	var warmRetryGen uint64
 	var handleSessionClosed func(uint64, error)
-	scheduleWarmRetry := func(reason string) {
+	// scheduleWarmRetryLocked arms the ONE pending idle-prewarm retry.
+	//
+	// Two things it fixes, both measured 2026-08-28 against a backend that had
+	// been failing for three days (29,897 connect failures, ~8.8 MB of log/day):
+	//
+	//  1. SINGLE LANE. Every failure used to spawn its own 5s timer goroutine.
+	//     The `warming` latch only merges timers that wake while an attempt is
+	//     actually in flight — and these failures return in under 100 ms, so the
+	//     latch was essentially never engaged and every lane ever created
+	//     survived. Lanes therefore accumulated (one per call-button press, one
+	//     per audio retry) and the aggregate rate crept up with usage: measured
+	//     1 failure/5s on a fresh process against 1 per 2.3s after 12 presses.
+	//     A generation counter now retires the previous timer, so there is
+	//     exactly one live lane no matter how many times it is armed.
+	//
+	//  2. POLICY, not a constant. WarmRetryPolicy decides the delay (backoff +
+	//     jitter) and whether to retry at all — a shared-prerequisite failure
+	//     pauses idle pre-warming instead of asking again every 5 seconds.
+	//
+	// Must be called with sessMu held: it mutates the generation counter.
+	scheduleWarmRetryLocked = func(reason, failureCode string) {
+		delay, retry := warmRetry.OnFailure(failureCode)
+		if !retry {
+			_, why := warmRetry.Paused()
+			log.Printf("koe[warm]: idle pre-warm paused after %s (%s) — pressing the call button still connects",
+				reason, why)
+			warmRetryGen++ // retire any pending lane; nothing is armed while paused
+			return
+		}
+		delay = koe.JitterWarmRetryDelay(delay)
+		warmRetryGen++
+		gen := warmRetryGen
+		if warmRetry.Streak() > 1 {
+			log.Printf("koe[warm]: retry #%d in %s (%s)", warmRetry.Streak(), delay.Round(time.Millisecond), reason)
+		}
 		go func() {
 			select {
-			case <-time.After(5 * time.Second):
+			case <-time.After(delay):
 			case <-ctx.Done():
 				return
 			}
 			sessMu.Lock()
 			defer sessMu.Unlock()
+			// Superseded by a newer arm (or by a user-initiated call, which
+			// retires the lane and attempts immediately).
+			if gen != warmRetryGen {
+				return
+			}
 			if curConn == nil && !warming {
 				ensureWarmSessionLocked(reason)
 			}
@@ -1254,13 +1326,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		audio, aerr := koe.NewAudioIO()
 		if aerr != nil {
 			failActiveCallLocked("audio init failed", aerr, koe.CallFailureAudio)
-			scheduleWarmRetry("audio_init_retry")
+			scheduleWarmRetryLocked("audio_init_retry", koe.CallFailureAudio)
 			return
 		}
 		audio.SetPreferredDevices(cfg.micDevice, cfg.speakerDevice)
 		if _, err := applyAudioProcessing(audio, cfg, fullDuplexAEC); err != nil {
 			failActiveCallLocked("audio processing config failed", err, koe.CallFailureAudio)
-			scheduleWarmRetry("audio_processing_retry")
+			scheduleWarmRetryLocked("audio_processing_retry", koe.CallFailureAudio)
 			return
 		}
 		audio.SetPlaybackEnabled(false)
@@ -1308,6 +1380,9 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 					sessMu.Lock()
 					if seq == sessionSeq {
 						sessionReady = true
+						// The prerequisite that was missing is evidently back:
+						// clear the backoff streak and any idle-prewarm pause.
+						warmRetry.OnSuccess()
 						log.Printf("koe[timing]: warm session ready in %dms reason=%s", time.Since(started).Milliseconds(), reason)
 						emitReadyLocked()
 						scheduleWarmRotationLocked(seq, reason)
@@ -1356,9 +1431,10 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 				return
 			}
 			if cerr != nil {
-				failActiveCallLocked("connect failed", cerr, "")
+				failureCode := koe.ClassifyCallFailure(cerr)
+				failActiveCallLocked("connect failed", cerr, failureCode)
 				conn, scancel, audio := closeSessionLocked(true)
-				scheduleWarmRetry("connect_retry")
+				scheduleWarmRetryLocked("connect_retry", failureCode)
 				sessMu.Unlock()
 				stopSessionResources(conn, scancel, audio)
 				return
@@ -1386,6 +1462,13 @@ func runDesktopCall(ctx context.Context, cfg koeConfig, client *koe.DaemonClient
 		callStarted = time.Now()
 		readyEmitted = false
 		ctrl.EmitCallState("connecting")
+		// The escape hatch that makes pausing safe: a user-initiated call always
+		// attempts, whatever the idle policy decided, and retires the pending
+		// idle lane so this attempt is immediate rather than inheriting a 60s
+		// backoff. The pause itself is cleared only by an actual success, so a
+		// still-broken prerequisite re-pauses instead of restarting the storm.
+		warmRetry.UserRequestedCall()
+		warmRetryGen++
 		if curConn == nil && !warming {
 			ensureWarmSessionLocked("call_start")
 		}
