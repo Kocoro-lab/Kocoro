@@ -430,10 +430,25 @@ func (h *eventHandler) releaseSpeakingTail() {
 // releaseSpeakingAfterOutputBufferWait. A side benefit on slow-draining hosts:
 // SetPlaybackEnabled(false) no longer fires while the local queue is still
 // audible, so the release cannot truncate a tail it did not wait for.
+//
+// It bumps BOTH epochs because it TAKES OVER from the missing-stop-event
+// watchdog, which owns playbackDrainEpoch alone. stopped is not an edge case
+// that occasionally follows an armed watchdog: it arrives AFTER response.done
+// by protocol, so outputBufferActive is still set at response.done and the
+// watchdog is armed on every spoken turn. Bumping only speakingEpoch left both
+// pollers live until the next response.created, and each turn released twice —
+// measured on stock defaults 2026-08-28, the stale watchdog firing ~970 ms
+// after the real release (SetSpeaking(false), SetPlaybackEnabled(false),
+// maybeRestoreUserMic, a second voice_state, plus outputBufferActive/
+// remoteAudioTailUntil writes from a turn that had already ended). The duplicate
+// is mostly absorbed downstream today, but the watchdog has no tail floor of its
+// own — it releases on the idle hold alone — so whenever it wins the race it
+// also skips the room-settle margin this path exists to guarantee.
 func (h *eventHandler) releaseSpeakingAfterStoppedDrain() {
 	tail := time.Duration(koeEnvInt("KOE_SPEAKING_TAIL_MS", defaultSpeakingTailMS)) * time.Millisecond
 	hold := time.Duration(koeEnvInt("KOE_STOPPED_DRAIN_HOLD_MS", defaultStoppedDrainHoldMS)) * time.Millisecond
 	hardCap := time.Duration(koeEnvInt("KOE_STOPPED_DRAIN_CAP_MS", defaultStoppedDrainCapMS)) * time.Millisecond
+	h.playbackDrainEpoch.Add(1)
 	epoch := h.speakingEpoch.Add(1)
 	go func() {
 		start := time.Now()

@@ -114,7 +114,6 @@ func NewSession(cfg SessionConfig) *Session {
 	}
 
 	sendFn := func(v any) error {
-		atomic.AddInt64(&s.sendCount, 1)
 		if cfg.Send == nil {
 			return nil
 		}
@@ -122,7 +121,15 @@ func NewSession(cfg SessionConfig) *Session {
 		if err != nil {
 			return err
 		}
-		return cfg.Send(string(raw))
+		if err := cfg.Send(string(raw)); err != nil {
+			return err
+		}
+		// Counted only once the host has actually taken the event. This counter is
+		// what koebind tells an iOS host to assert the brain reacted at all, so
+		// counting attempts would let a marshal failure — or a host that never
+		// wired Send — read as proof of a working brain.
+		atomic.AddInt64(&s.sendCount, 1)
+		return nil
 	}
 
 	s.send = sendFn
@@ -163,6 +170,13 @@ func (s *Session) Close() {
 // HandleEvent feeds one Realtime server event to the brain. `raw` is the JSON
 // exactly as it arrived on the transport — the brain parses it itself, so no
 // host-side interpretation can diverge between platforms.
+//
+// MUST NOT be called concurrently. The event path writes plain, non-atomic
+// handler fields (responseDoneAt, floorPausedAt, the turn ledger's bookkeeping)
+// and is safe only because every transport delivers serially — pion's OnMessage
+// on macOS, a single serial queue on iOS. Nothing in the type system stops a
+// host from dispatching its data-channel callback onto a concurrent queue, and
+// the resulting corruption has no visible error.
 func (s *Session) HandleEvent(raw []byte) {
 	s.handler.handleEvent(context.Background(), raw)
 }
@@ -170,7 +184,8 @@ func (s *Session) HandleEvent(raw []byte) {
 // BurstID identifies this call's task lineage.
 func (s *Session) BurstID() string { return s.state.BurstID() }
 
-// SentEventCount is how many client events the brain has emitted. Useful for
+// SentEventCount is how many client events the host has actually accepted from
+// the brain; a marshal failure or a rejected send is not counted. Useful for
 // asserting the brain actually reacted, which a silent audio path cannot show.
 func (s *Session) SentEventCount() int64 { return atomic.LoadInt64(&s.sendCount) }
 
@@ -182,10 +197,11 @@ func (s *Session) SentEventCount() int64 { return atomic.LoadInt64(&s.sendCount)
 // nothing whatsoever happens — which is precisely how the first iOS call failed.
 // The macOS path does the same thing from its data channel's OnOpen.
 //
-// `persona` is a parameter rather than a package constant because the macOS
-// spoken persona currently lives in cmd/koe.go (package main), out of reach of
-// any other host. Moving it here is follow-up work; until then a host that
-// passes "" gets a functioning call with tools and turn-taking but no persona.
+// `persona` is a parameter rather than a package constant because the caller
+// assembles it: SpokenPersona/AppendTaskLedgerPersona in persona.go hold the
+// shared text and each host layers its own runtime context on top. A host that
+// passes "" still gets a functioning call with tools and turn-taking, but no
+// personality at all.
 func (s *Session) SendSessionUpdate(persona, voice string, fullDuplexAEC bool) error {
 	if s.send == nil {
 		return nil

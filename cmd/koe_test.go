@@ -5,6 +5,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -998,5 +999,58 @@ func TestBargeInBackendWarning(t *testing.T) {
 func TestKoePersonaAllowsUserNameFromInstructions(t *testing.T) {
 	if !strings.Contains(koePersona, "established facts") {
 		t.Fatal("koePersona missing the user-name/personal-context exemption to the anti-hallucination rule")
+	}
+}
+
+// TestAutoStopsSkippingOpenAIOnceQwenIsKnownUnconfigured pins the order the two
+// negative caches are actually learned in.
+//
+// openAICircuitWorthOpening() already refuses to OPEN the circuit for a fallback
+// known unusable, but on the first failure nothing is known about Qwen yet — the
+// circuit opens, and only the fallback attempt it triggers discovers that the
+// backend has no Qwen at all. Consuming the circuit without re-reading
+// qwenHealth therefore pinned the whole cooldown onto a provider guaranteed to
+// refuse: every call failed, a possibly-recovered OpenAI was never retried, and
+// the error surfaced to the user named the wrong provider.
+func TestAutoStopsSkippingOpenAIOnceQwenIsKnownUnconfigured(t *testing.T) {
+	c := &realtimeConnector{
+		mode:       koe.ProviderAuto,
+		circuit:    koe.NewOpenAICircuit(5 * time.Minute),
+		qwenHealth: koe.NewFallbackHealth(10 * time.Minute),
+	}
+	if c.autoShouldSkipOpenAI() {
+		t.Fatal("a fresh connector must try OpenAI first")
+	}
+
+	// One eligible OpenAI failure opens the circuit. Nothing is known about the
+	// fallback yet, so skipping OpenAI is still the right call here.
+	c.circuit.RecordFailure(&koe.RealtimeConnectError{
+		Provider: koe.ProviderOpenAI, Stage: "ice", Err: errors.New("ice gathering failed"),
+	})
+	if !c.circuit.Skip() {
+		t.Fatal("an eligible failure did not open the circuit")
+	}
+	if !c.autoShouldSkipOpenAI() {
+		t.Fatal("an open circuit with a usable fallback must skip OpenAI")
+	}
+
+	// The fallback attempt that failure triggered reports the backend has no Qwen.
+	c.noteQwenOutcome(errors.New(`qwen bootstrap 503: {"code":"provider_not_configured"}`))
+	if !c.qwenHealth.Unavailable() {
+		t.Fatal("provider_not_configured did not mark the fallback unavailable")
+	}
+	if !c.circuit.Skip() {
+		t.Fatal("precondition: the circuit is still open, nothing clears it on its own")
+	}
+	if c.autoShouldSkipOpenAI() {
+		t.Fatal("Auto kept skipping OpenAI for a fallback it already knows is unconfigured")
+	}
+
+	// Forced providers never consult this decision at all.
+	for _, mode := range []koe.RealtimeProvider{koe.ProviderOpenAI, koe.ProviderQwen} {
+		forced := &realtimeConnector{mode: mode, circuit: c.circuit, qwenHealth: koe.NewFallbackHealth(0)}
+		if forced.autoShouldSkipOpenAI() {
+			t.Fatalf("forced %s must not take the Auto cooldown branch", mode)
+		}
 	}
 }

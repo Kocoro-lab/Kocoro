@@ -63,9 +63,11 @@ func (b *externalBackend) DoTask(_ context.Context, req DoTaskRequest) (DoTaskOu
 }
 
 func (b *externalBackend) Cancel(_ context.Context, req CancelRequest) error {
-	if req.Reason == "" {
-		req.Reason = "user_cancel"
+	reason, err := normalizeCancelReason(req.Reason)
+	if err != nil {
+		return err
 	}
+	req.Reason = reason
 	body, err := json.Marshal(req)
 	if err != nil {
 		return err

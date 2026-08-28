@@ -262,10 +262,10 @@ func TestControlServerCallFailedCarriesReason(t *testing.T) {
 	for s.subscriberCount() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	s.EmitCallFailed("ended", CallFailureAccountRequired)
+	s.EmitCallFailed(CallFailureAccountRequired)
 	// An empty reason must fall back to a plain `ended`: a hang-up the user
 	// asked for can never be reported to them as a failure.
-	s.EmitCallFailed("ended", "")
+	s.EmitCallFailed("")
 	s.EmitCallState("ended")
 
 	want := []string{

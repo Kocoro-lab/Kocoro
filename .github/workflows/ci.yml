@@ -155,8 +155,17 @@ jobs:
         # The full `gomobile bind` is deliberately not run: it needs Xcode and
         # minutes, and the Desktop repo gates the artifact itself in an iOS
         # build phase (scripts/verify-koe-framework.sh).
+        #
+        # The module checks above ("Verify modules", "Check go.mod/go.sum are
+        # tidy") have no working-directory, so they only ever saw the root
+        # module: mobile/go.mod could drift indefinitely without failing CI.
+        # They are repeated here rather than generalised, because the root steps
+        # run before Go is even pointed at this directory.
         working-directory: mobile
         run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
           go build ./...
           go vet ./...
           go test -count=1 -timeout=5m ./...

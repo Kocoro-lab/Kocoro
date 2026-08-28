@@ -503,16 +503,44 @@ type drainFakeAudio struct {
 	micOff          atomic.Bool
 	sticky          atomic.Bool
 	idle            atomic.Bool
+
+	// Release-shaped calls are COUNTED, not only stored. Two pollers racing to
+	// release the same turn leave byte-identical final state, so a boolean
+	// snapshot cannot tell one release from two — which is precisely how the
+	// missing playbackDrainEpoch bump in releaseSpeakingAfterStoppedDrain passed
+	// both review and CI while every spoken turn released twice. Any new drain
+	// test asserting "the gate opened" should also assert HOW MANY TIMES.
+	releases    atomic.Int64 // SetSpeaking(false)
+	playbackOff atomic.Int64 // SetPlaybackEnabled(false)
+	micRestores atomic.Int64 // SetUserMicOff(false)
 }
 
-func (f *drainFakeAudio) SetSpeaking(s bool)        { f.speaking.Store(s) }
-func (f *drainFakeAudio) SetPlaybackEnabled(s bool) { f.playbackEnabled.Store(s) }
-func (f *drainFakeAudio) SetPlaybackPaused(p bool)  { f.paused.Store(p) }
-func (f *drainFakeAudio) DropCapture() bool         { return f.speaking.Load() }
-func (f *drainFakeAudio) UserMicOff() bool          { return f.micOff.Load() }
-func (f *drainFakeAudio) SetUserMicOff(off bool)    { f.micOff.Store(off) }
-func (f *drainFakeAudio) UserMicSticky() bool       { return f.sticky.Load() }
-func (f *drainFakeAudio) PlaybackIdle() bool        { return f.idle.Load() }
+func (f *drainFakeAudio) SetSpeaking(s bool) {
+	if !s {
+		f.releases.Add(1)
+	}
+	f.speaking.Store(s)
+}
+
+func (f *drainFakeAudio) SetPlaybackEnabled(s bool) {
+	if !s {
+		f.playbackOff.Add(1)
+	}
+	f.playbackEnabled.Store(s)
+}
+
+func (f *drainFakeAudio) SetUserMicOff(off bool) {
+	if !off {
+		f.micRestores.Add(1)
+	}
+	f.micOff.Store(off)
+}
+
+func (f *drainFakeAudio) SetPlaybackPaused(p bool) { f.paused.Store(p) }
+func (f *drainFakeAudio) DropCapture() bool        { return f.speaking.Load() }
+func (f *drainFakeAudio) UserMicOff() bool         { return f.micOff.Load() }
+func (f *drainFakeAudio) UserMicSticky() bool      { return f.sticky.Load() }
+func (f *drainFakeAudio) PlaybackIdle() bool       { return f.idle.Load() }
 
 // TestStoppedWaitsForLocalDrainBeforeUngating pins the echo-window fix:
 // output_audio_buffer.stopped is the SERVER's send-buffer drain, and the local
@@ -590,6 +618,51 @@ func TestStoppedDrainStandsDownWhenANewResponseTakesOver(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if !h.audio.dropCapture() {
 		t.Fatal("a stale drain poller from the prior turn ungated the mic mid-response")
+	}
+}
+
+// TestStoppedDrainRetiresTheMissingStopWatchdog pins the release-ownership
+// handoff between the two pollers that can end a spoken turn.
+//
+// response.done arms releaseSpeakingAfterOutputBufferWait whenever the output
+// buffer is still active — which is EVERY spoken turn, because
+// output_audio_buffer.stopped arrives after response.done by protocol. The
+// stopped path then supersedes it and must retire it: the watchdog stands down
+// on playbackDrainEpoch alone, so bumping only speakingEpoch left both pollers
+// live and released the same turn twice, the stale one ~970 ms late on stock
+// defaults.
+//
+// Asserting that the gate opened cannot catch this — both pollers open it, and
+// the final state is identical either way. The assertion has to be on the COUNT.
+func TestStoppedDrainRetiresTheMissingStopWatchdog(t *testing.T) {
+	t.Setenv("KOE_SPEAKING_TAIL_MS", "1")
+	t.Setenv("KOE_STOPPED_DRAIN_HOLD_MS", "30")
+	t.Setenv("KOE_STOPPED_DRAIN_CAP_MS", "5000")
+	t.Setenv("KOE_PLAYBACK_IDLE_HOLD_MS", "50")
+	t.Setenv("KOE_OUTPUT_BUFFER_STOP_WAIT_MS", "5000")
+	fake := &drainFakeAudio{}
+	fake.idle.Store(false) // the jitter buffer is still playing locally
+	state := NewCallState("burst-x", "")
+	disp := NewDispatcher(NewDaemonClient(""), NewAgentResolver(fixtureAgents(), NoopSemanticMatcher{}), state, nil)
+	h := newEventHandler(disp, state, NewExternalAudioController(fake), func(any) error { return nil })
+
+	// The production order, not a synthetic one: the other drain tests go
+	// started → stopped and never arm the watchdog at all, which is why none of
+	// them could see this.
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.started"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"response.done"}`))
+	h.handleEvent(context.Background(), []byte(`{"type":"output_audio_buffer.stopped"}`))
+
+	fake.idle.Store(true) // local playout drains
+	waitUntil(t, func() bool { return !h.audio.dropCapture() }, "the stopped drain never released the gate")
+
+	// Well past the watchdog's own idle hold: a superseded poller stays retired.
+	time.Sleep(300 * time.Millisecond)
+	if got := fake.releases.Load(); got != 1 {
+		t.Fatalf("SetSpeaking(false) called %d times, want 1 — a superseded poller released the turn again", got)
+	}
+	if got := fake.playbackOff.Load(); got != 1 {
+		t.Fatalf("SetPlaybackEnabled(false) called %d times, want 1", got)
 	}
 }
 

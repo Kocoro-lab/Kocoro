@@ -106,6 +106,30 @@ func TestExternalBackendCancelPassesRouteKeyAndReason(t *testing.T) {
 	}
 }
 
+// The host-relayed path validates the cancel reason exactly like DaemonClient
+// does. Both share normalizeCancelReason for the same reason both share
+// parseMessageResponse: a cancel crossing the gomobile bridge must not be able
+// to carry a reason the local path would have refused, or the two platforms
+// disagree about what a valid cancel is.
+func TestExternalBackendCancelRejectsAnUnknownReason(t *testing.T) {
+	fake := &fakeExternalTaskBackend{}
+	backend := newExternalBackend(fake)
+
+	err := backend.Cancel(context.Background(), CancelRequest{RouteKey: "agent:x:koe:b1", Reason: "nope"})
+	if err == nil {
+		t.Fatal("an unknown cancel reason must be refused before it crosses the bridge")
+	}
+	if fake.cancelReq != "" {
+		t.Fatalf("a refused cancel still reached the host: %s", fake.cancelReq)
+	}
+	// The message lists the whole accepted set, sibling_error included — the
+	// daemon's own 400 text omits it, and that omission is exactly what a
+	// hand-written duplicate would copy.
+	if !strings.Contains(err.Error(), "sibling_error") {
+		t.Fatalf("error text does not list the full accepted set: %v", err)
+	}
+}
+
 func TestExternalBackendListAgentsDecodes(t *testing.T) {
 	fake := &fakeExternalTaskBackend{agentsJSON: `{"agents":[{"name":"writer","display_name":"Writer","description":{"en":"writes things"}}]}`}
 	backend := newExternalBackend(fake)

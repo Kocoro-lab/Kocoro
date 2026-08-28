@@ -1,6 +1,8 @@
 package koe
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -120,5 +122,149 @@ func TestWarmRetryUserRequestDoesNotClearPause(t *testing.T) {
 	// The attempt it triggers fails the same way → still paused, no schedule.
 	if delay, retry := p.OnFailure(CallFailureAccountRequired); retry || delay != 0 {
 		t.Fatalf("OnFailure after user request = (%v, %v), want (0, false)", delay, retry)
+	}
+}
+
+// fakeWarmTimers hands out one channel per Arm so a test fires lanes by hand
+// instead of sleeping. The lane's whole job is bookkeeping, so a wall clock
+// would only make these tests slow and flaky without testing anything more.
+type fakeWarmTimers struct {
+	mu  sync.Mutex
+	chs []chan time.Time
+}
+
+func (f *fakeWarmTimers) after(time.Duration) <-chan time.Time {
+	c := make(chan time.Time, 1)
+	f.mu.Lock()
+	f.chs = append(f.chs, c)
+	f.mu.Unlock()
+	return c
+}
+
+func (f *fakeWarmTimers) fireAll() {
+	f.mu.Lock()
+	chs := append([]chan time.Time(nil), f.chs...)
+	f.mu.Unlock()
+	for _, c := range chs {
+		c <- time.Time{}
+	}
+}
+
+func (f *fakeWarmTimers) armed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.chs)
+}
+
+// TestWarmRetryLaneRetiresSupersededTimers reproduces the SHAPE of the
+// 2026-08-28 accident, which the six WarmRetryPolicy tests above structurally
+// cannot see: a lane that should have been retired still asks for a perfectly
+// legal backoff, so the delay curve stays correct while the aggregate rate
+// climbs with every arm (measured 1 failure/5s fresh against 1 per 2.3s after
+// 12 call-button presses). Twelve arms must leave exactly one live lane.
+func TestWarmRetryLaneRetiresSupersededTimers(t *testing.T) {
+	timers := &fakeWarmTimers{}
+	lane := WarmRetryLane{after: timers.after}
+
+	var mu sync.Mutex // stands in for cmd/koe.go's sessMu
+	var wg sync.WaitGroup
+	fired := 0
+	arm := func() {
+		wg.Add(1)
+		mu.Lock()
+		defer mu.Unlock()
+		lane.Arm(context.Background(), 5*time.Second, func(gen uint64) {
+			defer wg.Done()
+			mu.Lock()
+			defer mu.Unlock()
+			if !lane.IsCurrent(gen) {
+				return
+			}
+			fired++
+		})
+	}
+
+	for i := 0; i < 12; i++ {
+		arm()
+	}
+	if got := timers.armed(); got != 12 {
+		t.Fatalf("armed %d timers, want 12 — the test is not exercising the accident", got)
+	}
+
+	timers.fireAll()
+	wg.Wait()
+	mu.Lock()
+	got := fired
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("%d lanes ran their retry body, want 1", got)
+	}
+
+	// Retiring eleven predecessors must not wedge the lane: the next failure
+	// still gets its retry.
+	arm()
+	timers.fireAll()
+	wg.Wait()
+	mu.Lock()
+	got = fired
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("re-arming after a fired lane ran %d bodies in total, want 2", got)
+	}
+}
+
+// TestWarmRetryLaneRetireCancelsThePendingLane: pausing idle pre-warm must not
+// leave a timer that fires into the pause. Only a fresh failure or a
+// user-initiated call arms the lane again.
+func TestWarmRetryLaneRetireCancelsThePendingLane(t *testing.T) {
+	timers := &fakeWarmTimers{}
+	lane := WarmRetryLane{after: timers.after}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	fired := 0
+
+	wg.Add(1)
+	mu.Lock()
+	lane.Arm(context.Background(), 5*time.Second, func(gen uint64) {
+		defer wg.Done()
+		mu.Lock()
+		defer mu.Unlock()
+		if !lane.IsCurrent(gen) {
+			return
+		}
+		fired++
+	})
+	mu.Unlock()
+
+	mu.Lock()
+	lane.Retire()
+	mu.Unlock()
+
+	timers.fireAll()
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if fired != 0 {
+		t.Fatalf("a retired lane still ran its retry body %d time(s)", fired)
+	}
+}
+
+// TestWarmRetryLaneDropsALaneWhenTheProcessContextEnds: teardown is not a
+// superseded retry, so the lane exits without calling back into a session that
+// is going away.
+func TestWarmRetryLaneDropsALaneWhenTheProcessContextEnds(t *testing.T) {
+	timers := &fakeWarmTimers{}
+	lane := WarmRetryLane{after: timers.after}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	lane.Arm(ctx, 5*time.Second, func(uint64) { close(done) })
+	cancel()
+
+	select {
+	case <-done:
+		t.Fatal("a cancelled context still ran the retry body")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

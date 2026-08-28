@@ -267,22 +267,23 @@ func (s *ControlServer) EmitCallState(state string) {
 // EmitCallFailed reports a call that never came up, or died on its own, as
 // `ended` PLUS a reason code (see ClassifyCallFailure).
 //
-// The state stays "ended" deliberately. Desktop's decoder drops a call_state
-// event whose `state` it does not recognize, so introducing a new state value
+// The state is hard-coded rather than a parameter. Desktop's decoder drops a
+// call_state event whose `state` it does not recognize, so any other value
 // would make an older Desktop ignore the event entirely and leave the call UI
-// open forever — strictly worse than the silence this fixes. `reason` is an
-// additive field on the same event instead: older builds ignore it and keep
-// today's behaviour, newer builds can finally tell the user what happened.
-// Same discipline as voice_state's task_pending/mic.
+// open forever — strictly worse than the silence this fixes. A parameter every
+// caller filled with "ended" was an invitation to do exactly the thing this
+// comment warns about. `reason` is an additive field on the same event instead:
+// older builds ignore it and keep today's behaviour, newer builds can finally
+// tell the user what happened. Same discipline as voice_state's task_pending/mic.
 //
 // An empty reason falls back to a plain `ended`, so a normal hang-up can never
 // be dressed up as a failure.
-func (s *ControlServer) EmitCallFailed(state, reason string) {
+func (s *ControlServer) EmitCallFailed(reason string) {
 	if reason == "" {
-		s.EmitCallState(state)
+		s.EmitCallState("ended")
 		return
 	}
-	s.broadcast(controlEvent{Type: "call_state", State: state, Reason: reason})
+	s.broadcast(controlEvent{Type: "call_state", State: "ended", Reason: reason})
 }
 
 // EmitMicStatus reports microphone health to Desktop. "silent" = the bound input

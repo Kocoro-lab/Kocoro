@@ -168,6 +168,11 @@ func NewBridge(
 
 // HandleEvent feeds one Realtime server event, raw JSON straight off the data
 // channel. This is the front brain's only input.
+//
+// MUST NOT be called concurrently. The brain's event path writes plain,
+// non-atomic state and is safe only because a transport delivers serially.
+// Deliver from ONE serial queue — an RTCDataChannel delegate dispatched onto a
+// concurrent queue corrupts that state with no visible error and no crash.
 func (b *Bridge) HandleEvent(raw []byte) { b.session.HandleEvent(raw) }
 
 // Close ends the call's brain: it stops the result-delivery worker and retires
@@ -178,8 +183,10 @@ func (b *Bridge) Close() { b.session.Close() }
 // BurstID identifies this call's task lineage.
 func (b *Bridge) BurstID() string { return b.session.BurstID() }
 
-// SentEventCount is how many client events the brain has emitted — the cheapest
-// way for the app to assert the brain reacted at all.
+// SentEventCount is how many client events the host has actually accepted from
+// the brain — the cheapest way for the app to assert the brain reacted at all.
+// An event that failed to encode, or that the host's Send rejected, is not
+// counted, so this is evidence of delivery rather than of intent.
 func (b *Bridge) SentEventCount() int64 { return b.session.SentEventCount() }
 
 // SendSessionUpdate configures the realtime session — instructions, the seven

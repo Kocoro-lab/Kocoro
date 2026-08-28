@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -386,9 +387,27 @@ func (c *DaemonClient) DoTask(ctx context.Context, req DoTaskRequest) (DoTaskOut
 // cancelReasons mirrors agenttypes.ParseCancelReason on the daemon (server.go:898).
 // Validating client-side avoids a guaranteed 400 round-trip. The daemon accepts
 // five reasons (the fifth, sibling_error, is missing from its own 400 message
-// string but accepted by ParseCancelReason) — keep this list complete.
-var cancelReasons = map[string]struct{}{
-	"user_cancel": {}, "interrupt": {}, "background": {}, "idle_timeout": {}, "sibling_error": {},
+// string but accepted by ParseCancelReason) — keep this list complete. The
+// default is the first entry, and the error text is built from the list, so the
+// accepted set and the message it prints cannot drift apart the way the
+// daemon's did.
+var cancelReasons = []string{"user_cancel", "interrupt", "background", "idle_timeout", "sibling_error"}
+
+// normalizeCancelReason applies the empty-string default and rejects anything
+// the daemon would 400.
+//
+// Shared by DaemonClient.Cancel and the host-relayed externalBackend for the
+// same reason parseMessageResponse is shared: a cancel crossing the gomobile
+// bridge must not be able to carry a reason the local path would have refused,
+// or iOS and macOS disagree about what a valid cancel even is.
+func normalizeCancelReason(reason string) (string, error) {
+	if reason == "" {
+		return cancelReasons[0], nil
+	}
+	if slices.Contains(cancelReasons, reason) {
+		return reason, nil
+	}
+	return "", fmt.Errorf("unknown cancel reason %q (want %s)", reason, strings.Join(cancelReasons, "|"))
 }
 
 // CancelRequest cancels the in-flight run on a route. RouteKey is the burst key
@@ -403,12 +422,11 @@ type CancelRequest struct {
 // Cancel POSTs /cancel. Returns an error for an unknown reason (caught locally),
 // transport failure, or a non-2xx daemon response.
 func (c *DaemonClient) Cancel(ctx context.Context, req CancelRequest) error {
-	if req.Reason == "" {
-		req.Reason = "user_cancel"
+	reason, err := normalizeCancelReason(req.Reason)
+	if err != nil {
+		return err
 	}
-	if _, ok := cancelReasons[req.Reason]; !ok {
-		return fmt.Errorf("unknown cancel reason %q (want user_cancel|interrupt|background|idle_timeout)", req.Reason)
-	}
+	req.Reason = reason
 	body, err := json.Marshal(req)
 	if err != nil {
 		return err

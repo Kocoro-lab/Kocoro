@@ -1,6 +1,7 @@
 package koe
 
 import (
+	"context"
 	"math/rand"
 	"time"
 )
@@ -133,3 +134,62 @@ func JitterWarmRetryDelay(d time.Duration) time.Duration {
 	}
 	return out
 }
+
+// WarmRetryLane owns the ONE pending idle pre-warm retry timer.
+//
+// Why the generation counter it wraps is a type rather than a bare uint64 in
+// cmd/koe.go: it is the half of the 2026-08-28 fix that no test could reach.
+// Every failure used to spawn its own timer goroutine, and the caller's
+// `warming` latch only merges timers that wake while an attempt is actually in
+// flight. Those failures returned in under 100 ms, so the latch was essentially
+// never engaged and every lane ever created survived — one per call-button
+// press, one per audio retry — and the aggregate failure rate crept up with
+// usage: measured 1 failure/5s on a fresh process against 1 per 2.3s after 12
+// presses, 29,897 failures over three days. Arm retires its predecessor, so
+// exactly one lane is live however many times it is armed.
+//
+// The generation is guarded by the CALLER's lock (cmd/koe.go's sessMu), not by
+// one of the lane's own. IsCurrent has to be read in the same critical section
+// as the caller's session state (curConn == nil && !warming), or the two reads
+// are not one decision; a second lock could not provide that and would only
+// invite a lock-order bug. Arm, Retire and IsCurrent must therefore all be
+// called under that lock.
+type WarmRetryLane struct {
+	gen uint64
+	// after is time.After in production. Tests substitute a channel they fire by
+	// hand, so the lane's bookkeeping is verifiable without a wall clock.
+	after func(time.Duration) <-chan time.Time
+}
+
+// Retire invalidates any pending lane without arming a new one. Used when idle
+// pre-warming pauses, and when a user-initiated call takes the attempt over.
+func (l *WarmRetryLane) Retire() { l.gen++ }
+
+// Arm retires any pending lane and schedules fire after delay. fire runs on its
+// own goroutine: it must take the caller's lock and consult IsCurrent with the
+// generation it was handed before acting. A cancelled ctx drops the lane
+// silently — process teardown, not a superseded retry.
+func (l *WarmRetryLane) Arm(ctx context.Context, delay time.Duration, fire func(gen uint64)) {
+	l.gen++
+	gen := l.gen
+	wait := l.after
+	if wait == nil {
+		wait = time.After
+	}
+	// The timer starts HERE, under the caller's lock — not whenever the goroutine
+	// happens to be scheduled. The delay the policy chose is measured from the
+	// failure that caused it, and the lane is observably armed the moment Arm
+	// returns.
+	timer := wait(delay)
+	go func() {
+		select {
+		case <-timer:
+		case <-ctx.Done():
+			return
+		}
+		fire(gen)
+	}()
+}
+
+// IsCurrent reports whether gen is still the live lane.
+func (l *WarmRetryLane) IsCurrent(gen uint64) bool { return gen == l.gen }

@@ -526,22 +526,28 @@ func (d *Dispatcher) PrepareDoTask(argsJSON []byte, lang string, sameTurnMultiDi
 	}
 	agent := d.state.BoundAgent()
 	if a.Agent != "" {
-		res := d.res().Resolve(a.Agent)
+		// One snapshot for the whole decision. The resolver is swapped in mid-call
+		// once the agent registry lands (Session's async ListAgents on iOS,
+		// cmd/koe.go's deferred resolverHolder on macOS), so re-reading it between
+		// the resolve and the override guard would let the two halves of one
+		// decision disagree about which registry they are talking about.
+		resolver := d.res()
+		res := resolver.Resolve(a.Agent)
 		switch res.Status {
 		case ResolveResolved:
-			if agentOverrideAllowed(a.Task, d.res().spokenNamesFor(a.Agent, res.Slug)) {
+			if agentOverrideAllowed(a.Task, resolver.spokenNamesFor(a.Agent, res.Slug)) {
 				agent = res.Slug
 			} else {
 				log.Printf("koe[task]: agent override guard rejected %q; using bound %q", a.Agent, agent)
 			}
 		case ResolveAmbiguous:
-			if !agentOverrideAllowed(a.Task, d.res().spokenNamesFor(a.Agent, "")) {
+			if !agentOverrideAllowed(a.Task, resolver.spokenNamesFor(a.Agent, "")) {
 				break
 			}
 			say := clarifyWhich(lang, res.Candidates)
 			return DoTaskRequest{}, nil, &SayResult{Status: "clarify", SpokenSummary: say, Say: say}, nil
 		default:
-			if !agentOverrideAllowed(a.Task, d.res().spokenNamesFor(a.Agent, "")) {
+			if !agentOverrideAllowed(a.Task, resolver.spokenNamesFor(a.Agent, "")) {
 				break
 			}
 			// Unknown named agent → ask rather than silently using the default.
