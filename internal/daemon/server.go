@@ -110,6 +110,11 @@ type Server struct {
 	warnedConfigRevision   string
 	configRevisionTracked  bool
 	loadConfigWithRevision func() (*config.Config, string, error)
+	// credentialStoreDisabled reports the process-level isolated-mode flag
+	// (config.DisableCredentialStoreForProcess). In that mode the API key is
+	// stdin-injected and lives only in process memory, so a yaml/in-memory
+	// api_key mismatch is expected and must not signal restart_required.
+	credentialStoreDisabled func() bool
 
 	marketplace                *skills.MarketplaceClient // static registry → /skills/marketplace/*
 	catalog                    skills.CatalogProvider
@@ -483,6 +488,7 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		agentSyncTrigger:                make(chan struct{}, 1),
 		pullDone:                        make(chan struct{}),
 		loadConfigWithRevision:          config.LoadWithRevision,
+		credentialStoreDisabled:         config.CredentialStoreDisabledForProcess,
 	}
 	// Registry-backed always-allow denial (integration requires_approval
 	// schemas). deps may be nil in test fixtures — the method fails open.
@@ -7780,12 +7786,17 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	//   - AuthManager-absent path (Linux & others): reload does NOT push
 	//     newCfg.APIKey into GatewayClient (captured value), so a yaml
 	//     api_key edit really does need a restart to take effect.
+	//   - Isolated mode (credential store disabled) also has no AuthManager,
+	//     but its key is stdin-injected and process-memory-only: yaml never
+	//     persists api_key, so the in-memory vs reloaded-yaml mismatch is
+	//     permanent and NOT evidence of a user edit — skip the heuristic.
 	needsRestart := false
 	var reason string
 	if oldCfg != nil && oldCfg.Endpoint != newCfg.Endpoint {
 		needsRestart = true
 		reason = "endpoint changed — restart daemon to apply"
-	} else if oldCfg != nil && oldCfg.APIKey != newCfg.APIKey && s.auth == nil {
+	} else if oldCfg != nil && oldCfg.APIKey != newCfg.APIKey && s.auth == nil &&
+		!s.credentialStoreDisabled() {
 		needsRestart = true
 		reason = "api_key changed in yaml (legacy path) — restart daemon to apply"
 	}

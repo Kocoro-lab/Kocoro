@@ -56,3 +56,11 @@ func credentialStoreDisabledForProcess() bool {
 	defer processCredentialStoreDisabled.RUnlock()
 	return processCredentialStoreDisabled.disabled
 }
+
+// CredentialStoreDisabledForProcess reports whether
+// DisableCredentialStoreForProcess was applied to this process. Consumers use
+// it to recognize the isolated-daemon mode, where the API key is
+// process-memory-only and never persisted to yaml.
+func CredentialStoreDisabledForProcess() bool {
+	return credentialStoreDisabledForProcess()
+}
