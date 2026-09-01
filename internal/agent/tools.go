@@ -616,6 +616,14 @@ func DisallowsAutoApproval(toolName string) bool {
 // ServerTool implements it for Cloud schemas marked requires_approval: Cloud
 // defines that set as material outbound writes needing per-call human
 // approval, so a single persisted grant must never authorize future calls.
+//
+// Returning true bundles THREE effects, mirroring what the static deny-list
+// already implies for its names: (1) persistence refusal at every write
+// entry point, (2) the always_allow_disabled approval-card flag, and (3)
+// refusal of the per-turn ApprovalCache — a byte-identical repeated tool_use
+// re-executes the write under a fresh request id, so it re-prompts. A future
+// tool that needs per-call approval but safe in-turn repeats would need a
+// separate predicate for (3).
 type AlwaysAllowPersistenceDenier interface {
 	DisallowsAlwaysAllowPersistence() bool
 }

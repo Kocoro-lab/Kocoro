@@ -95,7 +95,9 @@ func (b *ApprovalBroker) SetOnCleanup(fn func(requestID string)) {
 // SetAlwaysAllowPersistenceDenied installs the registry-backed lookup that
 // reports tools refusing "Always Allow" persistence (integration tools whose
 // Cloud schema carries requires_approval). It must be pure in-memory work —
-// Request calls it on the approval hot path.
+// Request calls it on the approval hot path. Call it before the broker
+// serves any request: the field is read without the broker mutex, so a
+// concurrent install after serving begins would race.
 func (b *ApprovalBroker) SetAlwaysAllowPersistenceDenied(fn func(tool string) bool) {
 	b.persistenceDenied = fn
 }

@@ -2,11 +2,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,11 +58,32 @@ func TestServerDepsToolDisallowsAlwaysAllowPersistence(t *testing.T) {
 func TestHandleAlwaysAllowDecision_IntegrationRequiresApprovalNotPersisted(t *testing.T) {
 	for _, agentName := range []string{"", "operator"} {
 		deps := newIntegrationRegistryDeps(t)
+		ch := deps.EventBus.Subscribe()
 		broker := NewApprovalBroker(func(req ApprovalRequest) error { return nil })
 		broker.SetAlwaysAllowPersistenceDenied(deps.ToolDisallowsAlwaysAllowPersistence)
 
 		HandleAlwaysAllowDecision(deps, broker, agentName, "gmail_send_email",
 			`{"to":"a@b.c","description":"Send an email"}`, true)
+
+		// The refusal is wire-visible: Desktop localizes off the stable
+		// notice code and interpolates the tool name.
+		select {
+		case evt := <-ch:
+			if evt.Type != EventApprovalNotice {
+				t.Errorf("agent=%q: event type = %s, want %s", agentName, evt.Type, EventApprovalNotice)
+			}
+			var notice AlwaysAllowNoticePayload
+			if err := json.Unmarshal(evt.Payload, &notice); err != nil {
+				t.Fatalf("agent=%q: decode notice: %v", agentName, err)
+			}
+			if notice.Code != NoticeCodeHighRiskNotPersistable || notice.Tool != "gmail_send_email" {
+				t.Errorf("agent=%q: notice = {code:%s tool:%s}, want {code:%s tool:gmail_send_email}",
+					agentName, notice.Code, notice.Tool, NoticeCodeHighRiskNotPersistable)
+			}
+		case <-time.After(time.Second):
+			t.Errorf("agent=%q: no EventApprovalNotice emitted for the refusal", agentName)
+		}
+		deps.EventBus.Unsubscribe(ch)
 
 		if len(deps.Config.Permissions.AlwaysAllowTools) != 0 {
 			t.Errorf("agent=%q: global always_allow_tools mutated: %v",
@@ -83,32 +106,40 @@ func TestHandleAlwaysAllowDecision_IntegrationRequiresApprovalNotPersisted(t *te
 // always_allow_disabled flag so Desktop hides the "Always Allow" button.
 func TestApprovalBrokerFlagsIntegrationRequiresApproval(t *testing.T) {
 	deps := newIntegrationRegistryDeps(t)
+	var mu sync.Mutex
 	var captured ApprovalRequest
-	broker := NewApprovalBroker(func(req ApprovalRequest) error {
+	var broker *ApprovalBroker
+	// Resolve from sendFn (off-lock goroutine) so Request returns as soon as
+	// the request is captured — no reliance on a context-timeout path.
+	broker = NewApprovalBroker(func(req ApprovalRequest) error {
+		mu.Lock()
 		captured = req
+		mu.Unlock()
+		go broker.Resolve(req.RequestID, DecisionDeny, nil)
 		return nil
 	})
 	broker.SetAlwaysAllowPersistenceDenied(deps.ToolDisallowsAlwaysAllowPersistence)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	_ = broker.Request(ctx, ApprovalRequestMeta{}, "gmail_send_email", "{}")
-	cancel()
+	_ = broker.Request(context.Background(), ApprovalRequestMeta{}, "gmail_send_email", "{}")
+	mu.Lock()
+	flags := captured.Flags
+	mu.Unlock()
 	found := false
-	for _, f := range captured.Flags {
+	for _, f := range flags {
 		if f == ApprovalFlagAlwaysAllowDisabled {
 			found = true
 		}
 	}
 	if !found {
 		t.Errorf("gmail_send_email approval request flags = %v, want %q",
-			captured.Flags, ApprovalFlagAlwaysAllowDisabled)
+			flags, ApprovalFlagAlwaysAllowDisabled)
 	}
 
-	captured = ApprovalRequest{}
-	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
-	_ = broker.Request(ctx, ApprovalRequestMeta{}, "notion_search", "{}")
-	cancel()
-	for _, f := range captured.Flags {
+	_ = broker.Request(context.Background(), ApprovalRequestMeta{}, "notion_search", "{}")
+	mu.Lock()
+	flags = captured.Flags
+	mu.Unlock()
+	for _, f := range flags {
 		if f == ApprovalFlagAlwaysAllowDisabled {
 			t.Errorf("unmarked integration tool must not carry %q", ApprovalFlagAlwaysAllowDisabled)
 		}

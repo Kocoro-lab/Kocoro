@@ -81,13 +81,15 @@ func TestCheckPermissionAndApproval_IntegrationRequiresApprovalIgnoresAlwaysAllo
 // requires_approval integration tool: it is absent from the unattended
 // deny-list, so the request reaches the handler and the handler's answer is
 // honored — the schedule and auto_approve handlers approve everything off
-// that deny-list.
+// that deny-list. This is the deliberately retained carve-out: the
+// always-allow persistence denial (which this mock carries) must not leak
+// into the unattended path and break scheduled/no-UI integration use.
 func TestCheckPermissionAndApproval_IntegrationRequiresApprovalUnattendedReachesHandler(t *testing.T) {
 	loop, handler := newApprovalProbeLoop(t, nil)
 	handler.approveResult = true
 	loop.SetUnattendedRun(true)
 
-	tool := &mockApprovalTool{name: "x_create_post"}
+	tool := &integrationApprovalTool{mockApprovalTool{name: "x_create_post"}}
 	_, approved := loop.checkPermissionAndApproval(
 		context.Background(), "x_create_post", `{"text":"hello"}`, tool, NewApprovalCache())
 	if !approved || !handler.approvalRequested {

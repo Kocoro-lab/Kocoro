@@ -289,8 +289,6 @@ type slashCmd struct {
 	desc string
 }
 
-// SetProgram stores the bubbletea program reference so goroutines can
-// inject messages (e.g. approval prompts) into the TUI event loop.
 // toolDisallowsSessionAllow reports whether the named tool refuses the TUI's
 // session-level always-allow ('a' key): static deny-list names, plus
 // registered tools that refuse persistence via their registration-time schema
@@ -309,6 +307,8 @@ func (m *Model) toolDisallowsSessionAllow(name string) bool {
 	return false
 }
 
+// SetProgram stores the bubbletea program reference so goroutines can
+// inject messages (e.g. approval prompts) into the TUI event loop.
 func (m *Model) SetProgram(p *tea.Program) {
 	m.program = p
 }

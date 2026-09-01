@@ -253,7 +253,17 @@ local approval-requiring tools — EXCEPT that "Always Allow" persistence is
 refused at every layer: the approval card carries `always_allow_disabled`,
 `HandleAlwaysAllowDecision` / `PersistAgentAlwaysAllow` reject the write, the
 broker cache refuses the name, and the runtime gate in `loop.go` ignores an
-existing `always_allow_tools` entry (hand-edited or pre-policy). Cloud defines
+existing `always_allow_tools` entry (hand-edited or pre-policy). The per-turn
+`ApprovalCache` also refuses these tools — a byte-identical repeated tool_use
+carries a fresh request id the idempotency journal cannot dedupe, so every
+repeat re-prompts. **BREAKING**: users who previously clicked Always Allow on
+such a tool are re-prompted on every call from now on; their persisted entry
+is silently ignored. Deliberately retained carve-outs (the refusal covers the
+persistence pathway, not every approval bypass): `daemon.auto_approve` and the
+no-approval-UI auto-approve on non-interactive channels
+(`IsNonInteractiveApprovalChannel`: WeChat/WeCom/Discord/Telegram/voice) still
+approve these tools per call — a user's real-time request on those channels
+must keep working, and Cloud retains its own access control. Cloud defines
 the requires_approval set as material outbound writes (gmail_send_email, X
 posts) needing per-call human approval, so one click must never become a
 standing unattended grant. The dynamic denial is schema-derived
