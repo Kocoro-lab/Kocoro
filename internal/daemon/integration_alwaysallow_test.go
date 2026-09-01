@@ -13,8 +13,11 @@ import (
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
+	"gopkg.in/yaml.v3"
 )
 
 // newIntegrationRegistryDeps returns deps whose live Registry carries one
@@ -246,6 +249,136 @@ func TestAgentConfigWritesDropIntegrationRequiresApproval(t *testing.T) {
 		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator")
 		if len(got) != 2 {
 			t.Fatalf("persisted always_allow_tools = %v, want both entries kept on registry miss", got)
+		}
+	})
+}
+
+// readGlobalAlwaysAllowFromDisk returns permissions.always_allow_tools from
+// the global config.yaml under shannonDir. Nil when absent.
+func readGlobalAlwaysAllowFromDisk(t *testing.T, shannonDir string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(shannonDir, "config.yaml"))
+	if err != nil {
+		return nil
+	}
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("parse global config: %v", err)
+	}
+	perms, _ := raw["permissions"].(map[string]interface{})
+	if perms == nil {
+		return nil
+	}
+	list, _ := perms["always_allow_tools"].([]interface{})
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// A grant persisted while the integration catalog was empty (key rotation /
+// principal-transition window) is permanently ignored by the runtime gate once
+// the catalog recovers. RefreshIntegrationTools self-heals: after a successful
+// catalog rebuild it prunes global and per-agent always-allow entries the
+// registry NOW marks persistence-denied. An empty or failed rebuild prunes
+// nothing (registry miss judges false — fail-safe against mass deletion).
+func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
+	seedDeps := func(t *testing.T) *ServerDeps {
+		t.Helper()
+		deps := newDepsWithConfig(t, "operator")
+		deps.ShannonDir = t.TempDir()
+		deps.Registry = agent.NewToolRegistry()
+		deps.Config.Cloud.Enabled = true
+		deps.Config.APIKey = "test-key"
+		deps.Config.Permissions.AlwaysAllowTools = []string{"gmail_send_email", "file_write"}
+		for _, tool := range []string{"gmail_send_email", "file_write"} {
+			if _, err := config.AppendGlobalAlwaysAllowToolWithRevision(deps.ShannonDir, tool); err != nil {
+				t.Fatalf("seed global grant %s: %v", tool, err)
+			}
+			if err := agents.AppendAlwaysAllowTool(deps.AgentsDir, "operator", tool); err != nil {
+				t.Fatalf("seed agent grant %s: %v", tool, err)
+			}
+		}
+		return deps
+	}
+
+	t.Run("denied grants pruned after rebuild", func(t *testing.T) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{
+				{Name: "gmail_send_email", RequiresApproval: true},
+				{Name: "notion_search"},
+			})
+		}))
+		defer cloud.Close()
+
+		deps := seedDeps(t)
+		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
+		var recorded []config.MutationRevisions
+		deps.RecordConfigMutation = func(r config.MutationRevisions) { recorded = append(recorded, r) }
+		s := &Server{deps: deps}
+
+		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+
+		if got := readGlobalAlwaysAllowFromDisk(t, deps.ShannonDir); len(got) != 1 || got[0] != "file_write" {
+			t.Errorf("global always_allow_tools on disk = %v, want [file_write]", got)
+		}
+		if got := deps.Config.Permissions.AlwaysAllowTools; len(got) != 1 || got[0] != "file_write" {
+			t.Errorf("in-memory global mirror = %v, want [file_write]", got)
+		}
+		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 1 || got[0] != "file_write" {
+			t.Errorf("per-agent always_allow_tools = %v, want [file_write]", got)
+		}
+		if len(recorded) == 0 {
+			t.Error("global prune must report its revision via RecordConfigMutation")
+		}
+	})
+
+	t.Run("empty catalog prunes nothing", func(t *testing.T) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{})
+		}))
+		defer cloud.Close()
+
+		deps := seedDeps(t)
+		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
+		s := &Server{deps: deps}
+
+		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		if got := readGlobalAlwaysAllowFromDisk(t, deps.ShannonDir); len(got) != 2 {
+			t.Errorf("global always_allow_tools on disk = %v, want both kept", got)
+		}
+		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 2 {
+			t.Errorf("per-agent always_allow_tools = %v, want both kept", got)
+		}
+	})
+
+	t.Run("failed rebuild prunes nothing", func(t *testing.T) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "temporary outage", http.StatusBadGateway)
+		}))
+		defer cloud.Close()
+
+		deps := seedDeps(t)
+		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
+		s := &Server{deps: deps}
+
+		if err := s.RefreshIntegrationTools(context.Background()); err == nil {
+			t.Fatal("refresh should surface the list failure")
+		}
+		if got := readGlobalAlwaysAllowFromDisk(t, deps.ShannonDir); len(got) != 2 {
+			t.Errorf("global always_allow_tools on disk = %v, want both kept", got)
+		}
+		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 2 {
+			t.Errorf("per-agent always_allow_tools = %v, want both kept", got)
 		}
 	})
 }

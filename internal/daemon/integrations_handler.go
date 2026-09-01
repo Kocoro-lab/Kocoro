@@ -8,11 +8,16 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/agents"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
+	"gopkg.in/yaml.v3"
 )
 
 // RefreshIntegrationTools re-pulls the caller's active integration tools from
@@ -25,13 +30,31 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 	if s == nil || s.deps == nil || s.deps.GW == nil {
 		return nil
 	}
+	rebuilt, err := s.refreshIntegrationCatalog(ctx)
+	if err != nil || !rebuilt {
+		return err
+	}
+	// The rebuilt catalog is now authoritative for the requires_approval
+	// denial, so grants persisted while the catalog was empty (key rotation /
+	// principal-transition window let ToolDisallowsAlwaysAllowPersistence
+	// judge false) can be pruned — otherwise they sit in config forever,
+	// silently ignored by the runtime gate while the UI shows an active grant.
+	s.pruneDeniedAlwaysAllowGrants()
+	return nil
+}
+
+// refreshIntegrationCatalog is the registry-lock transaction of
+// RefreshIntegrationTools. Split out so the always-allow prune runs after the
+// registry lock is released: the prune takes the config mutation lock, and the
+// reload path acquires these locks in the opposite nesting.
+func (s *Server) refreshIntegrationCatalog(ctx context.Context) (bool, error) {
 	// Serialize the list/build/live-swap transaction with auth, MCP health, and
 	// reload so no cached catalog can land across an identity transition.
 	unlock := s.deps.LockToolRegistryMutation()
 	defer unlock()
 	_, reg, _ := s.deps.Snapshot() // read the registry pointer under deps.mu
 	if reg == nil {
-		return nil
+		return false, nil
 	}
 	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -40,7 +63,96 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 	// the integration tools registered above (RebuildRegistryForHealth rebuilds
 	// the live registry from the cached GatewayOverlay).
 	s.syncToolOverlays(reg)
-	return err
+	return true, err
+}
+
+// pruneDeniedAlwaysAllowGrants removes always-allow entries the live registry
+// marks persistence-denied (integration requires_approval) from the global and
+// per-agent lists. Only names the CURRENT registry denies are touched: a
+// registry miss judges false, so an empty catalog (failed list, signed out)
+// can never mass-delete grants. Best-effort — failures are logged and never
+// propagated to the refresh caller. Skipped names simply survive until the
+// next refresh.
+func (s *Server) pruneDeniedAlwaysAllowGrants() {
+	deps := s.deps
+
+	// Global list: mirror persistGlobalToolAlwaysAllow's write discipline
+	// (config mutation lock -> yaml RMW with revisions -> in-memory mirror
+	// under WriteLock -> RecordConfigMutation).
+	cfg, _, _ := deps.Snapshot()
+	var denied []string
+	if cfg != nil {
+		for _, tool := range cfg.Permissions.AlwaysAllowTools {
+			if deps.ToolDisallowsAlwaysAllowPersistence(tool) {
+				denied = append(denied, tool)
+			}
+		}
+	}
+	if len(denied) > 0 {
+		unlockConfig := func() {}
+		if deps.LockConfigMutation != nil {
+			unlockConfig = deps.LockConfigMutation()
+		}
+		for _, tool := range denied {
+			revisions, err := config.RemoveGlobalAlwaysAllowToolWithRevision(deps.ShannonDir, tool)
+			if err != nil {
+				log.Printf("daemon: failed to prune denied global always-allow grant %s: %v", tool, err)
+				continue
+			}
+			deps.WriteLock()
+			kept := deps.Config.Permissions.AlwaysAllowTools[:0]
+			for _, t := range deps.Config.Permissions.AlwaysAllowTools {
+				if t != tool {
+					kept = append(kept, t)
+				}
+			}
+			deps.Config.Permissions.AlwaysAllowTools = kept
+			deps.WriteUnlock()
+			if deps.RecordConfigMutation != nil {
+				deps.RecordConfigMutation(revisions)
+			}
+			log.Printf("daemon: pruned denied global always-allow grant: %s", tool)
+		}
+		unlockConfig()
+	}
+
+	// Per-agent lists. The pre-read is lock-free; RemoveAlwaysAllowTool does
+	// its own locked read-modify-write, so a concurrent write only delays a
+	// prune to the next refresh.
+	entries, err := agents.ListAgents(deps.AgentsDir)
+	if err != nil {
+		log.Printf("daemon: skipping per-agent always-allow prune: %v", err)
+		return
+	}
+	for _, entry := range entries {
+		for _, tool := range agentAlwaysAllowTools(deps.AgentsDir, entry.Name) {
+			if !deps.ToolDisallowsAlwaysAllowPersistence(tool) {
+				continue
+			}
+			if err := agents.RemoveAlwaysAllowTool(deps.AgentsDir, entry.Name, tool); err != nil {
+				log.Printf("daemon: failed to prune denied always-allow grant: agent=%s tool=%s err=%v", entry.Name, tool, err)
+				continue
+			}
+			log.Printf("daemon: pruned denied always-allow grant: agent=%s tool=%s", entry.Name, tool)
+		}
+	}
+}
+
+// agentAlwaysAllowTools reads permissions.always_allow_tools from one agent's
+// config.yaml. Missing or unparseable config reads as empty.
+func agentAlwaysAllowTools(agentsDir, name string) []string {
+	data, err := os.ReadFile(filepath.Join(agentsDir, name, "config.yaml"))
+	if err != nil {
+		return nil
+	}
+	var cfg agents.AgentConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil
+	}
+	if cfg.Permissions == nil {
+		return nil
+	}
+	return cfg.Permissions.AlwaysAllowTools
 }
 
 // resetIntegrationToolsForPrincipal applies the strict identity boundary for
