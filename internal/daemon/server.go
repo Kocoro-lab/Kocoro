@@ -5142,7 +5142,7 @@ func (s *Server) handleRemoveAgentAlwaysAllow(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "tool is required")
 		return
 	}
-	if err := agents.RemoveAlwaysAllowTool(s.deps.AgentsDir, name, req.Tool); err != nil {
+	if _, err := agents.RemoveAlwaysAllowTool(s.deps.AgentsDir, name, req.Tool); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -266,10 +266,16 @@ both `RefreshIntegrationTools` and the verified-principal transition's
 `resetIntegrationToolsForPrincipal`; sign-out only clears the catalog and
 never prunes), covering grants persisted while the catalog was empty
 (key-rotation window, where the registry miss judges false). Both self-heals
-converge upstream: a pull-side drop skips the agent-sync LWW mirror stamp
-(local clock stays "now") and a per-agent prune fires `triggerAgentSync`, so
-the sanitized config passes Cloud's strict-newer upsert instead of leaving a
-stale row that reseeds other devices. A registry miss never drops or prunes —
+converge upstream: a pull-side sanitize drop (dynamic registry denial or the
+static legacy-GUI list inside `WriteAgentConfig`) skips the agent-sync LWW
+mirror stamp (local clock stays "now"), and the REFRESH-path prune fires
+`triggerAgentSync` when a removal actually wrote bytes, so the sanitized
+config passes Cloud's strict-newer upsert instead of leaving a stale row that
+reseeds other devices. The principal-transition prune deliberately does NOT
+push: `agentPullClean` is set-once by the startup-only pull and survives an
+account switch, so a `full_sync` push there would upload the previous
+account's local agents and soft-delete the new account's cloud-only agents.
+A registry miss never drops or prunes —
 fail-safe against mass deletion; the runtime gate backstops. The per-turn
 `ApprovalCache` also refuses these tools — a byte-identical repeated tool_use
 carries a fresh request id the idempotency journal cannot dedupe, so every
