@@ -81,10 +81,12 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   (`daemon.auto_approve` bypasses), but Always Allow persistence is refused —
   `DisallowsAlwaysAllowPersistence` gates flag/broker/persist/runtime; stale
   `always_allow_tools` entries are ignored. Full-replace agent config writes
-  drop such entries (`dropRegistryDeniedAlwaysAllow`, registry miss keeps);
-  `RefreshIntegrationTools` prunes window-persisted ones after a successful
-  catalog rebuild (`pruneDeniedAlwaysAllowGrants`). Absent=false; Cloud gates
-  marked schemas on `integration_requires_approval`.
+  (HTTP create/update + agent-sync pull) drop such entries
+  (`dropRegistryDeniedAlwaysAllow`, registry miss keeps); a successful catalog
+  rebuild — `RefreshIntegrationTools` or the principal transition's
+  `resetIntegrationToolsForPrincipal` — prunes window-persisted ones
+  (`pruneDeniedAlwaysAllowGrants`). Absent=false; Cloud gates marked schemas
+  on `integration_requires_approval`.
 - Trusted `material_side_effect=false` permits observational batching without
   the journal; absent is fail-closed. Stable `request_id`; material calls add
   `Idempotency-Key`. Only `provider_unavailable`/`provider_rejected` are

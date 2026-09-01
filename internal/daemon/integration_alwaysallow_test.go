@@ -280,6 +280,29 @@ func readGlobalAlwaysAllowFromDisk(t *testing.T, shannonDir string) []string {
 	return out
 }
 
+// seedDeniedGrantDeps returns deps carrying one denied (gmail_send_email) and
+// one ordinary (file_write) always-allow grant in BOTH the global config
+// (disk + in-memory mirror) and the "operator" agent's config.yaml, with an
+// empty live registry ready for a catalog rebuild.
+func seedDeniedGrantDeps(t *testing.T) *ServerDeps {
+	t.Helper()
+	deps := newDepsWithConfig(t, "operator")
+	deps.ShannonDir = t.TempDir()
+	deps.Registry = agent.NewToolRegistry()
+	deps.Config.Cloud.Enabled = true
+	deps.Config.APIKey = "test-key"
+	deps.Config.Permissions.AlwaysAllowTools = []string{"gmail_send_email", "file_write"}
+	for _, tool := range []string{"gmail_send_email", "file_write"} {
+		if _, err := config.AppendGlobalAlwaysAllowToolWithRevision(deps.ShannonDir, tool); err != nil {
+			t.Fatalf("seed global grant %s: %v", tool, err)
+		}
+		if err := agents.AppendAlwaysAllowTool(deps.AgentsDir, "operator", tool); err != nil {
+			t.Fatalf("seed agent grant %s: %v", tool, err)
+		}
+	}
+	return deps
+}
+
 // A grant persisted while the integration catalog was empty (key rotation /
 // principal-transition window) is permanently ignored by the runtime gate once
 // the catalog recovers. RefreshIntegrationTools self-heals: after a successful
@@ -287,24 +310,7 @@ func readGlobalAlwaysAllowFromDisk(t *testing.T, shannonDir string) []string {
 // registry NOW marks persistence-denied. An empty or failed rebuild prunes
 // nothing (registry miss judges false — fail-safe against mass deletion).
 func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
-	seedDeps := func(t *testing.T) *ServerDeps {
-		t.Helper()
-		deps := newDepsWithConfig(t, "operator")
-		deps.ShannonDir = t.TempDir()
-		deps.Registry = agent.NewToolRegistry()
-		deps.Config.Cloud.Enabled = true
-		deps.Config.APIKey = "test-key"
-		deps.Config.Permissions.AlwaysAllowTools = []string{"gmail_send_email", "file_write"}
-		for _, tool := range []string{"gmail_send_email", "file_write"} {
-			if _, err := config.AppendGlobalAlwaysAllowToolWithRevision(deps.ShannonDir, tool); err != nil {
-				t.Fatalf("seed global grant %s: %v", tool, err)
-			}
-			if err := agents.AppendAlwaysAllowTool(deps.AgentsDir, "operator", tool); err != nil {
-				t.Fatalf("seed agent grant %s: %v", tool, err)
-			}
-		}
-		return deps
-	}
+	seedDeps := seedDeniedGrantDeps
 
 	t.Run("denied grants pruned after rebuild", func(t *testing.T) {
 		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -440,6 +446,52 @@ func TestPullAndApplyAgentsDropsDeniedAlwaysAllow(t *testing.T) {
 		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "puller")
 		if len(got) != 2 {
 			t.Fatalf("pulled always_allow_tools = %v, want both entries kept on registry miss", got)
+		}
+	})
+}
+
+// The verified-principal transition (sign-in / account switch / key rotation)
+// is the exact catalog-empty window that lets a denied grant persist, so its
+// catalog rebuild must self-heal the same way RefreshIntegrationTools does.
+// Sign-out clears the catalog without a rebuild and must prune nothing.
+func TestResetIntegrationToolsForPrincipalPrunesDeniedAlwaysAllow(t *testing.T) {
+	t.Run("prunes after principal rebuild", func(t *testing.T) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{
+				{Name: "gmail_send_email", RequiresApproval: true},
+			})
+		}))
+		defer cloud.Close()
+
+		deps := seedDeniedGrantDeps(t)
+		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
+		s := &Server{deps: deps}
+
+		if err := s.resetIntegrationToolsForPrincipal(context.Background(), true); err != nil {
+			t.Fatalf("reset: %v", err)
+		}
+		if got := readGlobalAlwaysAllowFromDisk(t, deps.ShannonDir); len(got) != 1 || got[0] != "file_write" {
+			t.Errorf("global always_allow_tools on disk = %v, want [file_write]", got)
+		}
+		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 1 || got[0] != "file_write" {
+			t.Errorf("per-agent always_allow_tools = %v, want [file_write]", got)
+		}
+	})
+
+	t.Run("sign-out prunes nothing", func(t *testing.T) {
+		deps := seedDeniedGrantDeps(t)
+		deps.GW = client.NewGatewayClient("http://127.0.0.1:1", "test-key")
+		s := &Server{deps: deps}
+
+		if err := s.resetIntegrationToolsForPrincipal(context.Background(), false); err != nil {
+			t.Fatalf("reset: %v", err)
+		}
+		if got := readGlobalAlwaysAllowFromDisk(t, deps.ShannonDir); len(got) != 2 {
+			t.Errorf("global always_allow_tools on disk = %v, want both kept", got)
+		}
+		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 2 {
+			t.Errorf("per-agent always_allow_tools = %v, want both kept", got)
 		}
 	})
 }

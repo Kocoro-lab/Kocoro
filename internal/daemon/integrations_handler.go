@@ -170,22 +170,40 @@ func (s *Server) resetIntegrationToolsForPrincipal(ctx context.Context, hasPrinc
 	if s == nil || s.deps == nil {
 		return nil
 	}
+	rebuilt, err := s.resetIntegrationCatalogForPrincipal(ctx, hasPrincipal)
+	if err != nil || !rebuilt {
+		return err
+	}
+	// The new principal's catalog is authoritative now. This transition is the
+	// exact catalog-empty window that lets a denied grant persist, so prune
+	// here too — same post-rebuild self-heal as RefreshIntegrationTools, after
+	// the registry lock is released. Sign-out (hasPrincipal=false) only clears
+	// the catalog and never prunes.
+	s.pruneDeniedAlwaysAllowGrants()
+	return nil
+}
+
+// resetIntegrationCatalogForPrincipal is the registry-lock transaction of
+// resetIntegrationToolsForPrincipal, split out for the same reason as
+// refreshIntegrationCatalog. rebuilt reports that the new principal's catalog
+// registration completed and the prune may run.
+func (s *Server) resetIntegrationCatalogForPrincipal(ctx context.Context, hasPrincipal bool) (bool, error) {
 	unlock := s.deps.LockToolRegistryMutation()
 	defer unlock()
 	_, reg, _ := s.deps.Snapshot()
 	if reg == nil {
-		return nil
+		return false, nil
 	}
 	reg.RemoveSource(agent.SourceIntegration)
 	s.syncToolOverlays(reg)
 	if !hasPrincipal || s.deps.GW == nil {
-		return nil
+		return false, nil
 	}
 	itCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	err := tools.RegisterIntegrationTools(itCtx, s.deps.GW, reg)
 	s.syncToolOverlays(reg)
-	return err
+	return true, err
 }
 
 // InvalidateIntegrationTools removes the old catalog after AuthManager has
