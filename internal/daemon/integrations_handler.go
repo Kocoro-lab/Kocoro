@@ -129,6 +129,7 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 		log.Printf("daemon: skipping per-agent always-allow prune: %v", err)
 		return
 	}
+	agentPruned := false
 	for _, entry := range entries {
 		for _, tool := range agentAlwaysAllowTools(deps.AgentsDir, entry.Name) {
 			if !deps.ToolDisallowsAlwaysAllowPersistence(tool) {
@@ -138,8 +139,15 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 				log.Printf("daemon: failed to prune denied always-allow grant: agent=%s tool=%s err=%v", entry.Name, tool, err)
 				continue
 			}
+			agentPruned = true
 			log.Printf("daemon: pruned denied always-allow grant: agent=%s tool=%s", entry.Name, tool)
 		}
+	}
+	if agentPruned {
+		// The removal advanced the agent's config.yaml mtime past Cloud's row,
+		// so a coalesced push converges the pruned config upstream instead of
+		// leaving a stale cloud copy that reseeds other devices.
+		s.triggerAgentSync()
 	}
 }
 

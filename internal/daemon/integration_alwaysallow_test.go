@@ -326,7 +326,7 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
 		var recorded []config.MutationRevisions
 		deps.RecordConfigMutation = func(r config.MutationRevisions) { recorded = append(recorded, r) }
-		s := &Server{deps: deps}
+		s := &Server{deps: deps, agentSyncTrigger: make(chan struct{}, 1)}
 
 		// Alias the pre-prune backing array the way a lock-free Snapshot()
 		// reader (e.g. config.Clone on an in-flight agent turn) would: the
@@ -354,6 +354,14 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		if len(recorded) == 0 {
 			t.Error("global prune must report its revision via RecordConfigMutation")
 		}
+		// A per-agent removal is a real local mutation (config.yaml mtime is
+		// now ahead of Cloud's row) — it must request a sync push so the
+		// pruned config converges upstream.
+		select {
+		case <-s.agentSyncTrigger:
+		default:
+			t.Error("per-agent prune must trigger an agent sync push")
+		}
 	})
 
 	t.Run("empty catalog prunes nothing", func(t *testing.T) {
@@ -365,7 +373,7 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 
 		deps := seedDeps(t)
 		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
-		s := &Server{deps: deps}
+		s := &Server{deps: deps, agentSyncTrigger: make(chan struct{}, 1)}
 
 		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
 			t.Fatalf("refresh: %v", err)
@@ -375,6 +383,11 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		}
 		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 2 {
 			t.Errorf("per-agent always_allow_tools = %v, want both kept", got)
+		}
+		select {
+		case <-s.agentSyncTrigger:
+			t.Error("no-op prune must not trigger an agent sync push")
+		default:
 		}
 	})
 
@@ -405,12 +418,13 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 // The pull must apply the same registry-based drop as the HTTP handlers; a
 // registry miss keeps the entry (runtime gate + refresh prune backstop).
 func TestPullAndApplyAgentsDropsDeniedAlwaysAllow(t *testing.T) {
+	cloudUpdatedAt := time.Now().Add(-time.Hour).Truncate(time.Second)
 	newPullItem := func() client.SyncAgentItem {
 		return client.SyncAgentItem{
 			AgentKey:  "puller",
 			Prompt:    "cloud prompt",
 			Config:    json.RawMessage(`{"permissions":{"always_allow_tools":["gmail_send_email","file_write"]}}`),
-			UpdatedAt: time.Now(),
+			UpdatedAt: cloudUpdatedAt,
 		}
 	}
 	pullServer := func(t *testing.T, deps *ServerDeps) *Server {
@@ -433,6 +447,13 @@ func TestPullAndApplyAgentsDropsDeniedAlwaysAllow(t *testing.T) {
 		if len(got) != 1 || got[0] != "file_write" {
 			t.Fatalf("pulled always_allow_tools = %v, want [file_write] only", got)
 		}
+		// A drop makes the written config diverge from Cloud's copy, so the
+		// LWW clock must stay at "now" (strictly newer): the post-pull push is
+		// then accepted by Cloud's strict-newer upsert and the sanitized
+		// config converges upstream instead of leaving a stale cloud row.
+		if mod := agentLastModified(filepath.Join(deps.AgentsDir, "puller")); !mod.After(cloudUpdatedAt) {
+			t.Errorf("local LWW clock = %v, want strictly after cloud UpdatedAt %v after a drop", mod, cloudUpdatedAt)
+		}
 	})
 
 	t.Run("registry miss keeps entry", func(t *testing.T) {
@@ -446,6 +467,11 @@ func TestPullAndApplyAgentsDropsDeniedAlwaysAllow(t *testing.T) {
 		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "puller")
 		if len(got) != 2 {
 			t.Fatalf("pulled always_allow_tools = %v, want both entries kept on registry miss", got)
+		}
+		// No drop → byte mirror of Cloud's copy → mtimes stay stamped to the
+		// cloud timestamp (LWW no-op on the next push, as before).
+		if mod := agentLastModified(filepath.Join(deps.AgentsDir, "puller")); !mod.Equal(cloudUpdatedAt) {
+			t.Errorf("local LWW clock = %v, want stamped to cloud UpdatedAt %v when nothing was dropped", mod, cloudUpdatedAt)
 		}
 	})
 }
