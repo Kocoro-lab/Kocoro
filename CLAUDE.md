@@ -265,8 +265,12 @@ catalog denies (`integrations_handler.go pruneDeniedAlwaysAllowGrants`, run by
 both `RefreshIntegrationTools` and the verified-principal transition's
 `resetIntegrationToolsForPrincipal`; sign-out only clears the catalog and
 never prunes), covering grants persisted while the catalog was empty
-(key-rotation window, where the registry miss judges false). A registry miss never drops or prunes — fail-safe against
-mass deletion; the runtime gate backstops. The per-turn
+(key-rotation window, where the registry miss judges false). Both self-heals
+converge upstream: a pull-side drop skips the agent-sync LWW mirror stamp
+(local clock stays "now") and a per-agent prune fires `triggerAgentSync`, so
+the sanitized config passes Cloud's strict-newer upsert instead of leaving a
+stale row that reseeds other devices. A registry miss never drops or prunes —
+fail-safe against mass deletion; the runtime gate backstops. The per-turn
 `ApprovalCache` also refuses these tools — a byte-identical repeated tool_use
 carries a fresh request id the idempotency journal cannot dedupe, so every
 repeat re-prompts. **BREAKING**: users who previously clicked Always Allow on
