@@ -369,7 +369,8 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 				continue // local newer or equal — keep local edits.
 			}
 		}
-		materializeAgentFromItem(agentsDir, it, syncSkillNames, writeSyncedSkills)
+		materializeAgentFromItem(agentsDir, it, syncSkillNames, writeSyncedSkills,
+			s.dropRegistryDeniedAlwaysAllow)
 		s.deps.SessionCache.UnlockRoute(routeKey)
 		unlockSkills()
 	}
@@ -389,7 +390,12 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 // Note: SyncAgentItem.DisplayName is intentionally NOT applied here — the
 // display name is sourced from the config blob (AgentConfigAPI.DisplayName), so
 // the top-level field would be redundant/conflicting.
-func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNames []string, writeSyncedSkills bool) {
+// sanitizePerms applies the registry-based always-allow drop
+// (Server.dropRegistryDeniedAlwaysAllow) to the pulled permissions before the
+// full-replace config write — a config pushed by an older device can carry a
+// requires_approval integration grant the runtime will never honor. nil skips
+// the dynamic filter (the static sanitize inside WriteAgentConfig still runs).
+func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNames []string, writeSyncedSkills bool, sanitizePerms func(*agents.AgentPermissionsConfig)) {
 	writeFailed := false
 
 	// Capture the local cwd before any writes. It is device-local state: remote
@@ -464,6 +470,9 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNa
 			if reflect.DeepEqual(cfg, agents.AgentConfigAPI{}) {
 				clearSyncedConfig()
 			} else {
+				if sanitizePerms != nil {
+					sanitizePerms(cfg.Permissions)
+				}
 				cfg.CWD = localCWD
 				if err := agents.WriteAgentConfig(agentsDir, it.AgentKey, &cfg); err != nil {
 					log.Printf("agentsync: write config for %q failed: %v", it.AgentKey, err)

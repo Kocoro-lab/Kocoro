@@ -16,6 +16,7 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 	"gopkg.in/yaml.v3"
 )
@@ -389,6 +390,56 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		}
 		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 2 {
 			t.Errorf("per-agent always_allow_tools = %v, want both kept", got)
+		}
+	})
+}
+
+// The cloud agent-sync pull is a fourth full-replace config write: a config
+// pushed by an older device can carry a requires_approval integration grant.
+// The pull must apply the same registry-based drop as the HTTP handlers; a
+// registry miss keeps the entry (runtime gate + refresh prune backstop).
+func TestPullAndApplyAgentsDropsDeniedAlwaysAllow(t *testing.T) {
+	newPullItem := func() client.SyncAgentItem {
+		return client.SyncAgentItem{
+			AgentKey:  "puller",
+			Prompt:    "cloud prompt",
+			Config:    json.RawMessage(`{"permissions":{"always_allow_tools":["gmail_send_email","file_write"]}}`),
+			UpdatedAt: time.Now(),
+		}
+	}
+	pullServer := func(t *testing.T, deps *ServerDeps) *Server {
+		t.Helper()
+		sc := NewSessionCache(filepath.Join(deps.AgentsDir, "_sessions"))
+		t.Cleanup(func() { sc.CloseAll() })
+		deps.SessionCache = sc
+		return &Server{deps: deps, slugLocks: skills.NewSlugLocks()}
+	}
+
+	t.Run("denied entry dropped on pull", func(t *testing.T) {
+		deps := newIntegrationRegistryDeps(t)
+		srv := pullServer(t, deps)
+		if err := srv.pullAndApplyAgents(func() ([]client.SyncAgentItem, error) {
+			return []client.SyncAgentItem{newPullItem()}, nil
+		}); err != nil {
+			t.Fatalf("pull: %v", err)
+		}
+		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "puller")
+		if len(got) != 1 || got[0] != "file_write" {
+			t.Fatalf("pulled always_allow_tools = %v, want [file_write] only", got)
+		}
+	})
+
+	t.Run("registry miss keeps entry", func(t *testing.T) {
+		deps := newDepsWithConfig(t, "operator")
+		srv := pullServer(t, deps)
+		if err := srv.pullAndApplyAgents(func() ([]client.SyncAgentItem, error) {
+			return []client.SyncAgentItem{newPullItem()}, nil
+		}); err != nil {
+			t.Fatalf("pull: %v", err)
+		}
+		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "puller")
+		if len(got) != 2 {
+			t.Fatalf("pulled always_allow_tools = %v, want both entries kept on registry miss", got)
 		}
 	})
 }
