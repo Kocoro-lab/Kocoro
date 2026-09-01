@@ -4517,6 +4517,11 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if req.Config != nil {
+		// Same drop-not-reject sanitize as the update handlers, so a create
+		// cannot persist a grant the runtime gate will never honor.
+		s.dropRegistryDeniedAlwaysAllow(req.Config.Permissions)
+	}
 	// Slug is always server-generated and immutable; clients supply only display_name.
 	slug, err := agents.GenerateAgentSlug(s.deps.AgentsDir)
 	if err != nil {
@@ -4688,6 +4693,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		s.dropRegistryDeniedAlwaysAllow(cfg.Permissions)
 		parsedConfig = &cfg
 	}
 	if req.DisplayName != nil {
@@ -4980,6 +4986,29 @@ func clearAgentConfigPreservingDisplayName(agentsDir, name string) error {
 	return agents.WriteAgentConfig(agentsDir, name, &agents.AgentConfigAPI{DisplayName: displayName})
 }
 
+// dropRegistryDeniedAlwaysAllow removes permissions.always_allow_tools entries
+// the live registry marks persistence-denied (integration tools whose Cloud
+// schema carries requires_approval). Drop rather than reject: agent config
+// writes are full-replace, so a 400 would make an agent carrying such an entry
+// permanently uneditable through the API — the same rationale
+// agents.SanitizeAgentPermissionsConfig applies to the legacy GUI names. A
+// registry miss (integration catalog empty during a key/principal transition)
+// keeps the entry; the runtime gate in loop.go backstops it.
+func (s *Server) dropRegistryDeniedAlwaysAllow(perms *agents.AgentPermissionsConfig) {
+	if perms == nil || len(perms.AlwaysAllowTools) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(perms.AlwaysAllowTools))
+	for _, tool := range perms.AlwaysAllowTools {
+		if s.deps.ToolDisallowsAlwaysAllowPersistence(tool) {
+			log.Printf("daemon: dropped persistence-denied always-allow entry from agent config write: %s", tool)
+			continue
+		}
+		kept = append(kept, tool)
+	}
+	perms.AlwaysAllowTools = kept
+}
+
 func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if err := agents.ValidateAgentName(name); err != nil {
@@ -5011,6 +5040,7 @@ func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.dropRegistryDeniedAlwaysAllow(cfg.Permissions)
 	// Materialize builtin AFTER validation passes — avoids orphaned override dirs on bad input.
 	if !s.materializeIfBuiltin(w, name) {
 		return

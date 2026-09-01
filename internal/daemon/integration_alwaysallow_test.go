@@ -180,6 +180,76 @@ func TestAlwaysAllowEndpointsRejectIntegrationRequiresApproval(t *testing.T) {
 	}
 }
 
+// Full-replace agent config writes (PUT /agents/{name} with config, PUT
+// /agents/{name}/config) DROP always-allow entries the live registry marks
+// persistence-denied (integration requires_approval) instead of rejecting:
+// config writes are full-replace, so a 400 would make an agent carrying a
+// stale entry permanently uneditable — same rationale as the legacy GUI list
+// in agents.SanitizeAgentPermissionsConfig. Ordinary entries survive.
+func TestAgentConfigWritesDropIntegrationRequiresApproval(t *testing.T) {
+	const permsBody = `{"permissions":{"always_allow_tools":["gmail_send_email","file_write"]}}`
+
+	assertOnlyFileWrite := func(t *testing.T, agentsDir string) {
+		t.Helper()
+		got := readAlwaysAllowFromDisk(t, agentsDir, "operator")
+		if len(got) != 1 || got[0] != "file_write" {
+			t.Fatalf("persisted always_allow_tools = %v, want [file_write] only", got)
+		}
+	}
+
+	t.Run("config put", func(t *testing.T) {
+		deps := newIntegrationRegistryDeps(t)
+		deps.ShannonDir = t.TempDir()
+		srv := NewServer(0, nil, deps, "test")
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/agents/operator/config",
+			strings.NewReader(permsBody))
+		req.SetPathValue("name", "operator")
+		srv.handlePutAgentConfig(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		assertOnlyFileWrite(t, deps.AgentsDir)
+	})
+
+	t.Run("full update", func(t *testing.T) {
+		deps := newIntegrationRegistryDeps(t)
+		deps.ShannonDir = t.TempDir()
+		deps.SessionCache = NewSessionCache(deps.ShannonDir)
+		srv := NewServer(0, nil, deps, "test")
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/agents/operator",
+			strings.NewReader(`{"config":`+permsBody+`}`))
+		req.SetPathValue("name", "operator")
+		srv.handleUpdateAgent(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		assertOnlyFileWrite(t, deps.AgentsDir)
+	})
+
+	// Registry miss (integration catalog empty, e.g. mid key-rotation) must NOT
+	// drop the entry — the runtime gate in loop.go backstops it, and dropping on
+	// a miss would erase a grant for a tool that is merely unlisted right now.
+	t.Run("registry miss keeps entry", func(t *testing.T) {
+		deps := newDepsWithConfig(t, "operator")
+		deps.ShannonDir = t.TempDir()
+		srv := NewServer(0, nil, deps, "test")
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/agents/operator/config",
+			strings.NewReader(permsBody))
+		req.SetPathValue("name", "operator")
+		srv.handlePutAgentConfig(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator")
+		if len(got) != 2 {
+			t.Fatalf("persisted always_allow_tools = %v, want both entries kept on registry miss", got)
+		}
+	})
+}
+
 // Defense-in-depth on the broker cache itself: even a direct SetToolAutoApprove
 // (e.g. an old Desktop's Always Allow click relayed over WS) must not arm the
 // in-memory bypass for a persistence-denied tool.
