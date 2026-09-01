@@ -18,21 +18,21 @@ func TestKocoroAgentsReferenceNamesAllPruneTriggers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read embedded agents.md: %v", err)
 	}
-	const anchor = "prunes it automatically after the next successful catalog rebuild ("
-	src := string(data)
-	start := strings.Index(src, anchor)
-	if start < 0 {
-		t.Fatalf("agents.md lost the prune-trigger sentence (anchor %q)", anchor)
+	// Anchor on the behavior keyword, then scan its whole line so benign
+	// rewording around it cannot break the pin.
+	var line string
+	for _, l := range strings.Split(string(data), "\n") {
+		if strings.Contains(l, "prunes it automatically") {
+			line = l
+			break
+		}
 	}
-	rest := src[start+len(anchor):]
-	end := strings.Index(rest, ")")
-	if end < 0 {
-		t.Fatal("prune-trigger list parenthetical is unterminated")
+	if line == "" {
+		t.Fatal(`agents.md lost the "prunes it automatically" self-heal sentence`)
 	}
-	triggers := rest[:end]
 	for _, want := range []string{"/integrations/refresh", "sign-in", "account switch", "key rotation"} {
-		if !strings.Contains(triggers, want) {
-			t.Errorf("prune-trigger list %q missing %q", triggers, want)
+		if !strings.Contains(line, want) {
+			t.Errorf("prune-trigger line missing %q:\n%s", want, line)
 		}
 	}
 }

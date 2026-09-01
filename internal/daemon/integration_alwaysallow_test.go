@@ -201,6 +201,30 @@ func TestAgentConfigWritesDropIntegrationRequiresApproval(t *testing.T) {
 		}
 	}
 
+	t.Run("create", func(t *testing.T) {
+		deps := newIntegrationRegistryDeps(t)
+		deps.ShannonDir = t.TempDir()
+		deps.SessionCache = NewSessionCache(deps.ShannonDir)
+		srv := NewServer(0, nil, deps, "test")
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/agents",
+			strings.NewReader(`{"display_name":"Creator","prompt":"p","config":`+permsBody+`}`))
+		srv.handleCreateAgent(rr, req)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil || resp.Name == "" {
+			t.Fatalf("decode created agent slug: %v (body=%s)", err, rr.Body.String())
+		}
+		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, resp.Name)
+		if len(got) != 1 || got[0] != "file_write" {
+			t.Fatalf("created agent always_allow_tools = %v, want [file_write] only", got)
+		}
+	})
+
 	t.Run("config put", func(t *testing.T) {
 		deps := newIntegrationRegistryDeps(t)
 		deps.ShannonDir = t.TempDir()
@@ -310,8 +334,6 @@ func seedDeniedGrantDeps(t *testing.T) *ServerDeps {
 // registry NOW marks persistence-denied. An empty or failed rebuild prunes
 // nothing (registry miss judges false — fail-safe against mass deletion).
 func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
-	seedDeps := seedDeniedGrantDeps
-
 	t.Run("denied grants pruned after rebuild", func(t *testing.T) {
 		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -322,7 +344,7 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		}))
 		defer cloud.Close()
 
-		deps := seedDeps(t)
+		deps := seedDeniedGrantDeps(t)
 		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
 		var recorded []config.MutationRevisions
 		deps.RecordConfigMutation = func(r config.MutationRevisions) { recorded = append(recorded, r) }
@@ -356,6 +378,48 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		}
 	})
 
+	// The in-memory mirror may hold an entry the global config.yaml does not
+	// (external hand-edit since load). The prune must only strip the mirror —
+	// and only log/record — on evidence of an actual disk write: never claim
+	// bytes it did not write.
+	t.Run("mirror-only entry is not stripped without a disk write", func(t *testing.T) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{
+				{Name: "gmail_send_email", RequiresApproval: true},
+			})
+		}))
+		defer cloud.Close()
+
+		deps := newDepsWithConfig(t, "operator")
+		deps.ShannonDir = t.TempDir()
+		deps.Registry = agent.NewToolRegistry()
+		deps.Config.Cloud.Enabled = true
+		deps.Config.APIKey = "test-key"
+		deps.Config.Permissions.AlwaysAllowTools = []string{"gmail_send_email", "file_write"}
+		// Disk carries only the ordinary grant — the denied entry exists in
+		// memory alone.
+		if _, err := config.AppendGlobalAlwaysAllowToolWithRevision(deps.ShannonDir, "file_write"); err != nil {
+			t.Fatalf("seed global grant: %v", err)
+		}
+		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
+		var recorded []config.MutationRevisions
+		deps.RecordConfigMutation = func(r config.MutationRevisions) { recorded = append(recorded, r) }
+		s := &Server{deps: deps}
+
+		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		if got := deps.Config.Permissions.AlwaysAllowTools; len(got) != 2 {
+			t.Errorf("in-memory mirror = %v, want untouched (no disk write happened)", got)
+		}
+		for _, r := range recorded {
+			if r.After != "" {
+				t.Errorf("recorded a mutation revision %+v for a write that never happened", r)
+			}
+		}
+	})
+
 	t.Run("empty catalog prunes nothing", func(t *testing.T) {
 		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -363,7 +427,7 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		}))
 		defer cloud.Close()
 
-		deps := seedDeps(t)
+		deps := seedDeniedGrantDeps(t)
 		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
 		s := &Server{deps: deps}
 
@@ -378,13 +442,42 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		}
 	})
 
+	// Hand-edited config.yaml is the most likely place for a stale grant. A
+	// wrong-typed UNRELATED sibling field must not hide the always-allow list
+	// from the prune (the agents-package raw reader tolerates it; a typed
+	// whole-file unmarshal would not).
+	t.Run("hand-edited sibling field does not hide per-agent grants", func(t *testing.T) {
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]client.ServerToolSchema{
+				{Name: "gmail_send_email", RequiresApproval: true},
+			})
+		}))
+		defer cloud.Close()
+
+		deps := seedDeniedGrantDeps(t)
+		handEdited := "auto_approve: [not, a, bool]\npermissions:\n  always_allow_tools:\n    - file_write\n    - gmail_send_email\n"
+		if err := os.WriteFile(filepath.Join(deps.AgentsDir, "operator", "config.yaml"), []byte(handEdited), 0600); err != nil {
+			t.Fatalf("write hand-edited config: %v", err)
+		}
+		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
+		s := &Server{deps: deps}
+
+		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 1 || got[0] != "file_write" {
+			t.Errorf("per-agent always_allow_tools = %v, want [file_write] despite the hand-edited sibling field", got)
+		}
+	})
+
 	t.Run("failed rebuild prunes nothing", func(t *testing.T) {
 		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "temporary outage", http.StatusBadGateway)
 		}))
 		defer cloud.Close()
 
-		deps := seedDeps(t)
+		deps := seedDeniedGrantDeps(t)
 		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
 		s := &Server{deps: deps}
 
