@@ -727,6 +727,13 @@ func (s *Server) SetConsequentialRiskHTTPAuthorizer(authorizer func(*http.Reques
 	s.consequentialRiskHTTPAuthorizer = authorizer
 }
 
+// isCredentialStoreDisabled is the nil-safe read of the injectable field:
+// bare &Server{...} test fixtures never seed it, and the reload path must
+// fail open (heuristic stays active) rather than panic there.
+func (s *Server) isCredentialStoreDisabled() bool {
+	return s.credentialStoreDisabled != nil && s.credentialStoreDisabled()
+}
+
 func (s *Server) liveAPIKey(cfg *config.Config) string {
 	if s != nil && s.deps != nil && s.deps.GW != nil && (s.isolated || s.auth != nil) {
 		return s.deps.GW.APIKey()
@@ -7790,13 +7797,20 @@ func (s *Server) handleConfigReload(w http.ResponseWriter, r *http.Request) {
 	//     but its key is stdin-injected and process-memory-only: yaml never
 	//     persists api_key, so the in-memory vs reloaded-yaml mismatch is
 	//     permanent and NOT evidence of a user edit — skip the heuristic.
+	//     This is the same mode liveAPIKey/configWithLiveAPIKey recognize via
+	//     s.isolated (cmd/daemon.go sets both flags under one `if isolated`),
+	//     and the suppression is safe because every isolated-mode api_key
+	//     reader resolves through liveAPIKey / GW.APIKey(), never a raw
+	//     cfg.APIKey. It also covers a key hand-written into the isolated
+	//     yaml after startup: isolated mode must never adopt an on-disk key,
+	//     so no restart signal is the correct answer there too.
 	needsRestart := false
 	var reason string
 	if oldCfg != nil && oldCfg.Endpoint != newCfg.Endpoint {
 		needsRestart = true
 		reason = "endpoint changed — restart daemon to apply"
 	} else if oldCfg != nil && oldCfg.APIKey != newCfg.APIKey && s.auth == nil &&
-		!s.credentialStoreDisabled() {
+		!s.isCredentialStoreDisabled() {
 		needsRestart = true
 		reason = "api_key changed in yaml (legacy path) — restart daemon to apply"
 	}

@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,12 +26,8 @@ func newReloadRestartTestServer(t *testing.T, liveCfg, reloadedCfg *config.Confi
 	}))
 	t.Cleanup(upstream.Close)
 
-	shannonDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(shannonDir, "config.yaml"), []byte("{}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	srv := NewServer(0, nil, &ServerDeps{
-		ShannonDir: shannonDir,
+		ShannonDir: t.TempDir(),
 		Config:     liveCfg,
 		GW:         client.NewGatewayClient(upstream.URL, "test-key"),
 	}, "test")
@@ -67,11 +61,38 @@ func TestConfigReloadIsolatedInMemoryKeyDoesNotRequireRestart(t *testing.T) {
 		&config.Config{APIKey: "stdin-injected-key"},
 		&config.Config{},
 	)
+	// Stub the seam instead of calling the real
+	// config.DisableCredentialStoreForProcess(): that flag is process-global
+	// with no reset, so a real call would poison every other test in this
+	// binary. SetIsolated mirrors cmd/daemon.go, which sets both signals
+	// under one `if isolated` — the fixture encodes a producible state.
 	srv.credentialStoreDisabled = func() bool { return true }
+	srv.SetIsolated(true)
 
 	response := postConfigReload(t, srv)
 	if response["restart_required"] == true {
 		t.Fatalf("isolated reload reported restart_required: reason=%v", response["restart_reason"])
+	}
+}
+
+// The endpoint-change branch outranks the api_key suppression: an isolated
+// daemon whose endpoint really changed must still advertise restart_required
+// (AuthClient.baseURL and the WS dialer URL are captured at construction).
+func TestConfigReloadIsolatedEndpointChangeStillRequiresRestart(t *testing.T) {
+	srv := newReloadRestartTestServer(t,
+		&config.Config{APIKey: "stdin-injected-key", Endpoint: "https://a.example"},
+		&config.Config{Endpoint: "https://b.example"},
+	)
+	srv.credentialStoreDisabled = func() bool { return true }
+	srv.SetIsolated(true)
+
+	response := postConfigReload(t, srv)
+	if response["restart_required"] != true {
+		t.Fatalf("isolated endpoint change did not report restart_required: %v", response)
+	}
+	reason, _ := response["restart_reason"].(string)
+	if !strings.Contains(reason, "endpoint changed") {
+		t.Fatalf("restart_reason = %q, want it to mention endpoint changed", reason)
 	}
 }
 
