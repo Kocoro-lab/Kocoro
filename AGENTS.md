@@ -5,9 +5,9 @@ disagree, `CLAUDE.md` and the code win.
 
 **Keep this file under 24 KB (CI asserts)** — cut prose, not rules.
 
-Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production:
-daemon + Desktop + Cloud — the daemon holds a Cloud WS, runs the agent
-loop locally, streams back. Also TUI, one-shot CLI, MCP, schedules.
+Kocoro is the Go CLI/runtime (`shan`) for Shannon agents. Production: daemon +
+Desktop + Cloud (daemon holds the Cloud WS, runs the loop locally). Also TUI,
+one-shot CLI, MCP, schedules.
 
 Layout: `cmd/` (Cobra) + `internal/<pkg>/`; `daemon/` drives `agent/`.
 
@@ -38,10 +38,9 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 
 - **Required fields**: every `Run()` MUST check each `ToolInfo.Required` field is
   non-zero right after `json.Unmarshal` and return `agent.ValidationError(...)`,
-  NOT a bare `ToolResult{IsError: true}` (Go can't tell missing from zero — `""`
-  reaches `os.WriteFile`). The `[validation error]` prefix is load-bearing:
-  `LoopDetector.isValidationErrorSig` force-stops on 3 consecutive, far below
-  the all-errors 2x `ConsecutiveDup` budget.
+  NOT a bare `ToolResult{IsError: true}` (Go can't tell missing from zero). The
+  `[validation error]` prefix is load-bearing:
+  `LoopDetector.isValidationErrorSig` force-stops on 3 consecutive.
 - **Priority**: local > MCP > gateway, deduped by name. MCP-vs-MCP collisions
   resolve to the alphabetically-first server (`RebuildRegistryForHealth`); the
   shadowed tool is logged, never registered.
@@ -78,15 +77,13 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
 - Integration `requires_approval=true` → normal approval flow
-  (`daemon.auto_approve` bypasses), but Always Allow persistence is refused —
+  (`daemon.auto_approve` bypasses); Always Allow persistence refused —
   `DisallowsAlwaysAllowPersistence` gates flag/broker/persist/runtime; stale
-  `always_allow_tools` entries are ignored. Full-replace agent config writes
-  (HTTP create/update + agent-sync pull) drop such entries
-  (`dropRegistryDeniedAlwaysAllow`, registry miss keeps); a successful catalog
-  rebuild — `RefreshIntegrationTools` or the principal transition's
-  `resetIntegrationToolsForPrincipal` — prunes window-persisted ones
-  (`pruneDeniedAlwaysAllowGrants`). Absent=false; Cloud gates marked schemas
-  on `integration_requires_approval`.
+  `always_allow_tools` entries ignored. Config writes (incl. agent-sync pull)
+  drop denied entries (`dropRegistryDeniedAlwaysAllow`, registry miss keeps);
+  `RefreshIntegrationTools` + `resetIntegrationToolsForPrincipal` prune after
+  rebuild (`pruneDeniedAlwaysAllowGrants`). Absent=false; Cloud gates marked
+  schemas on `integration_requires_approval`.
 - Trusted `material_side_effect=false` permits observational batching without
   the journal; absent is fail-closed. Stable `request_id`; material calls add
   `Idempotency-Key`. Only `provider_unavailable`/`provider_rejected` are
@@ -117,16 +114,15 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   deadline still wins.
 - A post-dispatch transport failure repairs the connection but re-dispatches ONLY
   `mcp.ToolReplaySafe` tools (read-only/idempotent annotations) — a transport
-  error after dispatch does NOT prove the server never acted (a stdio server can
-  commit its write and die before responding). Everything else returns
-  `mcp.OutcomeUnknownError`. Timeouts/protocol errors are never retried.
+  error after dispatch does NOT prove the server never acted. Everything else
+  returns `mcp.OutcomeUnknownError`. Timeouts/protocol errors are never retried.
 - A failed async connect is NOT terminal: `ReconnectScheduler`
   (`mcp/reconnect.go`) backs off 5s → 5min, `reconnectMaxAttempts` 6.
   Retries are owned by the manager generation (`SwapMCPReconnectScheduler`,
   `ShutdownCleanup`) so a timer never respawns a subprocess the cleanup is
   reaping. `ForgetMCPReconnect` re-arms an exhausted streak.
 - Stdio subprocesses spawn in their own process group, killed via `-pgid` SIGTERM
-  + 3s SIGKILL — npx-bridged servers are a process chain.
+  + 3s SIGKILL.
 - Artifact paths: servers with known path semantics (playwright, or any
   `workspace_base`) get "Saved to:" absolute annotations for files that exist.
   Screenshot filenames default into `~/.shannon/tmp/sessions/<id>/` (swept by
@@ -154,9 +150,8 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   = those four plus `computer_use` and `screenshot`.
 - `computer_use` is deliberately absent from the FIRST list — its persisted
   global grant IS the product's Computer Use permission, honored even unattended,
-  scoped BY NAME via `unattendedGrantHonored` (a blanket rule would re-open
-  unattended capture for `screenshot`). Legacy GUI names never use the global
-  grant; per-agent `computer_use` is rejected
+  scoped BY NAME via `unattendedGrantHonored`. Legacy GUI names never use the
+  global grant; per-agent `computer_use` is rejected
   (`agents.ValidateAgentPermissionsConfig`) — the grant is global-only.
 
 ## Wire Contracts
