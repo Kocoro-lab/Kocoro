@@ -321,8 +321,18 @@ func TestRefreshIntegrationToolsPrunesDeniedAlwaysAllow(t *testing.T) {
 		deps.RecordConfigMutation = func(r config.MutationRevisions) { recorded = append(recorded, r) }
 		s := &Server{deps: deps}
 
+		// Alias the pre-prune backing array the way a lock-free Snapshot()
+		// reader (e.g. config.Clone on an in-flight agent turn) would: the
+		// prune must publish a fresh slice, never overwrite these elements
+		// in place.
+		seeded := deps.Config.Permissions.AlwaysAllowTools
+
 		if err := s.RefreshIntegrationTools(context.Background()); err != nil {
 			t.Fatalf("refresh: %v", err)
+		}
+
+		if len(seeded) != 2 || seeded[0] != "gmail_send_email" || seeded[1] != "file_write" {
+			t.Errorf("prune mutated the previously published backing array in place: %v", seeded)
 		}
 
 		if got := readGlobalAlwaysAllowFromDisk(t, deps.ShannonDir); len(got) != 1 || got[0] != "file_write" {

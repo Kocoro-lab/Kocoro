@@ -45,8 +45,10 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 
 // refreshIntegrationCatalog is the registry-lock transaction of
 // RefreshIntegrationTools. Split out so the always-allow prune runs after the
-// registry lock is released: the prune takes the config mutation lock, and the
-// reload path acquires these locks in the opposite nesting.
+// registry lock is released: the prune performs blocking file-lock I/O
+// (config.yaml.lock, per-agent .config.lock), and the registry mutation lock
+// is scoped to build-to-swap transactions — it must not be held across
+// unrelated blocking work.
 func (s *Server) refreshIntegrationCatalog(ctx context.Context) (bool, error) {
 	// Serialize the list/build/live-swap transaction with auth, MCP health, and
 	// reload so no cached catalog can land across an identity transition.
@@ -100,7 +102,10 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 				continue
 			}
 			deps.WriteLock()
-			kept := deps.Config.Permissions.AlwaysAllowTools[:0]
+			// Publish a fresh slice instead of filtering in place: Snapshot()
+			// readers use the Config without holding deps.mu, so elements of
+			// the already-published backing array must never be overwritten.
+			kept := make([]string, 0, len(deps.Config.Permissions.AlwaysAllowTools))
 			for _, t := range deps.Config.Permissions.AlwaysAllowTools {
 				if t != tool {
 					kept = append(kept, t)
