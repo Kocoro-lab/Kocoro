@@ -36,7 +36,12 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 	// principal-transition window let ToolDisallowsAlwaysAllowPersistence
 	// judge false) can be pruned — otherwise they sit in config forever,
 	// silently ignored by the runtime gate while the UI shows an active grant.
-	s.pruneDeniedAlwaysAllowGrants()
+	// The push request lives HERE, not inside the prune: this same-identity
+	// refresh path is the only prune caller where a sync push is safe (see the
+	// principal-transition caller for why).
+	if s.pruneDeniedAlwaysAllowGrants() {
+		s.triggerAgentSync()
+	}
 	return nil
 }
 
@@ -72,7 +77,12 @@ func (s *Server) refreshIntegrationCatalog(ctx context.Context) (bool, error) {
 // can never mass-delete grants. Best-effort — failures are logged and never
 // propagated to the refresh caller. Skipped names simply survive until the
 // next refresh.
-func (s *Server) pruneDeniedAlwaysAllowGrants() {
+//
+// Returns whether a per-agent config.yaml was actually rewritten (its mtime is
+// now ahead of Cloud's row). The CALLER decides whether to request a sync push
+// — pushing is not safe from every prune site (see the principal-transition
+// caller).
+func (s *Server) pruneDeniedAlwaysAllowGrants() bool {
 	deps := s.deps
 
 	// Global list: mirror persistGlobalToolAlwaysAllow's write discipline
@@ -130,7 +140,7 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 	entries, err := agents.ListAgents(deps.AgentsDir)
 	if err != nil {
 		log.Printf("daemon: skipping per-agent always-allow prune: %v", err)
-		return
+		return false
 	}
 	agentPruned := false
 	for _, entry := range entries {
@@ -141,20 +151,21 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 			if !deps.ToolDisallowsAlwaysAllowPersistence(tool) {
 				continue
 			}
-			if err := agents.RemoveAlwaysAllowTool(deps.AgentsDir, entry.Name, tool); err != nil {
+			removed, err := agents.RemoveAlwaysAllowTool(deps.AgentsDir, entry.Name, tool)
+			if err != nil {
 				log.Printf("daemon: failed to prune denied always-allow grant: agent=%s tool=%s err=%v", entry.Name, tool, err)
+				continue
+			}
+			if !removed {
+				// The lock-free pre-read raced a concurrent write (or the agent
+				// dir vanished): no bytes were written, so never claim a prune.
 				continue
 			}
 			agentPruned = true
 			log.Printf("daemon: pruned denied always-allow grant: agent=%s tool=%s", entry.Name, tool)
 		}
 	}
-	if agentPruned {
-		// The removal advanced the agent's config.yaml mtime past Cloud's row,
-		// so a coalesced push converges the pruned config upstream instead of
-		// leaving a stale cloud copy that reseeds other devices.
-		s.triggerAgentSync()
-	}
+	return agentPruned
 }
 
 // resetIntegrationToolsForPrincipal applies the strict identity boundary for
@@ -180,6 +191,12 @@ func (s *Server) resetIntegrationToolsForPrincipal(ctx context.Context, hasPrinc
 	// (file locks are taken only when a denied entry actually exists — rare),
 	// the bounded catalog fetch above already dominates the latency, and
 	// synchronous ordering keeps semantics and tests simple.
+	//
+	// No sync push from this caller: agentPullClean is set-once by the
+	// startup-only pull and survives an account switch, so a full_sync push
+	// fired here would upload the PREVIOUS account's local agent set to the
+	// new account and soft-delete its cloud-only agents. The pruned configs
+	// converge on the next ordinary refresh instead.
 	s.pruneDeniedAlwaysAllowGrants()
 	return nil
 }

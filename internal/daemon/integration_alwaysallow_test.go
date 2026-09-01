@@ -549,6 +549,29 @@ func TestPullAndApplyAgentsDropsDeniedAlwaysAllow(t *testing.T) {
 		}
 	})
 
+	// The STATIC sanitize inside WriteAgentConfig (legacy GUI names) diverges
+	// the written config from Cloud's copy exactly like the dynamic drop, so
+	// it must also leave the LWW clock at "now" — otherwise the stale cloud
+	// row carrying e.g. `applescript` keeps reseeding devices forever.
+	t.Run("static legacy-GUI drop also skips the stamp", func(t *testing.T) {
+		deps := newDepsWithConfig(t, "operator")
+		srv := pullServer(t, deps)
+		item := newPullItem()
+		item.Config = json.RawMessage(`{"permissions":{"always_allow_tools":["applescript","file_write"]}}`)
+		if err := srv.pullAndApplyAgents(func() ([]client.SyncAgentItem, error) {
+			return []client.SyncAgentItem{item}, nil
+		}); err != nil {
+			t.Fatalf("pull: %v", err)
+		}
+		got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "puller")
+		if len(got) != 1 || got[0] != "file_write" {
+			t.Fatalf("pulled always_allow_tools = %v, want [file_write] only", got)
+		}
+		if mod := agentLastModified(filepath.Join(deps.AgentsDir, "puller")); !mod.After(cloudUpdatedAt) {
+			t.Errorf("local LWW clock = %v, want strictly after cloud UpdatedAt %v after a static drop", mod, cloudUpdatedAt)
+		}
+	})
+
 	t.Run("registry miss keeps entry", func(t *testing.T) {
 		deps := newDepsWithConfig(t, "operator")
 		srv := pullServer(t, deps)
@@ -585,7 +608,7 @@ func TestResetIntegrationToolsForPrincipalPrunesDeniedAlwaysAllow(t *testing.T) 
 
 		deps := seedDeniedGrantDeps(t)
 		deps.GW = client.NewGatewayClient(cloud.URL, "test-key")
-		s := &Server{deps: deps}
+		s := &Server{deps: deps, agentSyncTrigger: make(chan struct{}, 1)}
 
 		if err := s.resetIntegrationToolsForPrincipal(context.Background(), true); err != nil {
 			t.Fatalf("reset: %v", err)
@@ -595,6 +618,16 @@ func TestResetIntegrationToolsForPrincipalPrunesDeniedAlwaysAllow(t *testing.T) 
 		}
 		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 1 || got[0] != "file_write" {
 			t.Errorf("per-agent always_allow_tools = %v, want [file_write]", got)
+		}
+		// The principal-transition prune must NOT request a sync push:
+		// agentPullClean survives an account switch (set-once, startup-only
+		// pull), so a full_sync push here would upload the PREVIOUS account's
+		// local agent set and soft-delete the new account's cloud-only agents.
+		// These grants converge on the next ordinary refresh instead.
+		select {
+		case <-s.agentSyncTrigger:
+			t.Error("principal-transition prune must not trigger an agent sync push")
+		default:
 		}
 	})
 

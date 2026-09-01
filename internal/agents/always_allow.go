@@ -186,30 +186,34 @@ func AppendAlwaysAllowTool(agentsDir, agentName, tool string) error {
 // permissions.always_allow_tools list. No-op if the tool is not present, the
 // list is empty, or config.yaml does not exist.
 //
+// The bool reports whether the entry was actually removed (bytes written) —
+// callers that act on a removal (e.g. requesting a sync push) must not claim
+// bytes that were never written.
+//
 // If the resulting list is empty AND no other permissions sub-fields are set,
 // the permissions: top-level key is dropped to keep YAML clean.
-func RemoveAlwaysAllowTool(agentsDir, agentName, tool string) error {
+func RemoveAlwaysAllowTool(agentsDir, agentName, tool string) (bool, error) {
 	if err := ValidateAgentName(agentName); err != nil {
-		return err
+		return false, err
 	}
 	if tool == "" {
-		return fmt.Errorf("tool name is empty")
+		return false, fmt.Errorf("tool name is empty")
 	}
 
 	dir := filepath.Join(agentsDir, agentName)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return nil
+		return false, nil
 	}
 
 	unlock, err := lockAgentConfig(dir)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer unlock()
 
 	raw, err := readAgentConfigRaw(dir)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	tools := readAlwaysAllowTools(raw, agentName)
@@ -223,11 +227,14 @@ func RemoveAlwaysAllowTool(agentsDir, agentName, tool string) error {
 		filtered = append(filtered, t)
 	}
 	if !removed {
-		return nil
+		return false, nil
 	}
 	setAlwaysAllowTools(raw, filtered)
 
-	return writeAgentConfigRaw(dir, raw)
+	if err := writeAgentConfigRaw(dir, raw); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // lockAgentConfig acquires an exclusive flock on <agentDir>/.config.lock and
