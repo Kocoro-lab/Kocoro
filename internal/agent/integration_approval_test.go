@@ -13,9 +13,10 @@ import (
 // material outbound writes needing per-call human approval, so a persisted
 // "Always Allow" grant must never silence future prompts for them. These
 // tests pin that contract at the permission engine with an integration-shaped
-// mock: first use prompts, an in-turn approval is cached, always_allow_tools
-// entries are IGNORED, and unattended runs reach the handler instead of
-// failing closed. The handler halves are pinned elsewhere:
+// mock: every call prompts (the in-turn approval cache is refused too, since
+// an identical repeated tool_use re-executes the send under a fresh request
+// id), always_allow_tools entries are IGNORED, and unattended runs reach the
+// handler instead of failing closed. The handler halves are pinned elsewhere:
 // daemon.auto_approve in cmd's TestDaemonEventHandler_AutoApproveAllowsAllTools,
 // "Always Allow" persistence refusal in internal/daemon's alwaysallow tests.
 
@@ -31,7 +32,7 @@ func TestCheckPermissionAndApproval_IntegrationRequiresApprovalPromptsFirstUse(t
 	loop, handler := newApprovalProbeLoop(t, nil)
 	handler.approveResult = true
 
-	tool := &mockApprovalTool{name: "x_create_post"}
+	tool := &integrationApprovalTool{mockApprovalTool{name: "x_create_post"}}
 	cache := NewApprovalCache()
 	args := `{"text":"hello","description":"Publish a post on X"}`
 	decision, approved := loop.checkPermissionAndApproval(
@@ -41,13 +42,16 @@ func TestCheckPermissionAndApproval_IntegrationRequiresApprovalPromptsFirstUse(t
 			decision, approved, handler.approvalRequested)
 	}
 
-	// Identical call within the same turn is served from the approval cache —
-	// integration tools are not on DisallowsAutoApproval, so no fresh prompt.
+	// A byte-identical repeat within the same turn is NOT served from the
+	// approval cache: a repeated tool_use carries a fresh request id, so the
+	// idempotency journal does not dedupe it and the send would execute
+	// again. Same rationale as the GUI tools' cache refusal — duplicate
+	// outbound writes need a human decision each time.
 	handler.approvalRequested = false
 	decision, approved = loop.checkPermissionAndApproval(
 		context.Background(), "x_create_post", args, tool, cache)
-	if decision != "ask" || !approved || handler.approvalRequested {
-		t.Fatalf("cached repeat: got (%s, %v), requested=%v; want cached approval without a prompt",
+	if decision != "ask" || !approved || !handler.approvalRequested {
+		t.Fatalf("identical repeat: got (%s, %v), requested=%v; want a fresh prompt reaching the handler",
 			decision, approved, handler.approvalRequested)
 	}
 }

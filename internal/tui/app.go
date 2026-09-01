@@ -291,6 +291,24 @@ type slashCmd struct {
 
 // SetProgram stores the bubbletea program reference so goroutines can
 // inject messages (e.g. approval prompts) into the TUI event loop.
+// toolDisallowsSessionAllow reports whether the named tool refuses the TUI's
+// session-level always-allow ('a' key): static deny-list names, plus
+// registered tools that refuse persistence via their registration-time schema
+// (integration tools marked requires_approval) — mirroring the daemon
+// broker's disallowsAlwaysAllow gate so the two surfaces cannot drift.
+func (m *Model) toolDisallowsSessionAllow(name string) bool {
+	if agent.DisallowsAutoApproval(name) {
+		return true
+	}
+	if m.toolRegistry == nil {
+		return false
+	}
+	if t, ok := m.toolRegistry.Get(name); ok {
+		return agent.ToolDisallowsAlwaysAllowPersistence(t)
+	}
+	return false
+}
+
 func (m *Model) SetProgram(p *tea.Program) {
 	m.program = p
 }
@@ -1332,7 +1350,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateProcessing
 				return m, nil
 			case "a", "A":
-				if !agent.DisallowsAutoApproval(m.pendingApprovalTool) {
+				if !m.toolDisallowsSessionAllow(m.pendingApprovalTool) {
 					m.sessionAllowed[m.pendingApprovalTool] = true
 				} else {
 					m.sendOutput("  ! Allowed once; this tool cannot be saved as always-allow.")
@@ -1495,7 +1513,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case approvalRequestMsg:
 		m.pendingApprovalTool = msg.tool
 		// Check session-level auto-approve
-		if m.sessionAllowed[msg.tool] && !agent.DisallowsAutoApproval(msg.tool) {
+		if m.sessionAllowed[msg.tool] && !m.toolDisallowsSessionAllow(msg.tool) {
 			select {
 			case m.approvalCh <- true:
 			default:

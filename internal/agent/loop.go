@@ -7769,8 +7769,12 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 		// in this turn, skip asking the user again. GUI control tools that
 		// refuse persistent auto-approval also refuse this shorter-lived cache:
 		// repeating an identical click or submit can still duplicate a purchase,
-		// send, delete, or other consequential side effect.
-		freshApproval := requireFreshApproval || DisallowsAutoApproval(toolName)
+		// send, delete, or other consequential side effect. The same applies to
+		// tools with the dynamic schema-derived denial (integration tools marked
+		// requires_approval): an identical repeated tool_use carries a fresh
+		// request id, so the idempotency journal does not dedupe the send.
+		freshApproval := requireFreshApproval || DisallowsAutoApproval(toolName) ||
+			ToolDisallowsAlwaysAllowPersistence(tool)
 		if !freshApproval && cache != nil && cache.WasApproved(toolName, argsStr) {
 			return "ask", true
 		}
