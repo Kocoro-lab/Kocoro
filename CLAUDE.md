@@ -253,7 +253,20 @@ local approval-requiring tools — EXCEPT that "Always Allow" persistence is
 refused at every layer: the approval card carries `always_allow_disabled`,
 `HandleAlwaysAllowDecision` / `PersistAgentAlwaysAllow` reject the write, the
 broker cache refuses the name, and the runtime gate in `loop.go` ignores an
-existing `always_allow_tools` entry (hand-edited or pre-policy). The per-turn
+existing `always_allow_tools` entry (hand-edited or pre-policy). Two self-heal
+layers keep config from accumulating grants the runtime will never honor:
+full-replace agent config writes (create / `PUT /agents/{name}` / `PUT
+/agents/{name}/config` / the cloud agent-sync pull, `server.go
+dropRegistryDeniedAlwaysAllow`) DROP registry-denied entries — drop, not
+reject, for the same reason as the legacy GUI list (config writes are
+full-replace; rejecting would brick agents carrying a stale entry) — and a
+successful catalog rebuild prunes global + per-agent entries the rebuilt
+catalog denies (`integrations_handler.go pruneDeniedAlwaysAllowGrants`, run by
+both `RefreshIntegrationTools` and the verified-principal transition's
+`resetIntegrationToolsForPrincipal`; sign-out only clears the catalog and
+never prunes), covering grants persisted while the catalog was empty
+(key-rotation window, where the registry miss judges false). A registry miss never drops or prunes — fail-safe against
+mass deletion; the runtime gate backstops. The per-turn
 `ApprovalCache` also refuses these tools — a byte-identical repeated tool_use
 carries a fresh request id the idempotency journal cannot dedupe, so every
 repeat re-prompts. **BREAKING**: users who previously clicked Always Allow on

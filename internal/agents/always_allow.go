@@ -115,6 +115,20 @@ func SanitizeAgentPermissionsConfig(config *AgentPermissionsConfig) *AgentPermis
 	return &cleaned
 }
 
+// AlwaysAllowTools reads permissions.always_allow_tools from the agent's
+// config.yaml with the same hand-edit tolerance as the locked RMW helpers
+// below: a wrong-typed sibling field or a wrong-shaped value never hides the
+// list (raw-map read, warning-logged shape fallback). Lock-free snapshot —
+// callers that mutate must go through Append/RemoveAlwaysAllowTool, which
+// re-read under the config lock. Missing config reads as empty.
+func AlwaysAllowTools(agentsDir, agentName string) []string {
+	raw, err := readAgentConfigRaw(filepath.Join(agentsDir, agentName))
+	if err != nil {
+		return nil
+	}
+	return readAlwaysAllowTools(raw, agentName)
+}
+
 // AppendAlwaysAllowTool adds a tool name to the agent's
 // permissions.always_allow_tools list in <agentsDir>/<agentName>/config.yaml.
 //
