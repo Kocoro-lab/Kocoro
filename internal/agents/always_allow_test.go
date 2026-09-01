@@ -624,3 +624,34 @@ func TestWriteAgentConfig_EmptyPermissions_OmittedFromYAML(t *testing.T) {
 		t.Errorf("empty permissions block should be omitted, got: %v", raw)
 	}
 }
+
+// AlwaysAllowTools is the lock-free reader the daemon's prune sweep uses. It
+// must share the RMW helpers' hand-edit tolerance: a wrong-typed sibling
+// field or a wrong-shaped value never hides the list.
+func TestAlwaysAllowToolsReaderToleratesHandEditedShapes(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "op")
+	if err := os.MkdirAll(agentDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(agentDir, "config.yaml"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("auto_approve: [not, a, bool]\npermissions:\n  always_allow_tools:\n    - file_write\n")
+	if got := AlwaysAllowTools(dir, "op"); len(got) != 1 || got[0] != "file_write" {
+		t.Errorf("wrong-typed sibling field hid the list: got %v, want [file_write]", got)
+	}
+
+	write("permissions:\n  always_allow_tools: file_write\n")
+	if got := AlwaysAllowTools(dir, "op"); len(got) != 0 {
+		t.Errorf("scalar-shaped value = %v, want empty (warning-logged fallback)", got)
+	}
+
+	if got := AlwaysAllowTools(dir, "missing"); got != nil {
+		t.Errorf("missing config = %v, want nil", got)
+	}
+}

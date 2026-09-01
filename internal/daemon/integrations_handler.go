@@ -8,8 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,7 +15,6 @@ import (
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/tools"
-	"gopkg.in/yaml.v3"
 )
 
 // RefreshIntegrationTools re-pulls the caller's active integration tools from
@@ -101,6 +98,12 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 				log.Printf("daemon: failed to prune denied global always-allow grant %s: %v", tool, err)
 				continue
 			}
+			if revisions.After == "" {
+				// Not in the global file (external hand-edit since load) — no
+				// write happened, so leave the mirror alone and stay silent:
+				// never claim bytes we did not write.
+				continue
+			}
 			deps.WriteLock()
 			// Publish a fresh slice instead of filtering in place: Snapshot()
 			// readers use the Config without holding deps.mu, so elements of
@@ -131,7 +134,10 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 	}
 	agentPruned := false
 	for _, entry := range entries {
-		for _, tool := range agentAlwaysAllowTools(deps.AgentsDir, entry.Name) {
+		// Builtin-shipped configs are deliberately out of scope: they are
+		// binary-managed and never carry user grants (an Always Allow click on
+		// a builtin agent forks a user override dir, which IS scanned here).
+		for _, tool := range agents.AlwaysAllowTools(deps.AgentsDir, entry.Name) {
 			if !deps.ToolDisallowsAlwaysAllowPersistence(tool) {
 				continue
 			}
@@ -149,23 +155,6 @@ func (s *Server) pruneDeniedAlwaysAllowGrants() {
 		// leaving a stale cloud copy that reseeds other devices.
 		s.triggerAgentSync()
 	}
-}
-
-// agentAlwaysAllowTools reads permissions.always_allow_tools from one agent's
-// config.yaml. Missing or unparseable config reads as empty.
-func agentAlwaysAllowTools(agentsDir, name string) []string {
-	data, err := os.ReadFile(filepath.Join(agentsDir, name, "config.yaml"))
-	if err != nil {
-		return nil
-	}
-	var cfg agents.AgentConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil
-	}
-	if cfg.Permissions == nil {
-		return nil
-	}
-	return cfg.Permissions.AlwaysAllowTools
 }
 
 // resetIntegrationToolsForPrincipal applies the strict identity boundary for
@@ -186,7 +175,11 @@ func (s *Server) resetIntegrationToolsForPrincipal(ctx context.Context, hasPrinc
 	// exact catalog-empty window that lets a denied grant persist, so prune
 	// here too — same post-rebuild self-heal as RefreshIntegrationTools, after
 	// the registry lock is released. Sign-out (hasPrincipal=false) only clears
-	// the catalog and never prunes.
+	// the catalog and never prunes. Deliberately synchronous even though this
+	// runs inside the auth mutation critical section: the sweep is read-mostly
+	// (file locks are taken only when a denied entry actually exists — rare),
+	// the bounded catalog fetch above already dominates the latency, and
+	// synchronous ordering keeps semantics and tests simple.
 	s.pruneDeniedAlwaysAllowGrants()
 	return nil
 }
