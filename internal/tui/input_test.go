@@ -7,7 +7,10 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Kocoro-lab/ShanClaw/internal/agent"
+	"github.com/Kocoro-lab/ShanClaw/internal/client"
 	"github.com/Kocoro-lab/ShanClaw/internal/config"
+	"github.com/Kocoro-lab/ShanClaw/internal/tools"
 )
 
 func newInputTestModel() *Model {
@@ -144,5 +147,62 @@ func TestAlwaysAllow_PersistsInSession(t *testing.T) {
 	// Check tool is remembered
 	if !m.sessionAllowed["bash"] {
 		t.Error("expected bash to be session-allowed")
+	}
+}
+
+// newIntegrationApprovalRegistry returns a registry carrying one
+// approval-required integration tool (a Cloud-marked outbound write).
+func newIntegrationApprovalRegistry() *agent.ToolRegistry {
+	reg := agent.NewToolRegistry()
+	reg.Register(tools.NewIntegrationTool(client.ServerToolSchema{
+		Name: "gmail_send_email", RequiresApproval: true,
+	}, nil))
+	return reg
+}
+
+// Pressing 'a' on an approval-required integration write tool grants the
+// current call only — the session-allow map must not remember it, mirroring
+// the daemon broker's persistence refusal.
+func TestAlwaysAllow_IntegrationRequiresApprovalNotSessionPersisted(t *testing.T) {
+	m := newInputTestModel()
+	m.toolRegistry = newIntegrationApprovalRegistry()
+	m.state = stateApproval
+	m.approvalCh = make(chan bool, 1)
+	m.sessionAllowed = make(map[string]bool)
+	m.pendingApprovalTool = "gmail_send_email"
+
+	m.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+
+	select {
+	case v := <-m.approvalCh:
+		if !v {
+			t.Error("expected the current call to be approved once")
+		}
+	default:
+		t.Error("expected value on approvalCh")
+	}
+	if m.sessionAllowed["gmail_send_email"] {
+		t.Error("session-allowed a persistence-denied integration tool")
+	}
+}
+
+// A stale sessionAllowed entry (e.g. minted before the tool's schema was
+// known) must not silence the prompt for an approval-required integration
+// tool — the request still surfaces the approval UI.
+func TestApprovalRequest_IgnoresSessionAllowForIntegrationRequiresApproval(t *testing.T) {
+	m := newInputTestModel()
+	m.toolRegistry = newIntegrationApprovalRegistry()
+	m.approvalCh = make(chan bool, 1)
+	m.sessionAllowed = map[string]bool{"gmail_send_email": true}
+
+	m.update(approvalRequestMsg{tool: "gmail_send_email", args: "{}"})
+
+	select {
+	case <-m.approvalCh:
+		t.Error("stale session-allow entry auto-approved a persistence-denied integration tool")
+	default:
+	}
+	if m.state != stateApproval {
+		t.Errorf("state = %v, want stateApproval (prompt shown)", m.state)
 	}
 }

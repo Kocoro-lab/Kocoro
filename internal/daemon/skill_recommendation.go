@@ -1493,6 +1493,7 @@ func (s *Server) handleSkillRecommendationContinue(w http.ResponseWriter, r *htt
 	broker.onRequest = s.approvalBroker.onRequest
 	broker.onCleanup = s.approvalBroker.onCleanup
 	broker.onAutoApprove = s.approvalBroker.onAutoApprove
+	broker.persistenceDenied = s.approvalBroker.persistenceDenied
 	broker.onRegister = func(requestID string) { s.pendingBrokers.Store(requestID, broker) }
 	broker.onDeregister = func(requestID string) { s.pendingBrokers.Delete(requestID) }
 	defer broker.CancelAll()

@@ -71,6 +71,19 @@ func HandleAlwaysAllowDecision(
 		persistGlobalToolAlwaysAllow(deps, broker, tool)
 		return
 	}
+	// Integration tools whose Cloud schema carries requires_approval are
+	// material outbound writes (email sends, X posts) that need per-call
+	// human approval — persisting a grant at ANY scope would permanently
+	// authorize unattended sends. Old clients may still show the button
+	// (the always_allow_disabled flag is advisory), so the write path must
+	// refuse regardless of what the UI rendered. The click stays a one-time
+	// allow upstream.
+	if deps.ToolDisallowsAlwaysAllowPersistence(tool) {
+		emitAlwaysAllowNotice(deps, "warn", NoticeCodeHighRiskNotPersistable, tool,
+			"This tool always requires fresh approval and cannot be saved as always-allow. Allowed for this call only.")
+		log.Printf("daemon: always-allow rejected for approval-required integration tool: %s", tool)
+		return
+	}
 	// Non-bash. PersistAgentAlwaysAllow does its own DisallowsAutoApproval gate
 	// (notice + false return) for both the per-agent and the "no agent context"
 	// sub-paths.
@@ -172,7 +185,7 @@ func PersistAgentAlwaysAllow(deps *ServerDeps, agentName, tool string) bool {
 	if deps == nil || tool == "" {
 		return false
 	}
-	if agent.DisallowsAutoApproval(tool) {
+	if agent.DisallowsAutoApproval(tool) || deps.ToolDisallowsAlwaysAllowPersistence(tool) {
 		emitAlwaysAllowNotice(deps, "warn", NoticeCodeHighRiskNotPersistable, tool,
 			"This tool always requires fresh approval and cannot be saved as always-allow. Allowed for this call only.")
 		log.Printf("daemon: always-allow rejected for non-persistable tool: %s", tool)
@@ -210,9 +223,11 @@ func PersistAgentAlwaysAllow(deps *ServerDeps, agentName, tool string) bool {
 // recognize the code.
 const (
 	// NoticeCodeHighRiskNotPersistable is sent when the user clicks "Always
-	// Allow" on a tool in agent.DisallowsAutoApproval. The click is honored
-	// once but cannot be saved at any persistence layer. The list is empty as
-	// of 2026-05-18, but the notice code stays for future entries.
+	// Allow" on a tool that refuses persistence: agent.DisallowsAutoApproval
+	// names (the legacy GUI wrappers) or integration tools whose Cloud schema
+	// carries requires_approval (material outbound writes such as
+	// gmail_send_email / X posts). The click is honored once but cannot be
+	// saved at any persistence layer.
 	NoticeCodeHighRiskNotPersistable = "high_risk_not_persistable"
 	// NoticeCodeBashAlwaysAskNotPersisted is sent when the user clicks
 	// "Always Allow" on a bash command matching permissions.alwaysAskPrefixes

@@ -1,17 +1,15 @@
 # Kocoro Project Guide (AGENTS.md)
 
-**Condensed mirror of `CLAUDE.md`** — actionable rules plus the symbols to grep.
-If the two disagree, `CLAUDE.md` and the code win.
+**Condensed mirror of `CLAUDE.md`** — rules + greppable symbols. If they
+disagree, `CLAUDE.md` and the code win.
 
-**Keep this file under 24 KB (CI asserts).** Harnesses truncate over-budget
-files silently from the tail. Cut prose, not rules.
+**Keep this file under 24 KB (CI asserts)** — cut prose, not rules.
 
-Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production path:
-daemon + Kocoro Desktop + Shannon Cloud — the daemon holds a Cloud WS, runs the
-agent loop locally, streams back. Also TUI, one-shot CLI, MCP, schedules.
+Kocoro is the Go CLI/runtime (`shan`) for Shannon AI agents. Production:
+daemon + Desktop + Cloud — the daemon holds a Cloud WS, runs the agent
+loop locally, streams back. Also TUI, one-shot CLI, MCP, schedules.
 
-Layout: `cmd/` (Cobra) + `internal/<pkg>/`. Production path is
-`daemon/` driving `agent/`.
+Layout: `cmd/` (Cobra) + `internal/<pkg>/`; `daemon/` drives `agent/`.
 
 ## Working Rules
 
@@ -79,9 +77,11 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
-- Integration `requires_approval=true` → normal approval flow (always-allow/
-  auto_approve bypasses apply); absent=false. Cloud withholds marked schemas
-  unless `integration_requires_approval` is advertised (fetch + WS).
+- Integration `requires_approval=true` → normal approval flow
+  (`daemon.auto_approve` bypasses), but Always Allow persistence is refused —
+  `DisallowsAlwaysAllowPersistence` gates flag/broker/persist/runtime; stale
+  `always_allow_tools` entries are ignored. Absent=false; Cloud gates marked
+  schemas on `integration_requires_approval`.
 - Trusted `material_side_effect=false` permits observational batching without
   the journal; absent is fail-closed. Stable `request_id`; material calls add
   `Idempotency-Key`. Only `provider_unavailable`/`provider_rejected` are

@@ -214,6 +214,7 @@ func (s *Server) HandleRemoteRunRequest(parent context.Context, req RemoteRunReq
 			Payload:   rawJSON(areq),
 		})
 	})
+	broker.SetAlwaysAllowPersistenceDenied(s.deps.ToolDisallowsAlwaysAllowPersistence)
 	broker.SetOnCleanup(func(requestID string) {
 		_ = s.sendRemoteRunEvent(RemoteRunEvent{
 			RunID:     runID,

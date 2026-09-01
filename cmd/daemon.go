@@ -581,6 +581,7 @@ var daemonStartCmd = &cobra.Command{
 		wsClient.SetOnChannelStateEvent(daemon.NewChannelStateConsumerForDeps(connStateCache, systemEvents, sessionCache))
 
 		broker = daemon.NewApprovalBroker(wsClient.SendApprovalRequest)
+		broker.SetAlwaysAllowPersistenceDenied(deps.ToolDisallowsAlwaysAllowPersistence)
 		wsClient.SetApprovalBroker(broker)
 
 		localServer := daemon.NewServer(port, wsClient, deps, Version)
