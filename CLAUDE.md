@@ -248,9 +248,18 @@ policy: `false` keeps observational tools such as X identity reads out of the
 durable mutation journal and permits concurrent batching; absence stays
 fail-closed for older Cloud versions. Cloud may also add `requires_approval`
 (trusted policy too): `true` routes the tool through the normal local approval
-flow — first-use approval card, "Always Allow" persistence, per-agent
-`always_allow_tools`, and `daemon.auto_approve` all behave exactly as for
-local approval-requiring tools, with no integration special-casing. The list
+flow — first-use approval card and `daemon.auto_approve` behave exactly as for
+local approval-requiring tools — EXCEPT that "Always Allow" persistence is
+refused at every layer: the approval card carries `always_allow_disabled`,
+`HandleAlwaysAllowDecision` / `PersistAgentAlwaysAllow` reject the write, the
+broker cache refuses the name, and the runtime gate in `loop.go` ignores an
+existing `always_allow_tools` entry (hand-edited or pre-policy). Cloud defines
+the requires_approval set as material outbound writes (gmail_send_email, X
+posts) needing per-call human approval, so one click must never become a
+standing unattended grant. The dynamic denial is schema-derived
+(`ServerTool.DisallowsAlwaysAllowPersistence` via
+`agent.AlwaysAllowPersistenceDenier` + `ServerDeps.ToolDisallowsAlwaysAllowPersistence`)
+— new provider write tools inherit it with no daemon change. The list
 request advertises `integration_requires_approval` on `X-Kocoro-Capabilities`;
 Cloud fails closed and withholds `requires_approval:true` schemas from daemons
 without the token, because an older daemon would register them approval-free.
@@ -499,7 +508,7 @@ Recovered runs are ALWAYS unattended (`IsUnattendedRun()==true` regardless of th
 
 Global and per-agent always-allow lists are **unioned at injection** in `SetAlwaysAllowTools` (called from runner.go / tui/app.go / cmd/root.go after `SwitchAgent`). `SwitchAgent` resets the field so reuse can't leak.
 
-**Two auto-approval deny-lists** (both rewritten by computer-use v1): `agent.DisallowsAutoApproval` refuses "always allow" persistence and now contains the four legacy GUI wrappers `computer` / `accessibility` / `applescript` / `ghostty`. `computer_use` is deliberately ABSENT from it, because its explicit persisted grant IS the product's single global Computer Use permission. `agent.DisallowsUnattendedAutoApproval` refuses unattended auto-approval and contains `computer_use`, the standalone `screenshot` tool, plus those same four legacy names.
+**Two auto-approval deny-lists** (both rewritten by computer-use v1): `agent.DisallowsAutoApproval` refuses "always allow" persistence and now contains the four legacy GUI wrappers `computer` / `accessibility` / `applescript` / `ghostty`. A DYNAMIC layer extends the persistence refusal beyond that static name list: integration tools whose Cloud schema carries `requires_approval` (see Integration tools above) — enforced via `agent.AlwaysAllowPersistenceDenier`, not by growing the name list. `computer_use` is deliberately ABSENT from it, because its explicit persisted grant IS the product's single global Computer Use permission. `agent.DisallowsUnattendedAutoApproval` refuses unattended auto-approval and contains `computer_use`, the standalone `screenshot` tool, plus those same four legacy names.
 
 **The one exception**: `loop.go checkPermissionAndApproval` honors a persisted GLOBAL `computer_use` grant even on unattended runs — that grant is what lets schedules and background tasks drive the Mac. Without it, unattended execution fails closed rather than inferring consent from `daemon.auto_approve` or the absence of an approval UI. Legacy GUI names can never use the global grant. The exception is scoped to `computer_use` BY NAME (`unattendedGrantHonored` in loop.go) — not to "any persisted always-allow" — because a blanket rule would silently re-open unattended desktop capture for `screenshot`.
 

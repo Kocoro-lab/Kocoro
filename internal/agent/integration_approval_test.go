@@ -8,15 +8,24 @@ import (
 // Integration tool schemas may carry requires_approval:true (Cloud-marked
 // consequential tools such as X writes, gated on the
 // integration_requires_approval capability). The registered ServerTool exposes
-// only the generic Tool contract — RequiresApproval()==true and no SafeChecker
-// exemption — so the standard approval flow governs it with zero integration
-// special-casing. These tests pin that contract at the permission engine with
-// an integration-shaped mock: first use prompts, an in-turn approval is
-// cached, always_allow_tools bypasses the prompt, and unattended runs reach
-// the handler instead of failing closed. The handler halves are pinned
-// elsewhere: daemon.auto_approve in cmd's
-// TestDaemonEventHandler_AutoApproveAllowsAllTools, "Always Allow"
-// persistence in internal/daemon's alwaysallow tests.
+// the generic Tool contract — RequiresApproval()==true and no SafeChecker
+// exemption — plus AlwaysAllowPersistenceDenier: Cloud defines that set as
+// material outbound writes needing per-call human approval, so a persisted
+// "Always Allow" grant must never silence future prompts for them. These
+// tests pin that contract at the permission engine with an integration-shaped
+// mock: first use prompts, an in-turn approval is cached, always_allow_tools
+// entries are IGNORED, and unattended runs reach the handler instead of
+// failing closed. The handler halves are pinned elsewhere:
+// daemon.auto_approve in cmd's TestDaemonEventHandler_AutoApproveAllowsAllTools,
+// "Always Allow" persistence refusal in internal/daemon's alwaysallow tests.
+
+// integrationApprovalTool mirrors the integration-variant ServerTool contract:
+// RequiresApproval()==true plus the schema-derived always-allow denial.
+type integrationApprovalTool struct {
+	mockApprovalTool
+}
+
+func (m *integrationApprovalTool) DisallowsAlwaysAllowPersistence() bool { return true }
 
 func TestCheckPermissionAndApproval_IntegrationRequiresApprovalPromptsFirstUse(t *testing.T) {
 	loop, handler := newApprovalProbeLoop(t, nil)
@@ -43,20 +52,24 @@ func TestCheckPermissionAndApproval_IntegrationRequiresApprovalPromptsFirstUse(t
 	}
 }
 
-func TestCheckPermissionAndApproval_IntegrationRequiresApprovalHonorsAlwaysAllow(t *testing.T) {
+// A persisted always_allow_tools entry (hand-edited config, or one minted
+// before this policy) must NOT bypass approval for an approval-required
+// integration tool: one historical click cannot permanently authorize
+// unattended outbound writes (email sends, X posts). The request still
+// reaches the handler for a fresh per-call decision.
+func TestCheckPermissionAndApproval_IntegrationRequiresApprovalIgnoresAlwaysAllow(t *testing.T) {
 	loop, handler := newApprovalProbeLoop(t, nil)
+	handler.approveResult = true
 	// SetAlwaysAllowTools receives the union of global and per-agent
 	// always_allow_tools — both persistence scopes land in the same map.
 	loop.SetAlwaysAllowTools([]string{"x_create_post"})
 
-	tool := &mockApprovalTool{name: "x_create_post"}
+	tool := &integrationApprovalTool{mockApprovalTool{name: "x_create_post"}}
 	decision, approved := loop.checkPermissionAndApproval(
 		context.Background(), "x_create_post", `{"text":"hello"}`, tool, NewApprovalCache())
-	if decision != "allow" || !approved {
-		t.Fatalf("always-allow: got (%s, %v); want (allow, true)", decision, approved)
-	}
-	if handler.approvalRequested {
-		t.Error("always-allowed integration tool should not prompt")
+	if decision != "ask" || !approved || !handler.approvalRequested {
+		t.Fatalf("always-allow bypass: got (%s, %v), requested=%v; want a fresh prompt reaching the handler",
+			decision, approved, handler.approvalRequested)
 	}
 }
 

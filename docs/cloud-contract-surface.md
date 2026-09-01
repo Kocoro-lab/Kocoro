@@ -119,9 +119,15 @@ materiality means material side effect for backward compatibility; only
 explicit `false` bypasses the durable mutation journal.
 
 `requires_approval` (absent = false) routes the tool through the daemon's
-normal local approval flow; it is only the permission engine's default input,
-so persisted always-allow, per-agent `always_allow_tools`, and
-`daemon.auto_approve` bypass it like any other approval-requiring tool. The
+normal local approval flow, with `daemon.auto_approve` applying like any other
+approval-requiring tool — but "Always Allow" persistence is refused for these
+schemas at every layer: the approval card carries the (pre-existing, advisory)
+`always_allow_disabled` flag, the persistence entry points reject the write,
+and the runtime gate ignores existing global/per-agent `always_allow_tools`
+entries. Cloud defines this set as material outbound writes needing per-call
+human approval, so a one-click grant must never authorize future unattended
+sends. Old UI clients that ignore the flag may still show the button; the
+daemon honors that click once and never persists it. The
 list request advertises `integration_requires_approval` on the
 `X-Kocoro-Capabilities` header (same comma-separated grammar as the WS
 handshake; constant `CapIntegrationRequiresApproval` in

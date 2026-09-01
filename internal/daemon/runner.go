@@ -1805,6 +1805,27 @@ func (d *ServerDeps) Snapshot() (*config.Config, *agent.ToolRegistry, *mcp.Super
 	return cfg, reg, sup
 }
 
+// ToolDisallowsAlwaysAllowPersistence reports whether the registered tool with
+// this name refuses "Always Allow" persistence based on registration-time
+// schema data (integration tools marked requires_approval). Purely in-memory —
+// approval paths may call it without any network cost. Unknown names return
+// false; the static name deny-list (agent.DisallowsAutoApproval) is checked
+// separately by callers.
+func (d *ServerDeps) ToolDisallowsAlwaysAllowPersistence(name string) bool {
+	if d == nil {
+		return false
+	}
+	_, reg, _ := d.Snapshot()
+	if reg == nil {
+		return false
+	}
+	t, ok := reg.Get(name)
+	if !ok {
+		return false
+	}
+	return agent.ToolDisallowsAlwaysAllowPersistence(t)
+}
+
 func (d *ServerDeps) computerUseAppPolicyStore() *ComputerUseAppPolicyStore {
 	d.mu.Lock()
 	defer d.mu.Unlock()

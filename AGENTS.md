@@ -79,9 +79,13 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
 - Every `RequiresApproval()==true` tool needs a `description` (5-15 words,
   model-written). The daemon does NOT block on a missing one; UI clients MUST use
   `description?.trim() || fallback`, NOT nullish coalescing.
-- Integration `requires_approval=true` → normal approval flow (always-allow/
-  auto_approve bypasses apply); absent=false. Cloud withholds marked schemas
-  unless `integration_requires_approval` is advertised (fetch + WS).
+- Integration `requires_approval=true` → normal approval flow with
+  `daemon.auto_approve` bypass, but "Always Allow" persistence is REFUSED at
+  every layer (`ServerTool.DisallowsAlwaysAllowPersistence`, broker flag/cache,
+  `HandleAlwaysAllowDecision`, runtime gate in loop.go — a hand-edited
+  `always_allow_tools` entry is not honored); absent=false. Cloud withholds
+  marked schemas unless `integration_requires_approval` is advertised (fetch +
+  WS).
 - Trusted `material_side_effect=false` permits observational batching without
   the journal; absent is fail-closed. Stable `request_id`; material calls add
   `Idempotency-Key`. Only `provider_unavailable`/`provider_rejected` are

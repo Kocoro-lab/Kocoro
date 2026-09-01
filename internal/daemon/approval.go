@@ -57,6 +57,12 @@ type ApprovalBroker struct {
 	sendFn          func(req ApprovalRequest) error
 	onRequest       func(req ApprovalRequest)
 	onAutoApprove   func(meta ApprovalRequestMeta, tool string) // called when a tool is auto-approved without prompting
+	// persistenceDenied extends the static DisallowsAutoApproval name check
+	// with registration-time schema data (integration tools marked
+	// requires_approval). Installed at broker construction from
+	// ServerDeps.ToolDisallowsAlwaysAllowPersistence; nil keeps the static
+	// behavior (tests, brokers without a registry).
+	persistenceDenied func(tool string) bool
 }
 
 // NewApprovalBroker creates a broker. sendFn sends an approval_request over WS.
@@ -84,6 +90,24 @@ func (b *ApprovalBroker) SetOnRequest(fn func(req ApprovalRequest)) {
 // inbox card instead of leaving a stale entry in the ring buffer.
 func (b *ApprovalBroker) SetOnCleanup(fn func(requestID string)) {
 	b.onCleanup = fn
+}
+
+// SetAlwaysAllowPersistenceDenied installs the registry-backed lookup that
+// reports tools refusing "Always Allow" persistence (integration tools whose
+// Cloud schema carries requires_approval). It must be pure in-memory work —
+// Request calls it on the approval hot path.
+func (b *ApprovalBroker) SetAlwaysAllowPersistenceDenied(fn func(tool string) bool) {
+	b.persistenceDenied = fn
+}
+
+// disallowsAlwaysAllow combines the static name deny-list with the dynamic
+// schema-derived denial. It gates the UI flag, the in-memory auto-approve
+// cache writes, and the cache reads (defense-in-depth).
+func (b *ApprovalBroker) disallowsAlwaysAllow(tool string) bool {
+	if agentpkg.DisallowsAutoApproval(tool) {
+		return true
+	}
+	return b.persistenceDenied != nil && b.persistenceDenied(tool)
 }
 
 // SetOnAutoApprove sets a callback invoked when the broker auto-approves a tool
@@ -156,9 +180,11 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 		Args:      presentationArgs,
 		Agent:     meta.Agent,
 	}
-	// Policy hint for UI: tools in DisallowsAutoApproval cannot be persisted.
-	// computer_use is intentionally persistable as the global product grant.
-	if agentpkg.DisallowsAutoApproval(tool) {
+	// Policy hint for UI: tools that refuse always-allow persistence (static
+	// deny-list, or integration tools marked requires_approval) cannot be
+	// persisted. computer_use is intentionally persistable as the global
+	// product grant.
+	if b.disallowsAlwaysAllow(tool) {
 		req.Flags = append(req.Flags, ApprovalFlagAlwaysAllowDisabled)
 	}
 
@@ -181,11 +207,12 @@ func (b *ApprovalBroker) Request(ctx context.Context, meta ApprovalRequestMeta, 
 func (b *ApprovalBroker) CancelAll() { b.cancelAll(DecisionDeny) }
 
 // SetToolAutoApprove marks a non-bash tool as auto-approved (in-memory only).
-// Tools in agentpkg.DisallowsAutoApproval are silently refused. Callers may
+// Tools that refuse always-allow persistence (static deny-list or
+// requires_approval integration schemas) are silently refused. Callers may
 // still unconditionally invoke this after DecisionAlwaysAllow; the broker
 // remains the authoritative gate.
 func (b *ApprovalBroker) SetToolAutoApprove(tool string) {
-	if agentpkg.DisallowsAutoApproval(tool) {
+	if b.disallowsAlwaysAllow(tool) {
 		return
 	}
 	b.mu.Lock()
@@ -198,7 +225,7 @@ func (b *ApprovalBroker) SetToolAutoApprove(tool string) {
 // (e.g. from a future regression or a callsite bypassing SetToolAutoApprove),
 // this gate refuses to honor it.
 func (b *ApprovalBroker) IsToolAutoApproved(tool string) bool {
-	if agentpkg.DisallowsAutoApproval(tool) {
+	if b.disallowsAlwaysAllow(tool) {
 		return false
 	}
 	b.mu.Lock()

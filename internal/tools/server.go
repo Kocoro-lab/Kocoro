@@ -520,10 +520,19 @@ func externalOutcomeUnknown(content string) agent.ToolResult {
 // consequential integration tools (e.g. X write endpoints) and only sends
 // them to daemons advertising the integration_requires_approval capability;
 // unmarked tools keep relying on Cloud's own access control with no local
-// approval, exactly as before. The flag is only the permission engine's
-// default input: persisted always-allow (global or per-agent) and
-// daemon.auto_approve bypass it like any other approval-requiring tool.
+// approval, exactly as before. daemon.auto_approve bypasses it like any other
+// approval-requiring tool, but "Always Allow" persistence is refused — see
+// DisallowsAlwaysAllowPersistence below.
 func (t *ServerTool) RequiresApproval() bool { return t.schema.RequiresApproval }
+
+// DisallowsAlwaysAllowPersistence implements agent.AlwaysAllowPersistenceDenier.
+// Cloud defines the requires_approval integration set as material outbound
+// writes needing per-call human approval (email sends, X posts, ...), so a
+// one-click "Always Allow" must never persist into a standing unattended
+// grant for them. Gateway tools stay outside this policy.
+func (t *ServerTool) DisallowsAlwaysAllowPersistence() bool {
+	return t.source == agent.SourceIntegration && t.schema.RequiresApproval
+}
 
 // HasMaterialSideEffect keeps explicitly reviewed observational gateway tools
 // out of the durable write journal. Gateway jobs that persist provider state,

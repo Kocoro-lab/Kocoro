@@ -96,6 +96,25 @@ func TestIntegrationTool_Metadata(t *testing.T) {
 	}
 }
 
+// Cloud marks approval-required integration schemas as material outbound
+// writes needing per-call human approval; those tools must refuse "Always
+// Allow" persistence. Unmarked integrations and gateway tools stay
+// persistable exactly as before.
+func TestIntegrationTool_RequiresApprovalDisallowsAlwaysAllowPersistence(t *testing.T) {
+	write := NewIntegrationTool(client.ServerToolSchema{Name: "gmail_send_email", RequiresApproval: true}, nil)
+	if !agent.ToolDisallowsAlwaysAllowPersistence(write) {
+		t.Error("requires_approval integration tool must refuse always-allow persistence")
+	}
+	read := NewIntegrationTool(client.ServerToolSchema{Name: "notion_search"}, nil)
+	if agent.ToolDisallowsAlwaysAllowPersistence(read) {
+		t.Error("unmarked integration tool must stay persistable")
+	}
+	gateway := NewServerTool(client.ServerToolSchema{Name: "web_search", RequiresApproval: true}, nil)
+	if agent.ToolDisallowsAlwaysAllowPersistence(gateway) {
+		t.Error("gateway tools are outside the integration requires_approval policy")
+	}
+}
+
 // TestIntegrationTool_Run_HitsIntegrationEndpoint verifies the tool proxies to
 // the integrations execute endpoint (not the generic gateway tools endpoint).
 func TestIntegrationTool_Run_HitsIntegrationEndpoint(t *testing.T) {

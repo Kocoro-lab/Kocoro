@@ -7643,7 +7643,13 @@ func (a *AgentLoop) checkPermissionAndApproval(ctx context.Context, toolName, ar
 	// observation or mutation in an unattended run. Establish this gate before
 	// ApprovalAdmission: the GUI admission checker resolves the target app, so
 	// calling it first would itself read Accessibility state before consent.
-	persistedAlwaysAllow := a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName)
+	// A tool may refuse always-allow persistence either by static name
+	// (DisallowsAutoApproval) or dynamically from its registration-time schema
+	// (integration tools marked requires_approval). The runtime gate covers
+	// both so a hand-edited or historically persisted config entry is never
+	// honored for such tools.
+	persistedAlwaysAllow := a.alwaysAllowTools[toolName] && !DisallowsAutoApproval(toolName) &&
+		!ToolDisallowsAlwaysAllowPersistence(tool)
 	unattendedGrantHonored := persistedAlwaysAllow && toolName == "computer_use"
 	unattendedDenied := a.unattendedRun &&
 		DisallowsUnattendedAutoApproval(toolName) && !unattendedGrantHonored

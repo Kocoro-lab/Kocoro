@@ -484,6 +484,9 @@ func NewServer(port int, client *Client, deps *ServerDeps, version string) *Serv
 		pullDone:                        make(chan struct{}),
 		loadConfigWithRevision:          config.LoadWithRevision,
 	}
+	// Registry-backed always-allow denial (integration requires_approval
+	// schemas). deps may be nil in test fixtures — the method fails open.
+	s.approvalBroker.SetAlwaysAllowPersistenceDenied(deps.ToolDisallowsAlwaysAllowPersistence)
 	s.realtimeUsageOutbox = newRealtimeUsageOutbox(shannonDir)
 	if deps != nil {
 		// These callbacks close over the fully constructed Server and are consumed
@@ -3516,6 +3519,7 @@ func (s *Server) handleMessageSSE(w http.ResponseWriter, r *http.Request, req Ru
 	reqBroker.onRequest = s.approvalBroker.onRequest
 	reqBroker.onCleanup = s.approvalBroker.onCleanup
 	reqBroker.onAutoApprove = s.approvalBroker.onAutoApprove
+	reqBroker.persistenceDenied = s.approvalBroker.persistenceDenied
 	// Register pending requestIDs so POST /approval can find this broker.
 	reqBroker.onRegister = func(requestID string) { s.pendingBrokers.Store(requestID, reqBroker) }
 	reqBroker.onDeregister = func(requestID string) { s.pendingBrokers.Delete(requestID) }
@@ -5056,6 +5060,14 @@ func (s *Server) handleAddAgentAlwaysAllow(w http.ResponseWriter, r *http.Reques
 	if !s.materializeIfBuiltin(w, name) {
 		return
 	}
+	// agents.AppendAlwaysAllowTool covers the static name deny-list; the
+	// dynamic schema-derived denial (integration requires_approval) needs the
+	// registry, which only this layer has.
+	if s.deps.ToolDisallowsAlwaysAllowPersistence(req.Tool) {
+		writeError(w, http.StatusBadRequest,
+			"tool requires fresh approval each call and cannot be persisted as always-allow")
+		return
+	}
 	if err := agents.AppendAlwaysAllowTool(s.deps.AgentsDir, name, req.Tool); err != nil {
 		if errors.Is(err, agents.ErrToolNotPersistable) {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -5113,7 +5125,11 @@ func (s *Server) handleAddGlobalAlwaysAllow(w http.ResponseWriter, r *http.Reque
 	if req.Tool == "computer_use" && !requireComputerUseLocalPresence(w, r) {
 		return
 	}
-	if agent.DisallowsAutoApproval(req.Tool) {
+	// Static name deny-list plus the dynamic schema-derived denial
+	// (integration tools marked requires_approval). Entries written while
+	// such a tool is unknown to the registry are still ignored by the
+	// runtime gate in loop.go.
+	if agent.DisallowsAutoApproval(req.Tool) || s.deps.ToolDisallowsAlwaysAllowPersistence(req.Tool) {
 		writeError(w, http.StatusBadRequest,
 			"tool requires fresh approval each call and cannot be persisted as always-allow")
 		return
