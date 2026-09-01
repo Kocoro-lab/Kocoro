@@ -21,7 +21,10 @@ func newReloadRestartTestServer(t *testing.T, liveCfg, reloadedCfg *config.Confi
 	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"tools":[]}`))
+		// Bare array: the shape both tool-list endpoints decode, so the
+		// reload's overlay refresh takes the clean path instead of the
+		// keep-existing degrade path.
+		_, _ = w.Write([]byte(`[]`))
 	}))
 	t.Cleanup(upstream.Close)
 
