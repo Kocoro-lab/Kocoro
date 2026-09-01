@@ -397,6 +397,7 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 // the dynamic filter (the static sanitize inside WriteAgentConfig still runs).
 func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNames []string, writeSyncedSkills bool, sanitizePerms func(*agents.AgentPermissionsConfig)) {
 	writeFailed := false
+	permsDropped := false
 
 	// Capture the local cwd before any writes. It is device-local state: remote
 	// config (including payloads produced by older daemons) must never replace
@@ -470,8 +471,21 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNa
 			if reflect.DeepEqual(cfg, agents.AgentConfigAPI{}) {
 				clearSyncedConfig()
 			} else {
-				if sanitizePerms != nil {
+				if sanitizePerms != nil && cfg.Permissions != nil {
+					before := len(cfg.Permissions.AlwaysAllowTools)
 					sanitizePerms(cfg.Permissions)
+					if len(cfg.Permissions.AlwaysAllowTools) != before {
+						permsDropped = true
+					}
+				}
+				// The STATIC sanitize inside WriteAgentConfig (legacy GUI
+				// names) diverges the written config from Cloud's copy the
+				// same way. Detect it up front via the documented contract:
+				// SanitizeAgentPermissionsConfig returns the original pointer
+				// when nothing needs dropping.
+				if cleaned := agents.SanitizeAgentPermissionsConfig(cfg.Permissions); cleaned != cfg.Permissions {
+					cfg.Permissions = cleaned
+					permsDropped = true
 				}
 				cfg.CWD = localCWD
 				if err := agents.WriteAgentConfig(agentsDir, it.AgentKey, &cfg); err != nil {
@@ -517,9 +531,22 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNa
 		return
 	}
 
-	// Stamp mtimes to the cloud timestamp so this agent reports UpdatedAt ==
-	// it.UpdatedAt on the next push (LWW no-op) rather than "now".
-	stampAgentMtime(filepath.Join(agentsDir, it.AgentKey), it.UpdatedAt)
+	// A sanitize drop makes the written config diverge from Cloud's copy, so
+	// the mirror stamp below would be a lie: at an equal timestamp the
+	// post-pull push is rejected by Cloud's strict-newer upsert and the stale
+	// cloud row keeps reseeding other devices. Leave the LWW clock at "now"
+	// (the drop is a real local mutation) so that push is strictly newer and
+	// converges Cloud to the sanitized config. Convergence rides the single
+	// post-pull push in runStartupAgentSync — if that push fails, the cloud
+	// row stays stale until the next restart or agent edit (locally we are
+	// correct either way: a "now" mtime wins the next pull's LWW check unless
+	// this device's clock runs behind Cloud's UpdatedAt, which only costs a
+	// harmless re-materialize-and-drop on the next startup).
+	if !permsDropped {
+		// Stamp mtimes to the cloud timestamp so this agent reports UpdatedAt
+		// == it.UpdatedAt on the next push (LWW no-op) rather than "now".
+		stampAgentMtime(filepath.Join(agentsDir, it.AgentKey), it.UpdatedAt)
+	}
 }
 
 // readDeviceLocalAgentCWD reads only the active definition's config.yaml so

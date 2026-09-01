@@ -276,7 +276,7 @@ func TestRemoveAlwaysAllowTool_RemovesEntry(t *testing.T) {
 			t.Fatalf("append %s: %v", tool, err)
 		}
 	}
-	if err := RemoveAlwaysAllowTool(dir, name, "http"); err != nil {
+	if _, err := RemoveAlwaysAllowTool(dir, name, "http"); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	raw := readRawConfig(t, dir, name)
@@ -297,7 +297,7 @@ func TestRemoveAlwaysAllowTool_LastEntryDropsBlock(t *testing.T) {
 	if err := AppendAlwaysAllowTool(dir, name, "file_write"); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	if err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
+	if _, err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	// Since the agent has nothing but permissions and we just emptied it,
@@ -320,7 +320,7 @@ permissions:
 	if err := os.WriteFile(filepath.Join(dir, name, "config.yaml"), seed, 0600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
+	if _, err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	raw := readRawConfig(t, dir, name)
@@ -337,7 +337,7 @@ func TestRemoveAlwaysAllowTool_MissingTool_NoOp(t *testing.T) {
 	if err := AppendAlwaysAllowTool(dir, name, "http"); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	if err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
+	if _, err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
 		t.Errorf("removing missing tool should be no-op, got: %v", err)
 	}
 	raw := readRawConfig(t, dir, name)
@@ -349,7 +349,7 @@ func TestRemoveAlwaysAllowTool_MissingTool_NoOp(t *testing.T) {
 
 func TestRemoveAlwaysAllowTool_NoConfig_NoOp(t *testing.T) {
 	dir, name := setupAgent(t, "noconfig")
-	if err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
+	if _, err := RemoveAlwaysAllowTool(dir, name, "file_write"); err != nil {
 		t.Errorf("removing from non-existent config should be no-op, got: %v", err)
 	}
 }
@@ -425,7 +425,7 @@ func TestAppendRemoveAlwaysAllowTool_Concurrent(t *testing.T) {
 			}(tool)
 			go func(tool string) {
 				defer wg.Done()
-				if err := RemoveAlwaysAllowTool(dir, name, tool); err != nil {
+				if _, err := RemoveAlwaysAllowTool(dir, name, tool); err != nil {
 					t.Errorf("remove %s: %v", tool, err)
 				}
 			}(tool)
@@ -653,5 +653,26 @@ func TestAlwaysAllowToolsReaderToleratesHandEditedShapes(t *testing.T) {
 
 	if got := AlwaysAllowTools(dir, "missing"); got != nil {
 		t.Errorf("missing config = %v, want nil", got)
+	}
+}
+
+// The removed flag is load-bearing for callers that act on a removal (the
+// daemon's prune requests a sync push only for bytes actually written).
+func TestRemoveAlwaysAllowToolReportsRemoval(t *testing.T) {
+	dir, name := setupAgent(t, "remover")
+	if err := AppendAlwaysAllowTool(dir, name, "file_write"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := RemoveAlwaysAllowTool(dir, name, "file_write")
+	if err != nil || !removed {
+		t.Fatalf("present entry: removed=%v err=%v, want true removal", removed, err)
+	}
+	removed, err = RemoveAlwaysAllowTool(dir, name, "file_write")
+	if err != nil || removed {
+		t.Fatalf("absent entry: removed=%v err=%v, want no-op", removed, err)
+	}
+	removed, err = RemoveAlwaysAllowTool(dir, "no-such-agent", "file_write")
+	if err != nil || removed {
+		t.Fatalf("missing agent dir: removed=%v err=%v, want no-op", removed, err)
 	}
 }
