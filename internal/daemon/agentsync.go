@@ -298,15 +298,23 @@ func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)
 		return
 	}
 	samePrincipal := s.principalUnchangedGuard()
-	pullErr := s.pullAndApplyAgents(pull)
+	items, pullErr := pull()
 	restored := false
 	if pullErr != nil {
 		log.Printf("agentsync: startup pull failed: %v", pullErr)
-	} else if samePrincipal() {
-		s.agentPullClean.Store(true)
-		restored = true
+	} else if !samePrincipal() {
+		// Superseded while the pull was in flight: discard the old account's
+		// mirror before it touches disk — materialized old-account agents
+		// would ride the next full-sync push into the new account.
+		log.Printf("agentsync: startup pull superseded by a principal transition; mirror discarded, full sync deferred to the new principal's resync")
 	} else {
-		log.Printf("agentsync: startup pull superseded by a principal transition; full sync deferred to the new principal's resync")
+		s.applyPulledAgents(items)
+		if samePrincipal() {
+			s.agentPullClean.Store(true)
+			restored = true
+		} else {
+			log.Printf("agentsync: startup pull superseded by a principal transition; full sync deferred to the new principal's resync")
+		}
 	}
 	close(s.pullDone)
 	if restored {
@@ -386,20 +394,28 @@ func (s *Server) resyncAgentsForVerifiedPrincipal() {
 // mid-process principal transition: pull the new principal's cloud mirror,
 // and ONLY on a clean pull restore the full-sync license and queue one push
 // (which reconciles local-wins agents up to the new account). Failure keeps
-// pushes upsert-only — safe, never destructive. samePrincipal guards both
-// sides of the pull so a superseded transition can neither apply a stale
-// account's mirror nor re-arm full_sync with it. Resyncs are serialized so
-// back-to-back switches cannot interleave their pulls.
+// pushes upsert-only — safe, never destructive. samePrincipal is re-checked
+// between the fetch and the disk writes so a transition that landed while the
+// pull was in flight discards the fetched mirror — old-account agents put on
+// disk would ride the next full-sync push into the new account (the residual
+// window is a mid-APPLY transition: local file writes, milliseconds, no
+// rollback mechanism exists). A final check guards the license restore.
+// Resyncs are serialized so back-to-back switches cannot interleave.
 func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgentItem, error), samePrincipal func() bool) {
 	s.agentResyncMu.Lock()
 	defer s.agentResyncMu.Unlock()
 	if !samePrincipal() {
 		return
 	}
-	if err := s.pullAndApplyAgents(pull); err != nil {
+	items, err := pull()
+	if err != nil {
 		log.Printf("agentsync: principal resync pull failed (pushes stay upsert-only): %v", err)
 		return
 	}
+	if !samePrincipal() {
+		return // superseded while the pull was in flight — discard the stale mirror
+	}
+	s.applyPulledAgents(items)
 	if !samePrincipal() {
 		return
 	}
@@ -424,19 +440,30 @@ func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgen
 // "now") — without this the freshly-written agent would falsely win the next
 // LWW round and ping-pong. The pull function is injected for testability.
 //
-// Each per-agent critical section takes the SAME per-route lock the CRUD
-// handlers use, so a pull write/delete never races handleCreate/Update/Delete:
+// Callers that must interpose a check between the fetch and the disk writes
+// (the principal-guarded resync/startup paths) call pull and applyPulledAgents
+// separately instead.
+func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error)) error {
+	items, err := pull()
+	if err != nil {
+		return err
+	}
+	s.applyPulledAgents(items)
+	return nil
+}
+
+// applyPulledAgents is the disk-write half of the pull reconciliation. Each
+// per-agent critical section takes the SAME per-route lock the CRUD handlers
+// use, so a pull write/delete never races handleCreate/Update/Delete:
 //   - materialize/overwrite mirrors handleCreate/Update — wrapped in
 //     LockRoute/UnlockRoute("agent:"+key).
 //   - tombstone-delete mirrors handleDeleteAgent — calls SessionCache.Evict
 //     (which does its OWN per-route locking; wrapping it in LockRoute would
 //     self-deadlock on the same entry mutex) then removes the definition files.
-func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error)) error {
+//
+// Per-agent failures are logged and never abort the rest of the mirror.
+func (s *Server) applyPulledAgents(items []client.SyncAgentItem) {
 	agentsDir := s.deps.AgentsDir
-	items, err := pull()
-	if err != nil {
-		return err
-	}
 	for _, it := range items {
 		// Validate the key before any path construction (path-traversal safety)
 		// and before acquiring any lock.
@@ -484,7 +511,6 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 		s.deps.SessionCache.UnlockRoute(routeKey)
 		unlockSkills()
 	}
-	return nil
 }
 
 // materializeAgentFromItem writes (or overwrites) all of an agent's definition

@@ -1490,13 +1490,17 @@ func TestRunStartupAgentSync_PrincipalSwitchMidPullDoesNotRestore(t *testing.T) 
 		// callback resets the gate exactly as production does.
 		a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-b"}, "", false)
 		s.beginAgentSyncPrincipalTransition("user-b")
-		return nil, nil // the pull itself completes cleanly (old account's mirror)
+		// The pull itself completes cleanly — with the OLD account's mirror.
+		return []client.SyncAgentItem{{AgentKey: "stale", Prompt: "old account's agent"}}, nil
 	})
 
 	select {
 	case <-s.pullDone:
 	default:
 		t.Fatal("pullDone not closed after startup sync")
+	}
+	if _, err := os.Stat(filepath.Join(root, "stale")); !os.IsNotExist(err) {
+		t.Fatal("old account's pulled agent was materialized after the principal switch")
 	}
 	if s.agentPullClean.Load() {
 		t.Fatal("startup pull must not restore full_sync after a mid-pull principal switch — the merged set belongs to the old account")
@@ -1589,5 +1593,35 @@ func TestResyncAfterPrincipalChange_SupersededDoesNotRestore(t *testing.T) {
 	}
 	if got := len(s.agentSyncTrigger); got != 0 {
 		t.Fatalf("expected no push trigger for superseded resync, got %d", got)
+	}
+}
+
+// A principal switch landing while the resync pull is IN FLIGHT must discard
+// the fetched mirror before it touches disk: the items belong to the OLD
+// account, and materializing them would let the next full-sync push upload
+// them into the new account.
+func TestResyncAfterPrincipalChange_SupersededPullNotApplied(t *testing.T) {
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	close(s.pullDone)
+	s.agentSyncTrigger = make(chan struct{}, 1)
+
+	calls := 0
+	s.resyncAgentsAfterPrincipalChange(
+		func() ([]client.SyncAgentItem, error) {
+			return []client.SyncAgentItem{{AgentKey: "stale", Prompt: "old account's agent"}}, nil
+		},
+		func() bool {
+			calls++
+			return calls == 1 // valid at entry, superseded while the pull was in flight
+		},
+	)
+
+	if _, err := os.Stat(filepath.Join(root, "stale")); !os.IsNotExist(err) {
+		t.Fatal("old account's pulled agent was materialized after the principal switch — it would ride the next full-sync push into the new account")
+	}
+	if s.agentPullClean.Load() || len(s.agentSyncTrigger) != 0 {
+		t.Fatal("superseded resync must not restore the gate or queue a push")
 	}
 }
