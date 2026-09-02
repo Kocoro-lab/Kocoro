@@ -676,3 +676,18 @@ func TestRemoveAlwaysAllowToolReportsRemoval(t *testing.T) {
 		t.Fatalf("missing agent dir: removed=%v err=%v, want no-op", removed, err)
 	}
 }
+
+// The pull-side materialize (daemon materializeAgentFromItem) pre-sanitizes a
+// pulled config so WriteAgentConfig's validator cannot reject the write into a
+// permanent backdate-and-retry loop. That only holds while Sanitize drops
+// EVERYTHING Validate rejects — pin the containment so adding a tool to the
+// reject set without adding it to the drop set fails here instead of wedging
+// production pulls.
+func TestSanitizeDropsEverythingValidateRejects(t *testing.T) {
+	cfg := &AgentPermissionsConfig{
+		AlwaysAllowTools: append(HighRiskTools(), "computer_use", "file_write"),
+	}
+	if err := ValidateAgentPermissionsConfig(SanitizeAgentPermissionsConfig(cfg)); err != nil {
+		t.Fatalf("sanitized config still rejected — the pull-side pre-sanitize no longer covers the validator's reject set: %v", err)
+	}
+}

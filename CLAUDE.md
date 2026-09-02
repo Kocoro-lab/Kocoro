@@ -270,8 +270,8 @@ converge upstream: a pull-side sanitize drop (dynamic registry denial, or the
 pre-write static `SanitizeAgentPermissionsConfig` pass in
 `materializeAgentFromItem` — legacy GUI names AND per-agent `computer_use`,
 which `WriteAgentConfig`'s validator would otherwise reject into a permanent
-pull-retry loop) skips the agent-sync LWW
-mirror stamp (local clock stays "now"), and the REFRESH-path prune fires
+pull-retry loop) skips the agent-sync LWW mirror stamp (local clock stays
+"now"), and the REFRESH-path prune fires
 `triggerAgentSync` when a removal actually wrote bytes, so the sanitized
 config passes Cloud's strict-newer upsert instead of leaving a stale row that
 reseeds other devices. The principal-transition prune now also fires

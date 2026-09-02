@@ -80,6 +80,13 @@ func MergeAlwaysAllowTools(global, perAgent []string) []string {
 // round-trip resubmits the stale entry and can never clear it). Those entries
 // are dropped by SanitizeAgentPermissionsConfig instead, which is safe because
 // the runtime gate in loop.go already refuses to honor them.
+//
+// CONTAINMENT INVARIANT: everything rejected here MUST also be dropped by
+// SanitizeAgentPermissionsConfig — the daemon's agent-sync pull pre-sanitizes
+// pulled configs so this validator (inside WriteAgentConfig) cannot reject the
+// materialize into a permanent backdate-and-retry loop. Pinned by
+// TestSanitizeDropsEverythingValidateRejects; extend IsToolAlwaysAllowable's
+// exclusions when adding to the reject set.
 func ValidateAgentPermissionsConfig(config *AgentPermissionsConfig) error {
 	if config == nil {
 		return nil

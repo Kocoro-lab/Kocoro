@@ -683,6 +683,10 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNa
 				// only converging behavior (same rationale as the legacy GUI
 				// precedent documented on SanitizeAgentPermissionsConfig).
 				if cleaned := agents.SanitizeAgentPermissionsConfig(cfg.Permissions); cleaned != cfg.Permissions {
+					// Log the drop: the API response path reports drops to its
+					// caller, but a pull has no caller — without this line a
+					// grant vanishing on startup leaves zero evidence anywhere.
+					log.Printf("agentsync: pull of %q: dropped non-persistable per-agent always-allow entries", it.AgentKey)
 					cfg.Permissions = cleaned
 					permsDropped = true
 				}
