@@ -2378,7 +2378,9 @@ func TestBuildSyncItems_ConcurrentRestampNeverGrandfatherClaims(t *testing.T) {
 	s := newPullServer(t, root)
 
 	stop := make(chan struct{})
+	writerDone := make(chan struct{})
 	go func() {
+		defer close(writerDone)
 		for {
 			select {
 			case <-stop:
@@ -2387,6 +2389,13 @@ func TestBuildSyncItems_ConcurrentRestampNeverGrandfatherClaims(t *testing.T) {
 				_ = agents.WriteAgentOwner(root, "agt", "user-b")
 			}
 		}
+	}()
+	// Join the writer before the test returns (t.Fatal included): an in-flight
+	// AtomicWrite (CreateTemp+rename) racing t.TempDir's RemoveAll leaves the
+	// dir "not empty" and fails the cleanup on CI.
+	defer func() {
+		close(stop)
+		<-writerDone
 	}()
 	for i := 0; i < 300; i++ {
 		items, _, err := s.buildSyncItems(root, "user-a")
@@ -2397,7 +2406,8 @@ func TestBuildSyncItems_ConcurrentRestampNeverGrandfatherClaims(t *testing.T) {
 			t.Fatal("user-a's push claimed user-b's agent mid-restamp — a torn owner read grandfathered it away")
 		}
 	}
-	close(stop)
+	// The writer only ever writes user-b and the write is atomic, so this
+	// holds even while it is still running.
 	if owner := agents.ReadAgentOwner(root, "agt"); owner != "user-b" {
 		t.Fatalf("owner after hammer = %q, want user-b", owner)
 	}
