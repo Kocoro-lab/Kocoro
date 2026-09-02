@@ -1469,6 +1469,68 @@ func TestPushAfterPrincipalSwitch_UpsertOnlyUntilResync(t *testing.T) {
 	}
 }
 
+// The startup pull's license restore must be principal-guarded: a verified-
+// principal transition landing while the startup pull is in flight means the
+// merged local set belongs to the OLD principal. An unguarded Store(true)
+// would overwrite the transition's reset, and the post-pull full_sync push
+// would go out under the NEW account's key carrying the old account's set —
+// soft-deleting the new account's cloud-only agents.
+func TestRunStartupAgentSync_PrincipalSwitchMidPullDoesNotRestore(t *testing.T) {
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	s.agentSyncTrigger = make(chan struct{}, 1)
+
+	a := &AuthManager{}
+	a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-a"}, "", false)
+	s.auth = a
+
+	s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
+		// The account switch lands while the pull is in flight; the SetAuth
+		// callback resets the gate exactly as production does.
+		a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-b"}, "", false)
+		s.beginAgentSyncPrincipalTransition("user-b")
+		return nil, nil // the pull itself completes cleanly (old account's mirror)
+	})
+
+	select {
+	case <-s.pullDone:
+	default:
+		t.Fatal("pullDone not closed after startup sync")
+	}
+	if s.agentPullClean.Load() {
+		t.Fatal("startup pull must not restore full_sync after a mid-pull principal switch — the merged set belongs to the old account")
+	}
+	if got := len(s.agentSyncTrigger); got != 0 {
+		t.Fatalf("expected no push trigger after a superseded startup pull, got %d", got)
+	}
+}
+
+// Counterpart: with an AuthManager present and a STABLE principal, the startup
+// pull must still restore the license and trigger — the guard must not fail
+// closed on the normal signed-in startup.
+func TestRunStartupAgentSync_StablePrincipalRestores(t *testing.T) {
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	s.agentSyncTrigger = make(chan struct{}, 1)
+
+	a := &AuthManager{}
+	a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-a"}, "", false)
+	s.auth = a
+
+	s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
+		return nil, nil
+	})
+
+	if !s.agentPullClean.Load() {
+		t.Fatal("agentPullClean must be set after a clean startup pull under a stable principal")
+	}
+	if got := len(s.agentSyncTrigger); got != 1 {
+		t.Fatalf("expected exactly one push trigger, got %d", got)
+	}
+}
+
 // A FAILED resync pull must leave pushes upsert-only and must not queue a push
 // (mirror of TestRunStartupAgentSync_FailureDoesNotTrigger).
 func TestResyncAfterPrincipalChange_FailureKeepsUpsertOnly(t *testing.T) {

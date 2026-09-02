@@ -251,6 +251,11 @@ func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, ag
 	if err != nil {
 		return err
 	}
+	// Known residual TOCTOU: a principal transition landing between this Load
+	// and the HTTP dispatch can still send full_sync=true under the new
+	// account's key. Closing it fully would need a principal-generation lease
+	// spanning the push (the integration-tools pattern); the window is
+	// milliseconds and accepted.
 	fullSync := s.agentPullClean.Load()
 	res, err := gw.SyncAgents(ctx, items, fullSync, start)
 	if err != nil {
@@ -280,20 +285,50 @@ func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, ag
 // pushes driven by later user edits, which run regardless of pull outcome) goes
 // up as upsert-only so it can't soft-delete cloud-only agents. The flag is set
 // BEFORE pullDone closes so the worker always observes the reconciled state.
+//
+// The restore is principal-guarded: a verified-principal transition landing
+// while this pull is in flight means the merged local set belongs to the OLD
+// principal — an unguarded Store(true) would overwrite the transition's reset
+// (beginAgentSyncPrincipalTransition) and the post-pull full_sync push would go
+// out under the NEW account's hot-swapped key carrying the old account's set.
+// The new principal's own resync re-earns the license instead.
 func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)) {
 	if pull == nil {
 		close(s.pullDone)
 		return
 	}
+	samePrincipal := s.principalUnchangedGuard()
 	pullErr := s.pullAndApplyAgents(pull)
+	restored := false
 	if pullErr != nil {
 		log.Printf("agentsync: startup pull failed: %v", pullErr)
-	} else {
+	} else if samePrincipal() {
 		s.agentPullClean.Store(true)
+		restored = true
+	} else {
+		log.Printf("agentsync: startup pull superseded by a principal transition; full sync deferred to the new principal's resync")
 	}
 	close(s.pullDone)
-	if pullErr == nil {
+	if restored {
 		s.triggerAgentSync()
+	}
+}
+
+// principalUnchangedGuard snapshots the verified principal (id, epoch,
+// verified-ness) and returns a func reporting whether it is still identical.
+// With no AuthManager (legacy yaml-key platforms) no principal transition can
+// occur, so the guard is constantly true. The epoch advances on EVERY verified-
+// principal transition (including sign-out and forced same-account re-login),
+// so a change-and-change-back cannot satisfy the guard.
+func (s *Server) principalUnchangedGuard() func() bool {
+	auth := s.auth
+	if auth == nil {
+		return func() bool { return true }
+	}
+	id, epoch, ok := auth.VerifiedPrincipal()
+	return func() bool {
+		curID, curEpoch, curOK := auth.VerifiedPrincipal()
+		return curID == id && curEpoch == epoch && curOK == ok
 	}
 }
 
@@ -336,6 +371,9 @@ func (s *Server) resyncAgentsForVerifiedPrincipal() {
 		return
 	}
 	s.resyncAgentsAfterPrincipalChange(
+		// Deliberately not tied to the server lifecycle context: the pull is
+		// bounded by the gateway HTTP client's own timeout and never blocks
+		// Server.Shutdown; cancelling it on shutdown would buy nothing.
 		func() ([]client.SyncAgentItem, error) { return gw.PullAgents(context.Background()) },
 		func() bool {
 			curID, curEpoch, curOK := auth.VerifiedPrincipal()
