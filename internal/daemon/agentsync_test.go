@@ -1874,8 +1874,8 @@ func TestBuildSyncItems_ScopedToVerifiedPrincipal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildSyncItems: %v", err)
 	}
-	if !excludedForeign {
-		t.Fatal("excludedForeign not reported — the push would keep full_sync and Cloud would tombstone this account's same-key row")
+	if len(excludedForeign) != 1 || excludedForeign[0] != "foreign" {
+		t.Fatalf("excludedForeign = %v, want [foreign] — the push could not judge the full_sync collision", excludedForeign)
 	}
 	got := make(map[string]bool, len(items))
 	for _, it := range items {
@@ -1907,8 +1907,8 @@ func TestBuildSyncItems_NoPrincipalKeepsSharedBehavior(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildSyncItems: %v", err)
 	}
-	if excludedForeign {
-		t.Fatal("excludedForeign reported with no verified principal — would needlessly degrade legacy pushes")
+	if len(excludedForeign) != 0 {
+		t.Fatalf("excludedForeign = %v with no verified principal — would needlessly degrade legacy pushes", excludedForeign)
 	}
 	if len(items) != 2 {
 		t.Fatalf("pushed %d agents, want 2 (no principal — shared behavior unchanged)", len(items))
@@ -2042,12 +2042,13 @@ func TestHandleCreateAgent_StampsCreatorOwnership(t *testing.T) {
 	}
 }
 
-// Excluding a foreign-owned agent from a full_sync push would make Cloud's
-// SoftDeleteMissing tombstone the pushing account's OWN row for that key (the
-// key is absent from the pushed keep set) — converting "excluded" into
-// account-wide deletion that propagates to the account's other devices. A push
-// that excluded any foreign-owned agent must therefore degrade to upsert-only.
-func TestPushAllAgents_ForeignExclusionDegradesFullSync(t *testing.T) {
+// Excluding a foreign-owned agent from a full_sync push makes Cloud's
+// SoftDeleteMissing tombstone the pushing account's OWN row for that key when
+// the key exists in this account's cloud mirror. Full chain: the resync pull
+// finds the colliding key live in the mirror but the local (foreign, newer)
+// copy wins LWW and keeps its owner; the later push excludes it and MUST
+// degrade to upsert-only.
+func TestPushAllAgents_CollidingForeignExclusionDegradesFullSync(t *testing.T) {
 	root := t.TempDir()
 	mkLocalAgent(t, root, "mine")
 	mkLocalAgent(t, root, "foreign")
@@ -2080,10 +2081,31 @@ func TestPushAllAgents_ForeignExclusionDegradesFullSync(t *testing.T) {
 	gw := client.NewGatewayClient(srv.URL, "k")
 
 	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	close(s.pullDone)
+	s.agentSyncTrigger = make(chan struct{}, 1)
 	a := &AuthManager{}
 	a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-b"}, "", false)
 	s.auth = a
-	s.agentPullClean.Store(true) // clean pull — full_sync would normally be allowed
+
+	// user-b's resync: the mirror carries the SAME key live, but the local
+	// foreign copy is newer -> keep-local, owner stays user-a; the live-key
+	// snapshot records the collision and the license is restored.
+	s.resyncAgentsAfterPrincipalChange(
+		func() ([]client.SyncAgentItem, error) {
+			return []client.SyncAgentItem{
+				{AgentKey: "foreign", Prompt: "b's cloud copy", UpdatedAt: time.Now().Add(-2 * time.Hour).UTC()},
+			}, nil
+		},
+		func() bool { return true },
+		"user-b",
+	)
+	if !s.agentPullClean.Load() {
+		t.Fatal("resync did not restore the license")
+	}
+	if owner := agents.ReadAgentOwner(root, "foreign"); owner != "user-a" {
+		t.Fatalf("keep-local branch re-stamped owner to %q", owner)
+	}
 
 	if err := s.pushAllAgents(context.Background(), gw, root); err != nil {
 		t.Fatalf("pushAllAgents: %v", err)
@@ -2092,10 +2114,10 @@ func TestPushAllAgents_ForeignExclusionDegradesFullSync(t *testing.T) {
 		t.Fatalf("pushed keys = %v, want [mine]", keys)
 	}
 	if gotFullSync.Load() {
-		t.Fatal("push that excluded a foreign-owned agent used full_sync=true — Cloud's SoftDeleteMissing would tombstone this account's own row for the excluded key")
+		t.Fatal("push that excluded a cloud-colliding foreign agent used full_sync=true — SoftDeleteMissing would tombstone this account's own row")
 	}
 
-	// Once nothing foreign is excluded, full_sync resumes.
+	// Once the collision is resolved (the agent becomes ours), full_sync resumes.
 	if err := agents.WriteAgentOwner(root, "foreign", "user-b"); err != nil {
 		t.Fatal(err)
 	}
@@ -2103,7 +2125,68 @@ func TestPushAllAgents_ForeignExclusionDegradesFullSync(t *testing.T) {
 		t.Fatalf("pushAllAgents (all owned): %v", err)
 	}
 	if !gotFullSync.Load() {
-		t.Fatal("push with no foreign exclusions did not resume full_sync")
+		t.Fatal("push with no colliding exclusions did not resume full_sync")
+	}
+}
+
+// A foreign-owned key the account's cloud has never heard of must NOT degrade
+// full_sync: delete reconciliation is the ONLY channel a local agent delete
+// has to reach Cloud, and a blanket degrade would make every deleted agent
+// silently resurrect on multi-account devices. This pins delete propagation:
+// after the local delete, the push still runs full_sync=true.
+func TestPushAllAgents_DisjointForeignKeepsFullSyncAndDeletePropagation(t *testing.T) {
+	root := t.TempDir()
+	mkLocalAgent(t, root, "mine")
+	mkLocalAgent(t, root, "foreign")
+	if err := agents.WriteAgentOwner(root, "mine", "user-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := agents.WriteAgentOwner(root, "foreign", "user-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotFullSync atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			var body struct {
+				FullSync bool `json:"full_sync"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			gotFullSync.Store(body.FullSync)
+			w.Write([]byte(`{"synced":1,"soft_deleted":0}`))
+		}
+	}))
+	defer srv.Close()
+	gw := client.NewGatewayClient(srv.URL, "k")
+
+	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	close(s.pullDone)
+	s.agentSyncTrigger = make(chan struct{}, 1)
+	a := &AuthManager{}
+	a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-b"}, "", false)
+	s.auth = a
+
+	// user-b's resync: mirror has only user-b's own agent — "foreign" is
+	// unknown to this account's cloud.
+	s.resyncAgentsAfterPrincipalChange(
+		func() ([]client.SyncAgentItem, error) {
+			return []client.SyncAgentItem{
+				{AgentKey: "mine", Prompt: "cloud", UpdatedAt: time.Now().Add(-2 * time.Hour).UTC()},
+			}, nil
+		},
+		func() bool { return true },
+		"user-b",
+	)
+
+	// Simulate a local delete of one of user-b's agents: the following push
+	// must keep full_sync so Cloud reconciles the removal.
+	deleteAgentDefinitionFiles(filepath.Join(root, "mine"))
+	if err := s.pushAllAgents(context.Background(), gw, root); err != nil {
+		t.Fatalf("pushAllAgents: %v", err)
+	}
+	if !gotFullSync.Load() {
+		t.Fatal("disjoint foreign exclusion degraded full_sync — local deletes would silently resurrect on every multi-account device")
 	}
 }
 
@@ -2126,6 +2209,12 @@ func TestPushAllAgents_AbortsOnPrincipalChangeDuringSnapshot(t *testing.T) {
 	defer srv.Close()
 	gw := client.NewGatewayClient(srv.URL, "k")
 
+	// Sentinel: ListAgents is sorted, so the snapshot processes (and
+	// grandfather-stamps) "aaa-sentinel" BEFORE blocking on "agt"'s held route
+	// lock — the sidecar appearing on disk proves ownerID was already captured
+	// as user-a, making the mid-snapshot switch deterministic (no sleeps).
+	mkLocalAgent(t, root, "aaa-sentinel")
+
 	s := newPullServer(t, root)
 	a := &AuthManager{}
 	a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-a"}, "", false)
@@ -2137,9 +2226,14 @@ func TestPushAllAgents_AbortsOnPrincipalChangeDuringSnapshot(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.pushAllAgents(context.Background(), gw, root) }()
 
-	// Let the push reach the route lock, then switch the account while it is
-	// still snapshotting.
-	time.Sleep(150 * time.Millisecond)
+	deadline := time.Now().Add(5 * time.Second)
+	for agents.ReadAgentOwner(root, "aaa-sentinel") != "user-a" {
+		if time.Now().After(deadline) {
+			t.Fatal("snapshot never reached the sentinel agent")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The snapshot is provably in flight under user-a; switch now.
 	a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-b"}, "", false)
 	s.deps.SessionCache.UnlockRoute("agent:agt")
 
@@ -2233,5 +2327,78 @@ func TestHandlePutAgentConfig_RestampsToEditingPrincipal(t *testing.T) {
 	}
 	if owner := agents.ReadAgentOwner(root, "agt"); owner != "user-b" {
 		t.Fatalf("owner after config clear under user-b = %q, want user-b", owner)
+	}
+}
+
+// AuthManager present but NO verified principal (Bootstrap's optimistic
+// sign-in after a /me network error: signed_in with a nil user, gateway key
+// live) must not push at all: an unfiltered push in that window uploads the
+// previous account's local agents under whatever key is installed — the exact
+// cross-account upload this feature closes. Only auth == nil (no AuthManager)
+// keeps the legacy unfiltered push.
+func TestPushAllAgents_SkipsWhenAuthPresentButUnverified(t *testing.T) {
+	root := t.TempDir()
+	mkLocalAgent(t, root, "agt")
+
+	var pushes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			pushes.Add(1)
+			w.Write([]byte(`{"synced":1,"soft_deleted":0}`))
+		}
+	}))
+	defer srv.Close()
+	gw := client.NewGatewayClient(srv.URL, "k")
+
+	s := newPullServer(t, root)
+	a := &AuthManager{}
+	a.setStateWithPrincipalEpoch(AuthStateSignedIn, nil, "", false) // optimistic: no verified user
+	s.auth = a
+
+	if err := s.pushAllAgents(context.Background(), gw, root); err != nil {
+		t.Fatalf("pushAllAgents: %v", err)
+	}
+	if got := pushes.Load(); got != 0 {
+		t.Fatalf("push dispatched %d request(s) with an unverified principal — local agents went up unfiltered under the live key", got)
+	}
+}
+
+// Concurrent restamp vs push snapshot: WriteAgentOwner is atomic
+// (temp+rename), so a lock-free ReadAgentOwner during a restamp must never
+// observe an empty/torn sidecar — which buildSyncItem would treat as
+// unstamped and grandfather-claim for the OTHER account, uploading its
+// content cross-account. Hammer both sides under -race and pin that user-a's
+// snapshot never claims the agent.
+func TestBuildSyncItems_ConcurrentRestampNeverGrandfatherClaims(t *testing.T) {
+	root := t.TempDir()
+	mkLocalAgent(t, root, "agt")
+	if err := agents.WriteAgentOwner(root, "agt", "user-b"); err != nil {
+		t.Fatal(err)
+	}
+	s := newPullServer(t, root)
+
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = agents.WriteAgentOwner(root, "agt", "user-b")
+			}
+		}
+	}()
+	for i := 0; i < 300; i++ {
+		items, _, err := s.buildSyncItems(root, "user-a")
+		if err != nil {
+			t.Fatalf("buildSyncItems: %v", err)
+		}
+		if len(items) != 0 {
+			t.Fatal("user-a's push claimed user-b's agent mid-restamp — a torn owner read grandfathered it away")
+		}
+	}
+	close(stop)
+	if owner := agents.ReadAgentOwner(root, "agt"); owner != "user-b" {
+		t.Fatalf("owner after hammer = %q, want user-b", owner)
 	}
 }

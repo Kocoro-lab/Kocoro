@@ -86,18 +86,18 @@ type agentProfileBlob struct {
 // handleUpdateAgent is mid-write. The lock is acquired per-agent (short critical
 // section) and only AFTER the builtin-skip check.
 // buildSyncItems snapshots the pushable agent set for ownerID (the caller's
-// verified-principal snapshot; "" = legacy unfiltered). excludedForeign
-// reports that at least one foreign-owned agent was left out — the caller MUST
-// degrade that push to upsert-only, because Cloud's full_sync SoftDeleteMissing
-// tombstones every account row whose key is absent from the pushed set: an
-// excluded same-key agent would otherwise turn into an account-wide delete of
-// this account's own cloud row.
-func (s *Server) buildSyncItems(agentsDir, ownerID string) ([]client.SyncAgentItem, bool, error) {
+// verified-principal snapshot; "" = legacy unfiltered). excludedForeign lists
+// the KEYS of foreign-owned agents left out — the caller must degrade a
+// full_sync push when any of them exists in this account's cloud mirror
+// (Cloud's SoftDeleteMissing tombstones every account row whose key is absent
+// from the pushed set, so an excluded same-key agent would turn into an
+// account-wide delete of this account's own row).
+func (s *Server) buildSyncItems(agentsDir, ownerID string) ([]client.SyncAgentItem, []string, error) {
 	entries, err := agents.ListAgents(agentsDir)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
-	excludedForeign := false
+	var excludedForeign []string
 	items := make([]client.SyncAgentItem, 0, len(entries))
 	for _, e := range entries {
 		// Only sync user-defined agents (and user-overridden builtins, which
@@ -108,7 +108,7 @@ func (s *Server) buildSyncItems(agentsDir, ownerID string) ([]client.SyncAgentIt
 		}
 		item, ok, foreign := s.buildSyncItem(agentsDir, e.Name, ownerID)
 		if foreign {
-			excludedForeign = true
+			excludedForeign = append(excludedForeign, e.Name)
 			continue
 		}
 		if ok {
@@ -155,7 +155,12 @@ func (s *Server) buildSyncItem(agentsDir, name, ownerID string) (client.SyncAgen
 		case ownerID:
 			// ours — push it
 		default:
-			return client.SyncAgentItem{}, false, true // foreign-owned — not this account's to push
+			// Foreign-owned — not this account's to push. Logged because this
+			// is the only silent exclusion in the push set, and a torn or
+			// hand-mangled sidecar reading as a bogus foreign owner would
+			// otherwise be undiagnosable.
+			log.Printf("agentsync: excluding foreign-owned agent %q from push", name)
+			return client.SyncAgentItem{}, false, true
 		}
 	}
 
@@ -295,6 +300,16 @@ func agentLastModified(dir string) time.Time {
 func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir string) error {
 	start := time.Now().UTC()
 	ownerID := s.currentVerifiedPrincipalID()
+	// An AuthManager with NO verified principal (optimistic sign-in after a
+	// /me network error: the gateway key is live, the principal is not) must
+	// not push at all — an unfiltered legacy push here would upload the
+	// previous account's local agents under whatever key is installed. Skip;
+	// the verified transition's resync re-triggers a push. Only auth == nil
+	// (no AuthManager, legacy platforms) keeps the unfiltered push.
+	if ownerID == "" && s.auth != nil {
+		log.Printf("agentsync: push skipped: no verified principal yet")
+		return nil
+	}
 	items, excludedForeign, err := s.buildSyncItems(agentsDir, ownerID)
 	if err != nil {
 		return err
@@ -311,15 +326,36 @@ func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, ag
 		log.Printf("agentsync: push dropped: verified principal changed while snapshotting the agent set")
 		return nil
 	}
-	// A push that excluded a foreign-owned agent must not reconcile deletes:
-	// Cloud's full_sync SoftDeleteMissing tombstones every account row whose
-	// key is absent from the pushed set, so the excluded same-key agent would
-	// turn into an account-wide delete of THIS account's own cloud row (and
-	// propagate to its other devices). Deletes stop reconciling only while a
-	// foreign same-key agent sits locally — the safe direction.
-	fullSync := s.agentPullClean.Load() && !excludedForeign
-	if excludedForeign && s.agentPullClean.Load() {
-		log.Printf("agentsync: push degraded to upsert-only: foreign-owned agent(s) excluded from the set")
+	// A push that excluded a foreign-owned agent whose key ALSO exists live in
+	// this account's cloud mirror must not reconcile deletes: Cloud's
+	// full_sync SoftDeleteMissing tombstones every account row absent from the
+	// pushed set, so that excluded same-key agent would turn into an
+	// account-wide delete of THIS account's own row (and propagate to its
+	// other devices). Disjoint foreign keys (the common case — slugs are
+	// random hex, so collisions essentially only exist where the old
+	// pre-ownership leak manufactured them) keep full_sync, preserving the
+	// ONLY channel a local agent delete has to reach Cloud; a blanket degrade
+	// would make deletes silently resurrect on every multi-account device. A
+	// nil snapshot (mirror unknown) degrades conservatively. Such a frozen
+	// collision clears once either account edits the agent (local edit
+	// re-stamps; a newer cloud row overwrites and re-stamps).
+	degradeForeign := false
+	if len(excludedForeign) > 0 {
+		cloudKeys, _ := s.agentCloudLiveKeys.Load().(map[string]struct{})
+		if cloudKeys == nil {
+			degradeForeign = true
+		} else {
+			for _, k := range excludedForeign {
+				if _, hit := cloudKeys[k]; hit {
+					degradeForeign = true
+					break
+				}
+			}
+		}
+	}
+	fullSync := s.agentPullClean.Load() && !degradeForeign
+	if degradeForeign && s.agentPullClean.Load() {
+		log.Printf("agentsync: push degraded to upsert-only: excluded foreign-owned agent collides with this account's cloud mirror")
 	}
 	res, err := gw.SyncAgents(ctx, items, fullSync, start)
 	if err != nil {
@@ -541,6 +577,20 @@ func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgen
 	if !samePrincipal() {
 		return
 	}
+	// Snapshot the mirror's LIVE keys BEFORE restoring the license (readers
+	// that observe the license observe this snapshot): pushAllAgents degrades
+	// full_sync only when an excluded foreign key exists in this account's
+	// cloud — a disjoint foreign key can't be tombstoned by SoftDeleteMissing,
+	// so deletes keep reconciling. New collisions can't appear later (slugs
+	// are random hex; foreign agents only predate the switch), so the
+	// pull-time snapshot stays valid for the license's lifetime.
+	liveKeys := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		if it.DeletedAt == nil {
+			liveKeys[it.AgentKey] = struct{}{}
+		}
+	}
+	s.agentCloudLiveKeys.Store(liveKeys)
 	s.agentPullClean.Store(true)
 	s.triggerAgentSync()
 }
@@ -659,9 +709,11 @@ func (s *Server) applyPulledAgents(items []client.SyncAgentItem, ownerID string)
 		// Stamp only a materialize that actually produced an agent (AGENT.md
 		// is the mandatory first write) — a failed materialize should not
 		// leave a ghost-owned dir behind.
-		if _, statErr := os.Stat(filepath.Join(dir, "AGENT.md")); ownerID != "" && statErr == nil {
-			if err := agents.WriteAgentOwner(agentsDir, it.AgentKey, ownerID); err != nil {
-				log.Printf("agentsync: stamping owner for pulled %q failed: %v", it.AgentKey, err)
+		if ownerID != "" {
+			if _, statErr := os.Stat(filepath.Join(dir, "AGENT.md")); statErr == nil {
+				if err := agents.WriteAgentOwner(agentsDir, it.AgentKey, ownerID); err != nil {
+					log.Printf("agentsync: stamping owner for pulled %q failed: %v", it.AgentKey, err)
+				}
 			}
 		}
 		s.deps.SessionCache.UnlockRoute(routeKey)

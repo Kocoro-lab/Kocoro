@@ -13,6 +13,14 @@ func TestAgentOwnerRoundTrip(t *testing.T) {
 		t.Fatalf("owner of missing agent = %q, want empty (unstamped)", got)
 	}
 
+	// Writing to a nonexistent agent dir must error, not create a ghost dir.
+	if err := WriteAgentOwner(dir, "agt", "user-a"); err == nil {
+		t.Fatal("WriteAgentOwner created a ghost agent dir")
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "agt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := WriteAgentOwner(dir, "agt", "user-a"); err != nil {
 		t.Fatalf("WriteAgentOwner: %v", err)
 	}

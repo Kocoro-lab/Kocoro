@@ -201,12 +201,21 @@ the pull's LWW overwrite); delete removes the sidecar. The RUNTIME
 (listing/routing/execution) deliberately stays cross-account shared — only the
 sync boundary is principal-scoped, closing the cross-account upload of the
 previous account's local agents after a switch. No verified principal (legacy
-yaml-key platforms) = unstamped, unfiltered, historical device-shared behavior.
-A push that excluded a foreign-owned agent degrades to upsert-only — Cloud's
-full_sync SoftDeleteMissing would tombstone the account's own same-key row.
-Accepted residual: an agent edited under A whose stamp never landed (push
-failed / daemon killed inside the debounce / pre-upgrade population) is
-grandfathered to whoever is signed in at first push contact.
+yaml-key platforms) = unstamped, unfiltered, historical device-shared behavior;
+an AuthManager with NO verified principal (optimistic sign-in) skips the push
+entirely instead — the gateway key is live there and an unfiltered push would
+leak. A push whose excluded foreign key COLLIDES with the account's cloud
+mirror (live-key snapshot taken by the resync pull) degrades to upsert-only —
+Cloud's full_sync SoftDeleteMissing would tombstone the account's own same-key
+row; disjoint foreign keys keep full_sync, since a blanket degrade would stop
+local deletes from ever reaching Cloud (deleted agents would resurrect on
+every multi-account device). Owner writes are atomic (temp+rename) so
+lock-free reads never see a torn value. Accepted residuals: an agent edited
+under A whose stamp never landed (push failed / daemon killed inside the
+debounce / pre-upgrade population) is grandfathered to whoever is signed in at
+first push contact; per-agent always-allow add/remove deliberately does NOT
+re-stamp yet still bumps the LWW clock (config.yaml is a definition file), so
+B's approval click on A's agent rides A's next push — small, known.
 
 #### Config revision state
 

@@ -176,6 +176,17 @@ type Server struct {
 	// back-to-back account switches cannot interleave their pulls.
 	agentResyncMu sync.Mutex
 
+	// agentCloudLiveKeys holds map[string]struct{} — the LIVE agent keys of the
+	// current principal's cloud mirror, snapshotted by the resync pull just
+	// before it restores agentPullClean. pushAllAgents degrades full_sync only
+	// when an excluded foreign-owned key intersects this set (Cloud's
+	// SoftDeleteMissing would tombstone the account's own same-key row);
+	// disjoint foreign keys keep delete reconciliation working. Written before
+	// the license store (sequentially consistent atomics: a reader that sees
+	// the license sees this snapshot); nil means "mirror unknown" and degrades
+	// conservatively.
+	agentCloudLiveKeys atomic.Value
+
 	// realtimeUsageOutbox is the private disk queue used by the Koe realtime
 	// relay. The mutex protects lazy construction for lightweight test servers
 	// that do not go through NewServer.
@@ -5076,12 +5087,20 @@ func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 	// display_name is identity-adjacent metadata owned by the top-level
 	// agent create/rename contract. Config replacement must not clear it or
 	// accept a nested bypass value.
+	// Serialize with concurrent CRUD and the async pull, matching the other
+	// definition-write handlers — the restamp's lock-free readers rely on
+	// owner WRITES being route-lock-serialized.
+	routeKey := "agent:" + name
+	s.deps.SessionCache.LockRoute(routeKey)
 	cfg.DisplayName = readAgentConfigDisplayName(s.deps.AgentsDir, name)
 	if err := agents.WriteAgentConfig(s.deps.AgentsDir, name, &cfg); err != nil {
+		s.deps.SessionCache.UnlockRoute(routeKey)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.restampAgentOwner(name)
+	s.deps.SessionCache.UnlockRoute(routeKey)
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
@@ -5097,11 +5116,17 @@ func (s *Server) handleDeleteAgentConfig(w http.ResponseWriter, r *http.Request)
 	if !s.materializeIfBuiltin(w, name) {
 		return
 	}
+	// Same serialization as handlePutAgentConfig — see the comment there.
+	routeKey := "agent:" + name
+	s.deps.SessionCache.LockRoute(routeKey)
 	if err := clearAgentConfigPreservingDisplayName(s.deps.AgentsDir, name); err != nil {
+		s.deps.SessionCache.UnlockRoute(routeKey)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.restampAgentOwner(name)
+	s.deps.SessionCache.UnlockRoute(routeKey)
+	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 

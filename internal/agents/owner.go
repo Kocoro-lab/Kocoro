@@ -18,8 +18,12 @@ const AgentOwnerFile = "_owner"
 
 // ReadAgentOwner returns the owning principal id, or "" when the agent is
 // unstamped (missing/unreadable/empty sidecar — all fail open to the
-// grandfather semantics).
+// grandfather semantics). Reads are lock-free: WriteAgentOwner replaces the
+// file atomically (temp+rename), so a read never observes a torn value.
 func ReadAgentOwner(agentsDir, name string) string {
+	if ValidateAgentName(name) != nil {
+		return ""
+	}
 	data, err := os.ReadFile(filepath.Join(agentsDir, name, AgentOwnerFile))
 	if err != nil {
 		return ""
@@ -28,9 +32,17 @@ func ReadAgentOwner(agentsDir, name string) string {
 }
 
 // WriteAgentOwner stamps (or, with an empty owner, clears) the agent's sync
-// owner. Callers already serialize per-agent mutations on the route lock, so
-// a plain write is sufficient.
+// owner. The write is atomic (temp+rename, per the repo's Atomic Writes
+// convention) so a concurrent lock-free ReadAgentOwner can never observe an
+// empty or truncated value and misread a stamped agent as unstamped — which
+// would let the OTHER account's push grandfather-claim it mid-restamp. The
+// agent directory must already exist (every caller writes after the
+// definition files); a missing dir surfaces as an error rather than creating
+// a ghost directory.
 func WriteAgentOwner(agentsDir, name, owner string) error {
+	if err := ValidateAgentName(name); err != nil {
+		return err
+	}
 	path := filepath.Join(agentsDir, name, AgentOwnerFile)
 	if owner == "" {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -38,8 +50,5 @@ func WriteAgentOwner(agentsDir, name, owner string) error {
 		}
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Join(agentsDir, name), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(owner+"\n"), 0o600)
+	return AtomicWrite(path, []byte(owner+"\n"))
 }
