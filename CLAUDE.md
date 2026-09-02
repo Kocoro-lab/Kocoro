@@ -271,14 +271,16 @@ static legacy-GUI list inside `WriteAgentConfig`) skips the agent-sync LWW
 mirror stamp (local clock stays "now"), and the REFRESH-path prune fires
 `triggerAgentSync` when a removal actually wrote bytes, so the sanitized
 config passes Cloud's strict-newer upsert instead of leaving a stale row that
-reseeds other devices. The principal-transition prune deliberately does NOT
-push: every verified-principal transition resets `agentPullClean` to false
+reseeds other devices. The principal-transition prune now also fires
+`triggerAgentSync` on write, same as the REFRESH path — safe because every
+verified-principal transition FIRST resets `agentPullClean` to false
 (`beginAgentSyncPrincipalTransition` — the full-sync license was earned under
-the previous account, so post-switch pushes degrade to upsert-only), and the
-async pull-then-push resync for the new principal
-(`resyncAgentsAfterPrincipalChange`, serialized + principal-epoch-guarded,
-restoring the flag only on a clean pull) already carries the pruned configs up;
-a push fired directly from the prune would race that resync's gate.
+the previous account, so post-switch pushes degrade to upsert-only, never
+destructive) and only the async pull-then-push resync for the new principal
+(`resyncAgentsAfterPrincipalChange`, serialized + principal-epoch-guarded on
+both sides of fetch AND apply, so a superseded transition's mirror never
+touches disk) restores the flag after a clean pull; the startup pull's restore
+is guarded the same way (`principalUnchangedGuard`).
 A registry miss never drops or prunes —
 fail-safe against mass deletion; the runtime gate backstops. The per-turn
 `ApprovalCache` also refuses these tools — a byte-identical repeated tool_use

@@ -619,15 +619,16 @@ func TestResetIntegrationToolsForPrincipalPrunesDeniedAlwaysAllow(t *testing.T) 
 		if got := readAlwaysAllowFromDisk(t, deps.AgentsDir, "operator"); len(got) != 1 || got[0] != "file_write" {
 			t.Errorf("per-agent always_allow_tools = %v, want [file_write]", got)
 		}
-		// The principal-transition prune must NOT request a sync push:
-		// agentPullClean survives an account switch (set-once, startup-only
-		// pull), so a full_sync push here would upload the PREVIOUS account's
-		// local agent set and soft-delete the new account's cloud-only agents.
-		// These grants converge on the next ordinary refresh instead.
+		// A prune that wrote bytes must request a coalesced sync push, exactly
+		// like the REFRESH path — otherwise convergence of the pruned config to
+		// Cloud depends on the resync push's timing (and fails entirely when
+		// the resync pull fails). The push is safe here: the principal
+		// transition already reset agentPullClean, so a pre-resync push is
+		// upsert-only, never destructive.
 		select {
 		case <-s.agentSyncTrigger:
-			t.Error("principal-transition prune must not trigger an agent sync push")
 		default:
+			t.Error("principal-transition prune wrote bytes but did not trigger an agent sync push — pruned config never converges to Cloud if the resync push misses it")
 		}
 	})
 
