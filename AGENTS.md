@@ -3,7 +3,8 @@
 **Condensed mirror of `CLAUDE.md`** — rules + greppable symbols. If they
 disagree, `CLAUDE.md` and the code win.
 
-**Keep this file under 24 KB (CI asserts)** — cut prose, not rules.
+**Keep this file under 24 KB (CI asserts)** — cut prose, not rules. Adding
+bytes requires cutting at least as many bytes in the same PR.
 
 Kocoro is the Go CLI/runtime (`shan`) for Shannon agents. Production: daemon +
 Desktop + Cloud (daemon holds the Cloud WS, runs the loop locally). Also TUI,
@@ -391,8 +392,7 @@ SHANNON_E2E_LIVE=1 go test -tags=live ./test/e2e/ -v # live suite (tag required)
 go build ./...
 ```
 
-Koe tests link cgo audio deps: `brew install opus opusfile pkg-config`, and set
-`PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig` if pkg-config cannot find them.
+Koe tests link cgo audio deps: `brew install opus opusfile pkg-config`.
 Schedule tests use temp dirs and MUST NOT write to the real LaunchAgents directory.
 
 Live E2E uses the hidden foreground-only isolation flags in
