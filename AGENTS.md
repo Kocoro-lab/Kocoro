@@ -150,11 +150,11 @@ hard-block -> denied commands -> compound splitting -> always-ask gates
   (`DisallowsAutoApproval`) = `computer`, `accessibility`, `applescript`,
   `ghostty`; `unattendedAutoApprovalDenyList` (`DisallowsUnattendedAutoApproval`)
   = those four plus `computer_use` and `screenshot`.
-- `computer_use` is deliberately absent from the FIRST list — its persisted
+- `computer_use` is NOT in the FIRST list — its persisted
   global grant IS the product's Computer Use permission, honored even unattended,
   scoped BY NAME via `unattendedGrantHonored`. Legacy GUI names never use the
-  global grant; per-agent `computer_use` is rejected
-  (`agents.ValidateAgentPermissionsConfig`) — the grant is global-only.
+  global grant; per-agent `computer_use` is rejected on API writes
+  (`ValidateAgentPermissionsConfig`), dropped on sync pull — global-only.
 
 ## Wire Contracts
 
