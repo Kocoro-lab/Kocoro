@@ -83,8 +83,8 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   `always_allow_tools` entries ignored. Config writes (incl. agent-sync pull)
   drop denied entries (`dropRegistryDeniedAlwaysAllow`, registry miss keeps);
   `RefreshIntegrationTools` + `resetIntegrationToolsForPrincipal` prune after
-  rebuild (`pruneDeniedAlwaysAllowGrants`). Drop skips the LWW stamp; only the
-  refresh prune pushes. Absent=false; Cloud gates marked schemas on
+  rebuild (`pruneDeniedAlwaysAllowGrants`). Drop skips the LWW stamp; both
+  prunes push on write. Absent=false; Cloud gates marked schemas on
   `integration_requires_approval`.
 - Trusted `material_side_effect=false` permits observational batching without
   the journal; absent is fail-closed. Stable `request_id`; material calls add

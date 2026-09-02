@@ -1265,21 +1265,12 @@ func (s *Server) startBackgroundServices(ctx context.Context) func() {
 	s.startCompactionSnapshotSweep(days)
 	s.startRunEventSweep(runEventDays)
 
-	// One-time agent pull on startup: applies the cloud mirror to local disk
-	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
-	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
-	// when this finishes (success, failure, or unconfigured) so agentSyncWorker
+	// One-time agent reconciliation on startup. Auth-managed daemons defer the
+	// pull to the verified-principal transition's resync (see startupAgentSync);
+	// legacy daemons pull directly. pullDone is ALWAYS closed when this
+	// finishes (deferred, success, failure, or unconfigured) so agentSyncWorker
 	// never blocks forever waiting on the gate before its first push.
-	go func() {
-		gw := s.cloudGateway()
-		if gw == nil {
-			s.runStartupAgentSync(nil) // unconfigured
-			return
-		}
-		s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
-			return gw.PullAgents(ctx)
-		})
-	}()
+	go s.startupAgentSync(ctx)
 
 	// Memory feature (Phase 2.3). Service is constructed once and Start runs
 	// the cold-path gates synchronously then spawns the supervisor goroutine.

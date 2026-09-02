@@ -9,12 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Kocoro-lab/ShanClaw/internal/agents"
 	"github.com/Kocoro-lab/ShanClaw/internal/audit"
 	"github.com/Kocoro-lab/ShanClaw/internal/client"
+	"github.com/Kocoro-lab/ShanClaw/internal/config"
 	"github.com/Kocoro-lab/ShanClaw/internal/skills"
 )
 
@@ -1421,14 +1423,14 @@ func TestPushAfterPrincipalSwitch_UpsertOnlyUntilResync(t *testing.T) {
 	os.MkdirAll(dir, 0o755)
 	os.WriteFile(filepath.Join(dir, "AGENT.md"), []byte("prompt"), 0o644)
 
-	var gotFullSync bool
+	var gotFullSync atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			var body struct {
 				FullSync bool `json:"full_sync"`
 			}
 			json.NewDecoder(r.Body).Decode(&body)
-			gotFullSync = body.FullSync
+			gotFullSync.Store(body.FullSync)
 			w.Write([]byte(`{"synced":1,"soft_deleted":0}`))
 		}
 	}))
@@ -1446,7 +1448,7 @@ func TestPushAfterPrincipalSwitch_UpsertOnlyUntilResync(t *testing.T) {
 	if err := s.pushAllAgents(context.Background(), gw, root); err != nil {
 		t.Fatalf("pushAllAgents (post-switch, pre-resync): %v", err)
 	}
-	if gotFullSync {
+	if gotFullSync.Load() {
 		t.Fatal("push after account switch used full_sync=true before the new principal's pull — can soft-delete the new account's cloud-only agents")
 	}
 
@@ -1464,7 +1466,7 @@ func TestPushAfterPrincipalSwitch_UpsertOnlyUntilResync(t *testing.T) {
 	if err := s.pushAllAgents(context.Background(), gw, root); err != nil {
 		t.Fatalf("pushAllAgents (post-resync): %v", err)
 	}
-	if !gotFullSync {
+	if !gotFullSync.Load() {
 		t.Fatal("push did not resume full_sync after the new principal's pull succeeded")
 	}
 }
@@ -1532,6 +1534,150 @@ func TestRunStartupAgentSync_StablePrincipalRestores(t *testing.T) {
 	}
 	if got := len(s.agentSyncTrigger); got != 1 {
 		t.Fatalf("expected exactly one push trigger, got %d", got)
+	}
+}
+
+// Auth-managed daemons must NOT run the direct startup pull: Bootstrap fires
+// the ""→A verified-principal transition on every signed-in launch and its
+// resync owns the reconciliation (verified principal, epoch guard). A direct
+// startup pull races Bootstrap's /me window (key installed, principal not yet
+// verified): the guard discards a mirror fetched before the transition, and
+// the transition resets a license granted before it — a duplicate pull (and
+// possibly a duplicate full-sync push) on ordinary launches either way.
+func TestStartupAgentSync_AuthManagedDefersToPrincipalResync(t *testing.T) {
+	var pulls atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pulls.Add(1)
+		w.Write([]byte(`{"agents":[]}`))
+	}))
+	defer cloud.Close()
+
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.deps.Config = &config.Config{Cloud: config.CloudConfig{Enabled: true}}
+	s.deps.GW = client.NewGatewayClient(cloud.URL, "k")
+	s.pullDone = make(chan struct{})
+	s.agentSyncTrigger = make(chan struct{}, 1)
+	s.auth = &AuthManager{}
+
+	s.startupAgentSync(context.Background())
+
+	select {
+	case <-s.pullDone:
+	default:
+		t.Fatal("pullDone not closed")
+	}
+	if got := pulls.Load(); got != 0 {
+		t.Fatalf("auth-managed daemon ran %d direct startup pull(s) — must defer to the principal-transition resync", got)
+	}
+	if s.agentPullClean.Load() || len(s.agentSyncTrigger) != 0 {
+		t.Fatal("auth-managed startup must not grant the full-sync license or queue a push")
+	}
+}
+
+// Legacy daemons without an AuthManager keep the direct startup pull — no
+// principal transitions exist there, so no resync would ever run.
+func TestStartupAgentSync_LegacyPathStillPulls(t *testing.T) {
+	var pulls atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pulls.Add(1)
+		w.Write([]byte(`{"agents":[]}`))
+	}))
+	defer cloud.Close()
+
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.deps.Config = &config.Config{APIKey: "k", Cloud: config.CloudConfig{Enabled: true}}
+	s.deps.GW = client.NewGatewayClient(cloud.URL, "k")
+	s.pullDone = make(chan struct{})
+	s.agentSyncTrigger = make(chan struct{}, 1)
+
+	s.startupAgentSync(context.Background())
+
+	if got := pulls.Load(); got != 1 {
+		t.Fatalf("legacy startup ran %d pulls, want exactly 1", got)
+	}
+	if !s.agentPullClean.Load() {
+		t.Fatal("legacy startup pull must grant the full-sync license")
+	}
+	if got := len(s.agentSyncTrigger); got != 1 {
+		t.Fatalf("expected exactly one push trigger, got %d", got)
+	}
+}
+
+// Exercises the production glue resyncAgentsForVerifiedPrincipal end to end
+// (pullDone wait, gateway resolution, epoch capture) with a REAL AuthManager,
+// including the forced same-account re-login (doAdoptKey passes
+// forcePrincipalEpoch=true): the epoch advances while the id is unchanged, so
+// a re-login landing mid-pull must discard that pull's license.
+func TestResyncForVerifiedPrincipal_WiringAndForcedEpochRelogin(t *testing.T) {
+	var relogin func()
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if relogin != nil {
+			relogin()
+		}
+		w.Write([]byte(`{"agents":[]}`))
+	}))
+	defer cloud.Close()
+
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.deps.Config = &config.Config{Cloud: config.CloudConfig{Enabled: true}}
+	s.deps.GW = client.NewGatewayClient(cloud.URL, "k")
+	s.pullDone = make(chan struct{})
+	close(s.pullDone)
+	s.agentSyncTrigger = make(chan struct{}, 1)
+
+	a := &AuthManager{}
+	a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-a"}, "", false)
+	s.auth = a
+
+	// Stable principal: the glue must pull once and restore the license.
+	s.resyncAgentsForVerifiedPrincipal()
+	if !s.agentPullClean.Load() {
+		t.Fatal("stable-principal resync did not restore the full-sync license")
+	}
+	if got := len(s.agentSyncTrigger); got != 1 {
+		t.Fatalf("expected exactly one push trigger, got %d", got)
+	}
+	<-s.agentSyncTrigger
+
+	// Same-account re-login lands while the pull is in flight: id unchanged,
+	// epoch advanced — the guard must discard the pull's license.
+	s.agentPullClean.Store(false) // what beginAgentSyncPrincipalTransition does
+	relogin = func() {
+		relogin = nil
+		a.setStateWithPrincipalEpoch(AuthStateSignedIn, &client.AuthUser{ID: "user-a"}, "", true)
+	}
+	s.resyncAgentsForVerifiedPrincipal()
+	if s.agentPullClean.Load() {
+		t.Fatal("a pull superseded by a forced same-account re-login must not restore the license (epoch advanced, id unchanged)")
+	}
+	if got := len(s.agentSyncTrigger); got != 0 {
+		t.Fatalf("expected no push trigger after superseded re-login pull, got %d", got)
+	}
+}
+
+// A superseded resync's final Store(true) can land AFTER the next transition's
+// begin...Store(false) (guard-then-store is not atomic). The next resync must
+// clear that stale license even when its own pull FAILS — otherwise the stale
+// true persists durably and the next push is full_sync under the wrong
+// account's set, the exact bug this series fixes.
+func TestResyncAfterPrincipalChange_ClearsStaleLicenseOnFailedPull(t *testing.T) {
+	root := t.TempDir()
+	s := newPullServer(t, root)
+	s.pullDone = make(chan struct{})
+	close(s.pullDone)
+	s.agentSyncTrigger = make(chan struct{}, 1)
+	s.agentPullClean.Store(true) // stale license from a superseded resync
+
+	s.resyncAgentsAfterPrincipalChange(
+		func() ([]client.SyncAgentItem, error) { return nil, context.DeadlineExceeded },
+		func() bool { return true },
+	)
+
+	if s.agentPullClean.Load() {
+		t.Fatal("failed resync left a stale full-sync license set — the next push would be full_sync under the wrong account")
 	}
 }
 
