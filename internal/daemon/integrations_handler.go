@@ -192,11 +192,12 @@ func (s *Server) resetIntegrationToolsForPrincipal(ctx context.Context, hasPrinc
 	// the bounded catalog fetch above already dominates the latency, and
 	// synchronous ordering keeps semantics and tests simple.
 	//
-	// No sync push from this caller: agentPullClean is set-once by the
-	// startup-only pull and survives an account switch, so a full_sync push
-	// fired here would upload the PREVIOUS account's local agent set to the
-	// new account and soft-delete its cloud-only agents. The pruned configs
-	// converge on the next ordinary refresh instead.
+	// No sync push from this caller: the principal transition already reset
+	// agentPullClean (beginAgentSyncPrincipalTransition) and spawned the
+	// pull-then-push resync for the new principal — that resync's post-pull
+	// push carries the pruned configs up under a restored full-sync license.
+	// A push fired here would race the resync's gate and, before the new
+	// principal's pull lands, could only go up upsert-only anyway.
 	s.pruneDeniedAlwaysAllowGrants()
 	return nil
 }

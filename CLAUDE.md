@@ -272,9 +272,13 @@ mirror stamp (local clock stays "now"), and the REFRESH-path prune fires
 `triggerAgentSync` when a removal actually wrote bytes, so the sanitized
 config passes Cloud's strict-newer upsert instead of leaving a stale row that
 reseeds other devices. The principal-transition prune deliberately does NOT
-push: `agentPullClean` is set-once by the startup-only pull and survives an
-account switch, so a `full_sync` push there would upload the previous
-account's local agents and soft-delete the new account's cloud-only agents.
+push: every verified-principal transition resets `agentPullClean` to false
+(`beginAgentSyncPrincipalTransition` — the full-sync license was earned under
+the previous account, so post-switch pushes degrade to upsert-only), and the
+async pull-then-push resync for the new principal
+(`resyncAgentsAfterPrincipalChange`, serialized + principal-epoch-guarded,
+restoring the flag only on a clean pull) already carries the pruned configs up;
+a push fired directly from the prune would race that resync's gate.
 A registry miss never drops or prunes —
 fail-safe against mass deletion; the runtime gate backstops. The per-turn
 `ApprovalCache` also refuses these tools — a byte-identical repeated tool_use

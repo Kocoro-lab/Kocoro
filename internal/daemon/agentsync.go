@@ -297,6 +297,78 @@ func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)
 	}
 }
 
+// beginAgentSyncPrincipalTransition is called from the verified-principal
+// change handler (SetAuth). It synchronously closes the destructive-push gate:
+// the startup pull's full-sync license was earned under the PREVIOUS principal,
+// so after a sign-in / account switch / sign-out every push must degrade to
+// upsert-only until a pull for the NEW principal has merged that account's
+// cloud mirror — otherwise the first agent CRUD after the switch would push
+// this device's local set with full_sync=true and soft-delete the new
+// account's cloud-only agents.
+//
+// For a non-empty new principal it then re-runs the pull-then-push
+// reconciliation asynchronously (never inside the auth mutation critical
+// section — the pull is a network call). Isolated processes never resync:
+// they suppress cloud background automation entirely.
+func (s *Server) beginAgentSyncPrincipalTransition(current string) {
+	s.agentPullClean.Store(false)
+	if current == "" || s.isolated {
+		return
+	}
+	go s.resyncAgentsForVerifiedPrincipal()
+}
+
+// resyncAgentsForVerifiedPrincipal is the production glue for the post-switch
+// resync: it waits for the startup pull to settle (pullDone closes exactly
+// once, success or failure), binds the pull to the currently verified
+// principal epoch, and delegates to the testable core. A pull that outlives
+// its principal (another switch while queued or in flight) must never restore
+// the full-sync license, so the epoch is re-checked around the pull.
+func (s *Server) resyncAgentsForVerifiedPrincipal() {
+	<-s.pullDone
+	auth := s.auth
+	gw := s.cloudGateway()
+	if auth == nil || gw == nil {
+		return
+	}
+	id, epoch, ok := auth.VerifiedPrincipal()
+	if !ok {
+		return
+	}
+	s.resyncAgentsAfterPrincipalChange(
+		func() ([]client.SyncAgentItem, error) { return gw.PullAgents(context.Background()) },
+		func() bool {
+			curID, curEpoch, curOK := auth.VerifiedPrincipal()
+			return curOK && curID == id && curEpoch == epoch
+		},
+	)
+}
+
+// resyncAgentsAfterPrincipalChange mirrors runStartupAgentSync for a
+// mid-process principal transition: pull the new principal's cloud mirror,
+// and ONLY on a clean pull restore the full-sync license and queue one push
+// (which reconciles local-wins agents up to the new account). Failure keeps
+// pushes upsert-only — safe, never destructive. samePrincipal guards both
+// sides of the pull so a superseded transition can neither apply a stale
+// account's mirror nor re-arm full_sync with it. Resyncs are serialized so
+// back-to-back switches cannot interleave their pulls.
+func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgentItem, error), samePrincipal func() bool) {
+	s.agentResyncMu.Lock()
+	defer s.agentResyncMu.Unlock()
+	if !samePrincipal() {
+		return
+	}
+	if err := s.pullAndApplyAgents(pull); err != nil {
+		log.Printf("agentsync: principal resync pull failed (pushes stay upsert-only): %v", err)
+		return
+	}
+	if !samePrincipal() {
+		return
+	}
+	s.agentPullClean.Store(true)
+	s.triggerAgentSync()
+}
+
 // pullAndApplyAgents applies the cloud agent mirror to local disk as a true
 // bidirectional last-writer-wins (LWW) reconciliation:
 //
