@@ -52,7 +52,25 @@ jobs:
             echo "Harnesses truncate from the tail silently — cut prose, not rules."
             exit 1
           fi
-          echo "AGENTS.md ${size}B, within budget"
+          echo "AGENTS.md ${size}B, $((24576 - size))B headroom"
+
+      - name: AGENTS.md does not grow near the ceiling
+        # The byte-budget rule AGENTS.md states about itself: within 1 KiB of
+        # the 24576B ceiling, adding bytes requires cutting at least as many
+        # from the file in the same PR. Scoped to that pressure zone so
+        # headroom recovered by a consolidation pass stays usable. checkout@v5
+        # is depth 1, so the base blob is fetched explicitly.
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin ${{ github.event.pull_request.base.sha }}
+          base=$(git show ${{ github.event.pull_request.base.sha }}:AGENTS.md | wc -c)
+          head=$(wc -c < AGENTS.md)
+          if [ "$head" -gt 23552 ] && [ "$head" -gt "$base" ]; then
+            echo "AGENTS.md grew ${base}B -> ${head}B within 1 KiB of the 24576B ceiling."
+            echo "Adding bytes here requires cutting at least as many from AGENTS.md."
+            exit 1
+          fi
+          echo "AGENTS.md ${base}B -> ${head}B, ok"
 
   test:
     # macos-latest matches the project's release.yml and the development

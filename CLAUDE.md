@@ -34,7 +34,7 @@ notably Voice Front-Brain Authority (`internal/koe`), Provider Architecture
 
 ### Doc Co-Maintenance
 
-Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-facing), and AGENTS.md (external-agent-facing: the rules and the greppable symbols, not a second copy of this file).
+Feature changes update README.md (user-facing), CLAUDE.md (this file, developer-facing), and AGENTS.md (external-agent-facing: the rules and the greppable symbols, not a second copy of this file). AGENTS.md is capped at 24576 bytes (CI asserts — harnesses truncate it from the tail silently), and within 1 KiB of that ceiling any addition must cut at least as many bytes from AGENTS.md in the same PR (also CI-asserted).
 
 **Kocoro skill is the AI's source of truth for the daemon HTTP API** — `references/*.md` are injected into the **kocoro agent's** context, so the rule covers only endpoints the agent calls or must understand: every such `mux.HandleFunc(...)` in `internal/daemon/server.go` needs a matching `references/*.md` entry in the same PR. Maps:
 - agents/skills/schedules/config endpoints → `references/{agents,skills,schedules,config}.md`
