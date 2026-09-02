@@ -482,7 +482,16 @@ func materializeAgentFromItem(agentsDir string, it client.SyncAgentItem, skillNa
 				// names) diverges the written config from Cloud's copy the
 				// same way. Detect it up front via the documented contract:
 				// SanitizeAgentPermissionsConfig returns the original pointer
-				// when nothing needs dropping.
+				// when nothing needs dropping. This pre-write pass is also
+				// LOAD-BEARING for per-agent computer_use entries (pushed by
+				// older daemons or hand-edited configs): Sanitize drops them
+				// here, whereas ValidateAgentPermissionsConfig inside
+				// WriteAgentConfig would REJECT the write — failing the
+				// materialize, backdating the mtime, and retrying (and
+				// re-failing) the pull on every startup forever. Pull has no
+				// caller to surface a rejection to, so drop-not-reject is the
+				// only converging behavior (same rationale as the legacy GUI
+				// precedent documented on SanitizeAgentPermissionsConfig).
 				if cleaned := agents.SanitizeAgentPermissionsConfig(cfg.Permissions); cleaned != cfg.Permissions {
 					cfg.Permissions = cleaned
 					permsDropped = true

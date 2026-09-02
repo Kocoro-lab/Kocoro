@@ -1385,3 +1385,46 @@ func TestHandleDeleteAgent_SerializesOnRouteLock(t *testing.T) {
 		t.Errorf("AGENT.md still exists after delete: %v", err)
 	}
 }
+
+// A pulled config carrying a per-agent computer_use always-allow entry (pushed
+// by an older daemon or a hand-edited config) must NOT wedge the pull into a
+// permanent retry loop: WriteAgentConfig's ValidateAgentPermissionsConfig
+// rejects computer_use, so without the pre-write sanitize the materialize would
+// fail, backdate the mtime to UpdatedAt-1s, and re-fail on every startup
+// forever. The entry must be dropped, ordinary entries kept, and the LWW clock
+// must land strictly AFTER the cloud UpdatedAt so the next pull does not retry.
+func TestPullAndApply_DropsPerAgentComputerUseWithoutRetryLoop(t *testing.T) {
+	root := t.TempDir()
+	updated := time.Now().Add(-time.Hour).UTC()
+	pull := func() ([]client.SyncAgentItem, error) {
+		return []client.SyncAgentItem{{
+			AgentKey:  "agt",
+			Prompt:    "p",
+			Config:    json.RawMessage(`{"permissions":{"always_allow_tools":["computer_use","file_write"]}}`),
+			UpdatedAt: updated,
+		}}, nil
+	}
+
+	if err := newPullServer(t, root).pullAndApplyAgents(pull); err != nil {
+		t.Fatalf("pullAndApplyAgents: %v", err)
+	}
+
+	a, err := agents.LoadAgent(root, "agt")
+	if err != nil {
+		t.Fatalf("agent not materialized: %v", err)
+	}
+	if a.Config == nil || a.Config.Permissions == nil {
+		t.Fatalf("config with sanitized permissions not written: %+v", a.Config)
+	}
+	got := a.Config.Permissions.AlwaysAllowTools
+	if len(got) != 1 || got[0] != "file_write" {
+		t.Fatalf("always_allow_tools = %v, want [file_write] (computer_use dropped, ordinary kept)", got)
+	}
+
+	// The LWW clock must be strictly later than the cloud UpdatedAt — a
+	// backdated (UpdatedAt-1s) clock means the partial-write retry path fired
+	// and every later pull re-materializes this agent forever.
+	if lm := agentLastModified(filepath.Join(root, "agt")); !lm.After(updated) {
+		t.Fatalf("agent mtime %v not strictly after cloud UpdatedAt %v — pull will retry forever", lm, updated)
+	}
+}
