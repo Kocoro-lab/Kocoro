@@ -85,11 +85,19 @@ type agentProfileBlob struct {
 // inconsistent agent (e.g. new AGENT.md + old PROFILE.yaml) while a concurrent
 // handleUpdateAgent is mid-write. The lock is acquired per-agent (short critical
 // section) and only AFTER the builtin-skip check.
-func (s *Server) buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error) {
+// buildSyncItems snapshots the pushable agent set for ownerID (the caller's
+// verified-principal snapshot; "" = legacy unfiltered). excludedForeign
+// reports that at least one foreign-owned agent was left out — the caller MUST
+// degrade that push to upsert-only, because Cloud's full_sync SoftDeleteMissing
+// tombstones every account row whose key is absent from the pushed set: an
+// excluded same-key agent would otherwise turn into an account-wide delete of
+// this account's own cloud row.
+func (s *Server) buildSyncItems(agentsDir, ownerID string) ([]client.SyncAgentItem, bool, error) {
 	entries, err := agents.ListAgents(agentsDir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	excludedForeign := false
 	items := make([]client.SyncAgentItem, 0, len(entries))
 	for _, e := range entries {
 		// Only sync user-defined agents (and user-overridden builtins, which
@@ -98,24 +106,63 @@ func (s *Server) buildSyncItems(agentsDir string) ([]client.SyncAgentItem, error
 		if e.Builtin && !e.Override {
 			continue
 		}
-		if item, ok := s.buildSyncItem(agentsDir, e.Name); ok {
+		item, ok, foreign := s.buildSyncItem(agentsDir, e.Name, ownerID)
+		if foreign {
+			excludedForeign = true
+			continue
+		}
+		if ok {
 			items = append(items, item)
 		}
 	}
-	return items, nil
+	return items, excludedForeign, nil
+}
+
+// currentVerifiedPrincipalID returns the verified Cloud user id, or "" when no
+// AuthManager is installed or nobody is verified — the sync-ownership paths
+// treat "" as "legacy device-shared behavior, no stamping, no filtering".
+func (s *Server) currentVerifiedPrincipalID() string {
+	if s.auth == nil {
+		return ""
+	}
+	id, _, ok := s.auth.VerifiedPrincipal()
+	if !ok {
+		return ""
+	}
+	return id
 }
 
 // buildSyncItem snapshots a single agent into a SyncAgentItem under the
 // per-route lock so the read is internally consistent against concurrent CRUD.
-func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bool) {
+// The third result reports a FOREIGN-OWNED exclusion, which the caller must
+// distinguish from an ordinary skip (see buildSyncItems' full_sync degrade).
+func (s *Server) buildSyncItem(agentsDir, name, ownerID string) (client.SyncAgentItem, bool, bool) {
 	routeKey := "agent:" + name
 	s.deps.SessionCache.LockRoute(routeKey)
 	defer s.deps.SessionCache.UnlockRoute(routeKey)
 
+	// Sync-boundary ownership: never push another verified principal's agents
+	// into this account (the cross-account leak an account switch used to
+	// arm). Unstamped agents are grandfathered — stamped to the current
+	// principal on first push contact, so single-account users keep exactly
+	// today's behavior. ownerID=="" skips both (legacy device-shared).
+	if ownerID != "" {
+		switch owner := agents.ReadAgentOwner(agentsDir, name); owner {
+		case "":
+			if err := agents.WriteAgentOwner(agentsDir, name, ownerID); err != nil {
+				log.Printf("agentsync: stamping owner for %q failed (agent still pushed): %v", name, err)
+			}
+		case ownerID:
+			// ours — push it
+		default:
+			return client.SyncAgentItem{}, false, true // foreign-owned — not this account's to push
+		}
+	}
+
 	a, err := agents.LoadAgent(agentsDir, name)
 	if err != nil {
 		log.Printf("agentsync: skipping agent %q: load failed: %v", name, err)
-		return client.SyncAgentItem{}, false
+		return client.SyncAgentItem{}, false, false
 	}
 	api := a.ToAPI()
 
@@ -132,7 +179,7 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 	})
 	if err != nil {
 		log.Printf("agentsync: skipping agent %q: marshal profile: %v", name, err)
-		return client.SyncAgentItem{}, false
+		return client.SyncAgentItem{}, false, false
 	}
 
 	var config json.RawMessage
@@ -151,7 +198,7 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 	if err != nil {
 		log.Printf("agentsync: skipping agent %q: attachment snapshot failed: %v", name, err)
 		s.auditAgentSyncFailure(name, "attachment snapshot failed", err)
-		return client.SyncAgentItem{}, false
+		return client.SyncAgentItem{}, false, false
 	}
 
 	return client.SyncAgentItem{
@@ -163,7 +210,7 @@ func (s *Server) buildSyncItem(agentsDir, name string) (client.SyncAgentItem, bo
 		Skills:      syncedSkills,
 		Profile:     profile,
 		UpdatedAt:   agentLastModified(filepath.Join(agentsDir, name)).UTC(),
-	}, true
+	}, true, false
 }
 
 // syncedAgentSkills serializes the attachment manifest itself, not only the
@@ -247,16 +294,33 @@ func agentLastModified(dir string) time.Time {
 // agents created on cloud after this snapshot are not clobbered.
 func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, agentsDir string) error {
 	start := time.Now().UTC()
-	items, err := s.buildSyncItems(agentsDir)
+	ownerID := s.currentVerifiedPrincipalID()
+	items, excludedForeign, err := s.buildSyncItems(agentsDir, ownerID)
 	if err != nil {
 		return err
 	}
-	// Known residual TOCTOU: a principal transition landing between this Load
-	// and the HTTP dispatch can still send full_sync=true under the new
-	// account's key. Closing it fully would need a principal-generation lease
-	// spanning the push (the integration-tools pattern); the window is
-	// milliseconds and accepted.
-	fullSync := s.agentPullClean.Load()
+	// The snapshot above can block behind an in-flight run's route lock for
+	// that run's whole duration, and a principal switch in that window
+	// hot-swaps the gateway key — dispatching now would upload the OLD
+	// principal's filtered content into the NEW account. Drop the push; the
+	// switch's own resync re-triggers one under the new principal. The
+	// remaining recheck-to-dispatch window is milliseconds; closing it fully
+	// would need a principal-generation lease spanning the push (the
+	// integration-tools pattern) and is accepted.
+	if s.currentVerifiedPrincipalID() != ownerID {
+		log.Printf("agentsync: push dropped: verified principal changed while snapshotting the agent set")
+		return nil
+	}
+	// A push that excluded a foreign-owned agent must not reconcile deletes:
+	// Cloud's full_sync SoftDeleteMissing tombstones every account row whose
+	// key is absent from the pushed set, so the excluded same-key agent would
+	// turn into an account-wide delete of THIS account's own cloud row (and
+	// propagate to its other devices). Deletes stop reconciling only while a
+	// foreign same-key agent sits locally — the safe direction.
+	fullSync := s.agentPullClean.Load() && !excludedForeign
+	if excludedForeign && s.agentPullClean.Load() {
+		log.Printf("agentsync: push degraded to upsert-only: foreign-owned agent(s) excluded from the set")
+	}
 	res, err := gw.SyncAgents(ctx, items, fullSync, start)
 	if err != nil {
 		return err
@@ -308,7 +372,10 @@ func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)
 		// would ride the next full-sync push into the new account.
 		log.Printf("agentsync: startup pull superseded by a principal transition; mirror discarded, full sync deferred to the new principal's resync")
 	} else {
-		s.applyPulledAgents(items)
+		// Production reaches here only without an AuthManager (ownerID "" —
+		// legacy unstamped apply); the defensive guard path stamps with the
+		// still-unchanged verified principal.
+		s.applyPulledAgents(items, s.currentVerifiedPrincipalID())
 		if samePrincipal() {
 			s.agentPullClean.Store(true)
 			restored = true
@@ -426,6 +493,7 @@ func (s *Server) resyncAgentsForVerifiedPrincipal() {
 			curID, curEpoch, curOK := auth.VerifiedPrincipal()
 			return curOK && curID == id && curEpoch == epoch
 		},
+		id,
 	)
 }
 
@@ -441,14 +509,14 @@ func (s *Server) resyncAgentsForVerifiedPrincipal() {
 // rollback mechanism exists). A final check guards the license restore.
 // Resyncs are serialized so back-to-back switches cannot interleave.
 //
-// Known limitation (pre-existing, tracked as follow-up): local agents are not
-// principal-scoped. The previous account's local-only agents survive a switch
-// untouched (the pulled mirror only materializes/tombstones ITS OWN keys), so
-// once this resync restores the license the next full-sync push uploads them
-// into the NEW account — and a colliding key with a newer local mtime wins LWW
-// over the new account's cloud row. Fixing that needs principal-stamped agent
-// materialization plus a foreign-principal filter in buildSyncItems.
-func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgentItem, error), samePrincipal func() bool) {
+// ownerID is the verified principal this resync pulls FOR: applyPulledAgents
+// stamps every agent it materializes with it and gates tombstones on it, and
+// buildSyncItems later excludes foreign-owned agents from the push — together
+// closing the cross-account shape where a switch uploaded the previous
+// account's local-only agents into the new account. The runtime (listing,
+// routing, execution) deliberately stays cross-account shared; only the sync
+// boundary is principal-scoped.
+func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgentItem, error), samePrincipal func() bool, ownerID string) {
 	s.agentResyncMu.Lock()
 	defer s.agentResyncMu.Unlock()
 	// Clear any stale license FIRST: a superseded resync's final Store(true)
@@ -469,7 +537,7 @@ func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgen
 	if !samePrincipal() {
 		return // superseded while the pull was in flight — discard the stale mirror
 	}
-	s.applyPulledAgents(items)
+	s.applyPulledAgents(items, ownerID)
 	if !samePrincipal() {
 		return
 	}
@@ -502,7 +570,9 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 	if err != nil {
 		return err
 	}
-	s.applyPulledAgents(items)
+	// No verified principal on this legacy path — apply unstamped (device-
+	// shared behavior unchanged).
+	s.applyPulledAgents(items, "")
 	return nil
 }
 
@@ -516,7 +586,16 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 //     self-deadlock on the same entry mutex) then removes the definition files.
 //
 // Per-agent failures are logged and never abort the rest of the mirror.
-func (s *Server) applyPulledAgents(items []client.SyncAgentItem) {
+//
+// ownerID scopes the apply to the pulling verified principal: materialized or
+// overwritten agents are stamped with it (an LWW overwrite re-stamps a
+// foreign-owned agent — the content now IS this account's mirror), and a
+// tombstone only deletes agents this principal owns or unstamped ones
+// (grandfathered) — account B's cloud delete must not remove account A's local
+// agent that merely shares the key. ownerID=="" (legacy startup pull, no
+// AuthManager) applies unstamped and ungated, preserving the historical
+// device-shared behavior.
+func (s *Server) applyPulledAgents(items []client.SyncAgentItem, ownerID string) {
 	agentsDir := s.deps.AgentsDir
 	for _, it := range items {
 		// Validate the key before any path construction (path-traversal safety)
@@ -536,9 +615,24 @@ func (s *Server) applyPulledAgents(items []client.SyncAgentItem) {
 			// The file removal is then serialized on the per-route lock so it
 			// can't interleave with handleCreate/Update/Delete on this agent.
 			if _, statErr := os.Stat(dir); statErr == nil {
+				// Lock-free ownership peek BEFORE Evict: Evict cancels an
+				// active run on the route, so a foreign-owned agent (whose
+				// files this tombstone must not touch) should not have its
+				// in-flight run user-cancelled either. Owner writes are
+				// route-lock-serialized, so a stale read here only delays the
+				// delete to the next pull; the locked re-check below stays
+				// the authority for the file removal.
+				if owner := agents.ReadAgentOwner(agentsDir, it.AgentKey); ownerID != "" && owner != "" && owner != ownerID {
+					continue
+				}
 				s.deps.SessionCache.Evict(it.AgentKey)
 				s.deps.SessionCache.LockRoute(routeKey)
-				deleteAgentDefinitionFiles(dir)
+				// Ownership gate, re-read under the route lock: foreign-owned
+				// stays; unstamped is grandfathered to the puller.
+				owner := agents.ReadAgentOwner(agentsDir, it.AgentKey)
+				if ownerID == "" || owner == "" || owner == ownerID {
+					deleteAgentDefinitionFiles(dir)
+				}
 				s.deps.SessionCache.UnlockRoute(routeKey)
 			}
 			continue
@@ -562,6 +656,14 @@ func (s *Server) applyPulledAgents(items []client.SyncAgentItem) {
 		}
 		materializeAgentFromItem(agentsDir, it, syncSkillNames, writeSyncedSkills,
 			s.dropRegistryDeniedAlwaysAllow)
+		// Stamp only a materialize that actually produced an agent (AGENT.md
+		// is the mandatory first write) — a failed materialize should not
+		// leave a ghost-owned dir behind.
+		if _, statErr := os.Stat(filepath.Join(dir, "AGENT.md")); ownerID != "" && statErr == nil {
+			if err := agents.WriteAgentOwner(agentsDir, it.AgentKey, ownerID); err != nil {
+				log.Printf("agentsync: stamping owner for pulled %q failed: %v", it.AgentKey, err)
+			}
+		}
 		s.deps.SessionCache.UnlockRoute(routeKey)
 		unlockSkills()
 	}
@@ -801,7 +903,7 @@ func stampAgentMtime(dir string, t time.Time) {
 // dir itself is removed only when nothing remains. Best-effort: per-file errors
 // are logged and do not abort the rest of the removal.
 func deleteAgentDefinitionFiles(dir string) {
-	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml", "PROFILE.yaml"} {
+	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml", "PROFILE.yaml", agents.AgentOwnerFile} {
 		p := filepath.Join(dir, f)
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			log.Printf("agentsync: tombstone remove %q failed: %v", p, err)

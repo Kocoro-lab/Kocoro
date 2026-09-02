@@ -186,6 +186,28 @@ One `####` per subsystem. Each names its code home first, then the invariant.
 
 A run that absorbed mid-run injected follow-ups completes + acks EACH inbound message under its OWN cloud id — superseded turns via `OnIntermediateAnswer(text, cloudMessageID)` (a real `SendReply`+ack, not a timeline segment); the final answer + co-acks via `RunAgentResult.{ReplyToMessageID,PendingAckMessageIDs}` -> `Client.SetReplyPlan`. Ack-after-delivery: `handleMessage` acks every absorbed id ONLY after the final reply lands. The injected follow-up's own handler suppresses BOTH its reply and ack via `Client.SuppressReply`; the owning run is solely responsible, so a crash replays it instead of losing the answer. Without this, Cloud collapses two logically-distinct replies (group-chat messages from different senders) into one channel message.
 
+#### Agent sync ownership
+
+`internal/agents/owner.go` + `internal/daemon/agentsync.go`. Agents carry a
+device-local `_owner` sidecar (verified Cloud user id; never synced, excluded
+from the LWW definition-file set). Push (`buildSyncItems`) excludes
+foreign-owned agents and grandfathers unstamped ones to the current verified
+principal on first push contact; the principal resync stamps everything it
+materializes/overwrites, and a pulled tombstone deletes only own/unstamped
+agents (account B's cloud delete cannot remove account A's same-key local
+agent). Create stamps the creator; definition edits (PUT agent / PUT+DELETE
+config) re-stamp to the editing principal (ownership follows content, same as
+the pull's LWW overwrite); delete removes the sidecar. The RUNTIME
+(listing/routing/execution) deliberately stays cross-account shared — only the
+sync boundary is principal-scoped, closing the cross-account upload of the
+previous account's local agents after a switch. No verified principal (legacy
+yaml-key platforms) = unstamped, unfiltered, historical device-shared behavior.
+A push that excluded a foreign-owned agent degrades to upsert-only — Cloud's
+full_sync SoftDeleteMissing would tombstone the account's own same-key row.
+Accepted residual: an agent edited under A whose stamp never landed (push
+failed / daemon killed inside the debounce / pre-upgrade population) is
+grandfathered to whoever is signed in at first push contact.
+
 #### Config revision state
 
 `internal/config/revision.go` + `internal/daemon/server.go`. The daemon records the exact global `~/.shannon/config.yaml` revision reflected in memory. GET `/config` and `/config/status` report a newer external revision as `reload_required`. Internal read-modify-write mutations preserve unknown external edits and MUST NOT mark bytes they did not load as applied. Project/local overlays are NOT watched by this signal. Capability `config_reload_state_v1`.
@@ -582,7 +604,7 @@ Scalars override, lists merge+dedup, structs field-level merge. MCP server env-v
 
 ### File Paths
 
-- Agent: `~/.shannon/agents/<name>/{AGENT.md, MEMORY.md, config.yaml, commands/*.md, _attached.yaml}`
+- Agent: `~/.shannon/agents/<name>/{AGENT.md, MEMORY.md, config.yaml, commands/*.md, _attached.yaml, _owner}` (`_owner` = device-local sync-ownership sidecar, never synced)
 - Global skills: `~/.shannon/skills/<name>/SKILL.md`
 - Sessions: `~/.shannon/sessions/` (default) or `~/.shannon/agents/<name>/sessions/` (per-agent); SQLite FTS5 index at `<sessions-dir>/sessions.db` (auto-rebuilt)
 - Spill: `~/.shannon/tmp/tool_result_<session>_<call_id>.txt`

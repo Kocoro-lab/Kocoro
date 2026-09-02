@@ -4632,6 +4632,14 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Stamp sync ownership to the creating verified principal (empty clears a
+	// stale sidecar left by a pre-ownership delete — GenerateAgentSlug may
+	// reuse a dir that has no AGENT.md, and an inherited foreign owner would
+	// silently keep the new agent out of every push). Best-effort: an
+	// unstamped agent is grandfathered on first push contact anyway.
+	if err := agents.WriteAgentOwner(s.deps.AgentsDir, req.Name, s.currentVerifiedPrincipalID()); err != nil {
+		log.Printf("daemon: stamping owner for created agent %q failed: %v", req.Name, err)
+	}
 	a, err := agents.LoadAgent(s.deps.AgentsDir, req.Name)
 	if err != nil {
 		rollback()
@@ -4862,6 +4870,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	s.restampAgentOwner(name)
 	a, err := agents.LoadAgent(s.deps.AgentsDir, name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -4869,6 +4878,21 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	s.triggerAgentSync()
 	writeJSON(w, http.StatusOK, a.ToAPI())
+}
+
+// restampAgentOwner re-stamps an agent's sync ownership to the editing
+// verified principal — the same ownership-follows-content rule the pull's LWW
+// overwrite applies. Without it, an agent stamped to account A but edited
+// under account B keeps A's owner: B's pushes exclude it and A's next sign-in
+// pushes B's edits into A's cloud. Skipped when nobody is verified (the stamp
+// is preserved; unstamped agents grandfather at push time). Best-effort — the
+// edit itself already succeeded.
+func (s *Server) restampAgentOwner(name string) {
+	if id := s.currentVerifiedPrincipalID(); id != "" {
+		if err := agents.WriteAgentOwner(s.deps.AgentsDir, name, id); err != nil {
+			log.Printf("daemon: re-stamping owner for edited agent %q failed: %v", name, err)
+		}
+	}
 }
 
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
@@ -4907,7 +4931,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	routeKey := "agent:" + name
 	s.deps.SessionCache.LockRoute(routeKey)
 	var errs []string
-	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml", "PROFILE.yaml"} {
+	for _, f := range []string{"AGENT.md", "config.yaml", "_attached.yaml", "PROFILE.yaml", agents.AgentOwnerFile} {
 		p := filepath.Join(agentDir, f)
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err.Error())
@@ -5057,6 +5081,7 @@ func (s *Server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.restampAgentOwner(name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
@@ -5076,6 +5101,7 @@ func (s *Server) handleDeleteAgentConfig(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.restampAgentOwner(name)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
