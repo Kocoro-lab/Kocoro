@@ -36,9 +36,8 @@ func (s *Server) RefreshIntegrationTools(ctx context.Context) error {
 	// principal-transition window let ToolDisallowsAlwaysAllowPersistence
 	// judge false) can be pruned — otherwise they sit in config forever,
 	// silently ignored by the runtime gate while the UI shows an active grant.
-	// The push request lives HERE, not inside the prune: this same-identity
-	// refresh path is the only prune caller where a sync push is safe (see the
-	// principal-transition caller for why).
+	// The push request lives with the CALLER, not inside the prune, so each
+	// prune site decides (both current sites push on write).
 	if s.pruneDeniedAlwaysAllowGrants() {
 		s.triggerAgentSync()
 	}
@@ -79,9 +78,10 @@ func (s *Server) refreshIntegrationCatalog(ctx context.Context) (bool, error) {
 // next refresh.
 //
 // Returns whether a per-agent config.yaml was actually rewritten (its mtime is
-// now ahead of Cloud's row). The CALLER decides whether to request a sync push
-// — pushing is not safe from every prune site (see the principal-transition
-// caller).
+// now ahead of Cloud's row). The CALLER decides whether to request a sync push;
+// both current sites (same-identity refresh, principal transition) push on
+// write, since the principal transition resets agentPullClean before the prune
+// can run — an early push is upsert-only.
 func (s *Server) pruneDeniedAlwaysAllowGrants() bool {
 	deps := s.deps
 
@@ -192,12 +192,18 @@ func (s *Server) resetIntegrationToolsForPrincipal(ctx context.Context, hasPrinc
 	// the bounded catalog fetch above already dominates the latency, and
 	// synchronous ordering keeps semantics and tests simple.
 	//
-	// No sync push from this caller: agentPullClean is set-once by the
-	// startup-only pull and survives an account switch, so a full_sync push
-	// fired here would upload the PREVIOUS account's local agent set to the
-	// new account and soft-delete its cloud-only agents. The pruned configs
-	// converge on the next ordinary refresh instead.
-	s.pruneDeniedAlwaysAllowGrants()
+	// A prune that wrote bytes requests a coalesced sync push, same as the
+	// REFRESH path — relying on the concurrent resync's post-pull push to
+	// carry the pruned configs would be a timing assumption (a prune slower
+	// than the resync's pull + debounce misses that push, and a failed resync
+	// pull triggers no push at all). This is safe now that the principal
+	// transition resets agentPullClean first (beginAgentSyncPrincipalTransition):
+	// a push before the new principal's pull lands is upsert-only, never
+	// destructive — the historical no-push rule here existed only because the
+	// gate used to survive the account switch.
+	if s.pruneDeniedAlwaysAllowGrants() {
+		s.triggerAgentSync()
+	}
 	return nil
 }
 
