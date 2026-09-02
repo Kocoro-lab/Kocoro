@@ -159,14 +159,22 @@ type Server struct {
 	pullDone chan struct{}
 
 	// agentPullClean gates the DESTRUCTIVE half of the push. It flips true only
-	// after a successful startup pull has reconciled the cloud mirror into the
-	// local set. Until then, pushes go up as upsert-only (full_sync=false) so a
-	// push driven by a later user edit can't soft-delete cloud-only agents the
-	// failed/never-run pull never brought down (e.g. agents created on another
-	// device). Set-once, never reset; written by runStartupAgentSync BEFORE
-	// pullDone closes, read by the push worker (which only pushes after the gate
-	// opens), so a plain atomic is sufficient.
+	// after a successful pull has reconciled the CURRENT principal's cloud
+	// mirror into the local set. Until then, pushes go up as upsert-only
+	// (full_sync=false) so a push driven by a later user edit can't soft-delete
+	// cloud-only agents the failed/never-run pull never brought down (e.g.
+	// agents created on another device). Written true by runStartupAgentSync
+	// BEFORE pullDone closes; RESET to false on every verified-principal
+	// transition (beginAgentSyncPrincipalTransition — the license was earned
+	// under the previous account) and restored only after
+	// resyncAgentsAfterPrincipalChange pulls cleanly for the new principal.
+	// Read by the push worker (which only pushes after pullDone), so a plain
+	// atomic is sufficient.
 	agentPullClean atomic.Bool
+
+	// agentResyncMu serializes post-principal-transition agent resyncs so
+	// back-to-back account switches cannot interleave their pulls.
+	agentResyncMu sync.Mutex
 
 	// realtimeUsageOutbox is the private disk queue used by the Koe realtime
 	// relay. The mutex protects lazy construction for lightweight test servers
@@ -661,6 +669,11 @@ func (s *Server) SetAuth(a *AuthManager) {
 	}
 	if a != nil {
 		a.SetPrincipalChangedHandler(func(previous, current string) {
+			// FIRST: synchronously close the destructive agent-push gate (cheap
+			// atomic) so no push observed under the new principal can carry the
+			// previous account's full-sync license; the pull-then-push resync it
+			// spawns runs outside this critical section.
+			s.beginAgentSyncPrincipalTransition(current)
 			if previous != "" {
 				if err := s.skillRecommendations.invalidateAccount(previous); err != nil {
 					log.Printf("daemon: invalidate old recommendation principal: %v", err)
@@ -1252,21 +1265,12 @@ func (s *Server) startBackgroundServices(ctx context.Context) func() {
 	s.startCompactionSnapshotSweep(days)
 	s.startRunEventSweep(runEventDays)
 
-	// One-time agent pull on startup: applies the cloud mirror to local disk
-	// (bidirectional LWW — materializes missing, overwrites cloud-newer, deletes
-	// tombstoned). No-op when Cloud is unconfigured. pullDone is ALWAYS closed
-	// when this finishes (success, failure, or unconfigured) so agentSyncWorker
+	// One-time agent reconciliation on startup. Auth-managed daemons defer the
+	// pull to the verified-principal transition's resync (see startupAgentSync);
+	// legacy daemons pull directly. pullDone is ALWAYS closed when this
+	// finishes (deferred, success, failure, or unconfigured) so agentSyncWorker
 	// never blocks forever waiting on the gate before its first push.
-	go func() {
-		gw := s.cloudGateway()
-		if gw == nil {
-			s.runStartupAgentSync(nil) // unconfigured
-			return
-		}
-		s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
-			return gw.PullAgents(ctx)
-		})
-	}()
+	go s.startupAgentSync(ctx)
 
 	// Memory feature (Phase 2.3). Service is constructed once and Start runs
 	// the cold-path gates synchronously then spawns the supervisor goroutine.

@@ -251,6 +251,11 @@ func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, ag
 	if err != nil {
 		return err
 	}
+	// Known residual TOCTOU: a principal transition landing between this Load
+	// and the HTTP dispatch can still send full_sync=true under the new
+	// account's key. Closing it fully would need a principal-generation lease
+	// spanning the push (the integration-tools pattern); the window is
+	// milliseconds and accepted.
 	fullSync := s.agentPullClean.Load()
 	res, err := gw.SyncAgents(ctx, items, fullSync, start)
 	if err != nil {
@@ -280,21 +285,196 @@ func (s *Server) pushAllAgents(ctx context.Context, gw *client.GatewayClient, ag
 // pushes driven by later user edits, which run regardless of pull outcome) goes
 // up as upsert-only so it can't soft-delete cloud-only agents. The flag is set
 // BEFORE pullDone closes so the worker always observes the reconciled state.
+//
+// The restore is principal-guarded: a verified-principal transition landing
+// while this pull is in flight means the merged local set belongs to the OLD
+// principal — an unguarded Store(true) would overwrite the transition's reset
+// (beginAgentSyncPrincipalTransition) and the post-pull full_sync push would go
+// out under the NEW account's hot-swapped key carrying the old account's set.
+// The new principal's own resync re-earns the license instead.
 func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)) {
 	if pull == nil {
 		close(s.pullDone)
 		return
 	}
-	pullErr := s.pullAndApplyAgents(pull)
+	samePrincipal := s.principalUnchangedGuard()
+	items, pullErr := pull()
+	restored := false
 	if pullErr != nil {
 		log.Printf("agentsync: startup pull failed: %v", pullErr)
+	} else if !samePrincipal() {
+		// Superseded while the pull was in flight: discard the old account's
+		// mirror before it touches disk — materialized old-account agents
+		// would ride the next full-sync push into the new account.
+		log.Printf("agentsync: startup pull superseded by a principal transition; mirror discarded, full sync deferred to the new principal's resync")
 	} else {
-		s.agentPullClean.Store(true)
+		s.applyPulledAgents(items)
+		if samePrincipal() {
+			s.agentPullClean.Store(true)
+			restored = true
+		} else {
+			log.Printf("agentsync: startup pull superseded by a principal transition; full sync deferred to the new principal's resync")
+		}
 	}
 	close(s.pullDone)
-	if pullErr == nil {
+	if restored {
 		s.triggerAgentSync()
 	}
+}
+
+// principalUnchangedGuard snapshots the verified principal (id, epoch,
+// verified-ness) and returns a func reporting whether it is still identical.
+// With no AuthManager (legacy yaml-key platforms) no principal transition can
+// occur, so the guard is constantly true. The epoch advances on EVERY verified-
+// principal transition (including sign-out and forced same-account re-login),
+// so a change-and-change-back cannot satisfy the guard.
+func (s *Server) principalUnchangedGuard() func() bool {
+	auth := s.auth
+	if auth == nil {
+		return func() bool { return true }
+	}
+	id, epoch, ok := auth.VerifiedPrincipal()
+	return func() bool {
+		curID, curEpoch, curOK := auth.VerifiedPrincipal()
+		return curID == id && curEpoch == epoch && curOK == ok
+	}
+}
+
+// startupAgentSync is the Start-time entry for the one-time startup pull.
+// Auth-managed daemons (AuthManager present) DEFER the pull to the verified-
+// principal transition's resync: Bootstrap fires the ""→A transition on every
+// signed-in launch, so the resync — verified principal, epoch guard, pullDone
+// wait — is the single owner of the launch reconciliation. A direct pull here
+// would race Bootstrap's /me window (applyAPIKey runs BEFORE the up-to-8s
+// verification probe, so "key installed, principal unverified" is the ordinary
+// launch state): the epoch guard would discard a mirror fetched before the
+// transition, and the transition would reset a license granted before it — a
+// duplicate pull and possibly a duplicate full-sync push on most launches.
+// Optimistic sign-in (/me network error) verifies no principal and therefore
+// syncs nothing until a later verified transition — the same terminal outcome
+// as a direct pull failing on that same dead network. Daemons without an
+// AuthManager (credential-store-unsupported platforms, legacy yaml key) keep
+// the direct pull: no principal transition ever fires there.
+func (s *Server) startupAgentSync(ctx context.Context) {
+	if s.auth != nil {
+		s.runStartupAgentSync(nil)
+		return
+	}
+	gw := s.cloudGateway()
+	if gw == nil {
+		s.runStartupAgentSync(nil) // unconfigured
+		return
+	}
+	s.runStartupAgentSync(func() ([]client.SyncAgentItem, error) {
+		return gw.PullAgents(ctx)
+	})
+}
+
+// beginAgentSyncPrincipalTransition is called from the verified-principal
+// change handler (SetAuth). It synchronously closes the destructive-push gate:
+// the startup pull's full-sync license was earned under the PREVIOUS principal,
+// so after a sign-in / account switch / sign-out every push must degrade to
+// upsert-only until a pull for the NEW principal has merged that account's
+// cloud mirror — otherwise the first agent CRUD after the switch would push
+// this device's local set with full_sync=true and soft-delete the new
+// account's cloud-only agents.
+//
+// For a non-empty new principal it then re-runs the pull-then-push
+// reconciliation asynchronously (never inside the auth mutation critical
+// section — the pull is a network call). Isolated processes never resync:
+// they suppress cloud background automation entirely.
+func (s *Server) beginAgentSyncPrincipalTransition(current string) {
+	s.agentPullClean.Store(false)
+	if current == "" || s.isolated {
+		return
+	}
+	go s.resyncAgentsForVerifiedPrincipal()
+}
+
+// resyncAgentsForVerifiedPrincipal is the production glue for the post-switch
+// resync: it waits for the startup pull to settle (pullDone closes exactly
+// once, success or failure), binds the pull to the currently verified
+// principal epoch, and delegates to the testable core. A pull that outlives
+// its principal (another switch while queued or in flight) must never restore
+// the full-sync license, so the epoch is re-checked around the pull.
+func (s *Server) resyncAgentsForVerifiedPrincipal() {
+	// pullDone is closed by every Start path (normal, isolated, unconfigured).
+	// A Server that never runs Start parks this goroutine here permanently —
+	// only constructible from tests/embedding, accepted.
+	<-s.pullDone
+	// s.ctx is assigned in Start strictly before any pullDone close, so this
+	// read is ordered by the channel close. Binding the pull to the server
+	// lifecycle means a shutdown fails the fetch instead of letting
+	// applyPulledAgents start deleting tombstoned agent dirs mid-Shutdown;
+	// nil (never-started test server) falls back to Background.
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	auth := s.auth
+	gw := s.cloudGateway()
+	if auth == nil || gw == nil || ctx.Err() != nil {
+		return
+	}
+	id, epoch, ok := auth.VerifiedPrincipal()
+	if !ok {
+		return
+	}
+	s.resyncAgentsAfterPrincipalChange(
+		func() ([]client.SyncAgentItem, error) { return gw.PullAgents(ctx) },
+		func() bool {
+			curID, curEpoch, curOK := auth.VerifiedPrincipal()
+			return curOK && curID == id && curEpoch == epoch
+		},
+	)
+}
+
+// resyncAgentsAfterPrincipalChange mirrors runStartupAgentSync for a
+// mid-process principal transition: pull the new principal's cloud mirror,
+// and ONLY on a clean pull restore the full-sync license and queue one push
+// (which reconciles local-wins agents up to the new account). Failure keeps
+// pushes upsert-only — safe, never destructive. samePrincipal is re-checked
+// between the fetch and the disk writes so a transition that landed while the
+// pull was in flight discards the fetched mirror — old-account agents put on
+// disk would ride the next full-sync push into the new account (the residual
+// window is a mid-APPLY transition: local file writes, milliseconds, no
+// rollback mechanism exists). A final check guards the license restore.
+// Resyncs are serialized so back-to-back switches cannot interleave.
+//
+// Known limitation (pre-existing, tracked as follow-up): local agents are not
+// principal-scoped. The previous account's local-only agents survive a switch
+// untouched (the pulled mirror only materializes/tombstones ITS OWN keys), so
+// once this resync restores the license the next full-sync push uploads them
+// into the NEW account — and a colliding key with a newer local mtime wins LWW
+// over the new account's cloud row. Fixing that needs principal-stamped agent
+// materialization plus a foreign-principal filter in buildSyncItems.
+func (s *Server) resyncAgentsAfterPrincipalChange(pull func() ([]client.SyncAgentItem, error), samePrincipal func() bool) {
+	s.agentResyncMu.Lock()
+	defer s.agentResyncMu.Unlock()
+	// Clear any stale license FIRST: a superseded resync's final Store(true)
+	// can land after this transition's begin...Store(false) (its guard passed
+	// before the transition; guard-then-store is not atomic). The mutex orders
+	// this store strictly after that stale store; in the normal path it is a
+	// no-op. Without it, a failed pull below would return with the stale
+	// license still set — durably re-arming full_sync under the wrong account.
+	s.agentPullClean.Store(false)
+	if !samePrincipal() {
+		return
+	}
+	items, err := pull()
+	if err != nil {
+		log.Printf("agentsync: principal resync pull failed (pushes stay upsert-only): %v", err)
+		return
+	}
+	if !samePrincipal() {
+		return // superseded while the pull was in flight — discard the stale mirror
+	}
+	s.applyPulledAgents(items)
+	if !samePrincipal() {
+		return
+	}
+	s.agentPullClean.Store(true)
+	s.triggerAgentSync()
 }
 
 // pullAndApplyAgents applies the cloud agent mirror to local disk as a true
@@ -314,19 +494,30 @@ func (s *Server) runStartupAgentSync(pull func() ([]client.SyncAgentItem, error)
 // "now") — without this the freshly-written agent would falsely win the next
 // LWW round and ping-pong. The pull function is injected for testability.
 //
-// Each per-agent critical section takes the SAME per-route lock the CRUD
-// handlers use, so a pull write/delete never races handleCreate/Update/Delete:
+// Callers that must interpose a check between the fetch and the disk writes
+// (the principal-guarded resync/startup paths) call pull and applyPulledAgents
+// separately instead.
+func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error)) error {
+	items, err := pull()
+	if err != nil {
+		return err
+	}
+	s.applyPulledAgents(items)
+	return nil
+}
+
+// applyPulledAgents is the disk-write half of the pull reconciliation. Each
+// per-agent critical section takes the SAME per-route lock the CRUD handlers
+// use, so a pull write/delete never races handleCreate/Update/Delete:
 //   - materialize/overwrite mirrors handleCreate/Update — wrapped in
 //     LockRoute/UnlockRoute("agent:"+key).
 //   - tombstone-delete mirrors handleDeleteAgent — calls SessionCache.Evict
 //     (which does its OWN per-route locking; wrapping it in LockRoute would
 //     self-deadlock on the same entry mutex) then removes the definition files.
-func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error)) error {
+//
+// Per-agent failures are logged and never abort the rest of the mirror.
+func (s *Server) applyPulledAgents(items []client.SyncAgentItem) {
 	agentsDir := s.deps.AgentsDir
-	items, err := pull()
-	if err != nil {
-		return err
-	}
 	for _, it := range items {
 		// Validate the key before any path construction (path-traversal safety)
 		// and before acquiring any lock.
@@ -374,7 +565,6 @@ func (s *Server) pullAndApplyAgents(pull func() ([]client.SyncAgentItem, error))
 		s.deps.SessionCache.UnlockRoute(routeKey)
 		unlockSkills()
 	}
-	return nil
 }
 
 // materializeAgentFromItem writes (or overwrites) all of an agent's definition
