@@ -3,12 +3,12 @@
 **Condensed mirror of `CLAUDE.md`** — rules + greppable symbols. If they
 disagree, `CLAUDE.md` and the code win.
 
-**Keep this file under 24 KB (CI asserts)** — cut prose, not rules. Adding
-bytes requires cutting at least as many bytes in the same PR.
+**Keep this file under 24 KB (CI asserts)** — cut prose, not rules. Within
+1 KB of the ceiling, adding bytes requires cutting at least as many from this
+file (CI asserts).
 
 Kocoro is the Go CLI/runtime (`shan`) for Shannon agents. Production: daemon +
-Desktop + Cloud (daemon holds the Cloud WS, runs the loop locally). Also TUI,
-one-shot CLI, MCP, schedules.
+Desktop + Cloud. Also TUI, one-shot CLI, MCP, schedules.
 
 Layout: `cmd/` (Cobra) + `internal/<pkg>/`; `daemon/` drives `agent/`.
 
