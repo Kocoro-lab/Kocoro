@@ -228,6 +228,7 @@ func TestAgentConfigWritesDropIntegrationRequiresApproval(t *testing.T) {
 	t.Run("config put", func(t *testing.T) {
 		deps := newIntegrationRegistryDeps(t)
 		deps.ShannonDir = t.TempDir()
+		deps.SessionCache = NewSessionCache(deps.ShannonDir)
 		srv := NewServer(0, nil, deps, "test")
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPut, "/agents/operator/config",
@@ -262,6 +263,7 @@ func TestAgentConfigWritesDropIntegrationRequiresApproval(t *testing.T) {
 	t.Run("registry miss keeps entry", func(t *testing.T) {
 		deps := newDepsWithConfig(t, "operator")
 		deps.ShannonDir = t.TempDir()
+		deps.SessionCache = NewSessionCache(deps.ShannonDir)
 		srv := NewServer(0, nil, deps, "test")
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPut, "/agents/operator/config",
