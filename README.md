@@ -561,6 +561,8 @@ agent:
 
 `/compact [instructions]` forces a pass immediately. The TUI shows a transient "Tidying context" spinner between the daemon's `compaction_started` and `compaction_finished` run-status events; other clients can render the same indicator by gating on the `compaction_status_events_v1` capability token.
 
+For the crash-recovery counterpart to this design, see [Mid-Turn Checkpointing in a Long-Running Agent Loop](https://waylandz.com/blog/mid-turn-checkpointing/), which explains why durable checkpoints are safer than replaying a partially completed agent turn.
+
 ## Named Agents
 
 Create independent agents with their own instructions, memory, tools, MCP servers, and model settings:
