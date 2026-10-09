@@ -223,7 +223,7 @@ B's approval click on A's agent rides A's next push — small, known.
 
 #### Built-in MCP catalog
 
-`internal/mcp/builtins.go` + `config.go mergeBuiltinMCPServers`. `BuiltinMCPServers` ships pre-bundled servers (e.g. `intercom`) disabled by default. `config.Load` field-merges the Go catalog onto user yaml: command/args/url come from the binary (auto-upgrade); disabled/env/keep_alive plus `connect_timeout_secs`/`tool_timeout_secs`/`workspace_base` persist from yaml. `PATCH /config` refuses daemon-owned fields on a builtin (`builtin_mcp_immutable`, 409). `GET /config/status` exposes `mcp_server_info` so Desktop renders a toggle + OAuth modal without hard-coding the catalog.
+`internal/mcp/builtins.go` + `config.go mergeBuiltinMCPServers`. `BuiltinMCPServers` ships pre-bundled servers (`intercom`, `parallel-search`) disabled by default. Parallel Search uses anonymous Streamable HTTP at `https://search.parallel.ai/mcp`, with no OAuth or API key; the existing local > MCP > gateway priority applies. Both HTTP connect paths send a Kocoro User-Agent. `config.Load` field-merges the Go catalog onto user yaml: command/args/url come from the binary (auto-upgrade); disabled/env/keep_alive plus `connect_timeout_secs`/`tool_timeout_secs`/`workspace_base` persist from yaml. `PATCH /config` refuses daemon-owned fields on a builtin (`builtin_mcp_immutable`, 409). `GET /config/status` exposes `mcp_server_info` so Desktop renders a toggle + OAuth modal without hard-coding the catalog.
 
 #### MCP async startup
 
