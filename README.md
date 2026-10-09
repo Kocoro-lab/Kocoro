@@ -474,7 +474,7 @@ mcp_servers:
 [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) uses
 `https://search.parallel.ai/mcp` without an API key or OAuth. Anonymous access has
 lower rate limits. Its `web_search` and `web_fetch` tools use the existing MCP
-approval and on-demand discovery flow. Once enabled, Parallel tools take priority
+on-demand discovery flow. Once enabled, Parallel tools take priority
 over same-named gateway tools under the existing local > MCP > gateway rule.
 Disabling it restores gateway search; the model provider stays unchanged.
 

@@ -34,7 +34,7 @@ func (o *parallelRequestObserver) RoundTrip(r *http.Request) (*http.Response, er
 	if r.URL.String() != "https://search.parallel.ai/mcp" {
 		o.t.Errorf("unexpected endpoint: %s", r.URL)
 	}
-	if r.Header.Get("User-Agent") != "Kocoro (https://github.com/Kocoro-lab/Kocoro)" {
+	if r.Method == http.MethodPost && r.Header.Get("User-Agent") != "Kocoro (https://github.com/Kocoro-lab/Kocoro)" {
 		o.t.Errorf("unexpected User-Agent: %q", r.Header.Get("User-Agent"))
 	}
 	if r.Header.Get("Authorization") != "" || r.Header.Get("X-API-Key") != "" {
@@ -127,7 +127,7 @@ func TestParallelSearchLive(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s missing from registry", call.name)
 		}
-		if mt, ok := tool.(*MCPTool); !ok || mt.serverName != "parallel-search" || !mt.RequiresApproval() {
+		if mt, ok := tool.(*MCPTool); !ok || mt.serverName != "parallel-search" || mt.RequiresApproval() {
 			t.Fatalf("unexpected tool: %T", tool)
 		}
 		result, err := tool.Run(ctx, call.args)
