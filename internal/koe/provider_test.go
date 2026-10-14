@@ -52,6 +52,9 @@ func TestAutoFallbackEligibility(t *testing.T) {
 		// Mint dials the local daemon; a refused dial is a daemon restart, not
 		// an OpenAI outage, and must not pin Auto to Qwen for the cooldown.
 		{"daemon down at mint", connectError(ProviderOpenAI, "mint", daemonRefused), false},
+		// SDP goes straight to api.openai.com, so a refused dial there is still
+		// an OpenAI availability failure; pins the mint-only scope of the carve-out.
+		{"openai refused at sdp", connectError(ProviderOpenAI, "sdp_exchange", daemonRefused), true},
 		{"genuine 503", connectError(ProviderOpenAI, "mint", &RealtimeBootstrapError{StatusCode: 503, Body: `{"detail":"provider_rate_limited"}`}), true},
 		{"auth", connectError(ProviderOpenAI, "sdp_exchange", &RealtimeBootstrapError{StatusCode: 401}), false},
 		{"quota", connectError(ProviderOpenAI, "sdp_exchange", &RealtimeBootstrapError{StatusCode: 429}), false},
