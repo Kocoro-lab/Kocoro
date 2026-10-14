@@ -290,3 +290,31 @@ func TestMergeBuiltinMCPServers_EveryUserFieldSurvivesMerge(t *testing.T) {
 		}
 	}
 }
+
+func TestMergeBuiltinMCPServers_ParallelOptIn(t *testing.T) {
+	cfg := &Config{Provider: "ollama", MCPServers: map[string]mcp.MCPServerConfig{
+		"custom": {Type: "http", URL: "https://example.com/mcp", Disabled: false},
+	}}
+	custom := cfg.MCPServers["custom"]
+	mergeBuiltinMCPServers(cfg)
+	got := cfg.MCPServers["parallel-search"]
+	if !got.Builtin || !got.Disabled || got.Type != "http" || got.URL != "https://search.parallel.ai/mcp" {
+		t.Fatalf("unexpected Parallel default: %+v", got)
+	}
+	if cfg.Provider != "ollama" || !reflect.DeepEqual(cfg.MCPServers["custom"], custom) {
+		t.Fatal("adding the catalog entry changed existing configuration")
+	}
+	entry := mcp.BuiltinMCPServers["parallel-search"]
+	if entry.RequiresAuth || entry.AuthHint != "" || entry.Config.Command != "" || len(entry.Config.Env) != 0 {
+		t.Fatal("Parallel anonymous HTTP entry must not require auth or a subprocess")
+	}
+	got.Disabled = false
+	got.ToolTimeoutSeconds = 42
+	got.KeepAlive = true
+	cfg.MCPServers["parallel-search"] = got
+	mergeBuiltinMCPServers(cfg)
+	got = cfg.MCPServers["parallel-search"]
+	if got.Disabled || got.ToolTimeoutSeconds != 42 || !got.KeepAlive {
+		t.Fatalf("lost user opt-in or runtime preferences: %+v", got)
+	}
+}

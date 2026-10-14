@@ -1,25 +1,22 @@
 # Kocoro Project Guide (AGENTS.md)
 
-**Condensed mirror of `CLAUDE.md`** — rules + greppable symbols. If they
-disagree, `CLAUDE.md` and the code win.
+**Mirror of `CLAUDE.md`**; if they disagree, `CLAUDE.md` and code win.
 
-**Keep this file under 24 KB (CI asserts)** — cut prose, not rules. Within
-1 KB of the ceiling, adding bytes requires cutting at least as many from this
-file (CI asserts).
+**Keep under 24 KB (CI asserts).** Within 1 KB, cut at least as many bytes as added.
 
-Kocoro is the Go CLI/runtime (`shan`) for Shannon agents. Production: daemon +
-Desktop + Cloud. Also TUI, one-shot CLI, MCP, schedules.
+Kocoro: Go CLI/runtime (`shan`) for Shannon agents; daemon, Desktop, Cloud, TUI,
+one-shot CLI, MCP, schedules.
 
-Layout: `cmd/` (Cobra) + `internal/<pkg>/`; `daemon/` drives `agent/`.
+Layout: `cmd/` (Cobra), `internal/<pkg>/`; `daemon/` drives `agent/`.
 
 ## Working Rules
 
 - `go.mod` is the source of truth for the Go version.
-- Prefer existing repo patterns over new abstractions; keep changes tied to the task.
-- Verify API response bodies, not just status codes.
-- No parallel `_enhanced` variants — update existing code in place.
-- Risky behavior changes keep operator-visible flags, rollback paths, focused tests.
-- Test locally before pushing dependency or generated-code changes.
+- Follow repo patterns; keep changes tied to the task.
+- Verify API response bodies and status codes.
+- Update existing code; no `_enhanced` variants.
+- Risky changes keep operator-visible flags, rollback paths, focused tests.
+- Test dependency or generated-code changes before pushing.
 - New `const max[A-Z]\w+ = <small_int>`: the comment MUST name (1) the workload,
   (2) the symptom when it binds, (3) the override path. Prefer
   `viper.SetDefault(...)` for liftable caps. Re-check small-int caps on
@@ -109,6 +106,10 @@ the SAME PR. Desktop-only transport endpoints stay out; their contract lives in
   X target blocks mutation; non-CDP: no claim; shell/custom MCP unguarded.
 
 ## MCP
+
+- `BuiltinMCPServers` (`mcp/builtins.go`) ships `parallel-search` disabled;
+  anonymous HTTP search/fetch needs no key. Existing local > MCP > gateway priority applies.
+  Both HTTP connect paths send a Kocoro User-Agent.
 
 - Probe and reconnect a supervisor-known-disconnected server BEFORE dispatch.
 - Every tools/call is bounded by per-server `tool_timeout_secs` >

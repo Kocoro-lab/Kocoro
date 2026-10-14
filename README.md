@@ -461,6 +461,23 @@ mcp_servers:
     context: "Remote MCP server providing custom tools."
 ```
 
+**Parallel Search** is a built-in, disabled-by-default HTTP MCP server for web
+search and page fetching. Enable it in Desktop's MCP Servers settings, or merge
+this entry into `~/.shannon/config.yaml` and restart `shan`:
+
+```yaml
+mcp_servers:
+  parallel-search:
+    disabled: false
+```
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) uses
+`https://search.parallel.ai/mcp` without an API key or OAuth. Anonymous access has
+lower rate limits. Its `web_search` and `web_fetch` tools use the existing MCP
+on-demand discovery flow. Once enabled, Parallel tools take priority
+over same-named gateway tools under the existing local > MCP > gateway rule.
+Disabling it restores gateway search; the model provider stays unchanged.
+
 Per-server: `command`/`args` (stdio), `type: http` + `url` (HTTP), `env`, `context` (LLM guidance — critical), `disabled: true` (skip without removing), `tool_timeout_secs` (bound a single tool-call attempt — after a transport failure the daemon reconnects and retries once, so a call is at most two attempts plus reconnect; default from `mcp.tool_timeout_secs`, 300s — raise for long-running tools; cannot be disabled, `0` means the default), `workspace_base` (for file-producing servers: the directory their results render relative paths against, so the daemon can report absolute artifact paths).
 
 - **On-demand discovery** — large MCP and integration catalogs are searched and loaded as needed; trusted Cloud `web_search`, `web_fetch`, and `x_search` openers plus core local tools remain immediately available.

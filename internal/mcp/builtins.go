@@ -45,6 +45,15 @@ type BuiltinEntry struct {
 // (same charset as user-added entries); Desktop uses the key as the
 // stable identifier in PATCH /config payloads.
 var BuiltinMCPServers = map[string]BuiltinEntry{
+	"parallel-search": {
+		DisplayName: "Parallel Search",
+		Description: "Search the web and fetch pages without an API key.",
+		Config: MCPServerConfig{
+			Type:    "http",
+			URL:     "https://search.parallel.ai/mcp",
+			Context: "Parallel Search MCP provides web_search and web_fetch. Search for current information and sources; fetch specific URLs when search excerpts are insufficient or the user asks about a page. Anonymous access has lower rate limits.",
+		},
+	},
 	"intercom": {
 		DisplayName: "Intercom",
 		Description: "Intercom customer messaging — conversations, contacts, articles, tickets.",

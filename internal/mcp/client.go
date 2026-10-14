@@ -360,7 +360,9 @@ func (m *ClientManager) connectWithForceClose(ctx context.Context, name string, 
 		if cfg.URL == "" {
 			return nil, fmt.Errorf("http MCP server requires url")
 		}
-		httpTransport, err := transport.NewStreamableHTTP(cfg.URL)
+		httpTransport, err := transport.NewStreamableHTTP(cfg.URL, transport.WithHTTPHeaders(map[string]string{
+			"User-Agent": "Kocoro (https://github.com/Kocoro-lab/Kocoro)",
+		}))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 		}
@@ -492,7 +494,9 @@ func (m *ClientManager) connect(ctx context.Context, name string, cfg MCPServerC
 		if cfg.URL == "" {
 			return nil, fmt.Errorf("http MCP server requires url")
 		}
-		httpTransport, err := transport.NewStreamableHTTP(cfg.URL)
+		httpTransport, err := transport.NewStreamableHTTP(cfg.URL, transport.WithHTTPHeaders(map[string]string{
+			"User-Agent": "Kocoro (https://github.com/Kocoro-lab/Kocoro)",
+		}))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 		}
