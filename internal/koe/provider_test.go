@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -35,6 +37,7 @@ func TestQwenRealtimeModelAllowlistOnlyIncludesCompatibleModels(t *testing.T) {
 
 func TestAutoFallbackEligibility(t *testing.T) {
 	netFailure := &net.DNSError{Err: "timeout", IsTimeout: true}
+	daemonRefused := refusedDaemonDial(t)
 	tests := []struct {
 		name string
 		err  error
@@ -46,6 +49,9 @@ func TestAutoFallbackEligibility(t *testing.T) {
 		// The daemon's own signed-out 503: Qwen rides the same relay, so falling
 		// back cannot succeed and must not open the OpenAI circuit either.
 		{"daemon signed out", connectError(ProviderOpenAI, "mint", &RealtimeBootstrapError{StatusCode: 503, Body: `{"error":"cloud not configured (sign in, or set cloud.enabled + api_key)"}`}), false},
+		// Mint dials the local daemon; a refused dial is a daemon restart, not
+		// an OpenAI outage, and must not pin Auto to Qwen for the cooldown.
+		{"daemon down at mint", connectError(ProviderOpenAI, "mint", daemonRefused), false},
 		{"genuine 503", connectError(ProviderOpenAI, "mint", &RealtimeBootstrapError{StatusCode: 503, Body: `{"detail":"provider_rate_limited"}`}), true},
 		{"auth", connectError(ProviderOpenAI, "sdp_exchange", &RealtimeBootstrapError{StatusCode: 401}), false},
 		{"quota", connectError(ProviderOpenAI, "sdp_exchange", &RealtimeBootstrapError{StatusCode: 429}), false},
@@ -60,6 +66,33 @@ func TestAutoFallbackEligibility(t *testing.T) {
 				t.Fatalf("AutoFallbackEligible(%v) = %t, want %t", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+// refusedDaemonDial returns the error a real HTTP POST to a closed localhost
+// port produces, so the test exercises the same wrapping chain
+// (*url.Error -> *net.OpError -> *os.SyscallError -> ECONNREFUSED) the daemon
+// client sees while the daemon is restarting.
+func refusedDaemonDial(t *testing.T) error {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	_, err = http.Post("http://"+addr+"/koe/realtime/mint", "application/json", nil)
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("POST to closed port = %v, want ECONNREFUSED", err)
+	}
+	return err
+}
+
+func TestOpenAICircuitIgnoresDaemonRestart(t *testing.T) {
+	c := NewOpenAICircuit(time.Minute)
+	c.RecordFailure(OpenAIMintError(refusedDaemonDial(t)))
+	if c.Skip() {
+		t.Fatal("refused daemon dial at mint opened the OpenAI circuit")
 	}
 }
 

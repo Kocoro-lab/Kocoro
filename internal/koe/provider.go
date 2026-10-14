@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -115,6 +116,13 @@ func AutoFallbackEligible(err error) bool {
 				return false
 			}
 			return bootstrapErr.StatusCode >= http.StatusInternalServerError
+		}
+		if ce.Stage == "mint" && errors.Is(ce.Err, syscall.ECONNREFUSED) {
+			// Mint goes to the local daemon, so a refused dial means the daemon
+			// is down or restarting — not that OpenAI is unavailable. Qwen
+			// bootstrap rides the same daemon, and opening the circuit here
+			// pins Auto to Qwen for the whole cooldown after the daemon is back.
+			return false
 		}
 		var netErr net.Error
 		return errors.As(ce.Err, &netErr) || errors.Is(ce.Err, context.DeadlineExceeded)
